@@ -14,11 +14,11 @@ use super::{
     LinearResult, ParentStamp, RequestKey, ReverseIndexRecord, ReverseParent, ScopeInfrastructure,
     ServiceRequestDescriptor, ServiceRequestPhase, ServiceRequestStateRecord, TaskPhase,
     VmAuthorityKey, WakeClaim, WorkloadContext, bearer_state, checked_add, checked_sub,
-    context_from_stamp, linear_apply, mint_continuation_key, next_continuation_bearer_generation,
-    preview_bearer_stamp, preview_nonce, preview_nonces, preview_revision, preview_task_child_add,
-    preview_task_child_sub, preview_workload_child_add, preview_workload_child_sub,
-    require_vacancy, validate_active_admission, validate_context, validate_continuation_key,
-    validate_task_stamp,
+    context_from_stamp, install_task_child_count, linear_apply, mint_continuation_key,
+    next_continuation_bearer_generation, preview_bearer_stamp, preview_nonce, preview_nonces,
+    preview_revision, preview_task_child_add, preview_task_child_sub, preview_workload_child_add,
+    preview_workload_child_sub, require_vacancy, validate_active_admission, validate_context,
+    validate_continuation_key, validate_task_child_stamp, validate_task_key, validate_task_stamp,
 };
 
 enum PreparedContinuationAdoption {
@@ -334,22 +334,25 @@ impl InfrastructureState {
         self.require_authoritative()?;
         descriptor.validate()?;
         let registry_instance = self.registry_instance;
-        let scope = self.scope_mut(task.0.root.scope)?;
-        validate_task_stamp(scope, registry_instance, &task.0)?;
+        let scope = self.scope_mut(task.0.authority.scope)?;
+        let task_record = validate_task_key(scope, registry_instance, &task.0)?;
+        let task_stamp = task_record.stamp;
         validate_active_admission(scope)?;
         if scope.binding_epoch(descriptor.source_domain)? != descriptor.source_binding_epoch {
             return Err(InfrastructureError::StaleBinding);
         }
-        let task_record = scope.tasks.get(task.0.identity.work_id).unwrap();
-        if task_record.phase != TaskPhase::Entered {
+        if task_record.phase != TaskPhase::Entered
+            || task_record.stamp.identity.role != super::TaskWorkRole::GuestSyscallWork
+        {
             return Err(InfrastructureError::InvalidState);
         }
-        if task.0.identity.vm.map(VmAuthorityKey::generation) != Some(descriptor.vm_generation) {
+        if task_stamp.identity.vm.map(VmAuthorityKey::generation) != Some(descriptor.vm_generation)
+        {
             return Err(InfrastructureError::StaleGeneration);
         }
         if let Some(existing) = scope.continuations.get(descriptor.continuation_id) {
             return if existing.stamp.identity == descriptor
-                && existing.stamp.parent == ParentStamp::Task(task.0.identity)
+                && existing.stamp.parent == ParentStamp::Task(task_stamp.identity)
             {
                 Err(InfrastructureError::ExactReplay)
             } else if existing.stamp.identity.generation > descriptor.generation {
@@ -363,12 +366,12 @@ impl InfrastructureState {
             descriptor.continuation_id,
             InfrastructureKind::Continuation,
         )?;
-        let context = context_from_stamp(scope, task.0.workload)?;
+        let context = context_from_stamp(scope, task_stamp.workload)?;
         let (stamp, next_nonce) = preview_bearer_stamp(
             scope,
             &context,
             descriptor,
-            ParentStamp::Task(task.0.identity),
+            ParentStamp::Task(task_stamp.identity),
         )?;
         require_vacancy(
             &scope.reverse_indexes,
@@ -378,13 +381,13 @@ impl InfrastructureState {
         let next_revision = preview_revision(scope)?;
         let next_live = checked_add(scope.live.continuations, 1)?;
         let next_workload_children = preview_workload_child_add(scope, stamp.workload.request)?;
-        let next_task_children = preview_task_child_add(scope, task.0.identity)?;
+        let next_task_children = preview_task_child_add(scope, task_stamp.identity)?;
         let index = ReverseIndexRecord {
             slot: stamp.nonce,
             kind: InfrastructureKind::Continuation,
             root_effect: stamp.root.root_effect,
-            parent: ReverseParent::Task(task.0.identity),
-            task: Some(task.0.identity.task),
+            parent: ReverseParent::Task(task_stamp.identity),
+            task: Some(task_stamp.identity.task),
             domain: stamp.domain.domain,
             binding_epoch: stamp.domain.binding_epoch,
             source_domain: Some(descriptor.source_domain),
@@ -424,7 +427,7 @@ impl InfrastructureState {
             .live_children = next_workload_children;
         scope
             .tasks
-            .get_mut(task.0.identity.work_id)
+            .get_mut(task_stamp.identity.work_id)
             .unwrap()
             .live_children = next_task_children;
         scope.events.push(
@@ -452,6 +455,9 @@ impl InfrastructureState {
             let registry_instance = self.registry_instance;
             let scope = self.scope_mut(lease.0.authority.scope)?;
             let record = validate_continuation_key(scope, registry_instance, &lease.0)?;
+            if validate_task_child_stamp(scope, registry_instance, &record.stamp)? {
+                return Err(InfrastructureError::InvalidState);
+            }
             if record.service_owner.is_some() {
                 return Err(InfrastructureError::InvalidState);
             }
@@ -513,6 +519,9 @@ impl InfrastructureState {
             let registry_instance = self.registry_instance;
             let scope = self.scope_mut(claim.0.authority.scope)?;
             let record = validate_continuation_key(scope, registry_instance, &claim.0)?;
+            if validate_task_child_stamp(scope, registry_instance, &record.stamp)? {
+                return Err(InfrastructureError::InvalidState);
+            }
             if record.service_owner.is_some() {
                 return Err(InfrastructureError::InvalidState);
             }
@@ -843,11 +852,10 @@ impl InfrastructureState {
                 .get_mut(stamp.workload.request.id)
                 .unwrap()
                 .live_children = next_workload_children;
-            scope
-                .tasks
-                .get_mut(parent_task.work_id)
-                .unwrap()
-                .live_children = next_task_children;
+            install_task_child_count(
+                scope.tasks.get_mut(parent_task.work_id).unwrap(),
+                next_task_children,
+            );
             Ok(receipt)
         })
     }
@@ -862,6 +870,24 @@ impl InfrastructureState {
             let scope = self.scope_mut(lease.0.authority.scope)?;
             let record = validate_continuation_key(scope, registry_instance, &lease.0)?;
             if record.service_owner.is_some() || record.phase != ContinuationPhase::Pending {
+                return Err(InfrastructureError::InvalidState);
+            }
+            finish_continuation_cancel(scope, record.stamp)
+        })
+    }
+
+    pub(in super::super) fn cancel_claimed_continuation(
+        &mut self,
+        claim: WakeClaim,
+    ) -> LinearResult<WakeClaim, ()> {
+        linear_apply(claim, |claim| {
+            self.require_authoritative()?;
+            let registry_instance = self.registry_instance;
+            let scope = self.scope_mut(claim.0.authority.scope)?;
+            let record = validate_continuation_key(scope, registry_instance, &claim.0)?;
+            if record.service_owner.is_some()
+                || !__cser_core::matches!(record.phase, ContinuationPhase::Claimed { .. })
+            {
                 return Err(InfrastructureError::InvalidState);
             }
             finish_continuation_cancel(scope, record.stamp)
@@ -1359,11 +1385,10 @@ fn finish_continuation_cancel(
         .get_mut(stamp.workload.request.id)
         .unwrap()
         .live_children = next_workload_children;
-    scope
-        .tasks
-        .get_mut(parent_task.work_id)
-        .unwrap()
-        .live_children = next_task_children;
+    install_task_child_count(
+        scope.tasks.get_mut(parent_task.work_id).unwrap(),
+        next_task_children,
+    );
     scope.events.push(
         InfrastructureEventKind::ContinuationCancelled,
         stamp.identity.continuation_id,

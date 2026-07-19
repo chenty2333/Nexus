@@ -5,23 +5,24 @@ extern crate core as __cser_core;
 
 use super::continuation::{apply_service_owned_continuation, prepare_service_owned_continuation};
 use super::{
-    AuthorityKey, BearerKey, BearerStamp, BoundServiceCancellationOutcome, BoundServiceRequest,
-    ContinuationDescriptor, ContinuationLease, ContinuationPhase, EnqueuedServiceRequest,
-    EnteredTaskLease, InfrastructureError, InfrastructureEventKind, InfrastructureKind,
-    InfrastructureState, LinearResult, ParentStamp, RequestKey, ReverseIndexRecord, ReverseParent,
-    ScopeInfrastructure, ServiceArmAuthority, ServiceArmPlan, ServiceArmReceipt, ServiceBoundKey,
-    ServiceCancellationPoint, ServiceCancellationReceipt, ServiceChildBindingReceipt,
-    ServiceClaimantSnapshot, ServiceCompletionOutcome, ServiceCompletionReceipt,
-    ServiceEnqueueAuthority, ServiceEnqueuePlan, ServiceEnqueueReceipt, ServiceLineageCommitment,
-    ServiceRequestCausalIdentity, ServiceRequestDescriptor, ServiceRequestPhase,
-    ServiceRequestRecoveryProjection, ServiceRequestRecoveryState, ServiceRequestStateRecord,
-    ServiceRequestTicket, TaskPhase, TaskRecord, TaskWorkRole, UnarmedServiceRequest,
-    UnboundServiceRequest, ValidatedAbortProof, ValidatedServiceChildProof, WorkloadContext,
-    bearer_state, checked_add, checked_sub, context_from_stamp, linear_apply,
-    mint_continuation_key, next_continuation_bearer_generation, preview_bearer_stamp,
-    preview_nonce, preview_revision, preview_task_child_add, preview_workload_child_add,
-    preview_workload_child_sub, require_vacancy, validate_active_admission, validate_context,
-    validate_continuation_bearer, validate_stamp_common, validate_task_stamp,
+    ArmedFaultTask, AuthorityKey, BearerKey, BearerStamp, BoundServiceCancellationOutcome,
+    BoundServiceRequest, ContinuationDescriptor, ContinuationLease, ContinuationPhase,
+    EnqueuedServiceRequest, EnteredTaskLease, InfrastructureError, InfrastructureEventKind,
+    InfrastructureKind, InfrastructureState, LinearResult, ParentStamp, RequestKey,
+    ReverseIndexRecord, ReverseParent, ScopeInfrastructure, ServiceArmAuthority, ServiceArmPlan,
+    ServiceArmReceipt, ServiceBoundKey, ServiceCancellationPoint, ServiceCancellationReceipt,
+    ServiceChildBindingReceipt, ServiceClaimantSnapshot, ServiceCompletionOutcome,
+    ServiceCompletionReceipt, ServiceEnqueueAuthority, ServiceEnqueuePlan, ServiceEnqueueReceipt,
+    ServiceLineageCommitment, ServiceRequestCausalIdentity, ServiceRequestDescriptor,
+    ServiceRequestPhase, ServiceRequestRecoveryProjection, ServiceRequestRecoveryState,
+    ServiceRequestStateRecord, ServiceRequestTicket, TaskPhase, TaskRecord, TaskWorkRole,
+    UnarmedServiceRequest, UnboundServiceRequest, ValidatedAbortProof, ValidatedServiceChildProof,
+    WorkloadContext, bearer_state, checked_add, checked_sub, context_from_stamp,
+    install_task_child_count, linear_apply, mint_continuation_key,
+    next_continuation_bearer_generation, preview_bearer_stamp, preview_nonce, preview_revision,
+    preview_task_child_add, preview_workload_child_add, preview_workload_child_sub,
+    require_vacancy, validate_active_admission, validate_context, validate_continuation_bearer,
+    validate_task_child_stamp, validate_task_key, validate_task_stamp,
 };
 use sha2::{Digest, Sha256};
 
@@ -34,14 +35,13 @@ impl InfrastructureState {
         self.require_authoritative()?;
         descriptor.validate()?;
         let registry_instance = self.registry_instance;
-        let scope = self.scope_mut(task.0.root.scope)?;
-        validate_task_stamp(scope, registry_instance, &task.0)?;
+        let scope = self.scope_mut(task.0.authority.scope)?;
+        let parent_task = validate_task_key(scope, registry_instance, &task.0)?;
+        let task_stamp = parent_task.stamp;
         validate_active_admission(scope)?;
-        let parent_task = scope
-            .tasks
-            .get(task.0.identity.work_id)
-            .ok_or(InfrastructureError::UnknownObligation)?;
-        if parent_task.phase != TaskPhase::Entered {
+        if parent_task.phase != TaskPhase::Entered
+            || parent_task.stamp.identity.role != TaskWorkRole::GuestSyscallWork
+        {
             return Err(InfrastructureError::ForeignParent);
         }
         if scope.binding_epoch(descriptor.destination_domain)?
@@ -51,7 +51,7 @@ impl InfrastructureState {
         }
         if let Some(existing) = scope.service_requests.get(descriptor.request_id) {
             return if existing.stamp.identity == descriptor
-                && existing.stamp.parent == ParentStamp::Task(task.0.identity)
+                && existing.stamp.parent == ParentStamp::Task(task_stamp.identity)
             {
                 Err(InfrastructureError::ExactReplay)
             } else if existing.stamp.identity.generation > descriptor.generation {
@@ -73,12 +73,12 @@ impl InfrastructureState {
             descriptor.request_id,
             InfrastructureKind::ServiceRequest,
         )?;
-        let context = context_from_stamp(scope, task.0.workload)?;
+        let context = context_from_stamp(scope, task_stamp.workload)?;
         let (stamp, next_nonce) = preview_bearer_stamp(
             scope,
             &context,
             descriptor,
-            ParentStamp::Task(task.0.identity),
+            ParentStamp::Task(task_stamp.identity),
         )?;
         require_vacancy(
             &scope.reverse_indexes,
@@ -88,13 +88,13 @@ impl InfrastructureState {
         let next_revision = preview_revision(scope)?;
         let next_live = checked_add(scope.live.service_requests, 1)?;
         let next_workload_children = preview_workload_child_add(scope, stamp.workload.request)?;
-        let next_task_children = preview_task_child_add(scope, task.0.identity)?;
+        let next_task_children = preview_task_child_add(scope, task_stamp.identity)?;
         let index = ReverseIndexRecord {
             slot: stamp.nonce,
             kind: InfrastructureKind::ServiceRequest,
             root_effect: stamp.root.root_effect,
-            parent: ReverseParent::Task(task.0.identity),
-            task: Some(task.0.identity.task),
+            parent: ReverseParent::Task(task_stamp.identity),
+            task: Some(task_stamp.identity.task),
             domain: stamp.domain.domain,
             binding_epoch: stamp.domain.binding_epoch,
             source_domain: Some(descriptor.destination_domain),
@@ -139,7 +139,7 @@ impl InfrastructureState {
         workload.live_children = next_workload_children;
         let task_record = scope
             .tasks
-            .get_mut(task.0.identity.work_id)
+            .get_mut(task_stamp.identity.work_id)
             .ok_or(InfrastructureError::UnknownObligation)?;
         task_record.live_children = next_task_children;
         scope.events.push(
@@ -212,6 +212,9 @@ impl InfrastructureState {
             let scope = self.scope_mut(ticket.0.authority.scope)?;
             let record = validate_service_bound_key(scope, registry_instance, &ticket.0)?;
             if record.phase != ServiceRequestPhase::ReservedBound {
+                return Err(InfrastructureError::InvalidState);
+            }
+            if validate_task_child_stamp(scope, registry_instance, &record.stamp)? {
                 return Err(InfrastructureError::InvalidState);
             }
             let response = validate_service_owned_continuation(scope, registry_instance, record)?;
@@ -432,7 +435,7 @@ impl InfrastructureState {
     pub(in super::super) fn claim_and_bind_service_child(
         &mut self,
         enqueued: EnqueuedServiceRequest,
-        claimant: &EnteredTaskLease,
+        claimant: &ArmedFaultTask,
         proof: ValidatedServiceChildProof,
     ) -> LinearResult<EnqueuedServiceRequest, BoundServiceRequest> {
         linear_apply(enqueued, |enqueued| {
@@ -440,23 +443,21 @@ impl InfrastructureState {
             let registry_instance = self.registry_instance;
             let scope = self.scope_mut(enqueued.0.authority.scope)?;
             let record = validate_service_bound_key(scope, registry_instance, &enqueued.0)?;
-            validate_task_stamp(scope, registry_instance, &claimant.0)?;
+            let claimant_record = validate_task_key(scope, registry_instance, &claimant.0)?;
+            let claimant_stamp = claimant_record.stamp;
             if proof.receipt.child_effect.generation() == 0
                 || proof.receipt.registration_digest == 0
             {
                 return Err(InfrastructureError::InvalidReceipt);
             }
-            let destination_binding_epoch = claimant.0.domain.binding_epoch;
-            let claimant_record = scope
-                .tasks
-                .get(claimant.0.identity.work_id)
-                .ok_or(InfrastructureError::UnknownObligation)?;
+            let destination_binding_epoch = claimant_stamp.domain.binding_epoch;
             if scope.binding_epoch(record.stamp.identity.destination_domain)?
                 != destination_binding_epoch
                 || record.stamp.identity.destination_binding_epoch != destination_binding_epoch
-                || claimant.0.domain.domain != record.stamp.identity.destination_domain
+                || claimant_stamp.domain.domain != record.stamp.identity.destination_domain
                 || claimant_record.phase != TaskPhase::Entered
-                || claimant_record.stamp.identity != claimant.0.identity
+                || claimant_record.stamp.identity != claimant_stamp.identity
+                || claimant_record.service_fault.is_none()
             {
                 return Err(InfrastructureError::StaleBinding);
             }
@@ -475,7 +476,7 @@ impl InfrastructureState {
             let bearer_generation = next_service_bearer_generation(record)?;
             let (claim_nonce, next_nonce) = preview_nonce(scope)?;
             let next_revision = preview_revision(scope)?;
-            let next_claimant_children = preview_task_child_add(scope, claimant.0.identity)?;
+            let next_claimant_children = preview_task_child_add(scope, claimant_stamp.identity)?;
             let mut successor = record.stamp;
             successor.bearer_generation = bearer_generation;
             let binding_receipt = ServiceChildBindingReceipt {
@@ -484,7 +485,7 @@ impl InfrastructureState {
                 service_bearer_generation: bearer_generation,
                 claim_generation,
                 claim_nonce,
-                claimant: service_claimant_snapshot(&claimant.0),
+                claimant: service_claimant_snapshot(&claimant_stamp),
                 child: proof.receipt,
             };
             let bound_commitment = service_child_bound_commitment(
@@ -499,7 +500,7 @@ impl InfrastructureState {
                 .ok_or(InfrastructureError::UnknownObligation)?;
             let claimant_record = scope
                 .tasks
-                .get_mut(claimant.0.identity.work_id)
+                .get_mut(claimant_stamp.identity.work_id)
                 .ok_or(InfrastructureError::UnknownObligation)?;
             service_record.stamp = successor;
             service_record.claim_generation = claim_generation;
@@ -550,7 +551,7 @@ impl InfrastructureState {
                 _ => return Err(InfrastructureError::InvalidState),
             };
             let validated_binding =
-                validate_live_service_child_binding(scope, registry_instance, record)?;
+                validate_service_child_binding_for_drain(scope, registry_instance, record)?;
             if validated_binding != binding_receipt {
                 return Err(InfrastructureError::InvalidState);
             }
@@ -1017,7 +1018,7 @@ fn validate_service_request_stamp(
     registry_instance: u64,
     stamp: &BearerStamp<ServiceRequestDescriptor>,
 ) -> Result<(), InfrastructureError> {
-    validate_stamp_common(scope, registry_instance, stamp)?;
+    let terminal_parent = validate_task_child_stamp(scope, registry_instance, stamp)?;
     let record = scope
         .service_requests
         .get(stamp.identity.request_id)
@@ -1025,8 +1026,23 @@ fn validate_service_request_stamp(
     if record.stamp != *stamp {
         return Err(InfrastructureError::StaleGeneration);
     }
-    if scope.binding_epoch(stamp.identity.destination_domain)?
-        != stamp.identity.destination_binding_epoch
+    let retained_claimant = match record.phase {
+        ServiceRequestPhase::ChildBound {
+            binding_receipt, ..
+        } => scope
+            .tasks
+            .get(binding_receipt.claimant.task.work_id)
+            .is_some_and(|task| {
+                __cser_core::matches!(task.phase, TaskPhase::Isolated | TaskPhase::Reaped)
+                    && task.anchor != super::TaskAnchorPhase::Live
+            }),
+        _ => false,
+    };
+    let historical_drain = terminal_parent || retained_claimant;
+    let destination_binding_epoch = scope.binding_epoch(stamp.identity.destination_domain)?;
+    if (!historical_drain && destination_binding_epoch != stamp.identity.destination_binding_epoch)
+        || (historical_drain
+            && destination_binding_epoch < stamp.identity.destination_binding_epoch)
     {
         return Err(InfrastructureError::StaleBinding);
     }
@@ -1427,6 +1443,49 @@ pub(super) fn validate_live_service_child_binding(
     Ok(receipt)
 }
 
+pub(super) fn validate_service_child_binding_for_drain(
+    scope: &ScopeInfrastructure,
+    registry_instance: u64,
+    record: &ServiceRequestStateRecord,
+) -> Result<ServiceChildBindingReceipt, InfrastructureError> {
+    let receipt = match record.phase {
+        ServiceRequestPhase::ChildBound {
+            binding_receipt, ..
+        } => binding_receipt,
+        _ => return Err(InfrastructureError::InvalidState),
+    };
+    if !valid_service_child_binding_commitment(record, receipt) {
+        return Err(InfrastructureError::InvalidReceipt);
+    }
+    let task = scope
+        .tasks
+        .get(receipt.claimant.task.work_id)
+        .ok_or(InfrastructureError::UnknownObligation)?;
+    validate_task_child_stamp(scope, registry_instance, &record.stamp)?;
+    let active = task.phase == TaskPhase::Entered
+        && task.anchor == super::TaskAnchorPhase::Live
+        && service_claimant_snapshot(&task.stamp) == receipt.claimant;
+    let historical = __cser_core::matches!(task.phase, TaskPhase::Isolated | TaskPhase::Reaped)
+        && task.anchor != super::TaskAnchorPhase::Live
+        && task.stamp.root.registry_instance == receipt.claimant.registry_instance
+        && task.stamp.root.scope == receipt.claimant.scope
+        && task.stamp.root.root_effect == receipt.claimant.root_effect
+        && task.stamp.root.authority_epoch >= receipt.claimant.authority_epoch
+        && task.stamp.workload.request.id == receipt.claimant.workload_request_id
+        && task.stamp.workload.request.generation == receipt.claimant.workload_request_generation
+        && task.stamp.workload.nonce == receipt.claimant.workload_nonce
+        && task.stamp.workload.bearer_generation >= receipt.claimant.workload_bearer_generation
+        && task.stamp.domain.domain == receipt.claimant.domain
+        && task.stamp.domain.binding_epoch >= receipt.claimant.binding_epoch
+        && task.stamp.identity == receipt.claimant.task
+        && task.stamp.nonce == receipt.claimant.task_nonce
+        && task.stamp.bearer_generation >= receipt.claimant.task_bearer_generation;
+    if (!active && !historical) || task.live_children == 0 {
+        return Err(InfrastructureError::InvalidState);
+    }
+    Ok(receipt)
+}
+
 pub(super) fn valid_service_child_binding_commitment(
     record: &ServiceRequestStateRecord,
     receipt: ServiceChildBindingReceipt,
@@ -1693,7 +1752,7 @@ fn apply_unbound_service_terminal(
     service.bound_continuation = None;
     service.phase = terminal;
     workload.live_children = next_workload_children;
-    task.live_children = next_task_children;
+    install_task_child_count(task, next_task_children);
     scope.live.service_requests = next_live_services;
     scope.revision = next_revision;
     Ok(())
@@ -1810,8 +1869,8 @@ fn apply_bound_service_terminal(
         service.bound_continuation = None;
         service.phase = terminal;
         workload.live_children = next_workload_children;
-        task.live_children = next_task_children;
-        claimant_task.live_children = next_claimant_task_children;
+        install_task_child_count(task, next_task_children);
+        install_task_child_count(claimant_task, next_claimant_task_children);
     } else {
         if expected_claimant_task_children.is_some() || next_claimant_task_children.is_some() {
             return Err(InfrastructureError::StaleClaim);
@@ -1826,7 +1885,7 @@ fn apply_bound_service_terminal(
         service.bound_continuation = None;
         service.phase = terminal;
         workload.live_children = next_workload_children;
-        task.live_children = next_task_children;
+        install_task_child_count(task, next_task_children);
     }
     scope.live.service_requests = next_live_services;
     scope.revision = next_revision;
