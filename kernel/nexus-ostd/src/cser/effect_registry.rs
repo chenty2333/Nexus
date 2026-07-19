@@ -1962,7 +1962,15 @@ struct DomainRecoveryState {
     unadopted: BTreeSet<EffectKey>,
     snapshot: Option<DomainRecoverySnapshot>,
     ready: Option<TaskKey>,
-    fault: Option<DomainFaultRecoveryAnchor>,
+    origin: DomainRecoveryOrigin,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DomainRecoveryOrigin {
+    /// A supervisor-reported crash has no infrastructure fault anchor.
+    SupervisorCrash,
+    /// A fault-triggered crash carries its exact immutable infrastructure anchor.
+    ServiceFault(DomainFaultRecoveryAnchor),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2907,7 +2915,7 @@ impl EffectRegistry {
                     unadopted: cohort,
                     snapshot: None,
                     ready: None,
-                    fault: Some(DomainFaultRecoveryAnchor {
+                    origin: DomainRecoveryOrigin::ServiceFault(DomainFaultRecoveryAnchor {
                         fault_id: plan.projection.fault_id,
                         generation: plan.projection.generation,
                         task: plan.projection.task,
@@ -6786,7 +6794,7 @@ impl EffectRegistry {
             unadopted: cohort.clone(),
             snapshot: None,
             ready: None,
-            fault: None,
+            origin: DomainRecoveryOrigin::SupervisorCrash,
         });
         scope.invalidate_recovery_readiness();
         Ok(DomainCrashReceipt {
@@ -8127,23 +8135,31 @@ impl EffectRegistry {
     // Keep this cross-ledger oracle out of the already-large invariant frame.
     // Loom's modeled coroutine stack is intentionally small.
     #[inline(never)]
-    fn check_domain_fault_recovery_anchor(
+    fn check_domain_recovery_origin(
         &self,
         scope: ScopeKey,
         domain: DomainKey,
         binding: &DomainBindingRecord,
         recovery: &DomainRecoveryState,
     ) -> Result<(), RegistryError> {
-        let Some(anchor) = recovery.fault else {
-            return Ok(());
-        };
         let projection = self
             .infrastructure
-            .domain_fault_recovery_projection(scope, anchor.fault_id, anchor.generation)
-            .map_err(|_| RegistryError::Invariant("domain fault recovery anchor mismatch"))?
-            .ok_or(RegistryError::Invariant(
-                "domain fault recovery anchor mismatch",
-            ))?;
+            .domain_fault_recovery_projection(
+                scope,
+                domain,
+                binding.binding_epoch,
+                recovery.crash_revision,
+            )
+            .map_err(|_| RegistryError::Invariant("domain recovery origin mismatch"))?;
+        let anchor = match (recovery.origin, projection) {
+            (DomainRecoveryOrigin::SupervisorCrash, None) => return Ok(()),
+            (DomainRecoveryOrigin::ServiceFault(anchor), Some(projection)) => (anchor, projection),
+            (DomainRecoveryOrigin::SupervisorCrash, Some(_))
+            | (DomainRecoveryOrigin::ServiceFault(_), None) => {
+                return Err(RegistryError::Invariant("domain recovery origin mismatch"));
+            }
+        };
+        let (anchor, projection) = anchor;
         if projection.fault_id != anchor.fault_id
             || projection.generation != anchor.generation
             || projection.task != anchor.task
@@ -8275,7 +8291,7 @@ impl EffectRegistry {
                     {
                         return Err(RegistryError::Invariant("stale domain ready proof"));
                     }
-                    self.check_domain_fault_recovery_anchor(*key, *domain, binding, recovery)?;
+                    self.check_domain_recovery_origin(*key, *domain, binding, recovery)?;
                 } else if binding.fallback_running && *domain != DomainKey::LEGACY {
                     return Err(RegistryError::Invariant(
                         "fallback domain lacks recovery state",
@@ -12368,7 +12384,29 @@ fn task_owned_fault_outer_transaction_self_test() {
     let recovery = binding.recovery.as_ref().unwrap();
     assert_eq!(recovery.cohort, BTreeSet::from([service_effect]));
     assert_eq!(recovery.unadopted, recovery.cohort);
-    assert!(recovery.fault.is_some());
+    assert!(matches!(
+        recovery.origin,
+        DomainRecoveryOrigin::ServiceFault(_)
+    ));
+    let mut missing_fault_origin = crash.clone();
+    missing_fault_origin
+        .scopes
+        .get_mut(&SCOPE)
+        .unwrap()
+        .domains
+        .get_mut(&SERVICE)
+        .unwrap()
+        .recovery
+        .as_mut()
+        .unwrap()
+        .origin = DomainRecoveryOrigin::SupervisorCrash;
+    let before = missing_fault_origin.clone();
+    assert_eq!(
+        missing_fault_origin.check_invariants(),
+        Err(RegistryError::Invariant("domain recovery origin mismatch"))
+    );
+    assert_eq!(missing_fault_origin, before);
+
     type MutateAnchor = fn(&mut DomainFaultRecoveryAnchor);
     let anchor_mutations: &[MutateAnchor] = &[
         |anchor| anchor.fault_id += 1,
@@ -12380,21 +12418,20 @@ fn task_owned_fault_outer_transaction_self_test() {
     ];
     for mutate in anchor_mutations {
         let mut corrupt = crash.clone();
-        mutate(
-            corrupt
-                .scopes
-                .get_mut(&SCOPE)
-                .unwrap()
-                .domains
-                .get_mut(&SERVICE)
-                .unwrap()
-                .recovery
-                .as_mut()
-                .unwrap()
-                .fault
-                .as_mut()
-                .unwrap(),
-        );
+        let recovery = corrupt
+            .scopes
+            .get_mut(&SCOPE)
+            .unwrap()
+            .domains
+            .get_mut(&SERVICE)
+            .unwrap()
+            .recovery
+            .as_mut()
+            .unwrap();
+        let DomainRecoveryOrigin::ServiceFault(anchor) = &mut recovery.origin else {
+            panic!("fault crash changed recovery origin")
+        };
+        mutate(anchor);
         let before = corrupt.clone();
         assert_eq!(
             corrupt.check_invariants(),
@@ -12522,6 +12559,73 @@ fn task_owned_fault_outer_transaction_self_test() {
     isolate.check_invariants().unwrap();
 }
 
+#[cfg(test)]
+fn ordinary_domain_crash_rejects_a_forged_fault_origin() {
+    const SCOPE: ScopeKey = ScopeKey::new(0xfd01, 1);
+    const SERVICE: DomainKey = DomainKey::new(0xfd);
+    const ROOT_OWNER: TaskKey = TaskKey::new(0xfd10, 1);
+    const SERVICE_OWNER: TaskKey = TaskKey::new(0xfd11, 1);
+
+    let mut registry = EffectRegistry::new();
+    registry
+        .create_scope(ScopeConfig {
+            key: SCOPE,
+            authority_epoch: 1,
+            binding_epoch: 1,
+            supervisor: ROOT_OWNER,
+            credits: alloc::vec![],
+        })
+        .unwrap();
+    registry
+        .add_domain(
+            SCOPE,
+            DomainConfig {
+                key: SERVICE,
+                binding_epoch: 1,
+                supervisor: SERVICE_OWNER,
+            },
+        )
+        .unwrap();
+    registry
+        .crash_domain(SCOPE, SERVICE, SERVICE_OWNER)
+        .unwrap();
+    registry.check_invariants().unwrap();
+    assert_eq!(
+        registry.scopes[&SCOPE].domains[&SERVICE]
+            .recovery
+            .as_ref()
+            .unwrap()
+            .origin,
+        DomainRecoveryOrigin::SupervisorCrash
+    );
+
+    let mut forged = registry.clone();
+    let recovery = forged
+        .scopes
+        .get_mut(&SCOPE)
+        .unwrap()
+        .domains
+        .get_mut(&SERVICE)
+        .unwrap()
+        .recovery
+        .as_mut()
+        .unwrap();
+    recovery.origin = DomainRecoveryOrigin::ServiceFault(DomainFaultRecoveryAnchor {
+        fault_id: 0xfd40,
+        generation: 1,
+        task: SERVICE_OWNER,
+        vm_generation: 1,
+        evidence_digest: 0xfd50,
+        plan_commitment: [0xfd; 32],
+    });
+    let before = forged.clone();
+    assert_eq!(
+        forged.check_invariants(),
+        Err(RegistryError::Invariant("domain recovery origin mismatch"))
+    );
+    assert_eq!(forged, before);
+}
+
 /// Pins the first registry-native production identity chain independently of
 /// the later runtime wiring.  These are real registry records with one shared
 /// credit ledger, distinct service bindings, and immutable effect ancestry;
@@ -12531,6 +12635,8 @@ pub(crate) fn production_identity_registry_self_test() {
     combined_scope_candidate_self_test();
     #[cfg(test)]
     task_owned_fault_outer_transaction_self_test();
+    #[cfg(test)]
+    ordinary_domain_crash_rejects_a_forged_fault_origin();
     publication_ack_and_revoke_complete_self_test();
 
     const PERSONALITY_CREDIT: CreditClass = CreditClass::new(0x201);

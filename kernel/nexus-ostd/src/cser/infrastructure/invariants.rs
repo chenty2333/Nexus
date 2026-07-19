@@ -120,6 +120,10 @@ pub(super) fn check_scope_invariants(
             increment_invariant(&mut expected_live.tasks)?;
             increment_workload_child(&mut workload_children, record.stamp.workload.request)?;
         }
+        if record.service_fault.is_some() {
+            let (_, fault) = validate_exact_task_fault_pair(scope, record)?;
+            check_fault_phase(scope, fault)?;
+        }
         push_expected_index(&mut expected_indexes, reverse_index_for_task(record))?;
     }
 

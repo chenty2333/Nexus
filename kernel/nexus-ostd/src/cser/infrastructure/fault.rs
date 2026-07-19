@@ -800,47 +800,63 @@ impl InfrastructureState {
     pub(in super::super) fn domain_fault_recovery_projection(
         &self,
         scope_key: super::ScopeKey,
-        fault_id: u64,
-        generation: u64,
+        service_domain: super::DomainKey,
+        binding_epoch: u64,
+        crash_generation: u64,
     ) -> Result<Option<DomainFaultRecoveryProjection>, InfrastructureError> {
-        let scope = self.scope(scope_key)?;
-        let record = scope
-            .faults
-            .get(fault_id)
-            .ok_or(InfrastructureError::UnknownObligation)?;
-        if record.stamp.identity.generation != generation {
-            return Err(InfrastructureError::StaleGeneration);
-        }
-        let (projection, commitment) = match record.phase {
-            FaultPhase::InstalledAwaitingClaim {
-                projection,
-                commitment,
-                ..
-            }
-            | FaultPhase::Claimed {
-                projection,
-                commitment,
-                ..
-            } if projection.disposition == FaultDisposition::CrashService => {
-                (projection, commitment)
-            }
-            FaultPhase::Reserved
-            | FaultPhase::Armed
-            | FaultPhase::Exited { .. }
-            | FaultPhase::InstalledAwaitingClaim { .. }
-            | FaultPhase::Claimed { .. } => return Ok(None),
+        let scope = match self.scope(scope_key) {
+            Ok(scope) => scope,
+            Err(InfrastructureError::NotEnabled) => return Ok(None),
+            Err(error) => return Err(error),
         };
-        Ok(Some(DomainFaultRecoveryProjection {
-            fault_id: projection.fault_id,
-            generation: projection.generation,
-            task: projection.task,
-            vm_generation: projection.vm_generation,
-            service_domain: projection.service_domain,
-            closed_binding_epoch: projection.closed_binding_epoch,
-            crash_generation: projection.crash_generation,
-            evidence_digest: projection.evidence_digest,
-            plan_commitment: commitment.0,
-        }))
+        let mut current = None;
+        for record in scope.faults.iter() {
+            let (projection, commitment) = match record.phase {
+                FaultPhase::InstalledAwaitingClaim {
+                    projection,
+                    commitment,
+                    ..
+                }
+                | FaultPhase::Claimed {
+                    projection,
+                    commitment,
+                    ..
+                } if projection.disposition == FaultDisposition::CrashService => {
+                    (projection, commitment)
+                }
+                FaultPhase::Reserved
+                | FaultPhase::Armed
+                | FaultPhase::Exited { .. }
+                | FaultPhase::InstalledAwaitingClaim { .. }
+                | FaultPhase::Claimed { .. } => continue,
+            };
+            if projection.service_domain != service_domain
+                || projection.crash_generation != crash_generation
+                || projection
+                    .closed_binding_epoch
+                    .checked_add(1)
+                    .is_none_or(|epoch| epoch != binding_epoch)
+            {
+                continue;
+            }
+            let candidate = DomainFaultRecoveryProjection {
+                fault_id: projection.fault_id,
+                generation: projection.generation,
+                task: projection.task,
+                vm_generation: projection.vm_generation,
+                service_domain: projection.service_domain,
+                closed_binding_epoch: projection.closed_binding_epoch,
+                crash_generation: projection.crash_generation,
+                evidence_digest: projection.evidence_digest,
+                plan_commitment: commitment.0,
+            };
+            if current.replace(candidate).is_some() {
+                return Err(InfrastructureError::Invariant(
+                    "duplicate domain fault recovery projection",
+                ));
+            }
+        }
+        Ok(current)
     }
 }
 

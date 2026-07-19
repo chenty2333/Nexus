@@ -149,9 +149,6 @@ impl InfrastructureState {
             let scope = self.scope_mut(reserved.0.authority.scope)?;
             let task = validate_task_key(scope, registry_instance, &reserved.0)?;
             let task_stamp = task.stamp;
-            let link = task
-                .service_fault
-                .ok_or(InfrastructureError::InvalidState)?;
             if task.phase != TaskPhase::Admitted
                 || task.anchor != TaskAnchorPhase::Live
                 || !matches!(
@@ -161,20 +158,11 @@ impl InfrastructureState {
             {
                 return Err(InfrastructureError::InvalidState);
             }
-            let fault = scope
-                .faults
-                .get(link.fault_id)
-                .ok_or(InfrastructureError::UnknownObligation)?;
-            if fault.phase != FaultPhase::Reserved
-                || fault.stamp.identity.generation != link.fault_object_generation
-                || fault.stamp.bearer_generation != link.fault_bearer_generation
-                || fault.stamp.nonce != link.fault_nonce
-                || fault.owner.task != task_stamp.identity
-                || fault.owner.task_object_nonce != task_stamp.nonce
-                || fault.owner.task_bearer_generation != task_stamp.bearer_generation
-            {
+            let (link, fault) = validate_exact_task_fault_pair(scope, task)?;
+            if fault.phase != FaultPhase::Reserved {
                 return Err(InfrastructureError::StaleClaim);
             }
+            let link = *link;
             let next_task_generation = next_task_bearer_generation(task)?;
             let next_fault_generation = fault
                 .stamp

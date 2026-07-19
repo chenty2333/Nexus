@@ -14,8 +14,8 @@ use super::{
     EnqueuedServiceRequest, EnteredTaskLease, FaultAccess, FaultDisposition, FaultObservation,
     FaultPhase, FaultSlotDescriptor, InfrastructureError, InfrastructureKind, InfrastructureLimits,
     InfrastructureState, LinearFailure, PortalHandle, ReplyAbortAuthority, ReplyDescriptor,
-    ReplyPublicationReceipt, ResourceKey, ReverseIndexRecord, ReverseParent, ScopeKey,
-    ServiceArmAuthority, ServiceArmPlan, ServiceArmReceipt, ServiceBoundKey,
+    ReplyPublicationReceipt, ReservedFaultTask, ResourceKey, ReverseIndexRecord, ReverseParent,
+    ScopeKey, ServiceArmAuthority, ServiceArmPlan, ServiceArmReceipt, ServiceBoundKey,
     ServiceCancellationPoint, ServiceChildBindingReceipt, ServiceChildReceipt,
     ServiceClaimantSnapshot, ServiceEnqueueAuthority, ServiceEnqueuePlan, ServiceEnqueueReceipt,
     ServiceLineageCommitment, ServiceRequestCausalIdentity, ServiceRequestDescriptor,
@@ -3760,14 +3760,9 @@ fn publication_state() -> InfrastructureState {
     state
 }
 
-fn armed_fault_state(
+fn reserved_fault_state(
     registry_instance: u64,
-) -> (
-    InfrastructureState,
-    WorkloadContext,
-    ArmedFaultTask,
-    FaultObservation,
-) {
+) -> (InfrastructureState, WorkloadContext, ReservedFaultTask) {
     let mut state = InfrastructureState::new(registry_instance);
     state
         .enable(SCOPE, 1, ROOT, limits(), &[(SERVICE, 1)])
@@ -3806,6 +3801,19 @@ fn armed_fault_state(
         )
         .unwrap();
     assert_eq!(reserved.0.bearer_generation, 2);
+    state.check_invariants().unwrap();
+    (state, workload, reserved)
+}
+
+fn armed_fault_state(
+    registry_instance: u64,
+) -> (
+    InfrastructureState,
+    WorkloadContext,
+    ArmedFaultTask,
+    FaultObservation,
+) {
+    let (mut state, workload, reserved) = reserved_fault_state(registry_instance);
     let armed = state.claim_service_task_entry(reserved).unwrap();
     assert_eq!(armed.0.bearer_generation, 3);
     assert_eq!(
@@ -3820,7 +3828,7 @@ fn armed_fault_state(
         2
     );
     let observation = FaultObservation {
-        task: task_key,
+        task: TaskKey::new(0xfc20, 1),
         vm_generation: 1,
         instruction_pointer: 0xfc60,
         address: 0xfc70,
@@ -3830,6 +3838,107 @@ fn armed_fault_state(
     };
     state.check_invariants().unwrap();
     (state, workload, armed, observation)
+}
+
+#[test]
+fn service_task_entry_rejects_every_substituted_fault_coordinate_without_consuming_authority() {
+    type MutateReserved = fn(&mut super::FaultStateRecord);
+    let mutations: &[MutateReserved] = &[
+        |fault| fault.stamp.parent = super::ParentStamp::RootEffect(ROOT),
+        |fault| fault.stamp.root.root_effect = EffectKey::new(ROOT.id() + 1, ROOT.generation()),
+        |fault| fault.stamp.domain.binding_epoch += 1,
+        |fault| fault.stamp.workload.request.id += 1,
+        |fault| fault.stamp.identity.service_domain = GUEST,
+        |fault| fault.stamp.identity.vm_generation += 1,
+        |fault| {
+            fault.stamp.identity.task = TaskKey::new(
+                fault.stamp.identity.task.id() + 1,
+                fault.stamp.identity.task.generation(),
+            )
+        },
+    ];
+
+    for mutate in mutations {
+        let (mut state, _, reserved) = reserved_fault_state(0x90f0);
+        mutate(
+            state
+                .scope_mut(SCOPE)
+                .unwrap()
+                .faults
+                .get_mut(0xfc50)
+                .unwrap(),
+        );
+        let authority = service_key_coordinates(&reserved.0);
+        let before = state.private_full_clone();
+        let failure = state.claim_service_task_entry(reserved).unwrap_err();
+        assert_eq!(
+            failure.error(),
+            InfrastructureError::Invariant("task-fault pair mismatch")
+        );
+        let returned = failure.into_input();
+        assert_eq!(service_key_coordinates(&returned.0), authority);
+        assert_eq!(state, before);
+    }
+}
+
+fn install_additional_fault(
+    state: &mut InfrastructureState,
+    identity_base: u64,
+    disposition: FaultDisposition,
+) -> (u64, u64) {
+    let binding_epoch = state.scope(SCOPE).unwrap().binding_epoch(SERVICE).unwrap();
+    let workload = state
+        .open_workload(
+            WorkloadRootPresentation::new(SCOPE, 1, ROOT),
+            WorkloadRequestPresentation::new(SERVICE, binding_epoch, identity_base, 1),
+        )
+        .unwrap();
+    let work_id = identity_base + 1;
+    let task_key = TaskKey::new(identity_base + 2, 1);
+    let task = state
+        .admit_task(
+            &workload,
+            TaskWorkDescriptor {
+                work_id,
+                generation: 1,
+                task: task_key,
+                role: TaskWorkRole::ServiceRequest,
+                vm: Some(VmAuthorityKey::new(identity_base + 3, 1).unwrap()),
+            },
+        )
+        .unwrap();
+    let fault_id = identity_base + 4;
+    let reserved = state
+        .reserve_fault_event(
+            task,
+            FaultSlotDescriptor {
+                fault_id,
+                generation: 1,
+                task: task_key,
+                vm_generation: 1,
+                service_domain: SERVICE,
+                admission_binding_epoch: binding_epoch,
+            },
+        )
+        .unwrap();
+    let armed = state.claim_service_task_entry(reserved).unwrap();
+    let (intent, plan) = state
+        .prepare_fault_disposition(
+            armed,
+            FaultObservation {
+                task: task_key,
+                vm_generation: 1,
+                instruction_pointer: identity_base + 5,
+                address: identity_base + 6,
+                access: FaultAccess::Read,
+                architecture_error: identity_base + 7,
+                evidence_digest: identity_base + 8,
+            },
+            disposition,
+        )
+        .unwrap();
+    state.install_fault_disposition(intent, plan).unwrap();
+    (work_id, fault_id)
 }
 
 fn current_armed_fault(state: &InfrastructureState) -> ArmedFaultTask {
@@ -4982,6 +5091,44 @@ fn observed_fault_requires_atomic_task_and_domain_disposition() {
 #[test]
 fn task_fault_invariants_bind_both_directions_disposition_and_exact_exit_digest() {
     let installed = applied_fault_state(FaultDisposition::CrashService);
+
+    let mut deleted_terminal = installed.private_full_clone();
+    let fault_nonce = deleted_terminal
+        .scope(SCOPE)
+        .unwrap()
+        .faults
+        .get(0xb700)
+        .unwrap()
+        .stamp
+        .nonce;
+    let scope = deleted_terminal.scope_mut(SCOPE).unwrap();
+    assert!(scope.faults.remove(0xb700).is_some());
+    assert!(scope.reverse_indexes.remove(fault_nonce).is_some());
+    assert_invariant_message_read_only(deleted_terminal, "task-fault pair missing");
+
+    let mut substituted_terminal = installed.private_full_clone();
+    let (second_work_id, _) = install_additional_fault(
+        &mut substituted_terminal,
+        0xbc00,
+        FaultDisposition::IsolateTask,
+    );
+    let substitute = substituted_terminal
+        .scope(SCOPE)
+        .unwrap()
+        .tasks
+        .get(second_work_id)
+        .unwrap()
+        .service_fault
+        .unwrap();
+    substituted_terminal
+        .scope_mut(SCOPE)
+        .unwrap()
+        .tasks
+        .get_mut(0xb400)
+        .unwrap()
+        .service_fault = Some(substitute);
+    assert_invariant_message_read_only(substituted_terminal, "task-fault pair mismatch");
+
     type MutatePair = fn(&mut InfrastructureState);
     let pair_mutations: &[MutatePair] = &[
         |state| {
