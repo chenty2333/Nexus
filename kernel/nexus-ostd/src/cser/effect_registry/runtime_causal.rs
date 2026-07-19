@@ -13,8 +13,9 @@ extern crate core as __cser_core;
 use __cser_alloc::vec::Vec;
 
 use super::{
-    DomainKey, EffectKey, EffectPhase, EffectRegistry, PortalHandle, PublicationTicket,
-    RegistryError, RevokeSelection, ScopeKey, ScopePhase, infrastructure,
+    DomainKey, DomainRecoverySnapshot, EffectKey, EffectPhase, EffectRegistry, PortalHandle,
+    PublicationTicket, RegistryError, RevokeSelection, ScopeKey, ScopePhase, TaskKey,
+    domain_recovery_snapshot_digest, infrastructure,
 };
 
 /// Bounded capacity for workloads and the seven RFC 0003 obligation families.
@@ -190,6 +191,27 @@ impl CausalDomainWorkloadIdentity {
     }
 }
 
+/// Private origin of one child authority. The portable service descriptor
+/// never supplies these coordinates; the Registry derives them from either an
+/// active binding or one exact live recovery snapshot.
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
+pub(super) enum CausalDomainWorkloadProvenance {
+    ActiveSupervisor {
+        supervisor: TaskKey,
+    },
+    RecoveryReplacement {
+        replacement: TaskKey,
+        attempt: u32,
+        snapshot_digest: [u8; 32],
+    },
+}
+
 /// Opaque authority for one child workload admitted into a Registry-owned
 /// target domain. This type intentionally implements neither `Clone` nor
 /// `Copy`; only the authoritative infrastructure ledger can mint it.
@@ -197,11 +219,16 @@ impl CausalDomainWorkloadIdentity {
 pub(crate) struct CausalDomainWorkloadSession {
     pub(super) identity: CausalDomainWorkloadIdentity,
     pub(super) context: infrastructure::WorkloadContext,
+    provenance: CausalDomainWorkloadProvenance,
 }
 
 impl CausalDomainWorkloadSession {
     pub(crate) const fn identity(&self) -> CausalDomainWorkloadIdentity {
         self.identity
+    }
+
+    pub(super) const fn provenance(&self) -> CausalDomainWorkloadProvenance {
+        self.provenance
     }
 }
 
@@ -243,6 +270,8 @@ pub(crate) enum CausalWorkloadError {
     StaleScope,
     StaleRoot,
     StaleDomain,
+    RecoveryUnavailable,
+    RecoverySnapshotMismatch,
     AlreadyActive,
     ClosureMismatch,
     Registry(RegistryError),
@@ -268,6 +297,7 @@ pub(crate) struct CausalDomainWorkloadRequest {
     parent: CausalWorkloadIdentity,
     domain: DomainKey,
     binding_epoch: u64,
+    supervisor: TaskKey,
     request_id: u64,
     request_generation: u64,
 }
@@ -284,6 +314,104 @@ impl CausalDomainWorkloadActivationFailure {
     }
 
     pub(crate) fn into_input(self) -> CausalDomainWorkloadRequest {
+        self.request
+    }
+}
+
+/// Copyable, descriptive proof that one exact recovery snapshot is still the
+/// manager-owned admission window for a replacement. It carries no workload
+/// bearer and cannot be used by the ordinary active-child API.
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
+pub(crate) struct CausalRecoveryAdmissionFence {
+    registry_instance: u64,
+    parent: CausalWorkloadIdentity,
+    scope: ScopeKey,
+    domain: DomainKey,
+    replacement: TaskKey,
+    attempt: u32,
+    authority_epoch: u64,
+    binding_epoch: u64,
+    root_revision: u64,
+    domain_revision: u64,
+    infrastructure_scope_revision: u64,
+    snapshot_digest: [u8; 32],
+}
+
+impl CausalRecoveryAdmissionFence {
+    pub(crate) const fn scope(self) -> ScopeKey {
+        self.scope
+    }
+
+    pub(crate) const fn domain(self) -> DomainKey {
+        self.domain
+    }
+
+    pub(crate) const fn replacement(self) -> TaskKey {
+        self.replacement
+    }
+
+    pub(crate) const fn attempt(self) -> u32 {
+        self.attempt
+    }
+
+    pub(crate) const fn binding_epoch(self) -> u64 {
+        self.binding_epoch
+    }
+
+    pub(crate) const fn snapshot_digest(self) -> [u8; 32] {
+        self.snapshot_digest
+    }
+}
+
+/// Non-Copy activation input which keeps the recovery fence paired with the
+/// portable workload coordinates until the authoritative child append.
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
+pub(crate) struct CausalRecoveryWorkloadRequest {
+    fence: CausalRecoveryAdmissionFence,
+    request_id: u64,
+    request_generation: u64,
+}
+
+impl CausalRecoveryWorkloadRequest {
+    pub(crate) const fn fence(&self) -> CausalRecoveryAdmissionFence {
+        self.fence
+    }
+}
+
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
+pub(crate) struct CausalRecoveryFenceFailure {
+    error: CausalWorkloadError,
+    fence: CausalRecoveryAdmissionFence,
+}
+
+impl CausalRecoveryFenceFailure {
+    pub(crate) const fn error(&self) -> &CausalWorkloadError {
+        &self.error
+    }
+
+    pub(crate) const fn into_input(self) -> CausalRecoveryAdmissionFence {
+        self.fence
+    }
+}
+
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
+pub(crate) struct CausalRecoveryWorkloadActivationFailure {
+    error: CausalWorkloadError,
+    request: CausalRecoveryWorkloadRequest,
+}
+
+impl CausalRecoveryWorkloadActivationFailure {
+    pub(crate) const fn error(&self) -> &CausalWorkloadError {
+        &self.error
+    }
+
+    pub(crate) fn into_input(self) -> CausalRecoveryWorkloadRequest {
         self.request
     }
 }
@@ -605,10 +733,12 @@ impl EffectRegistry {
             .domains
             .get(&target_domain)
             .ok_or(CausalWorkloadError::Registry(RegistryError::UnknownDomain))?;
-        if binding.quarantine.is_some() || binding.supervisor.is_none() || binding.fallback_running
-        {
-            return Err(CausalWorkloadError::StaleDomain);
-        }
+        let supervisor = match binding.supervisor {
+            Some(supervisor) if binding.quarantine.is_none() && !binding.fallback_running => {
+                supervisor
+            }
+            Some(_) | None => return Err(CausalWorkloadError::StaleDomain),
+        };
         let infrastructure = self
             .infrastructure
             .root_binding(parent_identity.scope)
@@ -626,6 +756,7 @@ impl EffectRegistry {
             parent: parent_identity,
             domain: target_domain,
             binding_epoch: binding.binding_epoch,
+            supervisor,
             request_id,
             request_generation,
         })
@@ -668,7 +799,13 @@ impl EffectRegistry {
             request_generation: request.request_generation,
         };
         __cser_core::debug_assert!(self.check_infrastructure_root_links().is_ok());
-        Ok(CausalDomainWorkloadSession { identity, context })
+        Ok(CausalDomainWorkloadSession {
+            identity,
+            context,
+            provenance: CausalDomainWorkloadProvenance::ActiveSupervisor {
+                supervisor: request.supervisor,
+            },
+        })
     }
 
     fn validate_causal_domain_workload_activation(
@@ -703,7 +840,7 @@ impl EffectRegistry {
         if binding.binding_epoch != request.binding_epoch
             || binding.revision != request.domain_revision
             || binding.quarantine.is_some()
-            || binding.supervisor.is_none()
+            || binding.supervisor != Some(request.supervisor)
             || binding.fallback_running
         {
             return Err(CausalWorkloadError::StaleDomain);
@@ -721,6 +858,196 @@ impl EffectRegistry {
             return Err(CausalWorkloadError::StaleRoot);
         }
         if infrastructure.revision != request.infrastructure_scope_revision {
+            return Err(CausalWorkloadError::StaleScope);
+        }
+        Ok(())
+    }
+
+    /// Derives a copyable admission fence only while the supplied snapshot is
+    /// still the exact manager-owned recovery attempt below this root workload.
+    /// The infrastructure revision is sampled here so activation cannot race an
+    /// unrelated causal child append.
+    pub(crate) fn prepare_causal_recovery_admission_fence(
+        &self,
+        parent: &CausalWorkloadSession,
+        snapshot: &DomainRecoverySnapshot,
+    ) -> Result<CausalRecoveryAdmissionFence, CausalWorkloadError> {
+        if snapshot.registry_instance_id != self.instance_id {
+            return Err(CausalWorkloadError::ForeignRegistry);
+        }
+        if snapshot.digest != domain_recovery_snapshot_digest(snapshot) {
+            return Err(CausalWorkloadError::RecoverySnapshotMismatch);
+        }
+        let parent_identity = self.verify_causal_workload_session(parent)?;
+        let infrastructure = self
+            .infrastructure
+            .root_binding(parent_identity.scope)
+            .map_err(CausalWorkloadError::Infrastructure)?;
+        let fence = CausalRecoveryAdmissionFence {
+            registry_instance: self.instance_id,
+            parent: parent_identity,
+            scope: snapshot.scope,
+            domain: snapshot.domain,
+            replacement: snapshot.replacement,
+            attempt: snapshot.attempt,
+            authority_epoch: snapshot.authority_epoch,
+            binding_epoch: snapshot.binding_epoch,
+            root_revision: snapshot.root_revision,
+            domain_revision: snapshot.domain_revision,
+            infrastructure_scope_revision: infrastructure.revision,
+            snapshot_digest: snapshot.digest,
+        };
+        self.validate_causal_recovery_admission_fence(parent, &fence)?;
+        Ok(fence)
+    }
+
+    /// Pairs one exact live fence with portable child-workload coordinates.
+    /// A rejected prepare returns the identical copyable fence.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn prepare_causal_recovery_domain_workload(
+        &self,
+        parent: &CausalWorkloadSession,
+        fence: CausalRecoveryAdmissionFence,
+        request_id: u64,
+        request_generation: u64,
+    ) -> Result<CausalRecoveryWorkloadRequest, CausalRecoveryFenceFailure> {
+        if request_id == 0 || request_generation == 0 {
+            return Err(CausalRecoveryFenceFailure {
+                error: CausalWorkloadError::InvalidRequest,
+                fence,
+            });
+        }
+        if let Err(error) = self.validate_causal_recovery_admission_fence(parent, &fence) {
+            return Err(CausalRecoveryFenceFailure { error, fence });
+        }
+        Ok(CausalRecoveryWorkloadRequest {
+            fence,
+            request_id,
+            request_generation,
+        })
+    }
+
+    /// Opens a recovery-only child after repeating every snapshot, binding,
+    /// parent and revision check. The normal child API remains active-only.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn activate_causal_recovery_domain_workload(
+        &mut self,
+        parent: &CausalWorkloadSession,
+        request: CausalRecoveryWorkloadRequest,
+    ) -> Result<CausalDomainWorkloadSession, CausalRecoveryWorkloadActivationFailure> {
+        if request.request_id == 0 || request.request_generation == 0 {
+            return Err(CausalRecoveryWorkloadActivationFailure {
+                error: CausalWorkloadError::InvalidRequest,
+                request,
+            });
+        }
+        if let Err(error) = self.validate_causal_recovery_admission_fence(parent, &request.fence) {
+            return Err(CausalRecoveryWorkloadActivationFailure { error, request });
+        }
+        let context = match self.infrastructure.open_child_workload(
+            &parent.context,
+            request.fence.domain,
+            request.request_id,
+            request.request_generation,
+        ) {
+            Ok(context) => context,
+            Err(error) => {
+                return Err(CausalRecoveryWorkloadActivationFailure {
+                    error: CausalWorkloadError::Infrastructure(error),
+                    request,
+                });
+            }
+        };
+        let identity = CausalDomainWorkloadIdentity {
+            parent: request.fence.parent,
+            domain: request.fence.domain,
+            binding_epoch: request.fence.binding_epoch,
+            request_id: request.request_id,
+            request_generation: request.request_generation,
+        };
+        __cser_core::debug_assert!(self.check_infrastructure_root_links().is_ok());
+        Ok(CausalDomainWorkloadSession {
+            identity,
+            context,
+            provenance: CausalDomainWorkloadProvenance::RecoveryReplacement {
+                replacement: request.fence.replacement,
+                attempt: request.fence.attempt,
+                snapshot_digest: request.fence.snapshot_digest,
+            },
+        })
+    }
+
+    fn validate_causal_recovery_admission_fence(
+        &self,
+        parent: &CausalWorkloadSession,
+        fence: &CausalRecoveryAdmissionFence,
+    ) -> Result<(), CausalWorkloadError> {
+        if fence.registry_instance != self.instance_id {
+            return Err(CausalWorkloadError::ForeignRegistry);
+        }
+        let parent_identity = self.verify_causal_workload_session(parent)?;
+        if parent_identity != fence.parent || fence.scope != parent_identity.scope {
+            return Err(CausalWorkloadError::ParentMismatch);
+        }
+        let scope = self
+            .scopes
+            .get(&fence.scope)
+            .ok_or(CausalWorkloadError::Registry(RegistryError::UnknownScope))?;
+        if scope.phase != ScopePhase::Active
+            || scope.authority_epoch != fence.authority_epoch
+            || fence.authority_epoch != parent_identity.authority_epoch
+        {
+            return Err(CausalWorkloadError::StaleRoot);
+        }
+        if scope.revision != fence.root_revision {
+            return Err(CausalWorkloadError::StaleScope);
+        }
+        let binding = scope
+            .domains
+            .get(&fence.domain)
+            .ok_or(CausalWorkloadError::Registry(RegistryError::UnknownDomain))?;
+        if binding.binding_epoch != fence.binding_epoch || binding.revision != fence.domain_revision
+        {
+            return Err(CausalWorkloadError::StaleDomain);
+        }
+        if binding.quarantine.is_some() || !binding.fallback_running || binding.supervisor.is_some()
+        {
+            return Err(CausalWorkloadError::RecoveryUnavailable);
+        }
+        let recovery = binding
+            .recovery
+            .as_ref()
+            .ok_or(CausalWorkloadError::RecoveryUnavailable)?;
+        let snapshot = recovery
+            .snapshot
+            .as_ref()
+            .ok_or(CausalWorkloadError::RecoveryUnavailable)?;
+        if recovery.ready.is_some()
+            || recovery.highest_attempt != fence.attempt
+            || snapshot.registry_instance_id != fence.registry_instance
+            || snapshot.scope != fence.scope
+            || snapshot.domain != fence.domain
+            || snapshot.replacement != fence.replacement
+            || snapshot.attempt != fence.attempt
+            || snapshot.authority_epoch != fence.authority_epoch
+            || snapshot.binding_epoch != fence.binding_epoch
+            || snapshot.root_revision != fence.root_revision
+            || snapshot.domain_revision != fence.domain_revision
+            || snapshot.digest != fence.snapshot_digest
+            || snapshot.digest != domain_recovery_snapshot_digest(snapshot)
+        {
+            return Err(CausalWorkloadError::RecoverySnapshotMismatch);
+        }
+        let infrastructure = self
+            .infrastructure
+            .root_binding(fence.scope)
+            .map_err(CausalWorkloadError::Infrastructure)?;
+        if infrastructure.authority_epoch != parent_identity.authority_epoch
+            || infrastructure.root_effect != parent_identity.root_effect
+        {
+            return Err(CausalWorkloadError::StaleRoot);
+        }
+        if infrastructure.revision != fence.infrastructure_scope_revision {
             return Err(CausalWorkloadError::StaleScope);
         }
         Ok(())
@@ -1037,10 +1364,12 @@ impl EffectRegistry {
 
 #[cfg(test)]
 pub(super) fn runtime_causal_bootstrap_self_test() {
+    use super::runtime_service_task::{CausalServiceTaskDescriptor, CausalServiceTaskRole};
+    use super::runtime_task::CausalVmIdentity;
     use super::{
         CreditCharge, CreditClass, CreditLimit, DerivedRegisterRequest, DomainConfig,
-        OperationClass, PublicationMode, RegisterRequest, ScopeClosureProgress, ScopeConfig,
-        SyscallDescriptor, TaskKey, TerminalRequest,
+        DomainRecoveryAbortReason, OperationClass, PublicationMode, RegisterRequest,
+        ScopeClosureProgress, ScopeConfig, SyscallDescriptor, TaskKey, TerminalRequest,
     };
 
     const SCOPE: ScopeKey = ScopeKey::new(0xca00, 1);
@@ -1048,6 +1377,7 @@ pub(super) fn runtime_causal_bootstrap_self_test() {
     const SERVICE: TaskKey = TaskKey::new(0xca02, 1);
     const DOMAIN: DomainKey = DomainKey::new(0xca);
     const TARGET_SERVICE: TaskKey = TaskKey::new(0xca03, 1);
+    const REPLACEMENT: TaskKey = TaskKey::new(0xca04, 1);
     const TARGET_DOMAIN: DomainKey = DomainKey::new(0xcc);
     const CREDIT: CreditClass = CreditClass::new(0xca);
 
@@ -1112,6 +1442,84 @@ pub(super) fn runtime_causal_bootstrap_self_test() {
 
     fn fixture() -> (EffectRegistry, PortalHandle) {
         fixture_with_publication(PublicationMode::None)
+    }
+
+    fn recovery_fixture(
+        seed: u64,
+    ) -> (
+        EffectRegistry,
+        CausalWorkloadSession,
+        DomainRecoverySnapshot,
+    ) {
+        let (mut registry, root) = fixture();
+        let request = registry
+            .prepare_causal_workload_activation(root, seed, 1, nested_limits())
+            .unwrap();
+        let root_session = registry.activate_causal_workload(request).unwrap();
+        let request = registry
+            .prepare_causal_domain_workload(
+                &root_session,
+                TARGET_DOMAIN,
+                seed.checked_add(1).unwrap(),
+                1,
+            )
+            .unwrap();
+        let child = registry
+            .activate_causal_domain_workload(&root_session, TARGET_DOMAIN, request)
+            .unwrap();
+        let descriptor = CausalServiceTaskDescriptor::new(
+            seed.checked_add(2).unwrap(),
+            1,
+            CausalServiceTaskRole::ActiveService,
+            CausalVmIdentity::new(seed.checked_add(3).unwrap(), 1).unwrap(),
+            seed.checked_add(4).unwrap(),
+            1,
+        )
+        .unwrap();
+        let admitted = registry
+            .admit_causal_service_task(child, descriptor)
+            .unwrap();
+        let selector = admitted.selector();
+        let reserved = registry
+            .reserve_causal_service_fault(selector, admitted)
+            .unwrap();
+        let armed = registry
+            .arm_causal_service_task(selector, reserved)
+            .unwrap();
+        let observation = infrastructure::FaultObservation {
+            task: TARGET_SERVICE,
+            vm_generation: 1,
+            instruction_pointer: seed.checked_add(5).unwrap(),
+            address: seed.checked_add(6).unwrap(),
+            access: infrastructure::FaultAccess::Read,
+            architecture_error: 0,
+            evidence_digest: seed.checked_add(7).unwrap(),
+        };
+        let crash = registry
+            .crash_causal_service_task(selector, armed, observation)
+            .unwrap();
+        crash.close(&mut registry).unwrap();
+        let snapshot = registry
+            .domain_recovery_snapshot(SCOPE, TARGET_DOMAIN, REPLACEMENT, 1)
+            .unwrap();
+        registry.check_invariants().unwrap();
+        (registry, root_session, snapshot)
+    }
+
+    macro_rules! assert_recovery_activation_failure {
+        ($registry:expr, $parent:expr, $request:expr, $error:expr) => {{
+            let request = $request;
+            let expected = __cser_alloc::format!("{request:?}");
+            let before = $registry.failure_atomic_projection();
+            let failure = $registry
+                .activate_causal_recovery_domain_workload($parent, request)
+                .unwrap_err();
+            __cser_core::assert_eq!(failure.error(), &$error);
+            let request = failure.into_input();
+            __cser_core::assert_eq!(__cser_alloc::format!("{request:?}"), expected);
+            __cser_core::assert_eq!($registry.failure_atomic_projection(), before);
+            request
+        }};
     }
 
     fn advance_target_epoch_for_test(registry: &mut EffectRegistry) {
@@ -1451,6 +1859,408 @@ pub(super) fn runtime_causal_bootstrap_self_test() {
         );
         __cser_core::assert_eq!(stale.failure_atomic_projection(), before);
         stale.close_causal_workload(root_session).unwrap();
+    }
+
+    // A manager can mint a replacement child only from one exact live recovery
+    // snapshot. The replacement task identity comes from its private
+    // provenance, survives ready/rebind, and cannot be changed by the portable
+    // descriptor.
+    {
+        let (mut recovery, root_session, snapshot) = recovery_fixture(0xcc00);
+        let fence = recovery
+            .prepare_causal_recovery_admission_fence(&root_session, &snapshot)
+            .unwrap();
+        __cser_core::assert_eq!(fence.scope(), SCOPE);
+        __cser_core::assert_eq!(fence.domain(), TARGET_DOMAIN);
+        __cser_core::assert_eq!(fence.replacement(), REPLACEMENT);
+        __cser_core::assert_eq!(fence.attempt(), 1);
+        __cser_core::assert_eq!(fence.binding_epoch(), snapshot.binding_epoch);
+        __cser_core::assert_eq!(fence.snapshot_digest(), snapshot.digest());
+
+        let mut substituted_fence = fence;
+        substituted_fence.replacement = TaskKey::new(0xcc08, 1);
+        let before = recovery.failure_atomic_projection();
+        let failure = recovery
+            .prepare_causal_recovery_domain_workload(&root_session, substituted_fence, 0xcc09, 1)
+            .unwrap_err();
+        __cser_core::assert_eq!(
+            failure.error(),
+            &CausalWorkloadError::RecoverySnapshotMismatch
+        );
+        __cser_core::assert_eq!(failure.into_input(), substituted_fence);
+        __cser_core::assert_eq!(recovery.failure_atomic_projection(), before);
+
+        let request = recovery
+            .prepare_causal_recovery_domain_workload(&root_session, fence, 0xcc10, 1)
+            .unwrap();
+        let duplicate_request = recovery
+            .prepare_causal_recovery_domain_workload(&root_session, fence, 0xcc18, 1)
+            .unwrap();
+        __cser_core::assert_eq!(request.fence(), fence);
+        let child = recovery
+            .activate_causal_recovery_domain_workload(&root_session, request)
+            .unwrap();
+        let _ = assert_recovery_activation_failure!(
+            recovery,
+            &root_session,
+            duplicate_request,
+            CausalWorkloadError::StaleScope
+        );
+        __cser_core::assert_eq!(
+            child.provenance(),
+            CausalDomainWorkloadProvenance::RecoveryReplacement {
+                replacement: REPLACEMENT,
+                attempt: 1,
+                snapshot_digest: snapshot.digest(),
+            }
+        );
+
+        let active_descriptor = CausalServiceTaskDescriptor::new(
+            0xcc11,
+            1,
+            CausalServiceTaskRole::ActiveService,
+            CausalVmIdentity::new(0xcc12, 1).unwrap(),
+            0xcc13,
+            1,
+        )
+        .unwrap();
+        let expected = __cser_alloc::format!("{child:?}");
+        let before = recovery.failure_atomic_projection();
+        let failure = recovery
+            .admit_causal_service_task(child, active_descriptor)
+            .unwrap_err();
+        __cser_core::assert_eq!(
+            failure.error(),
+            &super::runtime_service_task::CausalServiceTaskError::ProvenanceMismatch
+        );
+        let child = failure.into_session();
+        __cser_core::assert_eq!(__cser_alloc::format!("{child:?}"), expected);
+        __cser_core::assert_eq!(recovery.failure_atomic_projection(), before);
+
+        let replacement_descriptor = CausalServiceTaskDescriptor::new(
+            0xcc14,
+            1,
+            CausalServiceTaskRole::ReplacementRecovery,
+            CausalVmIdentity::new(0xcc15, 1).unwrap(),
+            0xcc16,
+            1,
+        )
+        .unwrap();
+        let admitted = recovery
+            .admit_causal_service_task(child, replacement_descriptor)
+            .unwrap();
+        let selector = admitted.selector();
+        __cser_core::assert_eq!(selector.task(), REPLACEMENT);
+        let reserved = recovery
+            .reserve_causal_service_fault(selector, admitted)
+            .unwrap();
+        let armed = recovery
+            .arm_causal_service_task(selector, reserved)
+            .unwrap();
+        recovery
+            .domain_ready(SCOPE, TARGET_DOMAIN, REPLACEMENT, &snapshot)
+            .unwrap();
+        recovery
+            .rebind_domain(SCOPE, TARGET_DOMAIN, REPLACEMENT)
+            .unwrap();
+        let completed = recovery
+            .finish_causal_service_task_without_fault(selector, armed, 0xcc17)
+            .unwrap();
+        completed.close(&mut recovery).unwrap();
+        recovery.check_invariants().unwrap();
+    }
+
+    // Every forged fence coordinate is rejected before append and the exact
+    // non-Copy request is returned unchanged.
+    {
+        let (mut substituted, root_session, snapshot) = recovery_fixture(0xcd00);
+        let fence = substituted
+            .prepare_causal_recovery_admission_fence(&root_session, &snapshot)
+            .unwrap();
+
+        let mut request = substituted
+            .prepare_causal_recovery_domain_workload(&root_session, fence, 0xcd10, 1)
+            .unwrap();
+        request.fence.parent.request_id = request.fence.parent.request_id.checked_add(1).unwrap();
+        let _ = assert_recovery_activation_failure!(
+            substituted,
+            &root_session,
+            request,
+            CausalWorkloadError::ParentMismatch
+        );
+
+        let mut request = substituted
+            .prepare_causal_recovery_domain_workload(&root_session, fence, 0xcd11, 1)
+            .unwrap();
+        request.fence.domain = DOMAIN;
+        let _ = assert_recovery_activation_failure!(
+            substituted,
+            &root_session,
+            request,
+            CausalWorkloadError::StaleDomain
+        );
+
+        let mut request = substituted
+            .prepare_causal_recovery_domain_workload(&root_session, fence, 0xcd12, 1)
+            .unwrap();
+        request.fence.replacement = TaskKey::new(0xcdfe, 1);
+        let _ = assert_recovery_activation_failure!(
+            substituted,
+            &root_session,
+            request,
+            CausalWorkloadError::RecoverySnapshotMismatch
+        );
+
+        let mut request = substituted
+            .prepare_causal_recovery_domain_workload(&root_session, fence, 0xcd13, 1)
+            .unwrap();
+        request.fence.attempt = 2;
+        let _ = assert_recovery_activation_failure!(
+            substituted,
+            &root_session,
+            request,
+            CausalWorkloadError::RecoverySnapshotMismatch
+        );
+
+        let mut request = substituted
+            .prepare_causal_recovery_domain_workload(&root_session, fence, 0xcd14, 1)
+            .unwrap();
+        request.fence.snapshot_digest[0] ^= 1;
+        let _ = assert_recovery_activation_failure!(
+            substituted,
+            &root_session,
+            request,
+            CausalWorkloadError::RecoverySnapshotMismatch
+        );
+
+        let mut request = substituted
+            .prepare_causal_recovery_domain_workload(&root_session, fence, 0xcd15, 1)
+            .unwrap();
+        request.fence.binding_epoch = request.fence.binding_epoch.checked_add(1).unwrap();
+        let _ = assert_recovery_activation_failure!(
+            substituted,
+            &root_session,
+            request,
+            CausalWorkloadError::StaleDomain
+        );
+
+        let mut request = substituted
+            .prepare_causal_recovery_domain_workload(&root_session, fence, 0xcd16, 1)
+            .unwrap();
+        request.fence.root_revision = request.fence.root_revision.checked_add(1).unwrap();
+        let _ = assert_recovery_activation_failure!(
+            substituted,
+            &root_session,
+            request,
+            CausalWorkloadError::StaleScope
+        );
+
+        let mut request = substituted
+            .prepare_causal_recovery_domain_workload(&root_session, fence, 0xcd17, 1)
+            .unwrap();
+        request.fence.domain_revision = request.fence.domain_revision.checked_add(1).unwrap();
+        let _ = assert_recovery_activation_failure!(
+            substituted,
+            &root_session,
+            request,
+            CausalWorkloadError::StaleDomain
+        );
+
+        let mut request = substituted
+            .prepare_causal_recovery_domain_workload(&root_session, fence, 0xcd18, 1)
+            .unwrap();
+        request.fence.infrastructure_scope_revision = request
+            .fence
+            .infrastructure_scope_revision
+            .checked_add(1)
+            .unwrap();
+        let _ = assert_recovery_activation_failure!(
+            substituted,
+            &root_session,
+            request,
+            CausalWorkloadError::StaleScope
+        );
+
+        let mut request = substituted
+            .prepare_causal_recovery_domain_workload(&root_session, fence, 0xcd19, 1)
+            .unwrap();
+        request.fence.registry_instance = request.fence.registry_instance.checked_add(1).unwrap();
+        let _ = assert_recovery_activation_failure!(
+            substituted,
+            &root_session,
+            request,
+            CausalWorkloadError::ForeignRegistry
+        );
+        substituted.check_invariants().unwrap();
+    }
+
+    // An authentic request cannot move between otherwise coordinate-identical
+    // Registry instances.
+    {
+        let (owner, owner_root, owner_snapshot) = recovery_fixture(0xce00);
+        let owner_fence = owner
+            .prepare_causal_recovery_admission_fence(&owner_root, &owner_snapshot)
+            .unwrap();
+        let foreign_request = owner
+            .prepare_causal_recovery_domain_workload(&owner_root, owner_fence, 0xce10, 1)
+            .unwrap();
+        let (mut target, target_root, _) = recovery_fixture(0xce20);
+        let _ = assert_recovery_activation_failure!(
+            target,
+            &target_root,
+            foreign_request,
+            CausalWorkloadError::ForeignRegistry
+        );
+        target.check_invariants().unwrap();
+        owner.check_invariants().unwrap();
+    }
+
+    // State changes after prepare fence the request without adding a workload:
+    // aborted/replaced snapshots, root/domain/infrastructure revision changes,
+    // rebind, and permanent quarantine are all independently covered.
+    {
+        let (mut stale, root_session, snapshot) = recovery_fixture(0xcf00);
+        let fence = stale
+            .prepare_causal_recovery_admission_fence(&root_session, &snapshot)
+            .unwrap();
+        let request = stale
+            .prepare_causal_recovery_domain_workload(&root_session, fence, 0xcf10, 1)
+            .unwrap();
+        stale
+            .abort_domain_recovery_attempt(
+                SCOPE,
+                TARGET_DOMAIN,
+                REPLACEMENT,
+                1,
+                &snapshot,
+                DomainRecoveryAbortReason::ExitedBeforeReady,
+            )
+            .unwrap();
+        stale
+            .domain_recovery_snapshot(SCOPE, TARGET_DOMAIN, TaskKey::new(0xcf11, 1), 2)
+            .unwrap();
+        let _ = assert_recovery_activation_failure!(
+            stale,
+            &root_session,
+            request,
+            CausalWorkloadError::RecoverySnapshotMismatch
+        );
+    }
+
+    {
+        let (mut changed_root, root_session, snapshot) = recovery_fixture(0xd000);
+        let fence = changed_root
+            .prepare_causal_recovery_admission_fence(&root_session, &snapshot)
+            .unwrap();
+        let request = changed_root
+            .prepare_causal_recovery_domain_workload(&root_session, fence, 0xd010, 1)
+            .unwrap();
+        let scope = changed_root.scopes.get_mut(&SCOPE).unwrap();
+        scope.revision = scope.revision.checked_add(1).unwrap();
+        scope.invalidate_recovery_readiness();
+        let _ = assert_recovery_activation_failure!(
+            changed_root,
+            &root_session,
+            request,
+            CausalWorkloadError::StaleScope
+        );
+        changed_root.check_invariants().unwrap();
+    }
+
+    {
+        let (mut changed_domain, root_session, snapshot) = recovery_fixture(0xd100);
+        let fence = changed_domain
+            .prepare_causal_recovery_admission_fence(&root_session, &snapshot)
+            .unwrap();
+        let request = changed_domain
+            .prepare_causal_recovery_domain_workload(&root_session, fence, 0xd110, 1)
+            .unwrap();
+        let binding = changed_domain
+            .scopes
+            .get_mut(&SCOPE)
+            .unwrap()
+            .domains
+            .get_mut(&TARGET_DOMAIN)
+            .unwrap();
+        binding.revision = binding.revision.checked_add(1).unwrap();
+        binding.recovery.as_mut().unwrap().ready = None;
+        let _ = assert_recovery_activation_failure!(
+            changed_domain,
+            &root_session,
+            request,
+            CausalWorkloadError::StaleDomain
+        );
+        changed_domain.check_invariants().unwrap();
+    }
+
+    {
+        let (mut changed_infrastructure, root_session, snapshot) = recovery_fixture(0xd200);
+        let fence = changed_infrastructure
+            .prepare_causal_recovery_admission_fence(&root_session, &snapshot)
+            .unwrap();
+        let request = changed_infrastructure
+            .prepare_causal_recovery_domain_workload(&root_session, fence, 0xd210, 1)
+            .unwrap();
+        let _unrelated = changed_infrastructure
+            .infrastructure
+            .open_child_workload(&root_session.context, DomainKey::LEGACY, 0xd211, 1)
+            .unwrap();
+        let _ = assert_recovery_activation_failure!(
+            changed_infrastructure,
+            &root_session,
+            request,
+            CausalWorkloadError::StaleScope
+        );
+        changed_infrastructure.check_invariants().unwrap();
+    }
+
+    {
+        let (mut rebound, root_session, snapshot) = recovery_fixture(0xd300);
+        let fence = rebound
+            .prepare_causal_recovery_admission_fence(&root_session, &snapshot)
+            .unwrap();
+        let request = rebound
+            .prepare_causal_recovery_domain_workload(&root_session, fence, 0xd310, 1)
+            .unwrap();
+        rebound
+            .domain_ready(SCOPE, TARGET_DOMAIN, REPLACEMENT, &snapshot)
+            .unwrap();
+        rebound
+            .rebind_domain(SCOPE, TARGET_DOMAIN, REPLACEMENT)
+            .unwrap();
+        let _ = assert_recovery_activation_failure!(
+            rebound,
+            &root_session,
+            request,
+            CausalWorkloadError::RecoveryUnavailable
+        );
+        rebound.check_invariants().unwrap();
+    }
+
+    {
+        let (mut quarantined, root_session, snapshot) = recovery_fixture(0xd400);
+        let fence = quarantined
+            .prepare_causal_recovery_admission_fence(&root_session, &snapshot)
+            .unwrap();
+        let request = quarantined
+            .prepare_causal_recovery_domain_workload(&root_session, fence, 0xd410, 1)
+            .unwrap();
+        __cser_core::assert!(matches!(
+            quarantined.isolate_domain_authority(
+                SCOPE,
+                TARGET_DOMAIN,
+                REPLACEMENT,
+                Some(snapshot.binding_epoch),
+            ),
+            super::DomainIsolationOutcome::Isolated(_)
+        ));
+        let _ = assert_recovery_activation_failure!(
+            quarantined,
+            &root_session,
+            request,
+            CausalWorkloadError::RecoveryUnavailable
+        );
+        quarantined.check_invariants().unwrap();
     }
 
     // A live child blocks close without consuming the opaque session or

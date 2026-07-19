@@ -12,6 +12,7 @@ infrastructure_mod_file=${6:-$script_root/src/cser/infrastructure/mod.rs}
 effect_registry_file=${7:-$script_root/src/cser/effect_registry.rs}
 adapter_file=${8:-$script_root/src/personality/virtio_cser_adapter.rs}
 receipt_bridge_file=${9:-$script_root/src/cser/infrastructure/device_receipt_bridge.rs}
+service_task_file=${10:-$script_root/src/cser/effect_registry/runtime_service_task.rs}
 registry_file=$effect_registry_file
 
 fail() {
@@ -28,7 +29,8 @@ for input in \
     "$infrastructure_mod_file" \
     "$effect_registry_file" \
     "$adapter_file" \
-    "$receipt_bridge_file"; do
+    "$receipt_bridge_file" \
+    "$service_task_file"; do
     [[ -f $input && ! -L $input ]] ||
         fail "implementation source is not a regular non-symlink file: $input"
 done
@@ -234,6 +236,11 @@ causal_domain_validate="$work/causal-domain-validate.rs"
 causal_domain_verify="$work/causal-domain-verify.rs"
 causal_domain_close_validate="$work/causal-domain-close-validate.rs"
 causal_domain_close="$work/causal-domain-close.rs"
+causal_recovery_types="$work/causal-recovery-types.rs"
+causal_recovery_derive="$work/causal-recovery-derive.rs"
+causal_recovery_prepare="$work/causal-recovery-prepare.rs"
+causal_recovery_activate="$work/causal-recovery-activate.rs"
+causal_recovery_validate="$work/causal-recovery-validate.rs"
 causal_close_intent="$work/causal-close-intent.rs"
 causal_close_prepare="$work/causal-close-prepare.rs"
 causal_close_validate="$work/causal-close-validate.rs"
@@ -343,8 +350,28 @@ extract_between "$runtime_causal_file" \
     "$causal_domain_activate"
 extract_between "$runtime_causal_file" \
     '    fn validate_causal_domain_workload_activation(' \
-    '    pub(crate) fn verify_causal_domain_workload_session(' \
+    '    pub(crate) fn prepare_causal_recovery_admission_fence(' \
     "$causal_domain_validate"
+extract_between "$runtime_causal_file" \
+    'pub(crate) struct CausalRecoveryAdmissionFence {' \
+    'pub(crate) struct CausalDomainWorkloadCloseFailure {' \
+    "$causal_recovery_types"
+extract_between "$runtime_causal_file" \
+    '    pub(crate) fn prepare_causal_recovery_admission_fence(' \
+    '    pub(crate) fn prepare_causal_recovery_domain_workload(' \
+    "$causal_recovery_derive"
+extract_between "$runtime_causal_file" \
+    '    pub(crate) fn prepare_causal_recovery_domain_workload(' \
+    '    pub(crate) fn activate_causal_recovery_domain_workload(' \
+    "$causal_recovery_prepare"
+extract_between "$runtime_causal_file" \
+    '    pub(crate) fn activate_causal_recovery_domain_workload(' \
+    '    fn validate_causal_recovery_admission_fence(' \
+    "$causal_recovery_activate"
+extract_between "$runtime_causal_file" \
+    '    fn validate_causal_recovery_admission_fence(' \
+    '    pub(crate) fn verify_causal_domain_workload_session(' \
+    "$causal_recovery_validate"
 extract_between "$runtime_causal_file" \
     '    pub(crate) fn verify_causal_domain_workload_session(' \
     '    fn validate_causal_domain_workload_close(' \
@@ -465,6 +492,7 @@ for required in \
     'parent: CausalWorkloadIdentity,' \
     'domain: DomainKey,' \
     'binding_epoch: u64,' \
+    'supervisor: TaskKey,' \
     'request_id: u64,' \
     'request_generation: u64,'; do
     require_count "$causal_domain_request" "$required" 1
@@ -475,6 +503,7 @@ require_count "$causal_domain_prepare" '.domains' 1
 require_count "$causal_domain_prepare" '.get(&target_domain)' 1
 require_count "$causal_domain_prepare" 'domain_revision: binding.revision,' 1
 require_count "$causal_domain_prepare" 'binding_epoch: binding.binding_epoch,' 1
+require_count "$causal_domain_prepare" 'supervisor,' 1
 reject_fixed "$causal_domain_prepare" 'binding_epoch: u64'
 require_count "$causal_domain_activate" \
     'self.validate_causal_domain_workload_activation(parent, target_domain, &request)' 1
@@ -493,6 +522,8 @@ require_count "$causal_domain_validate" \
 require_count "$causal_domain_validate" \
     'binding.revision != request.domain_revision' 1
 require_count "$causal_domain_validate" \
+    'binding.supervisor != Some(request.supervisor)' 1
+require_count "$causal_domain_validate" \
     'scope.revision != request.registry_scope_revision' 1
 require_count "$causal_domain_validate" \
     'infrastructure.revision != request.infrastructure_scope_revision' 1
@@ -508,6 +539,94 @@ require_count "$causal_domain_close" \
     '.prepare_historical_workload_close(&session.context)' 1
 require_count "$causal_domain_close" \
     '.apply_workload_close(intent, &session.context);' 1
+
+# Recovery child admission is a separate manager-only surface. Its fence is
+# copyable evidence, while the request and resulting session remain linear. A
+# live snapshot, fallback binding, absent supervisor/quarantine, root parent,
+# and all three revisions are revalidated immediately before child append.
+require_count "$causal_session" \
+    'provenance: CausalDomainWorkloadProvenance,' 1
+require_count "$causal_session" \
+    'RecoveryReplacement {' 1
+recovery_fence_line=$(line_of_unique "$runtime_causal_file" \
+    'pub(crate) struct CausalRecoveryAdmissionFence {')
+sed -n "$((recovery_fence_line - 8)),${recovery_fence_line}p" \
+    "$runtime_causal_file" >"$work/causal-recovery-fence-derive.rs"
+require_count "$work/causal-recovery-fence-derive.rs" \
+    '__cser_core::marker::Copy,' 1
+for required in \
+    'registry_instance: u64,' \
+    'parent: CausalWorkloadIdentity,' \
+    'scope: ScopeKey,' \
+    'domain: DomainKey,' \
+    'replacement: TaskKey,' \
+    'attempt: u32,' \
+    'authority_epoch: u64,' \
+    'binding_epoch: u64,' \
+    'root_revision: u64,' \
+    'domain_revision: u64,' \
+    'infrastructure_scope_revision: u64,' \
+    'snapshot_digest: [u8; 32],'; do
+    require_count "$causal_recovery_types" "$required" 1
+done
+recovery_request_line=$(line_of_unique "$runtime_causal_file" \
+    'pub(crate) struct CausalRecoveryWorkloadRequest {')
+recovery_request_derive=$(sed -n "$((recovery_request_line - 1))p" \
+    "$runtime_causal_file")
+[[ $recovery_request_derive == \
+    '#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]' ]] ||
+    fail 'CausalRecoveryWorkloadRequest gained Clone/Copy or lost its frozen derive set'
+require_count "$causal_recovery_types" \
+    'request: CausalRecoveryWorkloadRequest,' 1
+require_count "$causal_recovery_types" \
+    'into_input(self) -> CausalRecoveryWorkloadRequest' 1
+require_count "$causal_recovery_types" \
+    'into_input(self) -> CausalRecoveryAdmissionFence' 1
+require_count "$causal_recovery_derive" \
+    'if snapshot.registry_instance_id != self.instance_id {' 1
+require_count "$causal_recovery_derive" \
+    'snapshot.digest != domain_recovery_snapshot_digest(snapshot)' 1
+require_count "$causal_recovery_derive" \
+    '.root_binding(parent_identity.scope)' 1
+require_count "$causal_recovery_derive" \
+    'self.validate_causal_recovery_admission_fence(parent, &fence)?;' 1
+require_count "$causal_recovery_prepare" '&self,' 1
+reject_fixed "$causal_recovery_prepare" '&mut self'
+require_count "$causal_recovery_prepare" \
+    'self.validate_causal_recovery_admission_fence(parent, &fence)' 1
+require_count "$causal_recovery_prepare" \
+    'return Err(CausalRecoveryFenceFailure { error, fence });' 1
+require_order "$causal_recovery_activate" \
+    'self.validate_causal_recovery_admission_fence(parent, &request.fence)' \
+    'let context = match self.infrastructure.open_child_workload('
+require_at_least "$causal_recovery_activate" \
+    'return Err(CausalRecoveryWorkloadActivationFailure {' 2
+require_count "$causal_recovery_activate" \
+    'provenance: CausalDomainWorkloadProvenance::RecoveryReplacement {' 1
+for required in \
+    'if fence.registry_instance != self.instance_id {' \
+    'if parent_identity != fence.parent || fence.scope != parent_identity.scope {' \
+    'scope.revision != fence.root_revision' \
+    'binding.binding_epoch != fence.binding_epoch' \
+    'binding.revision != fence.domain_revision' \
+    'binding.quarantine.is_some()' \
+    '!binding.fallback_running' \
+    'binding.supervisor.is_some()' \
+    'recovery.ready.is_some()' \
+    'recovery.highest_attempt != fence.attempt' \
+    'snapshot.replacement != fence.replacement' \
+    'snapshot.digest != fence.snapshot_digest' \
+    'infrastructure.revision != fence.infrastructure_scope_revision'; do
+    require_count "$causal_recovery_validate" "$required" 1
+done
+require_count "$service_task_file" '    ProvenanceMismatch,' 1
+require_count "$service_task_file" 'session.provenance()' 2
+require_count "$service_task_file" \
+    'snapshot.digest() == snapshot_digest' 1
+require_count "$service_task_file" \
+    'task.descriptor.role.infrastructure()' 3
+reject_fixed "$service_task_file" \
+    'projection.descriptor.role != infrastructure::TaskWorkRole::ServiceRequest'
 require_count "$infrastructure_child_open" 'target_domain: DomainKey,' 1
 reject_fixed "$infrastructure_child_open" 'binding_epoch'
 require_count "$infrastructure_child_apply" \
@@ -1779,6 +1898,29 @@ if [[ ${NEXUS_SAME_BOOT_SOURCE_PRIMARY_ONLY:-0} != 1 ]]; then
         /#\[derive\(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq\)\]/ {
             candidate = $0
             getline next_line
+            if (!changed && next_line ~ /pub\(crate\) struct CausalRecoveryWorkloadRequest \{/) {
+                sub(/\)\]$/, ", __cser_core::clone::Clone)]", candidate)
+                print candidate
+                print next_line
+                changed = 1
+                next
+            }
+            print candidate
+            print next_line
+            next
+        }
+        { print }
+        END { if (!changed) exit 2 }
+    ' "$runtime_causal_file" >"$work/cloneable-causal-recovery-request.rs"
+    require_mutation "$runtime_causal_file" "$work/cloneable-causal-recovery-request.rs" \
+        cloneable-causal-recovery-request
+    require_causal_facade_rejection "$work/cloneable-causal-recovery-request.rs" \
+        cloneable-causal-recovery-request
+
+    awk '
+        /#\[derive\(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq\)\]/ {
+            candidate = $0
+            getline next_line
             if (!changed && next_line ~ /pub\(crate\) struct CausalWorkloadCloseIntent \{/) {
                 sub(/\)\]$/, ", __cser_core::clone::Clone)]", candidate)
                 print candidate
@@ -1940,7 +2082,7 @@ if [[ ${NEXUS_SAME_BOOT_SOURCE_PRIMARY_ONLY:-0} != 1 ]]; then
     require_mutation "$source_file" "$work/publish-owner-expect.rs" publish-owner-expect
     require_source_rejection "$work/publish-owner-expect.rs" publish-owner-expect
 
-    [[ $mutations == 46 ]] || fail "expected 46 source mutations, observed $mutations"
+    [[ $mutations == 47 ]] || fail "expected 47 source mutations, observed $mutations"
 fi
 
-echo 'runtime filesystem same-boot source assertions: PASS checkpoint=device_flight accepted_registry=one accepted_ledger=one compatibility_syscalls=payload_only_not_cser causal_bootstrap=workload+two-phase-core causal_slot=vacant+active+closed causal_close=non-clone+failure-atomic+projected-root-finish combined_order=external+ack+workload+root exact_outer_ack_retry=true rfc0003_obligations=not_wired source_mapped=false observed=false adapter_wired=false flight=single_actor_slot_handoff actor_resident=false semantic_identity=registry_issued receipt_boundary=provider-neutral+sibling-adapter-only real_user_service_crash=true fsd_task_key=current-task-bound+951:1->951:2 replacement_construction=post-crash distinct_task_vm=true guest_admission=receipt-before-armed guest_wait_locks=none crash_cohort=filesystem_read_only stale_prepare=queued-v1+failure-atomic old_sender_current_handle=NoSupervisor reply_wakeups=1 published_error=retained ack_revoke=failure_atomic guest_write=prevalidated+infallible_frame_apply fail_stop=before_guest_resume post_terminal_allocation=false facade_companion=false polling=true irq_evidence=false smp=1 legacy_phase=false rfc0001_full_closure=false mutations=46'
+echo 'runtime filesystem same-boot source assertions: PASS checkpoint=device_flight accepted_registry=one accepted_ledger=one compatibility_syscalls=payload_only_not_cser causal_bootstrap=workload+two-phase-core causal_slot=vacant+active+closed recovery_admission=manager-snapshot+exact-revisions+linear-request causal_close=non-clone+failure-atomic+projected-root-finish combined_order=external+ack+workload+root exact_outer_ack_retry=true rfc0003_obligations=not_wired source_mapped=false observed=false adapter_wired=false flight=single_actor_slot_handoff actor_resident=false semantic_identity=registry_issued receipt_boundary=provider-neutral+sibling-adapter-only real_user_service_crash=true fsd_task_key=current-task-bound+951:1->951:2 replacement_construction=post-crash distinct_task_vm=true guest_admission=receipt-before-armed guest_wait_locks=none crash_cohort=filesystem_read_only stale_prepare=queued-v1+failure-atomic old_sender_current_handle=NoSupervisor reply_wakeups=1 published_error=retained ack_revoke=failure_atomic guest_write=prevalidated+infallible_frame_apply fail_stop=before_guest_resume post_terminal_allocation=false facade_companion=false polling=true irq_evidence=false smp=1 legacy_phase=false rfc0001_full_closure=false mutations=47'

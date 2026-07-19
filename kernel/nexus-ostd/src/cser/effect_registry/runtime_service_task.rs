@@ -12,7 +12,8 @@ extern crate alloc as __cser_alloc;
 extern crate core as __cser_core;
 
 use super::runtime_causal::{
-    CausalDomainWorkloadIdentity, CausalDomainWorkloadSession, CausalWorkloadError,
+    CausalDomainWorkloadIdentity, CausalDomainWorkloadProvenance, CausalDomainWorkloadSession,
+    CausalWorkloadError,
 };
 use super::runtime_task::CausalVmIdentity;
 use super::{DomainKey, EffectRegistry, RegistryError, TaskKey, infrastructure};
@@ -135,6 +136,7 @@ impl CausalServiceTaskSelector {
 pub(crate) enum CausalServiceTaskError {
     InvalidDescriptor,
     RecoveryUnavailable,
+    ProvenanceMismatch,
     ForeignBearerRegistry,
     ForeignSession,
     SelectorMismatch,
@@ -738,9 +740,9 @@ fn claim_crash(
 }
 
 impl EffectRegistry {
-    /// Derives the service task key from the live domain supervisor.  A
-    /// replacement role is reserved for the manager-only recovery admission
-    /// tranche and is rejected without touching either ledger for now.
+    /// Derives the service task key exclusively from the moved workload's
+    /// Registry-minted provenance. Active and recovery roles cannot be
+    /// substituted for one another by a portable descriptor.
     #[allow(clippy::result_large_err)]
     pub(crate) fn admit_causal_service_task(
         &mut self,
@@ -759,36 +761,81 @@ impl EffectRegistry {
                 });
             }
         };
-        if descriptor.role == CausalServiceTaskRole::ReplacementRecovery {
-            return Err(CausalServiceTaskAdmissionFailure {
-                error: CausalServiceTaskError::RecoveryUnavailable,
-                session,
-            });
-        }
-        let binding = match self
-            .scopes
-            .get(&identity.parent.scope)
-            .and_then(|scope| scope.domains.get(&identity.domain))
-        {
-            Some(binding) => binding,
+        let (binding, root_revision) = match self.scopes.get(&identity.parent.scope) {
+            Some(scope) => match scope.domains.get(&identity.domain) {
+                Some(binding) => (binding, scope.revision),
+                None => {
+                    return Err(CausalServiceTaskAdmissionFailure {
+                        error: CausalServiceTaskError::Workload(CausalWorkloadError::Registry(
+                            RegistryError::UnknownDomain,
+                        )),
+                        session,
+                    });
+                }
+            },
             None => {
                 return Err(CausalServiceTaskAdmissionFailure {
                     error: CausalServiceTaskError::Workload(CausalWorkloadError::Registry(
-                        RegistryError::UnknownDomain,
+                        RegistryError::UnknownScope,
                     )),
                     session,
                 });
             }
         };
-        let task = match binding.supervisor {
-            Some(task) if !binding.fallback_running && binding.quarantine.is_none() => task,
-            Some(_) => {
+        let task = match (descriptor.role, session.provenance()) {
+            (
+                CausalServiceTaskRole::ActiveService,
+                CausalDomainWorkloadProvenance::ActiveSupervisor { supervisor },
+            ) if binding.supervisor == Some(supervisor)
+                && !binding.fallback_running
+                && binding.quarantine.is_none() =>
+            {
+                supervisor
+            }
+            (
+                CausalServiceTaskRole::ReplacementRecovery,
+                CausalDomainWorkloadProvenance::RecoveryReplacement {
+                    replacement,
+                    attempt,
+                    snapshot_digest,
+                },
+            ) if binding.quarantine.is_none()
+                && binding.fallback_running
+                && binding.supervisor.is_none()
+                && binding.recovery.as_ref().is_some_and(|recovery| {
+                    recovery.ready.is_none()
+                        && recovery.highest_attempt == attempt
+                        && recovery.snapshot.as_ref().is_some_and(|snapshot| {
+                            snapshot.replacement == replacement
+                                && snapshot.attempt == attempt
+                                && snapshot.digest() == snapshot_digest
+                                && snapshot.root_revision == root_revision
+                                && snapshot.domain_revision == binding.revision
+                        })
+                }) =>
+            {
+                replacement
+            }
+            (
+                CausalServiceTaskRole::ReplacementRecovery,
+                CausalDomainWorkloadProvenance::ActiveSupervisor { .. },
+            ) => {
                 return Err(CausalServiceTaskAdmissionFailure {
-                    error: CausalServiceTaskError::Registry(RegistryError::NoSupervisor),
+                    error: CausalServiceTaskError::RecoveryUnavailable,
                     session,
                 });
             }
-            None => {
+            (
+                CausalServiceTaskRole::ActiveService,
+                CausalDomainWorkloadProvenance::RecoveryReplacement { .. },
+            ) => {
+                return Err(CausalServiceTaskAdmissionFailure {
+                    error: CausalServiceTaskError::ProvenanceMismatch,
+                    session,
+                });
+            }
+            (CausalServiceTaskRole::ActiveService, _)
+            | (CausalServiceTaskRole::ReplacementRecovery, _) => {
                 return Err(CausalServiceTaskAdmissionFailure {
                     error: CausalServiceTaskError::Registry(RegistryError::NoSupervisor),
                     session,
@@ -1203,7 +1250,12 @@ impl EffectRegistry {
         task: &CausalAdmittedServiceTask,
         selector: CausalServiceTaskSelector,
     ) -> Result<(), CausalServiceTaskError> {
-        self.validate_service_task_identity(task.identity, &task.session, selector)?;
+        self.validate_service_task_identity(
+            task.identity,
+            &task.session,
+            task.descriptor,
+            selector,
+        )?;
         if selector != task.selector {
             return Err(CausalServiceTaskError::SelectorMismatch);
         }
@@ -1212,7 +1264,7 @@ impl EffectRegistry {
             .query_task(&task.session.context, selector.work_id, selector.generation)
             .map_err(CausalServiceTaskError::Infrastructure)?;
         if projection.descriptor.task != selector.task
-            || projection.descriptor.role != infrastructure::TaskWorkRole::ServiceRequest
+            || projection.descriptor.role != task.descriptor.role.infrastructure()
             || projection.descriptor.vm.map(|vm| vm.generation()) != Some(selector.vm_generation)
             || projection.state != infrastructure::TaskRecoveryState::Admitted
         {
@@ -1226,7 +1278,12 @@ impl EffectRegistry {
         task: &CausalReservedServiceTask,
         selector: CausalServiceTaskSelector,
     ) -> Result<(), CausalServiceTaskError> {
-        self.validate_service_task_identity(task.identity, &task.session, selector)?;
+        self.validate_service_task_identity(
+            task.identity,
+            &task.session,
+            task.descriptor,
+            selector,
+        )?;
         if selector != task.selector {
             return Err(CausalServiceTaskError::SelectorMismatch);
         }
@@ -1235,7 +1292,7 @@ impl EffectRegistry {
             .query_task(&task.session.context, selector.work_id, selector.generation)
             .map_err(CausalServiceTaskError::Infrastructure)?;
         if projection.descriptor.task != selector.task
-            || projection.descriptor.role != infrastructure::TaskWorkRole::ServiceRequest
+            || projection.descriptor.role != task.descriptor.role.infrastructure()
             || projection.state != infrastructure::TaskRecoveryState::Admitted
             || projection.live_children != 1
         {
@@ -1249,7 +1306,12 @@ impl EffectRegistry {
         task: &CausalArmedServiceTask,
         selector: CausalServiceTaskSelector,
     ) -> Result<(), CausalServiceTaskError> {
-        self.validate_service_task_identity(task.identity, &task.session, selector)?;
+        self.validate_service_task_identity(
+            task.identity,
+            &task.session,
+            task.descriptor,
+            selector,
+        )?;
         if selector != task.selector {
             return Err(CausalServiceTaskError::SelectorMismatch);
         }
@@ -1258,7 +1320,7 @@ impl EffectRegistry {
             .query_task(&task.session.context, selector.work_id, selector.generation)
             .map_err(CausalServiceTaskError::Infrastructure)?;
         if projection.descriptor.task != selector.task
-            || projection.descriptor.role != infrastructure::TaskWorkRole::ServiceRequest
+            || projection.descriptor.role != task.descriptor.role.infrastructure()
             || projection.state != infrastructure::TaskRecoveryState::Entered
             || projection.live_children != 1
         {
@@ -1271,6 +1333,7 @@ impl EffectRegistry {
         &self,
         identity: CausalDomainWorkloadIdentity,
         session: &CausalDomainWorkloadSession,
+        descriptor: CausalServiceTaskDescriptor,
         selector: CausalServiceTaskSelector,
     ) -> Result<(), CausalServiceTaskError> {
         if identity.parent.registry_instance != self.instance_id {
@@ -1282,6 +1345,23 @@ impl EffectRegistry {
         if selector.service_domain != identity.domain
             || selector.binding_epoch != identity.binding_epoch
         {
+            return Err(CausalServiceTaskError::SelectorMismatch);
+        }
+        let expected_task = match (descriptor.role, session.provenance()) {
+            (
+                CausalServiceTaskRole::ActiveService,
+                CausalDomainWorkloadProvenance::ActiveSupervisor { supervisor },
+            ) => supervisor,
+            (
+                CausalServiceTaskRole::ReplacementRecovery,
+                CausalDomainWorkloadProvenance::RecoveryReplacement { replacement, .. },
+            ) => replacement,
+            (CausalServiceTaskRole::ReplacementRecovery, _)
+            | (CausalServiceTaskRole::ActiveService, _) => {
+                return Err(CausalServiceTaskError::ProvenanceMismatch);
+            }
+        };
+        if selector.task != expected_task {
             return Err(CausalServiceTaskError::SelectorMismatch);
         }
         self.verify_causal_domain_workload_session(session)
