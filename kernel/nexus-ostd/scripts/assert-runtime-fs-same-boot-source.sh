@@ -6,13 +6,14 @@ script_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 source_file=${1:-$script_root/src/personality/linux_fs.rs}
 lib_file=${2:-$script_root/src/lib.rs}
 device_flight_file=${3:-$script_root/src/cser/device_flight.rs}
+runtime_causal_file=${4:-$script_root/src/cser/effect_registry/runtime_causal.rs}
 
 fail() {
     echo "runtime filesystem same-boot source assertion: FAIL: $*" >&2
     exit 1
 }
 
-for input in "$source_file" "$lib_file" "$device_flight_file"; do
+for input in "$source_file" "$lib_file" "$device_flight_file" "$runtime_causal_file"; do
     [[ -f $input && ! -L $input ]] ||
         fail "implementation source is not a regular non-symlink file: $input"
 done
@@ -153,6 +154,7 @@ require_not_feature_guarded_if_present() {
 
 fs_state="$work/fs-state.rs"
 flight="$work/device-flight.rs"
+causal_slot="$work/causal-adapter-slot.rs"
 runtime="$work/production-runtime.rs"
 runtime_impl="$work/production-runtime-impl.rs"
 dispatch="$work/same-boot-dispatch.rs"
@@ -181,11 +183,16 @@ guest_loop="$work/guest-loop.rs"
 feature_root="$work/feature-root.rs"
 semantic_close="$work/semantic-close.rs"
 prepared_guest_write="$work/prepared-guest-write.rs"
+causal_session="$work/causal-session.rs"
+causal_activation="$work/causal-activation.rs"
+causal_limits="$work/causal-limits.rs"
 
 extract_between "$source_file" 'struct FsState {' \
     'struct FsClosureWork {' "$fs_state"
 extract_between "$source_file" 'enum FsDeviceFlight {' \
-    'struct ProductionReadRuntime {' "$flight"
+    'struct FsCausalAdapterSlot {' "$flight"
+extract_between "$source_file" 'struct FsCausalAdapterSlot {' \
+    'struct ProductionReadRuntime {' "$causal_slot"
 extract_between "$source_file" 'struct ProductionReadRuntime {' \
     'impl ProductionReadRuntime {' "$runtime"
 extract_between "$source_file" 'impl ProductionReadRuntime {' \
@@ -247,14 +254,46 @@ extract_from "$device_flight_file" \
     "$semantic_close"
 extract_between "$source_file" 'struct PreparedGuestWrite {' \
     'fn same_boot_credit' "$prepared_guest_write"
+extract_between "$runtime_causal_file" \
+    'pub(crate) struct CausalWorkloadSession {' \
+    'pub(crate) enum CausalWorkloadError {' "$causal_session"
+extract_between "$runtime_causal_file" \
+    'pub(crate) struct CausalActivationRequest {' \
+    'impl EffectRegistry {' "$causal_activation"
+extract_between "$source_file" 'const fn same_boot_causal_limits()' \
+    'fn new_same_boot_registry()' "$causal_limits"
 
 # RFC 0001 accepts one root, one production Registry, and one ledger. The
 # legacy in-memory filesystem Registry may remain in the non-facade build, but
 # it may not be instantiated in the accepted same-boot build.
 require_count "$runtime" 'registry: EffectRegistry,' 1
+require_count "$runtime" 'causal: FsCausalAdapterSlot,' 1
 require_count "$runtime" 'flight: FsDeviceFlight,' 1
 require_count "$runtime" 'next_flight_cookie: NonZeroU64,' 1
 require_count "$runtime_impl" 'registry: new_same_boot_registry(),' 1
+require_count "$runtime_impl" 'causal: FsCausalAdapterSlot::new(),' 1
+reject_fixed "$flight" 'CausalWorkloadSession'
+require_regex_count "$causal_slot" '^[[:space:]]+Vacant,$' 1
+require_regex_count "$causal_slot" \
+    '^[[:space:]]+Active\(CausalWorkloadSession\),$' 1
+require_regex_count "$causal_slot" \
+    '^[[:space:]]+Closed\(CausalWorkloadIdentity\),$' 1
+require_count "$causal_slot" 'struct FsCausalActivationReservation' 1
+reject_regex "$causal_slot" '(^|[^_])assert!\('
+require_count "$causal_session" 'context: infrastructure::WorkloadContext,' 1
+causal_session_line=$(line_of_unique "$runtime_causal_file" \
+    'pub(crate) struct CausalWorkloadSession {')
+causal_session_derive=$(sed -n "$((causal_session_line - 1))p" \
+    "$runtime_causal_file")
+[[ $causal_session_derive == \
+    '#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]' ]] ||
+    fail 'CausalWorkloadSession gained Clone/Copy or lost its frozen derive set'
+require_count "$causal_activation" 'request: CausalActivationRequest,' 1
+require_count "$causal_activation" 'into_input(self) -> CausalActivationRequest' 1
+require_count "$causal_activation" \
+    'into_parts(self) -> (CausalWorkloadError, CausalActivationRequest)' 1
+require_count "$causal_limits" \
+    'CausalWorkloadLimits::new(8, 2, 8, 2, 2, 8, 4, 4, 4, 12, 12, 128)' 1
 require_not_feature_guarded_if_present "$fs_state" 'effects: EffectRegistry,'
 require_not_feature_guarded_if_present "$source_file" \
     'effects: new_production_registry(),'
@@ -341,15 +380,32 @@ reject_fixed "$semantic_close" 'publish(&'
 require_count "$capture" 'runtime.registry.register_derived(' 1
 require_count "$capture" 'task: GUEST,' 1
 require_count "$capture" 'domain: PERSONALITY_DOMAIN,' 1
+require_count "$capture" '.prepare(PERSONALITY_V1, syscall.handle)' 1
+require_count "$capture" 'prepare_causal_workload_activation(' 1
+require_count "$capture" 'activate_causal_workload(activation)' 1
+require_count "$capture" 'reservation.install(session);' 1
+require_order "$capture" \
+    'runtime.registry.register_derived(' \
+    '.prepare(PERSONALITY_V1, syscall.handle)' \
+    'prepare_causal_workload_activation(' \
+    'activate_causal_workload(activation)' \
+    'reservation.install(session);' \
+    'syscall: syscall.clone(),'
+require_count "$capture" \
+    'return Err(DispatchOutcome::retained(identity.request_id()));' 1
+reject_fixed "$capture" \
+    'stage=causal_slot_not_vacant error={:?}'
 require_count "$source_file" 'QueuedUnannounced,' 1
 require_count "$source_file" 'self.phase = FsServicePhase::QueuedUnannounced;' 1
 require_count "$source_file" 'fn arm_queued(&mut self) {' 1
 require_count "$service_next" 'if service.phase != FsServicePhase::Queued {' 1
 require_count "$guest_wait" '.enqueue_unannounced(descriptor, cookie, waker);' 1
+require_count "$guest_wait" 'self.require_same_boot_causal_session(cookie)' 1
 require_count "$guest_wait" 'self.service.lock().arm_queued();' 1
 require_count "$guest_wait" 'waiter.wait();' 1
 require_count "$guest_wait" 'self.service.lock().take_outcome()' 1
 require_order "$guest_wait" \
+    'self.require_same_boot_causal_session(cookie)' \
     '.enqueue_unannounced(descriptor, cookie, waker);' \
     'all_locks_released=true reply_wakeups=0' \
     'self.service.lock().arm_queued();' \
@@ -560,6 +616,12 @@ reject_fixed "$generic_dispatch" 'EffectRegistry::new()'
 # This witness is polling-only. Facade interrupt preparation/tokens are useful
 # substrate, but they are not evidence that an OSTD IRQ actor delivered work.
 require_count "$source_file" 'prepare_read_sector0(&mut root)' 1
+require_count "$dispatch" \
+    'runtime.verify_causal_session(cookie, captured.identity.effect())' 1
+require_order "$dispatch" \
+    'runtime.verify_causal_session(cookie, captured.identity.effect())' \
+    'prepare_read_sector0(&mut root)'
+reject_fixed "$dispatch" 'close_or_verify_causal_terminal'
 reject_fixed "$dispatch" 'prepare_read_sector0_irq('
 reject_fixed "$dispatch" '.ack_interrupt('
 reject_fixed "$dispatch" '.complete_after_interrupt('
@@ -594,6 +656,12 @@ reject_fixed "$source_file" '.poll_completion'
 # bytes and prevents the guest from resuming.
 require_count "$production_publish" \
     '.acknowledge_publication_and_revoke_complete_with_apply(' 1
+require_count "$production_publish" \
+    'runtime.close_or_verify_causal_terminal(causal_cookie, root_effect)' 1
+require_count "$production_publish" \
+    '.prepare_terminal_clear(causal_cookie, root_effect)' 1
+require_count "$production_publish" \
+    'runtime.causal.apply_terminal_clear(causal_clear);' 1
 reject_fixed "$production_publish" '.acknowledge_publication('
 reject_fixed "$production_publish" '.revoke_complete('
 reject_fixed "$production_publish" 'self.apply_publication(&outcome.publication)'
@@ -609,7 +677,9 @@ require_order "$production_publish" \
     'let preempt_guard = disable_preempt();' \
     'PreparedGuestWrite::prepare(&mut cursor, *address, *bytes, *len)' \
     'let mut runtime = self.production.lock();' \
-    'let selection = match &runtime.flight {' \
+    'let (selection, root_effect) = match &runtime.flight {' \
+    'runtime.close_or_verify_causal_terminal(causal_cookie, root_effect)' \
+    '.prepare_terminal_clear(causal_cookie, root_effect)' \
     '.acknowledge_publication_and_revoke_complete_with_apply(' \
     'let _mapping_lock = mapping_cursor.as_ref();' \
     'prepared_publication.apply();' \
@@ -617,7 +687,8 @@ require_order "$production_publish" \
     'drop(mapping_cursor);' \
     'drop(preempt_guard);' \
     'let flight = runtime.take_flight();' \
-    'runtime.put_flight(FsDeviceFlight::Complete { root, device });'
+    'runtime.put_flight(FsDeviceFlight::Complete { root, device });' \
+    'runtime.causal.apply_terminal_clear(causal_clear);'
 
 # The production guest write is prepared against one locked, writable RAM
 # mapping and owns a frame reference before Registry validation. Its apply path
@@ -688,22 +759,29 @@ if [[ ${NEXUS_SAME_BOOT_SOURCE_PRIMARY_ONLY:-0} != 1 ]]; then
 
     require_source_rejection() {
         if NEXUS_SAME_BOOT_SOURCE_PRIMARY_ONLY=1 bash "$0" "$1" "$lib_file" \
-            "$device_flight_file" >/dev/null 2>&1; then
+            "$device_flight_file" "$runtime_causal_file" >/dev/null 2>&1; then
             fail "source gate accepted mutation: $2"
         fi
     }
 
     require_lib_rejection() {
         if NEXUS_SAME_BOOT_SOURCE_PRIMARY_ONLY=1 bash "$0" "$source_file" "$1" \
-            "$device_flight_file" >/dev/null 2>&1; then
+            "$device_flight_file" "$runtime_causal_file" >/dev/null 2>&1; then
             fail "source gate accepted lib mutation: $2"
         fi
     }
 
     require_semantic_rejection() {
         if NEXUS_SAME_BOOT_SOURCE_PRIMARY_ONLY=1 bash "$0" "$source_file" "$lib_file" \
-            "$1" >/dev/null 2>&1; then
+            "$1" "$runtime_causal_file" >/dev/null 2>&1; then
             fail "source gate accepted semantic mutation: $2"
+        fi
+    }
+
+    require_causal_facade_rejection() {
+        if NEXUS_SAME_BOOT_SOURCE_PRIMARY_ONLY=1 bash "$0" "$source_file" "$lib_file" \
+            "$device_flight_file" "$1" >/dev/null 2>&1; then
+            fail "source gate accepted causal facade mutation: $2"
         fi
     }
 
@@ -984,7 +1062,75 @@ if [[ ${NEXUS_SAME_BOOT_SOURCE_PRIMARY_ONLY:-0} != 1 ]]; then
     require_source_rejection "$work/stale-fsd-v2-task-key.rs" \
         stale-fsd-v2-task-key
 
-    [[ $mutations == 26 ]] || fail "expected 26 source mutations, observed $mutations"
+    cp "$source_file" "$work/missing-causal-activation.rs"
+    sed -i \
+        '0,/registry\.activate_causal_workload(activation)/s//registry.skip_causal_workload_activation(activation)/' \
+        "$work/missing-causal-activation.rs"
+    require_mutation "$source_file" "$work/missing-causal-activation.rs" \
+        missing-causal-activation
+    require_source_rejection "$work/missing-causal-activation.rs" \
+        missing-causal-activation
+
+    cp "$source_file" "$work/missing-causal-device-check.rs"
+    sed -i \
+        '0,/runtime\.verify_causal_session(cookie, captured\.identity\.effect())/s//runtime.skip_causal_session_check(cookie, captured.identity.effect())/' \
+        "$work/missing-causal-device-check.rs"
+    require_mutation "$source_file" "$work/missing-causal-device-check.rs" \
+        missing-causal-device-check
+    require_source_rejection "$work/missing-causal-device-check.rs" \
+        missing-causal-device-check
+
+    awk '
+        { print }
+        /enum FsDeviceFlight \{/ { flight = 1 }
+        flight && !changed && /^[[:space:]]*Captured \{/ {
+            print "        causal: CausalWorkloadSession,"
+            changed = 1
+        }
+        END { if (!changed) exit 2 }
+    ' "$source_file" >"$work/causal-session-in-device-flight.rs"
+    require_mutation "$source_file" "$work/causal-session-in-device-flight.rs" \
+        causal-session-in-device-flight
+    require_source_rejection "$work/causal-session-in-device-flight.rs" \
+        causal-session-in-device-flight
+
+    cp "$source_file" "$work/causal-busy-zero-sentinel.rs"
+    sed -i \
+        '0,/DispatchOutcome::retained(identity\.request_id())/s//DispatchOutcome::retained(0)/' \
+        "$work/causal-busy-zero-sentinel.rs"
+    require_mutation "$source_file" "$work/causal-busy-zero-sentinel.rs" \
+        causal-busy-zero-sentinel
+    require_source_rejection "$work/causal-busy-zero-sentinel.rs" \
+        causal-busy-zero-sentinel
+
+    awk '
+        /#\[derive\(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq\)\]/ {
+            candidate = $0
+            getline next_line
+            if (!changed && next_line ~ /pub\(crate\) struct CausalWorkloadSession \{/) {
+                sub(/\)\]$/, ", __cser_core::clone::Clone)]", candidate)
+                print candidate
+                print next_line
+                changed = 1
+                next
+            }
+            print candidate
+            print next_line
+            next
+        }
+        {
+            print
+        }
+        END {
+            if (!changed) exit 2
+        }
+    ' "$runtime_causal_file" >"$work/cloneable-causal-session.rs"
+    require_mutation "$runtime_causal_file" "$work/cloneable-causal-session.rs" \
+        cloneable-causal-session
+    require_causal_facade_rejection "$work/cloneable-causal-session.rs" \
+        cloneable-causal-session
+
+    [[ $mutations == 31 ]] || fail "expected 31 source mutations, observed $mutations"
 fi
 
-echo 'runtime filesystem same-boot source assertions: PASS checkpoint=device_flight accepted_registry=one accepted_ledger=one compatibility_syscalls=payload_only_not_cser flight=single_actor_slot_handoff actor_resident=false semantic_identity=registry_issued real_user_service_crash=true fsd_task_key=current-task-bound+951:1->951:2 replacement_construction=post-crash distinct_task_vm=true guest_admission=receipt-before-armed guest_wait_locks=none crash_cohort=filesystem_read_only stale_prepare=queued-v1+failure-atomic old_sender_current_handle=NoSupervisor reply_wakeups=1 published_error=retained ack_revoke=failure_atomic guest_write=prevalidated+infallible_frame_apply fail_stop=before_guest_resume post_terminal_allocation=false facade_companion=false polling=true irq_evidence=false smp=1 legacy_phase=false rfc0001_full_closure=false mutations=26'
+echo 'runtime filesystem same-boot source assertions: PASS checkpoint=device_flight accepted_registry=one accepted_ledger=one compatibility_syscalls=payload_only_not_cser causal_bootstrap=workload_only causal_slot=vacant+active+closed exact_outer_ack_retry=true rfc0003_obligations=not_wired source_mapped=false observed=false flight=single_actor_slot_handoff actor_resident=false semantic_identity=registry_issued real_user_service_crash=true fsd_task_key=current-task-bound+951:1->951:2 replacement_construction=post-crash distinct_task_vm=true guest_admission=receipt-before-armed guest_wait_locks=none crash_cohort=filesystem_read_only stale_prepare=queued-v1+failure-atomic old_sender_current_handle=NoSupervisor reply_wakeups=1 published_error=retained ack_revoke=failure_atomic guest_write=prevalidated+infallible_frame_apply fail_stop=before_guest_resume post_terminal_allocation=false facade_companion=false polling=true irq_evidence=false smp=1 legacy_phase=false rfc0001_full_closure=false mutations=31'

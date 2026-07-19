@@ -79,6 +79,10 @@ use crate::device_flight::{
 use crate::effect_registry::{CommitOutcome, CommitReceipt};
 
 #[cfg(feature = "virtio-cser-facade")]
+use crate::effect_registry::runtime_causal::{
+    CausalWorkloadError, CausalWorkloadIdentity, CausalWorkloadLimits, CausalWorkloadSession,
+};
+#[cfg(feature = "virtio-cser-facade")]
 use crate::effect_registry::{
     DeviceBatchEnrollmentReceipt, DeviceClosureReceipt, DeviceClosureResult, DeviceCohortParent,
     DeviceDerivedCohortEntry, DeviceEnvelope, DeviceIotlbTicket, DeviceIotlbTombstone,
@@ -584,9 +588,192 @@ enum FsDeviceFlight {
     Transitioning,
 }
 
+/// Filesystem-owned adapter slot for the one opaque causal-workload bearer.
+///
+/// This slot is deliberately independent of [`FsDeviceFlight`]: device
+/// recovery may move hardware authority through several linear states, while
+/// causal admission remains anchored to the original business root.
+#[cfg(feature = "virtio-cser-facade")]
+struct FsCausalAdapterSlot {
+    state: FsCausalAdapterState,
+}
+
+#[cfg(feature = "virtio-cser-facade")]
+enum FsCausalAdapterState {
+    Vacant,
+    Active(CausalWorkloadSession),
+    Closed(CausalWorkloadIdentity),
+}
+
+#[cfg(feature = "virtio-cser-facade")]
+struct FsCausalActivationReservation<'a> {
+    state: &'a mut FsCausalAdapterState,
+}
+
+#[cfg(feature = "virtio-cser-facade")]
+impl FsCausalActivationReservation<'_> {
+    fn install(self, session: CausalWorkloadSession) {
+        *self.state = FsCausalAdapterState::Active(session);
+    }
+}
+
+#[cfg(feature = "virtio-cser-facade")]
+#[derive(Clone, Copy)]
+struct FsCausalTerminalClear {
+    identity: CausalWorkloadIdentity,
+}
+
+#[cfg(feature = "virtio-cser-facade")]
+#[derive(Debug, Eq, PartialEq)]
+enum FsCausalAdapterError {
+    AlreadyActive {
+        identity: CausalWorkloadIdentity,
+    },
+    MissingActive,
+    FlightMismatch {
+        expected_cookie: u64,
+    },
+    IdentityMismatch {
+        expected_cookie: u64,
+        observed_request: u64,
+        expected_root: EffectKey,
+        observed_root: EffectKey,
+    },
+    Registry(CausalWorkloadError),
+}
+
+#[cfg(feature = "virtio-cser-facade")]
+impl FsCausalAdapterSlot {
+    const fn new() -> Self {
+        Self {
+            state: FsCausalAdapterState::Vacant,
+        }
+    }
+
+    fn require_vacant(&self) -> Result<(), CausalWorkloadIdentity> {
+        match &self.state {
+            FsCausalAdapterState::Vacant => Ok(()),
+            FsCausalAdapterState::Active(session) => Err(session.identity()),
+            FsCausalAdapterState::Closed(identity) => Err(*identity),
+        }
+    }
+
+    /// Borrows the proven-vacant adapter state until activation either fails
+    /// or installs its opaque bearer. This makes install infallible without a
+    /// production assertion or an observable half-activated slot.
+    fn reserve_activation(
+        &mut self,
+    ) -> Result<FsCausalActivationReservation<'_>, FsCausalAdapterError> {
+        self.require_vacant()
+            .map_err(|identity| FsCausalAdapterError::AlreadyActive { identity })?;
+        Ok(FsCausalActivationReservation {
+            state: &mut self.state,
+        })
+    }
+
+    fn verify_active(
+        &self,
+        registry: &EffectRegistry,
+        cookie: NonZeroU64,
+        root_effect: EffectKey,
+    ) -> Result<CausalWorkloadIdentity, FsCausalAdapterError> {
+        let FsCausalAdapterState::Active(session) = &self.state else {
+            return Err(FsCausalAdapterError::MissingActive);
+        };
+        let identity = registry
+            .verify_causal_workload_session(session)
+            .map_err(FsCausalAdapterError::Registry)?;
+        if identity.request_id() != cookie.get() || identity.root_effect() != root_effect {
+            return Err(FsCausalAdapterError::IdentityMismatch {
+                expected_cookie: cookie.get(),
+                observed_request: identity.request_id(),
+                expected_root: root_effect,
+                observed_root: identity.root_effect(),
+            });
+        }
+        Ok(identity)
+    }
+
+    /// Consumes the opaque bearer only at the final publication boundary. A
+    /// failed Registry close restores that same non-Copy bearer; a successful
+    /// close installs a terminal identity so outer-ack retries are exact.
+    fn close_or_verify_terminal(
+        &mut self,
+        registry: &mut EffectRegistry,
+        cookie: NonZeroU64,
+        root_effect: EffectKey,
+    ) -> Result<CausalWorkloadIdentity, FsCausalAdapterError> {
+        if let FsCausalAdapterState::Closed(identity) = self.state {
+            return validate_causal_slot_identity(identity, cookie, root_effect);
+        }
+        self.verify_active(registry, cookie, root_effect)?;
+        let FsCausalAdapterState::Active(session) =
+            core::mem::replace(&mut self.state, FsCausalAdapterState::Vacant)
+        else {
+            return Err(FsCausalAdapterError::MissingActive);
+        };
+        match registry.close_causal_workload(session) {
+            Ok(identity) => {
+                self.state = FsCausalAdapterState::Closed(identity);
+                Ok(identity)
+            }
+            Err(failure) => {
+                let error = failure.error().clone();
+                self.state = FsCausalAdapterState::Active(failure.into_session());
+                Err(FsCausalAdapterError::Registry(error))
+            }
+        }
+    }
+
+    fn prepare_terminal_clear(
+        &self,
+        cookie: NonZeroU64,
+        root_effect: EffectKey,
+    ) -> Result<FsCausalTerminalClear, FsCausalAdapterError> {
+        let FsCausalAdapterState::Closed(identity) = self.state else {
+            return Err(FsCausalAdapterError::MissingActive);
+        };
+        validate_causal_slot_identity(identity, cookie, root_effect)?;
+        Ok(FsCausalTerminalClear { identity })
+    }
+
+    /// Applies a prevalidated clear after outer publication/revoke completion
+    /// succeeded under the same runtime lock.
+    fn apply_terminal_clear(&mut self, clear: FsCausalTerminalClear) {
+        debug_assert!(matches!(
+            self.state,
+            FsCausalAdapterState::Closed(identity) if identity == clear.identity
+        ));
+        self.state = FsCausalAdapterState::Vacant;
+    }
+
+    const fn is_vacant(&self) -> bool {
+        matches!(self.state, FsCausalAdapterState::Vacant)
+    }
+}
+
+#[cfg(feature = "virtio-cser-facade")]
+fn validate_causal_slot_identity(
+    identity: CausalWorkloadIdentity,
+    cookie: NonZeroU64,
+    root_effect: EffectKey,
+) -> Result<CausalWorkloadIdentity, FsCausalAdapterError> {
+    if identity.request_id() != cookie.get() || identity.root_effect() != root_effect {
+        Err(FsCausalAdapterError::IdentityMismatch {
+            expected_cookie: cookie.get(),
+            observed_request: identity.request_id(),
+            expected_root: root_effect,
+            observed_root: identity.root_effect(),
+        })
+    } else {
+        Ok(identity)
+    }
+}
+
 #[cfg(feature = "virtio-cser-facade")]
 struct ProductionReadRuntime {
     registry: EffectRegistry,
+    causal: FsCausalAdapterSlot,
     flight: FsDeviceFlight,
     next_flight_cookie: NonZeroU64,
     registered_effects: usize,
@@ -605,6 +792,7 @@ impl ProductionReadRuntime {
         let device = ProductionDevice::for_owned_device(&mut root);
         Self {
             registry: new_same_boot_registry(),
+            causal: FsCausalAdapterSlot::new(),
             flight: FsDeviceFlight::Ready { root, device },
             next_flight_cookie: NonZeroU64::MIN,
             registered_effects: 0,
@@ -632,6 +820,26 @@ impl ProductionReadRuntime {
     fn put_flight(&mut self, flight: FsDeviceFlight) {
         debug_assert!(matches!(self.flight, FsDeviceFlight::Transitioning));
         self.flight = flight;
+    }
+
+    fn verify_causal_session(
+        &self,
+        cookie: NonZeroU64,
+        root_effect: EffectKey,
+    ) -> Result<CausalWorkloadIdentity, FsCausalAdapterError> {
+        self.causal
+            .verify_active(&self.registry, cookie, root_effect)
+    }
+
+    fn close_or_verify_causal_terminal(
+        &mut self,
+        cookie: NonZeroU64,
+        root_effect: EffectKey,
+    ) -> Result<CausalWorkloadIdentity, FsCausalAdapterError> {
+        let Self {
+            registry, causal, ..
+        } = self;
+        causal.close_or_verify_terminal(registry, cookie, root_effect)
     }
 
     fn retain_current(&mut self, stage: &'static str) -> u64 {
@@ -845,6 +1053,7 @@ impl ProductionReadRuntime {
 
     fn assert_complete(&self) {
         assert!(matches!(self.flight, FsDeviceFlight::Complete { .. }));
+        assert!(self.causal.is_vacant());
         let scope = self.registry.scope_projection(SCOPE).unwrap();
         assert_eq!(scope.phase, ScopePhase::Revoked);
         assert_eq!(scope.live_effects, 0);
@@ -921,6 +1130,21 @@ fn new_production_registry() -> EffectRegistry {
         effects.add_domain(SCOPE, config).unwrap();
     }
     effects
+}
+
+#[cfg(feature = "virtio-cser-facade")]
+const fn same_boot_causal_limits() -> CausalWorkloadLimits {
+    // Bounded capacity is reserved for the seven RFC 0003 tranches: task
+    // admission; service plus delayed command; guest continuation; guest
+    // reply; deadline/retry; request-derived fault; and device preparation
+    // with its queue/page/DMA owners. Four retained device attempts reserve
+    // four queue owners and three pages/mappings each. Eight task/delayed/
+    // deadline slots cover v1/v2 service work, poll/ready/stop, reset retry,
+    // IOTLB retry, and reply closure without reusing terminal slots. Four
+    // fault generations bound repeated replacement crashes. This bootstrap
+    // does not yet create those obligation records and therefore is not
+    // source-mapped or observed causal-coverage evidence for them.
+    CausalWorkloadLimits::new(8, 2, 8, 2, 2, 8, 4, 4, 4, 12, 12, 128)
 }
 
 #[cfg(feature = "virtio-cser-facade")]
@@ -1900,6 +2124,27 @@ struct FsScenario {
 
 impl FsScenario {
     #[cfg(feature = "virtio-cser-facade")]
+    fn require_same_boot_causal_session(
+        &self,
+        cookie: NonZeroU64,
+    ) -> Result<CausalWorkloadIdentity, FsCausalAdapterError> {
+        let runtime = self.production.lock();
+        let root_effect = match &runtime.flight {
+            FsDeviceFlight::Captured {
+                cookie: captured_cookie,
+                syscall,
+                ..
+            } if *captured_cookie == cookie => syscall.identity.effect(),
+            _ => {
+                return Err(FsCausalAdapterError::FlightMismatch {
+                    expected_cookie: cookie.get(),
+                });
+            }
+        };
+        runtime.verify_causal_session(cookie, root_effect)
+    }
+
+    #[cfg(feature = "virtio-cser-facade")]
     fn retain_current_flight(&self, stage: &'static str) -> DispatchOutcome {
         let cookie = {
             let mut runtime = self.production.lock();
@@ -2407,6 +2652,20 @@ impl FsScenario {
                     ));
                 }
             };
+            if let Err(identity) = runtime.causal.require_vacant() {
+                // Busy admission does not consume or relabel either owner.
+                // The Ready hardware flight and exact existing causal identity
+                // remain independently queryable for recovery.
+                runtime.put_flight(FsDeviceFlight::Ready { root, device });
+                let error = FsCausalAdapterError::AlreadyActive { identity };
+                println!(
+                    "LINUX_FS_SAME_BOOT Retained stage=causal_slot_not_vacant request={} root_effect={} error={:?}",
+                    identity.request_id(),
+                    identity.root_effect().id(),
+                    error,
+                );
+                return Err(DispatchOutcome::retained(identity.request_id()));
+            }
             let cookie = match runtime.allocate_flight_cookie() {
                 Ok(cookie) => cookie,
                 Err(error) => {
@@ -2463,6 +2722,74 @@ impl FsScenario {
                 ));
             }
             runtime.registered_effects = 1;
+            let activation = match runtime.registry.prepare_causal_workload_activation(
+                syscall.handle,
+                cookie.get(),
+                1,
+                same_boot_causal_limits(),
+            ) {
+                Ok(activation) => activation,
+                Err(error) => {
+                    runtime.put_flight(FsDeviceFlight::Captured {
+                        cookie,
+                        root,
+                        device,
+                        syscall,
+                    });
+                    let retained = runtime.retain_current("causal_activation_prepare");
+                    println!(
+                        "LINUX_FS_SAME_BOOT Retained stage=causal_activation_prepare error={:?}",
+                        error
+                    );
+                    return Err(DispatchOutcome::retained(retained));
+                }
+            };
+            let activation_result = {
+                let ProductionReadRuntime {
+                    registry, causal, ..
+                } = &mut *runtime;
+                match causal.reserve_activation() {
+                    Ok(reservation) => match registry.activate_causal_workload(activation) {
+                        Ok(session) => {
+                            reservation.install(session);
+                            Ok(())
+                        }
+                        Err(failure) => {
+                            let (error, _exact_activation) = failure.into_parts();
+                            Err(FsCausalAdapterError::Registry(error))
+                        }
+                    },
+                    Err(error) => Err(error),
+                }
+            };
+            if let Err(error) = activation_result {
+                runtime.put_flight(FsDeviceFlight::Captured {
+                    cookie,
+                    root,
+                    device,
+                    syscall,
+                });
+                let retained = runtime.retain_current("causal_activation_install");
+                println!(
+                    "LINUX_FS_SAME_BOOT Retained stage=causal_activation_install error={:?}",
+                    error
+                );
+                return Err(DispatchOutcome::retained(retained));
+            }
+            if let Err(error) = runtime.verify_causal_session(cookie, syscall.identity.effect()) {
+                runtime.put_flight(FsDeviceFlight::Captured {
+                    cookie,
+                    root,
+                    device,
+                    syscall,
+                });
+                let retained = runtime.retain_current("causal_activation_verify");
+                println!(
+                    "LINUX_FS_SAME_BOOT Retained stage=causal_activation_verify error={:?}",
+                    error
+                );
+                return Err(DispatchOutcome::retained(retained));
+            }
             runtime.put_flight(FsDeviceFlight::Captured {
                 cookie,
                 root,
@@ -2491,6 +2818,13 @@ impl FsScenario {
             Ok(cookie) => cookie,
             Err(outcome) => return outcome,
         };
+        if let Err(error) = self.require_same_boot_causal_session(cookie) {
+            println!(
+                "LINUX_FS_SAME_BOOT Retained stage=causal_before_service_enqueue error={:?}",
+                error
+            );
+            return self.retain_current_flight("causal_before_service_enqueue");
+        }
         let (waiter, waker) = EffectWaiter::new_pair(EffectToken {
             authority_epoch: AUTHORITY_EPOCH,
             scope_id: SCOPE.id(),
@@ -2548,6 +2882,20 @@ impl FsScenario {
                 adopted_filesystem.binding_epoch(),
             );
 
+            if let Err(error) = runtime.verify_causal_session(cookie, captured.identity.effect()) {
+                runtime.put_flight(FsDeviceFlight::Captured {
+                    cookie,
+                    root,
+                    device,
+                    syscall: captured,
+                });
+                let retained = runtime.retain_current("causal_before_device_prepare");
+                println!(
+                    "LINUX_FS_SAME_BOOT Retained stage=causal_before_device_prepare error={:?}",
+                    error
+                );
+                return DispatchOutcome::retained(retained);
+            }
             let request = match device.prepare_read_sector0(&mut root) {
                 Ok(request) => request,
                 Err(_) => {
@@ -4546,14 +4894,43 @@ impl FsScenario {
                     }
                 };
                 let mut runtime = self.production.lock();
-                let selection = match &runtime.flight {
+                let Some(causal_cookie) = NonZeroU64::new(*flight_cookie) else {
+                    println!("LINUX_FS_SAME_BOOT Retained stage=causal_terminal_zero_cookie");
+                    return PublicationResult::Retained;
+                };
+                let (selection, root_effect) = match &runtime.flight {
                     FsDeviceFlight::AwaitingPublication {
                         cookie,
                         selection,
                         ticket: stored_ticket,
+                        work,
                         ..
-                    } if cookie == flight_cookie && stored_ticket == ticket => selection.clone(),
+                    } if cookie == flight_cookie && stored_ticket == ticket => {
+                        (selection.clone(), work.effects[0])
+                    }
                     _ => return PublicationResult::Retained,
+                };
+                if let Err(error) =
+                    runtime.close_or_verify_causal_terminal(causal_cookie, root_effect)
+                {
+                    println!(
+                        "LINUX_FS_SAME_BOOT Retained stage=causal_close_before_outer_ack error={:?}",
+                        error
+                    );
+                    return PublicationResult::Retained;
+                }
+                let causal_clear = match runtime
+                    .causal
+                    .prepare_terminal_clear(causal_cookie, root_effect)
+                {
+                    Ok(clear) => clear,
+                    Err(error) => {
+                        println!(
+                            "LINUX_FS_SAME_BOOT Retained stage=causal_terminal_retry_preflight error={:?}",
+                            error
+                        );
+                        return PublicationResult::Retained;
+                    }
                 };
                 if runtime
                     .registry
@@ -4567,6 +4944,9 @@ impl FsScenario {
                     )
                     .is_err()
                 {
+                    println!(
+                        "LINUX_FS_SAME_BOOT Retained stage=causal_closed_outer_ack_pending retryable=true"
+                    );
                     return PublicationResult::Retained;
                 }
                 drop(mapping_cursor);
@@ -4576,6 +4956,7 @@ impl FsScenario {
                     unreachable!("validated publication flight changed under its Registry lock")
                 };
                 runtime.put_flight(FsDeviceFlight::Complete { root, device });
+                runtime.causal.apply_terminal_clear(causal_clear);
                 runtime.assert_complete();
                 #[cfg(feature = "virtio-cser-precommit-fault")]
                 let precommit_scope = if runtime.enrolled_revoke_wins_observed {

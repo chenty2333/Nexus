@@ -8,18 +8,19 @@ use __cser_alloc::vec::Vec;
 #[cfg(test)]
 use super::ClosureRecord;
 use super::{
-    ContinuationPhase, DeadlinePhase, DelayedCommandPhase, DeviceCreditOwnership, DevicePhase,
-    DomainKey, EffectKey, FaultPhase, InfrastructureClosureFinishPlan,
-    InfrastructureClosureProgress, InfrastructureClosureReceipt, InfrastructureClosureSelection,
-    InfrastructureClosureStartPlan, InfrastructureError, InfrastructureEventKind,
-    InfrastructureKind, InfrastructureLimits, InfrastructureLiveCounts, InfrastructureRootBinding,
-    InfrastructureScopeInstallPlan, InfrastructureScopeLink, InfrastructureState, LedgerMode,
-    ParentStamp, ReplyPhase, RequestKey, ReverseIndexRecord, ReverseParent, RootStamp,
-    ScopeInfrastructure, ScopeKey, ServiceRequestPhase, TaskAnchorPhase, TaskPhase,
-    WorkloadContext, WorkloadPhase, WorkloadRecord, WorkloadRequestPresentation,
+    CausalWorkloadBootstrapInstall, ContinuationPhase, DeadlinePhase, DelayedCommandPhase,
+    DeviceCreditOwnership, DevicePhase, DomainKey, EffectKey, FaultPhase,
+    InfrastructureClosureFinishPlan, InfrastructureClosureProgress, InfrastructureClosureReceipt,
+    InfrastructureClosureSelection, InfrastructureClosureStartPlan, InfrastructureError,
+    InfrastructureEventKind, InfrastructureKind, InfrastructureLimits, InfrastructureLiveCounts,
+    InfrastructureRootBinding, InfrastructureScopeInstallPlan, InfrastructureScopeLink,
+    InfrastructureState, LedgerMode, ParentStamp, ReplyPhase, RequestKey, ReverseIndexRecord,
+    ReverseParent, RootStamp, ScopeInfrastructure, ScopeKey, ServiceRequestPhase, TaskAnchorPhase,
+    TaskPhase, WorkloadContext, WorkloadPhase, WorkloadRecord, WorkloadRequestPresentation,
     WorkloadRootPresentation, check_scope_invariants, checked_add, checked_sub,
-    first_live_child_kind, preview_nonce, preview_revision, require_vacancy, rewrite_scope_stamps,
-    validate_active_admission, validate_context, validate_root_presentation, workload_bearer,
+    first_live_child_kind, mint_workload_context, prepare_workload_mint, preview_nonce,
+    preview_revision, require_vacancy, rewrite_scope_stamps, validate_active_admission,
+    validate_context, validate_root_presentation, workload_bearer,
 };
 
 impl InfrastructureState {
@@ -652,93 +653,99 @@ impl InfrastructureState {
             .ok_or(InfrastructureError::NotEnabled)
     }
 
+    /// Preallocates a previously disabled infrastructure root and opens its
+    /// first workload entirely off-ledger. The final live append is reserved
+    /// only after every identity, quota, counter, and invariant check passes.
+    pub(in super::super) fn prepare_causal_workload_bootstrap(
+        &mut self,
+        root: WorkloadRootPresentation,
+        request: WorkloadRequestPresentation,
+        limits: InfrastructureLimits,
+        domains: &[(DomainKey, u64)],
+    ) -> Result<CausalWorkloadBootstrapInstall, InfrastructureError> {
+        self.require_authoritative()?;
+        if self
+            .scopes
+            .iter()
+            .any(|(candidate, _)| *candidate == root.scope)
+        {
+            return Err(InfrastructureError::AlreadyEnabled);
+        }
+        let mut record = ScopeInfrastructure::try_new(
+            RootStamp {
+                registry_instance: self.registry_instance,
+                scope: root.scope,
+                authority_epoch: root.authority_epoch,
+                root_effect: root.root_effect,
+            },
+            limits,
+            domains,
+        )?;
+        let mint = open_workload_in_scope(self.registry_instance, &mut record, root, request)?;
+        check_scope_invariants(&record)?;
+
+        // This is the final fallible live-ledger operation. The returned plan
+        // is Registry-private and is installed immediately while its caller
+        // retains the only `&mut EffectRegistry`.
+        self.scopes
+            .try_reserve(1)
+            .map_err(|_| InfrastructureError::AllocationFailed)?;
+        Ok(CausalWorkloadBootstrapInstall {
+            scope: root.scope,
+            record,
+            mint,
+        })
+    }
+
+    /// Installs one fully prepared bootstrap record and releases its opaque
+    /// workload context only after the authoritative scope is live.
+    pub(in super::super) fn install_causal_workload_bootstrap(
+        &mut self,
+        install: CausalWorkloadBootstrapInstall,
+    ) -> WorkloadContext {
+        __cser_core::debug_assert_eq!(self.mode, LedgerMode::Authoritative);
+        __cser_core::debug_assert!(self.scopes.len() < self.scopes.capacity());
+        __cser_core::debug_assert!(
+            self.scopes
+                .iter()
+                .all(|(candidate, _)| *candidate != install.scope)
+        );
+        let CausalWorkloadBootstrapInstall {
+            scope,
+            record,
+            mint,
+        } = install;
+        self.scopes.push((scope, record));
+        mint_workload_context(mint)
+    }
+
+    pub(in super::super) fn workload_context_is_open(
+        &self,
+        context: &WorkloadContext,
+    ) -> Result<bool, InfrastructureError> {
+        self.require_authoritative()?;
+        let scope = self.scope(context.root.scope)?;
+        validate_context(scope, self.registry_instance, context)?;
+        Ok(scope
+            .workloads
+            .get(context.workload.request.id)
+            .is_some_and(|record| record.phase == WorkloadPhase::Open))
+    }
+
     pub(in super::super) fn open_workload(
         &mut self,
         root: WorkloadRootPresentation,
         request: WorkloadRequestPresentation,
     ) -> Result<WorkloadContext, InfrastructureError> {
         self.require_authoritative()?;
-        let request_key = RequestKey::new(request.request_id, request.request_generation)?;
         let registry_instance = self.registry_instance;
         let scope = self.scope_mut(root.scope)?;
-        validate_root_presentation(
-            scope,
+        Ok(mint_workload_context(open_workload_in_scope(
             registry_instance,
-            root.authority_epoch,
-            root.root_effect,
-        )?;
-        validate_active_admission(scope)?;
-        if scope.binding_epoch(request.domain)? != request.binding_epoch {
-            return Err(InfrastructureError::StaleBinding);
-        }
-        if let Some(existing) = scope.workloads.get(request_key.id) {
-            return if existing.request == request_key
-                && existing.root_effect == root.root_effect
-                && existing.domain == request.domain
-            {
-                Err(InfrastructureError::ExactReplay)
-            } else if existing.request.generation > request_key.generation {
-                Err(InfrastructureError::StaleGeneration)
-            } else {
-                Err(InfrastructureError::IdentityConflict)
-            };
-        }
-        require_vacancy(
-            &scope.workloads,
-            request_key.id,
-            InfrastructureKind::Workload,
-        )?;
-        require_vacancy(
-            &scope.reverse_indexes,
-            scope.next_nonce,
-            InfrastructureKind::Workload,
-        )?;
-        let (nonce, next_nonce) = preview_nonce(scope)?;
-        let next_revision = preview_revision(scope)?;
-        let next_workloads = checked_add(scope.live.workloads, 1)?;
-        let record = WorkloadRecord {
-            request: request_key,
-            root_effect: root.root_effect,
-            parent: ParentStamp::RootEffect(root.root_effect),
-            domain: request.domain,
-            admission_binding_epoch: request.binding_epoch,
-            current_binding_epoch: request.binding_epoch,
-            nonce,
-            bearer_generation: 1,
-            phase: WorkloadPhase::Open,
-            live_children: 0,
-            closure_sequence: None,
-        };
-        let index = ReverseIndexRecord {
-            slot: nonce,
-            kind: InfrastructureKind::Workload,
-            root_effect: root.root_effect,
-            parent: ReverseParent::RootEffect(root.root_effect),
-            task: None,
-            domain: request.domain,
-            binding_epoch: request.binding_epoch,
-            source_domain: None,
-            source_binding_epoch: None,
-            resource: None,
-            actor_slot: None,
-            actor_generation: None,
-            retry_generation: request.request_generation,
-        };
-        scope
-            .workloads
-            .install(record, InfrastructureKind::Workload)?;
-        scope
-            .reverse_indexes
-            .install(index, InfrastructureKind::Workload)?;
-        scope.next_nonce = next_nonce;
-        scope.revision = next_revision;
-        scope.live.workloads = next_workloads;
-        scope.events.push(
-            InfrastructureEventKind::WorkloadOpened,
-            request_key.id,
-            request_key.generation,
-        );
-        workload_bearer(scope, request_key.id)
+            scope,
+            root,
+            request,
+        )?))
     }
 
     pub(in super::super) fn adopt_workload_after_fence(
@@ -829,6 +836,93 @@ impl InfrastructureState {
         );
         Ok(())
     }
+}
+
+fn open_workload_in_scope(
+    registry_instance: u64,
+    scope: &mut ScopeInfrastructure,
+    root: WorkloadRootPresentation,
+    request: WorkloadRequestPresentation,
+) -> Result<super::PreparedWorkloadMint, InfrastructureError> {
+    let request_key = RequestKey::new(request.request_id, request.request_generation)?;
+    validate_root_presentation(
+        scope,
+        registry_instance,
+        root.authority_epoch,
+        root.root_effect,
+    )?;
+    validate_active_admission(scope)?;
+    if scope.binding_epoch(request.domain)? != request.binding_epoch {
+        return Err(InfrastructureError::StaleBinding);
+    }
+    if let Some(existing) = scope.workloads.get(request_key.id) {
+        return if existing.request == request_key
+            && existing.root_effect == root.root_effect
+            && existing.domain == request.domain
+        {
+            Err(InfrastructureError::ExactReplay)
+        } else if existing.request.generation > request_key.generation {
+            Err(InfrastructureError::StaleGeneration)
+        } else {
+            Err(InfrastructureError::IdentityConflict)
+        };
+    }
+    require_vacancy(
+        &scope.workloads,
+        request_key.id,
+        InfrastructureKind::Workload,
+    )?;
+    require_vacancy(
+        &scope.reverse_indexes,
+        scope.next_nonce,
+        InfrastructureKind::Workload,
+    )?;
+    let (nonce, next_nonce) = preview_nonce(scope)?;
+    let next_revision = preview_revision(scope)?;
+    let next_workloads = checked_add(scope.live.workloads, 1)?;
+    let record = WorkloadRecord {
+        request: request_key,
+        root_effect: root.root_effect,
+        parent: ParentStamp::RootEffect(root.root_effect),
+        domain: request.domain,
+        admission_binding_epoch: request.binding_epoch,
+        current_binding_epoch: request.binding_epoch,
+        nonce,
+        bearer_generation: 1,
+        phase: WorkloadPhase::Open,
+        live_children: 0,
+        closure_sequence: None,
+    };
+    let index = ReverseIndexRecord {
+        slot: nonce,
+        kind: InfrastructureKind::Workload,
+        root_effect: root.root_effect,
+        parent: ReverseParent::RootEffect(root.root_effect),
+        task: None,
+        domain: request.domain,
+        binding_epoch: request.binding_epoch,
+        source_domain: None,
+        source_binding_epoch: None,
+        resource: None,
+        actor_slot: None,
+        actor_generation: None,
+        retry_generation: request.request_generation,
+    };
+    scope
+        .workloads
+        .install(record, InfrastructureKind::Workload)?;
+    scope
+        .reverse_indexes
+        .install(index, InfrastructureKind::Workload)?;
+    scope.next_nonce = next_nonce;
+    scope.revision = next_revision;
+    scope.live.workloads = next_workloads;
+    scope.events.push(
+        InfrastructureEventKind::WorkloadOpened,
+        request_key.id,
+        request_key.generation,
+    );
+    prepare_workload_mint(scope, request_key.id)
 }
 
 fn stamp_live_closure_cohort(scope: &mut ScopeInfrastructure, sequence: u64) {

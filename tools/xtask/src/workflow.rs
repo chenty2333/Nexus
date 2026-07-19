@@ -1315,7 +1315,9 @@ fn audit_cser_attribute(attribute: &syn::Attribute) -> Option<String> {
             };
             (!matches!(
                 path.value().as_str(),
-                "effect_registry/root_lanes.rs" | "infrastructure/mod.rs"
+                "effect_registry/root_lanes.rs"
+                    | "effect_registry/runtime_causal.rs"
+                    | "infrastructure/mod.rs"
             ))
             .then(|| format!("path attribute targets unaudited source {}", path.value()))
         }
@@ -2483,10 +2485,10 @@ fn validate_backend_docker_source_set_semantics(
 fn expected_backend_docker_sha256(relative: &str) -> Result<&'static str> {
     match relative {
         "kernel/nexus-ostd/Dockerfile" => {
-            Ok("874b7cb859ba9648bf44bb33d116a8994abcc331aebb26913ddf3797651cebe2")
+            Ok("b1a1d5a446f6851878a1ba264d794e00532b64eff9900fa09fdee3fc4b1ba6a8")
         }
         "experiments/ostd-virtio-cser-spike/Dockerfile" => {
-            Ok("ff5f4c0129632991a4da032b7255af1ff763de6ced6b44dc25f084fa78651411")
+            Ok("37dd524243d44fdc247fe74b3eba4f31a362a7d248f30dbfde64b910dce8751b")
         }
         _ => Err(format!("unknown production backend Dockerfile: {relative}").into()),
     }

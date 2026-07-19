@@ -1,6 +1,7 @@
 device_flight.rs
 effect_registry.rs
 effect_registry/root_lanes.rs
+effect_registry/runtime_causal.rs
 infrastructure/continuation.rs
 infrastructure/deadline.rs
 infrastructure/delayed.rs

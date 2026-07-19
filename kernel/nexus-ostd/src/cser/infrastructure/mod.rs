@@ -3761,6 +3761,32 @@ pub(super) struct InfrastructureScopeInstallPlan {
     replacement: ScopeInfrastructure,
 }
 
+/// Fully staged first installation of one infrastructure root together with
+/// its initial workload. These mint coordinates are descriptive and are not a
+/// live [`WorkloadContext`]; that bearer is created only after installation.
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
+struct PreparedWorkloadMint {
+    root: RootStamp,
+    domain: DomainStamp,
+    workload: WorkloadStamp,
+    parent: ParentStamp,
+}
+
+/// Fully staged first installation of one infrastructure root together with
+/// its initial workload. No live bearer exists inside this plan.
+#[derive(__cser_core::fmt::Debug)]
+pub(super) struct CausalWorkloadBootstrapInstall {
+    scope: ScopeKey,
+    record: ScopeInfrastructure,
+    mint: PreparedWorkloadMint,
+}
+
 fn rewrite_scope_stamps(scope: &mut ScopeInfrastructure, registry_instance: u64) {
     if let Some(receipt) = scope
         .closure
@@ -3889,11 +3915,20 @@ fn workload_bearer(
     scope: &ScopeInfrastructure,
     request_id: u64,
 ) -> Result<WorkloadContext, InfrastructureError> {
+    Ok(mint_workload_context(prepare_workload_mint(
+        scope, request_id,
+    )?))
+}
+
+fn prepare_workload_mint(
+    scope: &ScopeInfrastructure,
+    request_id: u64,
+) -> Result<PreparedWorkloadMint, InfrastructureError> {
     let record = scope
         .workloads
         .get(request_id)
         .ok_or(InfrastructureError::UnknownWorkload)?;
-    Ok(WorkloadContext {
+    Ok(PreparedWorkloadMint {
         root: scope.root,
         domain: DomainStamp {
             domain: record.domain,
@@ -3906,6 +3941,15 @@ fn workload_bearer(
         },
         parent: record.parent,
     })
+}
+
+const fn mint_workload_context(mint: PreparedWorkloadMint) -> WorkloadContext {
+    WorkloadContext {
+        root: mint.root,
+        domain: mint.domain,
+        workload: mint.workload,
+        parent: mint.parent,
+    }
 }
 
 fn validate_context(

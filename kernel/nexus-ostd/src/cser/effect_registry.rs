@@ -31,6 +31,9 @@ use sha2::{Digest, Sha256};
 #[path = "effect_registry/root_lanes.rs"]
 mod root_lanes;
 
+#[path = "effect_registry/runtime_causal.rs"]
+pub(crate) mod runtime_causal;
+
 #[path = "infrastructure/mod.rs"]
 mod infrastructure;
 
@@ -16851,6 +16854,8 @@ fn supervisor_domain_recovery_primitives_self_test() {
 /// credit ledger, distinct service bindings, and immutable effect ancestry;
 /// no synthetic cohort or side ledger is constructed for the assertion.
 pub(crate) fn production_identity_registry_self_test() {
+    #[cfg(test)]
+    runtime_causal::runtime_causal_bootstrap_self_test();
     #[cfg(test)]
     supervisor_domain_recovery_primitives_self_test();
     #[cfg(test)]

@@ -739,6 +739,37 @@ before device publication. This is a one-vCPU, one-request vertical slice; it
 does not map a real configured GSI, deliver an IRQ, cover every crash point, or
 establish SMP/device breadth.
 
+The normal same-boot capture now also reaches the private causal-infrastructure
+workload bootstrap through a narrow Registry facade. After the business syscall
+root is registered and prepared, an exact Registry/scope/authority/root/domain/
+binding/request input preallocates and installs one infrastructure root plus one
+workload; only then is its opaque non-Copy session minted into an independent
+`FsCausalAdapterSlot`. The slot remains active across fsd-v1 crash, fsd-v2
+rebind/adopt, device publication, completion/reset/IOTLB, terminal drain, and
+guest-publication prevalidation. At the final publication boundary it becomes a
+typed `Closed` identity: an outer acknowledgement failure can retry without
+recreating authority, and successful acknowledgement plus revoke completion
+clears it only after the device flight enters `Complete`. Busy admission keeps
+the existing session and Ready hardware flight unchanged instead of creating a
+zero-cookie sentinel.
+
+This is bootstrap reachability, not complete RFC 0003 causal coverage. The
+profile reserves bounded capacity for eight task, eight delayed-command, eight
+deadline-series, four repeated-fault, four device-attempt, four queue, twelve
+pinned-page, and twelve DMA-mapping records, with smaller service,
+continuation, and reply tables; quota/backpressure is model-tested. The normal
+path does not yet create the task-admission, service/delayed-command,
+waiter/waker, guest-reply, deadline/retry, request-fault, or device-preparation
+obligations in those tables. No 66-cell source-mapped or observed claim is
+made, the locked-empty causal evidence overlay is unchanged, and existing
+QEMU receipts are not promoted by this source/model tranche. In particular,
+the bootstrap closes its causal workload after guest-write prevalidation but
+before the real guest publication and combined outer acknowledgement/revoke;
+`Closed` preserves exact retry authority, but this is not an atomic causal
+closure boundary. A later tranche still needs a two-phase close intent or one
+combined outer-ack plus causal-close transition before this path can support a
+complete causal-coverage claim.
+
 The generic `iommu_probe` adapter remains `Ostd018FailClosed`; its
 `unmap_invalidate_and_wait` still returns `IotlbInvalidationUnavailable` rather
 than claiming unsupported quiescence. That probe and the runtime-filesystem
