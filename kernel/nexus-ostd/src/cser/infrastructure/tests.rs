@@ -1,12 +1,17 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use super::{
-    ContinuationDescriptor, ContinuationPublicationReceipt, DeviceReservationCoordinates,
-    DomainKey, EffectKey, FaultAccess, FaultDescriptor, FaultDisposition, FaultObservation,
-    FaultPhase, InfrastructureError, InfrastructureLimits, InfrastructureState, ResourceKey,
-    ScopeKey, ServiceRequestDescriptor, ServiceRequestPhase, ServiceRequestTicket, TaskKey,
-    TaskPhase, TaskWorkDescriptor, TaskWorkRole, ValidatedAbortProof, VmAuthorityKey,
-    WorkloadRequestPresentation, WorkloadRootPresentation,
+    AuthorityKey, BearerKey, ContinuationAckReceipt, ContinuationAdoption, ContinuationDescriptor,
+    ContinuationLease, ContinuationPublicationAckReceipt, ContinuationPublicationAuthority,
+    ContinuationPublicationReceipt, ContinuationResumeAuthority, ContinuationResumePlan,
+    ContinuationResumeReceipt, DeviceReservationCoordinates, DomainKey, EffectKey,
+    EnteredTaskLease, FaultAccess, FaultDescriptor, FaultDisposition, FaultObservation, FaultPhase,
+    InfrastructureError, InfrastructureLimits, InfrastructureState, LinearFailure, ResourceKey,
+    ScopeKey, ServiceArmReceipt, ServiceChildReceipt, ServiceEnqueueReceipt,
+    ServiceRequestDescriptor, ServiceRequestPhase, ServiceRequestTicket, TaskAdoption, TaskKey,
+    TaskPhase, TaskWorkDescriptor, TaskWorkRole, ValidatedAbortProof, ValidatedServiceChildProof,
+    VmAuthorityKey, WakeClaim, WorkloadContext, WorkloadRequestPresentation,
+    WorkloadRootPresentation, bearer_state,
 };
 
 const SCOPE: ScopeKey = ScopeKey::new(0x9100, 1);
@@ -16,6 +21,632 @@ const SERVICE: DomainKey = DomainKey::new(0x92);
 
 fn limits() -> InfrastructureLimits {
     InfrastructureLimits::new(8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 16, 8, 8).unwrap()
+}
+
+const COMPACT_REQUEST: u64 = 0xd300;
+const COMPACT_WORK: u64 = 0xd400;
+const COMPACT_TASK: u64 = 0xd500;
+const COMPACT_VM: u64 = 0xd600;
+const COMPACT_CONTINUATION: u64 = 0xd700;
+const COMPACT_SERVICE_REQUEST: u64 = 0xd800;
+const COMPACT_RESPONSE_SLOT: u64 = 0xd900;
+
+fn compact_continuation_state(
+    registry_instance: u64,
+) -> (
+    InfrastructureState,
+    WorkloadContext,
+    EnteredTaskLease,
+    ContinuationLease,
+) {
+    let mut state = InfrastructureState::new(registry_instance);
+    state
+        .enable(SCOPE, 1, ROOT, limits(), &[(GUEST, 1), (SERVICE, 1)])
+        .unwrap();
+    let workload = state
+        .open_workload(
+            WorkloadRootPresentation::new(SCOPE, 1, ROOT),
+            WorkloadRequestPresentation::new(GUEST, 1, COMPACT_REQUEST, 1),
+        )
+        .unwrap();
+    let task = state
+        .admit_task(
+            &workload,
+            TaskWorkDescriptor {
+                work_id: COMPACT_WORK,
+                generation: 1,
+                task: TaskKey::new(COMPACT_TASK, 1),
+                role: TaskWorkRole::GuestSyscallWork,
+                vm: Some(VmAuthorityKey::new(COMPACT_VM, 1).unwrap()),
+            },
+        )
+        .unwrap();
+    let entered = state.claim_task_entry(task).unwrap();
+    let continuation = state
+        .create_continuation(
+            &entered,
+            ContinuationDescriptor {
+                continuation_id: COMPACT_CONTINUATION,
+                generation: 1,
+                vm_generation: 1,
+                source_domain: GUEST,
+                source_binding_epoch: 1,
+            },
+        )
+        .unwrap();
+    (state, workload, entered, continuation)
+}
+
+fn compact_bearer_generation(state: &InfrastructureState) -> u64 {
+    state
+        .scope(SCOPE)
+        .unwrap()
+        .continuations
+        .get(COMPACT_CONTINUATION)
+        .unwrap()
+        .stamp
+        .bearer_generation
+}
+
+fn continuation_resume_receipt(
+    plan: ContinuationResumePlan,
+    external_receipt_digest: u64,
+) -> ContinuationResumeReceipt {
+    ContinuationResumeReceipt {
+        continuation_id: plan.descriptor.continuation_id,
+        generation: plan.descriptor.generation,
+        publication_sequence: plan.publication_sequence,
+        vm_generation: plan.descriptor.vm_generation,
+        source_domain: plan.descriptor.source_domain,
+        source_binding_epoch: plan.descriptor.source_binding_epoch,
+        outcome_digest: plan.outcome_digest,
+        ack_generation: plan.ack_generation,
+        ack_nonce: plan.ack_nonce,
+        resume_generation: plan.resume_generation,
+        resume_nonce: plan.resume_nonce,
+        external_receipt_digest,
+    }
+}
+
+fn compact_bound_service_state(
+    registry_instance: u64,
+) -> (InfrastructureState, ServiceRequestTicket) {
+    let (mut state, _, entered, continuation) = compact_continuation_state(registry_instance);
+    let service = state
+        .reserve_service_request(
+            &entered,
+            ServiceRequestDescriptor {
+                request_id: COMPACT_SERVICE_REQUEST,
+                generation: 1,
+                queue: ResourceKey::new(0xda, 1, 1),
+                queue_generation: 1,
+                destination_domain: SERVICE,
+                destination_binding_epoch: 1,
+                command_digest: 0xdb,
+                payload_slot: 3,
+                payload_generation: 1,
+                response_slot_id: COMPACT_RESPONSE_SLOT,
+                response_slot_generation: 1,
+            },
+        )
+        .unwrap();
+    let service = state
+        .bind_service_response_continuation(service, continuation)
+        .unwrap();
+    (state, service)
+}
+
+#[test]
+fn continuation_compact_authority_layout_is_bounded() {
+    assert!(core::mem::size_of::<AuthorityKey>() <= 32);
+    assert!(core::mem::size_of::<BearerKey<bearer_state::ContinuationPending>>() <= 64);
+    assert!(core::mem::size_of::<ContinuationLease>() <= 96);
+    assert!(core::mem::size_of::<WakeClaim>() <= 96);
+    assert!(core::mem::size_of::<ContinuationPublicationAuthority>() <= 96);
+    assert!(core::mem::size_of::<ContinuationPublicationAckReceipt>() <= 96);
+    assert!(core::mem::size_of::<ContinuationAckReceipt>() <= 96);
+    assert!(core::mem::size_of::<ContinuationResumeAuthority>() <= 96);
+    assert!(core::mem::size_of::<ContinuationResumeReceipt>() <= 96);
+    assert!(core::mem::size_of::<LinearFailure<ContinuationLease>>() <= 120);
+    assert!(core::mem::size_of::<LinearFailure<WakeClaim>>() <= 120);
+    assert!(core::mem::size_of::<LinearFailure<ContinuationPublicationAuthority>>() <= 120);
+    assert!(core::mem::size_of::<LinearFailure<ContinuationAckReceipt>>() <= 120);
+    assert!(core::mem::size_of::<LinearFailure<ContinuationResumeAuthority>>() <= 120);
+}
+
+#[test]
+fn continuation_retry_returns_exact_authority_without_mutation() {
+    let (mut state, _, _, continuation) = compact_continuation_state(0xd001);
+    assert_eq!(compact_bearer_generation(&state), 1);
+
+    let before_claim = state.private_full_clone();
+    let failure = state.claim_continuation(continuation, 0).unwrap_err();
+    assert_eq!(failure.error(), InfrastructureError::InvalidIdentity);
+    assert_eq!(state, before_claim);
+    let continuation = failure.into_input();
+
+    let claim = state.claim_continuation(continuation, 0xd8).unwrap();
+    assert_eq!(compact_bearer_generation(&state), 2);
+    let before_publication = state.private_full_clone();
+    let failure = state
+        .begin_continuation_publication(
+            claim,
+            ContinuationPublicationReceipt {
+                vm_generation: 1,
+                source_domain: GUEST,
+                source_binding_epoch: 2,
+                outcome_digest: 0xd8,
+            },
+        )
+        .unwrap_err();
+    assert_eq!(failure.error(), InfrastructureError::InvalidReceipt);
+    assert_eq!(state, before_publication);
+    let claim = failure.into_input();
+
+    let publication = state
+        .begin_continuation_publication(
+            claim,
+            ContinuationPublicationReceipt {
+                vm_generation: 1,
+                source_domain: GUEST,
+                source_binding_epoch: 1,
+                outcome_digest: 0xd8,
+            },
+        )
+        .unwrap();
+    assert_eq!(compact_bearer_generation(&state), 3);
+    let publication_plan = publication.plan();
+    assert_eq!(publication_plan, publication.plan());
+    assert_eq!(
+        publication_plan.descriptor.continuation_id,
+        COMPACT_CONTINUATION
+    );
+    let authority = publication.into_authority();
+    let acknowledgement = ContinuationPublicationAckReceipt {
+        continuation_id: publication_plan.descriptor.continuation_id,
+        generation: publication_plan.descriptor.generation,
+        claim_generation: publication_plan.claim_generation,
+        claim_nonce: publication_plan.claim_nonce,
+        apply_generation: publication_plan.apply_generation,
+        apply_nonce: publication_plan.apply_nonce,
+        publication_sequence: publication_plan.publication_sequence,
+        vm_generation: publication_plan.descriptor.vm_generation,
+        source_domain: publication_plan.descriptor.source_domain,
+        source_binding_epoch: publication_plan.descriptor.source_binding_epoch,
+        outcome_digest: publication_plan.receipt.outcome_digest,
+        external_receipt_digest: 0,
+    };
+    let before_ack = state.private_full_clone();
+    let failure = state
+        .acknowledge_continuation_publication(authority, acknowledgement)
+        .unwrap_err();
+    assert_eq!(failure.error(), InfrastructureError::InvalidReceipt);
+    assert_eq!(state, before_ack);
+    let authority = failure.into_input();
+    let failure = state
+        .acknowledge_continuation_publication(
+            authority,
+            ContinuationPublicationAckReceipt {
+                apply_nonce: publication_plan.apply_nonce ^ 1,
+                external_receipt_digest: 0xd9,
+                ..acknowledgement
+            },
+        )
+        .unwrap_err();
+    assert_eq!(failure.error(), InfrastructureError::InvalidReceipt);
+    assert_eq!(state, before_ack);
+    let authority = failure.into_input();
+    let acknowledgement = ContinuationPublicationAckReceipt {
+        external_receipt_digest: 0xd9,
+        ..acknowledgement
+    };
+    let ack = state
+        .acknowledge_continuation_publication(authority, acknowledgement)
+        .unwrap();
+    assert_eq!(compact_bearer_generation(&state), 4);
+
+    let resume = state.begin_continuation_resume(ack).unwrap();
+    assert_eq!(compact_bearer_generation(&state), 5);
+    let resume_plan = resume.plan();
+    assert_eq!(resume_plan, resume.plan());
+    assert_eq!(resume_plan.publication_ack, acknowledgement);
+    let completion = ContinuationResumeReceipt {
+        continuation_id: resume_plan.descriptor.continuation_id,
+        generation: resume_plan.descriptor.generation,
+        publication_sequence: resume_plan.publication_sequence,
+        vm_generation: resume_plan.descriptor.vm_generation,
+        source_domain: resume_plan.descriptor.source_domain,
+        source_binding_epoch: resume_plan.descriptor.source_binding_epoch,
+        outcome_digest: resume_plan.outcome_digest,
+        ack_generation: resume_plan.ack_generation,
+        ack_nonce: resume_plan.ack_nonce,
+        resume_generation: resume_plan.resume_generation,
+        resume_nonce: resume_plan.resume_nonce,
+        external_receipt_digest: 0,
+    };
+    let before_complete = state.private_full_clone();
+    let failure = state
+        .complete_continuation_resume(resume.into_authority(), completion)
+        .unwrap_err();
+    assert_eq!(failure.error(), InfrastructureError::InvalidReceipt);
+    assert_eq!(state, before_complete);
+    let authority = failure.into_input();
+    state
+        .complete_continuation_resume(
+            authority,
+            ContinuationResumeReceipt {
+                external_receipt_digest: 0xd9,
+                ..completion
+            },
+        )
+        .unwrap();
+    assert_eq!(compact_bearer_generation(&state), 6);
+    state.check_invariants().unwrap();
+}
+
+#[test]
+fn foreign_registry_rejects_compact_continuation_and_returns_it() {
+    let (mut owner, _, _, continuation) = compact_continuation_state(0xd011);
+    let (mut foreign, _, _, _foreign_continuation) = compact_continuation_state(0xd012);
+    let before_owner = owner.private_full_clone();
+    let before_foreign = foreign.private_full_clone();
+
+    let failure = foreign.claim_continuation(continuation, 0xda).unwrap_err();
+    assert_eq!(failure.error(), InfrastructureError::ForeignRegistry);
+    assert_eq!(foreign, before_foreign);
+    assert_eq!(owner, before_owner);
+
+    owner
+        .claim_continuation(failure.into_input(), 0xda)
+        .unwrap();
+    assert_eq!(compact_bearer_generation(&owner), 2);
+}
+
+#[test]
+fn continuation_adoption_fences_old_compact_bearer() {
+    let (mut state, _old_workload, _old_entered, stale) = compact_continuation_state(0xd021);
+    *state
+        .scope_mut(SCOPE)
+        .unwrap()
+        .binding_epoch_mut(GUEST)
+        .unwrap() = 2;
+    let workload = state
+        .adopt_workload_after_fence(
+            WorkloadRootPresentation::new(SCOPE, 1, ROOT),
+            WorkloadRequestPresentation::new(GUEST, 2, COMPACT_REQUEST, 1),
+        )
+        .unwrap();
+    let before_parent_adoption = state.private_full_clone();
+    assert_eq!(
+        state
+            .adopt_continuation_after_fence(&workload, COMPACT_CONTINUATION, 1, 2)
+            .unwrap_err(),
+        InfrastructureError::StaleBinding
+    );
+    assert_eq!(state, before_parent_adoption);
+    assert!(matches!(
+        state
+            .adopt_task_after_fence(&workload, COMPACT_WORK, 1)
+            .unwrap(),
+        TaskAdoption::Entered(_)
+    ));
+    let mut missing_index = state.private_full_clone();
+    let index_slot = missing_index
+        .scope(SCOPE)
+        .unwrap()
+        .continuations
+        .get(COMPACT_CONTINUATION)
+        .unwrap()
+        .stamp
+        .nonce;
+    missing_index
+        .scope_mut(SCOPE)
+        .unwrap()
+        .reverse_indexes
+        .remove(index_slot)
+        .unwrap();
+    let before_missing_index = missing_index.private_full_clone();
+    assert_eq!(
+        missing_index
+            .adopt_continuation_after_fence(&workload, COMPACT_CONTINUATION, 1, 2)
+            .unwrap_err(),
+        InfrastructureError::Invariant("missing continuation reverse index")
+    );
+    assert_eq!(missing_index, before_missing_index);
+
+    let current = match state
+        .adopt_continuation_after_fence(&workload, COMPACT_CONTINUATION, 1, 2)
+        .unwrap()
+    {
+        ContinuationAdoption::Pending(lease) => lease,
+        _ => panic!("pending continuation adopted into the wrong phase"),
+    };
+    assert_eq!(compact_bearer_generation(&state), 2);
+    state.check_invariants().unwrap();
+
+    let before_stale = state.private_full_clone();
+    let failure = state.claim_continuation(stale, 0xdb).unwrap_err();
+    assert_eq!(failure.error(), InfrastructureError::StaleGeneration);
+    assert_eq!(state, before_stale);
+    state.claim_continuation(current, 0xdb).unwrap();
+    assert_eq!(compact_bearer_generation(&state), 3);
+}
+
+#[test]
+fn continuation_adoption_retains_exact_historical_publication_ack() {
+    let (mut state, _old_workload, _old_entered, continuation) = compact_continuation_state(0xd029);
+    let claim = state.claim_continuation(continuation, 0xdb01).unwrap();
+    let publication = state
+        .begin_continuation_publication(
+            claim,
+            ContinuationPublicationReceipt {
+                vm_generation: 1,
+                source_domain: GUEST,
+                source_binding_epoch: 1,
+                outcome_digest: 0xdb01,
+            },
+        )
+        .unwrap();
+    let publication_plan = publication.plan();
+    let acknowledgement = ContinuationPublicationAckReceipt {
+        continuation_id: publication_plan.descriptor.continuation_id,
+        generation: publication_plan.descriptor.generation,
+        claim_generation: publication_plan.claim_generation,
+        claim_nonce: publication_plan.claim_nonce,
+        apply_generation: publication_plan.apply_generation,
+        apply_nonce: publication_plan.apply_nonce,
+        publication_sequence: publication_plan.publication_sequence,
+        vm_generation: publication_plan.descriptor.vm_generation,
+        source_domain: publication_plan.descriptor.source_domain,
+        source_binding_epoch: publication_plan.descriptor.source_binding_epoch,
+        outcome_digest: publication_plan.receipt.outcome_digest,
+        external_receipt_digest: 0xdb02,
+    };
+    let stale_ack = state
+        .acknowledge_continuation_publication(publication.into_authority(), acknowledgement)
+        .unwrap();
+
+    *state
+        .scope_mut(SCOPE)
+        .unwrap()
+        .binding_epoch_mut(GUEST)
+        .unwrap() = 2;
+    let workload = state
+        .adopt_workload_after_fence(
+            WorkloadRootPresentation::new(SCOPE, 1, ROOT),
+            WorkloadRequestPresentation::new(GUEST, 2, COMPACT_REQUEST, 1),
+        )
+        .unwrap();
+    assert!(matches!(
+        state
+            .adopt_task_after_fence(&workload, COMPACT_WORK, 1)
+            .unwrap(),
+        TaskAdoption::Entered(_)
+    ));
+    let current_ack = match state
+        .adopt_continuation_after_fence(&workload, COMPACT_CONTINUATION, 1, 2)
+        .unwrap()
+    {
+        ContinuationAdoption::Acknowledged(ack) => ack,
+        _ => panic!("acknowledged continuation adopted into the wrong phase"),
+    };
+    let projection = state
+        .query_continuation(&workload, COMPACT_CONTINUATION, 1)
+        .unwrap();
+    assert_eq!(projection.descriptor.source_binding_epoch, 2);
+    assert_eq!(projection.publication_ack, Some(acknowledgement));
+    assert_eq!(projection.publication_ack.unwrap().source_binding_epoch, 1);
+
+    let before_stale = state.private_full_clone();
+    let failure = state.begin_continuation_resume(stale_ack).unwrap_err();
+    assert_eq!(failure.error(), InfrastructureError::StaleGeneration);
+    assert_eq!(state, before_stale);
+
+    let stale_resume = state.begin_continuation_resume(current_ack).unwrap();
+    let stale_resume_plan = stale_resume.plan();
+    assert_eq!(stale_resume_plan.descriptor.source_binding_epoch, 2);
+    assert_eq!(stale_resume_plan.publication_ack, acknowledgement);
+
+    *state
+        .scope_mut(SCOPE)
+        .unwrap()
+        .binding_epoch_mut(GUEST)
+        .unwrap() = 3;
+    let workload = state
+        .adopt_workload_after_fence(
+            WorkloadRootPresentation::new(SCOPE, 1, ROOT),
+            WorkloadRequestPresentation::new(GUEST, 3, COMPACT_REQUEST, 1),
+        )
+        .unwrap();
+    assert!(matches!(
+        state
+            .adopt_task_after_fence(&workload, COMPACT_WORK, 1)
+            .unwrap(),
+        TaskAdoption::Entered(_)
+    ));
+    let current_resume = match state
+        .adopt_continuation_after_fence(&workload, COMPACT_CONTINUATION, 1, 3)
+        .unwrap()
+    {
+        ContinuationAdoption::ReplayResume(resume) => resume,
+        _ => panic!("resuming continuation adopted into the wrong phase"),
+    };
+    let before_stale_resume = state.private_full_clone();
+    let failure = state
+        .complete_continuation_resume(
+            stale_resume.into_authority(),
+            continuation_resume_receipt(stale_resume_plan, 0xdb03),
+        )
+        .unwrap_err();
+    assert_eq!(failure.error(), InfrastructureError::StaleGeneration);
+    assert_eq!(state, before_stale_resume);
+
+    let current_resume_plan = current_resume.plan();
+    assert_eq!(current_resume_plan.descriptor.source_binding_epoch, 3);
+    assert_eq!(current_resume_plan.publication_ack, acknowledgement);
+    let before_substitution = state.private_full_clone();
+    let failure = state
+        .complete_continuation_resume(
+            current_resume.into_authority(),
+            continuation_resume_receipt(stale_resume_plan, 0xdb03),
+        )
+        .unwrap_err();
+    assert_eq!(failure.error(), InfrastructureError::InvalidReceipt);
+    assert_eq!(state, before_substitution);
+    state
+        .complete_continuation_resume(
+            failure.into_input(),
+            continuation_resume_receipt(current_resume_plan, 0xdb04),
+        )
+        .unwrap();
+    let projection = state
+        .query_continuation(&workload, COMPACT_CONTINUATION, 1)
+        .unwrap();
+    assert_eq!(projection.publication_ack, Some(acknowledgement));
+    assert_eq!(
+        projection.resume_receipt,
+        Some(continuation_resume_receipt(current_resume_plan, 0xdb04))
+    );
+    state.check_invariants().unwrap();
+
+    let mut missing_ack = state.private_full_clone();
+    missing_ack
+        .scope_mut(SCOPE)
+        .unwrap()
+        .continuations
+        .get_mut(COMPACT_CONTINUATION)
+        .unwrap()
+        .publication_ack = None;
+    assert_invariant_read_only(missing_ack);
+
+    let mut corrupt_ack = state.private_full_clone();
+    corrupt_ack
+        .scope_mut(SCOPE)
+        .unwrap()
+        .continuations
+        .get_mut(COMPACT_CONTINUATION)
+        .unwrap()
+        .publication_ack
+        .as_mut()
+        .unwrap()
+        .external_receipt_digest = 0;
+    assert_invariant_read_only(corrupt_ack);
+
+    let mut nonce_rollback = state.private_full_clone();
+    nonce_rollback.scope_mut(SCOPE).unwrap().next_nonce = current_resume_plan.resume_nonce;
+    assert_invariant_read_only(nonce_rollback);
+
+    let mut publication_rollback = state.private_full_clone();
+    publication_rollback
+        .scope_mut(SCOPE)
+        .unwrap()
+        .next_publication_sequence = acknowledgement.publication_sequence;
+    assert_invariant_read_only(publication_rollback);
+}
+
+#[test]
+fn service_cancel_returns_fresh_compact_continuation_authority() {
+    let (mut state, service) = compact_bound_service_state(0xd031);
+    assert_eq!(compact_bearer_generation(&state), 2);
+    let historical_generation = state
+        .scope(SCOPE)
+        .unwrap()
+        .service_requests
+        .get(COMPACT_SERVICE_REQUEST)
+        .unwrap()
+        .bound_continuation
+        .unwrap()
+        .bearer_generation;
+    assert_eq!(historical_generation, 2);
+
+    let continuation = state
+        .cancel_service_request(service, ValidatedAbortProof::new(0xdc))
+        .unwrap()
+        .unwrap();
+    assert_eq!(compact_bearer_generation(&state), 3);
+    assert_eq!(
+        state
+            .scope(SCOPE)
+            .unwrap()
+            .service_requests
+            .get(COMPACT_SERVICE_REQUEST)
+            .unwrap()
+            .bound_continuation
+            .unwrap()
+            .bearer_generation,
+        historical_generation
+    );
+    state.claim_continuation(continuation, 0xdd).unwrap();
+    assert_eq!(compact_bearer_generation(&state), 4);
+    state.check_invariants().unwrap();
+}
+
+#[test]
+fn service_completion_returns_fresh_compact_continuation_authority() {
+    let (mut state, service) = compact_bound_service_state(0xd041);
+    let enqueue = state.begin_service_enqueue(service).unwrap();
+    let unarmed = state
+        .acknowledge_service_enqueue(
+            enqueue,
+            ServiceEnqueueReceipt {
+                queue: ResourceKey::new(0xda, 1, 1),
+                queue_generation: 1,
+                payload_slot: 3,
+                payload_generation: 1,
+                transport_receipt_digest: 0xde,
+            },
+        )
+        .unwrap();
+    let arm = state.begin_service_arm(unarmed).unwrap();
+    let arm_generation = arm.arm_generation;
+    let enqueued = state
+        .acknowledge_service_arm(
+            arm,
+            ServiceArmReceipt {
+                response_slot_id: COMPACT_RESPONSE_SLOT,
+                response_slot_generation: 1,
+                bound_continuation_id: COMPACT_CONTINUATION,
+                bound_continuation_generation: 1,
+                arm_generation,
+                transport_receipt_digest: 0xdf,
+            },
+        )
+        .unwrap();
+
+    let service_workload = state
+        .open_workload(
+            WorkloadRootPresentation::new(SCOPE, 1, ROOT),
+            WorkloadRequestPresentation::new(SERVICE, 1, 0xe300, 1),
+        )
+        .unwrap();
+    let claimant = state
+        .admit_task(
+            &service_workload,
+            TaskWorkDescriptor {
+                work_id: 0xe400,
+                generation: 1,
+                task: TaskKey::new(0xe500, 1),
+                role: TaskWorkRole::GuestSyscallWork,
+                vm: Some(VmAuthorityKey::new(0xe600, 1).unwrap()),
+            },
+        )
+        .unwrap();
+    let claimant = state.claim_task_entry(claimant).unwrap();
+    let claim = state.claim_service_request(enqueued, &claimant).unwrap();
+    let bound = state
+        .bind_service_child(
+            claim,
+            ValidatedServiceChildProof::new(ServiceChildReceipt {
+                child_effect: EffectKey::new(0xe700, 1),
+                registration_digest: 0xe8,
+            }),
+        )
+        .unwrap();
+    let outcome = state.complete_service_request(bound, 0xe9).unwrap();
+    assert_eq!(compact_bearer_generation(&state), 3);
+    state.claim_continuation(outcome.response, 0xea).unwrap();
+    assert_eq!(compact_bearer_generation(&state), 4);
+    state.check_invariants().unwrap();
 }
 
 fn seeded_state() -> InfrastructureState {

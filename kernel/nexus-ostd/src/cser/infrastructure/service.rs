@@ -9,11 +9,12 @@ use super::{
     ServiceEnqueueReceipt, ServiceRequestDescriptor, ServiceRequestPhase,
     ServiceRequestRecoveryProjection, ServiceRequestRecoveryState, ServiceRequestStateRecord,
     ServiceRequestTicket, TaskPhase, UnarmedServiceRequest, ValidatedAbortProof,
-    ValidatedServiceChildProof, WorkloadContext, checked_add, checked_sub, context_from_stamp,
-    linear_apply, preview_bearer_stamp, preview_nonce, preview_revision, preview_task_child_add,
+    ValidatedServiceChildProof, WorkloadContext, bearer_state, checked_add, checked_sub,
+    context_from_stamp, linear_apply, mint_continuation_key, next_continuation_bearer_generation,
+    preview_bearer_stamp, preview_nonce, preview_revision, preview_task_child_add,
     preview_task_child_sub, preview_workload_child_add, preview_workload_child_sub,
     require_vacancy, validate_active_admission, validate_context, validate_continuation_bearer,
-    validate_stamp_common, validate_task_stamp,
+    validate_continuation_key, validate_stamp_common, validate_task_stamp,
 };
 
 impl InfrastructureState {
@@ -137,39 +138,39 @@ impl InfrastructureState {
             let registry_instance = self.registry_instance;
             let scope = self.scope_mut(stamp.root.scope)?;
             validate_service_request_bearer(scope, registry_instance, &stamp)?;
-            validate_continuation_bearer(scope, registry_instance, &continuation.0)?;
+            let continuation_record =
+                validate_continuation_key(scope, registry_instance, &continuation.0)?;
+            let continuation_stamp = continuation_record.stamp;
             let request = scope
                 .service_requests
                 .get(stamp.identity.request_id)
                 .unwrap();
             if request.phase != ServiceRequestPhase::ReservedUnbound
                 || request.bound_continuation.is_some()
-                || continuation.0.workload != stamp.workload
-                || continuation.0.parent != stamp.parent
-                || scope
-                    .continuations
-                    .get(continuation.0.identity.continuation_id)
-                    .unwrap()
-                    .phase
-                    != ContinuationPhase::Pending
+                || continuation_stamp.workload != stamp.workload
+                || continuation_stamp.parent != stamp.parent
+                || continuation_record.phase != ContinuationPhase::Pending
+                || continuation_record.service_owner.is_some()
             {
                 return Err(InfrastructureError::InvalidState);
             }
+            let bearer_generation = next_continuation_bearer_generation(continuation_record)?;
+            let continuation_id = continuation_stamp.identity.continuation_id;
             let next_revision = preview_revision(scope)?;
+            let owner = RequestKey {
+                id: stamp.identity.request_id,
+                generation: stamp.identity.generation,
+            };
+            let continuation_record = scope.continuations.get_mut(continuation_id).unwrap();
+            continuation_record.stamp.bearer_generation = bearer_generation;
+            continuation_record.service_owner = Some(owner);
+            let bound_continuation = continuation_record.stamp;
             let request = scope
                 .service_requests
                 .get_mut(stamp.identity.request_id)
                 .unwrap();
-            request.bound_continuation = Some(continuation.0);
+            request.bound_continuation = Some(bound_continuation);
             request.phase = ServiceRequestPhase::ReservedBound;
-            scope
-                .continuations
-                .get_mut(continuation.0.identity.continuation_id)
-                .unwrap()
-                .service_owner = Some(RequestKey {
-                id: stamp.identity.request_id,
-                generation: stamp.identity.generation,
-            });
             scope.revision = next_revision;
             Ok(ServiceRequestTicket(stamp))
         })
@@ -625,18 +626,28 @@ impl InfrastructureState {
             {
                 return Err(InfrastructureError::InvalidState);
             }
+            validate_continuation_bearer(scope, registry_instance, &response)?;
+            let bearer_generation = next_continuation_bearer_generation(
+                scope
+                    .continuations
+                    .get(response.identity.continuation_id)
+                    .unwrap(),
+            )?;
             finish_service_request(scope, stamp, ServiceRequestPhase::Completed { receipt })?;
             // All fallible service-request accounting is complete.  The exact
             // continuation record was prevalidated above, so releasing its
             // service ownership cannot fail after the request became terminal.
-            scope
+            let continuation = scope
                 .continuations
                 .get_mut(response.identity.continuation_id)
-                .unwrap()
-                .service_owner = None;
+                .unwrap();
+            continuation.stamp.bearer_generation = bearer_generation;
+            continuation.service_owner = None;
             Ok(ServiceCompletionOutcome {
                 receipt,
-                response: ContinuationLease(response),
+                response: ContinuationLease(mint_continuation_key::<
+                    bearer_state::ContinuationPending,
+                >(continuation)),
             })
         })
     }
@@ -674,16 +685,16 @@ impl InfrastructureState {
                 .service_requests
                 .get(stamp.identity.request_id)
                 .unwrap()
-                .bound_continuation
-                .map(ContinuationLease);
-            if let Some(response) = response.as_ref() {
+                .bound_continuation;
+            let bearer_generation = if let Some(response) = response.as_ref() {
                 let owner = scope
                     .continuations
-                    .get(response.0.identity.continuation_id)
+                    .get(response.identity.continuation_id)
                     .ok_or(InfrastructureError::Invariant(
                         "bound service request lacks response continuation",
                     ))?;
-                if owner.stamp != response.0
+                validate_continuation_bearer(scope, registry_instance, response)?;
+                if owner.stamp != *response
                     || owner.phase != ContinuationPhase::Pending
                     || owner.service_owner
                         != Some(RequestKey {
@@ -693,7 +704,10 @@ impl InfrastructureState {
                 {
                     return Err(InfrastructureError::InvalidState);
                 }
-            }
+                Some(next_continuation_bearer_generation(owner)?)
+            } else {
+                None
+            };
             finish_service_request(
                 scope,
                 stamp,
@@ -701,15 +715,21 @@ impl InfrastructureState {
                     evidence_digest: proof.evidence_digest,
                 },
             )?;
-            if let Some(response) = response.as_ref() {
+            let response = if let Some(response) = response.as_ref() {
                 // This lookup and mutation are infallible because the exact
                 // record and owner were checked before terminal accounting.
-                scope
+                let continuation = scope
                     .continuations
-                    .get_mut(response.0.identity.continuation_id)
-                    .unwrap()
-                    .service_owner = None;
-            }
+                    .get_mut(response.identity.continuation_id)
+                    .unwrap();
+                continuation.stamp.bearer_generation = bearer_generation.unwrap();
+                continuation.service_owner = None;
+                Some(ContinuationLease(mint_continuation_key::<
+                    bearer_state::ContinuationPending,
+                >(continuation)))
+            } else {
+                None
+            };
             Ok(response)
         })
     }

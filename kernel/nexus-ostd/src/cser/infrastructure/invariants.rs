@@ -11,7 +11,7 @@ use super::{
     ScopeInfrastructure, ServiceArmReceipt, ServiceEnqueueReceipt, ServiceRequestDescriptor,
     ServiceRequestPhase, ServiceRequestStateRecord, SlotIdentity, TaskPhase, TaskRecord,
     TaskWorkDescriptor, VmAuthorityKey, WorkloadPhase, delayed_command_phase_live,
-    device_phase_live, service_request_phase_live,
+    device_phase_live, service_request_phase_live, validate_continuation_publication_ack,
 };
 
 pub(super) fn check_scope_invariants(
@@ -714,6 +714,16 @@ fn check_monotonic_sequences(scope: &ScopeInfrastructure) -> Result<(), Infrastr
                 receipt,
             } => {
                 observe_sequence(
+                    &mut max_nonce,
+                    receipt.ack_nonce,
+                    "zero retained continuation ack nonce",
+                )?;
+                observe_sequence(
+                    &mut max_nonce,
+                    receipt.resume_nonce,
+                    "zero retained continuation resume nonce",
+                )?;
+                observe_sequence(
                     &mut max_publication,
                     publication_sequence,
                     "zero continuation publication sequence",
@@ -725,6 +735,23 @@ fn check_monotonic_sequences(scope: &ScopeInfrastructure) -> Result<(), Infrastr
                 )?;
             }
             ContinuationPhase::Pending | ContinuationPhase::Cancelled => {}
+        }
+        if let Some(ack) = record.publication_ack {
+            observe_sequence(
+                &mut max_nonce,
+                ack.claim_nonce,
+                "zero retained continuation claim nonce",
+            )?;
+            observe_sequence(
+                &mut max_nonce,
+                ack.apply_nonce,
+                "zero retained continuation apply nonce",
+            )?;
+            observe_sequence(
+                &mut max_publication,
+                ack.publication_sequence,
+                "zero retained continuation publication sequence",
+            )?;
         }
         observe_optional_sequence(
             &mut max_closure,
@@ -1078,11 +1105,23 @@ fn check_fault_phase(
 }
 
 fn check_continuation_phase(record: &ContinuationRecord) -> Result<(), InfrastructureError> {
+    validate_continuation_publication_ack(record)?;
     let valid = match record.phase {
-        ContinuationPhase::Pending => record.claim_generation == 0,
+        ContinuationPhase::Pending | ContinuationPhase::Cancelled => {
+            record.claim_generation == 0
+                && record.apply_generation == 0
+                && record.ack_generation == 0
+                && record.resume_generation == 0
+        }
         ContinuationPhase::Claimed {
             claim_generation, ..
-        } => claim_generation != 0 && claim_generation == record.claim_generation,
+        } => {
+            claim_generation != 0
+                && claim_generation == record.claim_generation
+                && record.apply_generation == 0
+                && record.ack_generation == 0
+                && record.resume_generation == 0
+        }
         ContinuationPhase::Publishing {
             claim_generation,
             apply_generation,
@@ -1093,18 +1132,35 @@ fn check_continuation_phase(record: &ContinuationRecord) -> Result<(), Infrastru
                 && apply_generation != 0
                 && claim_generation == record.claim_generation
                 && apply_generation == record.apply_generation
+                && record.ack_generation == 0
+                && record.resume_generation == 0
                 && receipt.vm_generation == record.stamp.identity.vm_generation
                 && receipt.source_domain == record.stamp.identity.source_domain
                 && receipt.source_binding_epoch == record.stamp.identity.source_binding_epoch
         }
-        ContinuationPhase::Acknowledged { ack_generation, .. }
-        | ContinuationPhase::Resuming { ack_generation, .. } => {
-            ack_generation != 0 && ack_generation == record.ack_generation
+        ContinuationPhase::Acknowledged { ack_generation, .. } => {
+            ack_generation != 0
+                && ack_generation == record.ack_generation
+                && record.resume_generation == 0
+        }
+        ContinuationPhase::Resuming {
+            ack_generation,
+            resume_generation,
+            ..
+        } => {
+            ack_generation != 0
+                && ack_generation == record.ack_generation
+                && resume_generation != 0
+                && resume_generation == record.resume_generation
         }
         ContinuationPhase::Resumed { receipt, .. } => {
             receipt.vm_generation == record.stamp.identity.vm_generation
+                && receipt.external_receipt_digest != 0
+                && record.ack_generation != 0
+                && receipt.ack_generation == record.ack_generation
+                && record.resume_generation != 0
+                && receipt.resume_generation == record.resume_generation
         }
-        ContinuationPhase::Cancelled => true,
     };
     if !valid {
         return Err(InfrastructureError::Invariant(

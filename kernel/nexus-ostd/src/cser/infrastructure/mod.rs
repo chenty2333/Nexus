@@ -10,6 +10,7 @@
 //! values: none implements `Clone` or `Copy`, and a query never recreates one.
 
 use alloc::vec::Vec;
+use core::marker::PhantomData;
 
 mod continuation;
 mod deadline;
@@ -23,6 +24,7 @@ mod service;
 mod task;
 
 use self::{
+    continuation::validate_continuation_publication_ack,
     delayed::delayed_command_phase_live,
     device::device_phase_live,
     fault::validate_fault_bearer,
@@ -250,6 +252,56 @@ struct BearerStamp<I> {
     parent: ParentStamp,
     nonce: u64,
     bearer_generation: u64,
+}
+
+/// Compact root authority shared by opaque infrastructure bearers.
+///
+/// This is deliberately neither `Clone` nor `Copy`: a transition may inspect
+/// it through a borrow, but only the authoritative record may mint a successor
+/// bearer.  The root effect and all domain/workload/parent coordinates remain
+/// in that record and are revalidated on every action.
+#[derive(Debug, Eq, PartialEq)]
+struct AuthorityKey {
+    registry_instance: u64,
+    scope: ScopeKey,
+    authority_epoch: u64,
+}
+
+mod bearer_state {
+    pub(super) trait Sealed {}
+
+    #[derive(Debug, Eq, PartialEq)]
+    pub(super) enum ContinuationPending {}
+    #[derive(Debug, Eq, PartialEq)]
+    pub(super) enum ContinuationClaimed {}
+    #[derive(Debug, Eq, PartialEq)]
+    pub(super) enum ContinuationPublishing {}
+    #[derive(Debug, Eq, PartialEq)]
+    pub(super) enum ContinuationAcknowledged {}
+    #[derive(Debug, Eq, PartialEq)]
+    pub(super) enum ContinuationResuming {}
+
+    impl Sealed for ContinuationPending {}
+    impl Sealed for ContinuationClaimed {}
+    impl Sealed for ContinuationPublishing {}
+    impl Sealed for ContinuationAcknowledged {}
+    impl Sealed for ContinuationResuming {}
+}
+
+/// Opaque, state-typed authority for one fixed continuation slot.
+///
+/// The key intentionally contains no descriptor, domain, source, parent, or
+/// workload snapshot.  Those facts have exactly one authoritative copy in
+/// `ContinuationRecord`; a key is accepted only after revalidating that full
+/// record and matching all of the compact coordinates below.
+#[derive(Debug, Eq, PartialEq)]
+struct BearerKey<State: bearer_state::Sealed> {
+    authority: AuthorityKey,
+    slot: u64,
+    object_generation: u64,
+    bearer_generation: u64,
+    nonce: u64,
+    state: PhantomData<fn() -> State>,
 }
 
 /// Descriptive root coordinates presented when opening or adopting a workload.
@@ -799,15 +851,10 @@ impl ContinuationDescriptor {
 }
 
 #[derive(Debug, Eq, PartialEq)]
-pub(crate) struct ContinuationLease(BearerStamp<ContinuationDescriptor>);
+pub(crate) struct ContinuationLease(BearerKey<bearer_state::ContinuationPending>);
 
 #[derive(Debug, Eq, PartialEq)]
-pub(crate) struct WakeClaim {
-    continuation: BearerStamp<ContinuationDescriptor>,
-    claim_generation: u64,
-    claim_nonce: u64,
-    outcome_digest: u64,
-}
+pub(crate) struct WakeClaim(BearerKey<bearer_state::ContinuationClaimed>);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ContinuationPublicationReceipt {
@@ -817,45 +864,109 @@ pub(crate) struct ContinuationPublicationReceipt {
     pub(crate) outcome_digest: u64,
 }
 
+/// External publication acknowledgement.  This value is descriptive evidence,
+/// not authority: only the separate one-shot publication bearer may consume it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ContinuationPublicationAckReceipt {
+    pub(crate) continuation_id: u64,
+    pub(crate) generation: u64,
+    pub(crate) claim_generation: u64,
+    pub(crate) claim_nonce: u64,
+    pub(crate) apply_generation: u64,
+    pub(crate) apply_nonce: u64,
+    pub(crate) publication_sequence: u64,
+    pub(crate) vm_generation: u64,
+    pub(crate) source_domain: DomainKey,
+    pub(crate) source_binding_epoch: u64,
+    pub(crate) outcome_digest: u64,
+    pub(crate) external_receipt_digest: u64,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct ContinuationPublicationAuthority(BearerKey<bearer_state::ContinuationPublishing>);
+
+/// Copyable instructions for the external publication apply. Copying this
+/// value never copies authority; acknowledgement consumes the separate opaque
+/// authority exactly once.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ContinuationPublicationPlan {
+    pub(crate) descriptor: ContinuationDescriptor,
+    pub(crate) claim_generation: u64,
+    pub(crate) claim_nonce: u64,
+    pub(crate) apply_generation: u64,
+    pub(crate) apply_nonce: u64,
+    pub(crate) publication_sequence: u64,
+    pub(crate) receipt: ContinuationPublicationReceipt,
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct ContinuationPublicationIntent {
-    continuation: BearerStamp<ContinuationDescriptor>,
-    claim_generation: u64,
-    claim_nonce: u64,
-    apply_generation: u64,
-    apply_nonce: u64,
-    publication_sequence: u64,
-    receipt: ContinuationPublicationReceipt,
+    authority: ContinuationPublicationAuthority,
+    plan: ContinuationPublicationPlan,
+}
+
+impl ContinuationPublicationIntent {
+    pub(crate) const fn plan(&self) -> ContinuationPublicationPlan {
+        self.plan
+    }
+
+    pub(crate) fn into_authority(self) -> ContinuationPublicationAuthority {
+        self.authority
+    }
 }
 
 /// Receipt which alone gates the post-publication resume path.
 #[derive(Debug, Eq, PartialEq)]
-pub(crate) struct ContinuationAckReceipt {
-    continuation: BearerStamp<ContinuationDescriptor>,
-    publication_sequence: u64,
-    outcome_digest: u64,
-    ack_generation: u64,
-    ack_nonce: u64,
-}
+pub(crate) struct ContinuationAckReceipt(BearerKey<bearer_state::ContinuationAcknowledged>);
 
 /// Persisted-before-wake successor. Replaying this intent after a fence is
 /// idempotent by the Registry-minted publication sequence.
 #[derive(Debug, Eq, PartialEq)]
+pub(crate) struct ContinuationResumeAuthority(BearerKey<bearer_state::ContinuationResuming>);
+
+/// Copyable instructions for the external resume apply. Completion consumes
+/// the separate linear authority, never this descriptor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ContinuationResumePlan {
+    pub(crate) descriptor: ContinuationDescriptor,
+    pub(crate) publication_ack: ContinuationPublicationAckReceipt,
+    pub(crate) publication_sequence: u64,
+    pub(crate) outcome_digest: u64,
+    pub(crate) ack_generation: u64,
+    pub(crate) ack_nonce: u64,
+    pub(crate) resume_generation: u64,
+    pub(crate) resume_nonce: u64,
+}
+
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) struct ContinuationResumeIntent {
-    continuation: BearerStamp<ContinuationDescriptor>,
-    publication_sequence: u64,
-    outcome_digest: u64,
-    ack_generation: u64,
-    ack_nonce: u64,
-    resume_generation: u64,
-    resume_nonce: u64,
+    authority: ContinuationResumeAuthority,
+    plan: ContinuationResumePlan,
+}
+
+impl ContinuationResumeIntent {
+    pub(crate) const fn plan(&self) -> ContinuationResumePlan {
+        self.plan
+    }
+
+    pub(crate) fn into_authority(self) -> ContinuationResumeAuthority {
+        self.authority
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ContinuationResumeReceipt {
+    pub(crate) continuation_id: u64,
+    pub(crate) generation: u64,
     pub(crate) publication_sequence: u64,
     pub(crate) vm_generation: u64,
+    pub(crate) source_domain: DomainKey,
+    pub(crate) source_binding_epoch: u64,
     pub(crate) outcome_digest: u64,
+    pub(crate) ack_generation: u64,
+    pub(crate) ack_nonce: u64,
+    pub(crate) resume_generation: u64,
+    pub(crate) resume_nonce: u64,
     pub(crate) external_receipt_digest: u64,
 }
 
@@ -876,6 +987,7 @@ pub(crate) struct ContinuationRecoveryProjection {
     pub(crate) parent_task: TaskWorkDescriptor,
     pub(crate) state: ContinuationRecoveryState,
     pub(crate) claim_generation: u64,
+    pub(crate) publication_ack: Option<ContinuationPublicationAckReceipt>,
     pub(crate) resume_receipt: Option<ContinuationResumeReceipt>,
 }
 
@@ -887,6 +999,23 @@ pub(crate) enum ContinuationAdoption {
     Acknowledged(ContinuationAckReceipt),
     ReplayResume(ContinuationResumeIntent),
 }
+
+const _: () = {
+    assert!(core::mem::size_of::<AuthorityKey>() <= 32);
+    assert!(core::mem::size_of::<BearerKey<bearer_state::ContinuationPending>>() <= 64);
+    assert!(core::mem::size_of::<ContinuationLease>() <= 96);
+    assert!(core::mem::size_of::<WakeClaim>() <= 96);
+    assert!(core::mem::size_of::<ContinuationPublicationAuthority>() <= 96);
+    assert!(core::mem::size_of::<ContinuationPublicationAckReceipt>() <= 96);
+    assert!(core::mem::size_of::<ContinuationAckReceipt>() <= 96);
+    assert!(core::mem::size_of::<ContinuationResumeAuthority>() <= 96);
+    assert!(core::mem::size_of::<ContinuationResumeReceipt>() <= 96);
+    assert!(core::mem::size_of::<LinearFailure<ContinuationLease>>() <= 120);
+    assert!(core::mem::size_of::<LinearFailure<WakeClaim>>() <= 120);
+    assert!(core::mem::size_of::<LinearFailure<ContinuationPublicationAuthority>>() <= 120);
+    assert!(core::mem::size_of::<LinearFailure<ContinuationAckReceipt>>() <= 120);
+    assert!(core::mem::size_of::<LinearFailure<ContinuationResumeAuthority>>() <= 120);
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DeadlinePurpose {
@@ -1587,6 +1716,7 @@ struct ContinuationRecord {
     apply_generation: u64,
     ack_generation: u64,
     resume_generation: u64,
+    publication_ack: Option<ContinuationPublicationAckReceipt>,
     service_owner: Option<RequestKey>,
     phase: ContinuationPhase,
     closure_sequence: Option<u64>,
@@ -2494,7 +2624,68 @@ fn validate_continuation_bearer(
         return Err(InfrastructureError::StaleGeneration);
     }
     validate_continuation_source(scope, stamp)?;
+    validate_continuation_publication_ack(record)?;
     Ok(())
+}
+
+fn mint_continuation_key<State: bearer_state::Sealed>(
+    record: &ContinuationRecord,
+) -> BearerKey<State> {
+    BearerKey {
+        authority: AuthorityKey {
+            registry_instance: record.stamp.root.registry_instance,
+            scope: record.stamp.root.scope,
+            authority_epoch: record.stamp.root.authority_epoch,
+        },
+        slot: record.stamp.identity.continuation_id,
+        object_generation: record.stamp.identity.generation,
+        bearer_generation: record.stamp.bearer_generation,
+        nonce: record.stamp.nonce,
+        state: PhantomData,
+    }
+}
+
+fn validate_continuation_key<'a, State: bearer_state::Sealed>(
+    scope: &'a ScopeInfrastructure,
+    registry_instance: u64,
+    key: &BearerKey<State>,
+) -> Result<&'a ContinuationRecord, InfrastructureError> {
+    if key.authority.registry_instance != registry_instance
+        || scope.root.registry_instance != registry_instance
+    {
+        return Err(InfrastructureError::ForeignRegistry);
+    }
+    if key.authority.scope != scope.root.scope {
+        return Err(InfrastructureError::ForeignScope);
+    }
+    if key.authority.authority_epoch != scope.root.authority_epoch {
+        return Err(InfrastructureError::StaleAuthority);
+    }
+    let record = scope
+        .continuations
+        .get(key.slot)
+        .ok_or(InfrastructureError::UnknownObligation)?;
+    if record.stamp.identity.continuation_id != key.slot {
+        return Err(InfrastructureError::IdentityConflict);
+    }
+    if record.stamp.identity.generation != key.object_generation
+        || record.stamp.bearer_generation != key.bearer_generation
+        || record.stamp.nonce != key.nonce
+    {
+        return Err(InfrastructureError::StaleGeneration);
+    }
+    validate_continuation_bearer(scope, registry_instance, &record.stamp)?;
+    Ok(record)
+}
+
+fn next_continuation_bearer_generation(
+    record: &ContinuationRecord,
+) -> Result<u64, InfrastructureError> {
+    record
+        .stamp
+        .bearer_generation
+        .checked_add(1)
+        .ok_or(InfrastructureError::CounterOverflow)
 }
 
 fn validate_continuation_source(
@@ -2513,9 +2704,13 @@ fn validate_continuation_source(
         .get(parent.work_id)
         .ok_or(InfrastructureError::UnknownObligation)?;
     if task.stamp.identity != parent
+        || task.stamp.root != stamp.root
+        || task.stamp.domain != stamp.domain
+        || task.stamp.workload != stamp.workload
+        || task.phase != TaskPhase::Entered
         || parent.vm.map(VmAuthorityKey::generation) != Some(stamp.identity.vm_generation)
     {
-        return Err(InfrastructureError::StaleGeneration);
+        return Err(InfrastructureError::ForeignParent);
     }
     Ok(())
 }
