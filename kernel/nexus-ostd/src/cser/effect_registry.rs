@@ -37,6 +37,9 @@ pub(crate) mod runtime_causal;
 #[path = "effect_registry/runtime_task.rs"]
 pub(crate) mod runtime_task;
 
+#[path = "effect_registry/runtime_service_task.rs"]
+pub(crate) mod runtime_service_task;
+
 #[path = "infrastructure/mod.rs"]
 mod infrastructure;
 
@@ -16875,6 +16878,8 @@ pub(crate) fn production_identity_registry_self_test() {
     runtime_causal::runtime_causal_bootstrap_self_test();
     #[cfg(test)]
     runtime_task::causal_task_facade_self_test();
+    #[cfg(test)]
+    runtime_service_task::causal_service_task_facade_self_test();
     #[cfg(test)]
     supervisor_domain_recovery_primitives_self_test();
     #[cfg(test)]

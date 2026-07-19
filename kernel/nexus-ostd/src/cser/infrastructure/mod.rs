@@ -1363,6 +1363,41 @@ pub(crate) struct IsolateTaskReceipt(BearerKey<bearer_state::FaultIsolateReceipt
 #[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(crate) struct ServiceCrashCause(BearerKey<bearer_state::FaultCrashCauseClaimed>);
 
+/// Terminal receipt for an unpublished service-task composite cancellation.
+///
+/// A reserved service task owns both a task child and a fault child.  The
+/// receipt records the exact pair that was released by the atomic transition;
+/// it is descriptive and carries no authority to mutate the ledger again.
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
+pub(crate) struct ServiceTaskCancellationReceipt {
+    pub(crate) fault_id: u64,
+    pub(crate) generation: u64,
+    pub(crate) task: TaskKey,
+    pub(crate) vm_generation: u64,
+    pub(crate) service_domain: DomainKey,
+    pub(crate) binding_epoch: u64,
+}
+
+/// Descriptive result of draining a claimed isolate receipt.  The underlying
+/// `IsolateTaskReceipt` is linear and must be consumed through the explicit
+/// drain operation before the caller drops the authority.
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
+pub(crate) struct IsolateTaskDrainReceipt {
+    pub(crate) projection: ServiceFaultProjection,
+}
+
 #[derive(
     __cser_core::clone::Clone,
     __cser_core::marker::Copy,
@@ -1421,6 +1456,10 @@ pub(crate) struct FaultRecoveryProjection {
     /// authority; the ledger still decides whether the claim is first or a
     /// duplicate.
     pub(crate) selector: Option<InstalledFaultObservation>,
+    /// Present only after an unpublished reserved composite was atomically
+    /// cancelled.  This keeps the terminal cancellation evidence queryable
+    /// without making it a new source of transition authority.
+    pub(crate) cancellation: Option<ServiceTaskCancellationReceipt>,
     pub(crate) consumed: bool,
     pub(crate) awaiting_claim: bool,
 }
@@ -2587,7 +2626,9 @@ pub(crate) enum InfrastructureEventKind {
     DelayedCommandIssued,
     DelayedCommandRejected,
     FaultReserved,
+    FaultCancelled,
     FaultObserved,
+    FaultReceiptDrained,
     ContinuationCreated,
     ContinuationClaimed,
     ContinuationPublishing,
@@ -3015,6 +3056,14 @@ struct DelayedCommandStateRecord {
 enum FaultPhase {
     Reserved,
     Armed,
+    Cancelled {
+        receipt: ServiceTaskCancellationReceipt,
+    },
+    IsolateDrained {
+        projection: ServiceFaultProjection,
+        observation: FaultObservation,
+        commitment: FaultPlanCommitment,
+    },
     Exited {
         receipt: ServiceTaskExitReceipt,
     },

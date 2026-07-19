@@ -5,7 +5,9 @@ extern crate core as __cser_core;
 
 use __cser_alloc::vec::Vec;
 
-use super::fault::{exit_receipt_digest, validate_exact_task_fault_pair};
+use super::fault::{
+    cancellation_receipt_digest, exit_receipt_digest, validate_exact_task_fault_pair,
+};
 use super::{
     BearerStamp, ContinuationPhase, ContinuationRecord, DeadlineExhaustedDisposition,
     DeadlinePhase, DeadlineRecord, DelayedCommandPhase, DelayedCommandStateRecord,
@@ -1297,6 +1299,44 @@ fn check_fault_phase(
                 && parent_record.anchor == TaskAnchorPhase::Live
                 && link.terminal_install_digest.is_none()
         }
+        FaultPhase::Cancelled { receipt } => {
+            receipt.fault_id == record.stamp.identity.fault_id
+                && receipt.generation == record.stamp.identity.generation
+                && receipt.task == record.stamp.identity.task
+                && receipt.vm_generation == record.stamp.identity.vm_generation
+                && receipt.service_domain == record.stamp.identity.service_domain
+                && receipt.binding_epoch == record.stamp.identity.admission_binding_epoch
+                && parent_record.phase == TaskPhase::Rejected
+                && parent_record.anchor == TaskAnchorPhase::TerminalDrained
+                && parent_record.live_children == 0
+                && link.terminal_install_digest == Some(cancellation_receipt_digest(receipt))
+        }
+        FaultPhase::IsolateDrained {
+            projection,
+            observation,
+            commitment,
+        } => {
+            let current_domain_epoch = scope
+                .binding_epoch(projection.service_domain)
+                .map_err(|_| InfrastructureError::Invariant("fault references unknown domain"))?;
+            projection.disposition == FaultDisposition::IsolateTask
+                && projection.fault_id == record.stamp.identity.fault_id
+                && projection.generation == record.stamp.identity.generation
+                && projection.task == record.stamp.identity.task
+                && projection.vm_generation == record.stamp.identity.vm_generation
+                && projection.service_domain == record.stamp.identity.service_domain
+                && projection.closed_binding_epoch == record.stamp.identity.admission_binding_epoch
+                && projection.evidence_digest != 0
+                && observation.task == projection.task
+                && observation.vm_generation == projection.vm_generation
+                && observation.instruction_pointer != 0
+                && observation.evidence_digest == projection.evidence_digest
+                && current_domain_epoch >= projection.closed_binding_epoch
+                && parent_record.phase == TaskPhase::Isolated
+                && parent_record.anchor != TaskAnchorPhase::Live
+                && parent_record.live_children == 0
+                && link.terminal_install_digest == Some(commitment.0)
+        }
         FaultPhase::Exited { receipt } => {
             receipt.fault_id == record.stamp.identity.fault_id
                 && receipt.generation == record.stamp.identity.generation
@@ -1320,7 +1360,11 @@ fn check_fault_phase(
                     commitment,
                     cause_claimed,
                 } => (projection, observation, commitment, cause_claimed),
-                FaultPhase::Reserved | FaultPhase::Armed | FaultPhase::Exited { .. } => {
+                FaultPhase::Reserved
+                | FaultPhase::Cancelled { .. }
+                | FaultPhase::IsolateDrained { .. }
+                | FaultPhase::Armed
+                | FaultPhase::Exited { .. } => {
                     __cser_core::unreachable!()
                 }
             };

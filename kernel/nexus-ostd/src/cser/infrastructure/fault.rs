@@ -9,9 +9,10 @@ use super::{
     FaultDispositionPlan, FaultPhase, FaultPlanCommitment, FaultReceiptClaimOutcome,
     FaultRecoveryProjection, FaultSlotDescriptor, FaultStateRecord, FaultTaskOwner,
     InfrastructureError, InfrastructureEventKind, InfrastructureKind, InfrastructureState,
-    InstalledFaultObservation, InstalledFaultProjection, IsolateTaskReceipt, LedgerMode,
-    LinearFailure, LinearResult, ParentStamp, ReservedFaultTask, ReverseIndexRecord, ReverseParent,
-    ScopeInfrastructure, ServiceCrashCause, ServiceFaultProjection, TaskAnchorPhase, TaskFaultLink,
+    InstalledFaultObservation, InstalledFaultProjection, IsolateTaskDrainReceipt,
+    IsolateTaskReceipt, LedgerMode, LinearFailure, LinearResult, ParentStamp, ReservedFaultTask,
+    ReverseIndexRecord, ReverseParent, ScopeInfrastructure, ServiceCrashCause,
+    ServiceFaultProjection, ServiceTaskCancellationReceipt, TaskAnchorPhase, TaskFaultLink,
     TaskLease, TaskPhase, TaskWorkRole, VmAuthorityKey, WorkloadContext, bearer_state, checked_add,
     checked_sub, context_from_stamp, linear_apply, mint_task_key, next_task_bearer_generation,
     preview_bearer_stamp, preview_revision, preview_workload_child_add, preview_workload_child_sub,
@@ -164,6 +165,99 @@ impl InfrastructureState {
             Ok(ReservedFaultTask(mint_task_key::<
                 bearer_state::TaskFaultReserved,
             >(task_record)))
+        })
+    }
+
+    /// Atomically cancels a reserved service-task composite before it has
+    /// entered the external task boundary. A reserved composite owns two live
+    /// children (the task and its fault slot), so ordinary task rejection is
+    /// intentionally not sufficient here.
+    pub(in super::super) fn cancel_reserved_service_task(
+        &mut self,
+        reserved: ReservedFaultTask,
+    ) -> LinearResult<ReservedFaultTask, ServiceTaskCancellationReceipt> {
+        linear_apply(reserved, |reserved| {
+            self.require_authoritative()?;
+            let registry_instance = self.registry_instance;
+            let scope = self.scope_mut(reserved.0.authority.scope)?;
+            let task = validate_task_key(scope, registry_instance, &reserved.0)?;
+            let task_stamp = task.stamp;
+            if task.phase != TaskPhase::Admitted || task.anchor != TaskAnchorPhase::Live {
+                return Err(InfrastructureError::InvalidState);
+            }
+            let (link, fault) = validate_exact_task_fault_pair(scope, task)?;
+            if fault.phase != FaultPhase::Reserved {
+                return Err(InfrastructureError::StaleClaim);
+            }
+            if task.live_children != 1 {
+                return Err(InfrastructureError::ClosureBlocked {
+                    kind: InfrastructureKind::Fault,
+                    live: task.live_children.saturating_sub(1),
+                });
+            }
+            let workload = scope
+                .workloads
+                .get(task_stamp.workload.request.id)
+                .ok_or(InfrastructureError::UnknownWorkload)?;
+            if workload.request != task_stamp.workload.request || workload.live_children < 2 {
+                return Err(InfrastructureError::Invariant(
+                    "reserved service cancellation workload child underflow",
+                ));
+            }
+            let link = *link;
+            let fault_identity = fault.stamp.identity;
+            let next_revision = preview_revision(scope)?;
+            let next_tasks = checked_sub(scope.live.tasks, 1)?;
+            let next_faults = checked_sub(scope.live.faults, 1)?;
+            let next_workload_children = workload.live_children - 2;
+            let next_task_generation = next_task_bearer_generation(task)?;
+            let next_fault_generation = fault
+                .stamp
+                .bearer_generation
+                .checked_add(1)
+                .ok_or(InfrastructureError::CounterOverflow)?;
+            let receipt = ServiceTaskCancellationReceipt {
+                fault_id: fault_identity.fault_id,
+                generation: fault_identity.generation,
+                task: fault_identity.task,
+                vm_generation: fault_identity.vm_generation,
+                service_domain: fault_identity.service_domain,
+                binding_epoch: fault_identity.admission_binding_epoch,
+            };
+
+            // Every fallible check is above this point; the remainder is an
+            // allocation-free replacement of existing records.
+            let fault = scope.faults.get_mut(link.fault_id).unwrap();
+            fault.phase = FaultPhase::Cancelled { receipt };
+            fault.stamp.bearer_generation = next_fault_generation;
+            fault.owner.task_bearer_generation = next_task_generation;
+            let task = scope.tasks.get_mut(task_stamp.identity.work_id).unwrap();
+            task.phase = TaskPhase::Rejected;
+            task.anchor = TaskAnchorPhase::TerminalDrained;
+            task.live_children = 0;
+            task.stamp.bearer_generation = next_task_generation;
+            let task_link = task.service_fault.as_mut().unwrap();
+            task_link.fault_bearer_generation = next_fault_generation;
+            task_link.terminal_install_digest = Some(cancellation_receipt_digest(receipt));
+            scope
+                .workloads
+                .get_mut(task_stamp.workload.request.id)
+                .unwrap()
+                .live_children = next_workload_children;
+            scope.live.tasks = next_tasks;
+            scope.live.faults = next_faults;
+            scope.revision = next_revision;
+            scope.events.push(
+                InfrastructureEventKind::TaskRejected,
+                task_stamp.identity.work_id,
+                task_stamp.identity.generation,
+            );
+            scope.events.push(
+                InfrastructureEventKind::FaultCancelled,
+                fault_identity.fault_id,
+                fault_identity.generation,
+            );
+            Ok(receipt)
         })
     }
 
@@ -691,10 +785,83 @@ impl InfrastructureState {
             FaultPhase::InstalledAwaitingClaim { .. } | FaultPhase::Claimed { .. } => {
                 Err(InfrastructureError::InvalidReceipt)
             }
-            FaultPhase::Reserved | FaultPhase::Armed | FaultPhase::Exited { .. } => {
-                Err(InfrastructureError::InvalidState)
-            }
+            FaultPhase::Reserved
+            | FaultPhase::Armed
+            | FaultPhase::Cancelled { .. }
+            | FaultPhase::IsolateDrained { .. }
+            | FaultPhase::Exited { .. } => Err(InfrastructureError::InvalidState),
         }
+    }
+
+    /// Consumes an isolate receipt after the task has been isolated.  Install
+    /// already releases the task/fault live-child counts, but the claimed
+    /// receipt is still linear authority and must have an explicit terminal
+    /// transition before it can be handed to a caller or dropped.
+    pub(in super::super) fn drain_isolate_task(
+        &mut self,
+        receipt: IsolateTaskReceipt,
+    ) -> LinearResult<IsolateTaskReceipt, IsolateTaskDrainReceipt> {
+        linear_apply(receipt, |receipt| {
+            self.require_authoritative()?;
+            let registry_instance = self.registry_instance;
+            let scope = self.scope_mut(receipt.0.authority.scope)?;
+            let record = validate_fault_key(scope, registry_instance, &receipt.0)?;
+            let (projection, observation, commitment) = match record.phase {
+                FaultPhase::Claimed {
+                    projection,
+                    observation,
+                    commitment,
+                    cause_claimed: false,
+                } if projection.disposition == FaultDisposition::IsolateTask => {
+                    (projection, observation, commitment)
+                }
+                _ => return Err(InfrastructureError::InvalidState),
+            };
+            let next_generation = record
+                .stamp
+                .bearer_generation
+                .checked_add(1)
+                .ok_or(InfrastructureError::CounterOverflow)?;
+            let next_revision = preview_revision(scope)?;
+            let owner_work_id = record.owner.task.work_id;
+            let owner = scope
+                .tasks
+                .get(owner_work_id)
+                .ok_or(InfrastructureError::UnknownObligation)?;
+            let (_, linked_fault) = validate_exact_task_fault_pair(scope, owner)?;
+            if linked_fault.stamp.identity != record.stamp.identity
+                || owner.phase != TaskPhase::Isolated
+                || owner.anchor == TaskAnchorPhase::Live
+                || owner.live_children != 0
+            {
+                return Err(InfrastructureError::Invariant(
+                    "isolate receipt owner is not terminal",
+                ));
+            }
+            let fault_id = projection.fault_id;
+            let record = scope.faults.get_mut(fault_id).unwrap();
+            record.stamp.bearer_generation = next_generation;
+            record.phase = FaultPhase::IsolateDrained {
+                projection,
+                observation,
+                commitment,
+            };
+            scope
+                .tasks
+                .get_mut(owner_work_id)
+                .unwrap()
+                .service_fault
+                .as_mut()
+                .unwrap()
+                .fault_bearer_generation = next_generation;
+            scope.revision = next_revision;
+            scope.events.push(
+                InfrastructureEventKind::FaultReceiptDrained,
+                projection.fault_id,
+                projection.generation,
+            );
+            Ok(IsolateTaskDrainReceipt { projection })
+        })
     }
 
     pub(in super::super) fn consume_service_fault(
@@ -774,7 +941,7 @@ impl InfrastructureState {
         if record.stamp.workload.request != context.workload.request {
             return Err(InfrastructureError::ForeignWorkload);
         }
-        let (receipt, selector) = match record.phase {
+        let (receipt, selector, cancellation) = match record.phase {
             FaultPhase::InstalledAwaitingClaim {
                 projection,
                 commitment,
@@ -787,19 +954,33 @@ impl InfrastructureState {
             } => (
                 Some(projection),
                 Some(installed_fault_observation(projection, commitment)),
+                None,
             ),
-            FaultPhase::Reserved | FaultPhase::Armed | FaultPhase::Exited { .. } => (None, None),
+            FaultPhase::IsolateDrained {
+                projection,
+                commitment,
+                ..
+            } => (
+                Some(projection),
+                Some(installed_fault_observation(projection, commitment)),
+                None,
+            ),
+            FaultPhase::Cancelled { receipt } => (None, None, Some(receipt)),
+            FaultPhase::Reserved | FaultPhase::Armed | FaultPhase::Exited { .. } => {
+                (None, None, None)
+            }
         };
         Ok(FaultRecoveryProjection {
             descriptor: record.stamp.identity,
             receipt,
             selector,
+            cancellation,
             consumed: __cser_core::matches!(
                 record.phase,
                 FaultPhase::Claimed {
                     cause_claimed: true,
                     ..
-                }
+                } | FaultPhase::IsolateDrained { .. }
             ),
             awaiting_claim: __cser_core::matches!(
                 record.phase,
@@ -836,6 +1017,8 @@ impl InfrastructureState {
                 }
                 FaultPhase::Reserved
                 | FaultPhase::Armed
+                | FaultPhase::Cancelled { .. }
+                | FaultPhase::IsolateDrained { .. }
                 | FaultPhase::Exited { .. }
                 | FaultPhase::InstalledAwaitingClaim { .. }
                 | FaultPhase::Claimed { .. } => continue,
@@ -1134,6 +1317,21 @@ pub(super) fn exit_receipt_digest(receipt: super::ServiceTaskExitReceipt) -> [u8
     hash_word(&mut hasher, receipt.task.id());
     hash_word(&mut hasher, receipt.task.generation());
     hash_word(&mut hasher, receipt.evidence_digest);
+    hasher.finalize().into()
+}
+
+pub(super) fn cancellation_receipt_digest(
+    receipt: super::ServiceTaskCancellationReceipt,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"nexus.cser.task-fault-cancel.v1\0");
+    hash_word(&mut hasher, receipt.fault_id);
+    hash_word(&mut hasher, receipt.generation);
+    hash_word(&mut hasher, receipt.task.id());
+    hash_word(&mut hasher, receipt.task.generation());
+    hash_word(&mut hasher, receipt.vm_generation);
+    hash_word(&mut hasher, u64::from(receipt.service_domain.value()));
+    hash_word(&mut hasher, receipt.binding_epoch);
     hasher.finalize().into()
 }
 
