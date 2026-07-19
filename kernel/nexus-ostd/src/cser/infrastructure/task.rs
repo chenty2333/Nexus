@@ -368,6 +368,7 @@ impl InfrastructureState {
             let fault = scope.faults.get_mut(link.fault_id).unwrap();
             fault.stamp.domain = context.domain;
             fault.stamp.workload = context.workload;
+            fault.stamp.identity.admission_binding_epoch = context.domain.binding_epoch;
             fault.stamp.bearer_generation = fault_generation;
             fault.owner.task_bearer_generation = task_generation;
             scope

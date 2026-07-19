@@ -3899,6 +3899,7 @@ fn service_task_entry_rejects_every_substituted_fault_coordinate_without_consumi
         |fault| fault.stamp.domain.binding_epoch += 1,
         |fault| fault.stamp.workload.request.id += 1,
         |fault| fault.stamp.identity.service_domain = GUEST,
+        |fault| fault.stamp.identity.admission_binding_epoch += 1,
         |fault| fault.stamp.identity.vm_generation += 1,
         |fault| {
             fault.stamp.identity.task = TaskKey::new(
@@ -4235,8 +4236,20 @@ fn reserved_fault_adoption_is_composite_and_preflight_failure_is_atomic() {
     let adopted = state.adopt_task_after_fence(&workload, 0xfd03, 1).unwrap();
     let reserved = match adopted {
         TaskAdoption::FaultReserved(reserved) => reserved,
-        _ => panic!("reserved task/fault composite adopted into the wrong state"),
+        _ => __cser_core::panic!("reserved task/fault composite adopted into the wrong state"),
     };
+    __cser_core::assert_eq!(
+        state
+            .scope(SCOPE)
+            .unwrap()
+            .faults
+            .get(0xfd05)
+            .unwrap()
+            .stamp
+            .identity
+            .admission_binding_epoch,
+        2
+    );
     let stale_failure = state.claim_service_task_entry(stale_reserved).unwrap_err();
     __cser_core::assert_eq!(stale_failure.error(), InfrastructureError::StaleGeneration);
     let armed = state.claim_service_task_entry(reserved).unwrap();
@@ -5139,6 +5152,41 @@ fn observed_fault_requires_atomic_task_and_domain_disposition() {
 }
 
 #[test]
+fn domain_fault_recovery_projection_is_revision_independent_and_rejects_duplicates() {
+    let mut state = applied_fault_state(FaultDisposition::CrashService);
+    let (_, current_fault_id) =
+        install_additional_fault(&mut state, 0xbd00, FaultDisposition::CrashService);
+    state.check_invariants().unwrap();
+    let binding_epoch = state.scope(SCOPE).unwrap().binding_epoch(SERVICE).unwrap();
+    let projection = state
+        .domain_fault_recovery_projection(SCOPE, SERVICE, binding_epoch)
+        .unwrap()
+        .unwrap();
+    __cser_core::assert_eq!(projection.fault_id, current_fault_id);
+
+    let historical = state
+        .scope_mut(SCOPE)
+        .unwrap()
+        .faults
+        .get_mut(0xb700)
+        .unwrap();
+    if let FaultPhase::InstalledAwaitingClaim {
+        ref mut projection, ..
+    } = historical.phase
+    {
+        projection.closed_binding_epoch = binding_epoch - 1;
+    } else {
+        __cser_core::panic!("historical crash fault changed phase")
+    }
+    __cser_core::assert_eq!(
+        state.domain_fault_recovery_projection(SCOPE, SERVICE, binding_epoch),
+        Err(InfrastructureError::Invariant(
+            "duplicate domain fault recovery projection"
+        ))
+    );
+}
+
+#[test]
 fn task_fault_invariants_bind_both_directions_disposition_and_exact_exit_digest() {
     let installed = applied_fault_state(FaultDisposition::CrashService);
 
@@ -5237,6 +5285,17 @@ fn task_fault_invariants_bind_both_directions_disposition_and_exact_exit_digest(
                 .owner
                 .task_bearer_generation += 1
         },
+        |state| {
+            state
+                .scope_mut(SCOPE)
+                .unwrap()
+                .faults
+                .get_mut(0xb700)
+                .unwrap()
+                .stamp
+                .identity
+                .admission_binding_epoch += 1
+        },
     ];
     for mutate in pair_mutations {
         let mut corrupt = installed.private_full_clone();
@@ -5268,7 +5327,7 @@ fn task_fault_invariants_bind_both_directions_disposition_and_exact_exit_digest(
     {
         *cause_claimed = true;
     } else {
-        panic!("claimed isolate fault changed phase")
+        __cser_core::panic!("claimed isolate fault changed phase")
     }
     assert_invariant_message_read_only(isolate, "fault phase projection mismatch");
 
@@ -5309,7 +5368,7 @@ fn task_fault_invariants_bind_both_directions_disposition_and_exact_exit_digest(
         if let FaultPhase::Exited { ref mut receipt } = fault.phase {
             mutate(receipt);
         } else {
-            panic!("service exit changed fault phase")
+            __cser_core::panic!("service exit changed fault phase")
         }
         assert_invariant_message_read_only(corrupt, "fault phase projection mismatch");
     }

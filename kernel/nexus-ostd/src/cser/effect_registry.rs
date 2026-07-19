@@ -8693,12 +8693,7 @@ impl EffectRegistry {
     ) -> Result<(), RegistryError> {
         let projection = self
             .infrastructure
-            .domain_fault_recovery_projection(
-                scope,
-                domain,
-                binding.binding_epoch,
-                recovery.crash_revision,
-            )
+            .domain_fault_recovery_projection(scope, domain, binding.binding_epoch)
             .map_err(|_| RegistryError::Invariant("domain recovery origin mismatch"))?;
         let anchor = match (recovery.origin, projection) {
             (DomainRecoveryOrigin::SupervisorCrash, None) => return Ok(()),
@@ -8794,6 +8789,7 @@ impl EffectRegistry {
                 }
                 if let Some(recovery) = &binding.recovery {
                     if scope.phase != ScopePhase::Active
+                        || recovery.crash_revision == 0
                         || recovery.crash_revision > binding.revision
                         || !recovery.unadopted.is_subset(&recovery.cohort)
                     {
@@ -13019,6 +13015,81 @@ fn task_owned_fault_outer_transaction_self_test() {
     );
     __cser_core::assert_eq!(missing_fault_origin, before);
 
+    let mut zero_revision = crash.clone();
+    zero_revision
+        .scopes
+        .get_mut(&SCOPE)
+        .unwrap()
+        .domains
+        .get_mut(&SERVICE)
+        .unwrap()
+        .recovery
+        .as_mut()
+        .unwrap()
+        .crash_revision = 0;
+    let before = zero_revision.clone();
+    __cser_core::assert_eq!(
+        zero_revision.check_invariants(),
+        Err(RegistryError::Invariant("invalid domain recovery state"))
+    );
+    __cser_core::assert_eq!(zero_revision, before);
+
+    let mut synchronized_zero_origin = crash.clone();
+    let binding = synchronized_zero_origin
+        .scopes
+        .get_mut(&SCOPE)
+        .unwrap()
+        .domains
+        .get_mut(&SERVICE)
+        .unwrap();
+    let recovery = binding.recovery.as_mut().unwrap();
+    recovery.crash_revision = 0;
+    recovery.origin = DomainRecoveryOrigin::SupervisorCrash;
+    let before = synchronized_zero_origin.clone();
+    __cser_core::assert_eq!(
+        synchronized_zero_origin.check_invariants(),
+        Err(RegistryError::Invariant("invalid domain recovery state"))
+    );
+    __cser_core::assert_eq!(synchronized_zero_origin, before);
+
+    let mut wrong_nonzero_revision = crash.clone();
+    let binding = wrong_nonzero_revision
+        .scopes
+        .get_mut(&SCOPE)
+        .unwrap()
+        .domains
+        .get_mut(&SERVICE)
+        .unwrap();
+    binding.revision = 2;
+    binding.recovery.as_mut().unwrap().crash_revision = 2;
+    let before = wrong_nonzero_revision.clone();
+    __cser_core::assert_eq!(
+        wrong_nonzero_revision.check_invariants(),
+        Err(RegistryError::Invariant(
+            "domain fault recovery anchor mismatch"
+        ))
+    );
+    __cser_core::assert_eq!(wrong_nonzero_revision, before);
+
+    let mut synchronized_wrong_nonzero_origin = crash.clone();
+    let binding = synchronized_wrong_nonzero_origin
+        .scopes
+        .get_mut(&SCOPE)
+        .unwrap()
+        .domains
+        .get_mut(&SERVICE)
+        .unwrap();
+    binding.revision = 2;
+    let recovery = binding.recovery.as_mut().unwrap();
+    recovery.crash_revision = 2;
+    recovery.origin = DomainRecoveryOrigin::SupervisorCrash;
+    let before = synchronized_wrong_nonzero_origin.clone();
+    __cser_core::assert_eq!(
+        synchronized_wrong_nonzero_origin.check_invariants(),
+        Err(RegistryError::Invariant("domain recovery origin mismatch"))
+    );
+    __cser_core::assert_eq!(synchronized_wrong_nonzero_origin, before);
+
     type MutateAnchor = fn(&mut DomainFaultRecoveryAnchor);
     let anchor_mutations: &[MutateAnchor] = &[
         |anchor| anchor.fault_id += 1,
@@ -13041,7 +13112,7 @@ fn task_owned_fault_outer_transaction_self_test() {
             .as_mut()
             .unwrap();
         let DomainRecoveryOrigin::ServiceFault(anchor) = &mut recovery.origin else {
-            panic!("fault crash changed recovery origin")
+            __cser_core::panic!("fault crash changed recovery origin")
         };
         mutate(anchor);
         let before = corrupt.clone();
@@ -13104,7 +13175,7 @@ fn task_owned_fault_outer_transaction_self_test() {
     let projection = match installed {
         infrastructure::InstalledFaultObservation::Crash(projection) => projection,
         infrastructure::InstalledFaultObservation::Isolate(_) => {
-            panic!("crash recovery selector has isolate variant")
+            __cser_core::panic!("crash recovery selector has isolate variant")
         }
     };
     let awaiting_before = crash.infrastructure.private_full_clone();
@@ -13122,7 +13193,7 @@ fn task_owned_fault_outer_transaction_self_test() {
         .unwrap()
     {
         infrastructure::FaultReceiptClaimOutcome::Crash(receipt) => receipt,
-        _ => panic!("crash install minted the wrong typed receipt"),
+        _ => __cser_core::panic!("crash install minted the wrong typed receipt"),
     };
     let claimed_before_duplicate = crash.infrastructure.private_full_clone();
     __cser_core::assert!(__cser_core::matches!(

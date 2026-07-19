@@ -812,7 +812,6 @@ impl InfrastructureState {
         scope_key: super::ScopeKey,
         service_domain: super::DomainKey,
         binding_epoch: u64,
-        crash_generation: u64,
     ) -> Result<Option<DomainFaultRecoveryProjection>, InfrastructureError> {
         let scope = match self.scope(scope_key) {
             Ok(scope) => scope,
@@ -841,7 +840,6 @@ impl InfrastructureState {
                 | FaultPhase::Claimed { .. } => continue,
             };
             if projection.service_domain != service_domain
-                || projection.crash_generation != crash_generation
                 || projection
                     .closed_binding_epoch
                     .checked_add(1)
@@ -1024,6 +1022,8 @@ pub(super) fn validate_exact_task_fault_pair<'a>(
         || descriptor.task != task.stamp.identity.task
         || task.stamp.identity.vm.map(VmAuthorityKey::generation) != Some(descriptor.vm_generation)
         || descriptor.service_domain != fault.stamp.domain.domain
+        || descriptor.admission_binding_epoch != fault.stamp.domain.binding_epoch
+        || descriptor.admission_binding_epoch != task.stamp.domain.binding_epoch
         || fault.owner.task != task.stamp.identity
         || fault.owner.task_object_nonce != task.stamp.nonce
         || fault.owner.task_bearer_generation != task.stamp.bearer_generation
