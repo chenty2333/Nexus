@@ -196,6 +196,8 @@ flight="$work/device-flight.rs"
 causal_slot="$work/causal-adapter-slot.rs"
 runtime="$work/production-runtime.rs"
 runtime_impl="$work/production-runtime-impl.rs"
+retain_current="$work/retain-current.rs"
+retained_terminal="$work/retained-terminal.rs"
 dispatch="$work/same-boot-dispatch.rs"
 capture="$work/same-boot-capture.rs"
 guest_wait="$work/filesystem-guest-wait.rs"
@@ -258,6 +260,10 @@ extract_between "$source_file" 'struct ProductionReadRuntime {' \
     'impl ProductionReadRuntime {' "$runtime"
 extract_between "$source_file" 'impl ProductionReadRuntime {' \
     'struct ProductionReadReceipt {' "$runtime_impl"
+extract_between "$source_file" "    fn retain_current(&mut self, stage: &'static str) -> u64 {" \
+    '    fn verify_complete(&self)' "$retain_current"
+extract_between "$retain_current" '            FsDeviceFlight::Draining {' \
+    '            retained @ FsDeviceFlight::Retained' "$retained_terminal"
 extract_between "$source_file" 'fn fsd_next_operation(&self, sender: TaskKey)' \
     'fn fsd_prepare_active(&self, sender: TaskKey)' "$service_next"
 extract_between "$source_file" 'fn fsd_prepare_active(&self, sender: TaskKey)' \
@@ -1180,6 +1186,26 @@ require_order "$closure_driver" \
     'LINUX_FS_SAME_BOOT IotlbAck completed_pages=3' \
     '.stage_device_batch_terminal('
 
+# A post-IOTLB close is already authoritative. Every failure after that point
+# must retain the exact closure receipt, work projection, drain ordinal, and
+# optional publication ticket. Generic retention must likewise leave both
+# Draining and AwaitingPublication intact so retry/outer acknowledgement can
+# resume without reconstructing authority.
+require_at_least "$closure_driver" \
+    'runtime.put_flight(FsDeviceFlight::Draining {' 8
+reject_fixed "$post_terminal" 'FsDeviceFlight::Retained {'
+require_count "$retained_terminal" 'closure,' 2
+require_count "$retained_terminal" 'work,' 4
+require_count "$retained_terminal" 'next_ordinal,' 2
+require_count "$retained_terminal" 'publication,' 2
+require_count "$retained_terminal" 'selection,' 2
+require_count "$retained_terminal" 'ticket,' 2
+require_count "$retained_terminal" \
+    'self.put_flight(FsDeviceFlight::Draining {' 1
+require_count "$retained_terminal" \
+    'self.put_flight(FsDeviceFlight::AwaitingPublication {' 1
+reject_fixed "$retained_terminal" 'FsRetainedHardware::Ready'
+
 # Guest publication is the final cross-object transition. The Registry must
 # acknowledge the terminal publication and complete the frozen revoke as one
 # failure-atomic operation. The flight remains runtime-resident while all
@@ -1417,6 +1443,44 @@ if [[ ${NEXUS_SAME_BOOT_SOURCE_PRIMARY_ONLY:-0} != 1 ]]; then
         missing-retained-semantic
     require_source_rejection "$work/missing-retained-semantic.rs" \
         missing-retained-semantic
+
+    awk '
+        /fn retain_current\(&mut self, stage:/ { retain_current = 1 }
+        retain_current &&
+            /self\.put_flight\(FsDeviceFlight::Draining \{/ {
+            rebuilding_draining = 1
+        }
+        rebuilding_draining && !changed &&
+            /^[[:space:]]*closure,$/ {
+            changed = 1
+            next
+        }
+        { print }
+        END { if (!changed) exit 2 }
+    ' "$source_file" >"$work/drop-retained-draining-closure.rs"
+    require_mutation "$source_file" "$work/drop-retained-draining-closure.rs" \
+        drop-retained-draining-closure
+    require_source_rejection "$work/drop-retained-draining-closure.rs" \
+        drop-retained-draining-closure
+
+    awk '
+        /fn retain_current\(&mut self, stage:/ { retain_current = 1 }
+        retain_current &&
+            /self\.put_flight\(FsDeviceFlight::AwaitingPublication \{/ {
+            rebuilding_publication = 1
+        }
+        rebuilding_publication && !changed &&
+            /^[[:space:]]*ticket,$/ {
+            changed = 1
+            next
+        }
+        { print }
+        END { if (!changed) exit 2 }
+    ' "$source_file" >"$work/drop-retained-publication-ticket.rs"
+    require_mutation "$source_file" "$work/drop-retained-publication-ticket.rs" \
+        drop-retained-publication-ticket
+    require_source_rejection "$work/drop-retained-publication-ticket.rs" \
+        drop-retained-publication-ticket
 
     cp "$device_flight_file" "$work/recovery-republishes.rs"
     sed -i \
@@ -1876,7 +1940,7 @@ if [[ ${NEXUS_SAME_BOOT_SOURCE_PRIMARY_ONLY:-0} != 1 ]]; then
     require_mutation "$source_file" "$work/publish-owner-expect.rs" publish-owner-expect
     require_source_rejection "$work/publish-owner-expect.rs" publish-owner-expect
 
-    [[ $mutations == 44 ]] || fail "expected 44 source mutations, observed $mutations"
+    [[ $mutations == 46 ]] || fail "expected 46 source mutations, observed $mutations"
 fi
 
-echo 'runtime filesystem same-boot source assertions: PASS checkpoint=device_flight accepted_registry=one accepted_ledger=one compatibility_syscalls=payload_only_not_cser causal_bootstrap=workload+two-phase-core causal_slot=vacant+active+closed causal_close=non-clone+failure-atomic+projected-root-finish combined_order=external+ack+workload+root exact_outer_ack_retry=true rfc0003_obligations=not_wired source_mapped=false observed=false adapter_wired=false flight=single_actor_slot_handoff actor_resident=false semantic_identity=registry_issued receipt_boundary=provider-neutral+sibling-adapter-only real_user_service_crash=true fsd_task_key=current-task-bound+951:1->951:2 replacement_construction=post-crash distinct_task_vm=true guest_admission=receipt-before-armed guest_wait_locks=none crash_cohort=filesystem_read_only stale_prepare=queued-v1+failure-atomic old_sender_current_handle=NoSupervisor reply_wakeups=1 published_error=retained ack_revoke=failure_atomic guest_write=prevalidated+infallible_frame_apply fail_stop=before_guest_resume post_terminal_allocation=false facade_companion=false polling=true irq_evidence=false smp=1 legacy_phase=false rfc0001_full_closure=false mutations=44'
+echo 'runtime filesystem same-boot source assertions: PASS checkpoint=device_flight accepted_registry=one accepted_ledger=one compatibility_syscalls=payload_only_not_cser causal_bootstrap=workload+two-phase-core causal_slot=vacant+active+closed causal_close=non-clone+failure-atomic+projected-root-finish combined_order=external+ack+workload+root exact_outer_ack_retry=true rfc0003_obligations=not_wired source_mapped=false observed=false adapter_wired=false flight=single_actor_slot_handoff actor_resident=false semantic_identity=registry_issued receipt_boundary=provider-neutral+sibling-adapter-only real_user_service_crash=true fsd_task_key=current-task-bound+951:1->951:2 replacement_construction=post-crash distinct_task_vm=true guest_admission=receipt-before-armed guest_wait_locks=none crash_cohort=filesystem_read_only stale_prepare=queued-v1+failure-atomic old_sender_current_handle=NoSupervisor reply_wakeups=1 published_error=retained ack_revoke=failure_atomic guest_write=prevalidated+infallible_frame_apply fail_stop=before_guest_resume post_terminal_allocation=false facade_companion=false polling=true irq_evidence=false smp=1 legacy_phase=false rfc0001_full_closure=false mutations=46'

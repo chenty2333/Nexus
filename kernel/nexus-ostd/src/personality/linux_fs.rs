@@ -1451,18 +1451,41 @@ impl ProductionReadRuntime {
                 semantic,
                 root,
                 device,
-                ..
-            } => (
-                semantic.cookie(),
-                Some(FsRetainedSemantic::Close(semantic)),
-                FsRetainedHardware::Ready { root, device },
-            ),
+                closure,
+                work,
+                next_ordinal,
+                publication,
+            } => {
+                let cookie = semantic.cookie();
+                self.put_flight(FsDeviceFlight::Draining {
+                    semantic,
+                    root,
+                    device,
+                    closure,
+                    work,
+                    next_ordinal,
+                    publication,
+                });
+                return cookie;
+            }
             FsDeviceFlight::AwaitingPublication {
                 cookie,
                 root,
                 device,
-                ..
-            } => (cookie, None, FsRetainedHardware::Ready { root, device }),
+                selection,
+                ticket,
+                work,
+            } => {
+                self.put_flight(FsDeviceFlight::AwaitingPublication {
+                    cookie,
+                    root,
+                    device,
+                    selection,
+                    ticket,
+                    work,
+                });
+                return cookie;
+            }
             retained @ FsDeviceFlight::Retained { cookie, .. } => {
                 self.put_flight(retained);
                 return cookie;
@@ -5514,11 +5537,14 @@ impl FsScenario {
                             Ok(Some(selected)) if selected.effect == expected => selected,
                             _ => {
                                 let cookie = semantic.cookie();
-                                runtime.put_flight(FsDeviceFlight::Retained {
-                                    cookie,
-                                    semantic: Some(FsRetainedSemantic::Close(semantic)),
-                                    hardware: FsRetainedHardware::Ready { root, device },
-                                    stage: "device_drain_selection",
+                                runtime.put_flight(FsDeviceFlight::Draining {
+                                    semantic,
+                                    root,
+                                    device,
+                                    closure,
+                                    work,
+                                    next_ordinal,
+                                    publication,
                                 });
                                 return DispatchOutcome::retained(cookie);
                             }
@@ -5542,11 +5568,14 @@ impl FsScenario {
                                     }
                                     DeviceClosureResult::AbortedBeforeCommit => {
                                         let cookie = semantic.cookie();
-                                        runtime.put_flight(FsDeviceFlight::Retained {
-                                            cookie,
-                                            semantic: Some(FsRetainedSemantic::Close(semantic)),
-                                            hardware: FsRetainedHardware::Ready { root, device },
-                                            stage: "published_close_reported_precommit_abort",
+                                        runtime.put_flight(FsDeviceFlight::Draining {
+                                            semantic,
+                                            root,
+                                            device,
+                                            closure,
+                                            work,
+                                            next_ordinal,
+                                            publication,
                                         });
                                         return DispatchOutcome::retained(cookie);
                                     }
@@ -5564,11 +5593,14 @@ impl FsScenario {
                             Ok(terminal) => terminal,
                             Err(_) => {
                                 let cookie = semantic.cookie();
-                                runtime.put_flight(FsDeviceFlight::Retained {
-                                    cookie,
-                                    semantic: Some(FsRetainedSemantic::Close(semantic)),
-                                    hardware: FsRetainedHardware::Ready { root, device },
-                                    stage: "device_drain_terminal",
+                                runtime.put_flight(FsDeviceFlight::Draining {
+                                    semantic,
+                                    root,
+                                    device,
+                                    closure,
+                                    work,
+                                    next_ordinal,
+                                    publication,
                                 });
                                 return DispatchOutcome::retained(cookie);
                             }
@@ -5610,21 +5642,27 @@ impl FsScenario {
                     }
                     if !matches!(runtime.registry.revoke_next(semantic.selection()), Ok(None)) {
                         let cookie = semantic.cookie();
-                        runtime.put_flight(FsDeviceFlight::Retained {
-                            cookie,
-                            semantic: Some(FsRetainedSemantic::Close(semantic)),
-                            hardware: FsRetainedHardware::Ready { root, device },
-                            stage: "device_drain_not_empty",
+                        runtime.put_flight(FsDeviceFlight::Draining {
+                            semantic,
+                            root,
+                            device,
+                            closure,
+                            work,
+                            next_ordinal,
+                            publication,
                         });
                         return DispatchOutcome::retained(cookie);
                     }
                     let Some(ticket) = publication else {
                         let cookie = semantic.cookie();
-                        runtime.put_flight(FsDeviceFlight::Retained {
-                            cookie,
-                            semantic: Some(FsRetainedSemantic::Close(semantic)),
-                            hardware: FsRetainedHardware::Ready { root, device },
-                            stage: "device_drain_missing_publication",
+                        runtime.put_flight(FsDeviceFlight::Draining {
+                            semantic,
+                            root,
+                            device,
+                            closure,
+                            work,
+                            next_ordinal,
+                            publication: None,
                         });
                         return DispatchOutcome::retained(cookie);
                     };
