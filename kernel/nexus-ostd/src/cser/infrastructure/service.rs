@@ -101,6 +101,7 @@ impl InfrastructureState {
             source_binding_epoch: Some(descriptor.destination_binding_epoch),
             resource: Some(descriptor.queue),
             actor_slot: Some(descriptor.payload_slot),
+            actor_generation: Some(descriptor.payload_generation),
             retry_generation: descriptor.generation,
         };
         scope.service_requests.install(
@@ -1064,6 +1065,7 @@ fn validate_service_request_stamp(
         source_binding_epoch: Some(stamp.identity.destination_binding_epoch),
         resource: Some(stamp.identity.queue),
         actor_slot: Some(stamp.identity.payload_slot),
+        actor_generation: Some(stamp.identity.payload_generation),
         retry_generation: stamp.identity.generation,
     };
     if scope.reverse_indexes.get(stamp.nonce) != Some(&expected_index) {

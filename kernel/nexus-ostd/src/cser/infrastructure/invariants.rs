@@ -8,11 +8,12 @@ use __cser_alloc::vec::Vec;
 use super::fault::{exit_receipt_digest, validate_exact_task_fault_pair};
 use super::{
     BearerStamp, ContinuationPhase, ContinuationRecord, DeadlineExhaustedDisposition,
-    DeadlinePhase, DeadlineRecord, DelayedCommandPhase, DelayedCommandStateRecord, DevicePhase,
-    DeviceRecord, DeviceReservationCoordinates, FaultDisposition, FaultPhase, FaultStateRecord,
-    FixedSlots, InfrastructureError, InfrastructureKind, InfrastructureLiveCounts, ParentStamp,
-    ReplyPhase, ReplyStateRecord, RequestKey, ResourceUsage, ReverseIndexRecord, ReverseParent,
-    ScopeInfrastructure, ServiceArmReceipt, ServiceCancellationPoint, ServiceChildBindingReceipt,
+    DeadlinePhase, DeadlineRecord, DelayedCommandPhase, DelayedCommandStateRecord,
+    DeviceCreditOwnership, DevicePhase, DeviceRecord, DeviceReservationCoordinates,
+    FaultDisposition, FaultPhase, FaultStateRecord, FixedSlots, InfrastructureError,
+    InfrastructureKind, InfrastructureLiveCounts, ParentStamp, ReplyPhase, ReplyStateRecord,
+    RequestKey, ResourceUsage, ReverseIndexRecord, ReverseParent, ScopeInfrastructure,
+    ServiceArmReceipt, ServiceCancellationPoint, ServiceChildBindingReceipt,
     ServiceClaimantSnapshot, ServiceEnqueueReceipt, ServiceRequestCausalIdentity,
     ServiceRequestPhase, ServiceRequestStateRecord, SlotIdentity, TaskAnchorPhase, TaskPhase,
     TaskWorkDescriptor, VmAuthorityKey, WorkloadPhase, delayed_command_phase_live,
@@ -104,6 +105,7 @@ pub(super) fn check_scope_invariants(
                 source_binding_epoch: None,
                 resource: None,
                 actor_slot: None,
+                actor_generation: None,
                 retry_generation: record.request.generation,
             },
         )?;
@@ -252,6 +254,40 @@ pub(super) fn check_scope_invariants(
         if device_phase_live(record.phase) {
             increment_invariant(&mut expected_live.device_preparations)?;
             increment_workload_child(&mut workload_children, record.stamp.workload.request)?;
+        }
+        let credit_owner_matches = __cser_core::matches!(
+            (record.phase, record.credit_ownership),
+            (DevicePhase::Reserved, DeviceCreditOwnership::Held)
+                | (
+                    DevicePhase::Applying { .. } | DevicePhase::PreparedRetained { .. },
+                    DeviceCreditOwnership::Retained
+                )
+                | (
+                    DevicePhase::Materialized {
+                        preparation_credits_transferred: true,
+                        ..
+                    },
+                    DeviceCreditOwnership::Transferred
+                )
+                | (
+                    DevicePhase::Released {
+                        cohort_digest: Some(_),
+                        ..
+                    },
+                    DeviceCreditOwnership::Transferred
+                )
+                | (
+                    DevicePhase::Released {
+                        cohort_digest: None,
+                        ..
+                    } | DevicePhase::Cancelled { .. },
+                    DeviceCreditOwnership::Released
+                )
+        );
+        if !credit_owner_matches {
+            return Err(InfrastructureError::Invariant(
+                "device preparation credit owner mismatch",
+            ));
         }
         match record.phase {
             DevicePhase::Reserved
@@ -548,19 +584,19 @@ fn account_live_task_child<I>(
 
 fn add_device_usage(
     usage: &mut ResourceUsage,
-    coordinates: DeviceReservationCoordinates,
+    _coordinates: DeviceReservationCoordinates,
 ) -> Result<(), InfrastructureError> {
     usage.queue_slots = usage
         .queue_slots
-        .checked_add(coordinates.queue_slots)
+        .checked_add(super::DEVICE_QUEUE_SLOTS)
         .ok_or(InfrastructureError::Invariant("queue usage overflow"))?;
     usage.pinned_pages = usage
         .pinned_pages
-        .checked_add(coordinates.pinned_pages)
+        .checked_add(super::DEVICE_PINNED_PAGES)
         .ok_or(InfrastructureError::Invariant("pinned-page usage overflow"))?;
     usage.dma_mappings = usage
         .dma_mappings
-        .checked_add(coordinates.dma_mappings)
+        .checked_add(super::DEVICE_DMA_MAPPINGS)
         .ok_or(InfrastructureError::Invariant("DMA usage overflow"))?;
     Ok(())
 }
@@ -932,6 +968,7 @@ fn reverse_index_for_service(record: &ServiceRequestStateRecord) -> ReverseIndex
         source_binding_epoch: Some(descriptor.destination_binding_epoch),
         resource: Some(descriptor.queue),
         actor_slot: Some(descriptor.payload_slot),
+        actor_generation: Some(descriptor.payload_generation),
         retry_generation: descriptor.generation,
     }
 }
@@ -950,7 +987,8 @@ fn reverse_index_for_delayed(record: &DelayedCommandStateRecord) -> ReverseIndex
         source_binding_epoch: Some(descriptor.destination_binding_epoch),
         resource: None,
         actor_slot: Some(descriptor.actor_slot),
-        retry_generation: descriptor.actor_generation,
+        actor_generation: Some(descriptor.actor_generation),
+        retry_generation: descriptor.generation,
     }
 }
 
@@ -968,6 +1006,7 @@ fn reverse_index_for_continuation(record: &ContinuationRecord) -> ReverseIndexRe
         source_binding_epoch: Some(descriptor.source_binding_epoch),
         resource: None,
         actor_slot: None,
+        actor_generation: None,
         retry_generation: descriptor.generation,
     }
 }
@@ -986,6 +1025,7 @@ fn reverse_index_for_deadline(record: &DeadlineRecord) -> ReverseIndexRecord {
         source_binding_epoch: None,
         resource: None,
         actor_slot: None,
+        actor_generation: None,
         retry_generation: descriptor.generation,
     }
 }
@@ -1010,6 +1050,7 @@ fn reverse_index_for_device(
         source_binding_epoch: None,
         resource: Some(descriptor.owned_device),
         actor_slot: Some(descriptor.actor_slot),
+        actor_generation: Some(descriptor.actor_generation),
         retry_generation: descriptor.generation,
     })
 }
@@ -1028,7 +1069,8 @@ fn reverse_index_for_reply(record: &ReplyStateRecord) -> ReverseIndexRecord {
         source_binding_epoch: Some(descriptor.source_binding_epoch),
         resource: None,
         actor_slot: Some(descriptor.payload_slot),
-        retry_generation: descriptor.payload_generation,
+        actor_generation: Some(descriptor.payload_generation),
+        retry_generation: descriptor.generation,
     }
 }
 

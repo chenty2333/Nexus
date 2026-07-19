@@ -4,16 +4,18 @@ extern crate alloc as __cser_alloc;
 extern crate core as __cser_core;
 
 use super::{
-    BearerStamp, DeviceAdoption, DeviceApplyIntent, DeviceHardwareReceipt,
-    DeviceMaterializationPlan, DevicePhase, DevicePreparationRecoveryProjection,
-    DevicePreparationRecoveryState, DevicePreparationTicket, DeviceRecord,
-    DeviceReservationCoordinates, DeviceRollbackReceipt, EffectKey, InfrastructureError,
-    InfrastructureEventKind, InfrastructureKind, InfrastructureState, LedgerMode, LinearResult,
-    MaterializedDeviceTicket, ParentStamp, PreparedOwner, RegistryDeviceClosureReceipt,
-    ReverseIndexRecord, ReverseParent, ScopeInfrastructure, ValidatedDeviceClosureProof,
-    WorkloadContext, checked_add, checked_sub, linear_apply, preview_bearer_stamp, preview_nonce,
-    preview_nonces, preview_revision, preview_workload_child_add, preview_workload_child_sub,
-    require_vacancy, validate_active_admission, validate_context, validate_device_bearer,
+    BearerStamp, DEVICE_DMA_MAPPINGS, DEVICE_PINNED_PAGES, DEVICE_QUEUE_SLOTS, DeviceAdoption,
+    DeviceApplyIntent, DeviceCreditOwnership, DeviceHardwareReceipt, DeviceMaterializationPlan,
+    DevicePhase, DevicePreparationCreditOwnership, DevicePreparationCreditProjection,
+    DevicePreparationRecoveryProjection, DevicePreparationRecoveryState, DevicePreparationTicket,
+    DeviceRecord, DeviceReservationCoordinates, DeviceRollbackReceipt, EffectKey,
+    InfrastructureError, InfrastructureEventKind, InfrastructureKind, InfrastructureState,
+    LedgerMode, LinearResult, MaterializedDeviceTicket, ParentStamp, PreparedOwner,
+    RegistryDeviceClosureReceipt, ReverseIndexRecord, ReverseParent, ScopeInfrastructure,
+    ValidatedDeviceClosureProof, WorkloadContext, checked_add, checked_sub, linear_apply,
+    preview_bearer_stamp, preview_nonce, preview_nonces, preview_revision,
+    preview_workload_child_add, preview_workload_child_sub, require_vacancy,
+    validate_active_admission, validate_context, validate_device_bearer,
 };
 
 impl InfrastructureState {
@@ -23,7 +25,36 @@ impl InfrastructureState {
         parent_effect: EffectKey,
         coordinates: DeviceReservationCoordinates,
     ) -> Result<DevicePreparationTicket, InfrastructureError> {
-        self.require_authoritative()?;
+        self.reserve_device_preparation_for_mode(
+            context,
+            parent_effect,
+            coordinates,
+            LedgerMode::Authoritative,
+        )
+    }
+
+    pub(in super::super) fn reserve_device_preparation_in_candidate(
+        &mut self,
+        context: &WorkloadContext,
+        parent_effect: EffectKey,
+        coordinates: DeviceReservationCoordinates,
+    ) -> Result<DevicePreparationTicket, InfrastructureError> {
+        self.reserve_device_preparation_for_mode(
+            context,
+            parent_effect,
+            coordinates,
+            LedgerMode::NonAuthoritativeCandidate,
+        )
+    }
+
+    fn reserve_device_preparation_for_mode(
+        &mut self,
+        context: &WorkloadContext,
+        parent_effect: EffectKey,
+        coordinates: DeviceReservationCoordinates,
+        expected_mode: LedgerMode,
+    ) -> Result<DevicePreparationTicket, InfrastructureError> {
+        require_device_ledger_mode(self, expected_mode)?;
         coordinates.validate()?;
         let registry_instance = self.registry_instance;
         let scope = self.scope_mut(context.root.scope)?;
@@ -56,7 +87,7 @@ impl InfrastructureState {
         let next_queue_slots = scope
             .live
             .queue_slots
-            .checked_add(coordinates.queue_slots)
+            .checked_add(DEVICE_QUEUE_SLOTS)
             .ok_or(InfrastructureError::CounterOverflow)?;
         if next_queue_slots > scope.limits.queue_slots {
             return Err(InfrastructureError::QueueSlotQuotaExceeded);
@@ -64,7 +95,7 @@ impl InfrastructureState {
         let next_pinned = scope
             .live
             .pinned_pages
-            .checked_add(coordinates.pinned_pages)
+            .checked_add(DEVICE_PINNED_PAGES)
             .ok_or(InfrastructureError::CounterOverflow)?;
         if next_pinned > scope.limits.pinned_pages {
             return Err(InfrastructureError::PinnedPageQuotaExceeded);
@@ -72,7 +103,7 @@ impl InfrastructureState {
         let next_dma = scope
             .live
             .dma_mappings
-            .checked_add(coordinates.dma_mappings)
+            .checked_add(DEVICE_DMA_MAPPINGS)
             .ok_or(InfrastructureError::CounterOverflow)?;
         if next_dma > scope.limits.dma_mappings {
             return Err(InfrastructureError::DmaMappingQuotaExceeded);
@@ -103,12 +134,14 @@ impl InfrastructureState {
             source_binding_epoch: None,
             resource: Some(coordinates.owned_device),
             actor_slot: Some(coordinates.actor_slot),
+            actor_generation: Some(coordinates.actor_generation),
             retry_generation: coordinates.generation,
         };
         scope.devices.install(
             DeviceRecord {
                 stamp,
                 apply_generation: 0,
+                credit_ownership: DeviceCreditOwnership::Held,
                 phase: DevicePhase::Reserved,
                 closure_sequence: None,
             },
@@ -142,8 +175,24 @@ impl InfrastructureState {
         &mut self,
         ticket: DevicePreparationTicket,
     ) -> LinearResult<DevicePreparationTicket, ()> {
+        self.cancel_reserved_device_for_mode(ticket, LedgerMode::Authoritative)
+            .map(|_| ())
+    }
+
+    pub(in super::super) fn cancel_reserved_device_in_candidate(
+        &mut self,
+        ticket: DevicePreparationTicket,
+    ) -> LinearResult<DevicePreparationTicket, DevicePreparationTicket> {
+        self.cancel_reserved_device_for_mode(ticket, LedgerMode::NonAuthoritativeCandidate)
+    }
+
+    fn cancel_reserved_device_for_mode(
+        &mut self,
+        ticket: DevicePreparationTicket,
+        expected_mode: LedgerMode,
+    ) -> LinearResult<DevicePreparationTicket, DevicePreparationTicket> {
         linear_apply(ticket, |ticket| {
-            self.require_authoritative()?;
+            require_device_ledger_mode(self, expected_mode)?;
             let stamp = ticket.0;
             let registry_instance = self.registry_instance;
             let scope = self.scope_mut(stamp.root.scope)?;
@@ -157,7 +206,8 @@ impl InfrastructureState {
             {
                 return Err(InfrastructureError::InvalidState);
             }
-            finish_device(scope, stamp, DevicePhase::Cancelled { rollback: None })
+            finish_device(scope, stamp, DevicePhase::Cancelled { rollback: None })?;
+            Ok(DevicePreparationTicket(stamp))
         })
     }
 
@@ -165,8 +215,23 @@ impl InfrastructureState {
         &mut self,
         ticket: DevicePreparationTicket,
     ) -> LinearResult<DevicePreparationTicket, DeviceApplyIntent> {
+        self.begin_device_hardware_apply_for_mode(ticket, LedgerMode::Authoritative)
+    }
+
+    pub(in super::super) fn begin_device_hardware_apply_in_candidate(
+        &mut self,
+        ticket: DevicePreparationTicket,
+    ) -> LinearResult<DevicePreparationTicket, DeviceApplyIntent> {
+        self.begin_device_hardware_apply_for_mode(ticket, LedgerMode::NonAuthoritativeCandidate)
+    }
+
+    fn begin_device_hardware_apply_for_mode(
+        &mut self,
+        ticket: DevicePreparationTicket,
+        expected_mode: LedgerMode,
+    ) -> LinearResult<DevicePreparationTicket, DeviceApplyIntent> {
         linear_apply(ticket, |ticket| {
-            self.require_authoritative()?;
+            require_device_ledger_mode(self, expected_mode)?;
             let stamp = ticket.0;
             let registry_instance = self.registry_instance;
             let scope = self.scope_mut(stamp.root.scope)?;
@@ -186,6 +251,7 @@ impl InfrastructureState {
                 .get_mut(stamp.identity.preparation_id)
                 .unwrap();
             record.apply_generation = apply_generation;
+            record.credit_ownership = DeviceCreditOwnership::Retained;
             record.phase = DevicePhase::Applying {
                 apply_generation,
                 apply_nonce,
@@ -210,8 +276,30 @@ impl InfrastructureState {
         intent: DeviceApplyIntent,
         rollback: DeviceRollbackReceipt,
     ) -> LinearResult<DeviceApplyIntent, DeviceRollbackReceipt> {
+        self.acknowledge_device_apply_rollback_for_mode(intent, rollback, LedgerMode::Authoritative)
+            .map(|(_, receipt)| receipt)
+    }
+
+    pub(in super::super) fn acknowledge_device_apply_rollback_in_candidate(
+        &mut self,
+        intent: DeviceApplyIntent,
+        rollback: DeviceRollbackReceipt,
+    ) -> LinearResult<DeviceApplyIntent, (DeviceApplyIntent, DeviceRollbackReceipt)> {
+        self.acknowledge_device_apply_rollback_for_mode(
+            intent,
+            rollback,
+            LedgerMode::NonAuthoritativeCandidate,
+        )
+    }
+
+    fn acknowledge_device_apply_rollback_for_mode(
+        &mut self,
+        intent: DeviceApplyIntent,
+        rollback: DeviceRollbackReceipt,
+        expected_mode: LedgerMode,
+    ) -> LinearResult<DeviceApplyIntent, (DeviceApplyIntent, DeviceRollbackReceipt)> {
         linear_apply(intent, |intent| {
-            self.require_authoritative()?;
+            require_device_ledger_mode(self, expected_mode)?;
             let stamp = intent.preparation;
             let registry_instance = self.registry_instance;
             let scope = self.scope_mut(stamp.root.scope)?;
@@ -223,6 +311,7 @@ impl InfrastructureState {
                 || rollback.device_generation != coordinates.device_generation
                 || rollback.operation_digest != coordinates.operation_digest
                 || rollback.actor_slot != coordinates.actor_slot
+                || rollback.actor_generation != coordinates.actor_generation
                 || rollback.rollback_receipt_digest == 0
             {
                 return Err(InfrastructureError::InvalidReceipt);
@@ -239,7 +328,14 @@ impl InfrastructureState {
                 coordinates.preparation_id,
                 coordinates.generation,
             );
-            Ok(rollback)
+            Ok((
+                DeviceApplyIntent {
+                    preparation: intent.preparation,
+                    apply_generation: intent.apply_generation,
+                    apply_nonce: intent.apply_nonce,
+                },
+                rollback,
+            ))
         })
     }
 
@@ -248,8 +344,30 @@ impl InfrastructureState {
         intent: DeviceApplyIntent,
         receipt: DeviceHardwareReceipt,
     ) -> LinearResult<DeviceApplyIntent, DevicePreparationTicket> {
+        self.acknowledge_device_prepared_for_mode(intent, receipt, LedgerMode::Authoritative)
+            .map(DeviceApplyIntent::into_preparation_ticket)
+    }
+
+    pub(in super::super) fn acknowledge_device_prepared_in_candidate(
+        &mut self,
+        intent: DeviceApplyIntent,
+        receipt: DeviceHardwareReceipt,
+    ) -> LinearResult<DeviceApplyIntent, DeviceApplyIntent> {
+        self.acknowledge_device_prepared_for_mode(
+            intent,
+            receipt,
+            LedgerMode::NonAuthoritativeCandidate,
+        )
+    }
+
+    fn acknowledge_device_prepared_for_mode(
+        &mut self,
+        intent: DeviceApplyIntent,
+        receipt: DeviceHardwareReceipt,
+        expected_mode: LedgerMode,
+    ) -> LinearResult<DeviceApplyIntent, DeviceApplyIntent> {
         linear_apply(intent, |intent| {
-            self.require_authoritative()?;
+            require_device_ledger_mode(self, expected_mode)?;
             let stamp = intent.preparation;
             let registry_instance = self.registry_instance;
             let scope = self.scope_mut(stamp.root.scope)?;
@@ -265,6 +383,7 @@ impl InfrastructureState {
                 || receipt.device.device_generation() != coordinates.device_generation
                 || receipt.operation_digest != coordinates.operation_digest
                 || receipt.actor_slot != coordinates.actor_slot
+                || receipt.actor_generation != coordinates.actor_generation
                 || receipt.hardware_receipt_digest == 0
             {
                 return Err(InfrastructureError::InvalidReceipt);
@@ -275,6 +394,7 @@ impl InfrastructureState {
                 device: receipt.device,
                 operation_digest: receipt.operation_digest,
                 actor_slot: receipt.actor_slot,
+                actor_generation: receipt.actor_generation,
                 hardware_receipt_digest: receipt.hardware_receipt_digest,
             };
             scope
@@ -288,7 +408,11 @@ impl InfrastructureState {
                 coordinates.preparation_id,
                 coordinates.generation,
             );
-            Ok(DevicePreparationTicket(stamp))
+            Ok(DeviceApplyIntent {
+                preparation: intent.preparation,
+                apply_generation: intent.apply_generation,
+                apply_nonce: intent.apply_nonce,
+            })
         })
     }
 
@@ -324,7 +448,7 @@ impl InfrastructureState {
         &mut self,
         plan: DeviceMaterializationPlan,
         cohort_digest: u64,
-    ) -> LinearResult<DeviceMaterializationPlan, ()> {
+    ) -> LinearResult<DeviceMaterializationPlan, DeviceMaterializationPlan> {
         linear_apply(plan, |plan| {
             if self.mode != LedgerMode::NonAuthoritativeCandidate {
                 return Err(InfrastructureError::CandidateHasNoAuthority);
@@ -347,24 +471,25 @@ impl InfrastructureState {
             let next_queue_slots = scope
                 .live
                 .queue_slots
-                .checked_sub(stamp.identity.queue_slots)
+                .checked_sub(DEVICE_QUEUE_SLOTS)
                 .ok_or(InfrastructureError::Invariant("queue slot underflow"))?;
             let next_pinned_pages = scope
                 .live
                 .pinned_pages
-                .checked_sub(stamp.identity.pinned_pages)
+                .checked_sub(DEVICE_PINNED_PAGES)
                 .ok_or(InfrastructureError::Invariant("pinned-page underflow"))?;
             let next_dma_mappings = scope
                 .live
                 .dma_mappings
-                .checked_sub(stamp.identity.dma_mappings)
+                .checked_sub(DEVICE_DMA_MAPPINGS)
                 .ok_or(InfrastructureError::Invariant("DMA-mapping underflow"))?;
             let next_revision = preview_revision(scope)?;
-            scope
+            let record = scope
                 .devices
                 .get_mut(stamp.identity.preparation_id)
-                .unwrap()
-                .phase = DevicePhase::Materialized {
+                .unwrap();
+            record.credit_ownership = DeviceCreditOwnership::Transferred;
+            record.phase = DevicePhase::Materialized {
                 owner: plan.owner,
                 cohort_digest,
                 preparation_credits_transferred: true,
@@ -378,8 +503,43 @@ impl InfrastructureState {
                 stamp.identity.preparation_id,
                 stamp.identity.generation,
             );
-            Ok(())
+            Ok(DeviceMaterializationPlan {
+                preparation: plan.preparation,
+                owner: plan.owner,
+                base_revision: plan.base_revision,
+            })
         })
+    }
+
+    pub(in super::super) fn device_preparation_credit_projections(
+        &self,
+    ) -> __cser_alloc::vec::Vec<DevicePreparationCreditProjection> {
+        self.scopes
+            .iter()
+            .flat_map(|(scope, state)| {
+                state.devices.iter().map(|record| {
+                    let ownership = match record.credit_ownership {
+                        DeviceCreditOwnership::Held => {
+                            DevicePreparationCreditOwnership::HeldByPreparation
+                        }
+                        DeviceCreditOwnership::Retained => {
+                            DevicePreparationCreditOwnership::RetainedByPreparation
+                        }
+                        DeviceCreditOwnership::Transferred => {
+                            DevicePreparationCreditOwnership::TransferredToCohort
+                        }
+                        DeviceCreditOwnership::Released => {
+                            DevicePreparationCreditOwnership::Released
+                        }
+                    };
+                    DevicePreparationCreditProjection {
+                        scope: *scope,
+                        charges: record.stamp.identity.credit_charges(),
+                        ownership,
+                    }
+                })
+            })
+            .collect()
     }
 
     pub(in super::super) fn release_materialized_device(
@@ -490,6 +650,16 @@ impl InfrastructureState {
         if record.stamp.workload.request != context.workload.request {
             return Err(InfrastructureError::ForeignWorkload);
         }
+        let credit_ownership = match record.credit_ownership {
+            DeviceCreditOwnership::Held => DevicePreparationCreditOwnership::HeldByPreparation,
+            DeviceCreditOwnership::Retained => {
+                DevicePreparationCreditOwnership::RetainedByPreparation
+            }
+            DeviceCreditOwnership::Transferred => {
+                DevicePreparationCreditOwnership::TransferredToCohort
+            }
+            DeviceCreditOwnership::Released => DevicePreparationCreditOwnership::Released,
+        };
         let (state, prepared_device, cohort_digest, rollback_receipt, closure_receipt) =
             match record.phase {
                 DevicePhase::Reserved => (
@@ -551,6 +721,7 @@ impl InfrastructureState {
             coordinates: record.stamp.identity,
             parent_effect,
             state,
+            credit_ownership,
             prepared_device,
             cohort_digest,
             rollback_receipt,
@@ -681,6 +852,7 @@ fn validate_device_applying(
         .get(intent.preparation.identity.preparation_id)
         .ok_or(InfrastructureError::UnknownObligation)?;
     if record.stamp != intent.preparation
+        || record.credit_ownership != DeviceCreditOwnership::Retained
         || record.phase
             != (DevicePhase::Applying {
                 apply_generation: intent.apply_generation,
@@ -688,6 +860,76 @@ fn validate_device_applying(
             })
     {
         return Err(InfrastructureError::StaleClaim);
+    }
+    Ok(())
+}
+
+impl DevicePreparationTicket {
+    pub(in super::super) const fn coordinates(&self) -> DeviceReservationCoordinates {
+        self.0.identity
+    }
+
+    pub(in super::super) const fn scope(&self) -> super::ScopeKey {
+        self.0.root.scope
+    }
+}
+
+impl DeviceApplyIntent {
+    pub(in super::super) const fn coordinates(&self) -> DeviceReservationCoordinates {
+        self.preparation.identity
+    }
+
+    pub(in super::super) const fn scope(&self) -> super::ScopeKey {
+        self.preparation.root.scope
+    }
+
+    pub(in super::super) fn into_preparation_ticket(self) -> DevicePreparationTicket {
+        DevicePreparationTicket(self.preparation)
+    }
+}
+
+impl DeviceMaterializationPlan {
+    pub(in super::super) const fn coordinates(&self) -> DeviceReservationCoordinates {
+        self.preparation.identity
+    }
+
+    pub(in super::super) const fn scope(&self) -> super::ScopeKey {
+        self.preparation.root.scope
+    }
+
+    pub(in super::super) const fn parent_effect(&self) -> EffectKey {
+        match self.preparation.parent {
+            ParentStamp::Effect(parent) => parent,
+            _ => __cser_core::unreachable!(),
+        }
+    }
+
+    pub(in super::super) const fn prepared_device(&self) -> super::DeviceEnvelope {
+        self.owner.device
+    }
+
+    pub(in super::super) fn into_preparation_ticket(self) -> DevicePreparationTicket {
+        DevicePreparationTicket(self.preparation)
+    }
+
+    pub(in super::super) fn into_materialized_ticket(
+        self,
+        cohort_digest: u64,
+    ) -> MaterializedDeviceTicket {
+        MaterializedDeviceTicket {
+            preparation: self.preparation,
+            owner: self.owner,
+            cohort_digest,
+        }
+    }
+}
+
+fn require_device_ledger_mode(
+    state: &InfrastructureState,
+    expected: LedgerMode,
+) -> Result<(), InfrastructureError> {
+    if state.mode != expected {
+        return Err(InfrastructureError::CandidateHasNoAuthority);
     }
     Ok(())
 }
@@ -712,7 +954,7 @@ fn finish_device(
         scope
             .live
             .queue_slots
-            .checked_sub(stamp.identity.queue_slots)
+            .checked_sub(DEVICE_QUEUE_SLOTS)
             .ok_or(InfrastructureError::Invariant("queue slot underflow"))?
     } else {
         scope.live.queue_slots
@@ -721,7 +963,7 @@ fn finish_device(
         scope
             .live
             .pinned_pages
-            .checked_sub(stamp.identity.pinned_pages)
+            .checked_sub(DEVICE_PINNED_PAGES)
             .ok_or(InfrastructureError::Invariant("pinned-page underflow"))?
     } else {
         scope.live.pinned_pages
@@ -730,17 +972,34 @@ fn finish_device(
         scope
             .live
             .dma_mappings
-            .checked_sub(stamp.identity.dma_mappings)
+            .checked_sub(DEVICE_DMA_MAPPINGS)
             .ok_or(InfrastructureError::Invariant("DMA-mapping underflow"))?
     } else {
         scope.live.dma_mappings
     };
     let next_workload_children = preview_workload_child_sub(scope, stamp.workload.request)?;
-    scope
+    let credit_ownership = match terminal {
+        DevicePhase::Released {
+            cohort_digest: Some(_),
+            ..
+        } => DeviceCreditOwnership::Transferred,
+        DevicePhase::Released {
+            cohort_digest: None,
+            ..
+        }
+        | DevicePhase::Cancelled { .. } => DeviceCreditOwnership::Released,
+        _ => {
+            return Err(InfrastructureError::Invariant(
+                "nonterminal device finish phase",
+            ));
+        }
+    };
+    let record = scope
         .devices
         .get_mut(stamp.identity.preparation_id)
-        .unwrap()
-        .phase = terminal;
+        .unwrap();
+    record.credit_ownership = credit_ownership;
+    record.phase = terminal;
     scope.revision = next_revision;
     scope.live.device_preparations = next_live;
     scope.live.queue_slots = next_queue_slots;

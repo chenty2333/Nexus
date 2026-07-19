@@ -117,6 +117,7 @@ impl InfrastructureState {
                 source_binding_epoch: None,
                 resource: None,
                 actor_slot: None,
+                actor_generation: None,
                 retry_generation: descriptor.vm_generation,
             };
             scope.faults.install(

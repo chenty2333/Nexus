@@ -2500,6 +2500,15 @@ impl ScopeRecord {
     }
 }
 
+fn advance_device_preparation_scope(scope: &mut ScopeRecord) -> Result<(), RegistryError> {
+    scope.revision = scope
+        .revision
+        .checked_add(1)
+        .ok_or(RegistryError::CounterOverflow)?;
+    scope.invalidate_recovery_readiness();
+    Ok(())
+}
+
 #[derive(
     __cser_core::clone::Clone,
     __cser_core::fmt::Debug,
@@ -2904,6 +2913,22 @@ pub(crate) struct FaultRegistryFailure {
     input: infrastructure::ArmedFaultTask,
 }
 
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
+pub(crate) struct DevicePreparationRegistryFailure<T> {
+    error: RegistryError,
+    input: T,
+}
+
+impl<T> DevicePreparationRegistryFailure<T> {
+    pub(crate) const fn error(&self) -> &RegistryError {
+        &self.error
+    }
+
+    pub(crate) fn into_input(self) -> T {
+        self.input
+    }
+}
+
 impl FaultRegistryFailure {
     pub(crate) const fn error(&self) -> &RegistryError {
         &self.error
@@ -3281,6 +3306,312 @@ impl EffectRegistry {
             base_infrastructure,
             replacement,
         })
+    }
+
+    /// Atomically binds one pre-hardware device preparation to both ledgers.
+    /// The returned bearer is usable only after the exact-scope install has
+    /// made its queue/pinned/DMA credits authoritative.
+    pub(crate) fn reserve_device_preparation(
+        &mut self,
+        context: &infrastructure::WorkloadContext,
+        parent_effect: EffectKey,
+        coordinates: infrastructure::DeviceReservationCoordinates,
+    ) -> Result<infrastructure::DevicePreparationTicket, RegistryError> {
+        let scope_key = context.scope();
+        let parent = self
+            .effects
+            .get(&parent_effect)
+            .ok_or(RegistryError::UnknownEffect)?;
+        let scope = self
+            .scopes
+            .get(&scope_key)
+            .ok_or(RegistryError::UnknownScope)?;
+        if scope.phase != ScopePhase::Active
+            || parent.identity.scope != scope_key
+            || parent.identity.authority_epoch != scope.authority_epoch
+            || parent.phase.is_terminal()
+        {
+            return Err(RegistryError::InvalidHandle);
+        }
+
+        let charges = coordinates.credit_charges();
+        let mut candidate = self.combined_scope_candidate(scope_key)?;
+        let ticket = candidate
+            .replacement
+            .infrastructure
+            .reserve_device_preparation_in_candidate(context, parent_effect, coordinates)?;
+        let candidate_scope = candidate
+            .replacement
+            .scopes
+            .get_mut(&scope_key)
+            .ok_or(RegistryError::UnknownScope)?;
+        candidate_scope.credits.reserve(&charges)?;
+        advance_device_preparation_scope(candidate_scope)?;
+        let install = self.prepare_combined_scope_install(candidate)?;
+        self.install_combined_scope(install);
+        Ok(ticket)
+    }
+
+    /// Pre-hardware cancellation. The exact ticket is returned on every
+    /// failure, including a stale combined candidate after staging.
+    pub(crate) fn cancel_device_preparation(
+        &mut self,
+        ticket: infrastructure::DevicePreparationTicket,
+    ) -> Result<(), DevicePreparationRegistryFailure<infrastructure::DevicePreparationTicket>> {
+        let scope_key = ticket.scope();
+        let charges = ticket.coordinates().credit_charges();
+        let mut candidate = match self.combined_scope_candidate(scope_key) {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                return Err(DevicePreparationRegistryFailure {
+                    error,
+                    input: ticket,
+                });
+            }
+        };
+        let candidate_scope = candidate.replacement.scopes.get_mut(&scope_key).unwrap();
+        if let Err(error) = candidate_scope
+            .credits
+            .validate_release(&charges, CreditState::Held)
+        {
+            return Err(DevicePreparationRegistryFailure {
+                error,
+                input: ticket,
+            });
+        }
+        let returned = match candidate
+            .replacement
+            .infrastructure
+            .cancel_reserved_device_in_candidate(ticket)
+        {
+            Ok(ticket) => ticket,
+            Err(failure) => {
+                let (error, input) = failure.into_parts();
+                return Err(DevicePreparationRegistryFailure {
+                    error: error.into(),
+                    input,
+                });
+            }
+        };
+        candidate_scope
+            .credits
+            .release_validated(&charges, CreditState::Held);
+        if let Err(error) = advance_device_preparation_scope(candidate_scope) {
+            return Err(DevicePreparationRegistryFailure {
+                error,
+                input: returned,
+            });
+        }
+        let install = match self.prepare_combined_scope_install(candidate) {
+            Ok(install) => install,
+            Err(error) => {
+                return Err(DevicePreparationRegistryFailure {
+                    error,
+                    input: returned,
+                });
+            }
+        };
+        self.install_combined_scope(install);
+        Ok(())
+    }
+
+    /// Installs the retained uncertainty owner before any hardware callback
+    /// may run. The caller invokes hardware only after this method returns.
+    pub(crate) fn begin_device_hardware_apply(
+        &mut self,
+        ticket: infrastructure::DevicePreparationTicket,
+    ) -> Result<
+        infrastructure::DeviceApplyIntent,
+        DevicePreparationRegistryFailure<infrastructure::DevicePreparationTicket>,
+    > {
+        let scope_key = ticket.scope();
+        let charges = ticket.coordinates().credit_charges();
+        let mut candidate = match self.combined_scope_candidate(scope_key) {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                return Err(DevicePreparationRegistryFailure {
+                    error,
+                    input: ticket,
+                });
+            }
+        };
+        let candidate_scope = candidate.replacement.scopes.get_mut(&scope_key).unwrap();
+        if let Err(error) = candidate_scope
+            .credits
+            .validate_retain(&charges, CreditState::Held)
+        {
+            return Err(DevicePreparationRegistryFailure {
+                error,
+                input: ticket,
+            });
+        }
+        let intent = match candidate
+            .replacement
+            .infrastructure
+            .begin_device_hardware_apply_in_candidate(ticket)
+        {
+            Ok(intent) => intent,
+            Err(failure) => {
+                let (error, input) = failure.into_parts();
+                return Err(DevicePreparationRegistryFailure {
+                    error: error.into(),
+                    input,
+                });
+            }
+        };
+        candidate_scope
+            .credits
+            .retain_validated(&charges, CreditState::Held);
+        if let Err(error) = advance_device_preparation_scope(candidate_scope) {
+            return Err(DevicePreparationRegistryFailure {
+                error,
+                input: intent.into_preparation_ticket(),
+            });
+        }
+        let install = match self.prepare_combined_scope_install(candidate) {
+            Ok(install) => install,
+            Err(error) => {
+                return Err(DevicePreparationRegistryFailure {
+                    error,
+                    input: intent.into_preparation_ticket(),
+                });
+            }
+        };
+        self.install_combined_scope(install);
+        Ok(intent)
+    }
+
+    /// Acknowledges exact rollback evidence and releases the retained credit
+    /// owner in the same exact-scope install.
+    pub(crate) fn acknowledge_device_apply_rollback(
+        &mut self,
+        intent: infrastructure::DeviceApplyIntent,
+        rollback: infrastructure::DeviceRollbackReceipt,
+    ) -> Result<
+        infrastructure::DeviceRollbackReceipt,
+        DevicePreparationRegistryFailure<infrastructure::DeviceApplyIntent>,
+    > {
+        let scope_key = intent.scope();
+        let charges = intent.coordinates().credit_charges();
+        let mut candidate = match self.combined_scope_candidate(scope_key) {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                return Err(DevicePreparationRegistryFailure {
+                    error,
+                    input: intent,
+                });
+            }
+        };
+        let candidate_scope = candidate.replacement.scopes.get_mut(&scope_key).unwrap();
+        if let Err(error) = candidate_scope
+            .credits
+            .validate_release(&charges, CreditState::Retained)
+        {
+            return Err(DevicePreparationRegistryFailure {
+                error,
+                input: intent,
+            });
+        }
+        let (returned, receipt) = match candidate
+            .replacement
+            .infrastructure
+            .acknowledge_device_apply_rollback_in_candidate(intent, rollback)
+        {
+            Ok(applied) => applied,
+            Err(failure) => {
+                let (error, input) = failure.into_parts();
+                return Err(DevicePreparationRegistryFailure {
+                    error: error.into(),
+                    input,
+                });
+            }
+        };
+        candidate_scope
+            .credits
+            .release_validated(&charges, CreditState::Retained);
+        if let Err(error) = advance_device_preparation_scope(candidate_scope) {
+            return Err(DevicePreparationRegistryFailure {
+                error,
+                input: returned,
+            });
+        }
+        let install = match self.prepare_combined_scope_install(candidate) {
+            Ok(install) => install,
+            Err(error) => {
+                return Err(DevicePreparationRegistryFailure {
+                    error,
+                    input: returned,
+                });
+            }
+        };
+        self.install_combined_scope(install);
+        Ok(receipt)
+    }
+
+    /// Hardware acknowledgement contains no callback and leaves the exact
+    /// retained owner queryable for materialization or recovery.
+    pub(crate) fn acknowledge_device_prepared(
+        &mut self,
+        intent: infrastructure::DeviceApplyIntent,
+        receipt: infrastructure::DeviceHardwareReceipt,
+    ) -> Result<
+        infrastructure::DevicePreparationTicket,
+        DevicePreparationRegistryFailure<infrastructure::DeviceApplyIntent>,
+    > {
+        let scope_key = intent.scope();
+        let mut candidate = match self.combined_scope_candidate(scope_key) {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                return Err(DevicePreparationRegistryFailure {
+                    error,
+                    input: intent,
+                });
+            }
+        };
+        let returned = match candidate
+            .replacement
+            .infrastructure
+            .acknowledge_device_prepared_in_candidate(intent, receipt)
+        {
+            Ok(intent) => intent,
+            Err(failure) => {
+                let (error, input) = failure.into_parts();
+                return Err(DevicePreparationRegistryFailure {
+                    error: error.into(),
+                    input,
+                });
+            }
+        };
+        let candidate_scope = candidate.replacement.scopes.get_mut(&scope_key).unwrap();
+        if let Err(error) = advance_device_preparation_scope(candidate_scope) {
+            return Err(DevicePreparationRegistryFailure {
+                error,
+                input: returned,
+            });
+        }
+        let install = match self.prepare_combined_scope_install(candidate) {
+            Ok(install) => install,
+            Err(error) => {
+                return Err(DevicePreparationRegistryFailure {
+                    error,
+                    input: returned,
+                });
+            }
+        };
+        self.install_combined_scope(install);
+        Ok(returned.into_preparation_ticket())
+    }
+
+    pub(crate) fn query_device_preparation(
+        &self,
+        context: &infrastructure::WorkloadContext,
+        preparation_id: u64,
+        generation: u64,
+    ) -> Result<infrastructure::DevicePreparationRecoveryProjection, RegistryError> {
+        self.check_invariants()?;
+        self.infrastructure
+            .query_device_preparation(context, preparation_id, generation)
+            .map_err(Into::into)
     }
 
     /// Prepares the one task-owned fault plan which may later enter the
@@ -9357,6 +9688,33 @@ impl EffectRegistry {
             }
         }
 
+        // Device preparation is the only infrastructure obligation which
+        // owns business credits. Reconstruct that ownership from its primary
+        // record rather than trusting stored CreditLedger totals. Once
+        // materialized, the same units are attributed only to EffectRecords.
+        for owner in self.infrastructure.device_preparation_credit_projections() {
+            match owner.ownership {
+                infrastructure::DevicePreparationCreditOwnership::HeldByPreparation => {
+                    add_expected_credits(
+                        &mut expected_credits,
+                        owner.scope,
+                        &owner.charges,
+                        CreditState::Held,
+                    )?;
+                }
+                infrastructure::DevicePreparationCreditOwnership::RetainedByPreparation => {
+                    add_expected_credits(
+                        &mut expected_credits,
+                        owner.scope,
+                        &owner.charges,
+                        CreditState::Retained,
+                    )?;
+                }
+                infrastructure::DevicePreparationCreditOwnership::TransferredToCohort
+                | infrastructure::DevicePreparationCreditOwnership::Released => {}
+            }
+        }
+
         if self.next_device_enrollment_sequence == 0
             || self.next_device_batch_sequence == 0
             || self.next_device_closure_sequence == 0
@@ -9476,6 +9834,15 @@ impl EffectRegistry {
                 return Err(RegistryError::Invariant("handoff candidate index mismatch"));
             }
             let expected = expected_credits.get(scope_key);
+            if expected.is_some_and(|classes| {
+                classes
+                    .keys()
+                    .any(|class| !scope.credits.balances.contains_key(class))
+            }) {
+                return Err(RegistryError::Invariant(
+                    "credit owner references unknown class",
+                ));
+            }
             for (class, balance) in &scope.credits.balances {
                 let (held, committed, retained) = expected
                     .and_then(|classes| classes.get(class))
@@ -13309,6 +13676,341 @@ fn ordinary_domain_crash_rejects_a_forged_fault_origin() {
     __cser_core::assert_eq!(forged, before);
 }
 
+#[cfg(test)]
+fn device_preparation_outer_credit_self_test() {
+    const SCOPE: ScopeKey = ScopeKey::new(0xdb01, 1);
+    const OWNER: TaskKey = TaskKey::new(0xdb02, 1);
+    const UNRELATED_SCOPE: ScopeKey = ScopeKey::new(0xdb03, 1);
+    const UNRELATED_OWNER: TaskKey = TaskKey::new(0xdb04, 1);
+    const QUEUE: CreditClass = CreditClass::new(0xdb10);
+    const PINNED: CreditClass = CreditClass::new(0xdb11);
+    const DMA: CreditClass = CreditClass::new(0xdb12);
+
+    fn fixture(
+        request_id: u64,
+    ) -> (
+        EffectRegistry,
+        infrastructure::WorkloadContext,
+        EffectKey,
+        infrastructure::DeviceReservationCoordinates,
+    ) {
+        let mut registry = EffectRegistry::new();
+        registry
+            .create_scope(ScopeConfig {
+                key: SCOPE,
+                authority_epoch: 1,
+                binding_epoch: 1,
+                supervisor: OWNER,
+                credits: __cser_alloc::vec![
+                    CreditLimit::new(QUEUE, 1),
+                    CreditLimit::new(PINNED, 3),
+                    CreditLimit::new(DMA, 3),
+                ],
+            })
+            .unwrap();
+        let root = registry
+            .register(RegisterRequest {
+                scope: SCOPE,
+                task: OWNER,
+                operation: OperationClass::new(0xdb20),
+                descriptor: SyscallDescriptor::new(0xdb20, [0; 6]),
+                resources: __cser_alloc::vec![ResourceKey::new(0xdb, 1, 1)],
+                credits: __cser_alloc::vec![],
+                publication: PublicationMode::None,
+            })
+            .unwrap()
+            .identity
+            .effect();
+        registry
+            .enable_infrastructure_for_scope(
+                SCOPE,
+                root,
+                infrastructure::InfrastructureLimits::new(2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 4, 4, 8)
+                    .unwrap(),
+            )
+            .unwrap();
+        let workload = registry
+            .infrastructure
+            .open_workload(
+                infrastructure::WorkloadRootPresentation::new(SCOPE, 1, root),
+                infrastructure::WorkloadRequestPresentation::new(
+                    DomainKey::LEGACY,
+                    1,
+                    request_id,
+                    1,
+                ),
+            )
+            .unwrap();
+        registry
+            .create_scope(ScopeConfig {
+                key: UNRELATED_SCOPE,
+                authority_epoch: 1,
+                binding_epoch: 1,
+                supervisor: UNRELATED_OWNER,
+                credits: __cser_alloc::vec![],
+            })
+            .unwrap();
+        let unrelated_root = registry
+            .register(RegisterRequest {
+                scope: UNRELATED_SCOPE,
+                task: UNRELATED_OWNER,
+                operation: OperationClass::new(0xdb21),
+                descriptor: SyscallDescriptor::new(0xdb21, [0; 6]),
+                resources: __cser_alloc::vec![ResourceKey::new(0xdb, 2, 1)],
+                credits: __cser_alloc::vec![],
+                publication: PublicationMode::None,
+            })
+            .unwrap()
+            .identity
+            .effect();
+        registry
+            .enable_infrastructure_for_scope(
+                UNRELATED_SCOPE,
+                unrelated_root,
+                infrastructure::InfrastructureLimits::new(2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 4, 4, 8)
+                    .unwrap(),
+            )
+            .unwrap();
+        let coordinates = infrastructure::DeviceReservationCoordinates {
+            preparation_id: request_id + 1,
+            generation: 1,
+            owned_device: ResourceKey::new(0xdb, request_id, 1),
+            queue: 2,
+            device_generation: 1,
+            operation_digest: request_id + 2,
+            queue_credit_class: QUEUE,
+            pinned_credit_class: PINNED,
+            dma_credit_class: DMA,
+            actor_slot: 1,
+            actor_generation: 1,
+        };
+        registry.check_invariants().unwrap();
+        (registry, workload, root, coordinates)
+    }
+
+    let (mut cancelled, workload, root, coordinates) = fixture(0xdb30);
+    let unrelated_business = cancelled.scopes[&UNRELATED_SCOPE].clone();
+    let unrelated_infrastructure = cancelled
+        .infrastructure
+        .root_binding(UNRELATED_SCOPE)
+        .unwrap();
+    let ticket = cancelled
+        .reserve_device_preparation(&workload, root, coordinates)
+        .unwrap();
+    let held = cancelled.scope_projection(SCOPE).unwrap().credits;
+    __cser_core::assert_eq!((held.free, held.held, held.retained), (0, 7, 0));
+    let duplicate_before = cancelled.clone();
+    __cser_core::assert_eq!(
+        cancelled.reserve_device_preparation(&workload, root, coordinates),
+        Err(RegistryError::Infrastructure(
+            infrastructure::InfrastructureError::ExactReplay
+        ))
+    );
+    __cser_core::assert_eq!(cancelled, duplicate_before);
+    cancelled.cancel_device_preparation(ticket).unwrap();
+    let released = cancelled.scope_projection(SCOPE).unwrap().credits;
+    __cser_core::assert_eq!((released.free, released.held, released.retained), (7, 0, 0));
+    __cser_core::assert_eq!(cancelled.scopes[&UNRELATED_SCOPE], unrelated_business);
+    __cser_core::assert_eq!(
+        cancelled
+            .infrastructure
+            .root_binding(UNRELATED_SCOPE)
+            .unwrap(),
+        unrelated_infrastructure
+    );
+    cancelled.check_invariants().unwrap();
+
+    // A staged successor never escapes a rejected combined install. Converting
+    // it back to the sole input bearer still validates the unchanged live
+    // Reserved record.
+    let (mut stale_install, workload, root, coordinates) = fixture(0xdb35);
+    let ticket = stale_install
+        .reserve_device_preparation(&workload, root, coordinates)
+        .unwrap();
+    let charges = coordinates.credit_charges();
+    let mut candidate = stale_install.combined_scope_candidate(SCOPE).unwrap();
+    let intent = candidate
+        .replacement
+        .infrastructure
+        .begin_device_hardware_apply_in_candidate(ticket)
+        .unwrap();
+    let candidate_scope = candidate.replacement.scopes.get_mut(&SCOPE).unwrap();
+    candidate_scope
+        .credits
+        .validate_retain(&charges, CreditState::Held)
+        .unwrap();
+    candidate_scope
+        .credits
+        .retain_validated(&charges, CreditState::Held);
+    advance_device_preparation_scope(candidate_scope).unwrap();
+    candidate.base_registry_revision += 1;
+    __cser_core::assert!(__cser_core::matches!(
+        stale_install.prepare_combined_scope_install(candidate),
+        Err(RegistryError::CombinedCandidateStale)
+    ));
+    let ticket = intent.into_preparation_ticket();
+    __cser_core::assert_eq!(
+        stale_install
+            .query_device_preparation(
+                &workload,
+                coordinates.preparation_id,
+                coordinates.generation,
+            )
+            .unwrap()
+            .state,
+        infrastructure::DevicePreparationRecoveryState::Reserved
+    );
+    stale_install.cancel_device_preparation(ticket).unwrap();
+
+    let (mut cancel_overflow, workload, root, coordinates) = fixture(0xdb38);
+    let ticket = cancel_overflow
+        .reserve_device_preparation(&workload, root, coordinates)
+        .unwrap();
+    cancel_overflow.scopes.get_mut(&SCOPE).unwrap().revision = u64::MAX;
+    let failure = cancel_overflow
+        .cancel_device_preparation(ticket)
+        .unwrap_err();
+    __cser_core::assert_eq!(failure.error(), &RegistryError::CounterOverflow);
+    let returned = failure.into_input();
+    __cser_core::assert_eq!(returned.coordinates(), coordinates);
+    __cser_core::assert_eq!(
+        cancel_overflow
+            .query_device_preparation(
+                &workload,
+                coordinates.preparation_id,
+                coordinates.generation,
+            )
+            .unwrap()
+            .state,
+        infrastructure::DevicePreparationRecoveryState::Reserved
+    );
+
+    let (mut rolled_back, workload, root, coordinates) = fixture(0xdb40);
+    let ticket = rolled_back
+        .reserve_device_preparation(&workload, root, coordinates)
+        .unwrap();
+    let intent = rolled_back.begin_device_hardware_apply(ticket).unwrap();
+    let retained = rolled_back.scope_projection(SCOPE).unwrap().credits;
+    __cser_core::assert_eq!((retained.free, retained.held, retained.retained), (0, 0, 7));
+    let projection = rolled_back
+        .query_device_preparation(
+            &workload,
+            coordinates.preparation_id,
+            coordinates.generation,
+        )
+        .unwrap();
+    __cser_core::assert_eq!(
+        projection.state,
+        infrastructure::DevicePreparationRecoveryState::ApplyingHardware
+    );
+    __cser_core::assert_eq!(
+        projection.credit_ownership,
+        infrastructure::DevicePreparationCreditOwnership::RetainedByPreparation
+    );
+    let rollback = infrastructure::DeviceRollbackReceipt {
+        owned_device: coordinates.owned_device,
+        queue: coordinates.queue,
+        device_generation: coordinates.device_generation,
+        operation_digest: coordinates.operation_digest,
+        actor_slot: coordinates.actor_slot,
+        actor_generation: coordinates.actor_generation,
+        rollback_receipt_digest: 0xdb50,
+    };
+    let mut wrong_actor = rollback;
+    wrong_actor.actor_generation += 1;
+    let wrong_before = rolled_back.clone();
+    let failure = rolled_back
+        .acknowledge_device_apply_rollback(intent, wrong_actor)
+        .unwrap_err();
+    __cser_core::assert_eq!(
+        failure.error(),
+        &RegistryError::Infrastructure(infrastructure::InfrastructureError::InvalidReceipt)
+    );
+    __cser_core::assert_eq!(rolled_back, wrong_before);
+    rolled_back
+        .acknowledge_device_apply_rollback(failure.into_input(), rollback)
+        .unwrap();
+    let released = rolled_back.scope_projection(SCOPE).unwrap().credits;
+    __cser_core::assert_eq!((released.free, released.held, released.retained), (7, 0, 0));
+    rolled_back.check_invariants().unwrap();
+
+    let (mut rollback_overflow, workload, root, coordinates) = fixture(0xdb55);
+    let ticket = rollback_overflow
+        .reserve_device_preparation(&workload, root, coordinates)
+        .unwrap();
+    let intent = rollback_overflow
+        .begin_device_hardware_apply(ticket)
+        .unwrap();
+    rollback_overflow.scopes.get_mut(&SCOPE).unwrap().revision = u64::MAX;
+    let rollback = infrastructure::DeviceRollbackReceipt {
+        owned_device: coordinates.owned_device,
+        queue: coordinates.queue,
+        device_generation: coordinates.device_generation,
+        operation_digest: coordinates.operation_digest,
+        actor_slot: coordinates.actor_slot,
+        actor_generation: coordinates.actor_generation,
+        rollback_receipt_digest: 0xdb56,
+    };
+    let failure = rollback_overflow
+        .acknowledge_device_apply_rollback(intent, rollback)
+        .unwrap_err();
+    __cser_core::assert_eq!(failure.error(), &RegistryError::CounterOverflow);
+    __cser_core::assert_eq!(failure.into_input().coordinates(), coordinates);
+    __cser_core::assert_eq!(
+        rollback_overflow
+            .query_device_preparation(
+                &workload,
+                coordinates.preparation_id,
+                coordinates.generation,
+            )
+            .unwrap()
+            .state,
+        infrastructure::DevicePreparationRecoveryState::ApplyingHardware
+    );
+
+    let (mut uncertain, workload, root, coordinates) = fixture(0xdb60);
+    let ticket = uncertain
+        .reserve_device_preparation(&workload, root, coordinates)
+        .unwrap();
+    let intent = uncertain.begin_device_hardware_apply(ticket).unwrap();
+    let device = DeviceEnvelope::new(0xdb70, coordinates.queue, 9, 1).unwrap();
+    let receipt = infrastructure::DeviceHardwareReceipt {
+        owned_device: coordinates.owned_device,
+        device,
+        operation_digest: coordinates.operation_digest,
+        actor_slot: coordinates.actor_slot,
+        actor_generation: coordinates.actor_generation,
+        hardware_receipt_digest: 0xdb71,
+    };
+    let mut wrong_actor = receipt;
+    wrong_actor.actor_generation += 1;
+    let wrong_before = uncertain.clone();
+    let failure = uncertain
+        .acknowledge_device_prepared(intent, wrong_actor)
+        .unwrap_err();
+    __cser_core::assert_eq!(uncertain, wrong_before);
+    let ticket = uncertain
+        .acknowledge_device_prepared(failure.into_input(), receipt)
+        .unwrap();
+    let projection = uncertain
+        .query_device_preparation(
+            &workload,
+            coordinates.preparation_id,
+            coordinates.generation,
+        )
+        .unwrap();
+    __cser_core::assert_eq!(
+        projection.state,
+        infrastructure::DevicePreparationRecoveryState::PreparedRetained
+    );
+    __cser_core::assert_eq!(
+        projection.credit_ownership,
+        infrastructure::DevicePreparationCreditOwnership::RetainedByPreparation
+    );
+    __cser_core::assert_eq!(ticket.coordinates(), coordinates);
+    uncertain.check_invariants().unwrap();
+}
+
 /// Pins the first registry-native production identity chain independently of
 /// the later runtime wiring.  These are real registry records with one shared
 /// credit ledger, distinct service bindings, and immutable effect ancestry;
@@ -13318,6 +14020,8 @@ pub(crate) fn production_identity_registry_self_test() {
     combined_scope_candidate_self_test();
     #[cfg(test)]
     task_owned_fault_outer_transaction_self_test();
+    #[cfg(test)]
+    device_preparation_outer_credit_self_test();
     #[cfg(test)]
     ordinary_domain_crash_rejects_a_forged_fault_origin();
     publication_ack_and_revoke_complete_self_test();

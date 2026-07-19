@@ -189,6 +189,7 @@ pub(super) fn prepare_service_owned_continuation(
         source_binding_epoch: Some(descriptor.source_binding_epoch),
         resource: None,
         actor_slot: None,
+        actor_generation: None,
         retry_generation: descriptor.generation,
     };
     Ok(PreparedServiceOwnedContinuation {
@@ -394,6 +395,7 @@ impl InfrastructureState {
             source_binding_epoch: Some(descriptor.source_binding_epoch),
             resource: None,
             actor_slot: None,
+            actor_generation: None,
             retry_generation: descriptor.generation,
         };
         scope.continuations.install(

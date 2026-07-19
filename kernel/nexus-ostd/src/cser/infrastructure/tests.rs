@@ -3603,10 +3603,11 @@ fn seeded_state() -> InfrastructureState {
                 queue: 0,
                 device_generation: 1,
                 operation_digest: 0x9e,
-                queue_slots: 1,
-                pinned_pages: 2,
-                dma_mappings: 1,
+                queue_credit_class: super::super::CreditClass::new(0xa1),
+                pinned_credit_class: super::super::CreditClass::new(0xa2),
+                dma_credit_class: super::super::CreditClass::new(0xa3),
                 actor_slot: 2,
+                actor_generation: 1,
             },
         )
         .unwrap();
@@ -4329,6 +4330,7 @@ fn fault_adoption_validates_every_task_and_fault_reverse_coordinate() {
         |index| index.source_binding_epoch = Some(1),
         |index| index.resource = Some(ResourceKey::new(0xfd, 1, 1)),
         |index| index.actor_slot = Some(1),
+        |index| index.actor_generation = Some(1),
         |index| index.retry_generation += 1,
     ];
     let mut registry_instance = 0xfd90;
@@ -5490,6 +5492,35 @@ fn full_recompute_rejects_each_derived_ledger_corruption_without_mutation() {
         .unwrap()
         .retry_generation = 77;
     assert_invariant_read_only(index_field);
+
+    let device_index_slot = base
+        .scope(SCOPE)
+        .unwrap()
+        .devices
+        .iter()
+        .next()
+        .unwrap()
+        .stamp
+        .nonce;
+    let mut device_actor_generation = base.private_full_clone();
+    device_actor_generation
+        .scope_mut(SCOPE)
+        .unwrap()
+        .reverse_indexes
+        .get_mut(device_index_slot)
+        .unwrap()
+        .actor_generation = Some(2);
+    assert_invariant_read_only(device_actor_generation);
+
+    let mut device_obligation_generation = base.private_full_clone();
+    device_obligation_generation
+        .scope_mut(SCOPE)
+        .unwrap()
+        .reverse_indexes
+        .get_mut(device_index_slot)
+        .unwrap()
+        .retry_generation = 2;
+    assert_invariant_read_only(device_obligation_generation);
 
     let mut live = base.private_full_clone();
     live.scope_mut(SCOPE).unwrap().live.tasks += 1;

@@ -473,6 +473,20 @@ capacity free; the returned ELF bytes still come from the in-memory inode. The
 host gate binds the guest, first-pread input, four-byte payload, and preparation
 record by digest, and rejects a receipt from a fresh registry without mutation.
 
+The Registry now also contains an unpromoted outer queue/DMA-preparation
+contract. Before a hardware adapter may run, one exact-scope transaction binds
+one queue-slot, three pinned-page, and three DMA-mapping credits to the primary
+preparation record. Beginning hardware apply moves that owner from held to
+retained; pre-hardware cancellation and an exact rollback acknowledgement
+return the same units, while wrong actor-slot/generation receipts return the
+linear input without mutation. Hardware acknowledgement is a separate
+exact-scope transition, so no callback runs while Registry state is borrowed.
+This is Registry-only preparation evidence: no normal filesystem runtime calls
+it, no preallocated adapter table yet stores the `PreparedRequest`, and the
+recorded `{actor_slot, actor_generation}` selector is descriptive until that
+adapter integration lands. It therefore does not advance the runtime ledger,
+the RFC 0003 causal-coverage claim, or the existing Phase 2 evidence.
+
 The primary boot has no real DMA. `tools/workflow/runtime-fs-composition.sh`
 joins it to the independent real Stage 5B boot using those digests plus the
 reconstructed sector SHA

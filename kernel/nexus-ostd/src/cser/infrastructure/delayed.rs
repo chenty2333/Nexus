@@ -103,7 +103,8 @@ impl InfrastructureState {
             source_binding_epoch: Some(descriptor.destination_binding_epoch),
             resource: None,
             actor_slot: Some(descriptor.actor_slot),
-            retry_generation: descriptor.actor_generation,
+            actor_generation: Some(descriptor.actor_generation),
+            retry_generation: descriptor.generation,
         };
         scope.delayed_commands.install(
             DelayedCommandStateRecord {

@@ -106,7 +106,8 @@ impl InfrastructureState {
                 source_binding_epoch: Some(descriptor.source_binding_epoch),
                 resource: None,
                 actor_slot: Some(descriptor.payload_slot),
-                retry_generation: descriptor.payload_generation,
+                actor_generation: Some(descriptor.payload_generation),
+                retry_generation: descriptor.generation,
             };
             scope.replies.install(
                 ReplyStateRecord {

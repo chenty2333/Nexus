@@ -3,8 +3,12 @@
 //! Root-bound causal infrastructure owned privately by [`super::EffectRegistry`].
 //!
 //! These records cover kernel execution obligations; they are not business
-//! effects and never consume effect credits. The module is a private child of
-//! `effect_registry`, so canonical Registry identities are the only vocabulary.
+//! effects. Most infrastructure records do not consume effect credits. Device
+//! preparation is the deliberate exception: its immutable record names the
+//! exact business-credit classes held by the outer Registry until they are
+//! either released or transferred into the materialized effect cohort. The
+//! module is a private child of `effect_registry`, so canonical Registry
+//! identities are the only vocabulary.
 //! Authoritative records are cloneable only into an explicitly
 //! non-authoritative transaction candidate. Bearer values are linear Rust
 //! values: none implements `Clone` or `Copy`, and a query never recreates one.
@@ -33,8 +37,9 @@ use self::{
 };
 
 use super::{
-    CommitReceipt as RegistryCommitReceipt, DeviceClosureReceipt as RegistryDeviceClosureReceipt,
-    DeviceEnvelope, DomainKey, EffectKey, PortalHandle, ResourceKey, ScopeKey, TaskKey,
+    CommitReceipt as RegistryCommitReceipt, CreditCharge, CreditClass,
+    DeviceClosureReceipt as RegistryDeviceClosureReceipt, DeviceEnvelope, DomainKey, EffectKey,
+    PortalHandle, ResourceKey, ScopeKey, TaskKey,
 };
 
 #[derive(
@@ -490,6 +495,12 @@ pub(crate) struct WorkloadContext {
     domain: DomainStamp,
     workload: WorkloadStamp,
     parent: ParentStamp,
+}
+
+impl WorkloadContext {
+    pub(super) const fn scope(&self) -> ScopeKey {
+        self.root.scope
+    }
 }
 
 #[derive(
@@ -1935,13 +1946,22 @@ pub(crate) struct DeviceReservationCoordinates {
     pub(crate) queue: u16,
     pub(crate) device_generation: u64,
     pub(crate) operation_digest: u64,
-    pub(crate) queue_slots: u32,
-    pub(crate) pinned_pages: u32,
-    pub(crate) dma_mappings: u32,
+    /// Exact outer-Registry credit classes. Units are fixed by RFC 0003 at
+    /// one queue slot and three pinned-page/DMA pairs.
+    pub(crate) queue_credit_class: CreditClass,
+    pub(crate) pinned_credit_class: CreditClass,
+    pub(crate) dma_credit_class: CreditClass,
     /// Index of a preallocated kernel adapter slot which will own the linear
     /// prepared request before hardware success is acknowledged.
     pub(crate) actor_slot: u32,
+    /// Generation paired with `actor_slot`; neither coordinate may be reused
+    /// while this preparation remains live.
+    pub(crate) actor_generation: u64,
 }
+
+pub(super) const DEVICE_QUEUE_SLOTS: u32 = 1;
+pub(super) const DEVICE_PINNED_PAGES: u32 = 3;
+pub(super) const DEVICE_DMA_MAPPINGS: u32 = 3;
 
 impl DeviceReservationCoordinates {
     fn validate(self) -> Result<(), InfrastructureError> {
@@ -1949,13 +1969,22 @@ impl DeviceReservationCoordinates {
             || self.generation == 0
             || self.device_generation == 0
             || self.operation_digest == 0
-            || self.queue_slots != 1
-            || self.pinned_pages == 0
-            || self.dma_mappings == 0
+            || self.actor_generation == 0
+            || self.queue_credit_class == self.pinned_credit_class
+            || self.queue_credit_class == self.dma_credit_class
+            || self.pinned_credit_class == self.dma_credit_class
         {
             return Err(InfrastructureError::InvalidIdentity);
         }
         Ok(())
+    }
+
+    pub(super) const fn credit_charges(self) -> [CreditCharge; 3] {
+        [
+            CreditCharge::new(self.queue_credit_class, DEVICE_QUEUE_SLOTS as u64),
+            CreditCharge::new(self.pinned_credit_class, DEVICE_PINNED_PAGES as u64),
+            CreditCharge::new(self.dma_credit_class, DEVICE_DMA_MAPPINGS as u64),
+        ]
     }
 }
 
@@ -2012,6 +2041,7 @@ pub(crate) struct DeviceHardwareReceipt {
     pub(crate) device: DeviceEnvelope,
     pub(crate) operation_digest: u64,
     pub(crate) actor_slot: u32,
+    pub(crate) actor_generation: u64,
     pub(crate) hardware_receipt_digest: u64,
 }
 
@@ -2028,6 +2058,7 @@ pub(crate) struct DeviceRollbackReceipt {
     pub(crate) device_generation: u64,
     pub(crate) operation_digest: u64,
     pub(crate) actor_slot: u32,
+    pub(crate) actor_generation: u64,
     pub(crate) rollback_receipt_digest: u64,
 }
 
@@ -2054,14 +2085,42 @@ pub(crate) enum DevicePreparationRecoveryState {
     __cser_core::cmp::Eq,
     __cser_core::cmp::PartialEq,
 )]
+pub(crate) enum DevicePreparationCreditOwnership {
+    HeldByPreparation,
+    RetainedByPreparation,
+    TransferredToCohort,
+    Released,
+}
+
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct DevicePreparationRecoveryProjection {
     pub(crate) coordinates: DeviceReservationCoordinates,
     pub(crate) parent_effect: EffectKey,
     pub(crate) state: DevicePreparationRecoveryState,
+    pub(crate) credit_ownership: DevicePreparationCreditOwnership,
     pub(crate) prepared_device: Option<DeviceEnvelope>,
     pub(crate) cohort_digest: Option<u64>,
     pub(crate) rollback_receipt: Option<DeviceRollbackReceipt>,
     pub(crate) closure_receipt: Option<RegistryDeviceClosureReceipt>,
+}
+
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
+pub(super) struct DevicePreparationCreditProjection {
+    pub(super) scope: ScopeKey,
+    pub(super) charges: [CreditCharge; 3],
+    pub(super) ownership: DevicePreparationCreditOwnership,
 }
 
 #[derive(
@@ -2076,6 +2135,7 @@ struct PreparedOwner {
     device: DeviceEnvelope,
     operation_digest: u64,
     actor_slot: u32,
+    actor_generation: u64,
     hardware_receipt_digest: u64,
 }
 
@@ -2834,6 +2894,20 @@ enum DevicePhase {
     },
 }
 
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
+enum DeviceCreditOwnership {
+    Held,
+    Retained,
+    Transferred,
+    Released,
+}
+
 #[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(crate) enum DeviceAdoption {
     Reserved(DevicePreparationTicket),
@@ -2851,6 +2925,7 @@ pub(crate) enum DeviceAdoption {
 struct DeviceRecord {
     stamp: BearerStamp<DeviceReservationCoordinates>,
     apply_generation: u64,
+    credit_ownership: DeviceCreditOwnership,
     phase: DevicePhase,
     closure_sequence: Option<u64>,
 }
@@ -2988,6 +3063,7 @@ struct ReverseIndexRecord {
     source_binding_epoch: Option<u64>,
     resource: Option<ResourceKey>,
     actor_slot: Option<u32>,
+    actor_generation: Option<u64>,
     retry_generation: u64,
 }
 
@@ -3004,6 +3080,7 @@ fn reverse_index_for_task(record: &TaskRecord) -> ReverseIndexRecord {
         source_binding_epoch: None,
         resource: None,
         actor_slot: None,
+        actor_generation: None,
         retry_generation: record.stamp.identity.generation,
     }
 }
@@ -3022,6 +3099,7 @@ fn reverse_index_for_fault(record: &FaultStateRecord) -> ReverseIndexRecord {
         source_binding_epoch: None,
         resource: None,
         actor_slot: None,
+        actor_generation: None,
         retry_generation: descriptor.vm_generation,
     }
 }
