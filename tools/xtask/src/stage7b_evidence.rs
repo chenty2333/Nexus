@@ -2050,7 +2050,9 @@ fn validate_production_device_batch_source_text(source: &str) -> Result<(), Stri
         .find("let publication = self.prepare_publication_ack(ticket)?;")
         .ok_or_else(|| "combined transition skips publication prevalidation".to_owned())?;
     let revoke_prepare = combined_apply
-        .find("let revoke = self.prepare_revoke_complete_apply(selection, Some(&publication))?;")
+        .find(
+            "let revoke = self.prepare_revoke_complete_apply(selection, Some(&publication), None)?;",
+        )
         .ok_or_else(|| "combined transition skips projected revoke prevalidation".to_owned())?;
     let external_apply = combined_apply
         .find("let applied = apply_publication();")
@@ -2506,7 +2508,9 @@ fn validate_production_device_batch_source_text(source: &str) -> Result<(), Stri
     let revoke_finish_apply = &source[revoke_finish_apply_start..revoke_finish_end];
     for required in [
         "self.validate_revoke_selection(selection)?;",
-        ".prepare_closure_finish(infrastructure_selection)?;",
+        "projected_workload_close: Option<&infrastructure::WorkloadCloseIntent>,",
+        ".prepare_closure_finish_after_workload_close(",
+        ".prepare_closure_finish(infrastructure_selection)?,",
         "let receipt = ScopeClosureReceipt {",
         "infrastructure: infrastructure_receipt,",
         "closed_scope_revision: next_scope_revision,",
@@ -4557,13 +4561,24 @@ mod tests {
         assert!(validate_fault_registry_source_text(&premature_combined_apply).is_err());
 
         let skipped_infrastructure_finish_prepare = source.replacen(
-            ".prepare_closure_finish(infrastructure_selection)?;",
-            ".unchecked_closure_finish(infrastructure_selection)?;",
+            ".prepare_closure_finish(infrastructure_selection)?,",
+            ".unchecked_closure_finish(infrastructure_selection)?,",
             1,
         );
         assert_ne!(skipped_infrastructure_finish_prepare, source);
         assert!(
             validate_fault_registry_source_text(&skipped_infrastructure_finish_prepare).is_err()
+        );
+
+        let skipped_projected_infrastructure_finish_prepare = source.replacen(
+            ".prepare_closure_finish_after_workload_close(",
+            ".unchecked_closure_finish_after_workload_close(",
+            1,
+        );
+        assert_ne!(skipped_projected_infrastructure_finish_prepare, source);
+        assert!(
+            validate_fault_registry_source_text(&skipped_projected_infrastructure_finish_prepare)
+                .is_err()
         );
 
         let skipped_infrastructure_finish_apply = source.replacen(
