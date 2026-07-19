@@ -533,6 +533,39 @@ impl WorkloadContext {
     }
 }
 
+/// Copyable inspection of an already validated workload context. This is
+/// descriptive Registry-private data and cannot authorize any transition.
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
+pub(super) enum WorkloadParentDescription {
+    RootEffect(EffectKey),
+    Request { id: u64, generation: u64 },
+}
+
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
+pub(super) struct WorkloadContextDescription {
+    pub(super) registry_instance: u64,
+    pub(super) scope: ScopeKey,
+    pub(super) authority_epoch: u64,
+    pub(super) root_effect: EffectKey,
+    pub(super) domain: DomainKey,
+    pub(super) binding_epoch: u64,
+    pub(super) request_id: u64,
+    pub(super) request_generation: u64,
+    pub(super) parent: WorkloadParentDescription,
+}
+
 #[derive(
     __cser_core::clone::Clone,
     __cser_core::marker::Copy,
@@ -2746,6 +2779,7 @@ pub(super) struct WorkloadCloseIntent {
     base_revision: u64,
     next_revision: u64,
     next_live_workloads: u32,
+    next_parent_live_children: Option<u32>,
 }
 
 #[derive(
@@ -3466,6 +3500,19 @@ impl<T: SlotIdentity> FixedSlots<T> {
         Ok(())
     }
 
+    /// Installs a record after a read-only preflight proved both identity
+    /// absence and fixed-slot vacancy. This final step performs no allocation
+    /// and exposes no recoverable error after authoritative mutation begins.
+    fn install_vacant_prevalidated(&mut self, record: T) {
+        __cser_core::debug_assert!(self.get(record.slot_id()).is_none());
+        let vacant = self
+            .slots
+            .iter_mut()
+            .find(|slot| slot.is_none())
+            .expect("prevalidated fixed-slot vacancy remains present");
+        *vacant = Some(record);
+    }
+
     fn has_vacancy_or_id(&self, id: u64) -> bool {
         self.slots
             .iter()
@@ -3800,6 +3847,22 @@ pub(super) struct CausalWorkloadBootstrapInstall {
     scope: ScopeKey,
     record: ScopeInfrastructure,
     mint: PreparedWorkloadMint,
+}
+
+/// Fully checked child-workload append. Every fallible lookup, counter, quota,
+/// and invariant operation occurs before this plan exists; applying it only
+/// fills already allocated slots and updates precomputed counters.
+#[derive(__cser_core::fmt::Debug)]
+struct ChildWorkloadOpenPlan {
+    scope: ScopeKey,
+    record: WorkloadRecord,
+    index: ReverseIndexRecord,
+    mint: PreparedWorkloadMint,
+    parent_request: RequestKey,
+    next_parent_live_children: u32,
+    next_nonce: u64,
+    next_revision: u64,
+    next_live_workloads: u32,
 }
 
 fn rewrite_scope_stamps(scope: &mut ScopeInfrastructure, registry_instance: u64) {
@@ -4628,6 +4691,11 @@ fn first_live_child_kind(
     scope: &ScopeInfrastructure,
     request: RequestKey,
 ) -> Result<InfrastructureKind, InfrastructureError> {
+    if scope.workloads.iter().any(|record| {
+        record.parent == ParentStamp::Request(request) && record.phase == WorkloadPhase::Open
+    }) {
+        return Ok(InfrastructureKind::Workload);
+    }
     if scope.tasks.iter().any(|record| {
         record.stamp.workload.request == request
             && __cser_core::matches!(record.phase, TaskPhase::Admitted | TaskPhase::Entered)

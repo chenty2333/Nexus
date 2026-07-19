@@ -20,19 +20,19 @@ use super::{
     FaultAccess, FaultDisposition, FaultObservation, FaultPhase, FaultSlotDescriptor,
     InfrastructureClosureProgress, InfrastructureClosureReceipt, InfrastructureError,
     InfrastructureKind, InfrastructureLimits, InfrastructureState, LinearFailure,
-    MaterializedDeviceTicket, PortalHandle, PreparedDeviceTicket, RegistryDeviceClosureReceipt,
-    ReplyAbortAuthority, ReplyAckReceipt, ReplyAdoption, ReplyClaim, ReplyDescriptor,
-    ReplyPublicationIntent, ReplyPublicationReceipt, ReplyRecord, ReservedFaultTask, ResourceKey,
-    ReverseIndexRecord, ReverseParent, ScopeKey, ServiceArmAuthority, ServiceArmPlan,
-    ServiceArmReceipt, ServiceBoundKey, ServiceCancellationPoint, ServiceChildBindingReceipt,
-    ServiceChildReceipt, ServiceClaimantSnapshot, ServiceEnqueueAuthority, ServiceEnqueuePlan,
-    ServiceEnqueueReceipt, ServiceLineageCommitment, ServiceRequestCausalIdentity,
-    ServiceRequestDescriptor, ServiceRequestPhase, ServiceRequestRecoveryState,
-    ServiceRequestTicket, TaskAdoption, TaskAnchorRecoveryState, TaskKey, TaskPhase,
-    TaskWorkDescriptor, TaskWorkRole, UnarmedServiceRequest, UnboundServiceRequest,
-    ValidatedAbortProof, ValidatedCommitProof, ValidatedDeviceClosureProof,
-    ValidatedServiceChildProof, VmAuthorityKey, WakeClaim, WorkloadContext,
-    WorkloadRequestPresentation, WorkloadRootPresentation, bearer_state,
+    MaterializedDeviceTicket, ParentStamp, PortalHandle, PreparedDeviceTicket,
+    RegistryDeviceClosureReceipt, ReplyAbortAuthority, ReplyAckReceipt, ReplyAdoption, ReplyClaim,
+    ReplyDescriptor, ReplyPublicationIntent, ReplyPublicationReceipt, ReplyRecord, RequestKey,
+    ReservedFaultTask, ResourceKey, ReverseIndexRecord, ReverseParent, ScopeKey,
+    ServiceArmAuthority, ServiceArmPlan, ServiceArmReceipt, ServiceBoundKey,
+    ServiceCancellationPoint, ServiceChildBindingReceipt, ServiceChildReceipt,
+    ServiceClaimantSnapshot, ServiceEnqueueAuthority, ServiceEnqueuePlan, ServiceEnqueueReceipt,
+    ServiceLineageCommitment, ServiceRequestCausalIdentity, ServiceRequestDescriptor,
+    ServiceRequestPhase, ServiceRequestRecoveryState, ServiceRequestTicket, TaskAdoption,
+    TaskAnchorRecoveryState, TaskKey, TaskPhase, TaskWorkDescriptor, TaskWorkRole,
+    UnarmedServiceRequest, UnboundServiceRequest, ValidatedAbortProof, ValidatedCommitProof,
+    ValidatedDeviceClosureProof, ValidatedServiceChildProof, VmAuthorityKey, WakeClaim,
+    WorkloadContext, WorkloadRequestPresentation, WorkloadRootPresentation, bearer_state,
 };
 
 const SCOPE: ScopeKey = ScopeKey::new(0x9100, 1);
@@ -7233,6 +7233,198 @@ fn workload_close_intent_is_exact_failure_atomic_and_projects_root_finish() {
         Err(InfrastructureError::ForeignWorkload)
     );
     __cser_core::assert_eq!(owner, before_substitution);
+}
+
+#[test]
+fn domain_child_workload_is_single_level_parent_counted_and_failure_atomic() {
+    const ROOT_REQUEST: u64 = 0xb100;
+    const CHILD_REQUEST: u64 = 0xb101;
+    const GRANDCHILD_REQUEST: u64 = 0xb102;
+
+    let mut state = InfrastructureState::new(0xb000);
+    state
+        .enable(SCOPE, 1, ROOT, limits(), &[(GUEST, 1), (SERVICE, 1)])
+        .unwrap();
+    let root = state
+        .open_workload(
+            WorkloadRootPresentation::new(SCOPE, 1, ROOT),
+            WorkloadRequestPresentation::new(GUEST, 1, ROOT_REQUEST, 1),
+        )
+        .unwrap();
+    let child = state
+        .open_child_workload(&root, SERVICE, CHILD_REQUEST, 1)
+        .unwrap();
+    let description = state.describe_open_workload(&child).unwrap();
+    __cser_core::assert_eq!(description.domain, SERVICE);
+    __cser_core::assert_eq!(description.binding_epoch, 1);
+    __cser_core::assert_eq!(
+        description.parent,
+        super::WorkloadParentDescription::Request {
+            id: ROOT_REQUEST,
+            generation: 1,
+        }
+    );
+    let parent = state
+        .scope(SCOPE)
+        .unwrap()
+        .workloads
+        .get(ROOT_REQUEST)
+        .unwrap();
+    __cser_core::assert_eq!(parent.live_children, 1);
+    __cser_core::assert_eq!(state.scope(SCOPE).unwrap().live.workloads, 2);
+    state.check_invariants().unwrap();
+
+    // A child context can never mint a grandchild. The failed admission leaves
+    // every primary record, reverse index, counter, and diagnostic event exact.
+    let before_grandchild = state.private_full_clone();
+    __cser_core::assert_eq!(
+        state.open_child_workload(&child, SERVICE, GRANDCHILD_REQUEST, 1),
+        Err(InfrastructureError::ForeignParent)
+    );
+    __cser_core::assert_eq!(state, before_grandchild);
+
+    // The root's derived count names an actual live workload child, so close
+    // reports Workload rather than an unrelated obligation family.
+    let before_root_close = state.private_full_clone();
+    __cser_core::assert_eq!(
+        state.prepare_workload_close(&root),
+        Err(InfrastructureError::ClosureBlocked {
+            kind: InfrastructureKind::Workload,
+            live: 1,
+        })
+    );
+    __cser_core::assert_eq!(state, before_root_close);
+
+    // Duplicate identity is retained even though a second slot is available.
+    let before_replay = state.private_full_clone();
+    __cser_core::assert_eq!(
+        state.open_child_workload(&root, SERVICE, CHILD_REQUEST, 1),
+        Err(InfrastructureError::ExactReplay)
+    );
+    __cser_core::assert_eq!(state, before_replay);
+
+    // Both primary ancestry and its reverse index are authoritative. Forging
+    // either side of ParentStamp::Request is rejected by invariant rebuild.
+    let child_nonce = state
+        .scope(SCOPE)
+        .unwrap()
+        .workloads
+        .get(CHILD_REQUEST)
+        .unwrap()
+        .nonce;
+    let mut forged_parent = state.private_full_clone();
+    forged_parent
+        .scope_mut(SCOPE)
+        .unwrap()
+        .workloads
+        .get_mut(CHILD_REQUEST)
+        .unwrap()
+        .parent = ParentStamp::Request(RequestKey::new(0xb1ff, 1).unwrap());
+    assert_invariant_read_only(forged_parent);
+    let mut forged_index = state.private_full_clone();
+    forged_index
+        .scope_mut(SCOPE)
+        .unwrap()
+        .reverse_indexes
+        .get_mut(child_nonce)
+        .unwrap()
+        .parent = ReverseParent::RootEffect(ROOT);
+    assert_invariant_read_only(forged_index);
+
+    // A domain fence removes all admission authority from the historic child,
+    // but its exact non-cloned context remains usable for terminal cleanup.
+    *state
+        .scope_mut(SCOPE)
+        .unwrap()
+        .binding_epoch_mut(SERVICE)
+        .unwrap() = 2;
+    let before_stale_admission = state.private_full_clone();
+    __cser_core::assert_eq!(
+        state.admit_task(
+            &child,
+            TaskWorkDescriptor {
+                work_id: 0xb110,
+                generation: 1,
+                task: TaskKey::new(0xb111, 1),
+                role: TaskWorkRole::GuestSyscallWork,
+                vm: Some(VmAuthorityKey::new(0xb112, 1).unwrap()),
+            },
+        ),
+        Err(InfrastructureError::StaleBinding)
+    );
+    __cser_core::assert_eq!(
+        state.open_child_workload(&child, SERVICE, GRANDCHILD_REQUEST, 1),
+        Err(InfrastructureError::StaleBinding)
+    );
+    __cser_core::assert_eq!(state, before_stale_admission);
+    let intent = state.prepare_historical_workload_close(&child).unwrap();
+    state.apply_workload_close(intent, &child);
+    __cser_core::assert_eq!(
+        state
+            .scope(SCOPE)
+            .unwrap()
+            .workloads
+            .get(ROOT_REQUEST)
+            .unwrap()
+            .live_children,
+        0
+    );
+    state.close_workload(&root).unwrap();
+    __cser_core::assert_eq!(state.scope(SCOPE).unwrap().live.workloads, 0);
+    state.check_invariants().unwrap();
+
+    // A context minted by another Registry instance cannot become a local
+    // parent, even when every visible scope/root/request coordinate matches.
+    let mut foreign = InfrastructureState::new(0xb001);
+    foreign
+        .enable(SCOPE, 1, ROOT, limits(), &[(GUEST, 1), (SERVICE, 1)])
+        .unwrap();
+    let before_foreign = foreign.private_full_clone();
+    __cser_core::assert_eq!(
+        foreign.open_child_workload(&root, SERVICE, 0xb120, 1),
+        Err(InfrastructureError::ForeignRegistry)
+    );
+    __cser_core::assert_eq!(foreign, before_foreign);
+
+    // The conservative one-workload limit and a preflight nonce overflow both
+    // fail before either half of the append reaches the live ledger.
+    let one_workload = InfrastructureLimits::new(1, 8, 8, 8, 8, 8, 8, 8, 8, 8, 16, 8, 8).unwrap();
+    let mut quota = InfrastructureState::new(0xb002);
+    quota
+        .enable(SCOPE, 1, ROOT, one_workload, &[(GUEST, 1), (SERVICE, 1)])
+        .unwrap();
+    let quota_root = quota
+        .open_workload(
+            WorkloadRootPresentation::new(SCOPE, 1, ROOT),
+            WorkloadRequestPresentation::new(GUEST, 1, 0xb130, 1),
+        )
+        .unwrap();
+    let before_quota = quota.private_full_clone();
+    __cser_core::assert_eq!(
+        quota.open_child_workload(&quota_root, SERVICE, 0xb131, 1),
+        Err(InfrastructureError::QuotaExceeded(
+            InfrastructureKind::Workload
+        ))
+    );
+    __cser_core::assert_eq!(quota, before_quota);
+
+    let mut overflow = InfrastructureState::new(0xb003);
+    overflow
+        .enable(SCOPE, 1, ROOT, limits(), &[(GUEST, 1), (SERVICE, 1)])
+        .unwrap();
+    let overflow_root = overflow
+        .open_workload(
+            WorkloadRootPresentation::new(SCOPE, 1, ROOT),
+            WorkloadRequestPresentation::new(GUEST, 1, 0xb140, 1),
+        )
+        .unwrap();
+    overflow.scope_mut(SCOPE).unwrap().next_nonce = u64::MAX;
+    let before_overflow = overflow.private_full_clone();
+    __cser_core::assert_eq!(
+        overflow.open_child_workload(&overflow_root, SERVICE, 0xb141, 1),
+        Err(InfrastructureError::CounterOverflow)
+    );
+    __cser_core::assert_eq!(overflow, before_overflow);
 }
 
 #[test]

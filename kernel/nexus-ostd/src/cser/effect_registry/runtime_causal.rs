@@ -17,11 +17,13 @@ use super::{
     RegistryError, RevokeSelection, ScopeKey, ScopePhase, infrastructure,
 };
 
-/// Bounded capacity for the seven RFC 0003 obligation families.
+/// Bounded capacity for workloads and the seven RFC 0003 obligation families.
 ///
-/// One workload slot is implicit. Service-request and delayed-command capacity
-/// remain separate because they have distinct ownership transitions even
-/// though they form one implementation tranche.
+/// The conservative constructor retains one workload slot. A caller which
+/// needs a ledger-owned domain child must opt into additional bounded workload
+/// capacity explicitly with [`Self::with_workload_capacity`]. Service-request
+/// and delayed-command capacity remain separate because they have distinct
+/// ownership transitions even though they form one implementation tranche.
 #[derive(
     __cser_core::clone::Clone,
     __cser_core::marker::Copy,
@@ -30,6 +32,7 @@ use super::{
     __cser_core::cmp::PartialEq,
 )]
 pub(crate) struct CausalWorkloadLimits {
+    workloads: u32,
     task_admissions: u32,
     service_requests: u32,
     delayed_commands: u32,
@@ -61,6 +64,7 @@ impl CausalWorkloadLimits {
         diagnostic_events: u32,
     ) -> Self {
         Self {
+            workloads: 1,
             task_admissions,
             service_requests,
             delayed_commands,
@@ -76,9 +80,14 @@ impl CausalWorkloadLimits {
         }
     }
 
+    pub(crate) const fn with_workload_capacity(mut self, workloads: u32) -> Self {
+        self.workloads = workloads;
+        self
+    }
+
     fn infrastructure(self) -> Result<infrastructure::InfrastructureLimits, CausalWorkloadError> {
         infrastructure::InfrastructureLimits::new(
-            1,
+            self.workloads,
             self.task_admissions,
             self.service_requests,
             self.delayed_commands,
@@ -142,6 +151,60 @@ pub(crate) struct CausalWorkloadSession {
     pub(super) context: infrastructure::WorkloadContext,
 }
 
+/// Descriptive identity of one ledger-owned domain workload below the exact
+/// root workload. It is copyable evidence, never bearer authority.
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
+pub(crate) struct CausalDomainWorkloadIdentity {
+    pub(super) parent: CausalWorkloadIdentity,
+    pub(super) domain: DomainKey,
+    pub(super) binding_epoch: u64,
+    pub(super) request_id: u64,
+    pub(super) request_generation: u64,
+}
+
+impl CausalDomainWorkloadIdentity {
+    pub(crate) const fn parent(self) -> CausalWorkloadIdentity {
+        self.parent
+    }
+
+    pub(crate) const fn domain(self) -> DomainKey {
+        self.domain
+    }
+
+    pub(crate) const fn binding_epoch(self) -> u64 {
+        self.binding_epoch
+    }
+
+    pub(crate) const fn request_id(self) -> u64 {
+        self.request_id
+    }
+
+    pub(crate) const fn request_generation(self) -> u64 {
+        self.request_generation
+    }
+}
+
+/// Opaque authority for one child workload admitted into a Registry-owned
+/// target domain. This type intentionally implements neither `Clone` nor
+/// `Copy`; only the authoritative infrastructure ledger can mint it.
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
+pub(crate) struct CausalDomainWorkloadSession {
+    pub(super) identity: CausalDomainWorkloadIdentity,
+    pub(super) context: infrastructure::WorkloadContext,
+}
+
+impl CausalDomainWorkloadSession {
+    pub(crate) const fn identity(&self) -> CausalDomainWorkloadIdentity {
+        self.identity
+    }
+}
+
 /// Exact two-phase close authority for one session and one pair of Registry
 /// revisions. It is intentionally non-Clone and non-Copy.
 #[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
@@ -167,6 +230,8 @@ impl CausalWorkloadSession {
 pub(crate) enum CausalWorkloadError {
     InvalidRequest,
     ForeignRegistry,
+    ParentMismatch,
+    DomainMismatch,
     StaleScope,
     StaleRoot,
     StaleDomain,
@@ -180,6 +245,55 @@ pub(crate) enum CausalWorkloadError {
 pub(crate) struct CausalWorkloadCloseFailure {
     error: CausalWorkloadError,
     session: CausalWorkloadSession,
+}
+
+/// Exact prepared admission for a child workload. The target binding epoch is
+/// captured from the authoritative Registry and cannot be supplied by a
+/// caller. The input is deliberately non-Clone/non-Copy and is returned on
+/// every failed activation.
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
+pub(crate) struct CausalDomainWorkloadRequest {
+    registry_instance: u64,
+    registry_scope_revision: u64,
+    infrastructure_scope_revision: u64,
+    domain_revision: u64,
+    parent: CausalWorkloadIdentity,
+    domain: DomainKey,
+    binding_epoch: u64,
+    request_id: u64,
+    request_generation: u64,
+}
+
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
+pub(crate) struct CausalDomainWorkloadActivationFailure {
+    error: CausalWorkloadError,
+    request: CausalDomainWorkloadRequest,
+}
+
+impl CausalDomainWorkloadActivationFailure {
+    pub(crate) const fn error(&self) -> &CausalWorkloadError {
+        &self.error
+    }
+
+    pub(crate) fn into_input(self) -> CausalDomainWorkloadRequest {
+        self.request
+    }
+}
+
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
+pub(crate) struct CausalDomainWorkloadCloseFailure {
+    error: CausalWorkloadError,
+    session: CausalDomainWorkloadSession,
+}
+
+impl CausalDomainWorkloadCloseFailure {
+    pub(crate) const fn error(&self) -> &CausalWorkloadError {
+        &self.error
+    }
+
+    pub(crate) fn into_session(self) -> CausalDomainWorkloadSession {
+        self.session
+    }
 }
 
 impl CausalWorkloadCloseFailure {
@@ -429,17 +543,293 @@ impl EffectRegistry {
         &self,
         session: &CausalWorkloadSession,
     ) -> Result<CausalWorkloadIdentity, CausalWorkloadError> {
-        if session.identity.registry_instance != self.instance_id {
+        let identity = session.identity;
+        if identity.registry_instance != self.instance_id {
             return Err(CausalWorkloadError::ForeignRegistry);
         }
-        match self
+        self.validate_causal_workload_close_binding(identity)?;
+        let description = self
             .infrastructure
-            .workload_context_is_open(&session.context)
-            .map_err(CausalWorkloadError::Infrastructure)?
+            .describe_open_workload(&session.context)
+            .map_err(CausalWorkloadError::Infrastructure)?;
+        if description.registry_instance != identity.registry_instance
+            || description.scope != identity.scope
+            || description.authority_epoch != identity.authority_epoch
+            || description.root_effect != identity.root_effect
+            || description.domain != identity.domain
+            || description.binding_epoch != identity.binding_epoch
+            || description.request_id != identity.request_id
+            || description.request_generation != identity.request_generation
+            || description.parent
+                != infrastructure::WorkloadParentDescription::RootEffect(identity.root_effect)
         {
-            true => Ok(session.identity),
-            false => Err(CausalWorkloadError::StaleRoot),
+            return Err(CausalWorkloadError::StaleRoot);
         }
+        Ok(identity)
+    }
+
+    /// Captures a child admission from the exact authoritative Registry and
+    /// infrastructure revisions. The caller names only the target domain and
+    /// portable request coordinates; the binding epoch is never an input.
+    pub(crate) fn prepare_causal_domain_workload(
+        &self,
+        parent: &CausalWorkloadSession,
+        target_domain: DomainKey,
+        request_id: u64,
+        request_generation: u64,
+    ) -> Result<CausalDomainWorkloadRequest, CausalWorkloadError> {
+        if request_id == 0 || request_generation == 0 {
+            return Err(CausalWorkloadError::InvalidRequest);
+        }
+        let parent_identity = self.verify_causal_workload_session(parent)?;
+        self.check_invariants()
+            .map_err(CausalWorkloadError::Registry)?;
+        let scope = self
+            .scopes
+            .get(&parent_identity.scope)
+            .ok_or(CausalWorkloadError::Registry(RegistryError::UnknownScope))?;
+        if scope.phase != ScopePhase::Active
+            || scope.authority_epoch != parent_identity.authority_epoch
+        {
+            return Err(CausalWorkloadError::StaleRoot);
+        }
+        let binding = scope
+            .domains
+            .get(&target_domain)
+            .ok_or(CausalWorkloadError::Registry(RegistryError::UnknownDomain))?;
+        if binding.quarantine.is_some() || binding.supervisor.is_none() || binding.fallback_running
+        {
+            return Err(CausalWorkloadError::StaleDomain);
+        }
+        let infrastructure = self
+            .infrastructure
+            .root_binding(parent_identity.scope)
+            .map_err(CausalWorkloadError::Infrastructure)?;
+        if infrastructure.authority_epoch != parent_identity.authority_epoch
+            || infrastructure.root_effect != parent_identity.root_effect
+        {
+            return Err(CausalWorkloadError::StaleRoot);
+        }
+        Ok(CausalDomainWorkloadRequest {
+            registry_instance: self.instance_id,
+            registry_scope_revision: scope.revision,
+            infrastructure_scope_revision: infrastructure.revision,
+            domain_revision: binding.revision,
+            parent: parent_identity,
+            domain: target_domain,
+            binding_epoch: binding.binding_epoch,
+            request_id,
+            request_generation,
+        })
+    }
+
+    /// Installs a prepared child admission only after revalidating its exact
+    /// parent, target domain, and both authoritative revisions. The repeated
+    /// target-domain argument makes cross-domain plan substitution explicit.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn activate_causal_domain_workload(
+        &mut self,
+        parent: &CausalWorkloadSession,
+        target_domain: DomainKey,
+        request: CausalDomainWorkloadRequest,
+    ) -> Result<CausalDomainWorkloadSession, CausalDomainWorkloadActivationFailure> {
+        if let Err(error) =
+            self.validate_causal_domain_workload_activation(parent, target_domain, &request)
+        {
+            return Err(CausalDomainWorkloadActivationFailure { error, request });
+        }
+        let context = match self.infrastructure.open_child_workload(
+            &parent.context,
+            target_domain,
+            request.request_id,
+            request.request_generation,
+        ) {
+            Ok(context) => context,
+            Err(error) => {
+                return Err(CausalDomainWorkloadActivationFailure {
+                    error: CausalWorkloadError::Infrastructure(error),
+                    request,
+                });
+            }
+        };
+        let identity = CausalDomainWorkloadIdentity {
+            parent: request.parent,
+            domain: request.domain,
+            binding_epoch: request.binding_epoch,
+            request_id: request.request_id,
+            request_generation: request.request_generation,
+        };
+        __cser_core::debug_assert!(self.check_infrastructure_root_links().is_ok());
+        Ok(CausalDomainWorkloadSession { identity, context })
+    }
+
+    fn validate_causal_domain_workload_activation(
+        &self,
+        parent: &CausalWorkloadSession,
+        target_domain: DomainKey,
+        request: &CausalDomainWorkloadRequest,
+    ) -> Result<(), CausalWorkloadError> {
+        if request.registry_instance != self.instance_id {
+            return Err(CausalWorkloadError::ForeignRegistry);
+        }
+        if target_domain != request.domain {
+            return Err(CausalWorkloadError::DomainMismatch);
+        }
+        let parent_identity = self.verify_causal_workload_session(parent)?;
+        if parent_identity != request.parent {
+            return Err(CausalWorkloadError::ParentMismatch);
+        }
+        let scope = self
+            .scopes
+            .get(&request.parent.scope)
+            .ok_or(CausalWorkloadError::Registry(RegistryError::UnknownScope))?;
+        if scope.phase != ScopePhase::Active
+            || scope.authority_epoch != request.parent.authority_epoch
+        {
+            return Err(CausalWorkloadError::StaleRoot);
+        }
+        let binding = scope
+            .domains
+            .get(&request.domain)
+            .ok_or(CausalWorkloadError::Registry(RegistryError::UnknownDomain))?;
+        if binding.binding_epoch != request.binding_epoch
+            || binding.revision != request.domain_revision
+            || binding.quarantine.is_some()
+            || binding.supervisor.is_none()
+            || binding.fallback_running
+        {
+            return Err(CausalWorkloadError::StaleDomain);
+        }
+        if scope.revision != request.registry_scope_revision {
+            return Err(CausalWorkloadError::StaleScope);
+        }
+        let infrastructure = self
+            .infrastructure
+            .root_binding(request.parent.scope)
+            .map_err(CausalWorkloadError::Infrastructure)?;
+        if infrastructure.authority_epoch != request.parent.authority_epoch
+            || infrastructure.root_effect != request.parent.root_effect
+        {
+            return Err(CausalWorkloadError::StaleRoot);
+        }
+        if infrastructure.revision != request.infrastructure_scope_revision {
+            return Err(CausalWorkloadError::StaleScope);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn verify_causal_domain_workload_session(
+        &self,
+        session: &CausalDomainWorkloadSession,
+    ) -> Result<CausalDomainWorkloadIdentity, CausalWorkloadError> {
+        let identity = session.identity;
+        if identity.parent.registry_instance != self.instance_id {
+            return Err(CausalWorkloadError::ForeignRegistry);
+        }
+        self.validate_causal_workload_close_binding(identity.parent)?;
+        let scope = self
+            .scopes
+            .get(&identity.parent.scope)
+            .ok_or(CausalWorkloadError::Registry(RegistryError::UnknownScope))?;
+        let binding = scope
+            .domains
+            .get(&identity.domain)
+            .ok_or(CausalWorkloadError::Registry(RegistryError::UnknownDomain))?;
+        if binding.binding_epoch != identity.binding_epoch {
+            return Err(CausalWorkloadError::StaleDomain);
+        }
+        let description = self
+            .infrastructure
+            .describe_open_workload(&session.context)
+            .map_err(CausalWorkloadError::Infrastructure)?;
+        if description.registry_instance != identity.parent.registry_instance
+            || description.scope != identity.parent.scope
+            || description.authority_epoch != identity.parent.authority_epoch
+            || description.root_effect != identity.parent.root_effect
+            || description.domain != identity.domain
+            || description.binding_epoch != identity.binding_epoch
+            || description.request_id != identity.request_id
+            || description.request_generation != identity.request_generation
+            || description.parent
+                != (infrastructure::WorkloadParentDescription::Request {
+                    id: identity.parent.request_id,
+                    generation: identity.parent.request_generation,
+                })
+        {
+            return Err(CausalWorkloadError::ParentMismatch);
+        }
+        Ok(identity)
+    }
+
+    fn validate_causal_domain_workload_close(
+        &self,
+        session: &CausalDomainWorkloadSession,
+    ) -> Result<CausalDomainWorkloadIdentity, CausalWorkloadError> {
+        let identity = session.identity;
+        if identity.parent.registry_instance != self.instance_id {
+            return Err(CausalWorkloadError::ForeignRegistry);
+        }
+        self.validate_causal_workload_close_binding(identity.parent)?;
+        let scope = self
+            .scopes
+            .get(&identity.parent.scope)
+            .ok_or(CausalWorkloadError::Registry(RegistryError::UnknownScope))?;
+        let binding = scope
+            .domains
+            .get(&identity.domain)
+            .ok_or(CausalWorkloadError::Registry(RegistryError::UnknownDomain))?;
+        if binding.binding_epoch < identity.binding_epoch {
+            return Err(CausalWorkloadError::StaleDomain);
+        }
+        let description = self
+            .infrastructure
+            .describe_closable_workload(&session.context)
+            .map_err(CausalWorkloadError::Infrastructure)?;
+        if description.registry_instance != identity.parent.registry_instance
+            || description.scope != identity.parent.scope
+            || description.authority_epoch != identity.parent.authority_epoch
+            || description.root_effect != identity.parent.root_effect
+            || description.domain != identity.domain
+            || description.binding_epoch != identity.binding_epoch
+            || description.request_id != identity.request_id
+            || description.request_generation != identity.request_generation
+            || description.parent
+                != (infrastructure::WorkloadParentDescription::Request {
+                    id: identity.parent.request_id,
+                    generation: identity.parent.request_generation,
+                })
+        {
+            return Err(CausalWorkloadError::ParentMismatch);
+        }
+        Ok(identity)
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn close_causal_domain_workload(
+        &mut self,
+        session: CausalDomainWorkloadSession,
+    ) -> Result<CausalDomainWorkloadIdentity, CausalDomainWorkloadCloseFailure> {
+        let identity = match self.validate_causal_domain_workload_close(&session) {
+            Ok(identity) => identity,
+            Err(error) => {
+                return Err(CausalDomainWorkloadCloseFailure { error, session });
+            }
+        };
+        let intent = match self
+            .infrastructure
+            .prepare_historical_workload_close(&session.context)
+        {
+            Ok(intent) => intent,
+            Err(error) => {
+                return Err(CausalDomainWorkloadCloseFailure {
+                    error: CausalWorkloadError::Infrastructure(error),
+                    session,
+                });
+            }
+        };
+        self.infrastructure
+            .apply_workload_close(intent, &session.context);
+        Ok(identity)
     }
 
     /// Prevalidates an exact workload close and returns both the non-Copy
@@ -649,10 +1039,16 @@ pub(super) fn runtime_causal_bootstrap_self_test() {
     const ROOT_OWNER: TaskKey = TaskKey::new(0xca01, 1);
     const SERVICE: TaskKey = TaskKey::new(0xca02, 1);
     const DOMAIN: DomainKey = DomainKey::new(0xca);
+    const TARGET_SERVICE: TaskKey = TaskKey::new(0xca03, 1);
+    const TARGET_DOMAIN: DomainKey = DomainKey::new(0xcc);
     const CREDIT: CreditClass = CreditClass::new(0xca);
 
     const fn limits() -> CausalWorkloadLimits {
         CausalWorkloadLimits::new(8, 2, 8, 2, 2, 8, 4, 4, 4, 12, 12, 128)
+    }
+
+    const fn nested_limits() -> CausalWorkloadLimits {
+        limits().with_workload_capacity(3)
     }
 
     fn fixture_with_publication(publication: PublicationMode) -> (EffectRegistry, PortalHandle) {
@@ -673,6 +1069,16 @@ pub(super) fn runtime_causal_bootstrap_self_test() {
                     key: DOMAIN,
                     binding_epoch: 3,
                     supervisor: SERVICE,
+                },
+            )
+            .unwrap();
+        registry
+            .add_domain(
+                SCOPE,
+                DomainConfig {
+                    key: TARGET_DOMAIN,
+                    binding_epoch: 5,
+                    supervisor: TARGET_SERVICE,
                 },
             )
             .unwrap();
@@ -698,6 +1104,20 @@ pub(super) fn runtime_causal_bootstrap_self_test() {
 
     fn fixture() -> (EffectRegistry, PortalHandle) {
         fixture_with_publication(PublicationMode::None)
+    }
+
+    fn advance_target_epoch_for_test(registry: &mut EffectRegistry) {
+        let scope = registry.scopes.get_mut(&SCOPE).unwrap();
+        scope.revision = scope.revision.checked_add(1).unwrap();
+        let binding = scope.domains.get_mut(&TARGET_DOMAIN).unwrap();
+        binding.binding_epoch = binding.binding_epoch.checked_add(1).unwrap();
+        binding.revision = binding.revision.checked_add(1).unwrap();
+        registry.infrastructure.corrupt_domain_epoch_for_test(
+            SCOPE,
+            TARGET_DOMAIN,
+            binding.binding_epoch,
+        );
+        registry.check_invariants().unwrap();
     }
 
     fn closing_fixture(
@@ -740,6 +1160,290 @@ pub(super) fn runtime_causal_bootstrap_self_test() {
     registry.check_invariants().unwrap();
     __cser_core::assert_eq!(registry.close_causal_workload(session), Ok(identity));
     registry.check_invariants().unwrap();
+
+    // A child admission captures its target epoch from the Registry, becomes
+    // an exact workload child in the infrastructure ledger, and blocks the
+    // parent root until the child is closed.
+    {
+        let (mut nested, nested_root) = fixture();
+        let request = nested
+            .prepare_causal_workload_activation(nested_root, 0xcb00, 1, nested_limits())
+            .unwrap();
+        let root_session = nested.activate_causal_workload(request).unwrap();
+        let request = nested
+            .prepare_causal_domain_workload(&root_session, TARGET_DOMAIN, 0xcb01, 1)
+            .unwrap();
+        __cser_core::assert_eq!(request.binding_epoch, 5);
+        let child = nested
+            .activate_causal_domain_workload(&root_session, TARGET_DOMAIN, request)
+            .unwrap();
+        let child_identity = nested
+            .verify_causal_domain_workload_session(&child)
+            .unwrap();
+        __cser_core::assert_eq!(child_identity.parent(), root_session.identity());
+        __cser_core::assert_eq!(child_identity.domain(), TARGET_DOMAIN);
+        __cser_core::assert_eq!(child_identity.binding_epoch(), 5);
+        __cser_core::assert_eq!(child_identity.request_id(), 0xcb01);
+        __cser_core::assert_eq!(child_identity.request_generation(), 1);
+
+        let before = nested.failure_atomic_projection();
+        let failure = nested.close_causal_workload(root_session).unwrap_err();
+        __cser_core::assert_eq!(
+            failure.error(),
+            &CausalWorkloadError::Infrastructure(
+                infrastructure::InfrastructureError::ClosureBlocked {
+                    kind: infrastructure::InfrastructureKind::Workload,
+                    live: 1,
+                }
+            )
+        );
+        __cser_core::assert_eq!(nested.failure_atomic_projection(), before);
+        let root_session = failure.into_session();
+        __cser_core::assert_eq!(
+            nested.close_causal_domain_workload(child),
+            Ok(child_identity)
+        );
+        __cser_core::assert_eq!(
+            nested.close_causal_workload(root_session),
+            Ok(child_identity.parent())
+        );
+        nested.check_invariants().unwrap();
+    }
+
+    // Domain and parent coordinates are repeated at activation so a prepared
+    // request cannot be moved to a different domain or root. Every rejection
+    // returns the exact linear request and leaves both ledgers unchanged.
+    {
+        let (mut substituted, substituted_root) = fixture();
+        let request = substituted
+            .prepare_causal_workload_activation(substituted_root, 0xcb10, 1, nested_limits())
+            .unwrap();
+        let root_session = substituted.activate_causal_workload(request).unwrap();
+        let request = substituted
+            .prepare_causal_domain_workload(&root_session, TARGET_DOMAIN, 0xcb11, 1)
+            .unwrap();
+        let expected = __cser_alloc::format!("{request:?}");
+        let before = substituted.failure_atomic_projection();
+        let failure = substituted
+            .activate_causal_domain_workload(&root_session, DomainKey::new(0xcd), request)
+            .unwrap_err();
+        __cser_core::assert_eq!(failure.error(), &CausalWorkloadError::DomainMismatch);
+        let request = failure.into_input();
+        __cser_core::assert_eq!(__cser_alloc::format!("{request:?}"), expected);
+        __cser_core::assert_eq!(substituted.failure_atomic_projection(), before);
+
+        let child = substituted
+            .activate_causal_domain_workload(&root_session, TARGET_DOMAIN, request)
+            .unwrap();
+        substituted.close_causal_domain_workload(child).unwrap();
+
+        let mut request = substituted
+            .prepare_causal_domain_workload(&root_session, TARGET_DOMAIN, 0xcb12, 1)
+            .unwrap();
+        request.parent.root_effect = EffectKey::new(0xcbff, 1);
+        let expected = __cser_alloc::format!("{request:?}");
+        let before = substituted.failure_atomic_projection();
+        let failure = substituted
+            .activate_causal_domain_workload(&root_session, TARGET_DOMAIN, request)
+            .unwrap_err();
+        __cser_core::assert_eq!(failure.error(), &CausalWorkloadError::ParentMismatch);
+        __cser_core::assert_eq!(
+            __cser_alloc::format!("{:?}", failure.into_input()),
+            expected
+        );
+        __cser_core::assert_eq!(substituted.failure_atomic_projection(), before);
+        substituted.close_causal_workload(root_session).unwrap();
+        substituted.check_invariants().unwrap();
+    }
+
+    // A prepared request and parent from another Registry instance cannot be
+    // confused with an otherwise coordinate-identical local root.
+    {
+        let (mut owner, owner_root) = fixture();
+        let owner_request = owner
+            .prepare_causal_workload_activation(owner_root, 0xcb20, 1, nested_limits())
+            .unwrap();
+        let owner_session = owner.activate_causal_workload(owner_request).unwrap();
+        let foreign_request = owner
+            .prepare_causal_domain_workload(&owner_session, TARGET_DOMAIN, 0xcb21, 1)
+            .unwrap();
+        let expected = __cser_alloc::format!("{foreign_request:?}");
+
+        let (mut target, target_root) = fixture();
+        let target_request = target
+            .prepare_causal_workload_activation(target_root, 0xcb20, 1, nested_limits())
+            .unwrap();
+        let target_session = target.activate_causal_workload(target_request).unwrap();
+        __cser_core::assert_eq!(
+            target.prepare_causal_domain_workload(&owner_session, TARGET_DOMAIN, 0xcb22, 1,),
+            Err(CausalWorkloadError::ForeignRegistry)
+        );
+        let before = target.failure_atomic_projection();
+        let failure = target
+            .activate_causal_domain_workload(&target_session, TARGET_DOMAIN, foreign_request)
+            .unwrap_err();
+        __cser_core::assert_eq!(failure.error(), &CausalWorkloadError::ForeignRegistry);
+        __cser_core::assert_eq!(
+            __cser_alloc::format!("{:?}", failure.into_input()),
+            expected
+        );
+        __cser_core::assert_eq!(target.failure_atomic_projection(), before);
+        target.close_causal_workload(target_session).unwrap();
+        owner.close_causal_workload(owner_session).unwrap();
+    }
+
+    // Duplicate identity, the conservative default workload quota, and nonce
+    // exhaustion all fail before installing either a primary record or reverse
+    // index entry.
+    {
+        let (mut duplicate, duplicate_root) = fixture();
+        let request = duplicate
+            .prepare_causal_workload_activation(duplicate_root, 0xcb30, 1, nested_limits())
+            .unwrap();
+        let root_session = duplicate.activate_causal_workload(request).unwrap();
+        let request = duplicate
+            .prepare_causal_domain_workload(&root_session, TARGET_DOMAIN, 0xcb31, 1)
+            .unwrap();
+        let child = duplicate
+            .activate_causal_domain_workload(&root_session, TARGET_DOMAIN, request)
+            .unwrap();
+        let replay = duplicate
+            .prepare_causal_domain_workload(&root_session, TARGET_DOMAIN, 0xcb31, 1)
+            .unwrap();
+        let before = duplicate.failure_atomic_projection();
+        let failure = duplicate
+            .activate_causal_domain_workload(&root_session, TARGET_DOMAIN, replay)
+            .unwrap_err();
+        __cser_core::assert_eq!(
+            failure.error(),
+            &CausalWorkloadError::Infrastructure(infrastructure::InfrastructureError::ExactReplay)
+        );
+        __cser_core::assert_eq!(duplicate.failure_atomic_projection(), before);
+        duplicate.close_causal_domain_workload(child).unwrap();
+        duplicate.close_causal_workload(root_session).unwrap();
+
+        let (mut quota, quota_root) = fixture();
+        let request = quota
+            .prepare_causal_workload_activation(quota_root, 0xcb32, 1, limits())
+            .unwrap();
+        let root_session = quota.activate_causal_workload(request).unwrap();
+        let request = quota
+            .prepare_causal_domain_workload(&root_session, TARGET_DOMAIN, 0xcb33, 1)
+            .unwrap();
+        let before = quota.failure_atomic_projection();
+        let failure = quota
+            .activate_causal_domain_workload(&root_session, TARGET_DOMAIN, request)
+            .unwrap_err();
+        __cser_core::assert_eq!(
+            failure.error(),
+            &CausalWorkloadError::Infrastructure(
+                infrastructure::InfrastructureError::QuotaExceeded(
+                    infrastructure::InfrastructureKind::Workload
+                )
+            )
+        );
+        __cser_core::assert_eq!(quota.failure_atomic_projection(), before);
+        quota.close_causal_workload(root_session).unwrap();
+
+        let (mut overflow, overflow_root) = fixture();
+        let request = overflow
+            .prepare_causal_workload_activation(overflow_root, 0xcb34, 1, nested_limits())
+            .unwrap();
+        let root_session = overflow.activate_causal_workload(request).unwrap();
+        let request = overflow
+            .prepare_causal_domain_workload(&root_session, TARGET_DOMAIN, 0xcb35, 1)
+            .unwrap();
+        overflow
+            .infrastructure
+            .set_next_nonce_for_test(SCOPE, u64::MAX);
+        let before = overflow.failure_atomic_projection();
+        let failure = overflow
+            .activate_causal_domain_workload(&root_session, TARGET_DOMAIN, request)
+            .unwrap_err();
+        __cser_core::assert_eq!(
+            failure.error(),
+            &CausalWorkloadError::Infrastructure(
+                infrastructure::InfrastructureError::CounterOverflow
+            )
+        );
+        __cser_core::assert_eq!(overflow.failure_atomic_projection(), before);
+        overflow.close_causal_workload(root_session).unwrap();
+    }
+
+    // A target epoch advance fences ordinary verification and every new child
+    // admission. The exact historical session remains valid only for cleanup;
+    // closing it decrements the parent and allows the root to close.
+    {
+        let (mut historical, historical_root) = fixture();
+        let request = historical
+            .prepare_causal_workload_activation(historical_root, 0xcb40, 1, nested_limits())
+            .unwrap();
+        let root_session = historical.activate_causal_workload(request).unwrap();
+        let request = historical
+            .prepare_causal_domain_workload(&root_session, TARGET_DOMAIN, 0xcb41, 1)
+            .unwrap();
+        let child = historical
+            .activate_causal_domain_workload(&root_session, TARGET_DOMAIN, request)
+            .unwrap();
+        let child_identity = child.identity();
+        advance_target_epoch_for_test(&mut historical);
+        __cser_core::assert_eq!(
+            historical.verify_causal_domain_workload_session(&child),
+            Err(CausalWorkloadError::StaleDomain)
+        );
+        let before = historical.failure_atomic_projection();
+        __cser_core::assert_eq!(
+            historical.infrastructure.admit_task(
+                &child.context,
+                infrastructure::TaskWorkDescriptor {
+                    work_id: 0xcb42,
+                    generation: 1,
+                    task: TaskKey::new(0xcb43, 1),
+                    role: infrastructure::TaskWorkRole::GuestSyscallWork,
+                    vm: Some(infrastructure::VmAuthorityKey::new(0xcb44, 1).unwrap()),
+                },
+            ),
+            Err(infrastructure::InfrastructureError::StaleBinding)
+        );
+        __cser_core::assert_eq!(
+            historical
+                .infrastructure
+                .open_child_workload(&child.context, TARGET_DOMAIN, 0xcb45, 1,),
+            Err(infrastructure::InfrastructureError::StaleBinding)
+        );
+        __cser_core::assert_eq!(historical.failure_atomic_projection(), before);
+        __cser_core::assert_eq!(
+            historical.close_causal_domain_workload(child),
+            Ok(child_identity)
+        );
+        __cser_core::assert_eq!(
+            historical.close_causal_workload(root_session),
+            Ok(child_identity.parent())
+        );
+        historical.check_invariants().unwrap();
+
+        let (mut stale, stale_root) = fixture();
+        let request = stale
+            .prepare_causal_workload_activation(stale_root, 0xcb46, 1, nested_limits())
+            .unwrap();
+        let root_session = stale.activate_causal_workload(request).unwrap();
+        let request = stale
+            .prepare_causal_domain_workload(&root_session, TARGET_DOMAIN, 0xcb47, 1)
+            .unwrap();
+        let expected = __cser_alloc::format!("{request:?}");
+        advance_target_epoch_for_test(&mut stale);
+        let before = stale.failure_atomic_projection();
+        let failure = stale
+            .activate_causal_domain_workload(&root_session, TARGET_DOMAIN, request)
+            .unwrap_err();
+        __cser_core::assert_eq!(failure.error(), &CausalWorkloadError::StaleDomain);
+        __cser_core::assert_eq!(
+            __cser_alloc::format!("{:?}", failure.into_input()),
+            expected
+        );
+        __cser_core::assert_eq!(stale.failure_atomic_projection(), before);
+        stale.close_causal_workload(root_session).unwrap();
+    }
 
     // A live child blocks close without consuming the opaque session or
     // changing either ledger. Once that exact child terminalizes, the same

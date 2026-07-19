@@ -74,10 +74,41 @@ pub(super) fn check_scope_invariants(
         let current_epoch = scope
             .binding_epoch(record.domain)
             .map_err(|_| InfrastructureError::Invariant("workload references unknown domain"))?;
+        let reverse_parent = match record.parent {
+            ParentStamp::RootEffect(effect) if effect == scope.root.root_effect => {
+                ReverseParent::RootEffect(effect)
+            }
+            ParentStamp::Request(parent) => {
+                let parent_record =
+                    scope
+                        .workloads
+                        .get(parent.id)
+                        .ok_or(InfrastructureError::Invariant(
+                            "child workload lacks parent workload",
+                        ))?;
+                if parent == record.request
+                    || parent_record.request != parent
+                    || parent_record.root_effect != record.root_effect
+                    || parent_record.parent != ParentStamp::RootEffect(scope.root.root_effect)
+                    || (record.phase == WorkloadPhase::Open
+                        && parent_record.phase != WorkloadPhase::Open)
+                {
+                    return Err(InfrastructureError::Invariant(
+                        "child workload parent linkage mismatch",
+                    ));
+                }
+                if record.phase == WorkloadPhase::Open {
+                    increment_workload_child(&mut workload_children, parent)?;
+                }
+                ReverseParent::Request(parent)
+            }
+            ParentStamp::RootEffect(_) | ParentStamp::Task(_) | ParentStamp::Effect(_) => {
+                return Err(InfrastructureError::Invariant("invalid workload parent"));
+            }
+        };
         if record.request.id == 0
             || record.request.generation == 0
             || record.root_effect != scope.root.root_effect
-            || record.parent != ParentStamp::RootEffect(scope.root.root_effect)
             || record.nonce == 0
             || record.bearer_generation == 0
             || record.admission_binding_epoch == 0
@@ -97,7 +128,7 @@ pub(super) fn check_scope_invariants(
                 slot: record.nonce,
                 kind: InfrastructureKind::Workload,
                 root_effect: record.root_effect,
-                parent: ReverseParent::RootEffect(record.root_effect),
+                parent: reverse_parent,
                 task: None,
                 domain: record.domain,
                 binding_epoch: record.current_binding_epoch,

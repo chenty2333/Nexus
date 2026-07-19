@@ -8,8 +8,8 @@ use __cser_alloc::vec::Vec;
 #[cfg(test)]
 use super::ClosureRecord;
 use super::{
-    CausalWorkloadBootstrapInstall, ContinuationPhase, DeadlinePhase, DelayedCommandPhase,
-    DeviceCreditOwnership, DevicePhase, DomainKey, EffectKey, FaultPhase,
+    CausalWorkloadBootstrapInstall, ChildWorkloadOpenPlan, ContinuationPhase, DeadlinePhase,
+    DelayedCommandPhase, DeviceCreditOwnership, DevicePhase, DomainKey, EffectKey, FaultPhase,
     InfrastructureClosureFinishPlan, InfrastructureClosureProgress, InfrastructureClosureReceipt,
     InfrastructureClosureSelection, InfrastructureClosureStartPlan, InfrastructureError,
     InfrastructureEventKind, InfrastructureKind, InfrastructureLimits, InfrastructureLiveCounts,
@@ -17,11 +17,12 @@ use super::{
     InfrastructureState, LedgerMode, ParentStamp, PreparedWorkloadMint, ReplyPhase, RequestKey,
     ReverseIndexRecord, ReverseParent, RootStamp, ScopeInfrastructure, ScopeKey,
     ServiceRequestPhase, TaskAnchorPhase, TaskPhase, WorkloadCloseIntent, WorkloadContext,
-    WorkloadPhase, WorkloadRecord, WorkloadRequestPresentation, WorkloadRootPresentation,
-    check_scope_invariants, checked_add, checked_sub, first_live_child_kind, mint_workload_context,
-    prepare_workload_mint, preview_nonce, preview_revision, require_vacancy, rewrite_scope_stamps,
-    validate_active_admission, validate_context, validate_root_presentation,
-    validate_workload_mint, workload_bearer,
+    WorkloadContextDescription, WorkloadParentDescription, WorkloadPhase, WorkloadRecord,
+    WorkloadRequestPresentation, WorkloadRootPresentation, check_scope_invariants, checked_add,
+    checked_sub, first_live_child_kind, mint_workload_context, prepare_workload_mint,
+    preview_nonce, preview_revision, preview_workload_child_add, preview_workload_child_sub,
+    require_vacancy, rewrite_scope_stamps, validate_active_admission, validate_context,
+    validate_recovery_context, validate_root_presentation, validate_workload_mint, workload_bearer,
 };
 
 impl InfrastructureState {
@@ -297,6 +298,13 @@ impl InfrastructureState {
         __cser_core::assert_eq!(self.mode, LedgerMode::Authoritative);
         let record = self.scope_mut(scope).unwrap();
         record.revision = record.revision.checked_add(1).unwrap();
+    }
+
+    #[cfg(test)]
+    pub(in super::super) fn set_next_nonce_for_test(&mut self, scope: ScopeKey, nonce: u64) {
+        __cser_core::assert_eq!(self.mode, LedgerMode::Authoritative);
+        __cser_core::assert_ne!(nonce, 0);
+        self.scope_mut(scope).unwrap().next_nonce = nonce;
     }
 
     #[cfg(test)]
@@ -781,6 +789,137 @@ impl InfrastructureState {
             .is_some_and(|record| record.phase == WorkloadPhase::Open))
     }
 
+    /// Returns a descriptive view only after revalidating the opaque context
+    /// against the authoritative ledger. The outer Registry uses this to bind
+    /// its facade identity to the single infrastructure record; the view cannot
+    /// be converted back into a bearer.
+    pub(in super::super) fn describe_open_workload(
+        &self,
+        context: &WorkloadContext,
+    ) -> Result<WorkloadContextDescription, InfrastructureError> {
+        self.require_authoritative()?;
+        let scope = self.scope(context.root.scope)?;
+        validate_context(scope, self.registry_instance, context)?;
+        let parent = match context.parent {
+            ParentStamp::RootEffect(effect) => WorkloadParentDescription::RootEffect(effect),
+            ParentStamp::Request(request) => WorkloadParentDescription::Request {
+                id: request.id,
+                generation: request.generation,
+            },
+            ParentStamp::Task(_) | ParentStamp::Effect(_) => {
+                return Err(InfrastructureError::ForeignParent);
+            }
+        };
+        Ok(WorkloadContextDescription {
+            registry_instance: context.root.registry_instance,
+            scope: context.root.scope,
+            authority_epoch: context.root.authority_epoch,
+            root_effect: context.root.root_effect,
+            domain: context.domain.domain,
+            binding_epoch: context.domain.binding_epoch,
+            request_id: context.workload.request.id,
+            request_generation: context.workload.request.generation,
+            parent,
+        })
+    }
+
+    /// Describes an exact still-open workload for terminal cleanup after its
+    /// domain binding has advanced. The historical bearer must match its
+    /// immutable record exactly, while the authoritative domain epoch may only
+    /// dominate the captured epoch. This grants no new-admission authority.
+    pub(in super::super) fn describe_closable_workload(
+        &self,
+        context: &WorkloadContext,
+    ) -> Result<WorkloadContextDescription, InfrastructureError> {
+        self.require_authoritative()?;
+        let scope = self.scope(context.root.scope)?;
+        validate_recovery_context(scope, self.registry_instance, context)?;
+        let parent = match context.parent {
+            ParentStamp::RootEffect(effect) => WorkloadParentDescription::RootEffect(effect),
+            ParentStamp::Request(request) => WorkloadParentDescription::Request {
+                id: request.id,
+                generation: request.generation,
+            },
+            ParentStamp::Task(_) | ParentStamp::Effect(_) => {
+                return Err(InfrastructureError::ForeignParent);
+            }
+        };
+        Ok(WorkloadContextDescription {
+            registry_instance: context.root.registry_instance,
+            scope: context.root.scope,
+            authority_epoch: context.root.authority_epoch,
+            root_effect: context.root.root_effect,
+            domain: context.domain.domain,
+            binding_epoch: context.domain.binding_epoch,
+            request_id: context.workload.request.id,
+            request_generation: context.workload.request.generation,
+            parent,
+        })
+    }
+
+    /// Opens one bounded child workload below an exact root-workload context.
+    /// The target binding epoch is read from this authoritative scope; callers
+    /// provide only the domain identity and portable request coordinates.
+    pub(in super::super) fn open_child_workload(
+        &mut self,
+        parent: &WorkloadContext,
+        target_domain: DomainKey,
+        request_id: u64,
+        request_generation: u64,
+    ) -> Result<WorkloadContext, InfrastructureError> {
+        self.require_authoritative()?;
+        let plan = {
+            let scope = self.scope(parent.root.scope)?;
+            prepare_child_workload_open(
+                self.registry_instance,
+                scope,
+                parent,
+                target_domain,
+                request_id,
+                request_generation,
+            )?
+        };
+        Ok(self.apply_child_workload_open(plan))
+    }
+
+    fn apply_child_workload_open(&mut self, plan: ChildWorkloadOpenPlan) -> WorkloadContext {
+        let ChildWorkloadOpenPlan {
+            scope,
+            record,
+            index,
+            mint,
+            parent_request,
+            next_parent_live_children,
+            next_nonce,
+            next_revision,
+            next_live_workloads,
+        } = plan;
+        let scope = self
+            .scope_mut(scope)
+            .expect("prevalidated child-workload scope remains present");
+        let parent = scope
+            .workloads
+            .get_mut(parent_request.id)
+            .expect("prevalidated parent workload remains present");
+        __cser_core::debug_assert_eq!(parent.request, parent_request);
+        __cser_core::debug_assert_eq!(
+            parent.live_children.checked_add(1),
+            Some(next_parent_live_children)
+        );
+        parent.live_children = next_parent_live_children;
+        scope.workloads.install_vacant_prevalidated(record);
+        scope.reverse_indexes.install_vacant_prevalidated(index);
+        scope.next_nonce = next_nonce;
+        scope.revision = next_revision;
+        scope.live.workloads = next_live_workloads;
+        scope.events.push(
+            InfrastructureEventKind::WorkloadOpened,
+            mint.workload.request.id,
+            mint.workload.request.generation,
+        );
+        mint_workload_context(mint)
+    }
+
     pub(in super::super) fn open_workload(
         &mut self,
         root: WorkloadRootPresentation,
@@ -871,6 +1010,8 @@ impl InfrastructureState {
         }
         let next_revision = preview_revision(scope)?;
         let next_live_workloads = checked_sub(scope.live.workloads, 1)?;
+        let next_parent_live_children =
+            preview_workload_parent_close(scope, record.request, record.parent)?;
         Ok(WorkloadCloseIntent {
             registry_instance: self.registry_instance,
             mint: PreparedWorkloadMint {
@@ -882,6 +1023,45 @@ impl InfrastructureState {
             base_revision: scope.revision,
             next_revision,
             next_live_workloads,
+            next_parent_live_children,
+        })
+    }
+
+    /// Prepares terminal cleanup for an exact historical workload bearer after
+    /// a domain fence. Unlike admission and ordinary verification, this accepts
+    /// only monotonic epoch domination and still enforces the same child/count
+    /// gates before producing the non-Copy close intent.
+    pub(in super::super) fn prepare_historical_workload_close(
+        &self,
+        context: &WorkloadContext,
+    ) -> Result<WorkloadCloseIntent, InfrastructureError> {
+        self.require_authoritative()?;
+        let scope = self.scope(context.root.scope)?;
+        check_scope_invariants(scope)?;
+        validate_recovery_context(scope, self.registry_instance, context)?;
+        let record = scope.workloads.get(context.workload.request.id).unwrap();
+        if record.live_children != 0 {
+            return Err(InfrastructureError::ClosureBlocked {
+                kind: first_live_child_kind(scope, record.request)?,
+                live: record.live_children,
+            });
+        }
+        let next_revision = preview_revision(scope)?;
+        let next_live_workloads = checked_sub(scope.live.workloads, 1)?;
+        let next_parent_live_children =
+            preview_workload_parent_close(scope, record.request, record.parent)?;
+        Ok(WorkloadCloseIntent {
+            registry_instance: self.registry_instance,
+            mint: PreparedWorkloadMint {
+                root: context.root,
+                domain: context.domain,
+                workload: context.workload,
+                parent: context.parent,
+            },
+            base_revision: scope.revision,
+            next_revision,
+            next_live_workloads,
+            next_parent_live_children,
         })
     }
 
@@ -925,6 +1105,8 @@ impl InfrastructureState {
         if scope.revision != intent.base_revision
             || preview_revision(scope)? != intent.next_revision
             || checked_sub(scope.live.workloads, 1)? != intent.next_live_workloads
+            || preview_workload_parent_close(scope, record.request, record.parent)?
+                != intent.next_parent_live_children
         {
             return Err(InfrastructureError::StaleClaim);
         }
@@ -957,6 +1139,22 @@ impl InfrastructureState {
         __cser_core::debug_assert_eq!(workload.phase, WorkloadPhase::Open);
         __cser_core::debug_assert_eq!(workload.live_children, 0);
         workload.phase = WorkloadPhase::Closed;
+        if let ParentStamp::Request(parent_request) = intent.mint.parent {
+            let parent = scope
+                .workloads
+                .get_mut(parent_request.id)
+                .expect("prevalidated parent workload remains present");
+            __cser_core::debug_assert_eq!(parent.request, parent_request);
+            __cser_core::debug_assert_eq!(
+                parent.live_children.checked_sub(1),
+                intent.next_parent_live_children
+            );
+            parent.live_children = intent
+                .next_parent_live_children
+                .expect("child close prevalidated a parent count");
+        } else {
+            __cser_core::debug_assert_eq!(intent.next_parent_live_children, None);
+        }
         scope.live.workloads = intent.next_live_workloads;
         scope.revision = intent.next_revision;
         scope.events.push(
@@ -974,6 +1172,139 @@ impl InfrastructureState {
         self.apply_workload_close(intent, context);
         Ok(())
     }
+}
+
+fn preview_workload_parent_close(
+    scope: &super::ScopeInfrastructure,
+    child: RequestKey,
+    parent: ParentStamp,
+) -> Result<Option<u32>, InfrastructureError> {
+    match parent {
+        ParentStamp::RootEffect(effect) if effect == scope.root.root_effect => Ok(None),
+        ParentStamp::Request(parent) => {
+            if parent == child {
+                return Err(InfrastructureError::ForeignParent);
+            }
+            let parent_record = scope
+                .workloads
+                .get(parent.id)
+                .ok_or(InfrastructureError::UnknownWorkload)?;
+            if parent_record.request != parent
+                || parent_record.parent != ParentStamp::RootEffect(scope.root.root_effect)
+                || parent_record.phase != WorkloadPhase::Open
+            {
+                return Err(InfrastructureError::ForeignParent);
+            }
+            Ok(Some(preview_workload_child_sub(scope, parent)?))
+        }
+        ParentStamp::RootEffect(_) | ParentStamp::Task(_) | ParentStamp::Effect(_) => {
+            Err(InfrastructureError::ForeignParent)
+        }
+    }
+}
+
+fn prepare_child_workload_open(
+    registry_instance: u64,
+    scope: &super::ScopeInfrastructure,
+    parent: &WorkloadContext,
+    target_domain: DomainKey,
+    request_id: u64,
+    request_generation: u64,
+) -> Result<ChildWorkloadOpenPlan, InfrastructureError> {
+    check_scope_invariants(scope)?;
+    validate_context(scope, registry_instance, parent)?;
+    validate_active_admission(scope)?;
+    if parent.parent != ParentStamp::RootEffect(parent.root.root_effect) {
+        return Err(InfrastructureError::ForeignParent);
+    }
+    let parent_record = scope
+        .workloads
+        .get(parent.workload.request.id)
+        .ok_or(InfrastructureError::UnknownWorkload)?;
+    if parent_record.request != parent.workload.request
+        || parent_record.phase != WorkloadPhase::Open
+        || parent_record.parent != ParentStamp::RootEffect(parent.root.root_effect)
+    {
+        return Err(InfrastructureError::ForeignParent);
+    }
+    let binding_epoch = scope.binding_epoch(target_domain)?;
+    let request = RequestKey::new(request_id, request_generation)?;
+    if let Some(existing) = scope.workloads.get(request.id) {
+        return if existing.request == request
+            && existing.root_effect == parent.root.root_effect
+            && existing.parent == ParentStamp::Request(parent.workload.request)
+            && existing.domain == target_domain
+        {
+            Err(InfrastructureError::ExactReplay)
+        } else if existing.request.generation > request.generation {
+            Err(InfrastructureError::StaleGeneration)
+        } else {
+            Err(InfrastructureError::IdentityConflict)
+        };
+    }
+    require_vacancy(&scope.workloads, request.id, InfrastructureKind::Workload)?;
+    require_vacancy(
+        &scope.reverse_indexes,
+        scope.next_nonce,
+        InfrastructureKind::Workload,
+    )?;
+    let (nonce, next_nonce) = preview_nonce(scope)?;
+    let next_revision = preview_revision(scope)?;
+    let next_live_workloads = checked_add(scope.live.workloads, 1)?;
+    let next_parent_live_children = preview_workload_child_add(scope, parent.workload.request)?;
+    let workload = super::WorkloadStamp {
+        request,
+        nonce,
+        bearer_generation: 1,
+    };
+    let root = parent.root;
+    let domain = super::DomainStamp {
+        domain: target_domain,
+        binding_epoch,
+    };
+    let parent_stamp = ParentStamp::Request(parent.workload.request);
+    Ok(ChildWorkloadOpenPlan {
+        scope: root.scope,
+        record: WorkloadRecord {
+            request,
+            root_effect: root.root_effect,
+            parent: parent_stamp,
+            domain: target_domain,
+            admission_binding_epoch: binding_epoch,
+            current_binding_epoch: binding_epoch,
+            nonce,
+            bearer_generation: 1,
+            phase: WorkloadPhase::Open,
+            live_children: 0,
+            closure_sequence: None,
+        },
+        index: ReverseIndexRecord {
+            slot: nonce,
+            kind: InfrastructureKind::Workload,
+            root_effect: root.root_effect,
+            parent: ReverseParent::Request(parent.workload.request),
+            task: None,
+            domain: target_domain,
+            binding_epoch,
+            source_domain: None,
+            source_binding_epoch: None,
+            resource: None,
+            actor_slot: None,
+            actor_generation: None,
+            retry_generation: request.generation,
+        },
+        mint: PreparedWorkloadMint {
+            root,
+            domain,
+            workload,
+            parent: parent_stamp,
+        },
+        parent_request: parent.workload.request,
+        next_parent_live_children,
+        next_nonce,
+        next_revision,
+        next_live_workloads,
+    })
 }
 
 fn open_workload_in_scope(

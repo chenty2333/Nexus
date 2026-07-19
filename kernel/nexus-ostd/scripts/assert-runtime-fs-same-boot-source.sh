@@ -196,6 +196,13 @@ prepared_guest_write="$work/prepared-guest-write.rs"
 causal_session="$work/causal-session.rs"
 causal_activation="$work/causal-activation.rs"
 causal_limits="$work/causal-limits.rs"
+causal_domain_request="$work/causal-domain-request.rs"
+causal_domain_prepare="$work/causal-domain-prepare.rs"
+causal_domain_activate="$work/causal-domain-activate.rs"
+causal_domain_validate="$work/causal-domain-validate.rs"
+causal_domain_verify="$work/causal-domain-verify.rs"
+causal_domain_close_validate="$work/causal-domain-close-validate.rs"
+causal_domain_close="$work/causal-domain-close.rs"
 causal_close_intent="$work/causal-close-intent.rs"
 causal_close_prepare="$work/causal-close-prepare.rs"
 causal_close_validate="$work/causal-close-validate.rs"
@@ -206,6 +213,9 @@ infrastructure_close_prepare="$work/infrastructure-close-prepare.rs"
 infrastructure_close_validate="$work/infrastructure-close-validate.rs"
 infrastructure_close_apply="$work/infrastructure-close-apply.rs"
 infrastructure_projected_finish="$work/infrastructure-projected-finish.rs"
+infrastructure_child_open="$work/infrastructure-child-open.rs"
+infrastructure_child_apply="$work/infrastructure-child-apply.rs"
+infrastructure_historical_close="$work/infrastructure-historical-close.rs"
 registry_revoke_prepare="$work/registry-revoke-prepare.rs"
 
 extract_between "$source_file" 'struct FsState {' \
@@ -284,6 +294,34 @@ extract_between "$runtime_causal_file" \
 extract_between "$source_file" 'const fn same_boot_causal_limits()' \
     'fn new_same_boot_registry()' "$causal_limits"
 extract_between "$runtime_causal_file" \
+    'pub(crate) struct CausalDomainWorkloadRequest {' \
+    'pub(crate) struct CausalDomainWorkloadActivationFailure {' \
+    "$causal_domain_request"
+extract_between "$runtime_causal_file" \
+    '    pub(crate) fn prepare_causal_domain_workload(' \
+    '    pub(crate) fn activate_causal_domain_workload(' \
+    "$causal_domain_prepare"
+extract_between "$runtime_causal_file" \
+    '    pub(crate) fn activate_causal_domain_workload(' \
+    '    fn validate_causal_domain_workload_activation(' \
+    "$causal_domain_activate"
+extract_between "$runtime_causal_file" \
+    '    fn validate_causal_domain_workload_activation(' \
+    '    pub(crate) fn verify_causal_domain_workload_session(' \
+    "$causal_domain_validate"
+extract_between "$runtime_causal_file" \
+    '    pub(crate) fn verify_causal_domain_workload_session(' \
+    '    fn validate_causal_domain_workload_close(' \
+    "$causal_domain_verify"
+extract_between "$runtime_causal_file" \
+    '    fn validate_causal_domain_workload_close(' \
+    '    pub(crate) fn close_causal_domain_workload(' \
+    "$causal_domain_close_validate"
+extract_between "$runtime_causal_file" \
+    '    pub(crate) fn close_causal_domain_workload(' \
+    '    pub(crate) fn prepare_close_causal_workload(' \
+    "$causal_domain_close"
+extract_between "$runtime_causal_file" \
     'pub(crate) struct CausalWorkloadCloseIntent {' \
     'impl CausalWorkloadSession {' "$causal_close_intent"
 extract_between "$runtime_causal_file" \
@@ -304,7 +342,7 @@ extract_between "$runtime_causal_file" \
     '#[cfg(test)]' "$causal_standalone_close"
 extract_between "$infrastructure_root_file" \
     'pub(in super::super) fn prepare_workload_close(' \
-    'pub(in super::super) fn validate_workload_close_intent(' \
+    'pub(in super::super) fn prepare_historical_workload_close(' \
     "$infrastructure_close_prepare"
 extract_between "$infrastructure_root_file" \
     'pub(in super::super) fn validate_workload_close_intent(' \
@@ -313,6 +351,16 @@ extract_between "$infrastructure_root_file" \
 extract_between "$infrastructure_root_file" \
     'pub(in super::super) fn apply_workload_close(' \
     'pub(in super::super) fn close_workload(' "$infrastructure_close_apply"
+extract_between "$infrastructure_root_file" \
+    '    pub(in super::super) fn open_child_workload(' \
+    '    fn apply_child_workload_open(' "$infrastructure_child_open"
+extract_between "$infrastructure_root_file" \
+    '    fn apply_child_workload_open(' \
+    '    pub(in super::super) fn open_workload(' "$infrastructure_child_apply"
+extract_between "$infrastructure_root_file" \
+    '    pub(in super::super) fn prepare_historical_workload_close(' \
+    '    pub(in super::super) fn validate_workload_close_intent(' \
+    "$infrastructure_historical_close"
 extract_between "$infrastructure_root_file" \
     'pub(in super::super) fn prepare_closure_finish_after_workload_close(' \
     'pub(in super::super) fn apply_closure_finish(' "$infrastructure_projected_finish"
@@ -338,7 +386,7 @@ require_regex_count "$causal_slot" \
     '^[[:space:]]+Closed\(CausalWorkloadIdentity\),$' 1
 require_count "$causal_slot" 'struct FsCausalActivationReservation' 1
 reject_regex "$causal_slot" '(^|[^_])assert!\('
-require_count "$causal_session" 'context: infrastructure::WorkloadContext,' 1
+require_count "$causal_session" 'pub(super) context: infrastructure::WorkloadContext,' 2
 causal_session_line=$(line_of_unique "$runtime_causal_file" \
     'pub(crate) struct CausalWorkloadSession {')
 causal_session_derive=$(sed -n "$((causal_session_line - 1))p" \
@@ -346,12 +394,97 @@ causal_session_derive=$(sed -n "$((causal_session_line - 1))p" \
 [[ $causal_session_derive == \
     '#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]' ]] ||
     fail 'CausalWorkloadSession gained Clone/Copy or lost its frozen derive set'
+causal_domain_session_line=$(line_of_unique "$runtime_causal_file" \
+    'pub(crate) struct CausalDomainWorkloadSession {')
+causal_domain_session_derive=$(sed -n "$((causal_domain_session_line - 1))p" \
+    "$runtime_causal_file")
+[[ $causal_domain_session_derive == \
+    '#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]' ]] ||
+    fail 'CausalDomainWorkloadSession gained Clone/Copy or lost its frozen derive set'
 require_count "$causal_activation" 'request: CausalActivationRequest,' 1
 require_count "$causal_activation" 'into_input(self) -> CausalActivationRequest' 1
 require_count "$causal_activation" \
     'into_parts(self) -> (CausalWorkloadError, CausalActivationRequest)' 1
 require_count "$causal_limits" \
     'CausalWorkloadLimits::new(8, 2, 8, 2, 2, 8, 4, 4, 4, 12, 12, 128)' 1
+
+# The provider-neutral child-workload foundation is intentionally not wired to
+# the filesystem adapter yet. It still freezes the linear authority boundary,
+# authoritative binding capture, exact activation fences, parent accounting,
+# and cleanup-only historical epoch rule in the production core sources.
+require_count "$runtime_causal_file" '    workloads: u32,' 1
+require_count "$runtime_causal_file" \
+    '    pub(crate) const fn with_workload_capacity(mut self, workloads: u32) -> Self {' 1
+for required in \
+    'registry_instance: u64,' \
+    'registry_scope_revision: u64,' \
+    'infrastructure_scope_revision: u64,' \
+    'domain_revision: u64,' \
+    'parent: CausalWorkloadIdentity,' \
+    'domain: DomainKey,' \
+    'binding_epoch: u64,' \
+    'request_id: u64,' \
+    'request_generation: u64,'; do
+    require_count "$causal_domain_request" "$required" 1
+done
+require_count "$causal_domain_prepare" \
+    'let parent_identity = self.verify_causal_workload_session(parent)?;' 1
+require_count "$causal_domain_prepare" '.domains' 1
+require_count "$causal_domain_prepare" '.get(&target_domain)' 1
+require_count "$causal_domain_prepare" 'domain_revision: binding.revision,' 1
+require_count "$causal_domain_prepare" 'binding_epoch: binding.binding_epoch,' 1
+reject_fixed "$causal_domain_prepare" 'binding_epoch: u64'
+require_count "$causal_domain_activate" \
+    'self.validate_causal_domain_workload_activation(parent, target_domain, &request)' 1
+require_count "$causal_domain_activate" \
+    'let context = match self.infrastructure.open_child_workload(' 1
+require_count "$causal_domain_activate" \
+    'return Err(CausalDomainWorkloadActivationFailure {' 2
+require_count "$causal_domain_validate" \
+    'if request.registry_instance != self.instance_id {' 1
+require_count "$causal_domain_validate" \
+    'if target_domain != request.domain {' 1
+require_count "$causal_domain_validate" \
+    'if parent_identity != request.parent {' 1
+require_count "$causal_domain_validate" \
+    'binding.binding_epoch != request.binding_epoch' 1
+require_count "$causal_domain_validate" \
+    'binding.revision != request.domain_revision' 1
+require_count "$causal_domain_validate" \
+    'scope.revision != request.registry_scope_revision' 1
+require_count "$causal_domain_validate" \
+    'infrastructure.revision != request.infrastructure_scope_revision' 1
+require_count "$causal_domain_verify" \
+    'if binding.binding_epoch != identity.binding_epoch {' 1
+require_count "$causal_domain_verify" \
+    '.describe_open_workload(&session.context)' 1
+require_count "$causal_domain_close_validate" \
+    'if binding.binding_epoch < identity.binding_epoch {' 1
+require_count "$causal_domain_close_validate" \
+    '.describe_closable_workload(&session.context)' 1
+require_count "$causal_domain_close" \
+    '.prepare_historical_workload_close(&session.context)' 1
+require_count "$causal_domain_close" \
+    '.apply_workload_close(intent, &session.context);' 1
+require_count "$infrastructure_child_open" 'target_domain: DomainKey,' 1
+reject_fixed "$infrastructure_child_open" 'binding_epoch'
+require_count "$infrastructure_child_apply" \
+    'parent.live_children.checked_add(1)' 1
+require_count "$infrastructure_child_apply" \
+    'parent.live_children = next_parent_live_children;' 1
+require_count "$infrastructure_child_apply" \
+    'scope.workloads.install_vacant_prevalidated(record);' 1
+require_count "$infrastructure_child_apply" \
+    'scope.reverse_indexes.install_vacant_prevalidated(index);' 1
+require_count "$infrastructure_mod_file" \
+    '    next_parent_live_children: Option<u32>,' 1
+require_count "$infrastructure_close_apply" \
+    'if let ParentStamp::Request(parent_request) = intent.mint.parent {' 1
+require_count "$infrastructure_close_apply" \
+    'parent.live_children.checked_sub(1)' 1
+require_count "$infrastructure_historical_close" \
+    'validate_recovery_context(scope, self.registry_instance, context)?;' 1
+reject_fixed "$infrastructure_historical_close" 'validate_context('
 
 # The core Registry now owns an exact two-phase causal close transaction. Both
 # close intents are opaque, linear values: preparation is read-only and every
