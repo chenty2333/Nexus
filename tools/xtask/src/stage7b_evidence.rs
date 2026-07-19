@@ -12,8 +12,7 @@ const EVALUATOR_SOURCE: &str = "kernel/nexus-ostd/src/evaluation/stage7b.rs";
 const FAULT_REGISTRY_SOURCE: &str = registry_source_set::RegistryUnit::Authority.path();
 const DEVICE_INFRASTRUCTURE_MODULE_SOURCE: &str =
     "kernel/nexus-ostd/src/cser/infrastructure/mod.rs";
-const DEVICE_INFRASTRUCTURE_SOURCE: &str =
-    "kernel/nexus-ostd/src/cser/infrastructure/device.rs";
+const DEVICE_INFRASTRUCTURE_SOURCE: &str = "kernel/nexus-ostd/src/cser/infrastructure/device.rs";
 const KERNEL_SOURCE_DIRECTORY: &str = "kernel/nexus-ostd/src";
 const OUTPUT_DIRECTORY: &str = "target/verification/stage7b";
 const FAULT_OUTPUT: &str = "fault-matrix.jsonl";
@@ -605,9 +604,11 @@ fn braced_source_item<'a>(source: &'a str, marker: &str) -> Result<&'a str, Stri
     let mut depth = 0_u32;
     for (offset, byte) in source[open..].bytes().enumerate() {
         match byte {
-            b'{' => depth = depth
-                .checked_add(1)
-                .ok_or_else(|| format!("checked item {marker:?} brace depth overflowed"))?,
+            b'{' => {
+                depth = depth
+                    .checked_add(1)
+                    .ok_or_else(|| format!("checked item {marker:?} brace depth overflowed"))?
+            }
             b'}' => {
                 depth = depth
                     .checked_sub(1)
@@ -860,10 +861,7 @@ fn validate_device_compact_bearer_source_text(
             ));
         }
     }
-    let mint = braced_source_item(
-        device,
-        "fn mint_materialized_device_ticket_after_install(",
-    )?;
+    let mint = braced_source_item(device, "fn mint_materialized_device_ticket_after_install(")?;
     if mint.split_once('{').unwrap().0.contains("Result<")
         || !mint.contains("installed_device_successor(self, &previous)")
         || !mint.contains("DeviceCreditOwnership::Transferred")
