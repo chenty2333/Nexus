@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 mod catalog;
 mod causal_coverage;
+mod causal_evidence_overlay;
 mod causal_fault_matrix;
 mod current_status;
 mod doctor;
@@ -194,6 +195,8 @@ fn doctor(root: &Path) -> Result<()> {
         .map_err(|error| format!("production causal coverage: {error}"))?;
     let causal_matrix = causal_fault_matrix::validate(root)
         .map_err(|error| format!("additive causal fault matrix: {error}"))?;
+    let causal_overlay = causal_evidence_overlay::validate(root)
+        .map_err(|error| format!("causal evidence overlay: {error}"))?;
     println!(
         "DOCTOR CATALOGS PASS oracles={oracle_count} scenarios={scenario_count} guest_sources={} guest_workloads={}",
         guest.sources, guest.workloads
@@ -222,6 +225,15 @@ fn doctor(root: &Path) -> Result<()> {
         causal_matrix.observed,
         causal_matrix.legacy_cells,
         causal_matrix.canonical_sha256,
+    );
+    println!(
+        "DOCTOR CAUSAL EVIDENCE OVERLAY PASS cells={} promotions={} planned={} source_mapped={} observed={} complete={}",
+        causal_overlay.cells,
+        causal_overlay.promotions,
+        causal_overlay.planned,
+        causal_overlay.source_mapped,
+        causal_overlay.observed,
+        causal_overlay.complete,
     );
     Ok(())
 }
@@ -337,6 +349,19 @@ fn check(root: &Path) -> Result<()> {
         causal_matrix.observed,
         causal_matrix.legacy_cells,
         causal_matrix.canonical_sha256,
+    );
+
+    section("validate monotonic causal evidence overlay");
+    let causal_overlay = causal_evidence_overlay::validate(root)
+        .map_err(|error| format!("causal evidence overlay: {error}"))?;
+    println!(
+        "causal evidence overlay: PASS ({} cells, {} promotions: {} planned, {} source-mapped, {} observed; complete={})",
+        causal_overlay.cells,
+        causal_overlay.promotions,
+        causal_overlay.planned,
+        causal_overlay.source_mapped,
+        causal_overlay.observed,
+        causal_overlay.complete,
     );
 
     section("validate repository workflow surfaces");

@@ -142,6 +142,7 @@ The exact tier contracts and claim discipline are kept in
 | `tests/guest/linux/` | Hash-pinned Linux compatibility-pressure inputs |
 | `evaluation/stage7b/` | Released evaluation contracts, sources, and race catalog |
 | `evaluation/production-identity/causal-coverage.toml` | Audited causal-boundary inventory with explicit uncovered gaps; not runtime coverage evidence |
+| `evaluation/production-identity/causal-evidence-overlay.toml` | Monotonic v2 promotion log over the byte-frozen v1 causal inventory and 66-cell matrix; currently all planned and incomplete |
 | `status/` | Moving exact-revision checkpoints and frozen wire contracts |
 | `docs/research/engineering-reuse-map.md` | Adopt/borrow/own decisions for the nine engineering priorities |
 | `tools/xtask/`, `tools/workflow/` | Reproducible build, evaluation, and evidence tooling |

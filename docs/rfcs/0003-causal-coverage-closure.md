@@ -523,12 +523,13 @@ injection-point token, and one or more prospective
 their existence does not prove that a target symbol, injection hook, shared
 production call path, or runtime observation exists.
 
-Promotion to `source-mapped` first requires a separate reviewed validator change
-that resolves the actual production symbol, verifies the concrete injection
-hook inside that boundary, and proves that the normal shared call path reaches
-it. Promotion to any observed state additionally requires execution evidence
-from that exact hook and production path. A prospective target is never itself
-a source or runtime claim.
+Promotion to `source-mapped` uses the separate v2 evidence overlay described
+below. It resolves the actual production symbol, verifies the concrete
+injection hook inside that boundary, and checks that a named normal-workload
+call site has the required static source edge. Promotion to `observed`
+additionally requires execution evidence from the exact mapped revision, hook,
+and production path. A prospective target is never itself a source or runtime
+claim.
 
 The validator freezes the complete parsed matrix with a canonical semantic
 SHA-256 computed over deterministic struct-and-sequence serialization. The
@@ -558,6 +559,51 @@ The combined validator must:
 Passing unit tests, a reference provider, a deterministic state machine, source
 inspection, serial markers, or a hard-coded result table cannot promote a
 causal cell to observed.
+
+## Monotonic causal-evidence overlay
+
+The T0 evidence mechanism is
+`evaluation/production-identity/causal-evidence-overlay.toml`. It is additive:
+the v1 causal-coverage ledger and v1 66-cell matrix remain byte-frozen and keep
+their original incomplete, fully planned historical meaning. The overlay adds
+`root-owned-obligation` as the classification for request-derived task, fault,
+queue, continuation, deadline, device-preparation, and reply authority without
+mislabeling those obligations as business effects or raw kernel TCB machinery.
+
+The overlay starts from the immutable state `planned` for every exact v1 cell
+identity and records an ordered append-only promotion log. The only accepted
+adjacent transitions are:
+
+    planned -> source-mapped -> observed
+
+The validator rejects skipped, repeated, reordered, unknown, renamed, or
+tranche/boundary-changing promotions. A `source-mapped` transition binds one
+exact ancestor Git revision and three distinct `{path, symbol}` pairs: the
+production adapter, its normal-workload call site, and its injection hook. Both
+the recorded revision and current source must contain regular non-symlink Rust
+files and the exact non-test symbols. A conservative syntax check requires the
+normal call site to reference the production adapter and that adapter to
+reference the injection hook.
+
+That source gate is deliberately limited. It is a Rust AST name/reference
+check, not compiler name resolution, feature-configuration proof, link proof,
+or runtime reachability. It can reject absent, symlinked, test-only, and plainly
+detached mappings; it cannot establish production execution. Repository review
+must also preserve the append-only Git history because a validator in one
+checkout cannot detect rewritten repository history.
+
+An `observed` transition may follow only an accepted mapping. It binds the same
+full Git revision, an exact QEMU profile, a retained regular artifact and its
+SHA-256, and a distinct versioned receipt and its SHA-256. The receipt must bind
+the exact cell identity, mapped revision, and receipt schema. Substituted,
+missing, symlinked, or digest-drifted artifacts fail validation. Even then the
+overlay remains `complete = false`: promotion of individual cells does not by
+itself change the v1 boundary classification or satisfy the ledger acceptance
+conditions below.
+
+At the initial T0 checkpoint the promotion log is empty: all 66 cells remain
+`planned`, none is source-mapped or observed, and no production or runtime
+claim is advanced.
 
 ## Ledger and evidence acceptance
 
