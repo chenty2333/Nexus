@@ -523,13 +523,12 @@ injection-point token, and one or more prospective
 their existence does not prove that a target symbol, injection hook, shared
 production call path, or runtime observation exists.
 
-Promotion to `source-mapped` uses the separate v2 evidence overlay described
-below. It resolves the actual production symbol, verifies the concrete
-injection hook inside that boundary, and checks that a named normal-workload
-call site has the required static source edge. Promotion to `observed`
-additionally requires execution evidence from the exact mapped revision, hook,
-and production path. A prospective target is never itself a source or runtime
-claim.
+The separate v2 evidence overlay described below freezes an empty promotion
+baseline; it does not currently implement promotion to `source-mapped` or
+`observed`. A future structured schema must bind and verify the actual
+production boundary, hook, projections, and execution evidence before it may
+open either transition. A prospective target is never itself a source or
+runtime claim.
 
 The validator freezes the complete parsed matrix with a canonical semantic
 SHA-256 computed over deterministic struct-and-sequence serialization. The
@@ -560,50 +559,53 @@ Passing unit tests, a reference provider, a deterministic state machine, source
 inspection, serial markers, or a hard-coded result table cannot promote a
 causal cell to observed.
 
-## Monotonic causal-evidence overlay
+## Locked-empty causal-evidence overlay
 
-The T0 evidence mechanism is
+The T0 evidence baseline is
 `evaluation/production-identity/causal-evidence-overlay.toml`. It is additive:
 the v1 causal-coverage ledger and v1 66-cell matrix remain byte-frozen and keep
-their original incomplete, fully planned historical meaning. The overlay adds
-`root-owned-obligation` as the classification for request-derived task, fault,
+their original incomplete, fully planned historical meaning. The overlay
+records `root-owned-obligation` as vocabulary for request-derived task, fault,
 queue, continuation, deadline, device-preparation, and reply authority without
 mislabeling those obligations as business effects or raw kernel TCB machinery.
 
-The overlay starts from the immutable state `planned` for every exact v1 cell
-identity and records an ordered append-only promotion log. The only accepted
-adjacent transitions are:
+The v2 overlay is intentionally locked by the exact policy
+`locked-empty-until-structured-v3`. Its validator rejects every non-empty
+`[[promotion]]` array before interpreting any row. It therefore makes no claim
+that a source symbol, normal production call edge, injection hook, QEMU run,
+artifact, or receipt has been validated. All 66 cells remain `planned`, none is
+source-mapped or observed, and `complete` remains false.
 
-    planned -> source-mapped -> observed
+Opening promotion requires a separately reviewed schema and validator version;
+adding fields to v2 or weakening its empty-log rule is not an accepted path. At
+minimum that structured v3 gate must:
 
-The validator rejects skipped, repeated, reordered, unknown, renamed, or
-tranche/boundary-changing promotions. A `source-mapped` transition binds one
-exact ancestor Git revision and three distinct `{path, symbol}` pairs: the
-production adapter, its normal-workload call site, and its injection hook. Both
-the recorded revision and current source must contain regular non-symlink Rust
-files and the exact non-test symbols. A conservative syntax check requires the
-normal call site to reference the production adapter and that adapter to
-reference the injection hook.
+1. deserialize the complete frozen `BaseCell` contract and bind each promotion
+   to its exact `production_symbols`, `source_paths`, unique target injection
+   hook, expected disposition, before/after projections, and CPU and IRQ
+   requirements;
+2. prove a reviewed normal-workload call path to the exact production adapter
+   and hook without treating an unrelated same-named path, method, macro, test,
+   feature-only helper, or arbitrary identifier reference as a call edge;
+3. retain a full source-mapping digest and require an observation at the same
+   exact Git revision and mapping digest;
+4. parse a fixed, versioned, `deny_unknown_fields` execution receipt that binds
+   the cell, revision, injection hook, QEMU profile, artifact SHA-256, complete
+   before/after projection, disposition, vCPU count, and IRQ mode;
+5. accept only registered QEMU profiles whose CPU and IRQ properties satisfy
+   that cell, and reject empty, unrelated, or multiply substituted artifacts;
+6. restrict artifacts and receipts to an explicit retained-evidence root,
+   reject a symlink in every path component, prove canonical containment, and
+   bind archive or Git-manifest identity rather than accepting an arbitrary
+   worktree file;
+7. validate evidence dates and their order, including `recorded_on <= as_of`;
+   and
+8. bind every row to its predecessor digest and an externally reviewed history
+   anchor so swapping and renumbering rows cannot masquerade as append-only
+   history.
 
-That source gate is deliberately limited. It is a Rust AST name/reference
-check, not compiler name resolution, feature-configuration proof, link proof,
-or runtime reachability. It can reject absent, symlinked, test-only, and plainly
-detached mappings; it cannot establish production execution. Repository review
-must also preserve the append-only Git history because a validator in one
-checkout cannot detect rewritten repository history.
-
-An `observed` transition may follow only an accepted mapping. It binds the same
-full Git revision, an exact QEMU profile, a retained regular artifact and its
-SHA-256, and a distinct versioned receipt and its SHA-256. The receipt must bind
-the exact cell identity, mapped revision, and receipt schema. Substituted,
-missing, symlinked, or digest-drifted artifacts fail validation. Even then the
-overlay remains `complete = false`: promotion of individual cells does not by
-itself change the v1 boundary classification or satisfy the ledger acceptance
-conditions below.
-
-At the initial T0 checkpoint the promotion log is empty: all 66 cells remain
-`planned`, none is source-mapped or observed, and no production or runtime
-claim is advanced.
+Even a future valid per-cell promotion does not by itself change the v1
+boundary classification or satisfy the ledger acceptance conditions below.
 
 ## Ledger and evidence acceptance
 

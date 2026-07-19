@@ -21,18 +21,17 @@ The causal-coverage evidence path is intentionally separate from release and
 wire status. The byte-frozen v1 inventory and 66-cell prospective matrix remain
 in `evaluation/production-identity/causal-coverage.toml` and
 `evaluation/production-identity/causal-fault-matrix.toml`. Their additive v2
-overlay is
-`evaluation/production-identity/causal-evidence-overlay.toml`. It introduces
-the `root-owned-obligation` classification and an append-only adjacent
-`planned -> source-mapped -> observed` promotion log. Source mapping requires
-exact non-test source symbols and a normal-callsite-to-adapter-to-injection
-static edge; observation additionally requires the same exact Git revision,
-QEMU artifact, receipt, and both byte digests.
+overlay is `evaluation/production-identity/causal-evidence-overlay.toml`. It
+records the `root-owned-obligation` vocabulary and freezes the T0 population,
+but its exact policy is `locked-empty-until-structured-v3`: the validator
+rejects every promotion row without interpreting source or runtime fields.
 
-The static edge is a conservative Rust AST check, not compiler name resolution,
-link proof, or runtime evidence. At the current checkpoint the overlay contains
-no promotions: all 66 causal cells remain planned, none is source-mapped or
-observed, and `complete` remains false.
+Consequently v2 makes no source-mapping, call-reachability, QEMU-observation,
+receipt, or closure claim. All 66 causal cells remain planned, none is
+source-mapped or observed, and `complete` remains false. Opening promotion
+requires a separately reviewed v3 schema and validator with the complete
+production-target, projection, execution-receipt, retained-artifact, path
+containment, date-order, and predecessor-chain gates specified by RFC 0003.
 
 The repository checker validates both files, and the effect-peer test suite
 recomputes the canonical native-v1 serde snapshot:

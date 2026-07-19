@@ -1,6 +1,6 @@
 schema = "nexus.research.production-identity.causal-evidence-overlay.v2"
 overlay_revision = 1
-as_of = "2026-07-19"
+as_of = "2026-07-20"
 rfc = "docs/rfcs/0003-causal-coverage-closure.md"
 base_coverage = "evaluation/production-identity/causal-coverage.toml"
 base_coverage_sha256 = "5f2d71fadf0275217f0e28ede923551fb84b5a7530c832a81930e9ce24c54bbe"
@@ -9,6 +9,7 @@ base_matrix_sha256 = "9813ee8d26a2d72b383d8c4a7fbf7b193d8b0b1aa84e0fe49d4645fdd9
 base_matrix_semantic_sha256 = "fdd636526fde6c77d17d3a1acd9e4cb88a030230c4aeaa9f2cdf9245d5d05075"
 base_cell_count = 66
 base_state = "planned"
+promotion_policy = "locked-empty-until-structured-v3"
 status = "incomplete-no-promotions"
 complete = false
 allowed_classifications = [
@@ -23,12 +24,8 @@ promotion_count = 0
 planned_count = 66
 source_mapped_count = 0
 observed_count = 0
-static_reachability_gate = "exact-non-test-symbol-chain-normal-callsite-to-production-to-injection"
-static_reachability_limitation = "syntactic-rust-ast-edge-check-only-not-name-resolution-cfg-proof-link-proof-or-runtime-execution"
-promotion_history_limitation = "append-only-prefix-is-repository-review-policy-validator-cannot-detect-rewritten-git-history"
 
-# `promotion` is an append-only transition log over the byte-frozen v1
-# 66-cell population.  It is intentionally empty at this checkpoint.  A future
-# source mapping appends exactly `planned -> source-mapped`; a later exact QEMU
-# observation appends `source-mapped -> observed`.  The validator rejects
-# skipped, repeated, reordered, unknown, or identity-drifting transitions.
+# v2 is a locked-empty T0 baseline over the byte-frozen v1 66-cell population.
+# The validator rejects every `[[promotion]]` row without interpreting it. A
+# separately reviewed structured v3 schema and validator must define and prove
+# source mapping and runtime observation before this log can be opened.

@@ -351,7 +351,7 @@ fn check(root: &Path) -> Result<()> {
         causal_matrix.canonical_sha256,
     );
 
-    section("validate monotonic causal evidence overlay");
+    section("validate locked-empty causal evidence overlay");
     let causal_overlay = causal_evidence_overlay::validate(root)
         .map_err(|error| format!("causal evidence overlay: {error}"))?;
     println!(
