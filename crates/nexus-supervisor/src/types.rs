@@ -28,6 +28,48 @@ impl ServiceIdentity {
     }
 }
 
+/// Manager-owned parameters for constructing one replacement task.
+///
+/// The manager creates this value only after it has selected a fresh service
+/// identity and safely calculated the exact Registry binding and inclusive
+/// Ready deadline. A backend must pass these values through to the replacement
+/// without deriving either value from a second clock or policy copy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReplacementLaunch {
+    replacement: ServiceIdentity,
+    binding_epoch: u64,
+    ready_deadline_tick: u64,
+}
+
+impl ReplacementLaunch {
+    pub(crate) const fn new(
+        replacement: ServiceIdentity,
+        binding_epoch: u64,
+        ready_deadline_tick: u64,
+    ) -> Self {
+        Self {
+            replacement,
+            binding_epoch,
+            ready_deadline_tick,
+        }
+    }
+
+    /// Returns the fresh replacement identity selected by the manager.
+    pub const fn replacement(self) -> ServiceIdentity {
+        self.replacement
+    }
+
+    /// Returns the exact crashed Registry binding the replacement may report.
+    pub const fn binding_epoch(self) -> u64 {
+        self.binding_epoch
+    }
+
+    /// Returns the inclusive manager-owned Ready deadline.
+    pub const fn ready_deadline_tick(self) -> u64 {
+        self.ready_deadline_tick
+    }
+}
+
 /// Why a managed service stopped being usable.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExitReason {

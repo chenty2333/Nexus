@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use crate::{CrashObservation, RebindObservation, RecoverySnapshot, ServiceIdentity, StopReason};
+use crate::{
+    CrashObservation, RebindObservation, RecoverySnapshot, ReplacementLaunch, ServiceIdentity,
+    StopReason,
+};
 
 /// Platform operations driven by [`crate::SupervisorManager`].
 ///
@@ -58,7 +61,11 @@ pub trait SupervisorBackend {
 
     /// Constructs and schedules the replacement task without granting it
     /// backend authority.
-    fn spawn_replacement(&mut self, replacement: ServiceIdentity) -> Result<(), Self::Error>;
+    ///
+    /// The launch parameters are calculated by the manager. The backend must
+    /// pass them through exactly rather than recomputing the binding or Ready
+    /// deadline from its own Registry observation, clock, or policy copy.
+    fn spawn_replacement(&mut self, launch: ReplacementLaunch) -> Result<(), Self::Error>;
 
     /// Captures the exact crash-frozen cohort for the replacement handshake.
     ///

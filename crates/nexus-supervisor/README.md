@@ -20,12 +20,15 @@ The manager enforces this sequence:
 ```text
 Running
   -- crash_active --> Backoff
-  -- select + spawn + recovery_snapshot --> AwaitingReady
+  -- select + manager-owned launch + recovery_snapshot --> AwaitingReady
   -- ready(snapshot) --> rebind(replacement)
   -- bounded peek + adopt of the exact snapshot cohort --> Running
 ```
 
 `crash_active` must fence the old binding and return the exact frozen cohort.
+The manager calculates the replacement's binding epoch and inclusive Ready
+deadline once and passes both to `spawn_replacement` in `ReplacementLaunch`;
+the backend must not derive either value from a second clock or policy copy.
 The subsequent snapshot must name the same cohort. `Ready` is accepted at the
 inclusive deadline and rejected when `now > deadline_tick`. Adoption begins
 only after Ready validation and a matching rebind observation. An inventory

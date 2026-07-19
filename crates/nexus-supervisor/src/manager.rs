@@ -4,8 +4,8 @@ use core::mem;
 
 use crate::{
     BackendStage, CohortIdentity, CrashObservation, ExitReason, PollProgress, RecoveryCompletion,
-    RecoverySnapshot, ServiceIdentity, StopReason, SupervisorBackend, SupervisorError,
-    SupervisorHealth, SupervisorPhase, SupervisorPolicy,
+    RecoverySnapshot, ReplacementLaunch, ServiceIdentity, StopReason, SupervisorBackend,
+    SupervisorError, SupervisorHealth, SupervisorPhase, SupervisorPolicy,
 };
 
 enum State<S> {
@@ -459,7 +459,8 @@ where
                         return Err(SupervisorError::CounterOverflow);
                     }
                 };
-                if let Err(source) = self.backend.spawn_replacement(replacement) {
+                let launch = ReplacementLaunch::new(replacement, binding_epoch, deadline_tick);
+                if let Err(source) = self.backend.spawn_replacement(launch) {
                     self.schedule_backoff(now, replacement, binding_epoch, cohort, reason)?;
                     return Err(SupervisorError::Backend {
                         stage: BackendStage::Spawn,

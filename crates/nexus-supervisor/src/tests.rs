@@ -11,7 +11,7 @@ enum Call {
     Crash(ServiceIdentity),
     Isolate(ServiceIdentity, Option<u64>),
     Select(ServiceIdentity, u32),
-    Spawn(ServiceIdentity),
+    Spawn(ReplacementLaunch),
     Snapshot(ServiceIdentity),
     Stop(ServiceIdentity, StopReason),
     Abort(ServiceIdentity, StopReason),
@@ -161,8 +161,8 @@ impl SupervisorBackend for FakeBackend {
         ServiceIdentity::new(self.next_id, failed.generation() + 1).ok_or("identity")
     }
 
-    fn spawn_replacement(&mut self, replacement: ServiceIdentity) -> Result<(), Self::Error> {
-        self.calls.push(Call::Spawn(replacement));
+    fn spawn_replacement(&mut self, launch: ReplacementLaunch) -> Result<(), Self::Error> {
+        self.calls.push(Call::Spawn(launch));
         if self.should_fail(BackendStage::Spawn) {
             return Err("injected failure");
         }
@@ -355,7 +355,7 @@ fn crash_spawn_ready_rebind_and_adopt_are_manager_ordered() {
         vec![
             Call::Crash(active),
             Call::Select(active, 1),
-            Call::Spawn(replacement),
+            Call::Spawn(ReplacementLaunch::new(replacement, 8, 108)),
             Call::Snapshot(replacement),
             Call::Ready(replacement),
             Call::Rebind(replacement),
@@ -765,6 +765,49 @@ fn pre_snapshot_backend_failures_restore_state_and_consume_attempt() {
             .unwrap();
         assert_eq!(manager.health().phase, SupervisorPhase::Running);
     }
+}
+
+#[test]
+fn spawn_receives_exact_manager_launch_and_failure_preserves_fenced_authority() {
+    let active = service(10, 1);
+    let backend = FakeBackend::new(40, &[]).with_failures(&[BackendStage::Spawn]);
+    let mut manager = SupervisorManager::new(backend, policy(), active, 40, 7).unwrap();
+
+    manager.observe_exit(11, active, ExitReason::Fault).unwrap();
+    assert_eq!(manager.health().deadline_tick, Some(13));
+    assert_eq!(
+        manager.poll(13),
+        Err(SupervisorError::Backend {
+            stage: BackendStage::Spawn,
+            source: "injected failure",
+        })
+    );
+
+    let replacement = service(21, 2);
+    let launch = match manager.backend().calls.as_slice() {
+        [
+            Call::Crash(observed),
+            Call::Select(failed, 1),
+            Call::Spawn(launch),
+        ] => {
+            assert_eq!(*observed, active);
+            assert_eq!(*failed, active);
+            *launch
+        }
+        calls => panic!("unexpected spawn-failure calls: {calls:?}"),
+    };
+    assert_eq!(launch.replacement(), replacement);
+    assert_eq!(launch.binding_epoch(), 41);
+    assert_eq!(launch.ready_deadline_tick(), 18);
+
+    let health = manager.health();
+    assert_eq!(health.phase, SupervisorPhase::Backoff);
+    assert_eq!(health.service, replacement);
+    assert_eq!(health.binding_epoch, Some(41));
+    assert_eq!(health.recovery_attempts, 1);
+    assert_eq!(health.deadline_tick, Some(17));
+    assert!(!manager.backend().authority_active);
+    assert_eq!(manager.backend().snapshot_active, None);
 }
 
 #[test]
