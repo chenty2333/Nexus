@@ -3,11 +3,11 @@
 use alloc::vec::Vec;
 
 use super::{
-    BearerStamp, ContinuationPhase, ContinuationRecord, DeadlinePhase, DeadlineRecord,
-    DelayedCommandPhase, DelayedCommandStateRecord, DevicePhase, DeviceRecord,
-    DeviceReservationCoordinates, FaultDisposition, FaultPhase, FaultStateRecord, FixedSlots,
-    InfrastructureError, InfrastructureKind, InfrastructureLiveCounts, ParentStamp, ReplyPhase,
-    ReplyStateRecord, RequestKey, ResourceUsage, ReverseIndexRecord, ReverseParent,
+    BearerStamp, ContinuationPhase, ContinuationRecord, DeadlineExhaustedDisposition,
+    DeadlinePhase, DeadlineRecord, DelayedCommandPhase, DelayedCommandStateRecord, DevicePhase,
+    DeviceRecord, DeviceReservationCoordinates, FaultDisposition, FaultPhase, FaultStateRecord,
+    FixedSlots, InfrastructureError, InfrastructureKind, InfrastructureLiveCounts, ParentStamp,
+    ReplyPhase, ReplyStateRecord, RequestKey, ResourceUsage, ReverseIndexRecord, ReverseParent,
     ScopeInfrastructure, ServiceArmReceipt, ServiceEnqueueReceipt, ServiceRequestDescriptor,
     ServiceRequestPhase, ServiceRequestStateRecord, SlotIdentity, TaskPhase, TaskRecord,
     TaskWorkDescriptor, VmAuthorityKey, WorkloadPhase, delayed_command_phase_live,
@@ -215,6 +215,7 @@ pub(super) fn check_scope_invariants(
         if record.series_nonce == 0 {
             return Err(InfrastructureError::Invariant("zero deadline series nonce"));
         }
+        check_deadline_phase(record)?;
         if deadline_phase_live(record.phase) {
             increment_invariant(&mut expected_live.deadlines)?;
             account_live_task_child(&mut workload_children, &mut task_children, &record.stamp)?;
@@ -1165,6 +1166,76 @@ fn check_continuation_phase(record: &ContinuationRecord) -> Result<(), Infrastru
     if !valid {
         return Err(InfrastructureError::Invariant(
             "continuation phase generation mismatch",
+        ));
+    }
+    Ok(())
+}
+
+fn check_deadline_phase(record: &DeadlineRecord) -> Result<(), InfrastructureError> {
+    if record
+        .last_reconciliation
+        .is_some_and(|receipt| receipt.evidence_digest == 0)
+        || record.terminal_evidence_digest == Some(0)
+    {
+        return Err(InfrastructureError::Invariant(
+            "deadline retains zero reconciliation evidence",
+        ));
+    }
+
+    let retry_history_is_valid = record.last_reconciliation.is_none_or(|receipt| {
+        receipt.disposition == DeadlineExhaustedDisposition::RetryBySupervisor
+    });
+    let valid = match record.phase {
+        DeadlinePhase::Armed => record.terminal_evidence_digest.is_none() && retry_history_is_valid,
+        DeadlinePhase::Fired { expiry_nonce, .. }
+        | DeadlinePhase::ExhaustedRetained { expiry_nonce, .. } => {
+            expiry_nonce != 0
+                && expiry_nonce == record.stamp.nonce
+                && record.terminal_evidence_digest.is_none()
+                && retry_history_is_valid
+        }
+        DeadlinePhase::QuarantinedRetained {
+            receipt,
+            quarantine_generation,
+            quarantine_nonce,
+            ..
+        } => {
+            receipt.disposition == DeadlineExhaustedDisposition::Quarantine
+                && receipt.evidence_digest != 0
+                && record.last_reconciliation == Some(receipt)
+                && record.terminal_evidence_digest.is_none()
+                && quarantine_generation != 0
+                && quarantine_generation == record.quarantine_generation
+                && quarantine_nonce != 0
+                && quarantine_nonce == record.stamp.nonce
+        }
+        DeadlinePhase::Cancelled => {
+            record.terminal_evidence_digest.is_none() && retry_history_is_valid
+        }
+        DeadlinePhase::Resolved {
+            reconciliation,
+            terminal_evidence_digest,
+        } => {
+            record.last_reconciliation == reconciliation
+                && record.terminal_evidence_digest == terminal_evidence_digest
+                && match reconciliation {
+                    None => terminal_evidence_digest.is_none(),
+                    Some(receipt) => {
+                        matches!(
+                            receipt.disposition,
+                            DeadlineExhaustedDisposition::AbortWork
+                                | DeadlineExhaustedDisposition::Quarantine
+                        ) && receipt.evidence_digest != 0
+                            && terminal_evidence_digest.is_some_and(|digest| digest != 0)
+                            && (receipt.disposition != DeadlineExhaustedDisposition::Quarantine
+                                || record.quarantine_generation != 0)
+                    }
+                }
+        }
+    };
+    if !valid {
+        return Err(InfrastructureError::Invariant(
+            "deadline phase or reconciliation mismatch",
         ));
     }
     Ok(())

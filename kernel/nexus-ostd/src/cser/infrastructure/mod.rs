@@ -280,19 +280,31 @@ mod bearer_state {
     pub(super) enum ContinuationAcknowledged {}
     #[derive(Debug, Eq, PartialEq)]
     pub(super) enum ContinuationResuming {}
+    #[derive(Debug, Eq, PartialEq)]
+    pub(super) enum DeadlineArmed {}
+    #[derive(Debug, Eq, PartialEq)]
+    pub(super) enum DeadlineFired {}
+    #[derive(Debug, Eq, PartialEq)]
+    pub(super) enum DeadlineExhausted {}
+    #[derive(Debug, Eq, PartialEq)]
+    pub(super) enum DeadlineQuarantined {}
 
     impl Sealed for ContinuationPending {}
     impl Sealed for ContinuationClaimed {}
     impl Sealed for ContinuationPublishing {}
     impl Sealed for ContinuationAcknowledged {}
     impl Sealed for ContinuationResuming {}
+    impl Sealed for DeadlineArmed {}
+    impl Sealed for DeadlineFired {}
+    impl Sealed for DeadlineExhausted {}
+    impl Sealed for DeadlineQuarantined {}
 }
 
-/// Opaque, state-typed authority for one fixed continuation slot.
+/// Opaque, state-typed authority for one fixed infrastructure slot.
 ///
 /// The key intentionally contains no descriptor, domain, source, parent, or
 /// workload snapshot.  Those facts have exactly one authoritative copy in
-/// `ContinuationRecord`; a key is accepted only after revalidating that full
+/// the family record; a key is accepted only after revalidating that full
 /// record and matching all of the compact coordinates below.
 #[derive(Debug, Eq, PartialEq)]
 struct BearerKey<State: bearer_state::Sealed> {
@@ -1046,6 +1058,12 @@ pub(crate) struct DeadlineDescriptor {
 
 impl DeadlineDescriptor {
     fn validate(self) -> Result<(), InfrastructureError> {
+        // Device-closure timers require a device-owned authority edge which
+        // does not exist in this infrastructure tranche.  A task-owned timer
+        // must never be accepted as an approximation of that edge.
+        if self.purpose == DeadlinePurpose::DeviceClosure {
+            return Err(InfrastructureError::NotEnabled);
+        }
         if self.series_id == 0
             || self.generation == 0
             || self.deadline_tick == 0
@@ -1061,15 +1079,19 @@ impl DeadlineDescriptor {
 }
 
 #[derive(Debug, Eq, PartialEq)]
-pub(crate) struct DeadlineLease(BearerStamp<DeadlineDescriptor>);
+pub(crate) struct DeadlineLease(BearerKey<bearer_state::DeadlineArmed>);
 
 #[derive(Debug, Eq, PartialEq)]
-pub(crate) struct DeadlineExpiryReceipt {
-    deadline: BearerStamp<DeadlineDescriptor>,
-    observed_tick: u64,
-    expiry_nonce: u64,
-    exhausted: bool,
+enum DeadlineExpiryAuthority {
+    Fired(BearerKey<bearer_state::DeadlineFired>),
+    Exhausted(BearerKey<bearer_state::DeadlineExhausted>),
 }
+
+/// Opaque fired/exhausted authority. The observed tick and expiry nonce have
+/// one authoritative copy in `DeadlineRecord`; this value only selects the
+/// exact object and bearer generation which may consume them.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct DeadlineExpiryReceipt(DeadlineExpiryAuthority);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DeadlineRecoveryState {
@@ -1101,6 +1123,11 @@ pub(crate) enum DeadlineExhaustedDisposition {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct DeadlineReconciliationReceipt {
     pub(crate) disposition: DeadlineExhaustedDisposition,
+    /// Opaque evidence selected by the crate-private adapter.
+    ///
+    /// This logical receipt is not, by itself, proof of a real timer, reset,
+    /// device, or persistent supervisor action. A production adapter must
+    /// verify such provider evidence before constructing this value.
     pub(crate) evidence_digest: u64,
 }
 
@@ -1113,15 +1140,14 @@ pub(crate) struct DeadlineSupervisorRetry {
 }
 
 #[derive(Debug, Eq, PartialEq)]
-pub(crate) struct DeadlineQuarantineTicket {
-    deadline: BearerStamp<DeadlineDescriptor>,
-    receipt: DeadlineReconciliationReceipt,
-    quarantine_generation: u64,
-    quarantine_nonce: u64,
-}
+pub(crate) struct DeadlineQuarantineTicket(BearerKey<bearer_state::DeadlineQuarantined>);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct DeadlineQuarantineReleaseReceipt {
+    /// Opaque evidence selected by the crate-private adapter.
+    ///
+    /// The same external-verification boundary as
+    /// [`DeadlineReconciliationReceipt::evidence_digest`] applies.
     pub(crate) evidence_digest: u64,
 }
 
@@ -1139,6 +1165,19 @@ pub(crate) enum DeadlineAdoption {
     Exhausted(DeadlineExpiryReceipt),
     Quarantined(DeadlineQuarantineTicket),
 }
+
+const _: () = {
+    assert!(core::mem::size_of::<BearerKey<bearer_state::DeadlineArmed>>() <= 64);
+    assert!(core::mem::size_of::<BearerKey<bearer_state::DeadlineFired>>() <= 64);
+    assert!(core::mem::size_of::<BearerKey<bearer_state::DeadlineExhausted>>() <= 64);
+    assert!(core::mem::size_of::<BearerKey<bearer_state::DeadlineQuarantined>>() <= 64);
+    assert!(core::mem::size_of::<DeadlineLease>() <= 96);
+    assert!(core::mem::size_of::<DeadlineExpiryReceipt>() <= 96);
+    assert!(core::mem::size_of::<DeadlineQuarantineTicket>() <= 96);
+    assert!(core::mem::size_of::<LinearFailure<DeadlineLease>>() <= 120);
+    assert!(core::mem::size_of::<LinearFailure<DeadlineExpiryReceipt>>() <= 120);
+    assert!(core::mem::size_of::<LinearFailure<DeadlineQuarantineTicket>>() <= 120);
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct DeviceReservationCoordinates {
@@ -2715,20 +2754,112 @@ fn validate_continuation_source(
     Ok(())
 }
 
-fn validate_deadline_bearer(
+fn validate_deadline_record(
     scope: &ScopeInfrastructure,
     registry_instance: u64,
-    stamp: &BearerStamp<DeadlineDescriptor>,
+    record: &DeadlineRecord,
 ) -> Result<(), InfrastructureError> {
+    let stamp = &record.stamp;
     validate_stamp_common(scope, registry_instance, stamp)?;
-    let record = scope
-        .deadlines
-        .get(stamp.identity.series_id)
+    let parent = match stamp.parent {
+        ParentStamp::Task(parent) => parent,
+        _ => return Err(InfrastructureError::ForeignParent),
+    };
+    let task = scope
+        .tasks
+        .get(parent.work_id)
         .ok_or(InfrastructureError::UnknownObligation)?;
-    if record.stamp != *stamp {
-        return Err(InfrastructureError::StaleGeneration);
+    validate_task_stamp(scope, registry_instance, &task.stamp)?;
+    if task.phase != TaskPhase::Entered
+        || task.stamp.identity != parent
+        || task.stamp.root != stamp.root
+        || task.stamp.domain != stamp.domain
+        || task.stamp.workload != stamp.workload
+        || task.stamp.parent != ParentStamp::Request(stamp.workload.request)
+    {
+        return Err(InfrastructureError::ForeignParent);
+    }
+    let index =
+        scope
+            .reverse_indexes
+            .get(record.series_nonce)
+            .ok_or(InfrastructureError::Invariant(
+                "missing deadline reverse index",
+            ))?;
+    if index.slot != record.series_nonce
+        || index.kind != InfrastructureKind::Deadline
+        || index.root_effect != stamp.root.root_effect
+        || index.parent != ReverseParent::Task(parent)
+        || index.task != Some(parent.task)
+        || index.domain != stamp.domain.domain
+        || index.binding_epoch != stamp.domain.binding_epoch
+        || index.source_domain.is_some()
+        || index.source_binding_epoch.is_some()
+        || index.resource.is_some()
+        || index.actor_slot.is_some()
+        || index.retry_generation != stamp.identity.generation
+    {
+        return Err(InfrastructureError::Invariant(
+            "deadline reverse index mismatch",
+        ));
     }
     Ok(())
+}
+
+fn mint_deadline_key<State: bearer_state::Sealed>(record: &DeadlineRecord) -> BearerKey<State> {
+    BearerKey {
+        authority: AuthorityKey {
+            registry_instance: record.stamp.root.registry_instance,
+            scope: record.stamp.root.scope,
+            authority_epoch: record.stamp.root.authority_epoch,
+        },
+        slot: record.stamp.identity.series_id,
+        object_generation: record.stamp.identity.generation,
+        bearer_generation: record.stamp.bearer_generation,
+        nonce: record.stamp.nonce,
+        state: PhantomData,
+    }
+}
+
+fn validate_deadline_key<'a, State: bearer_state::Sealed>(
+    scope: &'a ScopeInfrastructure,
+    registry_instance: u64,
+    key: &BearerKey<State>,
+) -> Result<&'a DeadlineRecord, InfrastructureError> {
+    if key.authority.registry_instance != registry_instance
+        || scope.root.registry_instance != registry_instance
+    {
+        return Err(InfrastructureError::ForeignRegistry);
+    }
+    if key.authority.scope != scope.root.scope {
+        return Err(InfrastructureError::ForeignScope);
+    }
+    if key.authority.authority_epoch != scope.root.authority_epoch {
+        return Err(InfrastructureError::StaleAuthority);
+    }
+    let record = scope
+        .deadlines
+        .get(key.slot)
+        .ok_or(InfrastructureError::UnknownObligation)?;
+    if record.stamp.identity.series_id != key.slot {
+        return Err(InfrastructureError::IdentityConflict);
+    }
+    if record.stamp.identity.generation != key.object_generation
+        || record.stamp.bearer_generation != key.bearer_generation
+        || record.stamp.nonce != key.nonce
+    {
+        return Err(InfrastructureError::StaleGeneration);
+    }
+    validate_deadline_record(scope, registry_instance, record)?;
+    Ok(record)
+}
+
+fn next_deadline_bearer_generation(record: &DeadlineRecord) -> Result<u64, InfrastructureError> {
+    record
+        .stamp
+        .bearer_generation
+        .checked_add(1)
+        .ok_or(InfrastructureError::CounterOverflow)
 }
 
 fn validate_device_bearer(

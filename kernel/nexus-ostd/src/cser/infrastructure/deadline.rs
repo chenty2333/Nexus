@@ -1,19 +1,40 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use super::{
-    BearerStamp, DeadlineAdoption, DeadlineClockBasis, DeadlineDescriptor,
-    DeadlineExhaustedDisposition, DeadlineExpiryReceipt, DeadlineLease, DeadlinePhase,
+    DeadlineAdoption, DeadlineClockBasis, DeadlineDescriptor, DeadlineExhaustedDisposition,
+    DeadlineExpiryAuthority, DeadlineExpiryReceipt, DeadlineLease, DeadlinePhase,
     DeadlineQuarantineReleaseReceipt, DeadlineQuarantineTicket, DeadlineReconciliationOutcome,
     DeadlineReconciliationReceipt, DeadlineRecord, DeadlineRecoveryProjection,
     DeadlineRecoveryState, DeadlineSupervisorRetry, EnteredTaskLease, InfrastructureError,
     InfrastructureEventKind, InfrastructureKind, InfrastructureState, LinearResult, ParentStamp,
-    ReverseIndexRecord, ReverseParent, ScopeInfrastructure, TaskPhase, WorkloadContext,
-    checked_add, checked_sub, context_from_stamp, linear_apply, preview_bearer_stamp,
-    preview_nonce, preview_nonces, preview_revision, preview_task_child_add,
+    RequestKey, ReverseIndexRecord, ReverseParent, ScopeInfrastructure, ScopeKey, TaskPhase,
+    TaskWorkDescriptor, WorkloadContext, bearer_state, checked_add, checked_sub,
+    context_from_stamp, linear_apply, mint_deadline_key, next_deadline_bearer_generation,
+    preview_bearer_stamp, preview_nonce, preview_nonces, preview_revision, preview_task_child_add,
     preview_task_child_sub, preview_workload_child_add, preview_workload_child_sub,
-    require_vacancy, validate_active_admission, validate_context, validate_deadline_bearer,
+    require_vacancy, validate_active_admission, validate_context, validate_deadline_key,
     validate_task_stamp,
 };
+
+enum PreparedDeadlineAdoption {
+    Armed,
+    Fired,
+    Exhausted,
+    Quarantined,
+}
+
+struct PreparedDeadlineFinish {
+    series_id: u64,
+    generation: u64,
+    workload_request: RequestKey,
+    parent_task: TaskWorkDescriptor,
+    bearer_generation: u64,
+    next_revision: u64,
+    next_live: u32,
+    next_workload_children: u32,
+    next_task_children: u32,
+    terminal: DeadlinePhase,
+}
 
 impl InfrastructureState {
     pub(in super::super) fn arm_deadline(
@@ -79,21 +100,26 @@ impl InfrastructureState {
             actor_slot: None,
             retry_generation: descriptor.generation,
         };
-        scope.deadlines.install(
-            DeadlineRecord {
-                stamp,
-                series_nonce: stamp.nonce,
-                quarantine_generation: 0,
-                last_reconciliation: None,
-                terminal_evidence_digest: None,
-                phase: DeadlinePhase::Armed,
-                closure_sequence: None,
-            },
-            InfrastructureKind::Deadline,
-        )?;
+        let record = DeadlineRecord {
+            stamp,
+            series_nonce: stamp.nonce,
+            quarantine_generation: 0,
+            last_reconciliation: None,
+            terminal_evidence_digest: None,
+            phase: DeadlinePhase::Armed,
+            closure_sequence: None,
+        };
+
+        // Both vacancies and every counter successor were prepared above.
+        // FixedSlots::install therefore cannot fail in this exclusive apply.
+        scope
+            .deadlines
+            .install(record, InfrastructureKind::Deadline)
+            .unwrap();
         scope
             .reverse_indexes
-            .install(index, InfrastructureKind::Deadline)?;
+            .install(index, InfrastructureKind::Deadline)
+            .unwrap();
         scope.next_nonce = next_nonce;
         scope.revision = next_revision;
         scope.live.deadlines = next_live;
@@ -112,9 +138,11 @@ impl InfrastructureState {
             descriptor.series_id,
             descriptor.generation,
         );
-        Ok(DeadlineLease(
-            scope.deadlines.get(descriptor.series_id).unwrap().stamp,
-        ))
+        Ok(DeadlineLease(mint_deadline_key::<
+            bearer_state::DeadlineArmed,
+        >(
+            scope.deadlines.get(descriptor.series_id).unwrap(),
+        )))
     }
 
     pub(in super::super) fn fire_deadline(
@@ -125,25 +153,25 @@ impl InfrastructureState {
     ) -> LinearResult<DeadlineLease, DeadlineExpiryReceipt> {
         linear_apply(lease, |lease| {
             self.require_authoritative()?;
-            let stamp = lease.0;
             let registry_instance = self.registry_instance;
-            let scope = self.scope_mut(stamp.root.scope)?;
-            validate_deadline_bearer(scope, registry_instance, &stamp)?;
-            let record = scope.deadlines.get(stamp.identity.series_id).unwrap();
+            let scope = self.scope_mut(lease.0.authority.scope)?;
+            let record = validate_deadline_key(scope, registry_instance, &lease.0)?;
             if record.phase != DeadlinePhase::Armed {
                 return Err(InfrastructureError::ExactReplay);
             }
-            if stamp.identity.clock != clock || observed_tick < stamp.identity.deadline_tick {
+            let descriptor = record.stamp.identity;
+            if descriptor.clock != clock || observed_tick < descriptor.deadline_tick {
                 return Err(InfrastructureError::InvalidState);
             }
+            let exhausted = descriptor.attempt == descriptor.max_attempts;
+            let bearer_generation = next_deadline_bearer_generation(record)?;
             let (expiry_nonce, next_nonce) = preview_nonce(scope)?;
             let next_revision = preview_revision(scope)?;
-            let exhausted = stamp.identity.attempt == stamp.identity.max_attempts;
-            scope
-                .deadlines
-                .get_mut(stamp.identity.series_id)
-                .unwrap()
-                .phase = if exhausted {
+
+            let record = scope.deadlines.get_mut(descriptor.series_id).unwrap();
+            record.stamp.nonce = expiry_nonce;
+            record.stamp.bearer_generation = bearer_generation;
+            record.phase = if exhausted {
                 DeadlinePhase::ExhaustedRetained {
                     expiry_nonce,
                     observed_tick,
@@ -158,14 +186,14 @@ impl InfrastructureState {
             scope.revision = next_revision;
             scope.events.push(
                 InfrastructureEventKind::DeadlineFired,
-                stamp.identity.series_id,
-                stamp.identity.generation,
+                descriptor.series_id,
+                descriptor.generation,
             );
-            Ok(DeadlineExpiryReceipt {
-                deadline: stamp,
-                observed_tick,
-                expiry_nonce,
-                exhausted,
+            let record = scope.deadlines.get(descriptor.series_id).unwrap();
+            Ok(if exhausted {
+                mint_exhausted_deadline(record)
+            } else {
+                mint_fired_deadline(record)
             })
         })
     }
@@ -178,71 +206,60 @@ impl InfrastructureState {
     ) -> LinearResult<DeadlineExpiryReceipt, DeadlineLease> {
         linear_apply(expiry, |expiry| {
             self.require_authoritative()?;
-            let old = expiry.deadline;
             let registry_instance = self.registry_instance;
-            let scope = self.scope_mut(old.root.scope)?;
-            validate_deadline_bearer(scope, registry_instance, &old)?;
-            if expiry.exhausted {
+            let scope = self.scope_mut(deadline_expiry_scope(expiry))?;
+            let (record, exhausted) = validate_deadline_expiry(scope, registry_instance, expiry)?;
+            if exhausted {
                 return Err(InfrastructureError::ClosureRetained);
             }
-            let record = scope.deadlines.get(old.identity.series_id).unwrap();
-            if record.phase
-                != (DeadlinePhase::Fired {
-                    expiry_nonce: expiry.expiry_nonce,
-                    observed_tick: expiry.observed_tick,
-                })
-            {
-                return Err(InfrastructureError::StaleClaim);
-            }
+            let observed_tick = match record.phase {
+                DeadlinePhase::Fired {
+                    expiry_nonce,
+                    observed_tick,
+                } if record.stamp.nonce == expiry_nonce => observed_tick,
+                _ => return Err(InfrastructureError::StaleClaim),
+            };
+            let descriptor = record.stamp.identity;
             if next_generation
-                != old
-                    .identity
+                != descriptor
                     .generation
                     .checked_add(1)
                     .ok_or(InfrastructureError::CounterOverflow)?
             {
                 return Err(InfrastructureError::StaleGeneration);
             }
-            let minimum_tick = expiry
-                .observed_tick
-                .checked_add(old.identity.backoff_ticks)
+            let minimum_tick = observed_tick
+                .checked_add(descriptor.backoff_ticks)
                 .ok_or(InfrastructureError::CounterOverflow)?;
             if next_deadline_tick < minimum_tick {
                 return Err(InfrastructureError::InvalidIdentity);
             }
-            let next_attempt = old
-                .identity
+            let next_attempt = descriptor
                 .attempt
                 .checked_add(1)
                 .ok_or(InfrastructureError::CounterOverflow)?;
-            if next_attempt > old.identity.max_attempts {
+            if next_attempt > descriptor.max_attempts {
                 return Err(InfrastructureError::ClosureRetained);
             }
+            let bearer_generation = next_deadline_bearer_generation(record)?;
             let (nonce, next_nonce) = preview_nonce(scope)?;
             let next_revision = preview_revision(scope)?;
-            let bearer_generation = old
-                .bearer_generation
-                .checked_add(1)
-                .ok_or(InfrastructureError::CounterOverflow)?;
             let descriptor = DeadlineDescriptor {
                 generation: next_generation,
                 deadline_tick: next_deadline_tick,
                 attempt: next_attempt,
-                ..old.identity
-            };
-            let stamp = BearerStamp {
-                identity: descriptor,
-                nonce,
-                bearer_generation,
-                ..old
+                ..descriptor
             };
             let series_nonce = record.series_nonce;
+
             let record = scope.deadlines.get_mut(descriptor.series_id).unwrap();
-            record.stamp = stamp;
+            record.stamp.identity = descriptor;
+            record.stamp.nonce = nonce;
+            record.stamp.bearer_generation = bearer_generation;
             record.phase = DeadlinePhase::Armed;
             let index = scope.reverse_indexes.get_mut(series_nonce).unwrap();
             index.retry_generation = next_generation;
-            index.binding_epoch = stamp.domain.binding_epoch;
+            index.binding_epoch = record.stamp.domain.binding_epoch;
             scope.next_nonce = next_nonce;
             scope.revision = next_revision;
             scope.events.push(
@@ -250,7 +267,11 @@ impl InfrastructureState {
                 descriptor.series_id,
                 descriptor.generation,
             );
-            Ok(DeadlineLease(stamp))
+            Ok(DeadlineLease(mint_deadline_key::<
+                bearer_state::DeadlineArmed,
+            >(
+                scope.deadlines.get(descriptor.series_id).unwrap(),
+            )))
         })
     }
 
@@ -260,15 +281,15 @@ impl InfrastructureState {
     ) -> LinearResult<DeadlineLease, ()> {
         linear_apply(lease, |lease| {
             self.require_authoritative()?;
-            let stamp = lease.0;
             let registry_instance = self.registry_instance;
-            let scope = self.scope_mut(stamp.root.scope)?;
-            validate_deadline_bearer(scope, registry_instance, &stamp)?;
-            if scope.deadlines.get(stamp.identity.series_id).unwrap().phase != DeadlinePhase::Armed
-            {
+            let scope = self.scope_mut(lease.0.authority.scope)?;
+            let record = validate_deadline_key(scope, registry_instance, &lease.0)?;
+            if record.phase != DeadlinePhase::Armed {
                 return Err(InfrastructureError::InvalidState);
             }
-            finish_deadline(scope, stamp, DeadlinePhase::Cancelled)
+            let finish = prepare_deadline_finish(scope, record, DeadlinePhase::Cancelled)?;
+            apply_deadline_finish(scope, finish);
+            Ok(())
         })
     }
 
@@ -278,28 +299,31 @@ impl InfrastructureState {
     ) -> LinearResult<DeadlineExpiryReceipt, ()> {
         linear_apply(expiry, |expiry| {
             self.require_authoritative()?;
-            let stamp = expiry.deadline;
             let registry_instance = self.registry_instance;
-            let scope = self.scope_mut(stamp.root.scope)?;
-            validate_deadline_bearer(scope, registry_instance, &stamp)?;
-            if expiry.exhausted {
+            let scope = self.scope_mut(deadline_expiry_scope(expiry))?;
+            let (record, exhausted) = validate_deadline_expiry(scope, registry_instance, expiry)?;
+            if exhausted {
                 return Err(InfrastructureError::ClosureRetained);
             }
-            let expected = DeadlinePhase::Fired {
-                expiry_nonce: expiry.expiry_nonce,
-                observed_tick: expiry.observed_tick,
-            };
-            if scope.deadlines.get(stamp.identity.series_id).unwrap().phase != expected {
+            if !matches!(
+                record.phase,
+                DeadlinePhase::Fired {
+                    expiry_nonce,
+                    ..
+                } if expiry_nonce == record.stamp.nonce
+            ) {
                 return Err(InfrastructureError::StaleClaim);
             }
-            finish_deadline(
+            let finish = prepare_deadline_finish(
                 scope,
-                stamp,
+                record,
                 DeadlinePhase::Resolved {
                     reconciliation: None,
                     terminal_evidence_digest: None,
                 },
-            )
+            )?;
+            apply_deadline_finish(scope, finish);
+            Ok(())
         })
     }
 
@@ -311,45 +335,46 @@ impl InfrastructureState {
     ) -> LinearResult<DeadlineExpiryReceipt, DeadlineReconciliationOutcome> {
         linear_apply(expiry, |expiry| {
             self.require_authoritative()?;
-            if !expiry.exhausted || receipt.evidence_digest == 0 {
+            if !deadline_expiry_is_exhausted(expiry) || receipt.evidence_digest == 0 {
                 return Err(InfrastructureError::InvalidReceipt);
             }
-            let stamp = expiry.deadline;
             let registry_instance = self.registry_instance;
-            let scope = self.scope_mut(stamp.root.scope)?;
-            validate_deadline_bearer(scope, registry_instance, &stamp)?;
-            if scope.deadlines.get(stamp.identity.series_id).unwrap().phase
-                != (DeadlinePhase::ExhaustedRetained {
-                    expiry_nonce: expiry.expiry_nonce,
-                    observed_tick: expiry.observed_tick,
-                })
-            {
-                return Err(InfrastructureError::StaleClaim);
+            let scope = self.scope_mut(deadline_expiry_scope(expiry))?;
+            let (record, exhausted) = validate_deadline_expiry(scope, registry_instance, expiry)?;
+            if !exhausted {
+                return Err(InfrastructureError::InvalidReceipt);
             }
+            let observed_tick = match record.phase {
+                DeadlinePhase::ExhaustedRetained {
+                    expiry_nonce,
+                    observed_tick,
+                } if record.stamp.nonce == expiry_nonce => observed_tick,
+                _ => return Err(InfrastructureError::StaleClaim),
+            };
+            let descriptor = record.stamp.identity;
             match receipt.disposition {
                 DeadlineExhaustedDisposition::AbortWork => {
                     if supervisor_retry.is_some() {
                         return Err(InfrastructureError::InvalidReceipt);
                     }
-                    finish_deadline(
+                    let finish = prepare_deadline_finish(
                         scope,
-                        stamp,
+                        record,
                         DeadlinePhase::Resolved {
                             reconciliation: Some(receipt),
                             terminal_evidence_digest: Some(receipt.evidence_digest),
                         },
                     )?;
+                    apply_deadline_finish(scope, finish);
                     Ok(DeadlineReconciliationOutcome::Aborted)
                 }
                 DeadlineExhaustedDisposition::RetryBySupervisor => {
                     let retry = supervisor_retry.ok_or(InfrastructureError::InvalidReceipt)?;
-                    let minimum_tick = expiry
-                        .observed_tick
+                    let minimum_tick = observed_tick
                         .checked_add(retry.backoff_ticks)
                         .ok_or(InfrastructureError::CounterOverflow)?;
                     if retry.generation
-                        != stamp
-                            .identity
+                        != descriptor
                             .generation
                             .checked_add(1)
                             .ok_or(InfrastructureError::CounterOverflow)?
@@ -359,61 +384,60 @@ impl InfrastructureState {
                     {
                         return Err(InfrastructureError::InvalidReceipt);
                     }
-                    let bearer_generation = stamp
-                        .bearer_generation
-                        .checked_add(1)
-                        .ok_or(InfrastructureError::CounterOverflow)?;
+                    let bearer_generation = next_deadline_bearer_generation(record)?;
+                    let (nonce, next_nonce) = preview_nonce(scope)?;
                     let next_revision = preview_revision(scope)?;
-                    let mut next_stamp = stamp;
-                    next_stamp.identity.generation = retry.generation;
-                    next_stamp.identity.deadline_tick = retry.deadline_tick;
-                    next_stamp.identity.attempt = 1;
-                    next_stamp.identity.max_attempts = retry.max_attempts;
-                    next_stamp.identity.backoff_ticks = retry.backoff_ticks;
-                    next_stamp.bearer_generation = bearer_generation;
-                    let series_nonce = scope
-                        .deadlines
-                        .get(stamp.identity.series_id)
-                        .unwrap()
-                        .series_nonce;
-                    let record = scope.deadlines.get_mut(stamp.identity.series_id).unwrap();
-                    record.stamp = next_stamp;
+                    let series_nonce = record.series_nonce;
+                    let mut next_descriptor = descriptor;
+                    next_descriptor.generation = retry.generation;
+                    next_descriptor.deadline_tick = retry.deadline_tick;
+                    next_descriptor.attempt = 1;
+                    next_descriptor.max_attempts = retry.max_attempts;
+                    next_descriptor.backoff_ticks = retry.backoff_ticks;
+
+                    let record = scope.deadlines.get_mut(descriptor.series_id).unwrap();
+                    record.stamp.identity = next_descriptor;
+                    record.stamp.nonce = nonce;
+                    record.stamp.bearer_generation = bearer_generation;
                     record.phase = DeadlinePhase::Armed;
                     record.last_reconciliation = Some(receipt);
                     record.terminal_evidence_digest = None;
-                    let index = scope.reverse_indexes.get_mut(series_nonce).ok_or(
-                        InfrastructureError::Invariant("missing deadline reverse index"),
-                    )?;
+                    let index = scope.reverse_indexes.get_mut(series_nonce).unwrap();
                     index.retry_generation = retry.generation;
+                    index.binding_epoch = record.stamp.domain.binding_epoch;
+                    scope.next_nonce = next_nonce;
                     scope.revision = next_revision;
                     scope.events.push(
                         InfrastructureEventKind::DeadlineRearmed,
-                        next_stamp.identity.series_id,
-                        next_stamp.identity.generation,
+                        next_descriptor.series_id,
+                        next_descriptor.generation,
                     );
                     Ok(DeadlineReconciliationOutcome::Retried(DeadlineLease(
-                        next_stamp,
+                        mint_deadline_key::<bearer_state::DeadlineArmed>(
+                            scope.deadlines.get(next_descriptor.series_id).unwrap(),
+                        ),
                     )))
                 }
                 DeadlineExhaustedDisposition::Quarantine => {
                     if supervisor_retry.is_some() {
                         return Err(InfrastructureError::InvalidReceipt);
                     }
-                    let quarantine_generation = scope
-                        .deadlines
-                        .get(stamp.identity.series_id)
-                        .unwrap()
+                    let quarantine_generation = record
                         .quarantine_generation
                         .checked_add(1)
                         .ok_or(InfrastructureError::CounterOverflow)?;
+                    let bearer_generation = next_deadline_bearer_generation(record)?;
                     let (quarantine_nonce, next_nonce) = preview_nonce(scope)?;
                     let next_revision = preview_revision(scope)?;
-                    let record = scope.deadlines.get_mut(stamp.identity.series_id).unwrap();
+
+                    let record = scope.deadlines.get_mut(descriptor.series_id).unwrap();
+                    record.stamp.nonce = quarantine_nonce;
+                    record.stamp.bearer_generation = bearer_generation;
                     record.quarantine_generation = quarantine_generation;
                     record.last_reconciliation = Some(receipt);
                     record.terminal_evidence_digest = None;
                     record.phase = DeadlinePhase::QuarantinedRetained {
-                        observed_tick: expiry.observed_tick,
+                        observed_tick,
                         receipt,
                         quarantine_generation,
                         quarantine_nonce,
@@ -421,12 +445,11 @@ impl InfrastructureState {
                     scope.next_nonce = next_nonce;
                     scope.revision = next_revision;
                     Ok(DeadlineReconciliationOutcome::Quarantined(
-                        DeadlineQuarantineTicket {
-                            deadline: stamp,
-                            receipt,
-                            quarantine_generation,
-                            quarantine_nonce,
-                        },
+                        DeadlineQuarantineTicket(mint_deadline_key::<
+                            bearer_state::DeadlineQuarantined,
+                        >(
+                            scope.deadlines.get(descriptor.series_id).unwrap(),
+                        )),
                     ))
                 }
             }
@@ -443,36 +466,32 @@ impl InfrastructureState {
             if receipt.evidence_digest == 0 {
                 return Err(InfrastructureError::InvalidReceipt);
             }
-            let stamp = ticket.deadline;
             let registry_instance = self.registry_instance;
-            let scope = self.scope_mut(stamp.root.scope)?;
-            validate_deadline_bearer(scope, registry_instance, &stamp)?;
-            if scope.deadlines.get(stamp.identity.series_id).unwrap().phase
-                != (DeadlinePhase::QuarantinedRetained {
-                    observed_tick: match scope
-                        .deadlines
-                        .get(stamp.identity.series_id)
-                        .unwrap()
-                        .phase
-                    {
-                        DeadlinePhase::QuarantinedRetained { observed_tick, .. } => observed_tick,
-                        _ => 0,
-                    },
-                    receipt: ticket.receipt,
-                    quarantine_generation: ticket.quarantine_generation,
-                    quarantine_nonce: ticket.quarantine_nonce,
-                })
-            {
-                return Err(InfrastructureError::StaleClaim);
-            }
-            finish_deadline(
+            let scope = self.scope_mut(ticket.0.authority.scope)?;
+            let record = validate_deadline_key(scope, registry_instance, &ticket.0)?;
+            let reconciliation = match record.phase {
+                DeadlinePhase::QuarantinedRetained {
+                    receipt,
+                    quarantine_generation,
+                    quarantine_nonce,
+                    ..
+                } if quarantine_generation == record.quarantine_generation
+                    && quarantine_nonce == record.stamp.nonce =>
+                {
+                    receipt
+                }
+                _ => return Err(InfrastructureError::StaleClaim),
+            };
+            let finish = prepare_deadline_finish(
                 scope,
-                stamp,
+                record,
                 DeadlinePhase::Resolved {
-                    reconciliation: Some(ticket.receipt),
+                    reconciliation: Some(reconciliation),
                     terminal_evidence_digest: Some(receipt.evidence_digest),
                 },
-            )
+            )?;
+            apply_deadline_finish(scope, finish);
+            Ok(())
         })
     }
 
@@ -540,75 +559,77 @@ impl InfrastructureState {
         if record.stamp.identity.generation != generation {
             return Err(InfrastructureError::StaleGeneration);
         }
+        if record.stamp.root.registry_instance != registry_instance
+            || record.stamp.root.scope != context.root.scope
+            || record.stamp.root.root_effect != context.root.root_effect
+            || record.stamp.root.authority_epoch != context.root.authority_epoch
+        {
+            return Err(InfrastructureError::StaleAuthority);
+        }
+        let parent_task = match record.stamp.parent {
+            ParentStamp::Task(parent) => parent,
+            _ => return Err(InfrastructureError::ForeignParent),
+        };
+        let task = scope
+            .tasks
+            .get(parent_task.work_id)
+            .ok_or(InfrastructureError::UnknownObligation)?;
+        validate_task_stamp(scope, registry_instance, &task.stamp)?;
+        if task.phase != TaskPhase::Entered
+            || task.stamp.root != context.root
+            || task.stamp.domain != context.domain
+            || task.stamp.workload != context.workload
+            || task.stamp.parent != ParentStamp::Request(context.workload.request)
+            || task.stamp.identity != parent_task
+        {
+            return Err(InfrastructureError::ForeignParent);
+        }
         if record.stamp.workload.request != context.workload.request
             || record.stamp.domain.domain != context.domain.domain
             || record.stamp.domain.binding_epoch >= context.domain.binding_epoch
         {
             return Err(InfrastructureError::StaleBinding);
         }
-        let phase = record.phase;
+        let previous_phase = record.phase;
         if matches!(
-            phase,
+            previous_phase,
             DeadlinePhase::Cancelled | DeadlinePhase::Resolved { .. }
         ) {
             return Err(InfrastructureError::InvalidState);
         }
-        let bearer_generation = record
-            .stamp
-            .bearer_generation
-            .checked_add(1)
-            .ok_or(InfrastructureError::CounterOverflow)?;
-        let needs_successor_nonce = !matches!(phase, DeadlinePhase::Armed);
-        let (nonces, next_nonce) =
-            preview_nonces(scope, if needs_successor_nonce { 1 } else { 0 })?;
+        validate_deadline_reverse_index(scope, record)?;
+        let bearer_generation = next_deadline_bearer_generation(record)?;
+        let nonce_count = usize::from(!matches!(previous_phase, DeadlinePhase::Armed));
+        let (nonces, next_nonce) = preview_nonces(scope, nonce_count)?;
         let next_revision = preview_revision(scope)?;
         let index_slot = record.series_nonce;
         let mut stamp = record.stamp;
         stamp.domain = context.domain;
         stamp.workload = context.workload;
         stamp.bearer_generation = bearer_generation;
-        enum AdoptionData {
-            Armed,
-            Fired {
-                expiry_nonce: u64,
-                observed_tick: u64,
-                exhausted: bool,
-            },
-            Quarantined {
-                observed_tick: u64,
-                receipt: DeadlineReconciliationReceipt,
-                quarantine_generation: u64,
-                quarantine_nonce: u64,
-            },
-        }
-        let (next_phase, adoption) = match phase {
-            DeadlinePhase::Armed => (DeadlinePhase::Armed, AdoptionData::Armed),
+
+        let (next_phase, prepared) = match previous_phase {
+            DeadlinePhase::Armed => (DeadlinePhase::Armed, PreparedDeadlineAdoption::Armed),
             DeadlinePhase::Fired { observed_tick, .. } => {
                 let expiry_nonce = nonces[0];
+                stamp.nonce = expiry_nonce;
                 (
                     DeadlinePhase::Fired {
                         expiry_nonce,
                         observed_tick,
                     },
-                    AdoptionData::Fired {
-                        expiry_nonce,
-                        observed_tick,
-                        exhausted: false,
-                    },
+                    PreparedDeadlineAdoption::Fired,
                 )
             }
             DeadlinePhase::ExhaustedRetained { observed_tick, .. } => {
                 let expiry_nonce = nonces[0];
+                stamp.nonce = expiry_nonce;
                 (
                     DeadlinePhase::ExhaustedRetained {
                         expiry_nonce,
                         observed_tick,
                     },
-                    AdoptionData::Fired {
-                        expiry_nonce,
-                        observed_tick,
-                        exhausted: true,
-                    },
+                    PreparedDeadlineAdoption::Exhausted,
                 )
             }
             DeadlinePhase::QuarantinedRetained {
@@ -621,6 +642,7 @@ impl InfrastructureState {
                     .checked_add(1)
                     .ok_or(InfrastructureError::CounterOverflow)?;
                 let quarantine_nonce = nonces[0];
+                stamp.nonce = quarantine_nonce;
                 (
                     DeadlinePhase::QuarantinedRetained {
                         observed_tick,
@@ -628,28 +650,17 @@ impl InfrastructureState {
                         quarantine_generation,
                         quarantine_nonce,
                     },
-                    AdoptionData::Quarantined {
-                        observed_tick,
-                        receipt,
-                        quarantine_generation,
-                        quarantine_nonce,
-                    },
+                    PreparedDeadlineAdoption::Quarantined,
                 )
             }
             DeadlinePhase::Cancelled | DeadlinePhase::Resolved { .. } => {
                 return Err(InfrastructureError::InvalidState);
             }
         };
+
         let record = scope.deadlines.get_mut(series_id).unwrap();
         record.stamp = stamp;
         record.phase = next_phase;
-        scope
-            .reverse_indexes
-            .get_mut(index_slot)
-            .unwrap()
-            .binding_epoch = context.domain.binding_epoch;
-        scope.next_nonce = next_nonce;
-        scope.revision = next_revision;
         if let DeadlinePhase::QuarantinedRetained {
             quarantine_generation,
             ..
@@ -657,86 +668,181 @@ impl InfrastructureState {
         {
             record.quarantine_generation = quarantine_generation;
         }
-        Ok(match adoption {
-            AdoptionData::Armed => DeadlineAdoption::Armed(DeadlineLease(stamp)),
-            AdoptionData::Fired {
-                expiry_nonce,
-                observed_tick,
-                exhausted: false,
-            } => DeadlineAdoption::Fired(DeadlineExpiryReceipt {
-                deadline: stamp,
-                observed_tick,
-                expiry_nonce,
-                exhausted: false,
-            }),
-            AdoptionData::Fired {
-                expiry_nonce,
-                observed_tick,
-                exhausted: true,
-            } => DeadlineAdoption::Exhausted(DeadlineExpiryReceipt {
-                deadline: stamp,
-                observed_tick,
-                expiry_nonce,
-                exhausted: true,
-            }),
-            AdoptionData::Quarantined {
-                observed_tick: _,
-                receipt,
-                quarantine_generation,
-                quarantine_nonce,
-            } => DeadlineAdoption::Quarantined(DeadlineQuarantineTicket {
-                deadline: stamp,
-                receipt,
-                quarantine_generation,
-                quarantine_nonce,
-            }),
+        // The exact row was checked before the first mutation. This apply is
+        // allocation-free and cannot return an error.
+        scope
+            .reverse_indexes
+            .get_mut(index_slot)
+            .unwrap()
+            .binding_epoch = context.domain.binding_epoch;
+        scope.next_nonce = next_nonce;
+        scope.revision = next_revision;
+
+        let record = scope.deadlines.get(series_id).unwrap();
+        Ok(match prepared {
+            PreparedDeadlineAdoption::Armed => {
+                DeadlineAdoption::Armed(DeadlineLease(mint_deadline_key::<
+                    bearer_state::DeadlineArmed,
+                >(record)))
+            }
+            PreparedDeadlineAdoption::Fired => DeadlineAdoption::Fired(mint_fired_deadline(record)),
+            PreparedDeadlineAdoption::Exhausted => {
+                DeadlineAdoption::Exhausted(mint_exhausted_deadline(record))
+            }
+            PreparedDeadlineAdoption::Quarantined => {
+                DeadlineAdoption::Quarantined(DeadlineQuarantineTicket(mint_deadline_key::<
+                    bearer_state::DeadlineQuarantined,
+                >(record)))
+            }
         })
     }
 }
 
-fn finish_deadline(
-    scope: &mut ScopeInfrastructure,
-    stamp: BearerStamp<DeadlineDescriptor>,
-    terminal: DeadlinePhase,
+fn deadline_expiry_scope(expiry: &DeadlineExpiryReceipt) -> ScopeKey {
+    match &expiry.0 {
+        DeadlineExpiryAuthority::Fired(key) => key.authority.scope,
+        DeadlineExpiryAuthority::Exhausted(key) => key.authority.scope,
+    }
+}
+
+fn deadline_expiry_is_exhausted(expiry: &DeadlineExpiryReceipt) -> bool {
+    matches!(expiry.0, DeadlineExpiryAuthority::Exhausted(_))
+}
+
+fn validate_deadline_expiry<'a>(
+    scope: &'a ScopeInfrastructure,
+    registry_instance: u64,
+    expiry: &DeadlineExpiryReceipt,
+) -> Result<(&'a DeadlineRecord, bool), InfrastructureError> {
+    match &expiry.0 {
+        DeadlineExpiryAuthority::Fired(key) => {
+            let record = validate_deadline_key(scope, registry_instance, key)?;
+            if !matches!(
+                record.phase,
+                DeadlinePhase::Fired { expiry_nonce, .. }
+                    if expiry_nonce == record.stamp.nonce
+            ) {
+                return Err(InfrastructureError::StaleClaim);
+            }
+            Ok((record, false))
+        }
+        DeadlineExpiryAuthority::Exhausted(key) => {
+            let record = validate_deadline_key(scope, registry_instance, key)?;
+            if !matches!(
+                record.phase,
+                DeadlinePhase::ExhaustedRetained { expiry_nonce, .. }
+                    if expiry_nonce == record.stamp.nonce
+            ) {
+                return Err(InfrastructureError::StaleClaim);
+            }
+            Ok((record, true))
+        }
+    }
+}
+
+fn mint_fired_deadline(record: &DeadlineRecord) -> DeadlineExpiryReceipt {
+    DeadlineExpiryReceipt(DeadlineExpiryAuthority::Fired(mint_deadline_key::<
+        bearer_state::DeadlineFired,
+    >(record)))
+}
+
+fn mint_exhausted_deadline(record: &DeadlineRecord) -> DeadlineExpiryReceipt {
+    DeadlineExpiryReceipt(DeadlineExpiryAuthority::Exhausted(mint_deadline_key::<
+        bearer_state::DeadlineExhausted,
+    >(record)))
+}
+
+fn validate_deadline_reverse_index(
+    scope: &ScopeInfrastructure,
+    record: &DeadlineRecord,
 ) -> Result<(), InfrastructureError> {
-    let next_revision = preview_revision(scope)?;
-    let next_live = checked_sub(scope.live.deadlines, 1)?;
-    let next_workload_children = preview_workload_child_sub(scope, stamp.workload.request)?;
+    let stamp = record.stamp;
+    let parent = match stamp.parent {
+        ParentStamp::Task(parent) => parent,
+        _ => return Err(InfrastructureError::ForeignParent),
+    };
+    let index =
+        scope
+            .reverse_indexes
+            .get(record.series_nonce)
+            .ok_or(InfrastructureError::Invariant(
+                "missing deadline reverse index",
+            ))?;
+    if index.slot != record.series_nonce
+        || index.kind != InfrastructureKind::Deadline
+        || index.root_effect != stamp.root.root_effect
+        || index.parent != ReverseParent::Task(parent)
+        || index.task != Some(parent.task)
+        || index.domain != stamp.domain.domain
+        || index.binding_epoch != stamp.domain.binding_epoch
+        || index.source_domain.is_some()
+        || index.source_binding_epoch.is_some()
+        || index.resource.is_some()
+        || index.actor_slot.is_some()
+        || index.retry_generation != stamp.identity.generation
+    {
+        return Err(InfrastructureError::Invariant(
+            "deadline reverse index mismatch",
+        ));
+    }
+    Ok(())
+}
+
+fn prepare_deadline_finish(
+    scope: &ScopeInfrastructure,
+    record: &DeadlineRecord,
+    terminal: DeadlinePhase,
+) -> Result<PreparedDeadlineFinish, InfrastructureError> {
+    let stamp = record.stamp;
     let parent_task = match stamp.parent {
         ParentStamp::Task(parent) => parent,
         _ => return Err(InfrastructureError::ForeignParent),
     };
-    let next_task_children = preview_task_child_sub(scope, parent_task)?;
-    let record = scope.deadlines.get_mut(stamp.identity.series_id).unwrap();
-    record.phase = terminal;
+    Ok(PreparedDeadlineFinish {
+        series_id: stamp.identity.series_id,
+        generation: stamp.identity.generation,
+        workload_request: stamp.workload.request,
+        parent_task,
+        bearer_generation: next_deadline_bearer_generation(record)?,
+        next_revision: preview_revision(scope)?,
+        next_live: checked_sub(scope.live.deadlines, 1)?,
+        next_workload_children: preview_workload_child_sub(scope, stamp.workload.request)?,
+        next_task_children: preview_task_child_sub(scope, parent_task)?,
+        terminal,
+    })
+}
+
+fn apply_deadline_finish(scope: &mut ScopeInfrastructure, finish: PreparedDeadlineFinish) {
+    let record = scope.deadlines.get_mut(finish.series_id).unwrap();
+    record.stamp.bearer_generation = finish.bearer_generation;
+    record.phase = finish.terminal;
     if let DeadlinePhase::Resolved {
         reconciliation,
         terminal_evidence_digest,
-    } = terminal
+    } = finish.terminal
     {
         record.last_reconciliation = reconciliation;
         record.terminal_evidence_digest = terminal_evidence_digest;
     }
-    scope.revision = next_revision;
-    scope.live.deadlines = next_live;
+    scope.revision = finish.next_revision;
+    scope.live.deadlines = finish.next_live;
     scope
         .workloads
-        .get_mut(stamp.workload.request.id)
+        .get_mut(finish.workload_request.id)
         .unwrap()
-        .live_children = next_workload_children;
+        .live_children = finish.next_workload_children;
     scope
         .tasks
-        .get_mut(parent_task.work_id)
+        .get_mut(finish.parent_task.work_id)
         .unwrap()
-        .live_children = next_task_children;
+        .live_children = finish.next_task_children;
     scope.events.push(
-        if matches!(terminal, DeadlinePhase::Cancelled) {
+        if matches!(finish.terminal, DeadlinePhase::Cancelled) {
             InfrastructureEventKind::DeadlineCancelled
         } else {
             InfrastructureEventKind::DeadlineResolved
         },
-        stamp.identity.series_id,
-        stamp.identity.generation,
+        finish.series_id,
+        finish.generation,
     );
-    Ok(())
 }
