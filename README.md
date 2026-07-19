@@ -136,7 +136,7 @@ The exact tier contracts and claim discipline are kept in
 | `crates/cser-transition-gates/` | Production-transition-source Loom harnesses |
 | `crates/nexus-effect-peer/` | Frozen native-v1 logical effect peer and replay boundary |
 | `crates/nexus-portal-abi/` | `nexus.portal.v2` preview wire/dispatcher contract, exercised by the session-local kernel Registry adapter; no user/kernel transport or persistent selector recovery yet |
-| `crates/nexus-supervisor/` | Bounded provider-neutral restart/recovery manager; OSTD exact-reap adapter foundation is compiled but activation remains closed without fault containment, initial-active binding, and a live manager worker |
+| `crates/nexus-supervisor/` | Bounded provider-neutral restart/recovery manager; its generic OSTD adapter has an initial-active binding, UserMode-only fault boundary, Nexus-owned bounded worker, and exact reap/health permit, but no filesystem lifecycle run is claimed |
 | `kernel/nexus-ostd/` | Maintained OSTD kernel prototype and bounded workload paths |
 | `experiments/ostd-virtio-cser-spike/` | Mediated VirtIO/reset/IOMMU component evidence |
 | `tests/guest/linux/` | Hash-pinned Linux compatibility-pressure inputs |

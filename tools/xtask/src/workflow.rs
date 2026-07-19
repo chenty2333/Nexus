@@ -1937,17 +1937,21 @@ fn validate_ostd_supervisor_runtime_source(runtime: &str, kernel: &str) -> Resul
         &[
             "self.exact_task_exit_hook",
             "self.exact_task_reap_hook",
-            "self.isolated_task_fault_hook",
+            "self.isolated_user_fault_boundary",
             "self.initial_active_task_binding",
             "self.nexus_owned_manager_worker",
+            "self.worker_exact_reap_health",
+            "self.generation_fenced_timer_ingress",
         ],
     )?;
     for capability in [
         "exact_task_exit_hook: true",
         "exact_task_reap_hook: true",
-        "isolated_task_fault_hook: false",
-        "initial_active_task_binding: false",
-        "nexus_owned_manager_worker: false",
+        "isolated_user_fault_boundary: true",
+        "initial_active_task_binding: true",
+        "nexus_owned_manager_worker: true",
+        "worker_exact_reap_health: true",
+        "generation_fenced_timer_ingress: true",
     ] {
         if !source_function(
             runtime,
@@ -2012,7 +2016,7 @@ fn validate_ostd_supervisor_runtime_source(runtime: &str, kernel: &str) -> Resul
         ],
     )?;
     let wrapper_return =
-        source_function(runtime, "    fn report_return", "/// Replacement program")?;
+        source_function(runtime, "    fn report_return", "/// Typed terminal result")?;
     if !wrapper_return.contains("record_pending_exit(")
         || wrapper_return.contains("enqueue_signal_locked")
         || wrapper_return.contains("OstdSupervisorEvent::Exit")
@@ -2020,6 +2024,22 @@ fn validate_ostd_supervisor_runtime_source(runtime: &str, kernel: &str) -> Resul
         return Err(
             "service wrapper return must only retain an ExitReason until exact OSTD reap".into(),
         );
+    }
+    let user_fault_boundary = source_function(
+        runtime,
+        "    pub(crate) const fn from_user_mode_return",
+        "/// Replacement program",
+    )?;
+    require_source_order(
+        "isolated user-mode fault boundary",
+        user_fault_boundary,
+        &[
+            "ReturnReason::UserException => Self::Fault",
+            "ReturnReason::UserSyscall | ReturnReason::KernelEvent => Self::UnexpectedReturn",
+        ],
+    )?;
+    if user_fault_boundary.contains("panic") || user_fault_boundary.contains("KernelFault") {
+        return Err("user fault boundary may not claim or catch a kernel fault".into());
     }
     let flush = source_function(runtime, "    fn flush_oldest_retained", "    fn pop_event")?;
     require_source_order(
@@ -2072,7 +2092,9 @@ fn validate_ostd_supervisor_runtime_source(runtime: &str, kernel: &str) -> Resul
         kernel,
         &[
             "supervisor_exit: Option<supervisor_runtime::OstdSupervisorTaskExitBinding>",
+            "supervisor_worker_exit: Option<supervisor_runtime::OstdSupervisorWorkerExitBinding>",
             "fn new_supervised(",
+            "fn new_supervisor_worker(",
             "inject_post_task_exit_handler(supervisor_runtime::observe_post_task_exit)",
         ],
     )?;
@@ -2088,6 +2110,100 @@ fn validate_ostd_supervisor_runtime_source(runtime: &str, kernel: &str) -> Resul
             "task.is_reaped()",
             "data.supervisor_exit",
             "binding.observe_exact_reap()",
+            "data.supervisor_worker_exit",
+            "binding.observe_exact_reap()",
+        ],
+    )?;
+
+    let startup = source_function(
+        runtime,
+        "fn start_supervisor_runtime",
+        "impl<const N: usize> OstdSupervisorRuntime<N>",
+    )?;
+    require_source_order(
+        "initial-active and manager-worker install before publication",
+        startup,
+        &[
+            "reserve_initial_active(selector)",
+            "TaskData::new_supervised(",
+            ".build()",
+            "install_initial_active_task(",
+            "install_runtime(runtime)",
+            "TaskData::new_supervisor_worker(",
+            ".build()",
+            "install_initial_active_for_publication(selector)",
+            "timer.install_on_current_cpu(config.timer_generation)",
+            "worker.mark_published()",
+            "shared.publish_initial_active(selector)",
+            "worker_task.run()",
+            "initial_task.run()",
+        ],
+    )?;
+    if !startup.contains("authority: &OstdSupervisorActivationAuthority<N>")
+        || !runtime.contains("authority: self,")
+    {
+        return Err("startup failure must return the exact linear activation authority".into());
+    }
+    let worker_run = source_function(
+        runtime,
+        "    fn run(&self)",
+        "impl<const N: usize> ExactWorkerReapSink",
+    )?;
+    require_source_order(
+        "worker takes runtime before bounded drive and restores it before return",
+        worker_run,
+        &[
+            "self.runtime.disable_irq().lock().take()",
+            "self.drive_until_stop(&mut runtime)",
+            "self.install_runtime(runtime)",
+            "self.mark_returned(terminal)",
+        ],
+    )?;
+    require_source_order(
+        "worker disables timer on every no-runtime terminal path",
+        worker_run,
+        &[
+            "if !self.mark_running()",
+            "self.finish_without_runtime(OstdSupervisorWorkerTerminal::LifecycleViolation)",
+            "let Some(mut runtime) = self.runtime.disable_irq().lock().take() else",
+            "self.finish_without_runtime(OstdSupervisorWorkerTerminal::MissingRuntime)",
+            "self.drive_until_stop(&mut runtime)",
+            "self.disable_timer_or_lifecycle(terminal)",
+        ],
+    )?;
+    let worker_no_runtime_finish = source_function(
+        runtime,
+        "    fn finish_without_runtime",
+        "    fn run(&self)",
+    )?;
+    require_source_order(
+        "worker no-runtime terminal timer fence",
+        worker_no_runtime_finish,
+        &[
+            "self.disable_timer_or_lifecycle(terminal)",
+            "self.mark_returned",
+        ],
+    )?;
+    if source_function(runtime, "    fn drive_until_stop", "    fn run(&self)")?
+        .contains("self.runtime")
+    {
+        return Err("worker may not hold its runtime SpinLock across manager progress".into());
+    }
+    let timer = source_function(
+        runtime,
+        "    pub(crate) fn install_on_current_cpu",
+        "    fn disable",
+    )?;
+    require_source_order(
+        "generation-fenced weak timer ingress",
+        timer,
+        &[
+            "generation == 0",
+            "timer_generation",
+            "Arc::downgrade(&self.shared)",
+            "shared.timer_enabled.load(Ordering::Acquire)",
+            "shared.timer_generation.load(Ordering::Acquire) == generation",
+            "shared.tick_pending.store(true, Ordering::Release)",
         ],
     )?;
     Ok(())
@@ -4614,9 +4730,11 @@ mod tests {
         for capability in [
             "            && self.exact_task_exit_hook\n",
             "            && self.exact_task_reap_hook\n",
-            "            && self.isolated_task_fault_hook\n",
+            "            && self.isolated_user_fault_boundary\n",
             "            && self.initial_active_task_binding\n",
             "            && self.nexus_owned_manager_worker\n",
+            "            && self.worker_exact_reap_health\n",
+            "            && self.generation_fenced_timer_ingress\n",
         ] {
             let mutation = runtime.replacen(capability, "", 1);
             assert_ne!(mutation, runtime, "capability mutation must apply");
@@ -4625,8 +4743,8 @@ mod tests {
         }
 
         let early_exit = runtime.replacen(
-            "        let observed_tick = Jiffies::elapsed().as_u64();\n        match slot.phase {",
-            "        let observed_tick = Jiffies::elapsed().as_u64();\n        self.enqueue_signal_locked(&mut slot, observed_tick, OstdSupervisorEvent::Reaped { service, binding_epoch });\n        match slot.phase {",
+            "        match slot.phase {\n            ReplacementSlotPhase::Published => {",
+            "        self.enqueue_signal_locked(&mut slot, observed_tick, OstdSupervisorEvent::Reaped { service, binding_epoch });\n        match slot.phase {\n            ReplacementSlotPhase::Published => {",
             1,
         );
         assert_ne!(early_exit, runtime, "exact-reap mutation must apply");
@@ -4635,11 +4753,15 @@ mod tests {
 
         // The gate binds the audited slot-to-events edge before a runtime
         // oracle can exercise the race.
-        let missing_slot_lock = runtime.replacen(
+        let emit_ready =
+            source_function(&runtime, "    fn emit_ready", "    fn record_pending_exit")
+                .expect("extract ready ingress");
+        let mutated_emit_ready = emit_ready.replacen(
             "        let mut slot = self.replacement.disable_irq().lock();\n",
             "        let mut slot = self.replacement.lock();\n",
             1,
         );
+        let missing_slot_lock = runtime.replacen(emit_ready, &mutated_emit_ready, 1);
         assert_ne!(missing_slot_lock, runtime, "slot-lock mutation must apply");
         validate_ostd_supervisor_runtime_source(&missing_slot_lock, &kernel)
             .expect_err("event ingress must retain the IRQ-safe slot-first lock edge");
@@ -4652,6 +4774,43 @@ mod tests {
         assert_ne!(missing_hook, kernel, "post-exit hook mutation must apply");
         validate_ostd_supervisor_runtime_source(&runtime, &missing_hook)
             .expect_err("kernel root must install the exact post-task-exit hook");
+
+        let runtime_lock_across_drive = runtime.replacen(
+            "                let result = runtime.drive_once();\n",
+            "                let result = self.runtime.disable_irq().lock().as_mut().unwrap().drive_once();\n",
+            1,
+        );
+        assert_ne!(runtime_lock_across_drive, runtime);
+        validate_ostd_supervisor_runtime_source(&runtime_lock_across_drive, &kernel)
+            .expect_err("manager progress may not run under the worker runtime lock");
+
+        for no_timer_fence in [
+            "            self.finish_without_runtime(OstdSupervisorWorkerTerminal::LifecycleViolation);\n",
+            "            self.finish_without_runtime(OstdSupervisorWorkerTerminal::MissingRuntime);\n",
+        ] {
+            let mutation = runtime.replacen(no_timer_fence, "", 1);
+            assert_ne!(mutation, runtime, "timer-fence mutation must apply");
+            validate_ostd_supervisor_runtime_source(&mutation, &kernel)
+                .expect_err("every no-runtime worker terminal must disable its timer generation");
+        }
+
+        let early_initial_publication = runtime.replacen(
+            "    worker_task.run();\n    initial_task.run();\n",
+            "    initial_task.run();\n    worker_task.run();\n",
+            1,
+        );
+        assert_ne!(early_initial_publication, runtime);
+        validate_ostd_supervisor_runtime_source(&early_initial_publication, &kernel)
+            .expect_err("manager worker must be enqueued before initial-active publication");
+
+        let strong_timer_owner = runtime.replacen(
+            "        let shared = Arc::downgrade(&self.shared);\n",
+            "        let shared = Arc::clone(&self.shared);\n",
+            1,
+        );
+        assert_ne!(strong_timer_owner, runtime);
+        validate_ostd_supervisor_runtime_source(&strong_timer_owner, &kernel)
+            .expect_err("timer callback may not retain runtime authority forever");
     }
 
     #[test]

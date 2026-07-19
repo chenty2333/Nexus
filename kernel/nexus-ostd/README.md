@@ -468,8 +468,8 @@ owners; timeout does not advance device generation, ResetAck advances it, and
 only IOTLB Ack releases ownership.
 
 The production Registry now has the two private primitives required by the
-kernel supervisor backend. Current main also compiles an activation-gated OSTD
-adapter around the provider-neutral `SupervisorManager`: a fixed-size FIFO and
+kernel supervisor backend. Current main also compiles a permit-capable generic
+OSTD adapter around the provider-neutral `SupervisorManager`: a fixed-size FIFO and
 per-task retained slots, monotonic `Jiffies` wakeups, unpublished
 `TaskOptions::build`, state installation before `Task::run`, and the private
 Registry crash/snapshot/Ready/rebind/adopt/abort/isolate bridge. A domain
@@ -503,14 +503,43 @@ weaker stale-handle or no-supervisor path. This tranche intentionally provides
 no operator clear/retry operation: a quarantined domain can only be retired
 with its enclosing scope.
 
-This is supervisor adapter foundation, not supervisor completion evidence.
-`activation_report()` remains fail-closed because isolated service-fault
-containment, an exact binding for the initial active service task, and a
-Nexus-owned manager worker/system-cell are absent. Nothing in the filesystem
-runtime constructs the adapter, and cooperative stop is not arbitrary task
-kill. Consequently the compiled hook, queue, timer ingress, and backend do not
-establish a real filesystem service crash/replacement run, repeated-crash or
-timeout behavior, SMP refinement, or an operator-visible supervisor service.
+The generic startup authority is linear and non-cloneable. It constructs both
+the initial service and the manager worker unpublished, embeds weak exact-reap
+sinks in `TaskData`, installs the initial slot, runtime cell, worker health, and
+generation-fenced weak timer ingress, and only then calls `Task::run`. A typed
+failure at validation, task build, slot/runtime installation, or timer setup
+returns that exact authority with no runnable task; a registered callback is
+disabled and holds only `Weak` state. The worker takes the manager out of its
+ingress cell before bounded drive/yield, so no worker lock or IRQ guard spans a
+Registry transition or replacement publication. Cooperative worker shutdown
+restores the manager to the authority cell before exact reap records health;
+every worker terminal path generation-disables timer ingress first, including
+invalid lifecycle state and an unexpectedly empty runtime cell.
+
+The service entry returns one of `Fault`, `UnexpectedReturn`, or
+`CooperativeStop`; its wrapper only latches the corresponding reason, and the
+post-switch exact-reap hook is still the sole event publisher. The fault claim
+is deliberately `isolated_user_fault_boundary`: OSTD `UserMode` returning
+`UserException` becomes `Fault`, while a kernel-mode panic/fault remains
+fail-stop and is not caught or relabelled.
+
+This remains generic supervisor adapter foundation, not filesystem supervisor
+completion evidence. `activation_report()` can now issue a permit because the
+generic primitives above are implemented, but permit availability is not a
+claim that fsd, netd, or another production service constructed the runtime.
+Nothing in the filesystem runtime does so yet, and cooperative stop is not
+arbitrary task kill. Consequently the compiled hook, queue, worker, timer
+ingress, and backend do not establish a real filesystem crash/replacement run,
+repeated-crash or timeout runtime evidence, SMP refinement, or an
+operator-visible supervisor service.
+
+The ordinary provider-neutral tests retain the complete state-machine paths:
+initial crash through backoff, replacement Ready/rebind/adopt, pre-Ready exit
+and exact reap, Ready and stop deadlines, stale epoch/selector rejection, and
+fresh-generation repeated crash. Adapter-local tests separately bind initial
+active exact-exit ingress, pre-Ready `Exit < Reaped`, UserMode-only fault
+classification, and worker return-before-reap health. These are pure/source
+evidence, not an observed OSTD service lifecycle.
 
 Phase 2 stops at deterministic block preparation. It aborts that prepared
 effect without a device commit and keeps queue-slot, pinned-page, and DMA credit

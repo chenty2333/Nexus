@@ -2,18 +2,16 @@
 
 //! Nexus-owned OSTD adapter for the bounded supervisor state machine.
 //!
-//! This module is compiled into the kernel, but cannot be activated on the
-//! pinned OSTD 0.18 substrate. OSTD provides a real monotonic `Jiffies` clock,
-//! unpublished `TaskOptions::build`, scheduler publication by `Task::run`, and
-//! an exact once-only post-exit observation after terminal CPU switch-out. It
-//! still does not provide the isolated task-fault boundary required by
-//! `nexus-supervisor`, and this tranche does not yet bind the initial active
-//! task or start a Nexus-owned manager worker. [`activation_report`] keeps
-//! those gaps machine-readable and [`request_activation`] therefore fails
-//! closed.
+//! The generic adapter can be activated on the pinned OSTD 0.18 substrate. It
+//! binds the initial active service before scheduler publication, confines
+//! user-mode exceptions to a typed service outcome, and runs the single-owner
+//! manager in a Nexus-created task. This is deliberately narrower than a
+//! kernel panic boundary: kernel-mode faults remain fail-stop. Availability of
+//! an [`OstdSupervisorActivationPermit`] also says nothing about a filesystem
+//! service having constructed or exercised this runtime.
 //!
 //! The code below is still the production-shaped adapter, not a second manager:
-//! one worker would own [`SupervisorManager`], untrusted child events carry only
+//! one worker owns [`SupervisorManager`], untrusted child events carry only
 //! manager-selected identity and binding coordinates, the Registry backend is
 //! private to that manager, and every replacement task/attempt stays in a
 //! fixed-size Nexus-owned slot until exact cleanup.
@@ -21,8 +19,11 @@
 extern crate alloc as __cser_alloc;
 extern crate core as __cser_core;
 
-use __cser_alloc::sync::{Arc, Weak};
-use __cser_core::sync::atomic::{AtomicBool, Ordering};
+use __cser_alloc::{
+    boxed::Box,
+    sync::{Arc, Weak},
+};
+use __cser_core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use nexus_supervisor::{
     CohortIdentity, CrashObservation, ExitReason, PollProgress, RebindObservation,
@@ -34,6 +35,7 @@ use ostd::{
     sync::SpinLock,
     task::{Task, TaskOptions},
     timer::Jiffies,
+    user::ReturnReason,
 };
 use sha2::{Digest, Sha256};
 
@@ -46,6 +48,7 @@ use crate::{
 };
 
 const MIN_EVENT_CAPACITY: usize = 4;
+const MIN_MANAGER_DRIVE_BUDGET: u32 = 1;
 
 /// Exact capabilities supplied by this adapter and the pinned OSTD substrate.
 #[derive(
@@ -65,9 +68,11 @@ pub(crate) struct OstdSupervisorActivationReport {
     pub(crate) task_return_boundary: bool,
     pub(crate) exact_task_exit_hook: bool,
     pub(crate) exact_task_reap_hook: bool,
-    pub(crate) isolated_task_fault_hook: bool,
+    pub(crate) isolated_user_fault_boundary: bool,
     pub(crate) initial_active_task_binding: bool,
     pub(crate) nexus_owned_manager_worker: bool,
+    pub(crate) worker_exact_reap_health: bool,
+    pub(crate) generation_fenced_timer_ingress: bool,
 }
 
 impl OstdSupervisorActivationReport {
@@ -82,9 +87,11 @@ impl OstdSupervisorActivationReport {
             && self.task_return_boundary
             && self.exact_task_exit_hook
             && self.exact_task_reap_hook
-            && self.isolated_task_fault_hook
+            && self.isolated_user_fault_boundary
             && self.initial_active_task_binding
             && self.nexus_owned_manager_worker
+            && self.worker_exact_reap_health
+            && self.generation_fenced_timer_ingress
     }
 }
 
@@ -100,9 +107,11 @@ pub(crate) const fn activation_report() -> OstdSupervisorActivationReport {
         task_return_boundary: true,
         exact_task_exit_hook: true,
         exact_task_reap_hook: true,
-        isolated_task_fault_hook: false,
-        initial_active_task_binding: false,
-        nexus_owned_manager_worker: false,
+        isolated_user_fault_boundary: true,
+        initial_active_task_binding: true,
+        nexus_owned_manager_worker: true,
+        worker_exact_reap_health: true,
+        generation_fenced_timer_ingress: true,
     }
 }
 
@@ -302,6 +311,32 @@ enum SignalState {
     Consumed,
 }
 
+/// Exact task selector installed before an OSTD task becomes runnable.
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
+struct ServiceTaskSelector {
+    service: ServiceIdentity,
+    binding_epoch: u64,
+}
+
+impl ServiceTaskSelector {
+    const fn new(service: ServiceIdentity, binding_epoch: u64) -> Self {
+        Self {
+            service,
+            binding_epoch,
+        }
+    }
+
+    const fn from_launch(launch: ReplacementLaunch) -> Self {
+        Self::new(launch.replacement(), launch.binding_epoch())
+    }
+}
+
 #[derive(
     __cser_core::clone::Clone,
     __cser_core::marker::Copy,
@@ -314,6 +349,7 @@ enum ReplacementSlotPhase {
     Selected,
     Constructing,
     Constructed,
+    InstalledActive,
     Published,
     Active,
     StopRequested,
@@ -323,6 +359,7 @@ enum ReplacementSlotPhase {
 
 struct ReplacementSlot {
     phase: ReplacementSlotPhase,
+    selector: Option<ServiceTaskSelector>,
     failed: Option<ServiceIdentity>,
     launch: Option<ReplacementLaunch>,
     attempt: Option<u32>,
@@ -337,6 +374,7 @@ impl ReplacementSlot {
     const fn new() -> Self {
         Self {
             phase: ReplacementSlotPhase::Vacant,
+            selector: None,
             failed: None,
             launch: None,
             attempt: None,
@@ -350,6 +388,7 @@ impl ReplacementSlot {
 
     fn clear(&mut self) {
         self.phase = ReplacementSlotPhase::Vacant;
+        self.selector = None;
         self.failed = None;
         self.launch = None;
         self.attempt = None;
@@ -377,9 +416,7 @@ impl ReplacementSlot {
     }
 
     fn matches(&self, service: ServiceIdentity, binding_epoch: u64) -> bool {
-        self.launch.is_some_and(|launch| {
-            launch.replacement() == service && launch.binding_epoch() == binding_epoch
-        })
+        self.selector == Some(ServiceTaskSelector::new(service, binding_epoch))
     }
 }
 
@@ -409,6 +446,8 @@ struct OstdSupervisorShared<const N: usize> {
     stop_requested: AtomicBool,
     tick_pending: AtomicBool,
     timer_installed: AtomicBool,
+    timer_enabled: AtomicBool,
+    timer_generation: AtomicU64,
     lifecycle_ingress_rejected: AtomicBool,
 }
 
@@ -420,6 +459,8 @@ impl<const N: usize> OstdSupervisorShared<N> {
             stop_requested: AtomicBool::new(false),
             tick_pending: AtomicBool::new(false),
             timer_installed: AtomicBool::new(false),
+            timer_enabled: AtomicBool::new(false),
+            timer_generation: AtomicU64::new(0),
             lifecycle_ingress_rejected: AtomicBool::new(false),
         }
     }
@@ -427,6 +468,85 @@ impl<const N: usize> OstdSupervisorShared<N> {
     fn latch_lifecycle_ingress_rejection(&self) {
         self.lifecycle_ingress_rejected
             .store(true, Ordering::Release);
+    }
+
+    fn reserve_initial_active(
+        &self,
+        selector: ServiceTaskSelector,
+    ) -> Result<(), OstdSupervisorSlotError> {
+        let mut slot = self.replacement.disable_irq().lock();
+        if slot.phase != ReplacementSlotPhase::Vacant {
+            return Err(OstdSupervisorSlotError::Busy);
+        }
+        slot.phase = ReplacementSlotPhase::Constructing;
+        slot.selector = Some(selector);
+        Ok(())
+    }
+
+    fn install_initial_active_task(
+        &self,
+        selector: ServiceTaskSelector,
+        task: Arc<Task>,
+    ) -> Result<(), OstdSupervisorSlotError> {
+        let mut slot = self.replacement.disable_irq().lock();
+        if slot.phase != ReplacementSlotPhase::Constructing
+            || slot.selector != Some(selector)
+            || slot.task.is_some()
+        {
+            return Err(OstdSupervisorSlotError::WrongPhase);
+        }
+        slot.task = Some(task);
+        slot.phase = ReplacementSlotPhase::Constructed;
+        Ok(())
+    }
+
+    fn install_initial_active_for_publication(
+        &self,
+        selector: ServiceTaskSelector,
+    ) -> Result<Arc<Task>, OstdSupervisorSlotError> {
+        let mut slot = self.replacement.disable_irq().lock();
+        if slot.phase != ReplacementSlotPhase::Constructed || slot.selector != Some(selector) {
+            return Err(OstdSupervisorSlotError::WrongPhase);
+        }
+        let task = slot
+            .task
+            .as_ref()
+            .cloned()
+            .ok_or(OstdSupervisorSlotError::WrongPhase)?;
+        // The complete selector, task reference, and exit sink are visible
+        // before timer arming and before Task::run can make the service
+        // runnable.
+        slot.phase = ReplacementSlotPhase::InstalledActive;
+        Ok(task)
+    }
+
+    fn publish_initial_active(
+        &self,
+        selector: ServiceTaskSelector,
+    ) -> Result<(), OstdSupervisorSlotError> {
+        let mut slot = self.replacement.disable_irq().lock();
+        if slot.phase != ReplacementSlotPhase::InstalledActive
+            || slot.selector != Some(selector)
+            || slot.task.is_none()
+        {
+            return Err(OstdSupervisorSlotError::WrongPhase);
+        }
+        slot.phase = ReplacementSlotPhase::Active;
+        Ok(())
+    }
+
+    fn rollback_initial_active(&self, selector: ServiceTaskSelector) {
+        let mut slot = self.replacement.disable_irq().lock();
+        if slot.selector == Some(selector)
+            && __cser_core::matches!(
+                slot.phase,
+                ReplacementSlotPhase::Constructing
+                    | ReplacementSlotPhase::Constructed
+                    | ReplacementSlotPhase::InstalledActive
+            )
+        {
+            slot.clear();
+        }
     }
 
     fn enqueue_signal_locked(
@@ -516,11 +636,19 @@ impl<const N: usize> OstdSupervisorShared<N> {
         service: ServiceIdentity,
         binding_epoch: u64,
     ) -> Result<(), OstdSupervisorSignalError> {
+        self.observe_exact_reap_at(service, binding_epoch, Jiffies::elapsed().as_u64())
+    }
+
+    fn observe_exact_reap_at(
+        &self,
+        service: ServiceIdentity,
+        binding_epoch: u64,
+        observed_tick: u64,
+    ) -> Result<(), OstdSupervisorSignalError> {
         let mut slot = self.replacement.disable_irq().lock();
         if !slot.matches(service, binding_epoch) {
             return Err(OstdSupervisorSignalError::StaleTaskContext);
         }
-        let observed_tick = Jiffies::elapsed().as_u64();
         match slot.phase {
             ReplacementSlotPhase::Published => {
                 let reason = slot
@@ -647,6 +775,34 @@ impl<const N: usize> ExactTaskReapSink for OstdSupervisorShared<N> {
     }
 }
 
+trait ExactWorkerReapSink: Send + Sync {
+    fn observe_exact_worker_reap(&self);
+}
+
+/// Non-owning exact-reap binding for the Nexus manager worker.
+pub(crate) struct OstdSupervisorWorkerExitBinding {
+    sink: Weak<dyn ExactWorkerReapSink>,
+}
+
+impl OstdSupervisorWorkerExitBinding {
+    fn new<T>(shared: &Arc<T>) -> Self
+    where
+        T: ExactWorkerReapSink + 'static,
+    {
+        let erased: Arc<dyn ExactWorkerReapSink> =
+            Arc::clone(shared) as Arc<dyn ExactWorkerReapSink>;
+        Self {
+            sink: Arc::downgrade(&erased),
+        }
+    }
+
+    fn observe_exact_reap(&self) {
+        if let Some(sink) = self.sink.upgrade() {
+            sink.observe_exact_worker_reap();
+        }
+    }
+}
+
 /// Non-owning exact lifecycle binding embedded in one OSTD task.
 ///
 /// The weak sink avoids a `shared -> task -> binding -> shared` ownership
@@ -661,13 +817,13 @@ pub(crate) struct OstdSupervisorTaskExitBinding {
 impl OstdSupervisorTaskExitBinding {
     fn new<const N: usize>(
         shared: &Arc<OstdSupervisorShared<N>>,
-        launch: ReplacementLaunch,
+        selector: ServiceTaskSelector,
     ) -> Self {
         let erased: Arc<dyn ExactTaskReapSink> = Arc::clone(shared) as Arc<dyn ExactTaskReapSink>;
         let sink = Arc::downgrade(&erased);
         Self {
-            service: launch.replacement(),
-            binding_epoch: launch.binding_epoch(),
+            service: selector.service,
+            binding_epoch: selector.binding_epoch,
             sink,
         }
     }
@@ -689,6 +845,9 @@ pub(crate) fn observe_post_task_exit(task: &Task) {
         return;
     };
     if let Some(binding) = data.supervisor_exit.as_ref() {
+        binding.observe_exact_reap();
+    }
+    if let Some(binding) = data.supervisor_worker_exit.as_ref() {
         binding.observe_exact_reap();
     }
 }
@@ -742,24 +901,37 @@ pub(crate) enum OstdSupervisorSignalError {
 /// Context passed to one manager-selected replacement entry.
 pub(crate) struct OstdSupervisorServiceContext<const N: usize> {
     shared: Arc<OstdSupervisorShared<N>>,
-    launch: ReplacementLaunch,
+    selector: ServiceTaskSelector,
+    ready_deadline_tick: Option<u64>,
 }
 
 impl<const N: usize> OstdSupervisorServiceContext<N> {
-    fn new(shared: Arc<OstdSupervisorShared<N>>, launch: ReplacementLaunch) -> Self {
-        Self { shared, launch }
+    fn initial(shared: Arc<OstdSupervisorShared<N>>, selector: ServiceTaskSelector) -> Self {
+        Self {
+            shared,
+            selector,
+            ready_deadline_tick: None,
+        }
+    }
+
+    fn replacement(shared: Arc<OstdSupervisorShared<N>>, launch: ReplacementLaunch) -> Self {
+        Self {
+            shared,
+            selector: ServiceTaskSelector::from_launch(launch),
+            ready_deadline_tick: Some(launch.ready_deadline_tick()),
+        }
     }
 
     pub(crate) const fn service(&self) -> ServiceIdentity {
-        self.launch.replacement()
+        self.selector.service
     }
 
     pub(crate) const fn binding_epoch(&self) -> u64 {
-        self.launch.binding_epoch()
+        self.selector.binding_epoch
     }
 
-    pub(crate) const fn ready_deadline_tick(&self) -> u64 {
-        self.launch.ready_deadline_tick()
+    pub(crate) const fn ready_deadline_tick(&self) -> Option<u64> {
+        self.ready_deadline_tick
     }
 
     /// Reports Ready without exposing rebind or adoption authority.
@@ -774,18 +946,25 @@ impl<const N: usize> OstdSupervisorServiceContext<N> {
         self.shared.stop_requested.load(Ordering::Acquire)
     }
 
-    fn report_return(&self) {
+    fn report_return(&self, outcome: OstdSupervisorServiceOutcome) {
         // Do not deliver Exit until OSTD's post-task-exit hook proves terminal
         // switch-out. Otherwise Backoff could select the next generation while
         // this task still occupies the exact slot. The task wrapper owns only
         // this pending reason; the later hook owns event publication.
+        let reason = match outcome {
+            OstdSupervisorServiceOutcome::Fault => ExitReason::Fault,
+            OstdSupervisorServiceOutcome::UnexpectedReturn => ExitReason::UnexpectedReturn,
+            // In StopRequested the exact-reap path ignores the retained exit
+            // reason. A spontaneous cooperative return is instead a protocol
+            // violation and therefore starts ordinary recovery.
+            OstdSupervisorServiceOutcome::CooperativeStop if self.stop_requested() => {
+                ExitReason::UnexpectedReturn
+            }
+            OstdSupervisorServiceOutcome::CooperativeStop => ExitReason::ProtocolViolation,
+        };
         if self
             .shared
-            .record_pending_exit(
-                self.service(),
-                self.binding_epoch(),
-                ExitReason::UnexpectedReturn,
-            )
+            .record_pending_exit(self.service(), self.binding_epoch(), reason)
             .is_err()
         {
             self.shared.latch_lifecycle_ingress_rejection();
@@ -793,9 +972,38 @@ impl<const N: usize> OstdSupervisorServiceContext<N> {
     }
 }
 
+/// Typed terminal result returned by a bounded service entry.
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
+pub(crate) enum OstdSupervisorServiceOutcome {
+    Fault,
+    UnexpectedReturn,
+    CooperativeStop,
+}
+
+impl OstdSupervisorServiceOutcome {
+    /// Classifies only an OSTD user-mode return. Kernel faults never pass
+    /// through this API and remain fail-stop.
+    pub(crate) const fn from_user_mode_return(
+        reason: ReturnReason,
+        cooperative_stop_requested: bool,
+    ) -> Self {
+        match reason {
+            ReturnReason::UserException => Self::Fault,
+            ReturnReason::KernelEvent if cooperative_stop_requested => Self::CooperativeStop,
+            ReturnReason::UserSyscall | ReturnReason::KernelEvent => Self::UnexpectedReturn,
+        }
+    }
+}
+
 /// Replacement program selected by the Nexus-owned backend.
 pub(crate) trait OstdSupervisorServiceProgram<const N: usize>: Send + Sync {
-    fn run(&self, context: &OstdSupervisorServiceContext<N>);
+    fn run(&self, context: &OstdSupervisorServiceContext<N>) -> OstdSupervisorServiceOutcome;
 }
 
 /// Timer-side handle. The IRQ callback only coalesces a wake request; it never
@@ -805,8 +1013,14 @@ pub(crate) struct OstdSupervisorTimerIngress<const N: usize> {
 }
 
 impl<const N: usize> OstdSupervisorTimerIngress<N> {
-    /// Installs one callback on the current CPU.
-    pub(crate) fn install_on_current_cpu(&self) -> Result<(), OstdSupervisorTimerError> {
+    /// Installs one generation-fenced callback on the current CPU.
+    pub(crate) fn install_on_current_cpu(
+        &self,
+        generation: u64,
+    ) -> Result<(), OstdSupervisorTimerError> {
+        if generation == 0 {
+            return Err(OstdSupervisorTimerError::InvalidGeneration);
+        }
         if self
             .shared
             .timer_installed
@@ -815,10 +1029,29 @@ impl<const N: usize> OstdSupervisorTimerIngress<N> {
         {
             return Err(OstdSupervisorTimerError::AlreadyInstalled);
         }
-        let shared = Arc::clone(&self.shared);
+        self.shared
+            .timer_generation
+            .store(generation, Ordering::Release);
+        self.shared.timer_enabled.store(true, Ordering::Release);
+        let shared = Arc::downgrade(&self.shared);
         ostd::timer::register_callback_on_cpu(move || {
-            shared.tick_pending.store(true, Ordering::Release);
+            let Some(shared) = shared.upgrade() else {
+                return;
+            };
+            if shared.timer_enabled.load(Ordering::Acquire)
+                && shared.timer_generation.load(Ordering::Acquire) == generation
+            {
+                shared.tick_pending.store(true, Ordering::Release);
+            }
         });
+        Ok(())
+    }
+
+    fn disable(&self, generation: u64) -> Result<(), OstdSupervisorTimerError> {
+        if self.shared.timer_generation.load(Ordering::Acquire) != generation {
+            return Err(OstdSupervisorTimerError::StaleGeneration);
+        }
+        self.shared.timer_enabled.store(false, Ordering::Release);
         Ok(())
     }
 }
@@ -832,7 +1065,9 @@ impl<const N: usize> OstdSupervisorTimerIngress<N> {
     __cser_core::cmp::PartialEq,
 )]
 pub(crate) enum OstdSupervisorTimerError {
+    InvalidGeneration,
     AlreadyInstalled,
+    StaleGeneration,
 }
 
 /// Stable task-slot mismatch reported by the backend.
@@ -1056,6 +1291,7 @@ impl<const N: usize> SupervisorBackend for OstdRegistrySupervisorBackend<N> {
             ));
         }
         slot.phase = ReplacementSlotPhase::Selected;
+        slot.selector = None;
         slot.failed = Some(failed);
         slot.launch = None;
         slot.attempt = Some(attempt);
@@ -1082,28 +1318,35 @@ impl<const N: usize> SupervisorBackend for OstdRegistrySupervisorBackend<N> {
                 ));
             }
             slot.phase = ReplacementSlotPhase::Constructing;
+            slot.selector = Some(ServiceTaskSelector::from_launch(launch));
             slot.launch = Some(launch);
         }
 
-        let shared = Arc::clone(&self.shared);
+        let shared = Arc::downgrade(&self.shared);
         let program = Arc::clone(&self.program);
-        let context = OstdSupervisorServiceContext::new(Arc::clone(&shared), launch);
         let replacement = service_task(launch.replacement());
         // Install the manager-selected identity before scheduler publication.
         // The patched OSTD switch tail can therefore report exact reaping
         // without reconstructing either identity coordinate.
-        let exit_binding = OstdSupervisorTaskExitBinding::new(&shared, launch);
+        let exit_binding = OstdSupervisorTaskExitBinding::new(
+            &self.shared,
+            ServiceTaskSelector::from_launch(launch),
+        );
         let task_data = TaskData::new_supervised(replacement, exit_binding, None);
         let built = TaskOptions::new(move || {
-            program.run(&context);
-            context.report_return();
+            let Some(shared) = shared.upgrade() else {
+                return;
+            };
+            let context = OstdSupervisorServiceContext::replacement(shared, launch);
+            let outcome = program.run(&context);
+            context.report_return(outcome);
         })
         .data(task_data)
         .build();
         let task = match built {
             Ok(task) => Arc::new(task),
             Err(_) => {
-                let mut slot = shared.replacement.disable_irq().lock();
+                let mut slot = self.shared.replacement.disable_irq().lock();
                 if slot.phase == ReplacementSlotPhase::Constructing && slot.launch == Some(launch) {
                     slot.clear();
                 }
@@ -1358,12 +1601,21 @@ pub(crate) struct OstdSupervisorRuntime<const N: usize> {
     shared: Arc<OstdSupervisorShared<N>>,
 }
 
-/// Runtime construction failure.
+/// Runtime startup failure. No variant carries or consumes lifecycle authority.
 #[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(crate) enum OstdSupervisorRuntimeBuildError {
     EventCapacityTooSmall,
+    InvalidManagerDriveBudget,
+    InvalidManagerTaskIdentity,
+    InvalidTimerGeneration,
+    InitialSlot(OstdSupervisorSlotError),
+    InitialTaskBuild,
     Backend(OstdSupervisorBackendError),
     Manager(SupervisorError<OstdSupervisorBackendError>),
+    WorkerTaskBuild,
+    WorkerRuntimeAlreadyInstalled,
+    WorkerLifecycle(OstdSupervisorWorkerTerminal),
+    Timer(OstdSupervisorTimerError),
 }
 
 /// Fixed coordinates and policy for one manager-owned service domain.
@@ -1380,40 +1632,481 @@ pub(crate) struct OstdSupervisorRuntimeConfig {
     pub(crate) active: ServiceIdentity,
     pub(crate) binding_epoch: u64,
     pub(crate) policy: SupervisorPolicy,
+    pub(crate) manager_task_id: u64,
+    pub(crate) manager_drive_budget: u32,
+    pub(crate) timer_generation: u64,
 }
 
-impl<const N: usize> OstdSupervisorRuntime<N> {
+/// Linear startup authority. Failed startup returns this exact value so a
+/// caller can retry or retire it without reconstructing Registry authority.
+pub(crate) struct OstdSupervisorActivationAuthority<const N: usize> {
+    permit: OstdSupervisorActivationPermit,
+    registry: Arc<SpinLock<EffectRegistry>>,
+    config: OstdSupervisorRuntimeConfig,
+    program: Arc<dyn OstdSupervisorServiceProgram<N>>,
+}
+
+impl<const N: usize> OstdSupervisorActivationAuthority<N> {
     pub(crate) fn new(
-        _permit: OstdSupervisorActivationPermit,
+        permit: OstdSupervisorActivationPermit,
         registry: Arc<SpinLock<EffectRegistry>>,
         config: OstdSupervisorRuntimeConfig,
         program: Arc<dyn OstdSupervisorServiceProgram<N>>,
-    ) -> Result<Self, OstdSupervisorRuntimeBuildError> {
-        if N < MIN_EVENT_CAPACITY {
-            return Err(OstdSupervisorRuntimeBuildError::EventCapacityTooSmall);
-        }
-        let shared = Arc::new(OstdSupervisorShared::new());
-        let backend = OstdRegistrySupervisorBackend::new(
+    ) -> Self {
+        Self {
+            permit,
             registry,
-            config.scope,
-            config.domain,
-            config.active,
-            config.binding_epoch,
-            Arc::clone(&shared),
+            config,
             program,
-        )
-        .map_err(OstdSupervisorRuntimeBuildError::Backend)?;
-        let manager = SupervisorManager::new(
-            backend,
-            config.policy,
-            config.active,
-            config.binding_epoch,
-            Jiffies::elapsed().as_u64(),
-        )
-        .map_err(OstdSupervisorRuntimeBuildError::Manager)?;
-        Ok(Self { manager, shared })
+        }
     }
 
+    pub(crate) const fn config(&self) -> OstdSupervisorRuntimeConfig {
+        self.config
+    }
+
+    pub(crate) fn registry(&self) -> &Arc<SpinLock<EffectRegistry>> {
+        &self.registry
+    }
+
+    pub(crate) fn program(&self) -> &Arc<dyn OstdSupervisorServiceProgram<N>> {
+        &self.program
+    }
+
+    pub(crate) fn start(
+        self,
+    ) -> Result<OstdSupervisorRuntimeHandle<N>, Box<OstdSupervisorRuntimeStartFailure<N>>> {
+        match start_supervisor_runtime(&self) {
+            Ok(handle) => Ok(handle),
+            Err(error) => Err(Box::new(OstdSupervisorRuntimeStartFailure {
+                error,
+                authority: self,
+            })),
+        }
+    }
+}
+
+/// Atomic startup failure paired with the exact unconsumed authority.
+pub(crate) struct OstdSupervisorRuntimeStartFailure<const N: usize> {
+    error: OstdSupervisorRuntimeBuildError,
+    authority: OstdSupervisorActivationAuthority<N>,
+}
+
+impl<const N: usize> OstdSupervisorRuntimeStartFailure<N> {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        OstdSupervisorRuntimeBuildError,
+        OstdSupervisorActivationAuthority<N>,
+    ) {
+        (self.error, self.authority)
+    }
+}
+
+/// Exact state of the Nexus-owned manager task.
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
+pub(crate) enum OstdSupervisorWorkerPhase {
+    Installed,
+    Published,
+    Running,
+    ShutdownRequested,
+    Returned,
+    Failed,
+    Reaped,
+}
+
+/// Bounded worker terminal classification; detailed manager state remains in
+/// the runtime cell and is never reconstructed from this health projection.
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
+pub(crate) enum OstdSupervisorWorkerTerminal {
+    CooperativeShutdown,
+    RuntimeFailure,
+    MissingRuntime,
+    LifecycleViolation,
+}
+
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
+pub(crate) struct OstdSupervisorWorkerHealth {
+    pub(crate) phase: OstdSupervisorWorkerPhase,
+    pub(crate) terminal: Option<OstdSupervisorWorkerTerminal>,
+    pub(crate) completed_drives: u64,
+}
+
+struct OstdSupervisorWorkerShared<const N: usize> {
+    runtime: SpinLock<Option<OstdSupervisorRuntime<N>>>,
+    manager_health: SpinLock<Option<SupervisorHealth>>,
+    health: SpinLock<OstdSupervisorWorkerHealth>,
+    supervisor: Arc<OstdSupervisorShared<N>>,
+    shutdown_requested: AtomicBool,
+    drive_budget: u32,
+    timer_generation: u64,
+}
+
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
+enum OstdSupervisorWorkerInstallError {
+    AlreadyInstalled,
+}
+
+impl<const N: usize> OstdSupervisorWorkerShared<N> {
+    fn new(
+        supervisor: Arc<OstdSupervisorShared<N>>,
+        drive_budget: u32,
+        timer_generation: u64,
+    ) -> Self {
+        Self {
+            runtime: SpinLock::new(None),
+            manager_health: SpinLock::new(None),
+            health: SpinLock::new(OstdSupervisorWorkerHealth {
+                phase: OstdSupervisorWorkerPhase::Installed,
+                terminal: None,
+                completed_drives: 0,
+            }),
+            supervisor,
+            shutdown_requested: AtomicBool::new(false),
+            drive_budget,
+            timer_generation,
+        }
+    }
+
+    fn install_runtime(
+        &self,
+        runtime: OstdSupervisorRuntime<N>,
+    ) -> Result<(), OstdSupervisorWorkerInstallError> {
+        let mut installed = self.runtime.disable_irq().lock();
+        if installed.is_some() {
+            return Err(OstdSupervisorWorkerInstallError::AlreadyInstalled);
+        }
+        *self.manager_health.disable_irq().lock() = Some(runtime.health());
+        *installed = Some(runtime);
+        Ok(())
+    }
+
+    fn manager_health(&self) -> Option<SupervisorHealth> {
+        *self.manager_health.disable_irq().lock()
+    }
+
+    fn health(&self) -> OstdSupervisorWorkerHealth {
+        *self.health.disable_irq().lock()
+    }
+
+    fn mark_published(&self) -> Result<(), OstdSupervisorWorkerTerminal> {
+        let mut health = self.health.disable_irq().lock();
+        if health.phase != OstdSupervisorWorkerPhase::Installed {
+            return Err(OstdSupervisorWorkerTerminal::LifecycleViolation);
+        }
+        health.phase = OstdSupervisorWorkerPhase::Published;
+        Ok(())
+    }
+
+    fn request_shutdown(&self) {
+        self.shutdown_requested.store(true, Ordering::Release);
+        let mut health = self.health.disable_irq().lock();
+        if __cser_core::matches!(
+            health.phase,
+            OstdSupervisorWorkerPhase::Published | OstdSupervisorWorkerPhase::Running
+        ) {
+            health.phase = OstdSupervisorWorkerPhase::ShutdownRequested;
+        }
+    }
+
+    fn mark_running(&self) -> bool {
+        let mut health = self.health.disable_irq().lock();
+        match health.phase {
+            OstdSupervisorWorkerPhase::Published => {
+                health.phase = OstdSupervisorWorkerPhase::Running;
+                true
+            }
+            OstdSupervisorWorkerPhase::ShutdownRequested => true,
+            _ => {
+                health.phase = OstdSupervisorWorkerPhase::Failed;
+                health.terminal = Some(OstdSupervisorWorkerTerminal::LifecycleViolation);
+                false
+            }
+        }
+    }
+
+    fn record_drive(&self) -> bool {
+        let mut health = self.health.disable_irq().lock();
+        let Some(completed) = health.completed_drives.checked_add(1) else {
+            health.phase = OstdSupervisorWorkerPhase::Failed;
+            health.terminal = Some(OstdSupervisorWorkerTerminal::RuntimeFailure);
+            return false;
+        };
+        health.completed_drives = completed;
+        true
+    }
+
+    fn mark_returned(&self, terminal: OstdSupervisorWorkerTerminal) {
+        let mut health = self.health.disable_irq().lock();
+        health.phase = if terminal == OstdSupervisorWorkerTerminal::CooperativeShutdown {
+            OstdSupervisorWorkerPhase::Returned
+        } else {
+            OstdSupervisorWorkerPhase::Failed
+        };
+        health.terminal = Some(terminal);
+    }
+
+    fn drive_until_stop(
+        &self,
+        runtime: &mut OstdSupervisorRuntime<N>,
+    ) -> OstdSupervisorWorkerTerminal {
+        loop {
+            if self.shutdown_requested.load(Ordering::Acquire) {
+                return OstdSupervisorWorkerTerminal::CooperativeShutdown;
+            }
+            for _ in 0..self.drive_budget {
+                let result = runtime.drive_once();
+                *self.manager_health.disable_irq().lock() = Some(runtime.health());
+                match result {
+                    Ok(OstdSupervisorDriveProgress::Idle) => break,
+                    Ok(_) => {
+                        if !self.record_drive() {
+                            return OstdSupervisorWorkerTerminal::RuntimeFailure;
+                        }
+                    }
+                    Err(_) => return OstdSupervisorWorkerTerminal::RuntimeFailure,
+                }
+            }
+            // Even an idle worker yields: Jiffies and lifecycle ingress are
+            // external wake facts, not permission to spin in kernel context.
+            Task::yield_now();
+        }
+    }
+
+    fn disable_timer_or_lifecycle(
+        &self,
+        terminal: OstdSupervisorWorkerTerminal,
+    ) -> OstdSupervisorWorkerTerminal {
+        let timer = OstdSupervisorTimerIngress {
+            shared: Arc::clone(&self.supervisor),
+        };
+        if timer.disable(self.timer_generation).is_err() {
+            OstdSupervisorWorkerTerminal::LifecycleViolation
+        } else {
+            terminal
+        }
+    }
+
+    fn finish_without_runtime(&self, terminal: OstdSupervisorWorkerTerminal) {
+        let terminal = self.disable_timer_or_lifecycle(terminal);
+        self.mark_returned(terminal);
+    }
+
+    fn run(&self) {
+        if !self.mark_running() {
+            self.finish_without_runtime(OstdSupervisorWorkerTerminal::LifecycleViolation);
+            return;
+        }
+        // Take the single-owner manager out of the ingress cell. No worker
+        // SpinLock or IRQ guard spans manager.poll, Registry calls, or
+        // backend Task::run publication.
+        let Some(mut runtime) = self.runtime.disable_irq().lock().take() else {
+            self.finish_without_runtime(OstdSupervisorWorkerTerminal::MissingRuntime);
+            return;
+        };
+        let terminal = self.drive_until_stop(&mut runtime);
+        let terminal = self.disable_timer_or_lifecycle(terminal);
+        if self.install_runtime(runtime).is_err() {
+            self.mark_returned(OstdSupervisorWorkerTerminal::LifecycleViolation);
+            return;
+        }
+        self.mark_returned(terminal);
+    }
+}
+
+impl<const N: usize> ExactWorkerReapSink for OstdSupervisorWorkerShared<N> {
+    fn observe_exact_worker_reap(&self) {
+        let mut health = self.health.disable_irq().lock();
+        if !__cser_core::matches!(
+            health.phase,
+            OstdSupervisorWorkerPhase::Returned | OstdSupervisorWorkerPhase::Failed
+        ) {
+            health.terminal = Some(OstdSupervisorWorkerTerminal::LifecycleViolation);
+        }
+        health.phase = OstdSupervisorWorkerPhase::Reaped;
+    }
+}
+
+/// Live handles retain both task references and the manager authority cell.
+pub(crate) struct OstdSupervisorRuntimeHandle<const N: usize> {
+    _initial_task: Arc<Task>,
+    _worker_task: Arc<Task>,
+    shared: Arc<OstdSupervisorShared<N>>,
+    worker: Arc<OstdSupervisorWorkerShared<N>>,
+    timer_generation: u64,
+}
+
+impl<const N: usize> OstdSupervisorRuntimeHandle<N> {
+    pub(crate) fn manager_health(&self) -> Option<SupervisorHealth> {
+        self.worker.manager_health()
+    }
+
+    pub(crate) fn worker_health(&self) -> OstdSupervisorWorkerHealth {
+        self.worker.health()
+    }
+
+    pub(crate) fn request_worker_shutdown(&self) -> Result<(), OstdSupervisorTimerError> {
+        self.timer_ingress().disable(self.timer_generation)?;
+        self.worker.request_shutdown();
+        Ok(())
+    }
+
+    fn timer_ingress(&self) -> OstdSupervisorTimerIngress<N> {
+        OstdSupervisorTimerIngress {
+            shared: Arc::clone(&self.shared),
+        }
+    }
+}
+
+fn start_supervisor_runtime<const N: usize>(
+    authority: &OstdSupervisorActivationAuthority<N>,
+) -> Result<OstdSupervisorRuntimeHandle<N>, OstdSupervisorRuntimeBuildError> {
+    let config = authority.config;
+    let _permit = &authority.permit;
+    if N < MIN_EVENT_CAPACITY {
+        return Err(OstdSupervisorRuntimeBuildError::EventCapacityTooSmall);
+    }
+    if config.manager_drive_budget < MIN_MANAGER_DRIVE_BUDGET {
+        return Err(OstdSupervisorRuntimeBuildError::InvalidManagerDriveBudget);
+    }
+    if config.manager_task_id == 0 || config.manager_task_id == config.active.id() {
+        return Err(OstdSupervisorRuntimeBuildError::InvalidManagerTaskIdentity);
+    }
+    if config.timer_generation == 0 {
+        return Err(OstdSupervisorRuntimeBuildError::InvalidTimerGeneration);
+    }
+
+    let shared = Arc::new(OstdSupervisorShared::new());
+    let selector = ServiceTaskSelector::new(config.active, config.binding_epoch);
+    shared
+        .reserve_initial_active(selector)
+        .map_err(OstdSupervisorRuntimeBuildError::InitialSlot)?;
+
+    let weak_shared = Arc::downgrade(&shared);
+    let initial_program = Arc::clone(&authority.program);
+    let initial_exit = OstdSupervisorTaskExitBinding::new(&shared, selector);
+    let initial_data = TaskData::new_supervised(service_task(config.active), initial_exit, None);
+    let initial_task = match TaskOptions::new(move || {
+        let Some(shared) = weak_shared.upgrade() else {
+            return;
+        };
+        let context = OstdSupervisorServiceContext::initial(shared, selector);
+        let outcome = initial_program.run(&context);
+        context.report_return(outcome);
+    })
+    .data(initial_data)
+    .build()
+    {
+        Ok(task) => Arc::new(task),
+        Err(_) => {
+            shared.rollback_initial_active(selector);
+            return Err(OstdSupervisorRuntimeBuildError::InitialTaskBuild);
+        }
+    };
+    if let Err(error) = shared.install_initial_active_task(selector, Arc::clone(&initial_task)) {
+        shared.rollback_initial_active(selector);
+        return Err(OstdSupervisorRuntimeBuildError::InitialSlot(error));
+    }
+
+    let backend = OstdRegistrySupervisorBackend::new(
+        Arc::clone(&authority.registry),
+        config.scope,
+        config.domain,
+        config.active,
+        config.binding_epoch,
+        Arc::clone(&shared),
+        Arc::clone(&authority.program),
+    )
+    .map_err(OstdSupervisorRuntimeBuildError::Backend)?;
+    let manager = SupervisorManager::new(
+        backend,
+        config.policy,
+        config.active,
+        config.binding_epoch,
+        Jiffies::elapsed().as_u64(),
+    )
+    .map_err(OstdSupervisorRuntimeBuildError::Manager)?;
+    let runtime = OstdSupervisorRuntime {
+        manager,
+        shared: Arc::clone(&shared),
+    };
+    let worker = Arc::new(OstdSupervisorWorkerShared::new(
+        Arc::clone(&shared),
+        config.manager_drive_budget,
+        config.timer_generation,
+    ));
+    worker
+        .install_runtime(runtime)
+        .map_err(|_| OstdSupervisorRuntimeBuildError::WorkerRuntimeAlreadyInstalled)?;
+
+    let worker_entry = Arc::clone(&worker);
+    let worker_exit = OstdSupervisorWorkerExitBinding::new(&worker);
+    let worker_data = TaskData::new_supervisor_worker(config.manager_task_id, worker_exit);
+    let worker_task = TaskOptions::new(move || worker_entry.run())
+        .data(worker_data)
+        .build()
+        .map(Arc::new)
+        .map_err(|_| OstdSupervisorRuntimeBuildError::WorkerTaskBuild)?;
+
+    let initial_task = shared
+        .install_initial_active_for_publication(selector)
+        .map_err(OstdSupervisorRuntimeBuildError::InitialSlot)?;
+    let timer = OstdSupervisorTimerIngress {
+        shared: Arc::clone(&shared),
+    };
+    if let Err(error) = timer.install_on_current_cpu(config.timer_generation) {
+        shared.rollback_initial_active(selector);
+        return Err(OstdSupervisorRuntimeBuildError::Timer(error));
+    }
+    if let Err(error) = worker.mark_published() {
+        let _ = timer.disable(config.timer_generation);
+        shared.rollback_initial_active(selector);
+        return Err(OstdSupervisorRuntimeBuildError::WorkerLifecycle(error));
+    }
+    if let Err(error) = shared.publish_initial_active(selector) {
+        let _ = timer.disable(config.timer_generation);
+        shared.rollback_initial_active(selector);
+        return Err(OstdSupervisorRuntimeBuildError::InitialSlot(error));
+    }
+
+    // Both TaskData bindings, the runtime cell, the timer generation, and both
+    // health/slot projections are complete before either task is runnable.
+    worker_task.run();
+    initial_task.run();
+    Ok(OstdSupervisorRuntimeHandle {
+        _initial_task: initial_task,
+        _worker_task: worker_task,
+        shared,
+        worker,
+        timer_generation: config.timer_generation,
+    })
+}
+
+impl<const N: usize> OstdSupervisorRuntime<N> {
     pub(crate) fn timer_ingress(&self) -> OstdSupervisorTimerIngress<N> {
         OstdSupervisorTimerIngress {
             shared: Arc::clone(&self.shared),
@@ -1515,13 +2208,17 @@ mod tests {
     extern crate alloc as __cser_alloc;
     extern crate core as __cser_core;
 
+    use __cser_alloc::sync::Arc;
     use nexus_supervisor::{ExitReason, ServiceIdentity};
+    use ostd::user::ReturnReason;
 
     use super::{
         BoundedEventQueue, EventQueuePushError, OstdSupervisorActivationReport,
         OstdSupervisorBackendError, OstdSupervisorEvent, OstdSupervisorEventEnvelope,
-        OstdSupervisorRetentionReason, ReplacementSlot, ReplacementSlotPhase, SignalKind,
-        SignalState, activation_report, cohort_identity_from_effects, oldest_retained,
+        OstdSupervisorRetentionReason, OstdSupervisorServiceOutcome, OstdSupervisorShared,
+        OstdSupervisorSignalError, OstdSupervisorWorkerPhase, OstdSupervisorWorkerShared,
+        OstdSupervisorWorkerTerminal, ReplacementSlot, ReplacementSlotPhase, ServiceTaskSelector,
+        SignalKind, SignalState, activation_report, cohort_identity_from_effects, oldest_retained,
         permit_for_report, replacement_identity, request_activation,
     };
     use crate::effect_registry::EffectKey;
@@ -1531,18 +2228,20 @@ mod tests {
     }
 
     #[test]
-    fn activation_stays_closed_over_missing_isolated_fault_hook() {
+    fn generic_activation_permit_is_available_without_claiming_a_service_run() {
         let report = activation_report();
         __cser_core::assert!(report.registry_backend);
         __cser_core::assert!(report.construct_unpublished);
         __cser_core::assert!(report.task_return_boundary);
         __cser_core::assert!(report.exact_task_exit_hook);
         __cser_core::assert!(report.exact_task_reap_hook);
-        __cser_core::assert!(!report.isolated_task_fault_hook);
-        __cser_core::assert!(!report.initial_active_task_binding);
-        __cser_core::assert!(!report.nexus_owned_manager_worker);
-        __cser_core::assert!(!report.is_complete());
-        __cser_core::assert!(request_activation().is_err());
+        __cser_core::assert!(report.isolated_user_fault_boundary);
+        __cser_core::assert!(report.initial_active_task_binding);
+        __cser_core::assert!(report.nexus_owned_manager_worker);
+        __cser_core::assert!(report.worker_exact_reap_health);
+        __cser_core::assert!(report.generation_fenced_timer_ingress);
+        __cser_core::assert!(report.is_complete());
+        __cser_core::assert!(request_activation().is_ok());
     }
 
     #[test]
@@ -1557,9 +2256,11 @@ mod tests {
             task_return_boundary: true,
             exact_task_exit_hook: true,
             exact_task_reap_hook: true,
-            isolated_task_fault_hook: true,
+            isolated_user_fault_boundary: true,
             initial_active_task_binding: true,
             nexus_owned_manager_worker: true,
+            worker_exact_reap_health: true,
+            generation_fenced_timer_ingress: true,
         };
         __cser_core::assert!(permit_for_report(complete).is_ok());
 
@@ -1572,7 +2273,7 @@ mod tests {
         __cser_core::assert!(permit_for_report(missing_reap).is_err());
 
         let mut missing_fault = complete;
-        missing_fault.isolated_task_fault_hook = false;
+        missing_fault.isolated_user_fault_boundary = false;
         __cser_core::assert!(permit_for_report(missing_fault).is_err());
 
         let mut missing_initial_binding = complete;
@@ -1582,6 +2283,148 @@ mod tests {
         let mut missing_worker = complete;
         missing_worker.nexus_owned_manager_worker = false;
         __cser_core::assert!(permit_for_report(missing_worker).is_err());
+
+        let mut missing_worker_reap = complete;
+        missing_worker_reap.worker_exact_reap_health = false;
+        __cser_core::assert!(permit_for_report(missing_worker_reap).is_err());
+
+        let mut missing_timer_fence = complete;
+        missing_timer_fence.generation_fenced_timer_ingress = false;
+        __cser_core::assert!(permit_for_report(missing_timer_fence).is_err());
+    }
+
+    #[test]
+    fn user_mode_boundary_classifies_only_user_exception_as_fault() {
+        __cser_core::assert_eq!(
+            OstdSupervisorServiceOutcome::from_user_mode_return(ReturnReason::UserException, false,),
+            OstdSupervisorServiceOutcome::Fault
+        );
+        __cser_core::assert_eq!(
+            OstdSupervisorServiceOutcome::from_user_mode_return(ReturnReason::UserSyscall, false),
+            OstdSupervisorServiceOutcome::UnexpectedReturn
+        );
+        __cser_core::assert_eq!(
+            OstdSupervisorServiceOutcome::from_user_mode_return(ReturnReason::KernelEvent, true),
+            OstdSupervisorServiceOutcome::CooperativeStop
+        );
+    }
+
+    #[test]
+    fn initial_active_fault_is_published_only_by_exact_reap() {
+        let shared = OstdSupervisorShared::<4>::new();
+        let selector = ServiceTaskSelector::new(service(1), 7);
+        {
+            let mut slot = shared.replacement.lock();
+            slot.phase = ReplacementSlotPhase::Active;
+            slot.selector = Some(selector);
+        }
+        __cser_core::assert_eq!(
+            shared.record_pending_exit(selector.service, selector.binding_epoch, ExitReason::Fault),
+            Ok(())
+        );
+        __cser_core::assert_eq!(shared.pop_event(), None);
+        __cser_core::assert_eq!(
+            shared.observe_exact_reap_at(selector.service, selector.binding_epoch, 11),
+            Ok(())
+        );
+        __cser_core::assert_eq!(
+            shared.pop_event().map(|envelope| envelope.event),
+            Some(OstdSupervisorEvent::Exit {
+                service: selector.service,
+                binding_epoch: selector.binding_epoch,
+                reason: ExitReason::Fault,
+            })
+        );
+    }
+
+    #[test]
+    fn pre_ready_exit_and_reap_are_ordered_and_stale_selector_is_rejected() {
+        let shared = OstdSupervisorShared::<4>::new();
+        let selector = ServiceTaskSelector::new(service(2), 9);
+        {
+            let mut slot = shared.replacement.lock();
+            slot.phase = ReplacementSlotPhase::Published;
+            slot.selector = Some(selector);
+        }
+        __cser_core::assert_eq!(
+            shared.record_pending_exit(
+                selector.service,
+                selector.binding_epoch,
+                ExitReason::UnexpectedReturn,
+            ),
+            Ok(())
+        );
+        __cser_core::assert_eq!(
+            shared.observe_exact_reap_at(selector.service, selector.binding_epoch, 17),
+            Ok(())
+        );
+        __cser_core::assert!(__cser_core::matches!(
+            shared.pop_event().map(|envelope| envelope.event),
+            Some(OstdSupervisorEvent::Exit { .. })
+        ));
+        __cser_core::assert_eq!(
+            shared.pop_event().map(|envelope| envelope.event),
+            Some(OstdSupervisorEvent::Reaped {
+                service: selector.service,
+                binding_epoch: selector.binding_epoch,
+            })
+        );
+        __cser_core::assert_eq!(
+            shared.observe_exact_reap_at(service(3), selector.binding_epoch, 18),
+            Err(OstdSupervisorSignalError::StaleTaskContext)
+        );
+    }
+
+    #[test]
+    fn worker_shutdown_has_exact_return_then_reap_health() {
+        let worker =
+            OstdSupervisorWorkerShared::<4>::new(Arc::new(OstdSupervisorShared::new()), 2, 1);
+        __cser_core::assert_eq!(worker.mark_published(), Ok(()));
+        worker.request_shutdown();
+        __cser_core::assert!(worker.mark_running());
+        worker.mark_returned(OstdSupervisorWorkerTerminal::CooperativeShutdown);
+        __cser_core::assert_eq!(worker.health().phase, OstdSupervisorWorkerPhase::Returned);
+        super::ExactWorkerReapSink::observe_exact_worker_reap(&worker);
+        let health = worker.health();
+        __cser_core::assert_eq!(health.phase, OstdSupervisorWorkerPhase::Reaped);
+        __cser_core::assert_eq!(
+            health.terminal,
+            Some(OstdSupervisorWorkerTerminal::CooperativeShutdown)
+        );
+    }
+
+    #[test]
+    fn every_no_runtime_worker_terminal_disables_its_timer_generation() {
+        for publish in [false, true] {
+            let shared = Arc::new(OstdSupervisorShared::<4>::new());
+            shared
+                .timer_generation
+                .store(7, __cser_core::sync::atomic::Ordering::Release);
+            shared
+                .timer_enabled
+                .store(true, __cser_core::sync::atomic::Ordering::Release);
+            let worker = OstdSupervisorWorkerShared::new(Arc::clone(&shared), 1, 7);
+            if publish {
+                __cser_core::assert_eq!(worker.mark_published(), Ok(()));
+            }
+
+            worker.run();
+
+            __cser_core::assert!(
+                !shared
+                    .timer_enabled
+                    .load(__cser_core::sync::atomic::Ordering::Acquire)
+            );
+            __cser_core::assert_eq!(worker.health().phase, OstdSupervisorWorkerPhase::Failed);
+            __cser_core::assert_eq!(
+                worker.health().terminal,
+                Some(if publish {
+                    OstdSupervisorWorkerTerminal::MissingRuntime
+                } else {
+                    OstdSupervisorWorkerTerminal::LifecycleViolation
+                })
+            );
+        }
     }
 
     #[test]

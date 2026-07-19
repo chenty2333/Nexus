@@ -12,12 +12,11 @@ mod composition;
 mod effect;
 #[path = "cser/effect_registry.rs"]
 mod effect_registry;
-// This adapter is deliberately activation-gated until OSTD exposes isolated
-// service-fault containment and Nexus supplies initial-active binding plus a
-// live manager worker. The pinned patch does provide exact post-exit/reap
-// observation; keeping the full adapter compiled binds that hook, the real
-// Registry backend, unpublished task construction, and Jiffies deadline driver
-// without claiming supervisor completion.
+// The generic adapter now earns an activation permit: it binds an unpublished
+// initial service and Nexus-owned manager worker before publication, maps only
+// OSTD UserMode exceptions into typed service faults, and observes exact reap.
+// No filesystem path constructs it yet, and kernel faults remain fail-stop, so
+// permit availability is not runtime lifecycle evidence.
 #[allow(dead_code)]
 #[path = "cser/supervisor_runtime.rs"]
 mod supervisor_runtime;
@@ -108,6 +107,7 @@ pub struct TaskData {
     #[cfg(feature = "virtio-cser-facade")]
     pub(crate) cser_task: Option<TaskKey>,
     supervisor_exit: Option<supervisor_runtime::OstdSupervisorTaskExitBinding>,
+    supervisor_worker_exit: Option<supervisor_runtime::OstdSupervisorWorkerExitBinding>,
     dynamic_vm_space: Option<Arc<SpinLock<Arc<VmSpace>>>>,
 }
 
@@ -119,6 +119,7 @@ impl TaskData {
             #[cfg(feature = "virtio-cser-facade")]
             cser_task: None,
             supervisor_exit: None,
+            supervisor_worker_exit: None,
             dynamic_vm_space: None,
         }
     }
@@ -134,6 +135,7 @@ impl TaskData {
             vm_space,
             cser_task: Some(task),
             supervisor_exit: None,
+            supervisor_worker_exit: None,
             dynamic_vm_space: None,
         }
     }
@@ -151,6 +153,24 @@ impl TaskData {
             #[cfg(feature = "virtio-cser-facade")]
             cser_task: { Some(task) },
             supervisor_exit: Some(supervisor_exit),
+            supervisor_worker_exit: None,
+            dynamic_vm_space: None,
+        }
+    }
+
+    /// Installs the manager worker's exact reap sink before publication. The
+    /// worker is kernel infrastructure and never receives service authority.
+    pub(crate) fn new_supervisor_worker(
+        id: u64,
+        supervisor_worker_exit: supervisor_runtime::OstdSupervisorWorkerExitBinding,
+    ) -> Self {
+        Self {
+            id,
+            vm_space: None,
+            #[cfg(feature = "virtio-cser-facade")]
+            cser_task: None,
+            supervisor_exit: None,
+            supervisor_worker_exit: Some(supervisor_worker_exit),
             dynamic_vm_space: None,
         }
     }
@@ -164,6 +184,7 @@ impl TaskData {
             #[cfg(feature = "virtio-cser-facade")]
             cser_task: None,
             supervisor_exit: None,
+            supervisor_worker_exit: None,
             dynamic_vm_space: Some(vm_space),
         }
     }
