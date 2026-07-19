@@ -14,10 +14,10 @@ use super::{
     DeadlineReconciliationOutcome, DeadlineReconciliationReceipt, DeadlineRecoveryState,
     DeadlineSupervisorRetry, DelayedCommandDescriptor, DelayedCommandIntent, DelayedCommandReceipt,
     DelayedCommandRejectionReason, DelayedCommandRejectionReceipt, DelayedCommandTicket,
-    DeviceAdoption, DeviceApplyIntent, DeviceCohortIdentity, DeviceEnvelope, DeviceHardwareReceipt,
-    DeviceMaterializationPlan, DevicePreparationTicket, DeviceReservationCoordinates,
-    DeviceRollbackReceipt, DomainKey, EffectKey, EnqueuedServiceRequest, EnteredTaskLease,
-    FaultAccess, FaultDisposition, FaultObservation, FaultPhase, FaultSlotDescriptor,
+    DeviceAdoption, DeviceApplyIntent, DeviceCohortIdentity, DeviceEnvelope,
+    DeviceMaterializationPlan, DevicePreparationTicket, DeviceReservationCoordinates, DomainKey,
+    EffectKey, EnqueuedServiceRequest, EnteredTaskLease, FaultAccess, FaultDisposition,
+    FaultObservation, FaultPhase, FaultSlotDescriptor,
     InfrastructureClosureProgress, InfrastructureClosureReceipt, InfrastructureError,
     InfrastructureKind, InfrastructureLimits, InfrastructureState, LinearFailure,
     MaterializedDeviceTicket, ParentStamp, PortalHandle, PreparedDeviceTicket,
@@ -33,6 +33,7 @@ use super::{
     UnarmedServiceRequest, UnboundServiceRequest, ValidatedAbortProof, ValidatedCommitProof,
     ValidatedDeviceClosureProof, ValidatedServiceChildProof, VmAuthorityKey, WakeClaim,
     WorkloadContext, WorkloadRequestPresentation, WorkloadRootPresentation, bearer_state,
+    model_device_hardware_receipt, model_device_rollback_receipt,
 };
 
 const SCOPE: ScopeKey = ScopeKey::new(0x9100, 1);
@@ -108,14 +109,7 @@ fn compact_prepared_device_state(
     let prepared = state
         .acknowledge_device_prepared(
             intent,
-            DeviceHardwareReceipt {
-                owned_device: coordinates.owned_device,
-                device,
-                operation_digest: coordinates.operation_digest,
-                actor_slot: coordinates.actor_slot,
-                actor_generation: coordinates.actor_generation,
-                hardware_receipt_digest: registry_instance + 2,
-            },
+            model_device_hardware_receipt(coordinates, device, registry_instance + 2),
         )
         .unwrap();
     (state, workload, prepared, coordinates)
@@ -1322,15 +1316,7 @@ fn device_success_and_terminal_paths_advance_bearer_generation() {
     rolled_back
         .acknowledge_device_apply_rollback(
             intent,
-            DeviceRollbackReceipt {
-                owned_device: coordinates.owned_device,
-                queue: coordinates.queue,
-                device_generation: coordinates.device_generation,
-                operation_digest: coordinates.operation_digest,
-                actor_slot: coordinates.actor_slot,
-                actor_generation: coordinates.actor_generation,
-                rollback_receipt_digest: 0xda24,
-            },
+            model_device_rollback_receipt(coordinates, 0xda24),
         )
         .unwrap();
     let record = rolled_back
@@ -1369,8 +1355,15 @@ fn device_success_and_terminal_paths_advance_bearer_generation() {
     let (mut materialized, _, ticket, coordinates, device) =
         compact_materialized_device_state(0xda27);
     let materialized_generation = ticket.0.bearer_generation;
+    let closed_device = DeviceEnvelope::new(
+        device.device_session(),
+        device.queue(),
+        device.descriptor_token(),
+        device.device_generation() + 1,
+    )
+    .unwrap();
     materialized
-        .release_materialized_device(ticket, closure_proof(0xda27, device, Some(1)))
+        .release_materialized_device(ticket, closure_proof(0xda27, closed_device, Some(1)))
         .unwrap();
     let record = materialized
         .scope(SCOPE)

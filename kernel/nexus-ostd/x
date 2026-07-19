@@ -378,7 +378,7 @@ check_virtio_patch() {
         fi
 
         cp "$source" "$tmp/irq-uses-polling-mode.rs"
-        sed -i '\''0,/prepare_read_sector0_with_mode(root, CompletionMode::Interrupt)/s//prepare_read_sector0_with_mode(root, CompletionMode::Polling)/'\'' \
+        sed -i '\''0,/preflight_preparation_start(root, CompletionMode::Interrupt)/s//preflight_preparation_start(root, CompletionMode::Polling)/'\'' \
             "$tmp/irq-uses-polling-mode.rs"
         require_mutation "$source" "$tmp/irq-uses-polling-mode.rs" irq-uses-polling-mode
         if /repo/tools/virtio/assert-production-substrate.sh \
@@ -478,7 +478,7 @@ check_virtio_patch() {
         fi
 
         cp "$source" "$tmp/identity-only-hardware-intent.rs"
-        sed -i '\''0,/request: PreparedRequest,/s//identity: DeviceSessionIdentity,/'\'' \
+        sed -i '\''/pub struct PreparedCancelIntent {/,/^}/s/request: PreparedRequest,/identity: DeviceSessionIdentity,/'\'' \
             "$tmp/identity-only-hardware-intent.rs"
         require_mutation "$source" "$tmp/identity-only-hardware-intent.rs" identity-only-hardware-intent
         if /repo/tools/virtio/assert-production-substrate.sh \
@@ -548,7 +548,8 @@ check_virtio_patch() {
         fi
 
         cp "$source" "$tmp/reset-probe-spins.rs"
-        sed -i '\''/pub fn probe_ack_once(mut self, root: &mut Root) -> Result<ProductionResetAck, Self> {/a\        for _ in 0..POLL_LIMIT { core::hint::spin_loop(); }'\'' \
+        sed -i '\''/pub fn probe_ack_once(/,/^    }/ { /) -> Result<ProductionResetAck, ProductionResetRetryFailure> {/a\        for _ in 0..POLL_LIMIT { core::hint::spin_loop(); }
+        }'\'' \
             "$tmp/reset-probe-spins.rs"
         require_mutation "$source" "$tmp/reset-probe-spins.rs" reset-probe-spins
         if /repo/tools/virtio/assert-production-substrate.sh \
@@ -558,7 +559,7 @@ check_virtio_patch() {
         fi
 
         cp "$source" "$tmp/reset-probe-drops-owner.rs"
-        sed -i '\''0,/pub fn probe_ack_once(mut self, root: &mut Root) -> Result<ProductionResetAck, Self> {/s//pub fn probe_ack_once(mut self, root: \&mut Root) -> Option<ProductionResetAck> {/'\'' \
+        sed -i '\''/pub fn probe_ack_once(/,/^    }/s/) -> Result<ProductionResetAck, ProductionResetRetryFailure> {/) -> Option<ProductionResetAck> {/'\'' \
             "$tmp/reset-probe-drops-owner.rs"
         require_mutation "$source" "$tmp/reset-probe-drops-owner.rs" reset-probe-drops-owner
         if /repo/tools/virtio/assert-production-substrate.sh \

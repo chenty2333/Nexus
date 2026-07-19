@@ -82,8 +82,10 @@ fi
 negative_call='let namespace_isolation = assert_session_namespace_isolation();'
 negative_marker='println!("{}", namespace_isolation.into_marker());'
 raw_marker='IO Namespace foreign_bdf_rejected=true bidirectional=true portal_state_unchanged=true pre_pci_dma=true'
-discovery_call='let mut root = discover_and_own_bars();'
-for literal in "$negative_call" "$negative_marker" "$discovery_call"; do
+discovery_call='let mut root = match discover_and_own_bars() {'
+discovery_failure='Err(error) => {'
+discovery_failure_action='poweroff(ExitCode::Failure)'
+for literal in "$negative_call" "$negative_marker" "$discovery_call" "$discovery_failure" "$discovery_failure_action"; do
     if [[ $(grep -Fc "$literal" "$entry_file") -ne 1 ]]; then
         echo "Stage 7B I/O entrypoint must contain one exact namespace-negative step: $literal" >&2
         exit 1

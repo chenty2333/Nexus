@@ -157,8 +157,8 @@ reject_fixed "$precommit_close" 'claim_device_replay_reset_and_revoke'
 
 # Cancellation has an explicit prevalidated linear intent. The gate forbids a
 # stack-local forget/panic escape after the facade has changed hardware state.
+require_count "$prepared_impl" 'pub fn preflight_cancel(' 2
 for required in \
-    'pub fn preflight_cancel(' \
     'Result<PreparedCancelIntent, HardwareIntentFailure<PreparedRequest>>' \
     'Ok(PreparedCancelIntent { request: self })'; do
     require_at_least "$prepared_impl" "$required" 1

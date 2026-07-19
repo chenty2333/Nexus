@@ -127,8 +127,53 @@ grep -Fq 'active: Option<ActiveSession>,' <<<"$device_struct" \
     || fail 'production device does not serialize one active hardware lifecycle'
 device_constructor=$(rust_block '^    pub fn for_owned_device' "$production") \
     || fail 'cannot isolate ProductionDevice constructor'
-grep -Fq 'let device_function = root.claim_device_function();' <<<"$device_constructor" \
-    || fail 'production device can bypass the opaque Root singleton claim'
+for required in \
+    '-> Result<Self, ProductionDeviceClaimError>' \
+    'let owner_id = allocate_production_owner_id()?;' \
+    '.try_claim_device_function()' \
+    '.ok_or(ProductionDeviceClaimError::DeviceAlreadyClaimed)?;' \
+    'Ok(Self {' \
+    'owner_id,'; do
+    grep -Fq -- "$required" <<<"$device_constructor" \
+        || fail "typed production device claim lacks: $required"
+done
+if grep -Eq '(panic!|\.expect\(|\.unwrap\(|assert(_eq|_ne)?!)' \
+    <<<"$device_constructor"; then
+    fail 'supported production device constructor can panic on claim failure'
+fi
+owner_allocator=$(rust_block '^fn allocate_production_owner_id' "$production") \
+    || fail 'cannot isolate production owner allocator'
+for required in \
+    '-> Result<u64, ProductionDeviceClaimError>' \
+    'next.checked_add(1)' \
+    '.map_err(|_| ProductionDeviceClaimError::OwnerIdentityExhausted)'; do
+    grep -Fq -- "$required" <<<"$owner_allocator" \
+        || fail "typed production owner allocation lacks: $required"
+done
+if grep -Eq '(panic!|\.expect\(|\.unwrap\(|assert(_eq|_ne)?!)' \
+    <<<"$owner_allocator"; then
+    fail 'production owner namespace exhaustion can panic'
+fi
+claim_error=$(rust_block '^pub enum ProductionDeviceClaimError' "$production") \
+    || fail 'cannot isolate typed production device claim error'
+for variant in OwnerIdentityExhausted DeviceAlreadyClaimed; do
+    grep -Fq "$variant" <<<"$claim_error" \
+        || fail "production device claim error lacks $variant"
+done
+checked_root_claim=$(rust_block '^    pub[(]crate[)] fn try_claim_device_function' "$pci") \
+    || fail 'cannot isolate checked Root device claim'
+for required in \
+    'if self.portal_claimed {' \
+    'None' \
+    'self.portal_claimed = true;' \
+    'Some(self.device_function)'; do
+    grep -Fq "$required" <<<"$checked_root_claim" \
+        || fail "checked Root device claim lacks: $required"
+done
+if grep -Eq '(panic!|\.expect\(|\.unwrap\(|assert(_eq|_ne)?!)' \
+    <<<"$checked_root_claim"; then
+    fail 'checked Root device claim can panic on duplicate use'
+fi
 
 # The PCI route is descriptive; only Root's one-shot claim and linear
 # owner/epoch tokens authorize mask state transitions.
@@ -250,7 +295,7 @@ for required in \
 done
 for required in \
     'IntxOwnershipState::Unclaimed => return Err(IntxTransitionError::WrongState)' \
-    'let epoch = next_intx_epoch(current_epoch);' \
+    'let epoch = next_intx_epoch(current_epoch)?;' \
     'let observation = set_intx_mask(self, true);' \
     'if !observation.is_exact() {' \
     'self.intx_state = IntxOwnershipState::Poisoned {' \
@@ -277,7 +322,7 @@ for transition in "$unmask_intx" "$mask_intx"; do
 done
 grep -Fq 'IntxTransitionFailure<MaskedIntx>' <<<"$unmask_intx" \
     || fail 'failed unmask does not return the exact masked token'
-grep -Fq 'let epoch = next_intx_epoch(masked.epoch);' <<<"$unmask_intx" \
+grep -Fq 'let epoch = match next_intx_epoch(masked.epoch) {' <<<"$unmask_intx" \
     || fail 'unmask does not prevalidate its next owner epoch'
 for required in \
     'let (_, observed_before_unmask) =' \
@@ -299,11 +344,11 @@ grep -Fq 'set_intx_mask(self, false);' <<<"$unmask_intx" \
     || fail 'unmask does not change the PCI command through the canonical helper'
 grep -Fq 'IntxTransitionFailure<UnmaskedIntx>' <<<"$mask_intx" \
     || fail 'failed mask does not return the exact unmasked token'
-grep -Fq 'let epoch = next_intx_epoch(unmasked.epoch);' <<<"$mask_intx" \
+grep -Fq 'let epoch = match next_intx_epoch(unmasked.epoch) {' <<<"$mask_intx" \
     || fail 'mask does not prevalidate its next owner epoch'
 grep -Fq 'set_intx_mask(self, true);' <<<"$mask_intx" \
     || fail 'mask does not change the PCI command through the canonical helper'
-unmask_epoch_line=$(grep -nF 'let epoch = next_intx_epoch(masked.epoch);' \
+unmask_epoch_line=$(grep -nF 'let epoch = match next_intx_epoch(masked.epoch) {' \
     <<<"$unmask_intx" | cut -d: -f1)
 unmask_preread_line=$(grep -nF 'let (_, observed_before_unmask) =' \
     <<<"$unmask_intx" | cut -d: -f1)
@@ -313,7 +358,7 @@ unmask_precondition_line=$(grep -nF \
 unmask_recovery_line=$(grep -nF 'let recovery = set_intx_mask(self, true);' \
     <<<"$unmask_intx" | cut -d: -f1)
 unmask_write_line=$(grep -nF 'set_intx_mask(self, false);' <<<"$unmask_intx" | cut -d: -f1)
-mask_epoch_line=$(grep -nF 'let epoch = next_intx_epoch(unmasked.epoch);' \
+mask_epoch_line=$(grep -nF 'let epoch = match next_intx_epoch(unmasked.epoch) {' \
     <<<"$mask_intx" | cut -d: -f1)
 mask_write_line=$(grep -nF 'set_intx_mask(self, true);' <<<"$mask_intx" | cut -d: -f1)
 [[ -n $unmask_epoch_line && -n $unmask_preread_line \
@@ -404,25 +449,79 @@ for intent_spec in \
         || fail "$intent gained a descriptive or replayable constructor (count=$constructor_count)"
 done
 
+polling_preflight=$(rust_block '^    pub fn preflight_read_sector0<' "$production") \
+    || fail 'cannot isolate polling preparation preflight'
+irq_preflight=$(rust_block '^    pub fn preflight_read_sector0_irq<' "$production") \
+    || fail 'cannot isolate IRQ preparation preflight'
+preflight=$(rust_block '^    fn preflight_preparation_start<' "$production") \
+    || fail 'cannot isolate shared preparation preflight'
 polling_prepare=$(rust_block '^    pub fn prepare_read_sector0[(]' "$production") \
-    || fail 'cannot isolate polling preparation wrapper'
+    || fail 'cannot isolate legacy polling preparation wrapper'
 irq_prepare=$(rust_block '^    pub fn prepare_read_sector0_irq[(]' "$production") \
-    || fail 'cannot isolate IRQ preparation wrapper'
+    || fail 'cannot isolate legacy IRQ preparation wrapper'
+permit_struct=$(rust_block '^pub struct PreparationStartPermit<' "$production") \
+    || fail 'cannot isolate owner-bound preparation permit'
+permit_apply=$(rust_block \
+    '^    pub fn apply[(]self[)] -> Result<PreparedRequest, StartedPrepareReadFailure>' \
+    "$production") \
+    || fail 'cannot isolate preparation permit apply'
 prepare=$(rust_block '^    fn prepare_read_sector0_with_mode[(]' "$production") \
     || fail 'cannot isolate shared production preparation'
-grep -Fq 'self.prepare_read_sector0_with_mode(root, CompletionMode::Polling)' \
-    <<<"$polling_prepare" || fail 'polling wrapper bypasses shared preparation mode'
-grep -Fq 'self.prepare_read_sector0_with_mode(root, CompletionMode::Interrupt)' \
-    <<<"$irq_prepare" || fail 'IRQ wrapper bypasses shared preparation mode'
-for wrapper in "$polling_prepare" "$irq_prepare"; do
-    grep -Fq 'Result<PreparedRequest, PrepareReadError>' <<<"$wrapper" \
-        || fail 'production preparation wrapper is not a recoverable Result'
+grep -Fq 'self.preflight_preparation_start(root, CompletionMode::Polling)' \
+    <<<"$polling_preflight" || fail 'polling preflight bypasses shared validation'
+grep -Fq 'self.preflight_preparation_start(root, CompletionMode::Interrupt)' \
+    <<<"$irq_preflight" || fail 'IRQ preflight bypasses shared validation'
+for wrapper in "$polling_preflight" "$irq_preflight"; do
+    grep -Fq 'Result<PreparationStartPermit<' <<<"$wrapper" \
+        || fail 'preparation preflight does not return the linear start permit'
     if grep -Fq 'queue.prepare_add' <<<"$wrapper"; then
-        fail 'production preparation forked queue ownership outside the shared helper'
+        fail 'preflight forked queue ownership outside the started helper'
     fi
 done
-grep -Fq 'completion_mode: CompletionMode' <<<"$prepare" \
-    || fail 'shared preparation lacks an explicit completion mode'
+for required in \
+    "device: &'a mut ProductionDevice," \
+    "root: &'a mut Root," \
+    'start: PreparedStartCoordinates,' \
+    'gate: PreparationGate,'; do
+    grep -Fq "$required" <<<"$permit_struct" \
+        || fail "preparation permit lacks exact owner: $required"
+done
+permit_prefix=$(declaration_prefix '^pub struct PreparationStartPermit<' "$production") \
+    || fail 'cannot isolate preparation permit declaration prefix'
+if grep -Eq '#\[derive\([^]]*(Clone|Copy)' <<<"$permit_prefix" \
+    || has_manual_clone_or_copy PreparationStartPermit "$production"; then
+    fail 'preparation start permit became Clone or Copy'
+fi
+grep -Fq '.prepare_read_sector0_with_mode(self.root, self.start, self.gate)' \
+    <<<"$permit_apply" || fail 'start permit does not consume the exact preflight coordinates'
+grep -Fq 'preflight_read_sector0(root)' <<<"$polling_prepare" \
+    || fail 'legacy polling wrapper bypasses the owner-bound preflight'
+grep -Fq 'preflight_read_sector0_irq(root)' <<<"$irq_prepare" \
+    || fail 'legacy IRQ wrapper bypasses the owner-bound preflight'
+for wrapper in "$polling_prepare" "$irq_prepare"; do
+    grep -Fq '.apply()' <<<"$wrapper" \
+        || fail 'legacy preparation wrapper does not consume the start permit'
+    grep -Fq 'Result<PreparedRequest, PrepareReadError>' <<<"$wrapper" \
+        || fail 'legacy preparation wrapper is not a recoverable Result'
+done
+for required in \
+    'if self.indeterminate_preparation.is_some() {' \
+    'if self.active.is_some() {' \
+    'PreparationGate::acquire(self.owner_id)' \
+    'dma_preparation_is_quiescent(dma::preparation_observation())' \
+    'transport_preparation_is_quiescent(pci::transport_claim_observation())' \
+    'Ok(PreparationStartPermit {'; do
+    grep -Fq "$required" <<<"$preflight" \
+        || fail "shared preparation preflight lacks: $required"
+done
+if grep -Eq '(enable_device|begin_generation|begin_transport_claims|prepare_add|finish_init)' \
+    <<<"$preflight"; then
+    fail 'preparation preflight mutates hardware before Registry reservation/apply'
+fi
+grep -Fq 'start: PreparedStartCoordinates' <<<"$prepare" \
+    || fail 'started preparation lacks frozen start coordinates'
+grep -Fq '_gate: PreparationGate' <<<"$prepare" \
+    || fail 'started preparation does not retain the process-global RAII gate'
 grep -Fq 'queue.prepare_add(&inputs, &mut outputs)' <<<"$prepare" \
     || fail 'shared production preparation bypasses split VirtIO preparation'
 grep -Fq 'queue.set_dev_notify(completion_mode.device_notifications_enabled());' <<<"$prepare" \
@@ -431,19 +530,21 @@ grep -Fq 'descriptor_token: prepared.token(),' <<<"$prepare" \
     || fail 'prepared descriptor token is not frozen into identity'
 grep -Fq 'queue: ManuallyDrop::new(prepared),' <<<"$prepare" \
     || fail 'prepared queue is not transferred into the linear facade token'
-grep -Fq 'rollback_unexposed_preparation(' <<<"$prepare" \
-    || fail 'production validation failures bypass complete rollback'
+grep -Fq 'rollback_failed_preparation(' <<<"$prepare" \
+    || fail 'production validation failures bypass typed complete rollback'
 grep -Fq 'dma::try_arm_request_bounce(self.device_generation)' <<<"$prepare" \
     || fail 'request DMA allocation cannot return a rollback error'
-active_reject=$(grep -nF 'if self.active.is_some() {' <<<"$prepare" | cut -d: -f1)
-hardware_begin=$(grep -nF 'pci::enable_device_for_prepare(root, self.device_function);' \
+active_reject=$(grep -nF 'if self.active.is_some() {' <<<"$preflight" | cut -d: -f1)
+gate_acquire=$(grep -nF 'PreparationGate::acquire(self.owner_id)' <<<"$preflight" | cut -d: -f1)
+hardware_begin=$(grep -nF 'pci::enable_device_for_prepare_checked(root, self.device_function)' \
     <<<"$prepare" | cut -d: -f1)
-[[ -n $active_reject && -n $hardware_begin && $active_reject -lt $hardware_begin ]] \
-    || fail 'overlapping active session is not rejected before hardware mutation'
+[[ -n $active_reject && -n $gate_acquire && -n $hardware_begin \
+    && $active_reject -lt $gate_acquire ]] \
+    || fail 'overlap rejection or gate acquisition is not pre-hardware and ordered'
 prepared_line=$(grep -nF 'let prepared = match unsafe { queue.prepare_add' <<<"$prepare" | cut -d: -f1)
 exposed_line=$(grep -nF 'dma::mark_queue_exposed(self.device_generation);' <<<"$prepare" | cut -d: -f1)
 finish_line=$(grep -nF 'transport.finish_init();' <<<"$prepare" | cut -d: -f1)
-sequence_line=$(grep -nF 'self.next_session_sequence = next_sequence;' <<<"$prepare" | cut -d: -f1)
+sequence_line=$(grep -nF 'self.next_session_sequence = start.next_session_sequence;' <<<"$prepare" | cut -d: -f1)
 [[ -n $prepared_line && -n $exposed_line && -n $finish_line && -n $sequence_line \
     && $prepared_line -lt $exposed_line && $exposed_line -lt $finish_line \
     && $finish_line -lt $sequence_line ]] \
@@ -456,11 +557,14 @@ rollback=$(rust_block '^fn rollback_unexposed_preparation' "$production") \
     || fail 'cannot isolate unexposed preparation rollback'
 for rollback_step in \
     'transport.set_status(DeviceStatus::empty());' \
-    'pci::disable_bus_master(root, device_function);' \
+    'let bus_master_certain = pci::disable_bus_master_checked(root, device_function).is_ok();' \
+    'forget(queue);' \
+    'forget(transport);' \
+    'forget(buffers);' \
     'drop(queue);' \
     'drop(transport);' \
-    'pci::release_transport_claims()' \
-    'pci::restore_device_command(root, device_function, original_command);' \
+    'pci::release_unexposed_transport_claims_checked()' \
+    'pci::restore_device_command_checked(root, device_function, original_command);' \
     'dma::abort_unexposed_generation(generation);'; do
     grep -Fq "$rollback_step" <<<"$rollback" \
         || fail "preparation rollback omits: $rollback_step"
@@ -468,15 +572,31 @@ done
 
 preflight=$(rust_block '^    pub fn preflight_publish' "$production") \
     || fail 'cannot isolate publication preflight'
-grep -Fq 'expected: DeviceSessionIdentity' <<<"$preflight" \
-    || fail 'publication preflight cannot validate registry coordinates'
-grep -Fq 'self.identity != expected' <<<"$preflight" \
-    || fail 'publication preflight does not reject a foreign identity'
-grep -Fq 'self.queue.token() != self.identity.descriptor_token' <<<"$preflight" \
-    || fail 'publication preflight does not bind the queue token'
+for required in \
+    'owner: ReceiptedPreparedRequest,' \
+    'expected: DeviceSessionIdentity,' \
+    'Result<PreparedPublishIntent, PreparationPublishFailure>' \
+    'if owner.request.identity != expected {' \
+    'let Some(active) = self.active else {' \
+    'prepare_success_receipt(' \
+    'dma::preparation_observation(),' \
+    'pci::transport_claim_observation(),' \
+    'if expected_receipt != owner.receipt {' \
+    'Ok(PreparedPublishIntent { owner })'; do
+    grep -Fq "$required" <<<"$preflight" \
+        || fail "publication preflight lacks: $required"
+done
 if grep -Eq '(ManuallyDrop::take|forget\(|\.take\(\)|self\.[[:alnum:]_]+[[:space:]]*=)' <<<"$preflight"; then
     fail 'failed publication preflight can mutate or release an owner'
 fi
+publish_intent=$(rust_block '^pub struct PreparedPublishIntent [{]' "$production") \
+    || fail 'cannot isolate publication intent'
+grep -Fq 'owner: ReceiptedPreparedRequest,' <<<"$publish_intent" \
+    || fail 'publication intent does not retain the exact receipted owner'
+publish_apply=$(rust_impl_method PreparedPublishIntent apply "$production") \
+    || fail 'cannot isolate publication intent apply'
+grep -Fq 'self.owner.request.publish_prepared_unchecked()' <<<"$publish_apply" \
+    || fail 'publication intent does not exclusively consume the private Release'
 
 cancel_preflight=$(rust_block '^    pub fn preflight_cancel' "$production") \
     || fail 'cannot isolate prepared-cancel intent preflight'
@@ -681,8 +801,11 @@ for intent_apply in "$cancel_intent_impl" "$published_intent_impl"; do
     fi
 done
 
-publish=$(rust_block '^    pub fn publish_prepared' "$production") \
+publish=$(rust_block '^    fn publish_prepared_unchecked' "$production") \
     || fail 'cannot isolate split publication'
+if grep -Eq '^[[:space:]]+pub fn publish_prepared_unchecked' <<<"$production_impl"; then
+    fail 'private Release helper became directly callable by an adapter'
+fi
 grep -Fq 'let (queue, _token) = prepared.publish_prepared();' <<<"$publish" \
     || fail 'facade publication bypasses the canonical split Release'
 after_release=$(awk '
@@ -855,15 +978,15 @@ reset_tombstone_impl=$(rust_block '^impl ProductionResetTombstone [{]' "$product
 reset_probe=$(rust_block '^    pub fn probe_ack_once' "$production") \
     || fail 'cannot isolate one-step reset acknowledgement probe'
 for required in \
-    'pub fn probe_ack_once(mut self, root: &mut Root) -> Result<ProductionResetAck, Self>' \
+    'Result<ProductionResetAck, ProductionResetRetryFailure>' \
     'if self.inject_pending_once {' \
     'self.inject_pending_once = false;' \
     'if !self.reset_status_acknowledged() {' \
-    'Ok(self.finalize_acknowledged_reset(root))'; do
+    'self.finalize_acknowledged_reset(root)'; do
     grep -Fq "$required" <<<"$reset_probe" \
         || fail "one-step reset acknowledgement lacks: $required"
 done
-probe_owner_returns=$(grep -F -c 'return Err(self);' <<<"$reset_probe" || true)
+probe_owner_returns=$(grep -F -c 'return Err(ProductionResetRetryFailure {' <<<"$reset_probe" || true)
 [[ $probe_owner_returns == 2 ]] \
     || fail 'one-step reset acknowledgement does not return its tombstone on every pending path'
 probe_status_calls=$(grep -F -c 'self.reset_status_acknowledged()' <<<"$reset_probe" || true)
@@ -877,14 +1000,15 @@ fi
 reset_retry=$(rust_block '^    pub fn retry_ack' "$production") \
     || fail 'cannot isolate bounded reset acknowledgement retry'
 for required in \
-    'pub fn retry_ack(mut self, root: &mut Root) -> Result<ProductionResetAck, Self>' \
+    'Result<ProductionResetAck, ProductionResetRetryFailure>' \
     'if self.inject_pending_once {' \
     'self.inject_pending_once = false;' \
     'for _ in 0..POLL_LIMIT {' \
     'if self.reset_status_acknowledged() {' \
-    'return Ok(self.finalize_acknowledged_reset(root));' \
+    'return self.finalize_acknowledged_reset(root);' \
     'spin_loop();' \
-    'Err(self)'; do
+    'Err(ProductionResetRetryFailure {' \
+    'tombstone: self,'; do
     grep -Fq "$required" <<<"$reset_retry" \
         || fail "bounded reset acknowledgement behavior lacks: $required"
 done
@@ -913,8 +1037,10 @@ fi
 reset_finalize=$(rust_block '^    fn finalize_acknowledged_reset' "$production") \
     || fail 'cannot isolate unique reset acknowledgement finalization'
 for required in \
-    '-> ProductionResetAck' \
-    'pci::disable_bus_master(root, self.session.device_function);' \
+    '-> Result<ProductionResetAck, ProductionResetRetryFailure>' \
+    'if let Err(error) = pci::disable_bus_master_checked(root, self.session.device_function) {' \
+    'return Err(ProductionResetRetryFailure {' \
+    'tombstone: self,' \
     '.ack_interrupt();' \
     'let generation = self.session.identity.device_generation;' \
     'dma::acknowledge_device_reset(generation)' \
@@ -925,16 +1051,16 @@ for required in \
     'drop(session.transport.take().expect("retained transport"));' \
     'pci::release_transport_claims()' \
     'assert_eq!(dma::retained_pages(generation), 3);' \
-    'ProductionResetAck {'; do
+    'Ok(ProductionResetAck {'; do
     grep -Fq -- "$required" <<<"$reset_finalize" \
         || fail "reset acknowledgement finalization lacks: $required"
 done
-if grep -Eq '(Result<|for [^ ]+ in |while |loop |spin_loop|get_status)' \
+if grep -Eq '(for [^ ]+ in |while |loop |spin_loop|get_status)' \
     <<<"$reset_finalize"; then
-    fail 'ready reset finalization regained polling or a fallible result'
+    fail 'ready reset finalization regained polling'
 fi
 for unique_step in \
-    'pci::disable_bus_master(root, self.session.device_function);' \
+    'pci::disable_bus_master_checked(root, self.session.device_function)' \
     '.ack_interrupt();' \
     'dma::acknowledge_device_reset(generation)' \
     'abandon_queue_after_reset(queue)' \
@@ -949,10 +1075,16 @@ generation_preflight=$(rust_block '^    pub fn prepare_generation_advance' "$pro
     || fail 'cannot isolate generation prevalidation'
 grep -Fq 'Result<PreparedGenerationAdvance' <<<"$generation_preflight" \
     || fail 'generation advance has no failure-atomic prevalidation result'
-for rejection in NoActiveSession WrongIdentity AlreadyApplied GenerationOverflow; do
+for rejection in NoActiveSession WrongIdentity WrongAttempt AlreadyApplied; do
     grep -Fq "ResetGenerationError::$rejection" <<<"$generation_preflight" \
         || fail "generation prevalidation lacks $rejection rejection"
 done
+grep -Fq 'next_device_generation(self.device_generation)?' <<<"$generation_preflight" \
+    || fail 'generation prevalidation bypasses the overflow-checked successor helper'
+generation_successor=$(rust_block '^const fn next_device_generation' "$production") \
+    || fail 'cannot isolate generation successor helper'
+grep -Fq 'Err(ResetGenerationError::GenerationOverflow)' <<<"$generation_successor" \
+    || fail 'generation successor lacks typed overflow rejection'
 
 generation_apply=$(rust_block '^    pub fn apply[(]self[)] -> u64' "$production") \
     || fail 'cannot isolate infallible generation apply'
@@ -1002,11 +1134,15 @@ for export in \
     PreparedRequestResetIntent \
     InterruptCause \
     InterruptCompletionProgress InterruptNotReadyReason InterruptReceipt \
-    NotificationDisposition PendingCompletion PrepareReadError \
-    PreparedGenerationAdvance PreparedQuiescenceApply PublishIdentityError QuiescenceApplyError \
+    NotificationDisposition PendingCompletion PreparationAttemptIdentity \
+    PreparationEvidenceError PreparationEvidenceFailure PreparationFailureEvidence \
+    PreparationIndeterminate PreparationPublishFailure PreparationReceipt \
+    PreparationRollbackError PreparationRollbackKind PreparationRollbackReceipt \
+    PreparationStartPermit PrepareReadError PrepareReadFailure PreparedGenerationAdvance \
+    PreparedPublishIntent PreparedQuiescenceApply QuiescenceApplyError ReceiptedPreparedRequest \
     ResetGenerationError IntxRoute IntxTransitionError IntxTransitionFailure \
-    MaskedIntx UnmaskedIntx; do
+    StartedPreparationFailureEvidence StartedPrepareReadFailure MaskedIntx UnmaskedIntx; do
     grep -Fq "$export" "$lib" || fail "public facade omits $export"
 done
 
-echo 'production VirtIO substrate: PASS authority=registry-external identity=descriptive+reconstructible physical_owner=one-bdf+one-active-session intx=descriptive-route+linear-owner-epoch+masked-unmasked preparation=polling+irq+shared-result+full-unexposed-rollback+sequence-atomic linear_owner=non-clone+fail-closed preflight=failure-atomic publication=infallible+post-release-moves-only hardware_intent=real-owner+non-clone+failure-returns-owner+infallible-reset+completion-state-pop-aware notification=kick-or-suppressed+replay-safe completion=polling+irq+one-step-actor+one-validator+exact-used-length+pending-or-failed-resettable+pop-state reset_ack=one-step-actor+bounded-retry+unique-finalize cancel=exact-buffers generation=prevalidate+infallible-apply quiescence=prevalidate+infallible-apply legacy_portal=retained'
+echo 'production VirtIO substrate: PASS authority=registry-external identity=descriptive+reconstructible physical_owner=one-bdf+one-active-session intx=descriptive-route+linear-owner-epoch+masked-unmasked preparation=owner-bound-preflight+polling+irq+typed-rollback-or-indeterminate+sequence-atomic receipt=opaque+owner-coupled linear_owner=non-clone+fail-closed preflight=failure-atomic publication=receipt-revalidated+intent-only+infallible+post-release-moves-only hardware_intent=real-owner+non-clone+failure-returns-owner+infallible-reset+completion-state-pop-aware notification=kick-or-suppressed+replay-safe completion=polling+irq+one-step-actor+one-validator+exact-used-length+pending-or-failed-resettable+pop-state reset_ack=one-step-actor+bounded-retry+unique-finalize cancel=exact-buffers generation=prevalidate+infallible-apply quiescence=prevalidate+infallible-apply legacy_portal=retained'

@@ -86,16 +86,19 @@ use crate::effect_registry::runtime_causal::{
 use crate::effect_registry::{
     DeviceBatchEnrollmentReceipt, DeviceClosureReceipt, DeviceClosureResult, DeviceCohortParent,
     DeviceDerivedCohortEntry, DeviceEnvelope, DeviceIotlbTicket, DeviceIotlbTombstone,
-    DeviceResetReceipt, DeviceResetTicket, DeviceResetTombstone, DomainRecoverySnapshot, EffectKey,
-    EffectPhase, RevokeSelection,
+    DeviceReservationCoordinates, DeviceResetReceipt, DeviceResetTicket, DeviceResetTombstone,
+    DomainRecoverySnapshot, EffectKey, EffectPhase, MaterializedDeviceTicket, RevokeSelection,
 };
 #[cfg(feature = "virtio-cser-facade")]
 use nexus_ostd_virtio::{
     CompletedRequest, CompletionProbeProgress, DeviceSessionIdentity, FailedCompletion, OwnerKind,
-    PreparedCancelIntent, PreparedPublishedResetIntent, PreparedRequest,
-    PreparedRequestResetIntent, ProductionClosureProgress, ProductionClosureReceipt,
-    ProductionDevice, ProductionIotlbTombstone, ProductionResetAck, ProductionResetTombstone,
-    PublishedRequest, Root, UnregisteredPreparedCancellation, discover_and_own_bars, owner_address,
+    PciDiscoveryError, PreparationIndeterminate, PreparationRollbackReceipt, PreparedCancelIntent,
+    PreparedPublishedResetIntent, PreparedRequest, PreparedRequestResetIntent,
+    ProductionClosureProgress, ProductionClosureReceipt, ProductionDevice,
+    ProductionDeviceClaimError, ProductionIotlbTombstone, ProductionResetAck,
+    ProductionResetRetryError, ProductionResetTombstone, PublishedRequest,
+    ReceiptedPreparedRequest, Root, StartedPreparationFailureEvidence,
+    UnregisteredPreparedCancellation, discover_and_own_bars, owner_address,
 };
 
 #[cfg(all(
@@ -148,6 +151,8 @@ const DMA_QUEUE_OWNER_A_NAMESPACE: u32 = 0x7310;
 const DMA_QUEUE_OWNER_B_NAMESPACE: u32 = 0x7311;
 #[cfg(feature = "virtio-cser-facade")]
 const DMA_REQUEST_OWNER_NAMESPACE: u32 = 0x7312;
+#[cfg(feature = "virtio-cser-facade")]
+const OWNED_BLOCK_DEVICE_NAMESPACE: u32 = 0x7313;
 
 const EXECUTABLE_PATH: &[u8] = b"/bin/linux-runtime-fs-smoke";
 const EXECUTABLE_NAME: &[u8] = b"/bin/linux-runtime-fs-smoke\0";
@@ -319,6 +324,121 @@ struct FsClosureWork {
     completion_label: &'static str,
 }
 
+/// Verified mirror of the Nexus-owned queue/DMA adapter slot.
+///
+/// Linear hardware and Registry bearers remain in `FsDeviceFlight` and
+/// `materialized_authority`; this phase is checked on every transition so the
+/// service lifecycle cannot skip reserve, acknowledgement, closure, or drain.
+#[cfg(feature = "virtio-cser-facade")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FsDeviceAdapterPhase {
+    Vacant,
+    Reserved,
+    Applying,
+    PreparedPendingAck,
+    Prepared,
+    MaterializedUnpublished,
+    Published,
+    Closing,
+    ClosureInstalledDrainPending,
+    Released,
+    IndeterminateRetained,
+}
+
+#[cfg(feature = "virtio-cser-facade")]
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FsDeviceAdapterTransitionError {
+    PhaseMismatch {
+        expected: FsDeviceAdapterPhase,
+        observed: FsDeviceAdapterPhase,
+        requested: FsDeviceAdapterPhase,
+    },
+    InvalidClosingSource {
+        observed: FsDeviceAdapterPhase,
+    },
+}
+
+#[cfg(feature = "virtio-cser-facade")]
+#[allow(dead_code)]
+enum MaterializedAuthoritySlot {
+    Vacant,
+    Active(MaterializedDeviceTicket),
+    RetainedConflict {
+        active: MaterializedDeviceTicket,
+        conflicting: MaterializedDeviceTicket,
+    },
+}
+
+#[cfg(feature = "virtio-cser-facade")]
+enum MaterializedAuthorityInstallError {
+    RetainedConflict,
+    Saturated(MaterializedDeviceTicket),
+}
+
+#[cfg(feature = "virtio-cser-facade")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MaterializedAuthorityTakeError {
+    Missing,
+    RetainedConflict,
+}
+
+#[cfg(feature = "virtio-cser-facade")]
+impl MaterializedAuthoritySlot {
+    const fn vacant() -> Self {
+        Self::Vacant
+    }
+
+    fn install(
+        &mut self,
+        authority: MaterializedDeviceTicket,
+    ) -> Result<(), MaterializedAuthorityInstallError> {
+        match core::mem::replace(self, Self::Vacant) {
+            Self::Vacant => {
+                *self = Self::Active(authority);
+                Ok(())
+            }
+            Self::Active(active) => {
+                *self = Self::RetainedConflict {
+                    active,
+                    conflicting: authority,
+                };
+                Err(MaterializedAuthorityInstallError::RetainedConflict)
+            }
+            retained @ Self::RetainedConflict { .. } => {
+                *self = retained;
+                Err(MaterializedAuthorityInstallError::Saturated(authority))
+            }
+        }
+    }
+
+    fn take(&mut self) -> Result<MaterializedDeviceTicket, MaterializedAuthorityTakeError> {
+        match core::mem::replace(self, Self::Vacant) {
+            Self::Active(authority) => Ok(authority),
+            Self::Vacant => Err(MaterializedAuthorityTakeError::Missing),
+            retained @ Self::RetainedConflict { .. } => {
+                *self = retained;
+                Err(MaterializedAuthorityTakeError::RetainedConflict)
+            }
+        }
+    }
+
+    fn is_vacant(&self) -> bool {
+        matches!(self, Self::Vacant)
+    }
+}
+
+#[cfg(feature = "virtio-cser-facade")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FsRuntimeCompletionError {
+    FlightNotComplete,
+    AdapterNotReleased,
+    MaterializedAuthorityRetained,
+    CausalSessionLive,
+    ScopeUnavailable,
+    ScopeNotQuiescent,
+}
+
 #[cfg(feature = "virtio-cser-facade")]
 enum FsCloseSemantic {
     Published(PublishedSemantic),
@@ -371,14 +491,94 @@ enum FsRetainedHardware {
         root: Root,
         device: ProductionDevice,
     },
+    IndeterminatePreparation {
+        root: Root,
+        device: ProductionDevice,
+        intent: Option<crate::effect_registry::DeviceApplyIntent>,
+        observation: PreparationIndeterminate,
+    },
+    ApplyingRollback {
+        root: Root,
+        device: ProductionDevice,
+        intent: crate::effect_registry::DeviceApplyIntent,
+        receipt: PreparationRollbackReceipt,
+    },
+    UnregisteredApplyingReset {
+        root: Root,
+        device: ProductionDevice,
+        intent: crate::effect_registry::DeviceApplyIntent,
+        reset: ProductionResetTombstone,
+        cancellation: UnregisteredPreparedCancellation,
+    },
+    UnregisteredApplyingClosure {
+        root: Root,
+        device: ProductionDevice,
+        intent: crate::effect_registry::DeviceApplyIntent,
+        closure: ProductionClosureReceipt,
+        cancellation: UnregisteredPreparedCancellation,
+    },
+    UnregisteredApplyingIotlb {
+        root: Root,
+        device: ProductionDevice,
+        intent: crate::effect_registry::DeviceApplyIntent,
+        hardware: ProductionIotlbTombstone,
+        cancellation: UnregisteredPreparedCancellation,
+    },
+    UnregisteredApplyingResetAck {
+        root: Root,
+        device: ProductionDevice,
+        intent: crate::effect_registry::DeviceApplyIntent,
+        reset: ProductionResetAck,
+        cancellation: UnregisteredPreparedCancellation,
+    },
     Ready {
         root: Root,
         device: ProductionDevice,
     },
+    Reserved {
+        root: Root,
+        device: ProductionDevice,
+        ticket: crate::effect_registry::DevicePreparationTicket,
+    },
+    ApplyingNotStarted {
+        root: Root,
+        device: ProductionDevice,
+        intent: crate::effect_registry::DeviceApplyIntent,
+    },
     Prepared {
         root: Root,
         device: ProductionDevice,
+        request: ReceiptedPreparedRequest,
+        preparation: crate::effect_registry::PreparedDeviceTicket,
+        prepared_identity: crate::effect_registry::PreparedDeviceIdentity,
+    },
+    MaterializedUnpublished {
+        root: Root,
+        device: ProductionDevice,
+        request: ReceiptedPreparedRequest,
+    },
+    MaterializedAuthorityOverflow {
+        root: Root,
+        device: ProductionDevice,
+        request: ReceiptedPreparedRequest,
+        authority: MaterializedDeviceTicket,
+    },
+    ApplyingPrepared {
+        root: Root,
+        device: ProductionDevice,
+        intent: crate::effect_registry::DeviceApplyIntent,
         request: PreparedRequest,
+    },
+    PreparedPendingAck {
+        root: Root,
+        device: ProductionDevice,
+        intent: crate::effect_registry::DeviceApplyIntent,
+        request: ReceiptedPreparedRequest,
+    },
+    PublishIntent {
+        root: Root,
+        device: ProductionDevice,
+        intent: nexus_ostd_virtio::PreparedPublishIntent,
     },
     PreparedCancel {
         root: Root,
@@ -399,6 +599,16 @@ enum FsRetainedHardware {
         root: Root,
         device: ProductionDevice,
         intent: PreparedRequestResetIntent,
+    },
+    RegistryResetWithoutHardware {
+        root: Root,
+        device: ProductionDevice,
+        ticket: DeviceResetTicket,
+    },
+    RegistryIotlbWithoutHardware {
+        root: Root,
+        device: ProductionDevice,
+        ticket: DeviceIotlbTicket,
     },
     Completed {
         root: Root,
@@ -430,6 +640,21 @@ enum FsRetainedHardware {
         device: ProductionDevice,
         closure: ProductionClosureReceipt,
     },
+    ClosurePendingMaterialized {
+        root: Root,
+        device: ProductionDevice,
+        hardware: ProductionClosureReceipt,
+        registry: DeviceClosureReceipt,
+        work: FsClosureWork,
+    },
+    ClosureAuthorityOverflow {
+        root: Root,
+        device: ProductionDevice,
+        hardware: ProductionClosureReceipt,
+        registry: DeviceClosureReceipt,
+        work: FsClosureWork,
+        authority: MaterializedDeviceTicket,
+    },
     UnregisteredReset {
         root: Root,
         device: ProductionDevice,
@@ -445,19 +670,53 @@ enum FsDeviceFlight {
         root: Root,
         device: ProductionDevice,
     },
+    Reserved {
+        cookie: NonZeroU64,
+        root: Root,
+        device: ProductionDevice,
+        ticket: crate::effect_registry::DevicePreparationTicket,
+        effects: [EffectKey; 2],
+    },
     Captured {
         cookie: NonZeroU64,
         root: Root,
         device: ProductionDevice,
         syscall: RegisteredEffect,
     },
+    PreparationApplying {
+        cookie: NonZeroU64,
+        root: Root,
+        device: ProductionDevice,
+        intent: crate::effect_registry::DeviceApplyIntent,
+        request: PreparedRequest,
+        effects: [EffectKey; 2],
+    },
+    PreparedPendingAck {
+        cookie: NonZeroU64,
+        root: Root,
+        device: ProductionDevice,
+        intent: crate::effect_registry::DeviceApplyIntent,
+        request: ReceiptedPreparedRequest,
+        effects: [EffectKey; 2],
+    },
     Prepared {
         cookie: NonZeroU64,
         root: Root,
         device: ProductionDevice,
-        request: PreparedRequest,
+        request: ReceiptedPreparedRequest,
+        preparation: crate::effect_registry::PreparedDeviceTicket,
+        prepared_identity: crate::effect_registry::PreparedDeviceIdentity,
         effects: [Option<EffectKey>; 6],
         envelope: Option<DeviceEnvelope>,
+        enrollment: Option<DeviceBatchEnrollmentReceipt>,
+    },
+    MaterializedUnpublished {
+        cookie: NonZeroU64,
+        root: Root,
+        device: ProductionDevice,
+        request: ReceiptedPreparedRequest,
+        effects: [EffectKey; 6],
+        envelope: DeviceEnvelope,
         enrollment: Option<DeviceBatchEnrollmentReceipt>,
     },
     /// A prepared descriptor which was moved into its one cancellation intent.
@@ -478,7 +737,7 @@ enum FsDeviceFlight {
         cookie: NonZeroU64,
         root: Root,
         device: ProductionDevice,
-        request: PreparedRequest,
+        request: ReceiptedPreparedRequest,
         effects: [EffectKey; 6],
         envelope: DeviceEnvelope,
         enrollment: DeviceBatchEnrollmentReceipt,
@@ -694,6 +953,15 @@ impl FsCausalAdapterSlot {
         Ok(identity)
     }
 
+    fn active_session(&self) -> Result<&CausalWorkloadSession, FsCausalAdapterError> {
+        match &self.state {
+            FsCausalAdapterState::Active(session) => Ok(session),
+            FsCausalAdapterState::Vacant | FsCausalAdapterState::Closed(_) => {
+                Err(FsCausalAdapterError::MissingActive)
+            }
+        }
+    }
+
     /// Consumes the opaque bearer only at the final publication boundary. A
     /// failed Registry close restores that same non-Copy bearer; a successful
     /// close installs a terminal identity so outer-ack retries are exact.
@@ -775,6 +1043,8 @@ struct ProductionReadRuntime {
     registry: EffectRegistry,
     causal: FsCausalAdapterSlot,
     flight: FsDeviceFlight,
+    adapter_phase: FsDeviceAdapterPhase,
+    materialized_authority: MaterializedAuthoritySlot,
     next_flight_cookie: NonZeroU64,
     registered_effects: usize,
     preparation_identity_observed: bool,
@@ -783,23 +1053,31 @@ struct ProductionReadRuntime {
 }
 
 #[cfg(feature = "virtio-cser-facade")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProductionReadRuntimeInitError {
+    Discovery(PciDiscoveryError),
+    DeviceClaim(ProductionDeviceClaimError),
+}
+
+#[cfg(feature = "virtio-cser-facade")]
 impl ProductionReadRuntime {
-    fn new() -> Self {
-        let mut root = discover_and_own_bars();
-        let bdf = root.device_bdf();
-        assert_eq!((bdf.bus(), bdf.device(), bdf.function()), (0, 5, 0));
-        assert_ne!(root.memory_bar_count(), 0);
-        let device = ProductionDevice::for_owned_device(&mut root);
-        Self {
+    fn new() -> Result<Self, ProductionReadRuntimeInitError> {
+        let mut root =
+            discover_and_own_bars().map_err(ProductionReadRuntimeInitError::Discovery)?;
+        let device = ProductionDevice::for_owned_device(&mut root)
+            .map_err(ProductionReadRuntimeInitError::DeviceClaim)?;
+        Ok(Self {
             registry: new_same_boot_registry(),
             causal: FsCausalAdapterSlot::new(),
             flight: FsDeviceFlight::Ready { root, device },
+            adapter_phase: FsDeviceAdapterPhase::Vacant,
+            materialized_authority: MaterializedAuthoritySlot::vacant(),
             next_flight_cookie: NonZeroU64::MIN,
             registered_effects: 0,
             preparation_identity_observed: false,
             #[cfg(feature = "virtio-cser-precommit-fault")]
             enrolled_revoke_wins_observed: false,
-        }
+        })
     }
 
     fn allocate_flight_cookie(&mut self) -> Result<NonZeroU64, RegistryError> {
@@ -820,6 +1098,94 @@ impl ProductionReadRuntime {
     fn put_flight(&mut self, flight: FsDeviceFlight) {
         debug_assert!(matches!(self.flight, FsDeviceFlight::Transitioning));
         self.flight = flight;
+    }
+
+    fn transition_adapter(
+        &mut self,
+        expected: FsDeviceAdapterPhase,
+        next: FsDeviceAdapterPhase,
+    ) -> Result<(), FsDeviceAdapterTransitionError> {
+        debug_assert_eq!(self.adapter_phase, expected);
+        if self.adapter_phase != expected {
+            let observed = self.adapter_phase;
+            self.adapter_phase = FsDeviceAdapterPhase::IndeterminateRetained;
+            return Err(FsDeviceAdapterTransitionError::PhaseMismatch {
+                expected,
+                observed,
+                requested: next,
+            });
+        }
+        self.adapter_phase = next;
+        Ok(())
+    }
+
+    fn transition_started_preparation_terminal(
+        &mut self,
+        next: FsDeviceAdapterPhase,
+    ) -> Result<(), FsDeviceAdapterTransitionError> {
+        debug_assert!(matches!(
+            self.adapter_phase,
+            FsDeviceAdapterPhase::Applying | FsDeviceAdapterPhase::PreparedPendingAck
+        ));
+        if !matches!(
+            self.adapter_phase,
+            FsDeviceAdapterPhase::Applying | FsDeviceAdapterPhase::PreparedPendingAck
+        ) {
+            let observed = self.adapter_phase;
+            self.adapter_phase = FsDeviceAdapterPhase::IndeterminateRetained;
+            return Err(FsDeviceAdapterTransitionError::PhaseMismatch {
+                expected: FsDeviceAdapterPhase::Applying,
+                observed,
+                requested: next,
+            });
+        }
+        self.adapter_phase = next;
+        Ok(())
+    }
+
+    fn enter_adapter_closing(&mut self) -> Result<(), FsDeviceAdapterTransitionError> {
+        match self.adapter_phase {
+            FsDeviceAdapterPhase::Published => {
+                self.adapter_phase = FsDeviceAdapterPhase::Closing;
+                Ok(())
+            }
+            FsDeviceAdapterPhase::Closing => Ok(()),
+            observed => {
+                self.adapter_phase = FsDeviceAdapterPhase::IndeterminateRetained;
+                Err(FsDeviceAdapterTransitionError::InvalidClosingSource { observed })
+            }
+        }
+    }
+
+    fn retained_adapter_cookie(&self) -> Option<u64> {
+        if self.adapter_phase != FsDeviceAdapterPhase::IndeterminateRetained {
+            return None;
+        }
+        let cookie = match &self.flight {
+            FsDeviceFlight::Reserved { cookie, .. }
+            | FsDeviceFlight::Captured { cookie, .. }
+            | FsDeviceFlight::PreparationApplying { cookie, .. }
+            | FsDeviceFlight::PreparedPendingAck { cookie, .. }
+            | FsDeviceFlight::Prepared { cookie, .. }
+            | FsDeviceFlight::MaterializedUnpublished { cookie, .. }
+            | FsDeviceFlight::PreparedCancel { cookie, .. }
+            | FsDeviceFlight::Building { cookie, .. } => cookie.get(),
+            FsDeviceFlight::Published { semantic, .. }
+            | FsDeviceFlight::PublishedReset { semantic, .. }
+            | FsDeviceFlight::CompletionReset { semantic, .. }
+            | FsDeviceFlight::IndeterminateReset { semantic, .. } => semantic.key().cookie(),
+            FsDeviceFlight::Resetting { semantic, .. }
+            | FsDeviceFlight::ResetRetained { semantic, .. }
+            | FsDeviceFlight::Iotlb { semantic, .. }
+            | FsDeviceFlight::IotlbRetained { semantic, .. }
+            | FsDeviceFlight::Draining { semantic, .. } => semantic.cookie(),
+            FsDeviceFlight::AwaitingPublication { cookie, .. }
+            | FsDeviceFlight::Retained { cookie, .. } => *cookie,
+            FsDeviceFlight::Ready { .. }
+            | FsDeviceFlight::Complete { .. }
+            | FsDeviceFlight::Transitioning => 0,
+        };
+        Some(cookie)
     }
 
     fn verify_causal_session(
@@ -848,6 +1214,21 @@ impl ProductionReadRuntime {
             FsDeviceFlight::Ready { root, device } => {
                 (0, None, FsRetainedHardware::Ready { root, device })
             }
+            FsDeviceFlight::Reserved {
+                cookie,
+                root,
+                device,
+                ticket,
+                ..
+            } => (
+                cookie.get(),
+                None,
+                FsRetainedHardware::Reserved {
+                    root,
+                    device,
+                    ticket,
+                },
+            ),
             FsDeviceFlight::Captured {
                 cookie,
                 root,
@@ -858,11 +1239,47 @@ impl ProductionReadRuntime {
                 None,
                 FsRetainedHardware::Ready { root, device },
             ),
+            FsDeviceFlight::PreparationApplying {
+                cookie,
+                root,
+                device,
+                intent,
+                request,
+                ..
+            } => (
+                cookie.get(),
+                None,
+                FsRetainedHardware::ApplyingPrepared {
+                    root,
+                    device,
+                    intent,
+                    request,
+                },
+            ),
+            FsDeviceFlight::PreparedPendingAck {
+                cookie,
+                root,
+                device,
+                intent,
+                request,
+                ..
+            } => (
+                cookie.get(),
+                None,
+                FsRetainedHardware::PreparedPendingAck {
+                    root,
+                    device,
+                    intent,
+                    request,
+                },
+            ),
             FsDeviceFlight::Prepared {
                 cookie,
                 root,
                 device,
                 request,
+                preparation,
+                prepared_identity,
                 ..
             } => (
                 cookie.get(),
@@ -871,6 +1288,8 @@ impl ProductionReadRuntime {
                     root,
                     device,
                     request,
+                    preparation,
+                    prepared_identity,
                 },
             ),
             FsDeviceFlight::PreparedCancel {
@@ -888,6 +1307,21 @@ impl ProductionReadRuntime {
                     intent,
                 },
             ),
+            FsDeviceFlight::MaterializedUnpublished {
+                cookie,
+                root,
+                device,
+                request,
+                ..
+            } => (
+                cookie.get(),
+                None,
+                FsRetainedHardware::MaterializedUnpublished {
+                    root,
+                    device,
+                    request,
+                },
+            ),
             FsDeviceFlight::Building {
                 cookie,
                 root,
@@ -897,7 +1331,7 @@ impl ProductionReadRuntime {
             } => (
                 cookie.get(),
                 None,
-                FsRetainedHardware::Prepared {
+                FsRetainedHardware::MaterializedUnpublished {
                     root,
                     device,
                     request,
@@ -1051,18 +1485,35 @@ impl ProductionReadRuntime {
         cookie
     }
 
-    fn assert_complete(&self) {
-        assert!(matches!(self.flight, FsDeviceFlight::Complete { .. }));
-        assert!(self.causal.is_vacant());
-        let scope = self.registry.scope_projection(SCOPE).unwrap();
-        assert_eq!(scope.phase, ScopePhase::Revoked);
-        assert_eq!(scope.live_effects, 0);
-        assert_eq!(scope.pending_publications, 0);
-        assert_eq!(scope.credits.capacity, 10);
-        assert_eq!(scope.credits.free, 10);
-        assert_eq!(scope.credits.held, 0);
-        assert_eq!(scope.credits.committed, 0);
-        assert_eq!(scope.credits.retained, 0);
+    fn verify_complete(&self) -> Result<(), FsRuntimeCompletionError> {
+        if !matches!(self.flight, FsDeviceFlight::Complete { .. }) {
+            return Err(FsRuntimeCompletionError::FlightNotComplete);
+        }
+        if self.adapter_phase != FsDeviceAdapterPhase::Released {
+            return Err(FsRuntimeCompletionError::AdapterNotReleased);
+        }
+        if !self.materialized_authority.is_vacant() {
+            return Err(FsRuntimeCompletionError::MaterializedAuthorityRetained);
+        }
+        if !self.causal.is_vacant() {
+            return Err(FsRuntimeCompletionError::CausalSessionLive);
+        }
+        let scope = self
+            .registry
+            .scope_projection(SCOPE)
+            .map_err(|_| FsRuntimeCompletionError::ScopeUnavailable)?;
+        if scope.phase != ScopePhase::Revoked
+            || scope.live_effects != 0
+            || scope.pending_publications != 0
+            || scope.credits.capacity != 10
+            || scope.credits.free != 10
+            || scope.credits.held != 0
+            || scope.credits.committed != 0
+            || scope.credits.retained != 0
+        {
+            return Err(FsRuntimeCompletionError::ScopeNotQuiescent);
+        }
+        Ok(())
     }
 }
 
@@ -1923,6 +2374,30 @@ fn published_identity(
     )
 }
 
+#[cfg(feature = "virtio-cser-facade")]
+const fn packed_device_bdf(bdf: nexus_ostd_virtio::DeviceBdf) -> u64 {
+    ((bdf.bus() as u64) << 16) | ((bdf.device() as u64) << 8) | bdf.function() as u64
+}
+
+#[cfg(feature = "virtio-cser-facade")]
+fn reserved_block_descriptor(
+    cookie: NonZeroU64,
+    queue: u16,
+    device_generation: u64,
+) -> SyscallDescriptor {
+    SyscallDescriptor::new(
+        OP_BLOCK_REQUEST.value() as usize,
+        [
+            0,
+            512,
+            usize::from(queue),
+            device_generation as usize,
+            cookie.get() as usize,
+            0,
+        ],
+    )
+}
+
 enum PublicationAuthority {
     #[cfg(not(feature = "virtio-cser-facade"))]
     Generic(PublicationTicket),
@@ -2178,6 +2653,217 @@ impl FsScenario {
             stage, cookie,
         );
         DispatchOutcome::retained(cookie)
+    }
+
+    #[cfg(feature = "virtio-cser-facade")]
+    fn retain_started_preparation_indeterminate(
+        runtime: &mut ProductionReadRuntime,
+        cookie: NonZeroU64,
+        root: Root,
+        device: ProductionDevice,
+        intent: crate::effect_registry::DeviceApplyIntent,
+        observation: PreparationIndeterminate,
+        stage: &'static str,
+    ) -> DispatchOutcome {
+        let (intent, installed) = match crate::virtio_cser_adapter::retain_indeterminate(
+            &mut runtime.registry,
+            intent,
+            &observation,
+        ) {
+            Ok(digest) => {
+                debug_assert_eq!(digest, observation.observation_digest());
+                (None, true)
+            }
+            Err(failure) => (Some(failure.into_input()), false),
+        };
+        let retained_stage = if installed
+            && runtime
+                .transition_started_preparation_terminal(
+                    FsDeviceAdapterPhase::IndeterminateRetained,
+                )
+                .is_err()
+        {
+            "indeterminate_preparation_adapter_phase"
+        } else {
+            stage
+        };
+        runtime.put_flight(FsDeviceFlight::Retained {
+            cookie: cookie.get(),
+            semantic: None,
+            hardware: FsRetainedHardware::IndeterminatePreparation {
+                root,
+                device,
+                intent,
+                observation,
+            },
+            stage: retained_stage,
+        });
+        DispatchOutcome::retained(cookie.get())
+    }
+
+    #[cfg(feature = "virtio-cser-facade")]
+    fn acknowledge_started_preparation_rollback(
+        runtime: &mut ProductionReadRuntime,
+        cookie: NonZeroU64,
+        root: Root,
+        device: ProductionDevice,
+        intent: crate::effect_registry::DeviceApplyIntent,
+        receipt: PreparationRollbackReceipt,
+        stage: &'static str,
+    ) -> DispatchOutcome {
+        match crate::virtio_cser_adapter::acknowledge_rollback(
+            &mut runtime.registry,
+            intent,
+            &receipt,
+        ) {
+            Ok(()) => {
+                let retained_stage = if runtime
+                    .transition_started_preparation_terminal(FsDeviceAdapterPhase::Released)
+                    .is_err()
+                {
+                    "rolled_back_preparation_adapter_phase"
+                } else {
+                    stage
+                };
+                runtime.put_flight(FsDeviceFlight::Retained {
+                    cookie: cookie.get(),
+                    semantic: None,
+                    hardware: FsRetainedHardware::Ready { root, device },
+                    stage: retained_stage,
+                });
+            }
+            Err(failure) => {
+                runtime.put_flight(FsDeviceFlight::Retained {
+                    cookie: cookie.get(),
+                    semantic: None,
+                    hardware: FsRetainedHardware::ApplyingRollback {
+                        root,
+                        device,
+                        intent: failure.into_input(),
+                        receipt,
+                    },
+                    stage,
+                });
+            }
+        }
+        DispatchOutcome::retained(cookie.get())
+    }
+
+    #[cfg(feature = "virtio-cser-facade")]
+    fn cancel_unreceipted_preparation(
+        runtime: &mut ProductionReadRuntime,
+        cookie: NonZeroU64,
+        mut root: Root,
+        mut device: ProductionDevice,
+        intent: crate::effect_registry::DeviceApplyIntent,
+        request: PreparedRequest,
+        stage: &'static str,
+    ) -> DispatchOutcome {
+        let (reset, mut cancellation) = request.cancel_unregistered().begin_reset(false);
+        let mut reset = match reset.probe_ack_once(&mut root) {
+            Ok(reset) => reset,
+            Err(failure) => {
+                let _error = failure.error();
+                runtime.put_flight(FsDeviceFlight::Retained {
+                    cookie: cookie.get(),
+                    semantic: None,
+                    hardware: FsRetainedHardware::UnregisteredApplyingReset {
+                        root,
+                        device,
+                        intent,
+                        reset: failure.into_tombstone(),
+                        cancellation,
+                    },
+                    stage,
+                });
+                return DispatchOutcome::retained(cookie.get());
+            }
+        };
+        if device
+            .apply_unregistered_reset(&mut reset, &mut cancellation)
+            .is_err()
+        {
+            runtime.put_flight(FsDeviceFlight::Retained {
+                cookie: cookie.get(),
+                semantic: None,
+                hardware: FsRetainedHardware::UnregisteredApplyingResetAck {
+                    root,
+                    device,
+                    intent,
+                    reset,
+                    cancellation,
+                },
+                stage,
+            });
+            return DispatchOutcome::retained(cookie.get());
+        }
+        let progress = match device.begin_unregistered_iotlb(reset, &cancellation, false) {
+            Ok(progress) => progress,
+            Err((_error, reset)) => {
+                runtime.put_flight(FsDeviceFlight::Retained {
+                    cookie: cookie.get(),
+                    semantic: None,
+                    hardware: FsRetainedHardware::UnregisteredApplyingResetAck {
+                        root,
+                        device,
+                        intent,
+                        reset,
+                        cancellation,
+                    },
+                    stage,
+                });
+                return DispatchOutcome::retained(cookie.get());
+            }
+        };
+        let mut closure = match progress {
+            ProductionClosureProgress::Complete(closure) => closure,
+            ProductionClosureProgress::Pending(hardware) => {
+                runtime.put_flight(FsDeviceFlight::Retained {
+                    cookie: cookie.get(),
+                    semantic: None,
+                    hardware: FsRetainedHardware::UnregisteredApplyingIotlb {
+                        root,
+                        device,
+                        intent,
+                        hardware,
+                        cancellation,
+                    },
+                    stage,
+                });
+                return DispatchOutcome::retained(cookie.get());
+            }
+        };
+        match device.apply_unregistered_quiescence(&mut closure, &mut cancellation) {
+            Ok(receipt) => Self::acknowledge_started_preparation_rollback(
+                runtime, cookie, root, device, intent, receipt, stage,
+            ),
+            Err(nexus_ostd_virtio::PreparationRollbackError::Indeterminate(observation)) => {
+                Self::retain_started_preparation_indeterminate(
+                    runtime,
+                    cookie,
+                    root,
+                    device,
+                    intent,
+                    observation,
+                    stage,
+                )
+            }
+            Err(_) => {
+                runtime.put_flight(FsDeviceFlight::Retained {
+                    cookie: cookie.get(),
+                    semantic: None,
+                    hardware: FsRetainedHardware::UnregisteredApplyingClosure {
+                        root,
+                        device,
+                        intent,
+                        closure,
+                        cancellation,
+                    },
+                    stage,
+                });
+                DispatchOutcome::retained(cookie.get())
+            }
+        }
     }
 
     #[cfg(feature = "virtio-cser-facade")]
@@ -2856,6 +3542,9 @@ impl FsScenario {
     ) -> DispatchOutcome {
         let precommit_close = {
             let mut runtime = self.production.lock();
+            if let Some(retained_cookie) = runtime.retained_adapter_cookie() {
+                return DispatchOutcome::retained(retained_cookie);
+            }
             let flight = runtime.take_flight();
             let (mut root, mut device, captured) = match flight {
                 FsDeviceFlight::Captured {
@@ -2896,140 +3585,375 @@ impl FsScenario {
                 );
                 return DispatchOutcome::retained(retained);
             }
-            let request = match device.prepare_read_sector0(&mut root) {
-                Ok(request) => request,
+            let queue = 0;
+            let device_generation = device.device_generation();
+            let block_descriptor = reserved_block_descriptor(cookie, queue, device_generation);
+            let coordinates = DeviceReservationCoordinates {
+                preparation_id: cookie.get(),
+                generation: 1,
+                owned_device: ResourceKey::new(
+                    OWNED_BLOCK_DEVICE_NAMESPACE,
+                    packed_device_bdf(root.device_bdf()),
+                    device_generation,
+                ),
+                queue,
+                device_generation,
+                operation_digest: block_descriptor.digest(),
+                queue_credit_class: QUEUE_SLOT_CREDIT,
+                pinned_credit_class: PINNED_PAGE_CREDIT,
+                dma_credit_class: DMA_MAPPING_CREDIT,
+                actor_slot: 0,
+                actor_generation: cookie.get(),
+            };
+            let reservation = {
+                let ProductionReadRuntime {
+                    registry, causal, ..
+                } = &mut *runtime;
+                let session = match causal.active_session() {
+                    Ok(session) => session,
+                    Err(_) => {
+                        runtime.put_flight(FsDeviceFlight::Captured {
+                            cookie,
+                            root,
+                            device,
+                            syscall: captured,
+                        });
+                        return DispatchOutcome::retained(
+                            runtime.retain_current("device_reservation_session"),
+                        );
+                    }
+                };
+                registry.reserve_device_preparation_for_session(session, coordinates)
+            };
+            let reservation = match reservation {
+                Ok(reservation) => reservation,
                 Err(_) => {
+                    runtime.put_flight(FsDeviceFlight::Captured {
+                        cookie,
+                        root,
+                        device,
+                        syscall: captured,
+                    });
+                    return DispatchOutcome::retained(runtime.retain_current("device_reservation"));
+                }
+            };
+            if runtime
+                .transition_adapter(FsDeviceAdapterPhase::Vacant, FsDeviceAdapterPhase::Reserved)
+                .is_err()
+            {
+                runtime.put_flight(FsDeviceFlight::Retained {
+                    cookie: cookie.get(),
+                    semantic: None,
+                    hardware: FsRetainedHardware::Reserved {
+                        root,
+                        device,
+                        ticket: reservation,
+                    },
+                    stage: "device_reservation_adapter_phase",
+                });
+                return DispatchOutcome::retained(cookie.get());
+            }
+            let permit = match device.preflight_read_sector0(&mut root) {
+                Ok(permit) => permit,
+                Err(_) => {
+                    match runtime.registry.cancel_device_preparation(reservation) {
+                        Ok(()) => {
+                            if runtime
+                                .transition_adapter(
+                                    FsDeviceAdapterPhase::Reserved,
+                                    FsDeviceAdapterPhase::Vacant,
+                                )
+                                .is_err()
+                            {
+                                runtime.put_flight(FsDeviceFlight::Retained {
+                                    cookie: cookie.get(),
+                                    semantic: None,
+                                    hardware: FsRetainedHardware::Ready { root, device },
+                                    stage: "preflight_cancel_adapter_phase",
+                                });
+                                return DispatchOutcome::retained(cookie.get());
+                            }
+                            runtime.put_flight(FsDeviceFlight::Retained {
+                                cookie: cookie.get(),
+                                semantic: None,
+                                hardware: FsRetainedHardware::Ready { root, device },
+                                stage: "preflight_read_sector0",
+                            });
+                        }
+                        Err(failure) => {
+                            runtime.put_flight(FsDeviceFlight::Retained {
+                                cookie: cookie.get(),
+                                semantic: None,
+                                hardware: FsRetainedHardware::Reserved {
+                                    root,
+                                    device,
+                                    ticket: failure.into_input(),
+                                },
+                                stage: "preflight_cancel_reserved",
+                            });
+                        }
+                    }
+                    return DispatchOutcome::retained(cookie.get());
+                }
+            };
+            let intent = match runtime.registry.begin_device_hardware_apply(reservation) {
+                Ok(intent) => intent,
+                Err(failure) => {
+                    drop(permit);
                     runtime.put_flight(FsDeviceFlight::Retained {
                         cookie: cookie.get(),
                         semantic: None,
-                        hardware: FsRetainedHardware::Ready { root, device },
-                        stage: "prepare_read_sector0",
+                        hardware: FsRetainedHardware::Reserved {
+                            root,
+                            device,
+                            ticket: failure.into_input(),
+                        },
+                        stage: "begin_device_hardware_apply",
                     });
                     return DispatchOutcome::retained(cookie.get());
                 }
             };
+            if runtime
+                .transition_adapter(
+                    FsDeviceAdapterPhase::Reserved,
+                    FsDeviceAdapterPhase::Applying,
+                )
+                .is_err()
+            {
+                drop(permit);
+                runtime.put_flight(FsDeviceFlight::Retained {
+                    cookie: cookie.get(),
+                    semantic: None,
+                    hardware: FsRetainedHardware::ApplyingNotStarted {
+                        root,
+                        device,
+                        intent,
+                    },
+                    stage: "hardware_apply_adapter_phase",
+                });
+                return DispatchOutcome::retained(cookie.get());
+            }
+            let request = match permit.apply() {
+                Ok(request) => request,
+                Err(failure) => {
+                    let (_error, evidence) = failure.into_parts();
+                    return match evidence {
+                        StartedPreparationFailureEvidence::RolledBack(receipt) => {
+                            Self::acknowledge_started_preparation_rollback(
+                                &mut runtime,
+                                cookie,
+                                root,
+                                device,
+                                intent,
+                                receipt,
+                                "started_preparation_rolled_back",
+                            )
+                        }
+                        StartedPreparationFailureEvidence::Indeterminate(observation) => {
+                            Self::retain_started_preparation_indeterminate(
+                                &mut runtime,
+                                cookie,
+                                root,
+                                device,
+                                intent,
+                                observation,
+                                "started_preparation_indeterminate",
+                            )
+                        }
+                    };
+                }
+            };
             runtime.preparation_identity_observed = true;
-            let identity = request.identity();
-            let envelope = match DeviceEnvelope::new(
-                identity.device_session(),
-                identity.queue(),
-                identity.descriptor_token(),
-                identity.device_generation(),
-            ) {
-                Ok(envelope) => envelope,
-                Err(_) => {
-                    runtime.put_flight(FsDeviceFlight::Prepared {
+            runtime.put_flight(FsDeviceFlight::PreparationApplying {
+                cookie,
+                root,
+                device,
+                intent,
+                request,
+                effects: [captured.identity.effect(), filesystem.identity.effect()],
+            });
+            if runtime
+                .transition_adapter(
+                    FsDeviceAdapterPhase::Applying,
+                    FsDeviceAdapterPhase::PreparedPendingAck,
+                )
+                .is_err()
+            {
+                return DispatchOutcome::retained(
+                    runtime.retain_current("prepared_pending_ack_adapter_phase"),
+                );
+            }
+
+            let applying_flight = runtime.take_flight();
+            let FsDeviceFlight::PreparationApplying {
+                root,
+                mut device,
+                intent,
+                request,
+                effects: business_effects,
+                ..
+            } = applying_flight
+            else {
+                runtime.adapter_phase = FsDeviceAdapterPhase::IndeterminateRetained;
+                runtime.put_flight(applying_flight);
+                return DispatchOutcome::retained(cookie.get());
+            };
+            let request = match device.issue_preparation_receipt(request) {
+                Ok(request) => request,
+                Err(failure) => {
+                    return Self::cancel_unreceipted_preparation(
+                        &mut runtime,
                         cookie,
                         root,
                         device,
-                        request,
-                        effects: [
-                            Some(captured.identity.effect()),
-                            Some(filesystem.identity.effect()),
-                            None,
-                            None,
-                            None,
-                            None,
-                        ],
-                        envelope: None,
-                        enrollment: None,
-                    });
-                    return DispatchOutcome::retained(runtime.retain_current("device_envelope"));
+                        intent,
+                        failure.into_owner(),
+                        "preparation_receipt_issuance",
+                    );
                 }
             };
-            if request
-                .preflight_publish(published_identity(envelope, root.device_bdf()))
+            runtime.put_flight(FsDeviceFlight::PreparedPendingAck {
+                cookie,
+                root,
+                device,
+                intent,
+                request,
+                effects: business_effects,
+            });
+            let pending_ack_flight = runtime.take_flight();
+            let FsDeviceFlight::PreparedPendingAck {
+                root,
+                device,
+                intent,
+                request,
+                effects: business_effects,
+                ..
+            } = pending_ack_flight
+            else {
+                runtime.adapter_phase = FsDeviceAdapterPhase::IndeterminateRetained;
+                runtime.put_flight(pending_ack_flight);
+                return DispatchOutcome::retained(cookie.get());
+            };
+            let (preparation, prepared_identity) =
+                match crate::virtio_cser_adapter::acknowledge_prepared(
+                    &mut runtime.registry,
+                    intent,
+                    request.receipt(),
+                ) {
+                    Ok(acknowledged) => acknowledged,
+                    Err(failure) => {
+                        runtime.put_flight(FsDeviceFlight::PreparedPendingAck {
+                            cookie,
+                            root,
+                            device,
+                            intent: failure.into_input(),
+                            request,
+                            effects: business_effects,
+                        });
+                        return DispatchOutcome::retained(
+                            runtime.retain_current("preparation_registry_ack"),
+                        );
+                    }
+                };
+            if runtime
+                .transition_adapter(
+                    FsDeviceAdapterPhase::PreparedPendingAck,
+                    FsDeviceAdapterPhase::Prepared,
+                )
                 .is_err()
             {
+                let retained_envelope = prepared_identity.device;
                 runtime.put_flight(FsDeviceFlight::Prepared {
                     cookie,
                     root,
                     device,
                     request,
+                    preparation,
+                    prepared_identity,
                     effects: [
-                        Some(captured.identity.effect()),
-                        Some(filesystem.identity.effect()),
+                        Some(business_effects[0]),
+                        Some(business_effects[1]),
                         None,
                         None,
                         None,
                         None,
                     ],
-                    envelope: Some(envelope),
+                    envelope: Some(retained_envelope),
                     enrollment: None,
                 });
-                return DispatchOutcome::retained(
-                    runtime.retain_current("publish_identity_preflight"),
-                );
+                return DispatchOutcome::retained(runtime.retain_current("prepared_adapter_phase"));
             }
+            let identity = request.identity();
+            let envelope = prepared_identity.device;
+            debug_assert_eq!(identity.device_session(), envelope.device_session());
+            debug_assert_eq!(identity.queue(), envelope.queue());
+            debug_assert_eq!(identity.descriptor_token(), envelope.descriptor_token());
+            debug_assert_eq!(identity.device_generation(), envelope.device_generation());
 
             let queue_driver = owner_address(identity.device_generation(), OwnerKind::QueueDriver);
             let queue_device = owner_address(identity.device_generation(), OwnerKind::QueueDevice);
             let request_owner = owner_address(identity.device_generation(), OwnerKind::Request);
-            let cohort = runtime.registry.register_device_derived_cohort([
-                DeviceDerivedCohortEntry {
-                    batch_index: 0,
-                    request: RegisterRequest {
-                        scope: SCOPE,
-                        task: BLOCK_V1,
-                        operation: OP_BLOCK_REQUEST,
-                        descriptor: SyscallDescriptor::new(
-                            OP_BLOCK_REQUEST.value() as usize,
-                            [
-                                0,
-                                512,
-                                usize::from(identity.queue()),
-                                usize::from(identity.descriptor_token()),
-                                identity.device_session() as usize,
-                                identity.device_generation() as usize,
-                            ],
-                        ),
-                        resources: vec![BLOCK_REQUEST_RESOURCE],
-                        credits: vec![same_boot_credit(QUEUE_SLOT_CREDIT, 1)],
-                        publication: PublicationMode::None,
+            let materialized = runtime.registry.materialize_device_cohort_from_preparation(
+                preparation,
+                prepared_identity,
+                [
+                    DeviceDerivedCohortEntry {
+                        batch_index: 0,
+                        request: RegisterRequest {
+                            scope: SCOPE,
+                            task: BLOCK_V1,
+                            operation: OP_BLOCK_REQUEST,
+                            descriptor: block_descriptor,
+                            resources: vec![BLOCK_REQUEST_RESOURCE, coordinates.owned_device],
+                            credits: vec![same_boot_credit(QUEUE_SLOT_CREDIT, 1)],
+                            publication: PublicationMode::None,
+                        },
+                        domain: BLOCK_DOMAIN,
+                        parent: DeviceCohortParent::Existing(filesystem.identity.effect()),
+                        device: envelope,
                     },
-                    domain: BLOCK_DOMAIN,
-                    parent: DeviceCohortParent::Existing(filesystem.identity.effect()),
-                    device: envelope,
-                },
-                same_boot_dma_entry(
-                    1,
-                    OP_DMA_QUEUE_OWNER_A,
-                    DMA_QUEUE_OWNER_A_NAMESPACE,
-                    identity,
-                    envelope,
-                    queue_driver.0,
-                    queue_driver.1,
-                ),
-                same_boot_dma_entry(
-                    2,
-                    OP_DMA_QUEUE_OWNER_B,
-                    DMA_QUEUE_OWNER_B_NAMESPACE,
-                    identity,
-                    envelope,
-                    queue_device.0,
-                    queue_device.1,
-                ),
-                same_boot_dma_entry(
-                    3,
-                    OP_DMA_REQUEST_OWNER,
-                    DMA_REQUEST_OWNER_NAMESPACE,
-                    identity,
-                    envelope,
-                    request_owner.0,
-                    request_owner.1,
-                ),
-            ]);
-            let [block, dma_queue_a, dma_queue_b, dma_request] = match cohort {
-                Ok(cohort) => cohort,
-                Err(_) => {
+                    same_boot_dma_entry(
+                        1,
+                        OP_DMA_QUEUE_OWNER_A,
+                        DMA_QUEUE_OWNER_A_NAMESPACE,
+                        identity,
+                        envelope,
+                        queue_driver.0,
+                        queue_driver.1,
+                    ),
+                    same_boot_dma_entry(
+                        2,
+                        OP_DMA_QUEUE_OWNER_B,
+                        DMA_QUEUE_OWNER_B_NAMESPACE,
+                        identity,
+                        envelope,
+                        queue_device.0,
+                        queue_device.1,
+                    ),
+                    same_boot_dma_entry(
+                        3,
+                        OP_DMA_REQUEST_OWNER,
+                        DMA_REQUEST_OWNER_NAMESPACE,
+                        identity,
+                        envelope,
+                        request_owner.0,
+                        request_owner.1,
+                    ),
+                ],
+            );
+            let materialized = match materialized {
+                Ok(materialized) => materialized,
+                Err(failure) => {
                     runtime.put_flight(FsDeviceFlight::Prepared {
                         cookie,
                         root,
                         device,
                         request,
+                        preparation: failure.into_input(),
+                        prepared_identity,
                         effects: [
-                            Some(captured.identity.effect()),
-                            Some(filesystem.identity.effect()),
+                            Some(business_effects[0]),
+                            Some(business_effects[1]),
                             None,
                             None,
                             None,
@@ -3039,27 +3963,82 @@ impl FsScenario {
                         enrollment: None,
                     });
                     return DispatchOutcome::retained(
-                        runtime.retain_current("device_cohort_registration"),
+                        runtime.retain_current("device_cohort_materialization"),
                     );
                 }
             };
+            let [block, dma_queue_a, dma_queue_b, dma_request] = materialized.registered;
             let effects = [
-                captured.identity.effect(),
-                filesystem.identity.effect(),
+                business_effects[0],
+                business_effects[1],
                 block.identity.effect(),
                 dma_queue_a.identity.effect(),
                 dma_queue_b.identity.effect(),
                 dma_request.identity.effect(),
             ];
-            for member in [&block, &dma_queue_a, &dma_queue_b, &dma_request] {
-                if runtime.registry.prepare(BLOCK_V1, member.handle).is_err() {
-                    runtime.put_flight(FsDeviceFlight::Prepared {
+            match runtime
+                .materialized_authority
+                .install(materialized.authority)
+            {
+                Ok(()) => {}
+                Err(MaterializedAuthorityInstallError::RetainedConflict) => {
+                    runtime.adapter_phase = FsDeviceAdapterPhase::IndeterminateRetained;
+                    runtime.put_flight(FsDeviceFlight::MaterializedUnpublished {
                         cookie,
                         root,
                         device,
                         request,
-                        effects: effects.map(Some),
-                        envelope: Some(envelope),
+                        effects,
+                        envelope,
+                        enrollment: None,
+                    });
+                    return DispatchOutcome::retained(cookie.get());
+                }
+                Err(MaterializedAuthorityInstallError::Saturated(authority)) => {
+                    runtime.adapter_phase = FsDeviceAdapterPhase::IndeterminateRetained;
+                    runtime.put_flight(FsDeviceFlight::Retained {
+                        cookie: cookie.get(),
+                        semantic: None,
+                        hardware: FsRetainedHardware::MaterializedAuthorityOverflow {
+                            root,
+                            device,
+                            request,
+                            authority,
+                        },
+                        stage: "materialized_authority_slot_saturated",
+                    });
+                    return DispatchOutcome::retained(cookie.get());
+                }
+            }
+            if runtime
+                .transition_adapter(
+                    FsDeviceAdapterPhase::Prepared,
+                    FsDeviceAdapterPhase::MaterializedUnpublished,
+                )
+                .is_err()
+            {
+                runtime.put_flight(FsDeviceFlight::MaterializedUnpublished {
+                    cookie,
+                    root,
+                    device,
+                    request,
+                    effects,
+                    envelope,
+                    enrollment: None,
+                });
+                return DispatchOutcome::retained(
+                    runtime.retain_current("materialized_adapter_phase"),
+                );
+            }
+            for member in [&block, &dma_queue_a, &dma_queue_b, &dma_request] {
+                if runtime.registry.prepare(BLOCK_V1, member.handle).is_err() {
+                    runtime.put_flight(FsDeviceFlight::MaterializedUnpublished {
+                        cookie,
+                        root,
+                        device,
+                        request,
+                        effects,
+                        envelope,
                         enrollment: None,
                     });
                     return DispatchOutcome::retained(
@@ -3071,13 +4050,13 @@ impl FsScenario {
             let authority = match runtime.registry.kernel_root_authority(SCOPE, ROOT_OWNER) {
                 Ok(authority) => authority,
                 Err(_) => {
-                    runtime.put_flight(FsDeviceFlight::Prepared {
+                    runtime.put_flight(FsDeviceFlight::MaterializedUnpublished {
                         cookie,
                         root,
                         device,
                         request,
-                        effects: effects.map(Some),
-                        envelope: Some(envelope),
+                        effects,
+                        envelope,
                         enrollment: None,
                     });
                     return DispatchOutcome::retained(
@@ -3099,13 +4078,13 @@ impl FsScenario {
             {
                 Ok(enrollment) => enrollment,
                 Err(_) => {
-                    runtime.put_flight(FsDeviceFlight::Prepared {
+                    runtime.put_flight(FsDeviceFlight::MaterializedUnpublished {
                         cookie,
                         root,
                         device,
                         request,
-                        effects: effects.map(Some),
-                        envelope: Some(envelope),
+                        effects,
+                        envelope,
                         enrollment: None,
                     });
                     return DispatchOutcome::retained(runtime.retain_current("device_enrollment"));
@@ -3166,13 +4145,13 @@ impl FsScenario {
                 let key = match mint_device_flight_key(&runtime.registry, &enrollment, cookie) {
                     Ok(key) => key,
                     Err(_) => {
-                        runtime.put_flight(FsDeviceFlight::Prepared {
+                        runtime.put_flight(FsDeviceFlight::MaterializedUnpublished {
                             cookie,
                             root,
                             device,
                             request,
-                            effects: effects.map(Some),
-                            envelope: Some(envelope),
+                            effects,
+                            envelope,
                             enrollment: Some(enrollment),
                         });
                         return DispatchOutcome::retained(
@@ -3180,23 +4159,36 @@ impl FsScenario {
                         );
                     }
                 };
-                let mut request_slot = Some(request);
+                let expected = published_identity(envelope, root.device_bdf());
+                let publish_intent = match device.preflight_publish(request, expected) {
+                    Ok(intent) => intent,
+                    Err(failure) => {
+                        runtime.put_flight(FsDeviceFlight::MaterializedUnpublished {
+                            cookie,
+                            root,
+                            device,
+                            request: failure.into_owner(),
+                            effects,
+                            envelope,
+                            enrollment: Some(enrollment),
+                        });
+                        return DispatchOutcome::retained(
+                            runtime.retain_current("publish_receipt_preflight"),
+                        );
+                    }
+                };
+                let mut request_slot = Some(publish_intent);
                 match commit_or_recover_device_flight_with_apply(
                     &mut runtime.registry,
                     key,
                     authority,
                     &enrollment,
                     &commits,
-                    |_| {
-                        request_slot
-                            .take()
-                            .expect("prevalidated prepared owner")
-                            .publish_prepared()
-                    },
+                    |_| request_slot.take().map(|intent| intent.apply()),
                 ) {
                     Ok(DeviceFlightCloseOutcome::Applied {
                         published,
-                        publication,
+                        publication: Some(publication),
                     }) => {
                         let bdf = root.device_bdf();
                         let batch_sequence = published.batch().batch_sequence();
@@ -3217,6 +4209,17 @@ impl FsScenario {
                             },
                             completion_probes: 0,
                         });
+                        if runtime
+                            .transition_adapter(
+                                FsDeviceAdapterPhase::MaterializedUnpublished,
+                                FsDeviceAdapterPhase::Published,
+                            )
+                            .is_err()
+                        {
+                            return DispatchOutcome::retained(
+                                runtime.retain_current("published_adapter_phase"),
+                            );
+                        }
                         println!(
                             "LINUX_FS_SAME_BOOT Capture same_boot=true identity_preserving=true real_dma=true registry=shared_production scope=95 authority_epoch=141 effects=6 credits=10 device={} session={:#018x} generation={} queue={} descriptor={} syscall_effect={} filesystem_effect={} block_effect={}",
                             bdf,
@@ -3277,24 +4280,47 @@ impl FsScenario {
                         );
                         false
                     }
-                    Ok(DeviceFlightCloseOutcome::Recovered { .. }) => {
-                        let request = request_slot
-                            .expect("recovered close did not consume fresh prepared owner");
-                        runtime.put_flight(FsDeviceFlight::Prepared {
-                            cookie,
-                            root,
-                            device,
-                            request,
-                            effects: effects.map(Some),
-                            envelope: Some(envelope),
-                            enrollment: Some(enrollment),
+                    Ok(DeviceFlightCloseOutcome::Applied {
+                        published,
+                        publication: None,
+                    }) => {
+                        runtime.adapter_phase = FsDeviceAdapterPhase::IndeterminateRetained;
+                        runtime.put_flight(FsDeviceFlight::Retained {
+                            cookie: published.key().cookie(),
+                            semantic: Some(FsRetainedSemantic::Close(FsCloseSemantic::Published(
+                                published,
+                            ))),
+                            hardware: FsRetainedHardware::Quarantined { root, device },
+                            stage: "applied_close_without_publish_owner",
                         });
-                        return DispatchOutcome::retained(
-                            runtime.retain_current("fresh_prepared_recovered_close"),
-                        );
+                        return DispatchOutcome::retained(cookie.get());
+                    }
+                    Ok(DeviceFlightCloseOutcome::Recovered { published }) => {
+                        let retained_cookie = published.key().cookie();
+                        let semantic = Some(FsRetainedSemantic::Close(FsCloseSemantic::Published(
+                            published,
+                        )));
+                        let hardware = match request_slot {
+                            Some(intent) => FsRetainedHardware::PublishIntent {
+                                root,
+                                device,
+                                intent,
+                            },
+                            None => {
+                                runtime.adapter_phase = FsDeviceAdapterPhase::IndeterminateRetained;
+                                FsRetainedHardware::Quarantined { root, device }
+                            }
+                        };
+                        runtime.put_flight(FsDeviceFlight::Retained {
+                            cookie: retained_cookie,
+                            semantic,
+                            hardware,
+                            stage: "fresh_publish_intent_recovered_close",
+                        });
+                        return DispatchOutcome::retained(retained_cookie);
                     }
                     Err(error @ crate::effect_registry::DeviceCloseError::Unpublished(_)) => {
-                        let Some(request) = request_slot else {
+                        let Some(intent) = request_slot else {
                             runtime.put_flight(FsDeviceFlight::Retained {
                                 cookie: key.cookie(),
                                 semantic: None,
@@ -3304,14 +4330,15 @@ impl FsScenario {
                             return DispatchOutcome::retained(key.cookie());
                         };
                         let _ = error;
-                        runtime.put_flight(FsDeviceFlight::Prepared {
-                            cookie,
-                            root,
-                            device,
-                            request,
-                            effects: effects.map(Some),
-                            envelope: Some(envelope),
-                            enrollment: Some(enrollment),
+                        runtime.put_flight(FsDeviceFlight::Retained {
+                            cookie: cookie.get(),
+                            semantic: None,
+                            hardware: FsRetainedHardware::PublishIntent {
+                                root,
+                                device,
+                                intent,
+                            },
+                            stage: "unpublished_close_publish_intent",
                         });
                         true
                     }
@@ -3324,10 +4351,10 @@ impl FsScenario {
                         .ok()
                         .map(FsRetainedSemantic::PublishedObligation);
                         let hardware = match request_slot {
-                            Some(request) => FsRetainedHardware::Prepared {
+                            Some(intent) => FsRetainedHardware::PublishIntent {
                                 root,
                                 device,
-                                request,
+                                intent,
                             },
                             None => FsRetainedHardware::Quarantined { root, device },
                         };
@@ -3352,6 +4379,9 @@ impl FsScenario {
     #[cfg(feature = "virtio-cser-facade")]
     fn close_precommit_flight(&self, stage: &'static str) -> DispatchOutcome {
         let mut runtime = self.production.lock();
+        if let Some(retained_cookie) = runtime.retained_adapter_cookie() {
+            return DispatchOutcome::retained(retained_cookie);
+        }
         let flight = runtime.take_flight();
         let FsDeviceFlight::Building {
             cookie,
@@ -3372,13 +4402,13 @@ impl FsScenario {
         let intent = match request.preflight_cancel(expected) {
             Ok(intent) => intent,
             Err(failure) => {
-                runtime.put_flight(FsDeviceFlight::Prepared {
+                runtime.put_flight(FsDeviceFlight::MaterializedUnpublished {
                     cookie,
                     root,
                     device,
                     request: failure.into_owner(),
-                    effects: effects.map(Some),
-                    envelope: Some(envelope),
+                    effects,
+                    envelope,
                     enrollment: Some(enrollment),
                 });
                 drop(runtime);
@@ -3386,19 +4416,50 @@ impl FsScenario {
             }
         };
         let mut intent_slot = Some(intent);
+        if runtime
+            .transition_adapter(
+                FsDeviceAdapterPhase::MaterializedUnpublished,
+                FsDeviceAdapterPhase::Closing,
+            )
+            .is_err()
+        {
+            let hardware = match intent_slot.take() {
+                Some(intent) => FsRetainedHardware::PreparedCancel {
+                    root,
+                    device,
+                    intent,
+                },
+                None => FsRetainedHardware::Quarantined { root, device },
+            };
+            runtime.put_flight(FsDeviceFlight::Retained {
+                cookie: cookie.get(),
+                semantic: None,
+                hardware,
+                stage: "precommit_closing_adapter_phase",
+            });
+            return DispatchOutcome::retained(cookie.get());
+        }
         let transition = close_enrolled_device_flight_precommit_with_apply(
             &mut runtime.registry,
             &enrollment,
             cookie,
-            |_| {
-                intent_slot
-                    .take()
-                    .expect("prevalidated cancel intent is consumed once")
-                    .apply_reset(true)
-            },
+            |_| intent_slot.take().map(|intent| intent.apply_reset(true)),
         );
         let (semantic, hardware) = match transition {
-            Ok(transition) => transition,
+            Ok((semantic, Some(hardware))) => (semantic, hardware),
+            Ok((semantic, None)) => {
+                let retained_cookie = semantic.cookie();
+                runtime.adapter_phase = FsDeviceAdapterPhase::IndeterminateRetained;
+                runtime.put_flight(FsDeviceFlight::Retained {
+                    cookie: retained_cookie,
+                    semantic: Some(FsRetainedSemantic::Close(FsCloseSemantic::Precommit(
+                        semantic,
+                    ))),
+                    hardware: FsRetainedHardware::Quarantined { root, device },
+                    stage: "precommit_close_without_cancel_owner",
+                });
+                return DispatchOutcome::retained(retained_cookie);
+            }
             Err(_) => {
                 let hardware = match intent_slot {
                     Some(intent) => FsRetainedHardware::PreparedCancel {
@@ -3455,6 +4516,9 @@ impl FsScenario {
         loop {
             let flight = {
                 let mut runtime = self.production.lock();
+                if let Some(retained_cookie) = runtime.retained_adapter_cookie() {
+                    return DispatchOutcome::retained(retained_cookie);
+                }
                 runtime.take_flight()
             };
             match flight {
@@ -3628,18 +4692,27 @@ impl FsScenario {
                             semantic.batch(),
                             work.envelope,
                             work.result,
-                            |_| {
-                                intent_slot
-                                    .take()
-                                    .expect("prevalidated completion reset is consumed once")
-                                    .apply_reset(true)
-                            },
+                            |_| intent_slot.take().map(|intent| intent.apply_reset(true)),
                         );
                     match transition {
-                        Ok((completion, reset_ticket, hardware)) => {
+                        Ok((completion, reset_ticket, Some(hardware))) => {
                             debug_assert_eq!(completion.causal_root(), work.effects[0]);
+                            let semantic = FsCloseSemantic::Published(semantic);
+                            let cookie = semantic.cookie();
+                            if runtime.enter_adapter_closing().is_err() {
+                                runtime.put_flight(FsDeviceFlight::Resetting {
+                                    semantic,
+                                    root,
+                                    device,
+                                    reset_ticket,
+                                    hardware,
+                                    work,
+                                    retry: false,
+                                });
+                                return DispatchOutcome::retained(cookie);
+                            }
                             runtime.put_flight(FsDeviceFlight::Resetting {
-                                semantic: FsCloseSemantic::Published(semantic),
+                                semantic,
                                 root,
                                 device,
                                 reset_ticket,
@@ -3647,6 +4720,23 @@ impl FsScenario {
                                 work,
                                 retry: false,
                             });
+                        }
+                        Ok((_, reset_ticket, None)) => {
+                            let cookie = semantic.key().cookie();
+                            runtime.adapter_phase = FsDeviceAdapterPhase::IndeterminateRetained;
+                            runtime.put_flight(FsDeviceFlight::Retained {
+                                cookie,
+                                semantic: Some(FsRetainedSemantic::Close(
+                                    FsCloseSemantic::Published(semantic),
+                                )),
+                                hardware: FsRetainedHardware::RegistryResetWithoutHardware {
+                                    root,
+                                    device,
+                                    ticket: reset_ticket,
+                                },
+                                stage: "completion_reset_without_hardware_owner",
+                            });
+                            return DispatchOutcome::retained(cookie);
                         }
                         Err(_) => {
                             let hardware = match intent_slot {
@@ -3683,19 +4773,29 @@ impl FsScenario {
                 } => {
                     let mut runtime = self.production.lock();
                     let mut intent_slot = Some(intent);
-                    let transition =
-                        runtime
-                            .registry
-                            .begin_device_reset_with_apply(semantic.batch(), |_| {
-                                intent_slot
-                                    .take()
-                                    .expect("prevalidated failed-completion reset is consumed once")
-                                    .apply_reset(true)
-                            });
+                    let transition = runtime
+                        .registry
+                        .begin_device_reset_with_apply(semantic.batch(), |_| {
+                            intent_slot.take().map(|intent| intent.apply_reset(true))
+                        });
                     match transition {
-                        Ok((reset_ticket, hardware)) => {
+                        Ok((reset_ticket, Some(hardware))) => {
+                            let semantic = FsCloseSemantic::Published(semantic);
+                            let cookie = semantic.cookie();
+                            if runtime.enter_adapter_closing().is_err() {
+                                runtime.put_flight(FsDeviceFlight::Resetting {
+                                    semantic,
+                                    root,
+                                    device,
+                                    reset_ticket,
+                                    hardware,
+                                    work,
+                                    retry: false,
+                                });
+                                return DispatchOutcome::retained(cookie);
+                            }
                             runtime.put_flight(FsDeviceFlight::Resetting {
-                                semantic: FsCloseSemantic::Published(semantic),
+                                semantic,
                                 root,
                                 device,
                                 reset_ticket,
@@ -3703,6 +4803,23 @@ impl FsScenario {
                                 work,
                                 retry: false,
                             });
+                        }
+                        Ok((reset_ticket, None)) => {
+                            let cookie = semantic.key().cookie();
+                            runtime.adapter_phase = FsDeviceAdapterPhase::IndeterminateRetained;
+                            runtime.put_flight(FsDeviceFlight::Retained {
+                                cookie,
+                                semantic: Some(FsRetainedSemantic::Close(
+                                    FsCloseSemantic::Published(semantic),
+                                )),
+                                hardware: FsRetainedHardware::RegistryResetWithoutHardware {
+                                    root,
+                                    device,
+                                    ticket: reset_ticket,
+                                },
+                                stage: "failed_completion_reset_without_hardware_owner",
+                            });
+                            return DispatchOutcome::retained(cookie);
                         }
                         Err(_) => {
                             let cookie = semantic.key().cookie();
@@ -3737,19 +4854,29 @@ impl FsScenario {
                 } => {
                     let mut runtime = self.production.lock();
                     let mut intent_slot = Some(intent);
-                    let transition =
-                        runtime
-                            .registry
-                            .begin_device_reset_with_apply(semantic.batch(), |_| {
-                                intent_slot
-                                    .take()
-                                    .expect("prevalidated published reset is consumed once")
-                                    .apply_reset(true)
-                            });
+                    let transition = runtime
+                        .registry
+                        .begin_device_reset_with_apply(semantic.batch(), |_| {
+                            intent_slot.take().map(|intent| intent.apply_reset(true))
+                        });
                     match transition {
-                        Ok((reset_ticket, hardware)) => {
+                        Ok((reset_ticket, Some(hardware))) => {
+                            let semantic = FsCloseSemantic::Published(semantic);
+                            let cookie = semantic.cookie();
+                            if runtime.enter_adapter_closing().is_err() {
+                                runtime.put_flight(FsDeviceFlight::Resetting {
+                                    semantic,
+                                    root,
+                                    device,
+                                    reset_ticket,
+                                    hardware,
+                                    work,
+                                    retry: false,
+                                });
+                                return DispatchOutcome::retained(cookie);
+                            }
                             runtime.put_flight(FsDeviceFlight::Resetting {
-                                semantic: FsCloseSemantic::Published(semantic),
+                                semantic,
                                 root,
                                 device,
                                 reset_ticket,
@@ -3757,6 +4884,23 @@ impl FsScenario {
                                 work,
                                 retry: false,
                             });
+                        }
+                        Ok((reset_ticket, None)) => {
+                            let cookie = semantic.key().cookie();
+                            runtime.adapter_phase = FsDeviceAdapterPhase::IndeterminateRetained;
+                            runtime.put_flight(FsDeviceFlight::Retained {
+                                cookie,
+                                semantic: Some(FsRetainedSemantic::Close(
+                                    FsCloseSemantic::Published(semantic),
+                                )),
+                                hardware: FsRetainedHardware::RegistryResetWithoutHardware {
+                                    root,
+                                    device,
+                                    ticket: reset_ticket,
+                                },
+                                stage: "published_reset_without_hardware_owner",
+                            });
+                            return DispatchOutcome::retained(cookie);
                         }
                         Err(_) => {
                             let hardware = match intent_slot {
@@ -3802,6 +4946,9 @@ impl FsScenario {
         loop {
             let flight = {
                 let mut runtime = self.production.lock();
+                if let Some(retained_cookie) = runtime.retained_adapter_cookie() {
+                    return DispatchOutcome::retained(retained_cookie);
+                }
                 runtime.take_flight()
             };
             match flight {
@@ -3814,7 +4961,35 @@ impl FsScenario {
                     work,
                     retry,
                 } => match hardware.probe_ack_once(&mut root) {
-                    Err(hardware) => {
+                    Err(failure) => {
+                        let error = failure.error();
+                        let hardware = failure.into_tombstone();
+                        if error != ProductionResetRetryError::Pending {
+                            let stage = match error {
+                                ProductionResetRetryError::ForeignRoot => {
+                                    "reset_hardware_foreign_root"
+                                }
+                                ProductionResetRetryError::PciCommandStateUnavailable => {
+                                    "reset_hardware_pci_command_unavailable"
+                                }
+                                ProductionResetRetryError::PciCommandReadbackMismatch => {
+                                    "reset_hardware_pci_command_readback"
+                                }
+                                ProductionResetRetryError::Pending => {
+                                    "reset_hardware_retry_pending"
+                                }
+                            };
+                            return self.retain_exact_flight(
+                                semantic.cookie(),
+                                Some(FsRetainedSemantic::Close(semantic)),
+                                FsRetainedHardware::Reset {
+                                    root,
+                                    device,
+                                    tombstone: hardware,
+                                },
+                                stage,
+                            );
+                        }
                         let mut runtime = self.production.lock();
                         match runtime.registry.retain_device_reset_timeout(&reset_ticket) {
                             Ok(reset_tombstone) if !retry => {
@@ -3905,15 +5080,15 @@ impl FsScenario {
                             runtime
                                 .registry
                                 .begin_device_iotlb_with_apply(&registry_reset, |_| {
-                                    device.begin_iotlb(
-                                        reset_slot
-                                            .take()
-                                            .expect("reset acknowledgement is consumed once"),
-                                        true,
-                                    )
+                                    reset_slot
+                                        .take()
+                                        .map(|reset| device.begin_iotlb(reset, true))
                                 });
                         match iotlb_begin {
-                            Ok((iotlb_ticket, ProductionClosureProgress::Pending(hardware))) => {
+                            Ok((
+                                iotlb_ticket,
+                                Some(Ok(ProductionClosureProgress::Pending(hardware))),
+                            )) => {
                                 runtime.put_flight(FsDeviceFlight::Iotlb {
                                     semantic,
                                     root,
@@ -3947,7 +5122,7 @@ impl FsScenario {
                                     registry_reset.new_device().device_generation(),
                                 );
                             }
-                            Ok((_, ProductionClosureProgress::Complete(closure))) => {
+                            Ok((_, Some(Ok(ProductionClosureProgress::Complete(closure))))) => {
                                 let cookie = semantic.cookie();
                                 runtime.put_flight(FsDeviceFlight::Retained {
                                     cookie,
@@ -3958,6 +5133,37 @@ impl FsScenario {
                                         closure,
                                     },
                                     stage: "iotlb_timeout_injection_completed_early",
+                                });
+                                return DispatchOutcome::retained(cookie);
+                            }
+                            Ok((_, Some(Err(failure)))) => {
+                                let _error = failure.error();
+                                let cookie = semantic.cookie();
+                                runtime.adapter_phase = FsDeviceAdapterPhase::IndeterminateRetained;
+                                runtime.put_flight(FsDeviceFlight::Retained {
+                                    cookie,
+                                    semantic: Some(FsRetainedSemantic::Close(semantic)),
+                                    hardware: FsRetainedHardware::ResetAck {
+                                        root,
+                                        device,
+                                        reset: failure.into_reset(),
+                                    },
+                                    stage: "iotlb_hardware_begin_rejected",
+                                });
+                                return DispatchOutcome::retained(cookie);
+                            }
+                            Ok((iotlb_ticket, None)) => {
+                                let cookie = semantic.cookie();
+                                runtime.adapter_phase = FsDeviceAdapterPhase::IndeterminateRetained;
+                                runtime.put_flight(FsDeviceFlight::Retained {
+                                    cookie,
+                                    semantic: Some(FsRetainedSemantic::Close(semantic)),
+                                    hardware: FsRetainedHardware::RegistryIotlbWithoutHardware {
+                                        root,
+                                        device,
+                                        ticket: iotlb_ticket,
+                                    },
+                                    stage: "iotlb_registry_begin_without_hardware_owner",
                                 });
                                 return DispatchOutcome::retained(cookie);
                             }
@@ -4113,8 +5319,8 @@ impl FsScenario {
                         }
                     };
                     let mut hardware_closure = match hardware.retry(1024) {
-                        ProductionClosureProgress::Complete(closure) => closure,
-                        ProductionClosureProgress::Pending(hardware) => {
+                        Ok(ProductionClosureProgress::Complete(closure)) => closure,
+                        Ok(ProductionClosureProgress::Pending(hardware)) => {
                             return self.retain_exact_flight(
                                 semantic.cookie(),
                                 Some(FsRetainedSemantic::Close(semantic)),
@@ -4124,6 +5330,19 @@ impl FsScenario {
                                     tombstone: hardware,
                                 },
                                 "iotlb_hardware_retry_pending",
+                            );
+                        }
+                        Err(failure) => {
+                            let _error = failure.error();
+                            return self.retain_exact_flight(
+                                semantic.cookie(),
+                                Some(FsRetainedSemantic::Close(semantic)),
+                                FsRetainedHardware::Iotlb {
+                                    root,
+                                    device,
+                                    tombstone: failure.into_tombstone(),
+                                },
+                                "iotlb_hardware_retry_rejected",
                             );
                         }
                     };
@@ -4172,6 +5391,84 @@ impl FsScenario {
                     );
                     let registry_generation = registry_closure.device().device_generation();
                     let hardware_generation = applied_identity.device_generation();
+                    let materialized = match runtime.materialized_authority.take() {
+                        Ok(materialized) => materialized,
+                        Err(_) => {
+                            let cookie = semantic.cookie();
+                            runtime.adapter_phase = FsDeviceAdapterPhase::IndeterminateRetained;
+                            runtime.put_flight(FsDeviceFlight::Retained {
+                                cookie,
+                                semantic: Some(FsRetainedSemantic::Close(semantic)),
+                                hardware: FsRetainedHardware::ClosurePendingMaterialized {
+                                    root,
+                                    device,
+                                    hardware: hardware_closure,
+                                    registry: registry_closure,
+                                    work,
+                                },
+                                stage: "materialized_device_authority_unavailable",
+                            });
+                            return DispatchOutcome::retained(cookie);
+                        }
+                    };
+                    if let Err(failure) = crate::virtio_cser_adapter::install_materialized_closure(
+                        &mut runtime.registry,
+                        materialized,
+                        &registry_closure,
+                        &hardware_closure,
+                    ) {
+                        let authority = failure.into_input();
+                        let restore = runtime.materialized_authority.install(authority);
+                        let cookie = semantic.cookie();
+                        runtime.adapter_phase = FsDeviceAdapterPhase::IndeterminateRetained;
+                        let hardware = match restore {
+                            Ok(()) | Err(MaterializedAuthorityInstallError::RetainedConflict) => {
+                                FsRetainedHardware::ClosurePendingMaterialized {
+                                    root,
+                                    device,
+                                    hardware: hardware_closure,
+                                    registry: registry_closure,
+                                    work,
+                                }
+                            }
+                            Err(MaterializedAuthorityInstallError::Saturated(authority)) => {
+                                FsRetainedHardware::ClosureAuthorityOverflow {
+                                    root,
+                                    device,
+                                    hardware: hardware_closure,
+                                    registry: registry_closure,
+                                    work,
+                                    authority,
+                                }
+                            }
+                        };
+                        runtime.put_flight(FsDeviceFlight::Retained {
+                            cookie,
+                            semantic: Some(FsRetainedSemantic::Close(semantic)),
+                            hardware,
+                            stage: "materialized_device_closure_install",
+                        });
+                        return DispatchOutcome::retained(cookie);
+                    }
+                    if runtime
+                        .transition_adapter(
+                            FsDeviceAdapterPhase::Closing,
+                            FsDeviceAdapterPhase::ClosureInstalledDrainPending,
+                        )
+                        .is_err()
+                    {
+                        let cookie = semantic.cookie();
+                        runtime.put_flight(FsDeviceFlight::Draining {
+                            semantic,
+                            root,
+                            device,
+                            closure: registry_closure,
+                            work,
+                            next_ordinal: 0,
+                            publication: None,
+                        });
+                        return DispatchOutcome::retained(cookie);
+                    }
                     runtime.put_flight(FsDeviceFlight::Draining {
                         semantic,
                         root,
@@ -4340,6 +5637,24 @@ impl FsScenario {
                     let guest_byte_count = work.byte_count;
                     let precommit =
                         matches!(closure.outcome(), DeviceClosureResult::AbortedBeforeCommit);
+                    if runtime
+                        .transition_adapter(
+                            FsDeviceAdapterPhase::ClosureInstalledDrainPending,
+                            FsDeviceAdapterPhase::Released,
+                        )
+                        .is_err()
+                    {
+                        runtime.put_flight(FsDeviceFlight::Draining {
+                            semantic,
+                            root,
+                            device,
+                            closure,
+                            work,
+                            next_ordinal,
+                            publication: Some(ticket),
+                        });
+                        return DispatchOutcome::retained(cookie);
+                    }
                     runtime.put_flight(FsDeviceFlight::AwaitingPublication {
                         cookie,
                         root,
@@ -4894,6 +6209,9 @@ impl FsScenario {
                     }
                 };
                 let mut runtime = self.production.lock();
+                if runtime.retained_adapter_cookie().is_some() {
+                    return PublicationResult::Retained;
+                }
                 let Some(causal_cookie) = NonZeroU64::new(*flight_cookie) else {
                     println!("LINUX_FS_SAME_BOOT Retained stage=causal_terminal_zero_cookie");
                     return PublicationResult::Retained;
@@ -4953,11 +6271,22 @@ impl FsScenario {
                 drop(preempt_guard);
                 let flight = runtime.take_flight();
                 let FsDeviceFlight::AwaitingPublication { root, device, .. } = flight else {
-                    unreachable!("validated publication flight changed under its Registry lock")
+                    runtime.adapter_phase = FsDeviceAdapterPhase::IndeterminateRetained;
+                    runtime.put_flight(flight);
+                    println!(
+                        "LINUX_FS_SAME_BOOT Retained stage=publication_flight_changed_after_ack"
+                    );
+                    return PublicationResult::Retained;
                 };
                 runtime.put_flight(FsDeviceFlight::Complete { root, device });
                 runtime.causal.apply_terminal_clear(causal_clear);
-                runtime.assert_complete();
+                if let Err(error) = runtime.verify_complete() {
+                    println!(
+                        "LINUX_FS_SAME_BOOT Retained stage=runtime_completion_validation error={:?}",
+                        error,
+                    );
+                    return PublicationResult::Retained;
+                }
                 #[cfg(feature = "virtio-cser-precommit-fault")]
                 let precommit_scope = if runtime.enrolled_revoke_wins_observed {
                     Some(runtime.registry.scope_projection(SCOPE).unwrap())
@@ -5039,11 +6368,23 @@ impl FsScenario {
             feature = "virtio-cser-facade",
             not(feature = "virtio-cser-precommit-fault")
         ))]
-        self.production.lock().assert_complete();
+        if let Err(error) = self.production.lock().verify_complete() {
+            println!(
+                "LINUX_FS_SAME_BOOT FAIL stage=finish_completion_validation error={:?}",
+                error,
+            );
+            ostd::power::poweroff(ostd::power::ExitCode::Failure)
+        }
         #[cfg(feature = "virtio-cser-precommit-fault")]
         let (production_effects, preparation_identity_observed, enrolled_revoke_wins_observed) = {
             let production = self.production.lock();
-            production.assert_complete();
+            if let Err(error) = production.verify_complete() {
+                println!(
+                    "LINUX_FS_SAME_BOOT_PRECOMMIT FAIL stage=finish_completion_validation error={:?}",
+                    error,
+                );
+                ostd::power::poweroff(ostd::power::ExitCode::Failure)
+            }
             (
                 production.registered_effects,
                 production.preparation_identity_observed,
@@ -5303,11 +6644,22 @@ pub(crate) fn run_linux_fs_slice() -> RuntimeFsSliceReceipt {
         scope_id: SCOPE.id(),
         effect_id: SCENARIO_DONE_EFFECT,
     });
+    #[cfg(feature = "virtio-cser-facade")]
+    let production = match ProductionReadRuntime::new() {
+        Ok(production) => production,
+        Err(error) => {
+            println!(
+                "LINUX_FS_DEVICE_INIT FAIL class=typed_production_device_claim error={:?}",
+                error,
+            );
+            ostd::power::poweroff(ostd::power::ExitCode::Failure)
+        }
+    };
     let scenario = Arc::new(FsScenario {
         vm_space: loaded.vm_space.clone(),
         state: SpinLock::new(FsState::new()),
         #[cfg(feature = "virtio-cser-facade")]
-        production: SpinLock::new(ProductionReadRuntime::new()),
+        production: SpinLock::new(production),
         #[cfg(feature = "virtio-cser-facade")]
         service: SpinLock::new(FsServiceProtocol::new()),
         done: SpinLock::new(Some(done_waker)),
@@ -5475,7 +6827,13 @@ pub(crate) fn run_linux_fs_slice() -> RuntimeFsSliceReceipt {
     ))]
     let (production_effects, preparation_identity_observed) = {
         let production = scenario.production.lock();
-        production.assert_complete();
+        if let Err(error) = production.verify_complete() {
+            println!(
+                "LINUX_FS_SAME_BOOT FAIL stage=final_completion_validation error={:?}",
+                error,
+            );
+            ostd::power::poweroff(ostd::power::ExitCode::Failure)
+        }
         (
             production.registered_effects,
             production.preparation_identity_observed,
@@ -5484,7 +6842,13 @@ pub(crate) fn run_linux_fs_slice() -> RuntimeFsSliceReceipt {
     #[cfg(feature = "virtio-cser-precommit-fault")]
     let (production_effects, preparation_identity_observed, enrolled_revoke_wins_observed) = {
         let production = scenario.production.lock();
-        production.assert_complete();
+        if let Err(error) = production.verify_complete() {
+            println!(
+                "LINUX_FS_SAME_BOOT_PRECOMMIT FAIL stage=final_completion_validation error={:?}",
+                error,
+            );
+            ostd::power::poweroff(ostd::power::ExitCode::Failure)
+        }
         (
             production.registered_effects,
             production.preparation_identity_observed,

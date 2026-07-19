@@ -75,6 +75,56 @@ The facade preserves these ownership invariants:
   direct apply, so registry acknowledgement and facade `active = None` need not
   split.
 
+## Preparation evidence boundary
+
+The production constructor now has an owner-bound start boundary intended for
+the normal Nexus adapter. The adapter first obtains a `PreparationStartPermit`
+while its Registry record is still pre-apply, retains that permit while the
+Registry enters hardware apply, and then consumes it. The permit exclusively
+borrows the facade and PCI root and owns a process-global software preparation
+gate. Every rejection before permit consumption is `NotStarted`; after
+consumption the failure type has no such variant and must return either verified
+rollback or `PreparationIndeterminate`. Dropping the permit or returning from
+any started path releases the software gate. Attempt identity is allocated by
+the unique `ProductionDevice`, is not publicly constructible, and follows every
+prepared, published, reset, IOTLB, completion, and closure successor.
+
+A successful constructor does not return a detached claim. The facade consumes
+the exact `PreparedRequest`, revalidates its owner, attempt, active session, BDF,
+queue, descriptor token, device generation, transport status, all three DMA
+owners and active shares, and all live MMIO transport claims, and returns a
+`ReceiptedPreparedRequest`. Its fixed-size, non-copyable `PreparationReceipt`
+can only be borrowed while that wrapper still owns the real hardware lifecycle.
+The digest is a deterministic fingerprint, not authenticity or authority.
+Publication is similarly non-bypassable: the facade revalidates the complete
+live projection and coupled receipt, then returns the sole
+`PreparedPublishIntent` which can execute the underlying `avail.idx` Release.
+
+Rollback evidence has two explicit generation lineages. A constructor failure
+which never returned a prepared owner closes in generation `G -> G`; cancelling
+a returned prepared owner requires acknowledged whole-device reset and complete
+IOTLB closure and closes in `G -> G+1`. The public, non-copyable
+`PreparationRollbackReceipt` is constructed only after the projected facade is
+inactive and the live DMA and transport observations are exactly zero. If PCI
+command/status readback, the DMA ledger, the transport-claim ledger, active
+state, or generation lineage is uncertain, no rollback receipt is fabricated.
+Instead the facade permanently latches the attempt as quarantined and returns a
+complete read-only `PreparationIndeterminate` observation. That observation
+exposes attempt and BDF, attempt/current generations, active state, every DMA
+generation/exposure/reset/owner/share field, transport state, and a
+hardware-certainty bit plus a domain-separated observation digest. The digest
+supports comparison and durable diagnostics; it is not a MAC, capability, or
+recovery authority. This crate has no API which clears that latch yet.
+
+`cancel_prepared` and `cancel_unregistered` prove only facade ownership
+transitions. They cannot inspect a semantic Registry and therefore cannot prove
+that a device cohort was absent or that a reset/IOTLB acknowledgement was
+causally installed. A normal enrolled adapter must retain the
+`ReceiptedPreparedRequest` in its Nexus-owned slot, use `preflight_cancel`, and
+couple the returned hardware plans to Registry apply. The unregistered path is
+only for the failure-atomic window where the adapter independently proves under
+its Registry transition gate that cohort installation never happened.
+
 The implementation is pinned to `ostd = 0.18.0` and
 `virtio-drivers = 0.13.0`. Complete DMA closure additionally requires the
 repository-wide audited OSTD patch at `patches/ostd-0.18.0-cser.patch`. Split
@@ -87,10 +137,15 @@ mutation negatives. The upstream VirtIO license text is retained at
 `patches/virtio-drivers-0.13.0-LICENSE-MIT`; this is not part of the MPL-2.0
 OSTD overlay.
 
-This crate is source/build substrate. It does not install an OSTD `IrqLine` or
-prove that `nexus-kernel` uses the production typestate in the same boot,
-executes a real IRQ path, is SMP-safe, or preserves one causal identity through
-the production registry.
+This facade lands atomically with the feature-gated Nexus sibling adapter. The
+adapter reserves Registry credits before hardware work, stores each exact owner
+before acknowledgement, maps the private receipts through provider-neutral
+read-only views, and consumes the materialized Registry bearer only after reset
+and IOTLB closure. The bounded runtime-filesystem lane therefore uses this
+production typestate in the same boot under one causal root. The witness remains
+polling-only with INTx masked: it does not install an OSTD `IrqLine`, execute a
+real IRQ path, establish SMP safety, survive reboot, or provide a persistent
+retained-worker/operator recovery loop.
 In particular, registry envelopes alone do not exclude two roots claiming the
 same physical function and do not prove whole-function reset blast radius; the
 opaque facade owner is the singleton enforcement boundary.

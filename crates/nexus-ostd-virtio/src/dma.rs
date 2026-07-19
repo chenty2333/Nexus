@@ -141,14 +141,84 @@ impl DmaLedger {
 
 static DMA_LEDGER: SpinLock<DmaLedger> = SpinLock::new(DmaLedger::new());
 
-pub fn begin_generation(generation: u64) {
-    assert_ne!(generation, 0);
+/// Read-only ownership projection used when the production facade issues
+/// preparation evidence.
+///
+/// This is deliberately crate-private and contains no DMA owner or teardown
+/// authority. The production device compares the projection with the exact
+/// live `PreparedRequest` before it can construct a public receipt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PreparationDmaObservation {
+    pub(crate) generation: u64,
+    pub(crate) device_exposed: bool,
+    pub(crate) reset_acked: bool,
+    pub(crate) owner_count: usize,
+    pub(crate) active_owner_count: usize,
+    pub(crate) owner_generations_match: bool,
+    pub(crate) request_share_count: usize,
+    pub(crate) request_unshare_count: usize,
+    pub(crate) active_request_shares: usize,
+}
+
+/// Takes one lock-protected snapshot of the complete preparation-relevant DMA
+/// state. It neither moves an owner nor changes share accounting.
+pub(crate) fn preparation_observation() -> PreparationDmaObservation {
+    let ledger = DMA_LEDGER.lock();
+    let owner_count = ledger.owners.iter().flatten().count();
+    let active_owner_count = ledger
+        .owners
+        .iter()
+        .flatten()
+        .filter(|owner| owner.state == OwnerState::Active)
+        .count();
+    let owner_generations_match = ledger
+        .owners
+        .iter()
+        .flatten()
+        .all(|owner| owner.generation == ledger.generation);
+    let request = ledger.owners[OwnerKind::Request.slot()].as_ref();
+
+    PreparationDmaObservation {
+        generation: ledger.generation,
+        device_exposed: ledger.device_exposed,
+        reset_acked: ledger.reset_acked,
+        owner_count,
+        active_owner_count,
+        owner_generations_match,
+        request_share_count: request.map_or(0, |owner| owner.share_count),
+        request_unshare_count: request.map_or(0, |owner| owner.unshare_count),
+        active_request_shares: request.map_or(0, |owner| {
+            owner.shares.iter().filter(|share| share.active).count()
+        }),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DmaGenerationStartError {
+    InvalidGeneration,
+    PreviousGenerationLive,
+    RetainedOwners,
+}
+
+pub(crate) fn try_begin_generation(generation: u64) -> Result<(), DmaGenerationStartError> {
+    if generation == 0 {
+        return Err(DmaGenerationStartError::InvalidGeneration);
+    }
     let mut ledger = DMA_LEDGER.lock();
-    assert_eq!(ledger.generation, 0, "previous DMA generation still live");
-    assert!(ledger.owners.iter().all(Option::is_none));
+    if ledger.generation != 0 {
+        return Err(DmaGenerationStartError::PreviousGenerationLive);
+    }
+    if !ledger.owners.iter().all(Option::is_none) {
+        return Err(DmaGenerationStartError::RetainedOwners);
+    }
     ledger.generation = generation;
     ledger.device_exposed = false;
     ledger.reset_acked = false;
+    Ok(())
+}
+
+pub fn begin_generation(generation: u64) {
+    try_begin_generation(generation).expect("DMA generation start prevalidated")
 }
 
 pub fn mark_queue_exposed(generation: u64) {
@@ -194,22 +264,26 @@ pub fn arm_request_bounce(generation: u64) -> (usize, usize) {
 /// Queue owners must already have been destroyed, and every request share must
 /// either never have been created or have been exactly cancelled. These checks
 /// prevent a validation error from turning into an unsafe post-exposure free.
-pub(crate) fn abort_unexposed_generation(generation: u64) {
+pub(crate) fn abort_unexposed_generation(generation: u64) -> bool {
     let request = {
         let mut ledger = DMA_LEDGER.lock();
-        assert_eq!(ledger.generation, generation);
-        assert!(!ledger.device_exposed);
-        assert!(!ledger.reset_acked);
-        assert!(ledger.owners[OwnerKind::QueueDriver.slot()].is_none());
-        assert!(ledger.owners[OwnerKind::QueueDevice.slot()].is_none());
-
-        let request = ledger.owners[OwnerKind::Request.slot()].take();
-        if let Some(owner) = request.as_ref() {
-            assert_eq!(owner.generation, generation);
-            assert_eq!(owner.state, OwnerState::Active);
-            assert_eq!(owner.share_count, owner.unshare_count);
-            assert!(owner.shares.iter().all(|share| !share.active));
+        let request = ledger.owners[OwnerKind::Request.slot()].as_ref();
+        let request_quiescent = request.is_none_or(|owner| {
+            owner.generation == generation
+                && owner.state == OwnerState::Active
+                && owner.share_count == owner.unshare_count
+                && owner.shares.iter().all(|share| !share.active)
+        });
+        if ledger.generation != generation
+            || ledger.device_exposed
+            || ledger.reset_acked
+            || ledger.owners[OwnerKind::QueueDriver.slot()].is_some()
+            || ledger.owners[OwnerKind::QueueDevice.slot()].is_some()
+            || !request_quiescent
+        {
+            return false;
         }
+        let request = ledger.owners[OwnerKind::Request.slot()].take();
         ledger.generation = 0;
         request
     };
@@ -217,6 +291,7 @@ pub(crate) fn abort_unexposed_generation(generation: u64) {
     // No address in this generation was exposed to a DRIVER_OK device, so
     // ordinary OSTD teardown is sufficient and no reset/IOTLB receipt exists.
     drop(request);
+    true
 }
 
 pub fn request_share_counts(generation: u64) -> (usize, usize) {
@@ -557,7 +632,9 @@ impl IotlbTombstone {
     }
 
     pub fn retry(mut self, poll_budget: usize) -> ClosureProgress {
-        assert_ne!(poll_budget, 0);
+        if poll_budget == 0 {
+            return ClosureProgress::Pending(self);
+        }
         let mut polls = 0;
 
         loop {

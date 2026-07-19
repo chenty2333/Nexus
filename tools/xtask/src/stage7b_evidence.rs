@@ -743,18 +743,18 @@ fn validate_device_compact_bearer_source_text(
         }
     }
 
-    if device.matches("validate_device_key(").count() != 12
+    if device.matches("validate_device_key(").count() != 15
         || device
             .matches("record.stamp.bearer_generation = prepared.bearer_generation;")
             .count()
-            != 5
+            != 6
         || device
             .matches("next_device_bearer_generation(record)?")
             .count()
-            != 5
+            != 6
     {
         return Err(
-            "Device transitions must preserve the exact full-record validation and five successor/terminal/adoption generation advances"
+            "Device transitions must preserve the exact full-record validation and six successor/terminal/adoption generation advances"
                 .into(),
         );
     }

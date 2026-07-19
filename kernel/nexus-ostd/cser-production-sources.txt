@@ -8,6 +8,7 @@ infrastructure/continuation.rs
 infrastructure/deadline.rs
 infrastructure/delayed.rs
 infrastructure/device.rs
+infrastructure/device_receipt_bridge.rs
 infrastructure/fault.rs
 infrastructure/invariants.rs
 infrastructure/mod.rs

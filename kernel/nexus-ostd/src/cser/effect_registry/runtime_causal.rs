@@ -219,6 +219,14 @@ impl CausalWorkloadSession {
     pub(crate) const fn identity(&self) -> CausalWorkloadIdentity {
         self.identity
     }
+
+    /// Registry-only access to the opaque infrastructure context.
+    ///
+    /// Personalities can present `&CausalWorkloadSession` to Registry APIs,
+    /// but cannot extract or copy this root-bound authority.
+    pub(super) const fn infrastructure_context(&self) -> &infrastructure::WorkloadContext {
+        &self.context
+    }
 }
 
 #[derive(

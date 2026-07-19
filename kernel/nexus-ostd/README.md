@@ -547,21 +547,24 @@ capacity free; the returned ELF bytes still come from the in-memory inode. The
 host gate binds the guest, first-pread input, four-byte payload, and preparation
 record by digest, and rejects a receipt from a fresh registry without mutation.
 
-The Registry now also contains an unpromoted outer queue/DMA-preparation
-contract. Before a hardware adapter may run, one exact-scope transaction binds
+The Registry also owns the outer queue/DMA-preparation contract used by the
+feature-gated runtime-filesystem adapter. Before hardware may run, one
+exact-scope transaction binds
 one queue-slot, three pinned-page, and three DMA-mapping credits to the primary
 preparation record. Beginning hardware apply moves that owner from held to
 retained; pre-hardware cancellation and an exact rollback acknowledgement
 return the same units, while wrong actor-slot/generation receipts return the
 linear input without mutation. Hardware acknowledgement is a separate
 exact-scope transition, so no callback runs while Registry state is borrowed.
-This is Registry-only preparation evidence: no normal filesystem runtime calls
-it, no preallocated adapter table yet stores the `PreparedRequest`, and the
-recorded `{actor_slot, actor_generation}` selector is descriptive until that
-adapter integration lands. It therefore does not advance the runtime ledger,
-the RFC 0003 causal-coverage claim, or the existing Phase 2 evidence.
+The runtime slot stores the exact owner plus apply intent before receipt issue
+and Registry acknowledgement. Concrete VirtIO types remain outside the CSER
+core: a narrow sibling adapter exposes only provider-neutral receipt views, and
+the Registry revalidates every coordinate before minting its own opaque bearer.
+An indeterminate attempt keeps the original retained credits and hardware owner
+queryable but quarantined. This advances the bounded runtime ledger, not the
+complete RFC 0003 causal-coverage claim or the older Phase 2 evidence.
 
-The matching Registry-only materialization transition now consumes an exact,
+The matching materialization transition consumes an exact,
 sealed compact `PreparedRetained` bearer and installs one block effect plus
 three DMA descendants in the same linearization as the retained-to-held credit
 transfer. Device bearers contain only registry/scope/preparation identity,
@@ -576,11 +579,13 @@ revalidates the historical reverse index before mutation.
 
 The block owns exactly one queue credit; each DMA descendant owns exactly one
 pinned-page and one DMA-mapping credit. The primary record keeps the ordered
-four-effect identity and remains live until exact device-closure proof. This
-first outer implementation still builds an allocation-bearing O(N) private full
-Registry candidate before a no-allocation final replacement. It invokes no
-hardware callback, but bounded multi-tenant cost, typed allocator-pressure
-failure, preallocated adapter storage, and normal runtime use remain explicit
+four-effect identity and remains live until the Registry IOTLB receipt and
+facade closure view validate together. The exact materialized bearer is restored
+on every rejected candidate and consumed only after that coupled closure, before
+leaf drain and eventual frame-credit reuse. This implementation still builds
+an allocation-bearing O(N) private full Registry candidate before a no-allocation
+final replacement. Bounded multi-tenant cost, typed allocator-pressure failure,
+persistent recovery, real IRQ delivery, and 2/4-vCPU validation remain explicit
 follow-up non-claims; this paragraph does not promote RFC 0003 evidence.
 
 The primary boot has no real DMA. `tools/workflow/runtime-fs-composition.sh`

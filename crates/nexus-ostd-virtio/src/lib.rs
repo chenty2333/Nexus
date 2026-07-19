@@ -32,8 +32,8 @@ mod production;
 
 pub use dma::{OwnerKind, owner_address};
 pub use pci::{
-    DeviceBdf, IntxRoute, IntxTransitionError, IntxTransitionFailure, MaskedIntx, Root,
-    UnmaskedIntx, discover_and_own_bars,
+    DeviceBdf, IntxRoute, IntxTransitionError, IntxTransitionFailure, MaskedIntx,
+    PciDiscoveryError, Root, UnmaskedIntx, discover_and_own_bars,
 };
 pub use portal::{
     BindingToken, ClosureProgress, ClosureReceipt, EffectAuthority, IotlbTombstone, Operation,
@@ -44,11 +44,18 @@ pub use production::{
     CancelledRequest, CompletedRequest, CompletionFailure, CompletionMode, CompletionProbeProgress,
     CompletionProgress, DeviceSessionIdentity, FailedCompletion, HardwareIntentError,
     HardwareIntentFailure, InterruptCause, InterruptCompletionProgress, InterruptNotReadyReason,
-    InterruptReceipt, NotificationDisposition, PendingCompletion, PrepareReadError,
-    PreparedCancelIntent, PreparedGenerationAdvance, PreparedPublishedResetIntent,
+    InterruptReceipt, NotificationDisposition, PendingCompletion, PreparationAttemptIdentity,
+    PreparationEvidenceError, PreparationEvidenceFailure, PreparationFailureEvidence,
+    PreparationIndeterminate, PreparationPublishFailure, PreparationReceipt,
+    PreparationRollbackError, PreparationRollbackKind, PreparationRollbackReceipt,
+    PreparationStartPermit, PrepareReadError, PrepareReadFailure, PreparedCancelIntent,
+    PreparedGenerationAdvance, PreparedPublishIntent, PreparedPublishedResetIntent,
     PreparedQuiescenceApply, PreparedRequest, PreparedRequestResetIntent,
     ProductionClosureProgress, ProductionClosureReceipt, ProductionDevice,
-    ProductionIotlbTombstone, ProductionResetAck, ProductionResetTombstone, PublishIdentityError,
-    PublishedRequest, QuiescenceApplyError, ResetGenerationError, UnregisteredCancellationError,
-    UnregisteredCancelledRequest, UnregisteredPreparedCancellation,
+    ProductionDeviceClaimError, ProductionIotlbBeginError, ProductionIotlbBeginFailure,
+    ProductionIotlbRetryError, ProductionIotlbRetryFailure, ProductionIotlbTombstone,
+    ProductionResetAck, ProductionResetRetryError, ProductionResetRetryFailure,
+    ProductionResetTombstone, PublishedRequest, QuiescenceApplyError, ReceiptedPreparedRequest,
+    ResetGenerationError, StartedPreparationFailureEvidence, StartedPrepareReadFailure,
+    UnregisteredCancellationError, UnregisteredCancelledRequest, UnregisteredPreparedCancellation,
 };

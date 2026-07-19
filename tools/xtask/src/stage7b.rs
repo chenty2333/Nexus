@@ -1637,14 +1637,22 @@ fn validate_io_entrypoint_source(entry: &str) -> Result<(), String> {
     const NEGATIVE_CALL: &str = "let namespace_isolation = assert_session_namespace_isolation();";
     const NEGATIVE_MARKER: &str = "println!(\"{}\", namespace_isolation.into_marker());";
     const RAW_MARKER: &str = "IO Namespace foreign_bdf_rejected=true bidirectional=true portal_state_unchanged=true pre_pci_dma=true";
-    const DISCOVERY_CALL: &str = "let mut root = discover_and_own_bars();";
+    const DISCOVERY_CALL: &str = "let mut root = match discover_and_own_bars() {";
+    const DISCOVERY_FAILURE: &str = "Err(error) => {";
+    const DISCOVERY_FAILURE_ACTION: &str = "poweroff(ExitCode::Failure)";
 
     let kernel_start = entry
         .find("fn kernel_main() {")
         .ok_or_else(|| "Stage 7B I/O entrypoint lacks kernel_main".to_owned())?;
     let kernel = &entry[kernel_start..];
     let mut positions = Vec::new();
-    for required in [NEGATIVE_CALL, NEGATIVE_MARKER, DISCOVERY_CALL] {
+    for required in [
+        NEGATIVE_CALL,
+        NEGATIVE_MARKER,
+        DISCOVERY_CALL,
+        DISCOVERY_FAILURE,
+        DISCOVERY_FAILURE_ACTION,
+    ] {
         if entry.matches(required).count() != 1 || kernel.matches(required).count() != 1 {
             return Err(format!(
                 "Stage 7B I/O kernel entrypoint must contain one exact pre-PCI namespace step {required:?}"
@@ -2942,7 +2950,7 @@ mod tests {
         assert_ne!(missing, entry);
         assert!(validate_io_entrypoint_source(&missing).is_err());
 
-        let discovery = "    let mut root = discover_and_own_bars();";
+        let discovery = "    let mut root = match discover_and_own_bars() {";
         let late = entry
             .replacen(negative_call, "", 1)
             .replacen(negative_marker, "", 1)

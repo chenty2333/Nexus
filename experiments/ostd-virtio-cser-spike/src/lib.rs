@@ -79,7 +79,13 @@ fn kernel_main() {
     let namespace_isolation = assert_session_namespace_isolation();
     println!("{}", namespace_isolation.into_marker());
 
-    let mut root = discover_and_own_bars();
+    let mut root = match discover_and_own_bars() {
+        Ok(root) => root,
+        Err(error) => {
+            println!("VIRTIO_CSER PCI discovery failed: {:?}", error);
+            poweroff(ExitCode::Failure)
+        }
+    };
     println!(
         "PCI Found bdf={} vendor=1af4 device=1042 modern=true memory_bar_owners={}",
         root.device_bdf(),

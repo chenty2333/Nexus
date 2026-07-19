@@ -67,6 +67,9 @@ mod scheduler;
 #[cfg(feature = "stage7b-eval")]
 #[path = "evaluation/stage7b.rs"]
 mod stage7b_evaluation;
+#[cfg(feature = "virtio-cser-facade")]
+#[path = "personality/virtio_cser_adapter.rs"]
+mod virtio_cser_adapter;
 
 use alloc::{boxed::Box, sync::Arc};
 

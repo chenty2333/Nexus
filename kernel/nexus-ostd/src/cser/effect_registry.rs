@@ -43,6 +43,75 @@ pub(crate) mod runtime_service_task;
 #[path = "infrastructure/mod.rs"]
 mod infrastructure;
 
+pub(crate) use infrastructure::{
+    DeviceApplyIntent, DevicePreparationRecoveryProjection, DevicePreparationTicket,
+    DeviceReservationCoordinates, MaterializedDeviceTicket, PreparedDeviceIdentity,
+    PreparedDeviceTicket,
+};
+
+/// Provider-neutral lineage of a verified hardware-preparation rollback.
+///
+/// The Registry never imports a concrete device facade. A narrow kernel
+/// adapter maps its nonconstructible receipt onto this read-only vocabulary,
+/// while the Registry independently validates every presented coordinate.
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
+pub(crate) enum DeviceRollbackEvidenceKind {
+    UnexposedFailure,
+    PreparedCancellation,
+}
+
+pub(crate) trait DevicePreparedReceiptView {
+    fn preparation_owner_id(&self) -> u64;
+    fn preparation_sequence(&self) -> u64;
+    fn device_session(&self) -> u64;
+    fn packed_device_bdf(&self) -> u64;
+    fn queue(&self) -> u16;
+    fn descriptor_token(&self) -> u16;
+    fn device_generation(&self) -> u64;
+    fn dma_owner_count(&self) -> usize;
+    fn dma_share_count(&self) -> usize;
+    fn transport_claim_count(&self) -> usize;
+    fn receipt_digest(&self) -> u64;
+}
+
+pub(crate) trait DeviceRollbackReceiptView {
+    fn preparation_owner_id(&self) -> u64;
+    fn preparation_sequence(&self) -> u64;
+    fn packed_device_bdf(&self) -> u64;
+    fn attempt_device_generation(&self) -> u64;
+    fn quiescent_device_generation(&self) -> u64;
+    fn kind(&self) -> DeviceRollbackEvidenceKind;
+    fn request_packed_device_bdf(&self) -> Option<u64>;
+    fn request_queue(&self) -> Option<u16>;
+    fn request_device_generation(&self) -> Option<u64>;
+    fn receipt_digest(&self) -> u64;
+}
+
+pub(crate) trait DeviceIndeterminateReceiptView {
+    fn preparation_owner_id(&self) -> u64;
+    fn preparation_sequence(&self) -> u64;
+    fn packed_device_bdf(&self) -> u64;
+    fn attempt_device_generation(&self) -> u64;
+    fn observation_digest(&self) -> u64;
+}
+
+pub(crate) trait DeviceClosureReceiptView {
+    fn preparation_owner_id(&self) -> u64;
+    fn preparation_sequence(&self) -> u64;
+    fn device_session(&self) -> u64;
+    fn packed_device_bdf(&self) -> u64;
+    fn queue(&self) -> u16;
+    fn descriptor_token(&self) -> u16;
+    fn device_generation(&self) -> u64;
+    fn completed_pages(&self) -> usize;
+}
+
 static NEXT_REGISTRY_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 fn fault_cohort_digest(cohort: Option<&BTreeSet<EffectKey>>) -> [u8; 32] {
@@ -339,7 +408,7 @@ impl SyscallDescriptor {
         self.arguments
     }
 
-    fn digest(self) -> u64 {
+    pub(crate) fn digest(self) -> u64 {
         let mut digest = 0xcbf2_9ce4_8422_2325_u64;
         digest = (digest ^ self.number as u64).wrapping_mul(0x0000_0100_0000_01b3);
         let mut index = 0;
@@ -3700,6 +3769,27 @@ impl EffectRegistry {
             .mint_reserved_device_ticket_after_install(reservation))
     }
 
+    /// Reserves a device preparation through an opaque causal-workload
+    /// session. The infrastructure context never crosses into the personality.
+    pub(crate) fn reserve_device_preparation_for_session(
+        &mut self,
+        session: &runtime_causal::CausalWorkloadSession,
+        coordinates: DeviceReservationCoordinates,
+    ) -> Result<DevicePreparationTicket, RegistryError> {
+        let identity =
+            self.verify_causal_workload_session(session)
+                .map_err(|error| match error {
+                    runtime_causal::CausalWorkloadError::Registry(error) => error,
+                    runtime_causal::CausalWorkloadError::Infrastructure(error) => error.into(),
+                    _ => RegistryError::InvalidHandle,
+                })?;
+        self.reserve_device_preparation(
+            session.infrastructure_context(),
+            identity.root_effect(),
+            coordinates,
+        )
+    }
+
     /// Pre-hardware cancellation. The exact ticket is returned on every
     /// failure, including a stale combined candidate after staging.
     pub(crate) fn cancel_device_preparation(
@@ -4008,6 +4098,155 @@ impl EffectRegistry {
             .mint_prepared_device_ticket_after_install(intent))
     }
 
+    /// Provider-neutral acknowledgement of one hardware preparation view.
+    /// The private infrastructure bridge reconstructs and validates every
+    /// Registry coordinate before it can mint retained hardware evidence.
+    pub(crate) fn acknowledge_device_prepared_from_view(
+        &mut self,
+        intent: DeviceApplyIntent,
+        receipt_view: &(impl DevicePreparedReceiptView + ?Sized),
+    ) -> Result<
+        (PreparedDeviceTicket, PreparedDeviceIdentity),
+        DevicePreparationRegistryFailure<DeviceApplyIntent>,
+    > {
+        let coordinates = match self.infrastructure.device_apply_coordinates(&intent) {
+            Ok(coordinates) => coordinates,
+            Err(error) => {
+                return Err(DevicePreparationRegistryFailure {
+                    error: error.into(),
+                    input: intent,
+                });
+            }
+        };
+        let (receipt, prepared_identity) =
+            match infrastructure::device_receipt_bridge::verify_preparation(
+                coordinates,
+                receipt_view,
+            ) {
+                Ok(verified) => verified,
+                Err(error) => {
+                    return Err(DevicePreparationRegistryFailure {
+                        error: error.into(),
+                        input: intent,
+                    });
+                }
+            };
+        self.acknowledge_device_prepared(intent, receipt)
+            .map(|ticket| (ticket, prepared_identity))
+    }
+
+    /// Publishes a verified rollback view for one exact started attempt.
+    pub(crate) fn acknowledge_device_rollback_from_view(
+        &mut self,
+        intent: DeviceApplyIntent,
+        receipt_view: &(impl DeviceRollbackReceiptView + ?Sized),
+    ) -> Result<(), DevicePreparationRegistryFailure<DeviceApplyIntent>> {
+        let coordinates = match self.infrastructure.device_apply_coordinates(&intent) {
+            Ok(coordinates) => coordinates,
+            Err(error) => {
+                return Err(DevicePreparationRegistryFailure {
+                    error: error.into(),
+                    input: intent,
+                });
+            }
+        };
+        let rollback =
+            match infrastructure::device_receipt_bridge::verify_rollback(coordinates, receipt_view)
+            {
+                Ok(rollback) => rollback,
+                Err(error) => {
+                    return Err(DevicePreparationRegistryFailure {
+                        error: error.into(),
+                        input: intent,
+                    });
+                }
+            };
+        self.acknowledge_device_apply_rollback(intent, rollback)
+            .map(|_| ())
+    }
+
+    /// Installs a fail-closed preparation observation while preserving the
+    /// retained queue/pinned/DMA credits. No prepared or materialized bearer
+    /// can be minted from this state.
+    pub(crate) fn retain_device_indeterminate_from_view(
+        &mut self,
+        intent: DeviceApplyIntent,
+        observation: &(impl DeviceIndeterminateReceiptView + ?Sized),
+    ) -> Result<u64, DevicePreparationRegistryFailure<DeviceApplyIntent>> {
+        let scope_key = intent.scope();
+        let coordinates = match self.infrastructure.device_apply_coordinates(&intent) {
+            Ok(coordinates) => coordinates,
+            Err(error) => {
+                return Err(DevicePreparationRegistryFailure {
+                    error: error.into(),
+                    input: intent,
+                });
+            }
+        };
+        let (owner_id, sequence, observation_digest) =
+            match infrastructure::device_receipt_bridge::verify_indeterminate(
+                coordinates,
+                observation,
+            ) {
+                Ok(verified) => verified,
+                Err(error) => {
+                    return Err(DevicePreparationRegistryFailure {
+                        error: error.into(),
+                        input: intent,
+                    });
+                }
+            };
+        let mut candidate = match self.combined_scope_candidate(scope_key) {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                return Err(DevicePreparationRegistryFailure {
+                    error,
+                    input: intent,
+                });
+            }
+        };
+        let prepared = match candidate
+            .replacement
+            .infrastructure
+            .prepare_device_indeterminate_in_candidate(
+                &intent,
+                owner_id,
+                sequence,
+                observation_digest,
+            ) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return Err(DevicePreparationRegistryFailure {
+                    error: error.into(),
+                    input: intent,
+                });
+            }
+        };
+        if let Err(error) = advance_device_preparation_scope(
+            candidate.replacement.scopes.get_mut(&scope_key).unwrap(),
+        ) {
+            return Err(DevicePreparationRegistryFailure {
+                error,
+                input: intent,
+            });
+        }
+        candidate
+            .replacement
+            .infrastructure
+            .apply_device_indeterminate_in_candidate(prepared);
+        let install = match self.prepare_combined_scope_install(candidate) {
+            Ok(install) => install,
+            Err(error) => {
+                return Err(DevicePreparationRegistryFailure {
+                    error,
+                    input: intent,
+                });
+            }
+        };
+        self.install_combined_scope(install);
+        Ok(observation_digest)
+    }
+
     pub(crate) fn query_device_preparation(
         &self,
         context: &infrastructure::WorkloadContext,
@@ -4018,6 +4257,21 @@ impl EffectRegistry {
         self.infrastructure
             .query_device_preparation(context, preparation_id, generation)
             .map_err(Into::into)
+    }
+
+    pub(crate) fn query_device_preparation_for_session(
+        &self,
+        session: &runtime_causal::CausalWorkloadSession,
+        preparation_id: u64,
+        generation: u64,
+    ) -> Result<DevicePreparationRecoveryProjection, RegistryError> {
+        self.verify_causal_workload_session(session)
+            .map_err(|error| match error {
+                runtime_causal::CausalWorkloadError::Registry(error) => error,
+                runtime_causal::CausalWorkloadError::Infrastructure(error) => error.into(),
+                _ => RegistryError::InvalidHandle,
+            })?;
+        self.query_device_preparation(session.infrastructure_context(), preparation_id, generation)
     }
 
     /// Atomically transfers one exact `PreparedRetained` authority into the
@@ -7755,6 +8009,95 @@ impl EffectRegistry {
         if root.closure.as_ref() != Some(presented) {
             return Err(RegistryError::InvalidBatchReceipt);
         }
+        Ok(())
+    }
+
+    /// Atomically installs the facade's exact three-owner IOTLB closure and
+    /// consumes the materialized preparation bearer. Business-effect draining
+    /// may begin only after this transition succeeds.
+    pub(crate) fn install_materialized_device_closure_from_view(
+        &mut self,
+        ticket: MaterializedDeviceTicket,
+        registry_closure: &DeviceClosureReceipt,
+        closure_view: &(impl DeviceClosureReceiptView + ?Sized),
+    ) -> Result<(), DevicePreparationRegistryFailure<MaterializedDeviceTicket>> {
+        if let Err(error) = self.validate_device_closure_receipt(registry_closure) {
+            return Err(DevicePreparationRegistryFailure {
+                error,
+                input: ticket,
+            });
+        }
+        let prepared = match self.infrastructure.materialized_device_identity(&ticket) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return Err(DevicePreparationRegistryFailure {
+                    error: error.into(),
+                    input: ticket,
+                });
+            }
+        };
+        let device_closure =
+            match infrastructure::device_receipt_bridge::verify_closure(prepared, closure_view) {
+                Ok(device_closure) => device_closure,
+                Err(error) => {
+                    return Err(DevicePreparationRegistryFailure {
+                        error: error.into(),
+                        input: ticket,
+                    });
+                }
+            };
+        let scope_key = ticket.scope();
+        let mut candidate = match self.combined_scope_candidate(scope_key) {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                return Err(DevicePreparationRegistryFailure {
+                    error,
+                    input: ticket,
+                });
+            }
+        };
+        let release = match candidate
+            .replacement
+            .infrastructure
+            .prepare_materialized_device_release_in_candidate(
+                &ticket,
+                infrastructure::ValidatedDeviceClosureProof::new(*registry_closure),
+                device_closure,
+            ) {
+            Ok(release) => release,
+            Err(error) => {
+                return Err(DevicePreparationRegistryFailure {
+                    error: error.into(),
+                    input: ticket,
+                });
+            }
+        };
+        if let Err(error) = advance_device_preparation_scope(
+            candidate.replacement.scopes.get_mut(&scope_key).unwrap(),
+        ) {
+            return Err(DevicePreparationRegistryFailure {
+                error,
+                input: ticket,
+            });
+        }
+        candidate
+            .replacement
+            .infrastructure
+            .apply_materialized_device_release_in_candidate(release);
+        let install = match self.prepare_combined_scope_install(candidate) {
+            Ok(install) => install,
+            Err(error) => {
+                return Err(DevicePreparationRegistryFailure {
+                    error,
+                    input: ticket,
+                });
+            }
+        };
+        self.install_combined_scope(install);
+        let installed = self
+            .infrastructure
+            .consume_materialized_ticket_after_release(ticket);
+        __cser_core::debug_assert_eq!(installed, *registry_closure);
         Ok(())
     }
 
@@ -15784,17 +16127,10 @@ fn device_preparation_outer_credit_self_test() {
         projection.credit_ownership,
         infrastructure::DevicePreparationCreditOwnership::RetainedByPreparation
     );
-    let rollback = infrastructure::DeviceRollbackReceipt {
-        owned_device: coordinates.owned_device,
-        queue: coordinates.queue,
-        device_generation: coordinates.device_generation,
-        operation_digest: coordinates.operation_digest,
-        actor_slot: coordinates.actor_slot,
-        actor_generation: coordinates.actor_generation,
-        rollback_receipt_digest: 0xdb50,
-    };
-    let mut wrong_actor = rollback;
-    wrong_actor.actor_generation += 1;
+    let rollback = infrastructure::model_device_rollback_receipt(coordinates, 0xdb50);
+    let mut wrong_coordinates = coordinates;
+    wrong_coordinates.actor_generation += 1;
+    let wrong_actor = infrastructure::model_device_rollback_receipt(wrong_coordinates, 0xdb50);
     let wrong_before = rolled_back.clone();
     let failure = rolled_back
         .acknowledge_device_apply_rollback(intent, wrong_actor)
@@ -15819,15 +16155,7 @@ fn device_preparation_outer_credit_self_test() {
         .begin_device_hardware_apply(ticket)
         .unwrap();
     rollback_overflow.scopes.get_mut(&SCOPE).unwrap().revision = u64::MAX;
-    let rollback = infrastructure::DeviceRollbackReceipt {
-        owned_device: coordinates.owned_device,
-        queue: coordinates.queue,
-        device_generation: coordinates.device_generation,
-        operation_digest: coordinates.operation_digest,
-        actor_slot: coordinates.actor_slot,
-        actor_generation: coordinates.actor_generation,
-        rollback_receipt_digest: 0xdb56,
-    };
+    let rollback = infrastructure::model_device_rollback_receipt(coordinates, 0xdb56);
     let failure = rollback_overflow
         .acknowledge_device_apply_rollback(intent, rollback)
         .unwrap_err();
@@ -15855,16 +16183,11 @@ fn device_preparation_outer_credit_self_test() {
         .unwrap();
     let intent = uncertain.begin_device_hardware_apply(ticket).unwrap();
     let device = DeviceEnvelope::new(0xdb70, coordinates.queue, 9, 1).unwrap();
-    let receipt = infrastructure::DeviceHardwareReceipt {
-        owned_device: coordinates.owned_device,
-        device,
-        operation_digest: coordinates.operation_digest,
-        actor_slot: coordinates.actor_slot,
-        actor_generation: coordinates.actor_generation,
-        hardware_receipt_digest: 0xdb71,
-    };
-    let mut wrong_actor = receipt;
-    wrong_actor.actor_generation += 1;
+    let receipt = infrastructure::model_device_hardware_receipt(coordinates, device, 0xdb71);
+    let mut wrong_coordinates = coordinates;
+    wrong_coordinates.actor_generation += 1;
+    let wrong_actor =
+        infrastructure::model_device_hardware_receipt(wrong_coordinates, device, 0xdb71);
     let wrong_before = uncertain.clone();
     let failure = uncertain
         .acknowledge_device_prepared(intent, wrong_actor)
@@ -16034,27 +16357,13 @@ fn device_preparation_outer_materialization_self_test() {
             .reserve_device_preparation(&workload, root, coordinates)
             .unwrap();
         let intent = registry.begin_device_hardware_apply(ticket).unwrap();
-        let hardware = infrastructure::DeviceHardwareReceipt {
-            owned_device,
-            device,
-            operation_digest: coordinates.operation_digest,
-            actor_slot: coordinates.actor_slot,
-            actor_generation: coordinates.actor_generation,
-            hardware_receipt_digest: request_id + 0x200,
-        };
+        let hardware =
+            infrastructure::model_device_hardware_receipt(coordinates, device, request_id + 0x200);
         let ticket = registry
             .acknowledge_device_prepared(intent, hardware)
             .unwrap();
-        let prepared = infrastructure::PreparedDeviceIdentity {
-            preparation_id: coordinates.preparation_id,
-            preparation_generation: coordinates.generation,
-            owned_device,
-            device,
-            operation_digest: coordinates.operation_digest,
-            actor_slot: coordinates.actor_slot,
-            actor_generation: coordinates.actor_generation,
-            hardware_receipt_digest: hardware.hardware_receipt_digest,
-        };
+        let prepared =
+            infrastructure::model_prepared_device_identity(coordinates, device, request_id + 0x200);
         let dma_entry =
             |batch_index: usize, operation: u32, resource_id: u64| DeviceDerivedCohortEntry {
                 batch_index,

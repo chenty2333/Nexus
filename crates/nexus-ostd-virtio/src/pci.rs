@@ -51,12 +51,14 @@ pub(crate) struct PioConfigurationAccess {
 }
 
 impl PioConfigurationAccess {
-    fn acquire() -> Self {
-        let address = IoPort::acquire(CONFIG_ADDRESS).expect("acquire PCI CONFIG_ADDRESS");
-        let data = IoPort::acquire(CONFIG_DATA).expect("acquire PCI CONFIG_DATA");
-        Self {
+    fn acquire() -> Result<Self, PciDiscoveryError> {
+        let address = IoPort::acquire(CONFIG_ADDRESS)
+            .map_err(|_| PciDiscoveryError::ConfigurationAddressBusy)?;
+        let data =
+            IoPort::acquire(CONFIG_DATA).map_err(|_| PciDiscoveryError::ConfigurationDataBusy)?;
+        Ok(Self {
             ports: Arc::new(SpinLock::new(ConfigPorts { address, data })),
-        }
+        })
     }
 }
 
@@ -107,6 +109,48 @@ pub struct DeviceBdf {
     bus: u8,
     device: u8,
     function: u8,
+}
+
+/// Typed failure while discovering and exclusively owning the production PCI fixture.
+///
+/// Discovery is transactional: no BAR owner is installed in the global registry
+/// unless every validation and acquisition below succeeds.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PciDiscoveryError {
+    /// Another owner already holds the PCI configuration-address port.
+    ConfigurationAddressBusy,
+    /// Another owner already holds the PCI configuration-data port.
+    ConfigurationDataBusy,
+    /// More than one modern VirtIO block function was enumerated on bus zero.
+    MultipleBlockDevices,
+    /// No modern VirtIO block function was enumerated on bus zero.
+    MissingBlockDevice,
+    /// The discovered block function is not the bounded production fixture.
+    UnexpectedBlockDeviceBdf { observed: DeviceBdf },
+    /// The discovered function does not advertise the VirtIO vendor ID.
+    UnexpectedVendor { observed: u16 },
+    /// The discovered function is not the modern VirtIO block device ID.
+    UnexpectedDeviceId { observed: u16 },
+    /// PCI BAR discovery failed for the owned function.
+    BarsUnavailable,
+    /// A previous root still owns the process-wide BAR registry.
+    BarOwnersAlreadyInstalled,
+    /// A memory BAR has no firmware-assigned address.
+    BarAddressMissing { index: u8 },
+    /// A memory BAR advertises an empty range.
+    BarSizeZero { index: u8 },
+    /// A memory BAR address cannot be represented by this kernel.
+    BarAddressOutOfRange { index: u8 },
+    /// A memory BAR length cannot be represented by this kernel.
+    BarSizeOutOfRange { index: u8 },
+    /// A memory BAR range wraps the kernel address space.
+    BarRangeOverflow { index: u8 },
+    /// Another kernel owner already retains the advertised BAR range.
+    BarOwnerUnavailable { index: u8 },
+    /// The function contains no usable memory BAR.
+    NoMemoryBars,
+    /// The non-zero INTx owner namespace is exhausted.
+    IntxOwnerIdentityExhausted,
 }
 
 /// Descriptive PCI INTx routing coordinates for the fixed Nexus block fixture.
@@ -185,6 +229,8 @@ pub enum IntxTransitionError {
     WrongState,
     /// The token names an earlier transition epoch.
     StaleEpoch,
+    /// No further transition epoch can be represented without aliasing an old token.
+    EpochExhausted,
     /// PCI command observation did not support the requested transition.
     CommandReadbackMismatch {
         /// Requested state of `Command::INTERRUPT_DISABLE`.
@@ -288,18 +334,18 @@ const fn command_with_intx_mask(command: Command, masked: bool) -> Command {
     }
 }
 
-fn allocate_intx_owner_id() -> u64 {
+fn allocate_intx_owner_id() -> Result<u64, PciDiscoveryError> {
     NEXT_INTX_OWNER_ID
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
             next.checked_add(1)
         })
-        .expect("INTx owner identity exhausted")
+        .map_err(|_| PciDiscoveryError::IntxOwnerIdentityExhausted)
 }
 
-fn next_intx_epoch(epoch: u64) -> u64 {
+fn next_intx_epoch(epoch: u64) -> Result<u64, IntxTransitionError> {
     epoch
         .checked_add(1)
-        .expect("INTx transition epoch exhausted")
+        .ok_or(IntxTransitionError::EpochExhausted)
 }
 
 impl DeviceBdf {
@@ -431,7 +477,15 @@ impl Root {
                 token: masked,
             });
         }
-        let epoch = next_intx_epoch(masked.epoch);
+        let epoch = match next_intx_epoch(masked.epoch) {
+            Ok(epoch) => epoch,
+            Err(error) => {
+                return Err(IntxTransitionFailure {
+                    error,
+                    token: masked,
+                });
+            }
+        };
         let (_, observed_before_unmask) = self.inner.get_status_command(self.device_function);
         if !observed_before_unmask.contains(Command::INTERRUPT_DISABLE) {
             let recovery = set_intx_mask(self, true);
@@ -500,7 +554,15 @@ impl Root {
             });
         }
 
-        let epoch = next_intx_epoch(unmasked.epoch);
+        let epoch = match next_intx_epoch(unmasked.epoch) {
+            Ok(epoch) => epoch,
+            Err(error) => {
+                return Err(IntxTransitionFailure {
+                    error,
+                    token: unmasked,
+                });
+            }
+        };
         let observation = set_intx_mask(self, true);
         if !observation.is_exact() {
             let restored = restore_intx_command(self, observation.before);
@@ -537,7 +599,7 @@ impl Root {
             | IntxOwnershipState::Unmasked { epoch }
             | IntxOwnershipState::Poisoned { epoch, .. } => epoch,
         };
-        let epoch = next_intx_epoch(current_epoch);
+        let epoch = next_intx_epoch(current_epoch)?;
         let observation = set_intx_mask(self, true);
         if !observation.is_exact() {
             self.intx_state = IntxOwnershipState::Poisoned {
@@ -562,6 +624,21 @@ impl Root {
         assert!(!self.portal_claimed, "PCI device portal claimed twice");
         self.portal_claimed = true;
         self.device_function
+    }
+
+    /// Claims the device for a production owner without panicking on reuse.
+    ///
+    /// The caller holds `&mut Root`, so checking and installing the claim are
+    /// one exclusive operation. The legacy portal keeps its older invariant-
+    /// checked constructor; new production paths surface reuse as typed input
+    /// failure.
+    pub(crate) fn try_claim_device_function(&mut self) -> Option<DeviceFunction> {
+        if self.portal_claimed {
+            None
+        } else {
+            self.portal_claimed = true;
+            Some(self.device_function)
+        }
     }
 
     pub(crate) fn raw_mut(&mut self) -> &mut RawRoot {
@@ -635,20 +712,49 @@ impl Root {
         self.assert_intx_state_matches_readback();
     }
 
-    fn observe_internal_command_or_poison(&mut self, expected: Command, observed: Command) {
-        if observed != expected {
-            if let IntxOwnershipState::Masked { epoch }
-            | IntxOwnershipState::Unmasked { epoch }
-            | IntxOwnershipState::Poisoned { epoch, .. } = self.intx_state
-            {
-                self.intx_state = IntxOwnershipState::Poisoned {
-                    epoch,
-                    observed_masked: observed.contains(Command::INTERRUPT_DISABLE),
-                };
+    fn internal_mask_allowed_checked(&mut self) -> Result<(), PrepareCommandFailure> {
+        match self.intx_state {
+            IntxOwnershipState::Unclaimed => Ok(()),
+            IntxOwnershipState::Masked { epoch } => {
+                let (_, command) = self.inner.get_status_command(self.device_function);
+                if command.contains(Command::INTERRUPT_DISABLE) {
+                    Ok(())
+                } else {
+                    self.intx_state = IntxOwnershipState::Poisoned {
+                        epoch,
+                        observed_masked: false,
+                    };
+                    Err(PrepareCommandFailure::ReadbackMismatch {
+                        original_command: command,
+                    })
+                }
             }
+            IntxOwnershipState::Unmasked { .. } | IntxOwnershipState::Poisoned { .. } => {
+                Err(PrepareCommandFailure::IntxStateUnavailable)
+            }
+        }
+    }
+
+    fn observe_internal_command_or_poison(&mut self, expected: Command, observed: Command) {
+        if !self.observe_internal_command_checked(expected, observed) {
             panic!("PCI command readback mismatch");
         }
         self.assert_intx_state_matches_command(observed);
+    }
+
+    fn observe_internal_command_checked(&mut self, expected: Command, observed: Command) -> bool {
+        let exact = observed == expected;
+        if !exact
+            && let IntxOwnershipState::Masked { epoch }
+            | IntxOwnershipState::Unmasked { epoch }
+            | IntxOwnershipState::Poisoned { epoch, .. } = self.intx_state
+        {
+            self.intx_state = IntxOwnershipState::Poisoned {
+                epoch,
+                observed_masked: observed.contains(Command::INTERRUPT_DISABLE),
+            };
+        }
+        exact
     }
 }
 
@@ -683,11 +789,29 @@ impl BarRegistry {
 }
 
 pub fn begin_transport_claims() {
+    try_begin_transport_claims().expect("transport claim lifecycle is quiescent");
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TransportClaimStartError {
+    BarOwnersUnavailable,
+    AlreadyActive,
+    StaleClaims,
+}
+
+pub(crate) fn try_begin_transport_claims() -> Result<(), TransportClaimStartError> {
     let mut registry = BAR_REGISTRY.lock();
-    assert!(registry.installed);
-    assert!(!registry.transport_claims_active);
-    assert!(registry.claims.iter().all(Option::is_none));
+    if !registry.installed {
+        return Err(TransportClaimStartError::BarOwnersUnavailable);
+    }
+    if registry.transport_claims_active {
+        return Err(TransportClaimStartError::AlreadyActive);
+    }
+    if !registry.claims.iter().all(Option::is_none) {
+        return Err(TransportClaimStartError::StaleClaims);
+    }
     registry.transport_claims_active = true;
+    Ok(())
 }
 
 /// Releases the raw capability subranges claimed by one destroyed transport.
@@ -704,68 +828,150 @@ pub(crate) unsafe fn release_transport_claims() {
     registry.transport_claims_active = false;
 }
 
+/// Attempts to release the claims of a transport which never became exposed.
+///
+/// This is the production-constructor rollback counterpart of
+/// [`release_transport_claims`]. It deliberately does not assert: an
+/// inconsistent registry means rollback cannot be certified, so the static
+/// claim state is retained and the caller must quarantine the preparation.
+///
+/// # Safety
+///
+/// Every `PciTransport` and raw MMIO pointer for the attempted transport must
+/// already have been destroyed. This function is only valid before the device
+/// reached `DRIVER_OK`.
+pub(crate) unsafe fn release_unexposed_transport_claims_checked() -> bool {
+    let mut registry = BAR_REGISTRY.lock();
+    if !registry.installed || !registry.transport_claims_active {
+        return false;
+    }
+    registry.claims.fill(None);
+    registry.transport_claims_active = false;
+    true
+}
+
 static BAR_REGISTRY: SpinLock<BarRegistry> = SpinLock::new(BarRegistry::new());
+
+/// Read-only transport-capability projection for preparation evidence.
+///
+/// The range coordinates stay private. A caller can learn only whether the
+/// unique transport lifecycle is active and how many owner-backed subranges
+/// it currently retains.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TransportClaimObservation {
+    pub(crate) active: bool,
+    pub(crate) claim_count: usize,
+}
+
+pub(crate) fn transport_claim_observation() -> TransportClaimObservation {
+    let registry = BAR_REGISTRY.lock();
+    TransportClaimObservation {
+        active: registry.transport_claims_active,
+        claim_count: registry.claims.iter().flatten().count(),
+    }
+}
 
 /// Discovers exactly one modern VirtIO block device on bus 0 and installs one
 /// owner for each of its memory BARs before raw capability pointers are made.
-pub fn discover_and_own_bars() -> Root {
-    let configuration = PioConfigurationAccess::acquire();
+pub fn discover_and_own_bars() -> Result<Root, PciDiscoveryError> {
+    let configuration = PioConfigurationAccess::acquire()?;
     let mut root = RawRoot::new(configuration.clone());
     let mut found = None;
 
     for (device_function, info) in root.enumerate_bus(0) {
         if virtio_device_type(&info) == Some(DeviceType::Block) {
-            assert!(found.is_none(), "expected one VirtIO block device");
+            if found.is_some() {
+                return Err(PciDiscoveryError::MultipleBlockDevices);
+            }
             found = Some((device_function, info));
         }
     }
 
-    let (device_function, info) = found.expect("missing VirtIO block device");
-    assert_eq!(
-        device_function, EXPECTED_DEVICE,
-        "unexpected block-device BDF"
-    );
-    assert_eq!(info.vendor_id, 0x1af4, "unexpected VirtIO vendor");
-    assert_eq!(
-        info.device_id, MODERN_VIRTIO_BLOCK_DEVICE_ID,
-        "legacy or non-block VirtIO device"
-    );
+    let (device_function, info) = found.ok_or(PciDiscoveryError::MissingBlockDevice)?;
+    if device_function != EXPECTED_DEVICE {
+        return Err(PciDiscoveryError::UnexpectedBlockDeviceBdf {
+            observed: DeviceBdf::from(device_function),
+        });
+    }
+    if info.vendor_id != 0x1af4 {
+        return Err(PciDiscoveryError::UnexpectedVendor {
+            observed: info.vendor_id,
+        });
+    }
+    if info.device_id != MODERN_VIRTIO_BLOCK_DEVICE_ID {
+        return Err(PciDiscoveryError::UnexpectedDeviceId {
+            observed: info.device_id,
+        });
+    }
 
-    let bars = root.bars(device_function).expect("read VirtIO PCI BARs");
-    let mut registry = BAR_REGISTRY.lock();
-    assert!(!registry.installed, "BAR owners installed twice");
+    let bars = root
+        .bars(device_function)
+        .map_err(|_| PciDiscoveryError::BarsUnavailable)?;
+    {
+        let registry = BAR_REGISTRY.lock();
+        if registry.installed
+            || registry.transport_claims_active
+            || !registry.owners.iter().all(Option::is_none)
+            || !registry.claims.iter().all(Option::is_none)
+        {
+            return Err(PciDiscoveryError::BarOwnersAlreadyInstalled);
+        }
+    }
+    let mut owners = [const { None }; 6];
     let mut memory_bars = 0;
 
     for (index, bar) in bars.into_iter().enumerate() {
         let Some(BarInfo::Memory { address, size, .. }) = bar else {
             continue;
         };
-        assert_ne!(address, 0, "VirtIO BAR is not allocated");
-        assert_ne!(size, 0, "VirtIO BAR has zero size");
-        let start = usize::try_from(address).expect("BAR address fits usize");
-        let length = usize::try_from(size).expect("BAR size fits usize");
-        let end = start.checked_add(length).expect("BAR range overflow");
-        let io_mem = IoMem::acquire(start..end).expect("acquire unique VirtIO BAR owner");
-        registry.owners[index] = Some(BarOwner { start, end, io_mem });
+        let index = index as u8;
+        if address == 0 {
+            return Err(PciDiscoveryError::BarAddressMissing { index });
+        }
+        if size == 0 {
+            return Err(PciDiscoveryError::BarSizeZero { index });
+        }
+        let start = usize::try_from(address)
+            .map_err(|_| PciDiscoveryError::BarAddressOutOfRange { index })?;
+        let length =
+            usize::try_from(size).map_err(|_| PciDiscoveryError::BarSizeOutOfRange { index })?;
+        let end = start
+            .checked_add(length)
+            .ok_or(PciDiscoveryError::BarRangeOverflow { index })?;
+        let io_mem = IoMem::acquire(start..end)
+            .map_err(|_| PciDiscoveryError::BarOwnerUnavailable { index })?;
+        owners[usize::from(index)] = Some(BarOwner { start, end, io_mem });
         memory_bars += 1;
     }
 
-    assert_ne!(memory_bars, 0, "VirtIO device has no memory BAR");
+    if memory_bars == 0 {
+        return Err(PciDiscoveryError::NoMemoryBars);
+    }
     let intx_route = decode_intx_route(
         DeviceBdf::from(device_function),
         configuration.read_word(device_function, INTERRUPT_CONFIG_OFFSET),
     );
+    let intx_owner_id = allocate_intx_owner_id()?;
+    let mut registry = BAR_REGISTRY.lock();
+    if registry.installed
+        || registry.transport_claims_active
+        || !registry.owners.iter().all(Option::is_none)
+        || !registry.claims.iter().all(Option::is_none)
+    {
+        return Err(PciDiscoveryError::BarOwnersAlreadyInstalled);
+    }
+    registry.owners = owners;
     registry.installed = true;
     drop(registry);
-    Root {
+    Ok(Root {
         inner: root,
         device_function,
         memory_bars,
         intx_route,
-        intx_owner_id: allocate_intx_owner_id(),
+        intx_owner_id,
         intx_state: IntxOwnershipState::Unclaimed,
         portal_claimed: false,
-    }
+    })
 }
 
 fn set_intx_mask(root: &mut Root, masked: bool) -> IntxCommandObservation {
@@ -792,30 +998,61 @@ pub(crate) fn enable_device_for_prepare(
     root: &mut Root,
     device_function: DeviceFunction,
 ) -> Command {
-    root.assert_device(device_function);
-    root.assert_internal_mask_allowed();
+    match enable_device_for_prepare_checked(root, device_function) {
+        Ok(command) => command,
+        Err(PrepareCommandFailure::ForeignRoot) => panic!("foreign PCI root owner"),
+        Err(PrepareCommandFailure::IntxStateUnavailable) => {
+            panic!("recover or mask INTx through its linear owner-state API first")
+        }
+        Err(PrepareCommandFailure::ReadbackMismatch { .. }) => {
+            panic!("PCI command readback mismatch")
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PrepareCommandFailure {
+    ForeignRoot,
+    IntxStateUnavailable,
+    ReadbackMismatch { original_command: Command },
+}
+
+pub(crate) fn enable_device_for_prepare_checked(
+    root: &mut Root,
+    device_function: DeviceFunction,
+) -> Result<Command, PrepareCommandFailure> {
+    if root.device_function != device_function {
+        return Err(PrepareCommandFailure::ForeignRoot);
+    }
+    root.internal_mask_allowed_checked()?;
     let (_, command) = root.inner.get_status_command(device_function);
     let expected =
         command | Command::MEMORY_SPACE | Command::BUS_MASTER | Command::INTERRUPT_DISABLE;
     root.inner.set_command(device_function, expected);
     let (_, observed) = root.inner.get_status_command(device_function);
-    root.observe_internal_command_or_poison(expected, observed);
-    command
+    if root.observe_internal_command_checked(expected, observed) {
+        root.assert_intx_state_matches_command(observed);
+        Ok(command)
+    } else {
+        Err(PrepareCommandFailure::ReadbackMismatch {
+            original_command: command,
+        })
+    }
 }
 
 pub(crate) fn enable_device(root: &mut Root, device_function: DeviceFunction) {
     let _ = enable_device_for_prepare(root, device_function);
 }
 
-pub(crate) fn restore_device_command(
+pub(crate) fn restore_device_command_checked(
     root: &mut Root,
     device_function: DeviceFunction,
     command: Command,
-) {
+) -> bool {
     root.assert_device(device_function);
     root.inner.set_command(device_function, command);
     let (_, observed) = root.inner.get_status_command(device_function);
-    root.observe_internal_command_or_poison(command, observed);
+    root.observe_internal_command_checked(command, observed)
 }
 
 pub(crate) fn disable_bus_master(root: &mut Root, device_function: DeviceFunction) {
@@ -826,6 +1063,28 @@ pub(crate) fn disable_bus_master(root: &mut Root, device_function: DeviceFunctio
     root.inner.set_command(device_function, expected);
     let (_, observed) = root.inner.get_status_command(device_function);
     root.observe_internal_command_or_poison(expected, observed);
+}
+
+pub(crate) fn disable_bus_master_checked(
+    root: &mut Root,
+    device_function: DeviceFunction,
+) -> Result<(), PrepareCommandFailure> {
+    if root.device_function != device_function {
+        return Err(PrepareCommandFailure::ForeignRoot);
+    }
+    root.internal_mask_allowed_checked()?;
+    let (_, command) = root.inner.get_status_command(device_function);
+    let expected = (command & !Command::BUS_MASTER) | Command::INTERRUPT_DISABLE;
+    root.inner.set_command(device_function, expected);
+    let (_, observed) = root.inner.get_status_command(device_function);
+    if root.observe_internal_command_checked(expected, observed) {
+        root.assert_intx_state_matches_command(observed);
+        Ok(())
+    } else {
+        Err(PrepareCommandFailure::ReadbackMismatch {
+            original_command: command,
+        })
+    }
 }
 
 /// Returns a BAR-subrange pointer while the registry retains the unique
@@ -946,12 +1205,12 @@ mod tests {
         assert!(!implementation.contains("#[derive(Clone, Copy)]\npub struct UnmaskedIntx"));
 
         let unmask_epoch = implementation
-            .find("let epoch = next_intx_epoch(masked.epoch);")
+            .find("let epoch = match next_intx_epoch(masked.epoch)")
             .unwrap();
         let unmask_write = implementation.find("set_intx_mask(self, false);").unwrap();
         assert!(unmask_epoch < unmask_write);
         let mask_epoch = implementation
-            .find("let epoch = next_intx_epoch(unmasked.epoch);")
+            .find("let epoch = match next_intx_epoch(unmasked.epoch)")
             .unwrap();
         let mask_write = implementation.rfind("set_intx_mask(self, true);").unwrap();
         assert!(mask_epoch < mask_write);

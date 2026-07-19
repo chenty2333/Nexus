@@ -10,6 +10,9 @@ runtime_causal_file=${4:-$script_root/src/cser/effect_registry/runtime_causal.rs
 infrastructure_root_file=${5:-$script_root/src/cser/infrastructure/root.rs}
 infrastructure_mod_file=${6:-$script_root/src/cser/infrastructure/mod.rs}
 effect_registry_file=${7:-$script_root/src/cser/effect_registry.rs}
+adapter_file=${8:-$script_root/src/personality/virtio_cser_adapter.rs}
+receipt_bridge_file=${9:-$script_root/src/cser/infrastructure/device_receipt_bridge.rs}
+registry_file=$effect_registry_file
 
 fail() {
     echo "runtime filesystem same-boot source assertion: FAIL: $*" >&2
@@ -23,9 +26,35 @@ for input in \
     "$runtime_causal_file" \
     "$infrastructure_root_file" \
     "$infrastructure_mod_file" \
-    "$effect_registry_file"; do
+    "$effect_registry_file" \
+    "$adapter_file" \
+    "$receipt_bridge_file"; do
     [[ -f $input && ! -L $input ]] ||
         fail "implementation source is not a regular non-symlink file: $input"
+done
+
+# Concrete VirtIO receipt types belong only to the Linux filesystem consumer
+# and its feature-gated sibling adapter. The CSER core owns provider-neutral
+# views and must remain host-compilable without the OSTD facade dependency.
+if grep -R -Fq --include='*.rs' -- 'nexus_ostd_virtio' "$script_root/src/cser"; then
+    fail 'concrete nexus_ostd_virtio dependency entered the CSER core'
+fi
+mapfile -t concrete_virtio_files < <(
+    grep -R -lF --include='*.rs' -- 'nexus_ostd_virtio' "$script_root/src" || true
+)
+[[ ${#concrete_virtio_files[@]} == 2 ]] ||
+    fail "expected concrete VirtIO references in exactly linux_fs + sibling adapter, observed ${#concrete_virtio_files[@]} files"
+for expected_concrete_file in \
+    "$script_root/src/personality/linux_fs.rs" \
+    "$script_root/src/personality/virtio_cser_adapter.rs"; do
+    found_expected=false
+    for concrete_file in "${concrete_virtio_files[@]}"; do
+        if [[ $concrete_file == "$expected_concrete_file" ]]; then
+            found_expected=true
+        fi
+    done
+    [[ $found_expected == true ]] ||
+        fail "missing sole allowed concrete VirtIO dependency edge: $expected_concrete_file"
 done
 for command_name in awk bash cmp cp grep mapfile mktemp rm sed; do
     command -v "$command_name" >/dev/null 2>&1 ||
@@ -217,6 +246,7 @@ infrastructure_child_open="$work/infrastructure-child-open.rs"
 infrastructure_child_apply="$work/infrastructure-child-apply.rs"
 infrastructure_historical_close="$work/infrastructure-historical-close.rs"
 registry_revoke_prepare="$work/registry-revoke-prepare.rs"
+adapter_phase="$work/device-adapter-phase.rs"
 
 extract_between "$source_file" 'struct FsState {' \
     'struct FsClosureWork {' "$fs_state"
@@ -368,6 +398,8 @@ extract_between "$effect_registry_file" \
     'fn prepare_revoke_complete_apply(' \
     'fn apply_revoke_complete(&mut self, plan: RevokeCompleteApplyPlan)' \
     "$registry_revoke_prepare"
+extract_between "$source_file" 'enum FsDeviceAdapterPhase {' \
+    'enum FsDeviceAdapterTransitionError {' "$adapter_phase"
 
 # RFC 0001 accepts one root, one production Registry, and one ledger. The
 # legacy in-memory filesystem Registry may remain in the non-facade build, but
@@ -387,6 +419,10 @@ require_regex_count "$causal_slot" \
 require_count "$causal_slot" 'struct FsCausalActivationReservation' 1
 reject_regex "$causal_slot" '(^|[^_])assert!\('
 require_count "$causal_session" 'pub(super) context: infrastructure::WorkloadContext,' 2
+require_count "$causal_session" \
+    'pub(super) const fn infrastructure_context(&self) -> &infrastructure::WorkloadContext {' 1
+reject_fixed "$causal_session" \
+    'pub(crate) const fn infrastructure_context(&self) -> &infrastructure::WorkloadContext {'
 causal_session_line=$(line_of_unique "$runtime_causal_file" \
     'pub(crate) struct CausalWorkloadSession {')
 causal_session_derive=$(sed -n "$((causal_session_line - 1))p" \
@@ -645,6 +681,56 @@ reject_fixed "$source_file" 'clone_non_device_candidate'
 require_at_least "$source_file" 'registry=shared_production' 1
 require_at_least "$source_file" 'compatibility_syscalls=payload_only_not_cser' 1
 
+# The sibling adapter is the sole production implementation/call edge for the
+# provider-neutral receipt vocabulary. Fully qualified inherent calls prevent
+# same-name trait methods from accidentally recursing.
+for trait_impl in \
+    'impl DevicePreparedReceiptView for PreparationReceipt {' \
+    'impl DeviceRollbackReceiptView for PreparationRollbackReceipt {' \
+    'impl DeviceIndeterminateReceiptView for PreparationIndeterminate {' \
+    'impl DeviceClosureReceiptView for ProductionClosureReceipt {'; do
+    require_count "$adapter_file" "$trait_impl" 1
+done
+require_count "$adapter_file" 'PreparationReceipt::' 11
+require_count "$adapter_file" 'PreparationRollbackReceipt::' 10
+require_count "$adapter_file" 'PreparationIndeterminate::' 5
+require_count "$adapter_file" 'ProductionClosureReceipt::' 8
+reject_regex "$adapter_file" 'self\.[A-Za-z_][A-Za-z0-9_]*\('
+for trait_definition in \
+    'pub(crate) trait DevicePreparedReceiptView {' \
+    'pub(crate) trait DeviceRollbackReceiptView {' \
+    'pub(crate) trait DeviceIndeterminateReceiptView {' \
+    'pub(crate) trait DeviceClosureReceiptView {'; do
+    require_count "$registry_file" "$trait_definition" 1
+done
+for concrete_type in \
+    nexus_ostd_virtio \
+    PreparationReceipt \
+    PreparationRollbackReceipt \
+    PreparationIndeterminate \
+    ProductionClosureReceipt; do
+    reject_fixed "$receipt_bridge_file" "$concrete_type"
+done
+require_count "$adapter_file" \
+    'registry.acknowledge_device_prepared_from_view(intent, receipt)' 1
+require_count "$adapter_file" \
+    'registry.acknowledge_device_rollback_from_view(intent, receipt)' 1
+require_count "$adapter_file" \
+    'registry.retain_device_indeterminate_from_view(intent, observation)' 1
+require_count "$adapter_file" \
+    'registry.install_materialized_device_closure_from_view(ticket, registry_closure, closure)' 1
+require_count "$source_file" 'crate::virtio_cser_adapter::acknowledge_prepared(' 1
+require_count "$source_file" 'crate::virtio_cser_adapter::acknowledge_rollback(' 1
+require_count "$source_file" 'crate::virtio_cser_adapter::retain_indeterminate(' 1
+require_count "$source_file" 'crate::virtio_cser_adapter::install_materialized_closure(' 1
+for core_entry in \
+    acknowledge_device_prepared_from_view \
+    acknowledge_device_rollback_from_view \
+    retain_device_indeterminate_from_view \
+    install_materialized_device_closure_from_view; do
+    reject_fixed "$source_file" "$core_entry"
+done
+
 # The runtime slot, not a stack-local compatibility flight, owns every linear
 # hardware successor. Old phase/dispatch names are forbidden because they
 # allowed root/device/selection state to drift apart.
@@ -659,6 +745,9 @@ for forbidden in \
     reject_fixed "$source_file" "$forbidden"
 done
 for state in \
+    'Reserved {' \
+    'PreparationApplying {' \
+    'PreparedPendingAck {' \
     'Ready {' \
     'Captured {' \
     'Prepared {' \
@@ -678,6 +767,24 @@ for state in \
     'Transitioning'; do
     require_at_least "$flight" "$state" 1
 done
+for phase in \
+    Vacant Reserved Applying PreparedPendingAck Prepared MaterializedUnpublished Published \
+    Closing ClosureInstalledDrainPending Released IndeterminateRetained; do
+    require_regex_count "$adapter_phase" "^[[:space:]]+$phase,$" 1
+done
+require_count "$runtime" 'adapter_phase: FsDeviceAdapterPhase,' 1
+require_count "$runtime" \
+    'materialized_authority: MaterializedAuthoritySlot,' 1
+require_count "$source_file" 'enum MaterializedAuthoritySlot {' 1
+for required in \
+    'Active(MaterializedDeviceTicket),' \
+    'RetainedConflict {' \
+    'fn install(' \
+    'fn take(&mut self) -> Result<MaterializedDeviceTicket, MaterializedAuthorityTakeError>' \
+    'MaterializedAuthorityInstallError::Saturated(authority)' \
+    'FsRuntimeCompletionError::MaterializedAuthorityRetained'; do
+    require_at_least "$source_file" "$required" 1
+done
 require_count "$runtime_impl" \
     'core::mem::replace(&mut self.flight, FsDeviceFlight::Transitioning)' 1
 require_count "$runtime_impl" 'debug_assert!(matches!(self.flight, FsDeviceFlight::Transitioning));' 1
@@ -685,6 +792,24 @@ reject_regex "$runtime_impl" '^[[:space:]]*assert!\(matches!\(self\.flight, FsDe
 reject_fixed "$runtime_impl" 'check_invariants()'
 require_at_least "$runtime_impl" 'self.put_flight(' 3
 require_at_least "$runtime_impl" 'FsDeviceFlight::Retained {' 1
+require_count "$runtime_impl" \
+    'self.adapter_phase = FsDeviceAdapterPhase::IndeterminateRetained;' 3
+require_count "$runtime_impl" \
+    ') -> Result<(), FsDeviceAdapterTransitionError> {' 3
+reject_fixed "$runtime_impl" 'panic!("device adapter cannot enter Closing'
+reject_regex "$runtime_impl" '^[[:space:]]*assert(_eq)?!\(self\.adapter_phase'
+for forbidden in \
+    'unreachable!()' \
+    '.expect("prevalidated owner-bound publish intent")' \
+    '.expect("recovered close did not consume fresh publish intent")' \
+    '.expect("materialized device authority survives until IOTLB closure")' \
+    '.expect("prevalidated cancel intent is consumed once")' \
+    '.expect("prevalidated completion reset is consumed once")' \
+    '.expect("prevalidated failed-completion reset is consumed once")' \
+    '.expect("prevalidated published reset is consumed once")'; do
+    reject_fixed "$dispatch" "$forbidden"
+    reject_fixed "$closure_driver" "$forbidden"
+done
 require_at_least "$source_file" 'owner_runtime_resident=true' 1
 reject_fixed "$dispatch" 'core::mem::forget'
 reject_fixed "$dispatch" 'EffectRegistry::new()'
@@ -923,12 +1048,19 @@ for required in \
     require_at_least "$dispatch" "$required" 1
 done
 reject_fixed "$dispatch" 'runtime.registry.register_derived('
-require_count "$dispatch" 'runtime.registry.register_device_derived_cohort([' 1
+require_count "$dispatch" \
+    'runtime.registry.materialize_device_cohort_from_preparation(' 1
 require_count "$dispatch" '.enroll_device_batch(' 1
 require_count "$dispatch" \
     'mint_device_flight_key(&runtime.registry, &enrollment, cookie)' 1
 require_count "$dispatch" 'commit_or_recover_device_flight_with_apply(' 1
-require_count "$dispatch" '.publish_prepared()' 1
+require_count "$dispatch" 'device.preflight_publish(request, expected)' 1
+require_count "$dispatch" \
+    'request_slot.take().map(|intent| intent.apply())' 1
+reject_fixed "$dispatch" '.expect("prevalidated owner-bound publish intent")'
+reject_fixed "$dispatch" 'unreachable!()'
+require_at_least "$dispatch" '.apply()' 2
+reject_fixed "$dispatch" '.publish_prepared()'
 require_at_least "$dispatch" 'runtime.put_flight(' 8
 require_at_least "$dispatch" 'runtime.retain_current(' 3
 reject_fixed "$dispatch" 'begin_unpublished_device_cancel('
@@ -951,12 +1083,15 @@ reject_fixed "$generic_dispatch" 'EffectRegistry::new()'
 
 # This witness is polling-only. Facade interrupt preparation/tokens are useful
 # substrate, but they are not evidence that an OSTD IRQ actor delivered work.
-require_count "$source_file" 'prepare_read_sector0(&mut root)' 1
+require_count "$source_file" 'device.preflight_read_sector0(&mut root)' 1
 require_count "$dispatch" \
     'runtime.verify_causal_session(cookie, captured.identity.effect())' 1
 require_order "$dispatch" \
     'runtime.verify_causal_session(cookie, captured.identity.effect())' \
-    'prepare_read_sector0(&mut root)'
+    'registry.reserve_device_preparation_for_session(session, coordinates)' \
+    'device.preflight_read_sector0(&mut root)' \
+    'runtime.registry.begin_device_hardware_apply(reservation)' \
+    'let request = match permit.apply()'
 reject_fixed "$dispatch" 'close_or_verify_causal_terminal'
 reject_fixed "$dispatch" 'prepare_read_sector0_irq('
 reject_fixed "$dispatch" '.ack_interrupt('
@@ -984,6 +1119,66 @@ for required in \
 done
 reject_fixed "$dispatch" 'poll_completion()'
 reject_fixed "$source_file" '.poll_completion'
+reject_fixed "$source_file" 'DeviceHardwareReceipt {'
+reject_fixed "$source_file" 'DeviceRollbackReceipt {'
+
+# The adapter stores every exact hardware/Registry bearer before the next
+# fallible cross-component acknowledgement, then materializes one block and
+# three DMA effects. Publication consumes only a prevalidated intent after all
+# business Prepare/enrollment work. The materialized bearer survives through
+# reset and IOTLB and is consumed only by the coupled closure install before
+# leaf draining or frame-credit reuse.
+for required in \
+    'reserve_device_preparation_for_session(session, coordinates)' \
+    'cancel_device_preparation(reservation)' \
+    'FsDeviceFlight::PreparationApplying {' \
+    'device.issue_preparation_receipt(request)' \
+    'FsDeviceFlight::PreparedPendingAck {' \
+    'crate::virtio_cser_adapter::acknowledge_prepared(' \
+    'runtime.registry.materialize_device_cohort_from_preparation(' \
+    '.install(materialized.authority)' \
+    'device.preflight_publish(request, expected)' \
+    'request_slot' \
+    'request_slot.take().map(|intent| intent.apply())' \
+    '.apply()'; do
+    require_at_least "$dispatch" "$required" 1
+done
+require_count "$dispatch" \
+    'runtime.put_flight(FsDeviceFlight::PreparedPendingAck {' 2
+require_order "$dispatch" \
+    'registry.reserve_device_preparation_for_session(session, coordinates)' \
+    'device.preflight_read_sector0(&mut root)' \
+    'runtime.registry.begin_device_hardware_apply(reservation)' \
+    'let request = match permit.apply()' \
+    'runtime.put_flight(FsDeviceFlight::PreparationApplying {' \
+    'device.issue_preparation_receipt(request)' \
+    'let FsDeviceFlight::PreparedPendingAck {' \
+    'crate::virtio_cser_adapter::acknowledge_prepared(' \
+    'runtime.registry.materialize_device_cohort_from_preparation(' \
+    '.install(materialized.authority)' \
+    '.enroll_device_batch(authority, &handles, envelope)' \
+    'device.preflight_publish(request, expected)' \
+    'commit_or_recover_device_flight_with_apply('
+require_count "$closure_driver" \
+    '.acknowledge_device_iotlb_with_apply(&registry_retry, |_| {' 1
+require_at_least "$closure_driver" '.materialized_authority' 2
+require_count "$closure_driver" \
+    'let materialized = match runtime.materialized_authority.take() {' 1
+reject_fixed "$closure_driver" \
+    '.expect("materialized device authority survives until IOTLB closure")'
+require_count "$closure_driver" \
+    'crate::virtio_cser_adapter::install_materialized_closure(' 1
+require_at_least "$closure_driver" \
+    'runtime.put_flight(FsDeviceFlight::Draining {' 2
+require_at_least "$closure_driver" 'next_ordinal: 0,' 1
+require_at_least "$closure_driver" \
+    'FsDeviceAdapterPhase::ClosureInstalledDrainPending' 2
+require_order "$closure_driver" \
+    '.acknowledge_device_iotlb_with_apply(&registry_retry, |_| {' \
+    'let materialized = match runtime.materialized_authority.take() {' \
+    'crate::virtio_cser_adapter::install_materialized_closure(' \
+    'LINUX_FS_SAME_BOOT IotlbAck completed_pages=3' \
+    '.stage_device_batch_terminal('
 
 # Guest publication is the final cross-object transition. The Registry must
 # acknowledge the terminal publication and complete the frozen revoke as one
@@ -1125,7 +1320,8 @@ if [[ ${NEXUS_SAME_BOOT_SOURCE_PRIMARY_ONLY:-0} != 1 ]]; then
         if NEXUS_SAME_BOOT_SOURCE_PRIMARY_ONLY=1 bash "$0" \
             "$source_file" "$lib_file" "$device_flight_file" \
             "$runtime_causal_file" "$1" "$infrastructure_mod_file" \
-            "$effect_registry_file" >/dev/null 2>&1; then
+            "$effect_registry_file" "$adapter_file" "$receipt_bridge_file" \
+            >/dev/null 2>&1; then
             fail "source gate accepted infrastructure root mutation: $2"
         fi
     }
@@ -1134,7 +1330,8 @@ if [[ ${NEXUS_SAME_BOOT_SOURCE_PRIMARY_ONLY:-0} != 1 ]]; then
         if NEXUS_SAME_BOOT_SOURCE_PRIMARY_ONLY=1 bash "$0" \
             "$source_file" "$lib_file" "$device_flight_file" \
             "$runtime_causal_file" "$infrastructure_root_file" "$1" \
-            "$effect_registry_file" >/dev/null 2>&1; then
+            "$effect_registry_file" "$adapter_file" "$receipt_bridge_file" \
+            >/dev/null 2>&1; then
             fail "source gate accepted infrastructure type mutation: $2"
         fi
     }
@@ -1143,8 +1340,29 @@ if [[ ${NEXUS_SAME_BOOT_SOURCE_PRIMARY_ONLY:-0} != 1 ]]; then
         if NEXUS_SAME_BOOT_SOURCE_PRIMARY_ONLY=1 bash "$0" \
             "$source_file" "$lib_file" "$device_flight_file" \
             "$runtime_causal_file" "$infrastructure_root_file" \
-            "$infrastructure_mod_file" "$1" >/dev/null 2>&1; then
+            "$infrastructure_mod_file" "$1" "$adapter_file" \
+            "$receipt_bridge_file" >/dev/null 2>&1; then
             fail "source gate accepted Registry mutation: $2"
+        fi
+    }
+
+    require_adapter_rejection() {
+        if NEXUS_SAME_BOOT_SOURCE_PRIMARY_ONLY=1 bash "$0" \
+            "$source_file" "$lib_file" "$device_flight_file" \
+            "$runtime_causal_file" "$infrastructure_root_file" \
+            "$infrastructure_mod_file" "$effect_registry_file" "$1" \
+            "$receipt_bridge_file" >/dev/null 2>&1; then
+            fail "source gate accepted VirtIO adapter mutation: $2"
+        fi
+    }
+
+    require_receipt_bridge_rejection() {
+        if NEXUS_SAME_BOOT_SOURCE_PRIMARY_ONLY=1 bash "$0" \
+            "$source_file" "$lib_file" "$device_flight_file" \
+            "$runtime_causal_file" "$infrastructure_root_file" \
+            "$infrastructure_mod_file" "$effect_registry_file" "$adapter_file" \
+            "$1" >/dev/null 2>&1; then
+            fail "source gate accepted receipt bridge mutation: $2"
         fi
     }
 
@@ -1626,7 +1844,39 @@ if [[ ${NEXUS_SAME_BOOT_SOURCE_PRIMARY_ONLY:-0} != 1 ]]; then
     require_effect_registry_rejection "$work/nonprojected-root-finish.rs" \
         nonprojected-root-finish
 
-    [[ $mutations == 40 ]] || fail "expected 40 source mutations, observed $mutations"
+    cp "$adapter_file" "$work/recursive-receipt-view.rs"
+    sed -i \
+        '0,/PreparationReceipt::attempt(self)/s//self.attempt()/' \
+        "$work/recursive-receipt-view.rs"
+    require_mutation "$adapter_file" "$work/recursive-receipt-view.rs" \
+        recursive-receipt-view
+    require_adapter_rejection "$work/recursive-receipt-view.rs" \
+        recursive-receipt-view
+
+    cp "$receipt_bridge_file" "$work/concrete-core-receipt.rs"
+    sed -i '1i use nexus_ostd_virtio::PreparationReceipt;' \
+        "$work/concrete-core-receipt.rs"
+    require_mutation "$receipt_bridge_file" "$work/concrete-core-receipt.rs" \
+        concrete-core-receipt
+    require_receipt_bridge_rejection "$work/concrete-core-receipt.rs" \
+        concrete-core-receipt
+
+    cp "$source_file" "$work/phase-mismatch-continues.rs"
+    sed -i \
+        '0,/self.adapter_phase = FsDeviceAdapterPhase::IndeterminateRetained;/s//self.adapter_phase = next;/' \
+        "$work/phase-mismatch-continues.rs"
+    require_mutation "$source_file" "$work/phase-mismatch-continues.rs" \
+        phase-mismatch-continues
+    require_source_rejection "$work/phase-mismatch-continues.rs" phase-mismatch-continues
+
+    cp "$source_file" "$work/publish-owner-expect.rs"
+    sed -i \
+        '0,/request_slot.take().map(|intent| intent.apply())/s//request_slot.take().expect("prevalidated owner-bound publish intent").apply()/' \
+        "$work/publish-owner-expect.rs"
+    require_mutation "$source_file" "$work/publish-owner-expect.rs" publish-owner-expect
+    require_source_rejection "$work/publish-owner-expect.rs" publish-owner-expect
+
+    [[ $mutations == 44 ]] || fail "expected 44 source mutations, observed $mutations"
 fi
 
-echo 'runtime filesystem same-boot source assertions: PASS checkpoint=device_flight accepted_registry=one accepted_ledger=one compatibility_syscalls=payload_only_not_cser causal_bootstrap=workload+two-phase-core causal_slot=vacant+active+closed causal_close=non-clone+failure-atomic+projected-root-finish combined_order=external+ack+workload+root exact_outer_ack_retry=true rfc0003_obligations=not_wired source_mapped=false observed=false adapter_wired=false flight=single_actor_slot_handoff actor_resident=false semantic_identity=registry_issued real_user_service_crash=true fsd_task_key=current-task-bound+951:1->951:2 replacement_construction=post-crash distinct_task_vm=true guest_admission=receipt-before-armed guest_wait_locks=none crash_cohort=filesystem_read_only stale_prepare=queued-v1+failure-atomic old_sender_current_handle=NoSupervisor reply_wakeups=1 published_error=retained ack_revoke=failure_atomic guest_write=prevalidated+infallible_frame_apply fail_stop=before_guest_resume post_terminal_allocation=false facade_companion=false polling=true irq_evidence=false smp=1 legacy_phase=false rfc0001_full_closure=false mutations=40'
+echo 'runtime filesystem same-boot source assertions: PASS checkpoint=device_flight accepted_registry=one accepted_ledger=one compatibility_syscalls=payload_only_not_cser causal_bootstrap=workload+two-phase-core causal_slot=vacant+active+closed causal_close=non-clone+failure-atomic+projected-root-finish combined_order=external+ack+workload+root exact_outer_ack_retry=true rfc0003_obligations=not_wired source_mapped=false observed=false adapter_wired=false flight=single_actor_slot_handoff actor_resident=false semantic_identity=registry_issued receipt_boundary=provider-neutral+sibling-adapter-only real_user_service_crash=true fsd_task_key=current-task-bound+951:1->951:2 replacement_construction=post-crash distinct_task_vm=true guest_admission=receipt-before-armed guest_wait_locks=none crash_cohort=filesystem_read_only stale_prepare=queued-v1+failure-atomic old_sender_current_handle=NoSupervisor reply_wakeups=1 published_error=retained ack_revoke=failure_atomic guest_write=prevalidated+infallible_frame_apply fail_stop=before_guest_resume post_terminal_allocation=false facade_companion=false polling=true irq_evidence=false smp=1 legacy_phase=false rfc0001_full_closure=false mutations=44'

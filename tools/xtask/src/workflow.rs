@@ -2561,7 +2561,7 @@ fn validate_backend_source_pair_semantics(
 fn expected_backend_source_sha256(relative: &str) -> Result<&'static str> {
     match relative {
         "kernel/nexus-ostd/x" => {
-            Ok("b2f3a6d65ef9996950ad59f21d387c24481e0f099f6cb62b9b4469c6c2ace0c4")
+            Ok("783ac422934fda763daa0bff52d1282a1d21de0000b9d4c0aec6242976adfbcb")
         }
         "experiments/ostd-virtio-cser-spike/x" => {
             Ok("e51d863a8134cfd8b25ff33438441c73a93f6548ea0202fad54a6c4270153ee9")
@@ -2798,10 +2798,10 @@ fn validate_backend_docker_source_set_semantics(
 fn expected_backend_docker_sha256(relative: &str) -> Result<&'static str> {
     match relative {
         "kernel/nexus-ostd/Dockerfile" => {
-            Ok("bc67ae442290e4aee975ad2e5ff4e40a5799ec9527f9cf29f36c5418939811a3")
+            Ok("ca213ec54cfbb086886c9e0d1ea26a37e4a41318b621264d4f106f85af287182")
         }
         "experiments/ostd-virtio-cser-spike/Dockerfile" => {
-            Ok("c09f2565776d1695fbdae0a3f693e11978402d44c32436ff5e117af33bccc987")
+            Ok("d13b7c6629849de19957ad0536033706e2ebef9e54d761a4a0357beae332b1dc")
         }
         _ => Err(format!("unknown production backend Dockerfile: {relative}").into()),
     }

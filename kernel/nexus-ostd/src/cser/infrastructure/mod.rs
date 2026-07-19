@@ -23,6 +23,7 @@ mod continuation;
 mod deadline;
 mod delayed;
 mod device;
+pub(super) mod device_receipt_bridge;
 mod fault;
 mod invariants;
 mod reply;
@@ -2248,12 +2249,14 @@ impl ValidatedDeviceClosureProof {
     __cser_core::cmp::PartialEq,
 )]
 pub(crate) struct DeviceHardwareReceipt {
-    pub(crate) owned_device: ResourceKey,
-    pub(crate) device: DeviceEnvelope,
-    pub(crate) operation_digest: u64,
-    pub(crate) actor_slot: u32,
-    pub(crate) actor_generation: u64,
-    pub(crate) hardware_receipt_digest: u64,
+    owned_device: ResourceKey,
+    device: DeviceEnvelope,
+    operation_digest: u64,
+    actor_slot: u32,
+    actor_generation: u64,
+    hardware_receipt_digest: u64,
+    preparation_owner_id: u64,
+    preparation_sequence: u64,
 }
 
 /// Exact adapter presentation bound to one `PreparedRetained` owner.
@@ -2279,6 +2282,8 @@ pub(crate) struct PreparedDeviceIdentity {
     pub(crate) actor_slot: u32,
     pub(crate) actor_generation: u64,
     pub(crate) hardware_receipt_digest: u64,
+    pub(crate) preparation_owner_id: u64,
+    pub(crate) preparation_sequence: u64,
 }
 
 #[derive(
@@ -2289,13 +2294,78 @@ pub(crate) struct PreparedDeviceIdentity {
     __cser_core::cmp::PartialEq,
 )]
 pub(crate) struct DeviceRollbackReceipt {
-    pub(crate) owned_device: ResourceKey,
-    pub(crate) queue: u16,
-    pub(crate) device_generation: u64,
-    pub(crate) operation_digest: u64,
-    pub(crate) actor_slot: u32,
-    pub(crate) actor_generation: u64,
-    pub(crate) rollback_receipt_digest: u64,
+    owned_device: ResourceKey,
+    queue: u16,
+    device_generation: u64,
+    operation_digest: u64,
+    actor_slot: u32,
+    actor_generation: u64,
+    rollback_receipt_digest: u64,
+    preparation_owner_id: u64,
+    preparation_sequence: u64,
+}
+
+// Pure Registry model fixtures do not link a hardware facade. Keeping their
+// constructors in this private module lets tests exercise mutation rejection
+// without reopening receipt fields to personalities or services.
+fn model_preparation_attempt(coordinates: DeviceReservationCoordinates) -> (u64, u64) {
+    (coordinates.actor_generation, coordinates.preparation_id)
+}
+
+pub(super) fn model_device_hardware_receipt(
+    coordinates: DeviceReservationCoordinates,
+    device: DeviceEnvelope,
+    digest: u64,
+) -> DeviceHardwareReceipt {
+    let (preparation_owner_id, preparation_sequence) = model_preparation_attempt(coordinates);
+    DeviceHardwareReceipt {
+        owned_device: coordinates.owned_device,
+        device,
+        operation_digest: coordinates.operation_digest,
+        actor_slot: coordinates.actor_slot,
+        actor_generation: coordinates.actor_generation,
+        hardware_receipt_digest: digest,
+        preparation_owner_id,
+        preparation_sequence,
+    }
+}
+
+pub(super) fn model_device_rollback_receipt(
+    coordinates: DeviceReservationCoordinates,
+    digest: u64,
+) -> DeviceRollbackReceipt {
+    let (preparation_owner_id, preparation_sequence) = model_preparation_attempt(coordinates);
+    DeviceRollbackReceipt {
+        owned_device: coordinates.owned_device,
+        queue: coordinates.queue,
+        device_generation: coordinates.device_generation,
+        operation_digest: coordinates.operation_digest,
+        actor_slot: coordinates.actor_slot,
+        actor_generation: coordinates.actor_generation,
+        rollback_receipt_digest: digest,
+        preparation_owner_id,
+        preparation_sequence,
+    }
+}
+
+pub(super) fn model_prepared_device_identity(
+    coordinates: DeviceReservationCoordinates,
+    device: DeviceEnvelope,
+    digest: u64,
+) -> PreparedDeviceIdentity {
+    let (preparation_owner_id, preparation_sequence) = model_preparation_attempt(coordinates);
+    PreparedDeviceIdentity {
+        preparation_id: coordinates.preparation_id,
+        preparation_generation: coordinates.generation,
+        owned_device: coordinates.owned_device,
+        device,
+        operation_digest: coordinates.operation_digest,
+        actor_slot: coordinates.actor_slot,
+        actor_generation: coordinates.actor_generation,
+        hardware_receipt_digest: digest,
+        preparation_owner_id,
+        preparation_sequence,
+    }
 }
 
 #[derive(
@@ -2308,6 +2378,7 @@ pub(crate) struct DeviceRollbackReceipt {
 pub(crate) enum DevicePreparationRecoveryState {
     Reserved,
     ApplyingHardware,
+    IndeterminateRetained,
     PreparedRetained,
     Materialized,
     Released,
@@ -2345,6 +2416,7 @@ pub(crate) struct DevicePreparationRecoveryProjection {
     pub(crate) cohort: Option<DeviceCohortIdentity>,
     pub(crate) rollback_receipt: Option<DeviceRollbackReceipt>,
     pub(crate) closure_receipt: Option<RegistryDeviceClosureReceipt>,
+    pub(crate) observation_digest: Option<u64>,
 }
 
 #[derive(
@@ -2377,6 +2449,8 @@ struct PreparedOwner {
     actor_slot: u32,
     actor_generation: u64,
     hardware_receipt_digest: u64,
+    preparation_owner_id: u64,
+    preparation_sequence: u64,
 }
 
 #[derive(
@@ -2642,6 +2716,7 @@ pub(crate) enum InfrastructureEventKind {
     DeadlineExhaustedResolved,
     DeviceReserved,
     DeviceApplying,
+    DeviceIndeterminateRetained,
     DeviceRolledBack,
     DevicePreparedRetained,
     DeviceMaterialized,
@@ -3226,6 +3301,11 @@ enum DevicePhase {
     Applying {
         apply_generation: u64,
         apply_nonce: u64,
+    },
+    IndeterminateRetained {
+        preparation_owner_id: u64,
+        preparation_sequence: u64,
+        observation_digest: u64,
     },
     PreparedRetained {
         owner: PreparedOwner,

@@ -20,6 +20,8 @@ use super::{
     validate_active_admission, validate_context, validate_stamp_common_historical,
 };
 
+use super::device_receipt_bridge::VerifiedDeviceClosure;
+
 pub(in super::super) struct PreparedDeviceFinish {
     scope: super::ScopeKey,
     preparation_id: u64,
@@ -51,6 +53,16 @@ pub(in super::super) struct PreparedDeviceAcknowledge {
     next_revision: u64,
 }
 
+pub(in super::super) struct PreparedDeviceIndeterminate {
+    scope: super::ScopeKey,
+    preparation_id: u64,
+    bearer_generation: u64,
+    preparation_owner_id: u64,
+    preparation_sequence: u64,
+    observation_digest: u64,
+    next_revision: u64,
+}
+
 pub(in super::super) struct PreparedDeviceMaterialization {
     scope: super::ScopeKey,
     preparation_id: u64,
@@ -59,6 +71,13 @@ pub(in super::super) struct PreparedDeviceMaterialization {
     next_pinned_pages: u32,
     next_dma_mappings: u32,
     next_revision: u64,
+}
+
+pub(in super::super) struct PreparedMaterializedDeviceRelease {
+    finish: PreparedDeviceFinish,
+    owner: PreparedOwner,
+    cohort: DeviceCohortIdentity,
+    closure: RegistryDeviceClosureReceipt,
 }
 
 struct PreparedDeviceAdoption {
@@ -434,10 +453,61 @@ impl InfrastructureState {
             || rollback.actor_slot != coordinates.actor_slot
             || rollback.actor_generation != coordinates.actor_generation
             || rollback.rollback_receipt_digest == 0
+            || rollback.preparation_owner_id == 0
+            || rollback.preparation_sequence == 0
         {
             return Err(InfrastructureError::InvalidReceipt);
         }
         prepare_device_finish(scope, record, DeviceCreditOwnership::Released)
+    }
+
+    pub(in super::super) fn prepare_device_indeterminate_in_candidate(
+        &self,
+        intent: &DeviceApplyIntent,
+        preparation_owner_id: u64,
+        preparation_sequence: u64,
+        observation_digest: u64,
+    ) -> Result<PreparedDeviceIndeterminate, InfrastructureError> {
+        require_device_ledger_mode(self, LedgerMode::NonAuthoritativeCandidate)?;
+        let scope = self.scope(intent.0.authority.scope)?;
+        let record = validate_device_key(scope, self.registry_instance, &intent.0)?;
+        if !__cser_core::matches!(record.phase, DevicePhase::Applying { .. })
+            || preparation_owner_id == 0
+            || preparation_sequence == 0
+            || observation_digest == 0
+        {
+            return Err(InfrastructureError::InvalidReceipt);
+        }
+        Ok(PreparedDeviceIndeterminate {
+            scope: record.stamp.root.scope,
+            preparation_id: record.stamp.identity.preparation_id,
+            bearer_generation: next_device_bearer_generation(record)?,
+            preparation_owner_id,
+            preparation_sequence,
+            observation_digest,
+            next_revision: preview_revision(scope)?,
+        })
+    }
+
+    pub(in super::super) fn apply_device_indeterminate_in_candidate(
+        &mut self,
+        prepared: PreparedDeviceIndeterminate,
+    ) {
+        __cser_core::debug_assert_eq!(self.mode, LedgerMode::NonAuthoritativeCandidate);
+        let scope = installed_scope_mut(self, prepared.scope);
+        let record = scope.devices.get_mut(prepared.preparation_id).unwrap();
+        record.stamp.bearer_generation = prepared.bearer_generation;
+        record.phase = DevicePhase::IndeterminateRetained {
+            preparation_owner_id: prepared.preparation_owner_id,
+            preparation_sequence: prepared.preparation_sequence,
+            observation_digest: prepared.observation_digest,
+        };
+        scope.revision = prepared.next_revision;
+        scope.events.push(
+            InfrastructureEventKind::DeviceIndeterminateRetained,
+            record.stamp.identity.preparation_id,
+            record.stamp.identity.generation,
+        );
     }
 
     pub(in super::super) fn apply_device_apply_rollback_in_candidate(
@@ -530,6 +600,8 @@ impl InfrastructureState {
             || receipt.actor_slot != coordinates.actor_slot
             || receipt.actor_generation != coordinates.actor_generation
             || receipt.hardware_receipt_digest == 0
+            || receipt.preparation_owner_id == 0
+            || receipt.preparation_sequence == 0
         {
             return Err(InfrastructureError::InvalidReceipt);
         }
@@ -566,6 +638,8 @@ impl InfrastructureState {
                 actor_slot: receipt.actor_slot,
                 actor_generation: receipt.actor_generation,
                 hardware_receipt_digest: receipt.hardware_receipt_digest,
+                preparation_owner_id: receipt.preparation_owner_id,
+                preparation_sequence: receipt.preparation_sequence,
             },
         };
         scope.revision = prepared.next_revision;
@@ -798,12 +872,14 @@ impl InfrastructureState {
                                 DevicePhase::PreparedRetained { .. }
                                 | DevicePhase::Reserved
                                 | DevicePhase::Applying { .. }
+                                | DevicePhase::IndeterminateRetained { .. }
                                 | DevicePhase::Cancelled { .. } => None,
                             };
                             (Some(owner), cohort)
                         }
                         DevicePhase::Reserved
                         | DevicePhase::Applying { .. }
+                        | DevicePhase::IndeterminateRetained { .. }
                         | DevicePhase::Cancelled { .. } => (None, None),
                     };
                     let prepared = owner.map(|owner| PreparedDeviceIdentity {
@@ -815,6 +891,8 @@ impl InfrastructureState {
                         actor_slot: owner.actor_slot,
                         actor_generation: owner.actor_generation,
                         hardware_receipt_digest: owner.hardware_receipt_digest,
+                        preparation_owner_id: owner.preparation_owner_id,
+                        preparation_sequence: owner.preparation_sequence,
                     });
                     DevicePreparationCreditProjection {
                         scope: *scope,
@@ -848,11 +926,7 @@ impl InfrastructureState {
                 _ => return Err(InfrastructureError::InvalidState),
             };
             let closure = proof.receipt;
-            if closure.registry_instance_id != registry_instance
-                || closure.scope != record.stamp.root.scope
-                || closure.device != owner.device
-                || closure.sequence == 0
-            {
+            if !valid_materialized_closure(registry_instance, record, owner, closure) {
                 return Err(InfrastructureError::InvalidReceipt);
             }
             let prepared =
@@ -869,6 +943,80 @@ impl InfrastructureState {
             );
             Ok(closure)
         })
+    }
+
+    /// Candidate-only half of the production closure transaction. It binds
+    /// Registry reset/IOTLB closure and facade DMA closure to the same retained
+    /// preparation before the materialized bearer is consumed.
+    pub(in super::super) fn prepare_materialized_device_release_in_candidate(
+        &self,
+        ticket: &MaterializedDeviceTicket,
+        proof: ValidatedDeviceClosureProof,
+        device_closure: VerifiedDeviceClosure,
+    ) -> Result<PreparedMaterializedDeviceRelease, InfrastructureError> {
+        require_device_ledger_mode(self, LedgerMode::NonAuthoritativeCandidate)?;
+        let scope = self.scope(ticket.0.authority.scope)?;
+        let record = validate_device_key(scope, self.registry_instance, &ticket.0)?;
+        let (owner, cohort) = match record.phase {
+            DevicePhase::Materialized {
+                owner,
+                cohort,
+                preparation_credits_transferred: true,
+            } => (owner, cohort),
+            _ => return Err(InfrastructureError::InvalidState),
+        };
+        let closure = proof.receipt;
+        if !valid_materialized_closure(self.registry_instance, record, owner, closure)
+            || device_closure.preparation_owner_id != owner.preparation_owner_id
+            || device_closure.preparation_sequence != owner.preparation_sequence
+            || device_closure.device != owner.device
+        {
+            return Err(InfrastructureError::InvalidReceipt);
+        }
+        Ok(PreparedMaterializedDeviceRelease {
+            finish: prepare_device_finish(scope, record, DeviceCreditOwnership::Transferred)?,
+            owner,
+            cohort,
+            closure,
+        })
+    }
+
+    pub(in super::super) fn apply_materialized_device_release_in_candidate(
+        &mut self,
+        prepared: PreparedMaterializedDeviceRelease,
+    ) {
+        __cser_core::debug_assert_eq!(self.mode, LedgerMode::NonAuthoritativeCandidate);
+        let scope = installed_scope_mut(self, prepared.finish.scope);
+        apply_device_finish(
+            scope,
+            prepared.finish,
+            DevicePhase::Released {
+                owner: prepared.owner,
+                cohort: Some(prepared.cohort),
+                closure: prepared.closure,
+            },
+        );
+        scope.events.push(
+            InfrastructureEventKind::DeviceReleased,
+            prepared.closure.sequence,
+            prepared.closure.device.device_generation(),
+        );
+    }
+
+    pub(in super::super) fn consume_materialized_ticket_after_release(
+        &self,
+        ticket: MaterializedDeviceTicket,
+    ) -> RegistryDeviceClosureReceipt {
+        let previous = ticket.0;
+        let record = installed_device_successor(self, &previous);
+        match record.phase {
+            DevicePhase::Released {
+                cohort: Some(_),
+                closure,
+                ..
+            } => closure,
+            _ => __cser_core::unreachable!(),
+        }
     }
 
     pub(in super::super) fn release_unmaterialized_retained_device(
@@ -944,6 +1092,22 @@ impl InfrastructureState {
         Ok(record.stamp.identity)
     }
 
+    pub(in super::super) fn materialized_device_identity(
+        &self,
+        ticket: &MaterializedDeviceTicket,
+    ) -> Result<PreparedDeviceIdentity, InfrastructureError> {
+        let scope = self.scope(ticket.0.authority.scope)?;
+        let record = validate_device_key(scope, self.registry_instance, &ticket.0)?;
+        match record.phase {
+            DevicePhase::Materialized {
+                owner,
+                preparation_credits_transferred: true,
+                ..
+            } => Ok(prepared_identity(record, owner)),
+            _ => Err(InfrastructureError::InvalidState),
+        }
+    }
+
     pub(in super::super) fn query_device_preparation(
         &self,
         context: &WorkloadContext,
@@ -974,55 +1138,71 @@ impl InfrastructureState {
             }
             DeviceCreditOwnership::Released => DevicePreparationCreditOwnership::Released,
         };
-        let (state, prepared_device, cohort, rollback_receipt, closure_receipt) = match record.phase
-        {
-            DevicePhase::Reserved => (
-                DevicePreparationRecoveryState::Reserved,
-                None,
-                None,
-                None,
-                None,
-            ),
-            DevicePhase::Applying { .. } => (
-                DevicePreparationRecoveryState::ApplyingHardware,
-                None,
-                None,
-                None,
-                None,
-            ),
-            DevicePhase::PreparedRetained { owner } => (
-                DevicePreparationRecoveryState::PreparedRetained,
-                Some(owner.device),
-                None,
-                None,
-                None,
-            ),
-            DevicePhase::Materialized { owner, cohort, .. } => (
-                DevicePreparationRecoveryState::Materialized,
-                Some(owner.device),
-                Some(cohort),
-                None,
-                None,
-            ),
-            DevicePhase::Released {
-                owner,
-                cohort,
-                closure,
-            } => (
-                DevicePreparationRecoveryState::Released,
-                Some(owner.device),
-                cohort,
-                None,
-                Some(closure),
-            ),
-            DevicePhase::Cancelled { rollback } => (
-                DevicePreparationRecoveryState::Cancelled,
-                None,
-                None,
-                rollback,
-                None,
-            ),
-        };
+        let (state, prepared_device, cohort, rollback_receipt, closure_receipt, observation_digest) =
+            match record.phase {
+                DevicePhase::Reserved => (
+                    DevicePreparationRecoveryState::Reserved,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+                DevicePhase::Applying { .. } => (
+                    DevicePreparationRecoveryState::ApplyingHardware,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+                DevicePhase::IndeterminateRetained {
+                    observation_digest, ..
+                } => (
+                    DevicePreparationRecoveryState::IndeterminateRetained,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(observation_digest),
+                ),
+                DevicePhase::PreparedRetained { owner } => (
+                    DevicePreparationRecoveryState::PreparedRetained,
+                    Some(owner.device),
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+                DevicePhase::Materialized { owner, cohort, .. } => (
+                    DevicePreparationRecoveryState::Materialized,
+                    Some(owner.device),
+                    Some(cohort),
+                    None,
+                    None,
+                    None,
+                ),
+                DevicePhase::Released {
+                    owner,
+                    cohort,
+                    closure,
+                } => (
+                    DevicePreparationRecoveryState::Released,
+                    Some(owner.device),
+                    cohort,
+                    None,
+                    Some(closure),
+                    None,
+                ),
+                DevicePhase::Cancelled { rollback } => (
+                    DevicePreparationRecoveryState::Cancelled,
+                    None,
+                    None,
+                    rollback,
+                    None,
+                    None,
+                ),
+            };
         let parent_effect = match record.stamp.parent {
             ParentStamp::Effect(parent) => parent,
             _ => return Err(InfrastructureError::ForeignParent),
@@ -1039,9 +1219,12 @@ impl InfrastructureState {
                 actor_slot: owner.actor_slot,
                 actor_generation: owner.actor_generation,
                 hardware_receipt_digest: owner.hardware_receipt_digest,
+                preparation_owner_id: owner.preparation_owner_id,
+                preparation_sequence: owner.preparation_sequence,
             }),
             DevicePhase::Reserved
             | DevicePhase::Applying { .. }
+            | DevicePhase::IndeterminateRetained { .. }
             | DevicePhase::Cancelled { .. } => None,
         };
         Ok(DevicePreparationRecoveryProjection {
@@ -1054,6 +1237,7 @@ impl InfrastructureState {
             cohort,
             rollback_receipt,
             closure_receipt,
+            observation_digest,
         })
     }
 
@@ -1083,7 +1267,9 @@ impl InfrastructureState {
         }
         if __cser_core::matches!(
             record.phase,
-            DevicePhase::Released { .. } | DevicePhase::Cancelled { .. }
+            DevicePhase::IndeterminateRetained { .. }
+                | DevicePhase::Released { .. }
+                | DevicePhase::Cancelled { .. }
         ) {
             return Err(InfrastructureError::InvalidState);
         }
@@ -1148,7 +1334,9 @@ impl InfrastructureState {
                     bearer_state::DeviceMaterialized,
                 >(record)))
             }
-            DevicePhase::Released { .. } | DevicePhase::Cancelled { .. } => {
+            DevicePhase::IndeterminateRetained { .. }
+            | DevicePhase::Released { .. }
+            | DevicePhase::Cancelled { .. } => {
                 __cser_core::unreachable!()
             }
         })
@@ -1236,6 +1424,20 @@ impl PreparedDeviceTicket {
     #[cfg(test)]
     pub(in super::super) fn stale_bearer_for_test(&self) -> Self {
         Self(stale_device_key_for_test(&self.0))
+    }
+}
+
+impl MaterializedDeviceTicket {
+    pub(in super::super) const fn scope(&self) -> super::ScopeKey {
+        self.0.authority.scope
+    }
+
+    pub(in super::super) const fn preparation_id(&self) -> u64 {
+        self.0.slot
+    }
+
+    pub(in super::super) const fn generation(&self) -> u64 {
+        self.0.object_generation
     }
 }
 
@@ -1546,6 +1748,17 @@ fn validate_device_record_body(
                 && apply_generation == record.apply_generation
                 && record.credit_ownership == DeviceCreditOwnership::Retained
         }
+        DevicePhase::IndeterminateRetained {
+            preparation_owner_id,
+            preparation_sequence,
+            observation_digest,
+        } => {
+            record.apply_generation != 0
+                && record.credit_ownership == DeviceCreditOwnership::Retained
+                && preparation_owner_id != 0
+                && preparation_sequence != 0
+                && observation_digest != 0
+        }
         DevicePhase::PreparedRetained { owner } => {
             record.apply_generation != 0
                 && record.credit_ownership == DeviceCreditOwnership::Retained
@@ -1575,10 +1788,12 @@ fn validate_device_record_body(
             ownership_matches
                 && validate_prepared_owner(record, owner).is_ok()
                 && cohort.is_none_or(|cohort| cohort.validate().is_ok())
-                && closure.registry_instance_id == record.stamp.root.registry_instance
-                && closure.scope == record.stamp.root.scope
-                && closure.device == owner.device
-                && closure.sequence != 0
+                && valid_materialized_closure(
+                    record.stamp.root.registry_instance,
+                    record,
+                    owner,
+                    closure,
+                )
         }
         DevicePhase::Cancelled { rollback } => {
             record.credit_ownership == DeviceCreditOwnership::Released
@@ -1607,10 +1822,28 @@ fn validate_prepared_owner(
         || owner.actor_slot != coordinates.actor_slot
         || owner.actor_generation != coordinates.actor_generation
         || owner.hardware_receipt_digest == 0
+        || owner.preparation_owner_id == 0
+        || owner.preparation_sequence == 0
     {
         return Err(InfrastructureError::InvalidReceipt);
     }
     Ok(())
+}
+
+fn valid_materialized_closure(
+    registry_instance: u64,
+    record: &DeviceRecord,
+    owner: PreparedOwner,
+    closure: RegistryDeviceClosureReceipt,
+) -> bool {
+    let next_generation = owner.device.device_generation().checked_add(1);
+    closure.registry_instance_id == registry_instance
+        && closure.scope == record.stamp.root.scope
+        && closure.sequence != 0
+        && closure.device.device_session() == owner.device.device_session()
+        && closure.device.queue() == owner.device.queue()
+        && closure.device.descriptor_token() == owner.device.descriptor_token()
+        && Some(closure.device.device_generation()) == next_generation
 }
 
 fn validate_rollback(record: &DeviceRecord, rollback: DeviceRollbackReceipt) -> bool {
@@ -1622,6 +1855,8 @@ fn validate_rollback(record: &DeviceRecord, rollback: DeviceRollbackReceipt) -> 
         && rollback.actor_slot == coordinates.actor_slot
         && rollback.actor_generation == coordinates.actor_generation
         && rollback.rollback_receipt_digest != 0
+        && rollback.preparation_owner_id != 0
+        && rollback.preparation_sequence != 0
 }
 
 fn reverse_index_for_device_record(
@@ -1662,6 +1897,8 @@ fn prepared_identity(record: &DeviceRecord, owner: PreparedOwner) -> PreparedDev
         actor_slot: owner.actor_slot,
         actor_generation: owner.actor_generation,
         hardware_receipt_digest: owner.hardware_receipt_digest,
+        preparation_owner_id: owner.preparation_owner_id,
+        preparation_sequence: owner.preparation_sequence,
     }
 }
 

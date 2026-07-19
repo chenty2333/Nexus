@@ -292,7 +292,9 @@ pub(super) fn check_scope_invariants(
             (record.phase, record.credit_ownership),
             (DevicePhase::Reserved, DeviceCreditOwnership::Held)
                 | (
-                    DevicePhase::Applying { .. } | DevicePhase::PreparedRetained { .. },
+                    DevicePhase::Applying { .. }
+                        | DevicePhase::IndeterminateRetained { .. }
+                        | DevicePhase::PreparedRetained { .. },
                     DeviceCreditOwnership::Retained
                 )
                 | (
@@ -329,6 +331,7 @@ pub(super) fn check_scope_invariants(
                 .map_err(|_| InfrastructureError::Invariant("invalid device cohort identity"))?,
             DevicePhase::Reserved
             | DevicePhase::Applying { .. }
+            | DevicePhase::IndeterminateRetained { .. }
             | DevicePhase::PreparedRetained { .. }
             | DevicePhase::Released { cohort: None, .. }
             | DevicePhase::Cancelled { .. } => {}
@@ -336,6 +339,7 @@ pub(super) fn check_scope_invariants(
         match record.phase {
             DevicePhase::Reserved
             | DevicePhase::Applying { .. }
+            | DevicePhase::IndeterminateRetained { .. }
             | DevicePhase::PreparedRetained { .. } => {
                 add_device_usage(&mut expected_usage, record.stamp.identity)?;
             }

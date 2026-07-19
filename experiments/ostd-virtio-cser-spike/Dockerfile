@@ -41,6 +41,8 @@ COPY --from=nexus-root kernel/nexus-ostd/src/cser/infrastructure/delayed.rs \
     /kernel/nexus-ostd/src/cser/infrastructure/delayed.rs
 COPY --from=nexus-root kernel/nexus-ostd/src/cser/infrastructure/device.rs \
     /kernel/nexus-ostd/src/cser/infrastructure/device.rs
+COPY --from=nexus-root kernel/nexus-ostd/src/cser/infrastructure/device_receipt_bridge.rs \
+    /kernel/nexus-ostd/src/cser/infrastructure/device_receipt_bridge.rs
 COPY --from=nexus-root kernel/nexus-ostd/src/cser/infrastructure/fault.rs \
     /kernel/nexus-ostd/src/cser/infrastructure/fault.rs
 COPY --from=nexus-root kernel/nexus-ostd/src/cser/infrastructure/invariants.rs \
