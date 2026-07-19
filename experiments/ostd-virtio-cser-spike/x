@@ -14,7 +14,8 @@ lock_key=$(printf '%s' "$root" | sha256sum | cut -c1-16)
 exec 9>"/tmp/nexus-ostd-virtio-cser-spike-$lock_key.lock"
 flock 9
 production_source_manifest="$repo_root/kernel/nexus-ostd/cser-production-sources.txt"
-if [[ ! -f $production_source_manifest || -L $production_source_manifest ]]; then
+if [[ ! -f $production_source_manifest || -L $production_source_manifest ]] \
+    || [[ $(realpath -e -- "$production_source_manifest") != "$production_source_manifest" ]]; then
     echo "CSER production source manifest must be a non-symlink regular file: $production_source_manifest" >&2
     exit 1
 fi
@@ -35,7 +36,8 @@ for relative in "${cser_production_sources[@]}"; do
     fi
     source_path="$repo_root/kernel/nexus-ostd/src/cser/$relative"
     target_path="/kernel/nexus-ostd/src/cser/$relative"
-    if [[ ! -f $source_path || -L $source_path ]]; then
+    if [[ ! -f $source_path || -L $source_path ]] \
+        || [[ $(realpath -e -- "$source_path") != "$source_path" ]]; then
         echo "CSER production source must be a non-symlink regular file: $source_path" >&2
         exit 1
     fi
@@ -47,6 +49,8 @@ if ((${#cser_production_sources[@]} == 0)); then
     echo "CSER production source manifest is empty" >&2
     exit 1
 fi
+readonly production_source_manifest
+readonly -a cser_production_sources cser_source_hash_inputs cser_source_mount_args
 image_key=$(sha256sum \
     "$root/Dockerfile" \
     "$root/.dockerignore" \

@@ -79,6 +79,7 @@ const PRODUCTION_REGISTRY_TEST: &str = "crates/cser-transition-gates/tests/produ
 const CSER_PRODUCTION_SOURCE_MANIFEST: &str = "kernel/nexus-ostd/cser-production-sources.txt";
 const CSER_SOURCE_ROOT: &str = "kernel/nexus-ostd/src/cser";
 const CSER_PRODUCTION_ROOTS: [&str; 3] = ["device_flight.rs", "effect_registry.rs", "portal_v2.rs"];
+const PINNED_DOCKER_SYNTAX: &str = "# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e";
 const PORTAL_ABI_IMAGE_INPUTS: [&str; 15] = [
     "Cargo.toml",
     "src/capability.rs",
@@ -663,19 +664,6 @@ fn validate_cold_rebuild_contract(root: &Path, frontdoor: &str) -> Result<()> {
     Ok(())
 }
 
-fn require_plain_regular_file(path: &Path, label: &str) -> Result<()> {
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|error| format!("cannot inspect {label} at {}: {error}", path.display()))?;
-    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
-        return Err(format!(
-            "{label} must be a non-symlink regular file: {}",
-            path.display()
-        )
-        .into());
-    }
-    Ok(())
-}
-
 fn require_plain_regular_file_below(root: &Path, relative: &Path, label: &str) -> Result<()> {
     let canonical = canonical_relative_source_path(relative)?;
     let root_metadata = fs::symlink_metadata(root)
@@ -741,7 +729,14 @@ fn canonical_relative_source_path(path: &Path) -> Result<String> {
     if components.is_empty() {
         return Err("CSER source path is empty".into());
     }
-    Ok(components.join("/"))
+    let canonical = components.join("/");
+    if raw != canonical {
+        return Err(format!(
+            "CSER source path is not byte-canonical: raw={raw:?} canonical={canonical:?}"
+        )
+        .into());
+    }
+    Ok(canonical)
 }
 
 fn external_module_relative_path(
@@ -849,9 +844,125 @@ fn validate_external_module_attributes(
     Ok(())
 }
 
-#[derive(Default)]
-struct CserSourceMacroAudit {
+const CSER_FROZEN_TEST_MACRO_SOURCE: &str = "infrastructure/tests.rs";
+const CSER_FROZEN_TEST_MACROS: [(&str, &str, &[&str]); 4] = [
+    (
+        "assert_arm_plan_change",
+        "bd2acb1dd7cea6e3eb3c24f1bafee4ff2023464a86b08afe912cdca0560a4faf",
+        &[
+            "3f440ef4a088f91b6de87db5324412e5b94073df5603a4d6c68b9ca31b71e24e",
+            "596dee08fa52460dad17dbc37fb3078dcae936a81fabbc39e7f16282d03fe726",
+            "9bf0da1b6bbf4c3e181fcf867698128c2fcb48abf2877e2b1ff8ccb01e91b1ca",
+            "9d3d874fd8d6672c1e1bfbcb0f12b0e3c1b0e4b24472a687719c8af5f1b4c492",
+        ],
+    ),
+    (
+        "assert_arm_receipt_change",
+        "dfa418c41e5ed6d2824147b29738cc301f25452f2f1ffa4222bd14f0e651199d",
+        &["3f440ef4a088f91b6de87db5324412e5b94073df5603a4d6c68b9ca31b71e24e"],
+    ),
+    (
+        "assert_enqueue_plan_change",
+        "2eb227aea66a16f5748e30c0cb13b06018a76d2a5a26b8a22f8e0fb91b9571dc",
+        &[
+            "3f440ef4a088f91b6de87db5324412e5b94073df5603a4d6c68b9ca31b71e24e",
+            "8d3f14cc12732bc75f6de7a2f68d2178692339a098a2813a1de2a72b518ad0d6",
+            "93099e8e93fad73fcfde61e14bd9dc14607bda7c3feee32ce5ccca9917ed817c",
+            "d3092d56d565d02d34f5f383d97a6d5ff68d2cd40393610f0aed8a67e4e6e4f3",
+        ],
+    ),
+    (
+        "assert_enqueue_receipt_change",
+        "d432f6b9f6831896a733bafa9afa71efa28fe341c4d0542ade5fa3331aa54807",
+        &["3f440ef4a088f91b6de87db5324412e5b94073df5603a4d6c68b9ca31b71e24e"],
+    ),
+];
+
+struct CserSourceMacroAudit<'a> {
+    source_relative: &'a Path,
     rejected: Option<String>,
+    local_definitions: BTreeMap<String, String>,
+    local_invocations: BTreeMap<String, Vec<String>>,
+}
+
+impl<'a> CserSourceMacroAudit<'a> {
+    fn new(source_relative: &'a Path) -> Self {
+        Self {
+            source_relative,
+            rejected: None,
+            local_definitions: BTreeMap::new(),
+            local_invocations: BTreeMap::new(),
+        }
+    }
+
+    fn reject(&mut self, reason: impl Into<String>) {
+        if self.rejected.is_none() {
+            self.rejected = Some(reason.into());
+        }
+    }
+
+    fn record_frozen_local_invocation(&mut self, source_macro: &syn::Macro) {
+        let Some(name) = source_macro_name(source_macro) else {
+            self.reject("<absolute frozen local macro path>");
+            return;
+        };
+        if self.source_relative != Path::new(CSER_FROZEN_TEST_MACRO_SOURCE) {
+            self.reject(name);
+            return;
+        }
+        if let Some(source_construct) =
+            reject_source_construct_inside_macro(source_macro.tokens.clone())
+        {
+            self.reject(format!("{name} contains {source_construct}"));
+            return;
+        }
+        if let Some(nested) = reject_unreviewed_nested_macro(source_macro.tokens.clone()) {
+            self.reject(format!("{name} contains {nested}!"));
+            return;
+        }
+        self.local_invocations
+            .entry(name)
+            .or_default()
+            .push(sha256(source_macro.tokens.to_string().as_bytes()));
+    }
+
+    fn finish(mut self) -> Option<String> {
+        if self.rejected.is_some() {
+            return self.rejected;
+        }
+        if self.source_relative != Path::new(CSER_FROZEN_TEST_MACRO_SOURCE) {
+            return None;
+        }
+
+        let expected_definitions = CSER_FROZEN_TEST_MACROS
+            .iter()
+            .map(|(name, definition, _)| ((*name).to_owned(), (*definition).to_owned()))
+            .collect::<BTreeMap<_, _>>();
+        let expected_invocations = CSER_FROZEN_TEST_MACROS
+            .iter()
+            .map(|(name, _, invocations)| {
+                let mut invocations = invocations
+                    .iter()
+                    .map(|digest| (*digest).to_owned())
+                    .collect::<Vec<_>>();
+                invocations.sort();
+                ((*name).to_owned(), invocations)
+            })
+            .collect::<BTreeMap<_, _>>();
+        for invocations in self.local_invocations.values_mut() {
+            invocations.sort();
+        }
+
+        if self.local_definitions != expected_definitions
+            || self.local_invocations != expected_invocations
+        {
+            return Some(format!(
+                "frozen test-local macro fingerprint mismatch; definitions={:?}; invocations={:?}",
+                self.local_definitions, self.local_invocations
+            ));
+        }
+        None
+    }
 }
 
 fn audited_cser_macro_path(name: &str) -> bool {
@@ -929,24 +1040,416 @@ fn reject_unreviewed_nested_macro(tokens: proc_macro2::TokenStream) -> Option<St
     None
 }
 
-impl<'ast> syn::visit::Visit<'ast> for CserSourceMacroAudit {
-    fn visit_macro(&mut self, source_macro: &'ast syn::Macro) {
-        let name = if source_macro.path.leading_colon.is_some() {
-            None
-        } else {
-            Some(
-                source_macro
-                    .path
-                    .segments
-                    .iter()
-                    .map(|segment| segment.ident.to_string())
-                    .collect::<Vec<_>>()
-                    .join("::"),
+fn reject_source_construct_inside_macro(tokens: proc_macro2::TokenStream) -> Option<&'static str> {
+    let tokens = tokens.into_iter().collect::<Vec<_>>();
+    for (index, token) in tokens.iter().enumerate() {
+        if let proc_macro2::TokenTree::Group(group) = token
+            && let Some(rejected) = reject_source_construct_inside_macro(group.stream())
+        {
+            return Some(rejected);
+        }
+        if matches!(token, proc_macro2::TokenTree::Ident(ident) if ident == "mod") {
+            return Some("module item inside opaque macro tokens");
+        }
+        if matches!(token, proc_macro2::TokenTree::Punct(punctuation) if punctuation.as_char() == '#')
+            && matches!(
+                tokens.get(index + 1),
+                Some(proc_macro2::TokenTree::Group(group))
+                    if group.delimiter() == proc_macro2::Delimiter::Bracket
             )
+        {
+            return Some("attribute inside opaque macro tokens");
+        }
+    }
+    None
+}
+
+fn frozen_cser_test_macro(name: &str) -> bool {
+    CSER_FROZEN_TEST_MACROS
+        .iter()
+        .any(|(frozen, _, _)| *frozen == name)
+}
+
+fn source_macro_name(source_macro: &syn::Macro) -> Option<String> {
+    if source_macro.path.leading_colon.is_some() {
+        return None;
+    }
+    Some(
+        source_macro
+            .path
+            .segments
+            .iter()
+            .map(|segment| segment.ident.to_string())
+            .collect::<Vec<_>>()
+            .join("::"),
+    )
+}
+
+fn protected_cser_source_name(name: &str) -> bool {
+    audited_cser_macro_path(name)
+        || matches!(
+            name,
+            "alloc"
+                | "Clone"
+                | "Copy"
+                | "Debug"
+                | "Default"
+                | "Eq"
+                | "Ord"
+                | "PartialEq"
+                | "PartialOrd"
+                | "allow"
+                | "cfg"
+                | "derive"
+                | "doc"
+                | "path"
+                | "test"
+        )
+        || frozen_cser_test_macro(name)
+}
+
+fn audit_cser_use_tree<'a>(tree: &'a syn::UseTree, root: Option<&'a syn::Ident>) -> Option<String> {
+    match tree {
+        syn::UseTree::Path(path) => audit_cser_use_tree(&path.tree, root.or(Some(&path.ident))),
+        syn::UseTree::Name(name) => protected_cser_source_name(&name.ident.to_string())
+            .then(|| format!("import shadows protected source name {}", name.ident)),
+        syn::UseTree::Rename(rename) => protected_cser_source_name(&rename.rename.to_string())
+            .then(|| {
+                format!(
+                    "import renames {} to protected source name {}",
+                    rename.ident, rename.rename
+                )
+            }),
+        syn::UseTree::Glob(_) => Some(format!(
+            "glob import from {} may hide macro provenance",
+            root.map_or_else(|| "<root>".to_owned(), ToString::to_string)
+        )),
+        syn::UseTree::Group(group) => group
+            .items
+            .iter()
+            .find_map(|tree| audit_cser_use_tree(tree, root)),
+    }
+}
+
+fn exact_frozen_super_glob(item_use: &syn::ItemUse) -> bool {
+    if item_use.leading_colon.is_some()
+        || !item_use.attrs.is_empty()
+        || !matches!(item_use.vis, syn::Visibility::Inherited)
+    {
+        return false;
+    }
+    matches!(
+        &item_use.tree,
+        syn::UseTree::Path(path)
+            if path.ident == "super" && matches!(path.tree.as_ref(), syn::UseTree::Glob(_))
+    )
+}
+
+fn audit_cser_attribute(attribute: &syn::Attribute) -> Option<String> {
+    use syn::parse::Parser;
+
+    let name = if attribute.path().leading_colon.is_none() && attribute.path().segments.len() == 1 {
+        attribute.path().segments[0].ident.to_string()
+    } else {
+        return Some("qualified or empty attribute path".to_owned());
+    };
+    match name.as_str() {
+        "derive" => {
+            let syn::Meta::List(list) = &attribute.meta else {
+                return Some("derive attribute is not a list".to_owned());
+            };
+            let parser = syn::punctuated::Punctuated::<syn::Path, syn::Token![,]>::parse_terminated;
+            let Ok(paths) = parser.parse2(list.tokens.clone()) else {
+                return Some("derive attribute has malformed tokens".to_owned());
+            };
+            let mut seen = BTreeSet::new();
+            for path in paths {
+                if path.leading_colon.is_some() || path.segments.len() != 1 {
+                    return Some("derive attribute uses a qualified trait".to_owned());
+                }
+                let trait_name = path.segments[0].ident.to_string();
+                if !matches!(
+                    trait_name.as_str(),
+                    "Clone"
+                        | "Copy"
+                        | "Debug"
+                        | "Default"
+                        | "Eq"
+                        | "Ord"
+                        | "PartialEq"
+                        | "PartialOrd"
+                ) {
+                    return Some(format!(
+                        "derive attribute uses unaudited trait {trait_name}"
+                    ));
+                }
+                if !seen.insert(trait_name.clone()) {
+                    return Some(format!("derive attribute duplicates trait {trait_name}"));
+                }
+            }
+            if seen.is_empty() {
+                return Some("derive attribute is empty".to_owned());
+            }
+            None
+        }
+        "allow" => {
+            let syn::Meta::List(list) = &attribute.meta else {
+                return Some("allow attribute is not a list".to_owned());
+            };
+            matches!(
+                list.tokens.to_string().as_str(),
+                "dead_code"
+                    | "clippy :: large_enum_variant"
+                    | "clippy :: result_large_err"
+                    | "clippy :: too_many_arguments"
+            )
+            .then_some(())
+            .map_or_else(
+                || Some(format!("allow attribute is unaudited: {}", list.tokens)),
+                |_| None,
+            )
+        }
+        "cfg" => {
+            let syn::Meta::List(list) = &attribute.meta else {
+                return Some("cfg attribute is not a list".to_owned());
+            };
+            (list.tokens.to_string() != "test")
+                .then(|| format!("cfg attribute is not exact cfg(test): {}", list.tokens))
+        }
+        "test" => (!matches!(attribute.meta, syn::Meta::Path(_)))
+            .then(|| "test attribute has arguments".to_owned()),
+        "path" => {
+            let syn::Meta::NameValue(name_value) = &attribute.meta else {
+                return Some("path attribute is not a name-value string".to_owned());
+            };
+            let syn::Expr::Lit(expression) = &name_value.value else {
+                return Some("path attribute is not a literal".to_owned());
+            };
+            let syn::Lit::Str(path) = &expression.lit else {
+                return Some("path attribute is not a string".to_owned());
+            };
+            (!matches!(
+                path.value().as_str(),
+                "effect_registry/root_lanes.rs" | "infrastructure/mod.rs"
+            ))
+            .then(|| format!("path attribute targets unaudited source {}", path.value()))
+        }
+        "doc" => {
+            let exact_literal = matches!(
+                &attribute.meta,
+                syn::Meta::NameValue(name_value)
+                    if matches!(
+                        &name_value.value,
+                        syn::Expr::Lit(expression)
+                            if matches!(expression.lit, syn::Lit::Str(_))
+                    )
+            );
+            (!exact_literal).then(|| "doc attribute is not an inert string literal".to_owned())
+        }
+        _ => Some(format!("unaudited attribute {name}")),
+    }
+}
+
+struct CserSourceProvenanceAudit<'a> {
+    source_relative: &'a Path,
+    frozen_super_globs: usize,
+    module_path: Vec<String>,
+    frozen_test_module: bool,
+    rejected: Option<String>,
+}
+
+impl<'a> CserSourceProvenanceAudit<'a> {
+    fn new(source_relative: &'a Path) -> Self {
+        Self {
+            source_relative,
+            frozen_super_globs: 0,
+            module_path: Vec::new(),
+            frozen_test_module: false,
+            rejected: None,
+        }
+    }
+
+    fn finish(self) -> Option<String> {
+        if self.rejected.is_some() {
+            return self.rejected;
+        }
+        let expected =
+            usize::from(self.source_relative == Path::new("effect_registry/root_lanes.rs"));
+        (self.frozen_super_globs != expected).then(|| {
+            format!(
+                "frozen super glob count differs: expected {expected}, found {}",
+                self.frozen_super_globs
+            )
+        })
+    }
+}
+
+impl<'ast> syn::visit::Visit<'ast> for CserSourceProvenanceAudit<'_> {
+    fn visit_attribute(&mut self, attribute: &'ast syn::Attribute) {
+        if self.rejected.is_none() {
+            self.rejected = audit_cser_attribute(attribute);
+        }
+    }
+
+    fn visit_item_use(&mut self, item_use: &'ast syn::ItemUse) {
+        if self.rejected.is_some() {
+            return;
+        }
+        let frozen_super_glob = self.source_relative == Path::new("effect_registry/root_lanes.rs")
+            && self.module_path == ["tests"]
+            && self.frozen_test_module
+            && exact_frozen_super_glob(item_use);
+        if frozen_super_glob {
+            self.frozen_super_globs += 1;
+            if self.frozen_super_globs != 1 {
+                self.rejected = Some("frozen super glob import is duplicated".to_owned());
+            }
+        } else {
+            self.rejected = audit_cser_use_tree(&item_use.tree, None);
+        }
+        if self.rejected.is_none() {
+            syn::visit::visit_item_use(self, item_use);
+        }
+    }
+
+    fn visit_item_mod(&mut self, item_mod: &'ast syn::ItemMod) {
+        if self.rejected.is_some() {
+            return;
+        }
+        let was_frozen_test_module = self.frozen_test_module;
+        self.frozen_test_module = self.module_path.is_empty()
+            && item_mod.ident == "tests"
+            && item_mod.attrs.len() == 1
+            && matches!(
+                &item_mod.attrs[0].meta,
+                syn::Meta::List(list)
+                    if item_mod.attrs[0].path().is_ident("cfg")
+                        && list.tokens.to_string() == "test"
+            );
+        self.module_path.push(item_mod.ident.to_string());
+        syn::visit::visit_item_mod(self, item_mod);
+        self.module_path.pop();
+        self.frozen_test_module = was_frozen_test_module;
+    }
+
+    fn visit_item_extern_crate(&mut self, extern_crate: &'ast syn::ItemExternCrate) {
+        let binding = extern_crate
+            .rename
+            .as_ref()
+            .map_or(&extern_crate.ident, |(_, rename)| rename)
+            .to_string();
+        if self.rejected.is_none() && protected_cser_source_name(&binding) {
+            self.rejected = Some(format!(
+                "extern crate binds protected source name {binding}"
+            ));
+        }
+        if self.rejected.is_none() {
+            syn::visit::visit_item_extern_crate(self, extern_crate);
+        }
+    }
+}
+
+impl<'ast> syn::visit::Visit<'ast> for CserSourceMacroAudit<'_> {
+    fn visit_item_macro(&mut self, item_macro: &'ast syn::ItemMacro) {
+        if self.rejected.is_some() {
+            return;
+        }
+        if source_macro_name(&item_macro.mac).as_deref() != Some("macro_rules") {
+            syn::visit::visit_item_macro(self, item_macro);
+            return;
+        }
+
+        if self.source_relative != Path::new(CSER_FROZEN_TEST_MACRO_SOURCE) {
+            self.reject("macro_rules");
+            return;
+        }
+        let Some(name) = item_macro.ident.as_ref().map(ToString::to_string) else {
+            self.reject("anonymous macro_rules");
+            return;
         };
+        if !frozen_cser_test_macro(&name) {
+            self.reject(format!("macro_rules::{name}"));
+            return;
+        }
+        if !item_macro.attrs.is_empty()
+            || item_macro.semi_token.is_some()
+            || !matches!(item_macro.mac.delimiter, syn::MacroDelimiter::Brace(_))
+        {
+            self.reject(format!(
+                "macro_rules::{name} must retain its attribute-free braced item form"
+            ));
+            return;
+        }
+        if let Some(source_construct) =
+            reject_source_construct_inside_macro(item_macro.mac.tokens.clone())
+        {
+            self.reject(format!("macro_rules::{name} contains {source_construct}"));
+            return;
+        }
+        if let Some(nested) = reject_unreviewed_nested_macro(item_macro.mac.tokens.clone()) {
+            self.reject(format!("macro_rules::{name} contains {nested}!"));
+            return;
+        }
+        let digest = sha256(item_macro.mac.tokens.to_string().as_bytes());
+        if self
+            .local_definitions
+            .insert(name.clone(), digest)
+            .is_some()
+        {
+            self.reject(format!("duplicate macro_rules::{name}"));
+        }
+    }
+
+    fn visit_stmt_macro(&mut self, statement_macro: &'ast syn::StmtMacro) {
+        if self.rejected.is_some() {
+            return;
+        }
+        let frozen_local = source_macro_name(&statement_macro.mac)
+            .as_deref()
+            .is_some_and(frozen_cser_test_macro);
+        if !frozen_local {
+            syn::visit::visit_stmt_macro(self, statement_macro);
+            return;
+        }
+        if !statement_macro.attrs.is_empty()
+            || statement_macro.semi_token.is_none()
+            || !matches!(statement_macro.mac.delimiter, syn::MacroDelimiter::Paren(_))
+        {
+            self.reject(
+                "frozen test-local invocation must retain its attribute-free parenthesized statement form",
+            );
+            return;
+        }
+        self.record_frozen_local_invocation(&statement_macro.mac);
+    }
+
+    fn visit_expr_macro(&mut self, expression_macro: &'ast syn::ExprMacro) {
+        if source_macro_name(&expression_macro.mac)
+            .as_deref()
+            .is_some_and(frozen_cser_test_macro)
+        {
+            self.reject("frozen test-local macro used outside an audited statement");
+            return;
+        }
+        syn::visit::visit_expr_macro(self, expression_macro);
+    }
+
+    fn visit_macro(&mut self, source_macro: &'ast syn::Macro) {
+        if self.rejected.is_some() {
+            return;
+        }
+        let name = source_macro_name(source_macro);
         let allowed = name.as_deref().is_some_and(audited_cser_macro_path);
-        if !allowed && self.rejected.is_none() {
-            self.rejected = Some(name.unwrap_or_else(|| "<absolute macro path>".to_owned()));
+        if name.as_deref().is_some_and(frozen_cser_test_macro) {
+            self.reject("frozen test-local macro used outside an audited statement");
+        } else if !allowed {
+            self.reject(name.unwrap_or_else(|| "<absolute macro path>".to_owned()));
+        }
+        if self.rejected.is_none()
+            && let Some(source_construct) =
+                reject_source_construct_inside_macro(source_macro.tokens.clone())
+        {
+            self.reject(source_construct);
         }
         if self.rejected.is_none() {
             self.rejected = reject_unreviewed_nested_macro(source_macro.tokens.clone());
@@ -979,9 +1482,18 @@ impl<'ast> syn::visit::Visit<'ast> for NestedExternalModuleAudit {
 fn reject_unbound_source_constructs(syntax: &syn::File, relative: &Path) -> Result<()> {
     use syn::visit::Visit;
 
-    let mut audit = CserSourceMacroAudit::default();
+    let mut provenance = CserSourceProvenanceAudit::new(relative);
+    provenance.visit_file(syntax);
+    if let Some(rejected) = provenance.finish() {
+        return Err(format!(
+            "CSER production source {} has unaudited macro or attribute provenance: {rejected}",
+            relative.display()
+        )
+        .into());
+    }
+    let mut audit = CserSourceMacroAudit::new(relative);
     audit.visit_file(syntax);
-    if let Some(rejected) = audit.rejected {
+    if let Some(rejected) = audit.finish() {
         return Err(format!(
             "CSER production source {} uses unaudited macro {rejected}!; include-style and dynamically generated source are forbidden",
             relative.display()
@@ -1151,14 +1663,19 @@ fn validate_cser_production_manifest_text(
 
 fn cser_production_source_files(root: &Path) -> Result<Vec<String>> {
     let manifest = root.join(CSER_PRODUCTION_SOURCE_MANIFEST);
-    require_plain_regular_file(&manifest, "CSER production source manifest")?;
+    require_plain_regular_file_below(
+        root,
+        Path::new(CSER_PRODUCTION_SOURCE_MANIFEST),
+        "CSER production source manifest",
+    )?;
     let expected = expected_cser_production_sources(root)?;
     let entries =
         validate_cser_production_manifest_text(&fs::read_to_string(&manifest)?, &expected)?;
     for relative in &entries {
+        let source_relative = Path::new(CSER_SOURCE_ROOT).join(relative);
         require_plain_regular_file_below(
-            &root.join(CSER_SOURCE_ROOT),
-            Path::new(relative),
+            root,
+            &source_relative,
             "manifest-bound CSER production source",
         )?;
     }
@@ -1293,17 +1810,72 @@ fn validate_backend_source_pair(
         }
         _ => return Err(format!("unknown production backend workflow: {relative}").into()),
     };
+    // These digests freeze normalized logical command regions, not raw file
+    // bytes: the binding digest covers the manifest assignment through both
+    // readonly declarations, while the prelude digest proves that region runs
+    // at top level. Update them only with the adversarial mutation matrix and a
+    // real image build.
+    let expected_binding_region_sha256 = match relative {
+        "kernel/nexus-ostd/x" => "9c9e52ed7bb4be81a6bb98dde432749785a05931c948047438b5a7f253a8dc2f",
+        "experiments/ostd-virtio-cser-spike/x" => {
+            "1a80bca2d72fae2ce5081063d9d3d4270f51c8bbc17ba892facb1128ce08e8ee"
+        }
+        _ => return Err(format!("unknown production backend workflow: {relative}").into()),
+    };
+    let expected_prelude_sha256 = match relative {
+        "kernel/nexus-ostd/x" => "8ae3066a58c4759d2b3bf86ba2edf3a4309f66c46ddc8e3c5b72a22921b0b9f3",
+        "experiments/ostd-virtio-cser-spike/x" => {
+            "ac34448a81a2c78cffe4d3e6d02f303544e80e2684412bd9bf48fe1d36a8fedd"
+        }
+        _ => return Err(format!("unknown production backend workflow: {relative}").into()),
+    };
+    let binding_starts = logical
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.as_str() == expected_manifest_assignment)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let image_starts = logical
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.starts_with("image_key=$(sha256sum "))
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if binding_starts.len() != 1 || image_starts.len() != 1 || binding_starts[0] >= image_starts[0]
+    {
+        return Err(format!(
+            "{relative} must have one ordered manifest-to-image source-binding region"
+        )
+        .into());
+    }
+    let prelude_sha256 = sha256(logical[..binding_starts[0]].join("\n").as_bytes());
+    if prelude_sha256 != expected_prelude_sha256 {
+        return Err(format!(
+            "{relative} source-binding prelude drifted: expected {expected_prelude_sha256}, found {prelude_sha256}"
+        )
+        .into());
+    }
+    let binding_region = logical[binding_starts[0]..image_starts[0]].join("\n");
+    let binding_region_sha256 = sha256(binding_region.as_bytes());
+    if binding_region_sha256 != expected_binding_region_sha256 {
+        return Err(format!(
+            "{relative} source-binding command sequence drifted: expected {expected_binding_region_sha256}, found {binding_region_sha256}"
+        )
+        .into());
+    }
     for required in [
         expected_manifest_assignment,
-        r#"if [[ ! -f $production_source_manifest || -L $production_source_manifest ]]; then"#,
+        r#"if [[ ! -f $production_source_manifest || -L $production_source_manifest ]] || [[ $(realpath -e -- "$production_source_manifest") != "$production_source_manifest" ]]; then"#,
         r#"mapfile -t cser_production_sources <"$production_source_manifest""#,
         r#"for relative in "${cser_production_sources[@]}"; do"#,
         r#"$relative == ./* || $relative == *"/./"*"#,
         &format!(r#"source_path="{source_root}/$relative""#),
         r#"target_path="/kernel/nexus-ostd/src/cser/$relative""#,
-        r#"if [[ ! -f $source_path || -L $source_path ]]; then"#,
+        r#"if [[ ! -f $source_path || -L $source_path ]] || [[ $(realpath -e -- "$source_path") != "$source_path" ]]; then"#,
         r#"cser_source_hash_inputs+=("$source_path")"#,
         r#"cser_source_mount_args+=(--mount "type=bind,source=$source_path,target=$target_path,readonly")"#,
+        "readonly production_source_manifest",
+        "readonly -a cser_production_sources cser_source_hash_inputs cser_source_mount_args",
     ] {
         if active.matches(required).count() != 1 {
             return Err(format!(
@@ -1312,8 +1884,9 @@ fn validate_backend_source_pair(
             .into());
         }
     }
-    if active.matches("cser_source_hash_inputs").count() != 3
-        || active.matches("cser_source_mount_args").count() != 3
+    if active.matches("cser_production_sources").count() != 4
+        || active.matches("cser_source_hash_inputs").count() != 4
+        || active.matches("cser_source_mount_args").count() != 4
     {
         return Err(format!(
             "{relative} must derive hash and mount arrays only once from the canonical manifest"
@@ -1367,10 +1940,23 @@ fn validate_backend_source_pair(
         .matches(r#""${cser_source_mount_args[@]}""#)
         .count()
         != 1
+        || docker_runs[0].matches(r#""$image""#).count() != 1
         || docker_runs[0].contains("target=/kernel/nexus-ostd/src/cser/")
     {
         return Err(format!(
             "{relative} must mount only the exact manifest-derived CSER source array"
+        )
+        .into());
+    }
+    let mount_offset = docker_runs[0]
+        .find(r#""${cser_source_mount_args[@]}""#)
+        .expect("validated exact mount expansion");
+    let image_offset = docker_runs[0]
+        .find(r#""$image""#)
+        .expect("validated exact image argument");
+    if mount_offset >= image_offset || !docker_runs[0].ends_with(r#""$image" "$@""#) {
+        return Err(format!(
+            "{relative} must place the source mounts before the sole image and command tail"
         )
         .into());
     }
@@ -1392,12 +1978,124 @@ fn validate_backend_docker_source_set(
     dockerfile: &str,
     files: &[String],
 ) -> Result<()> {
+    if dockerfile.lines().next() != Some(PINNED_DOCKER_SYNTAX) {
+        return Err(format!("{relative} must retain the exact pinned Docker syntax").into());
+    }
+    let directives = dockerfile
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix('#').map(str::trim_start))
+        .filter(|comment| {
+            let lowercase = comment.to_ascii_lowercase();
+            lowercase.starts_with("syntax=")
+                || lowercase.starts_with("escape=")
+                || lowercase.starts_with("check=")
+        })
+        .collect::<Vec<_>>();
+    if directives != [PINNED_DOCKER_SYNTAX.trim_start_matches("# ")] {
+        return Err(format!(
+            "{relative} has an additional or mutated Docker parser directive: {directives:?}"
+        )
+        .into());
+    }
+    if dockerfile.contains("<<") {
+        return Err(format!("{relative} may not use Docker or shell heredocs").into());
+    }
+
     let copy_prefix = match relative {
         "kernel/nexus-ostd/Dockerfile" => "COPY ",
         "experiments/ostd-virtio-cser-spike/Dockerfile" => "COPY --from=nexus-root ",
         _ => return Err(format!("unknown production backend Dockerfile: {relative}").into()),
     };
+    // This freezes the normalized final RUN instruction. It is intentionally
+    // paired with semantic instruction checks and real BuildKit execution so a
+    // digest update cannot silently weaken the cold-image byte/inventory proof.
+    let expected_audit_sha256 = match relative {
+        "kernel/nexus-ostd/Dockerfile" => {
+            "fdf74ae4f564db845ac66f6c600ca623126082cea956bf4d6f7ea90ca2ea3b02"
+        }
+        "experiments/ostd-virtio-cser-spike/Dockerfile" => {
+            "60d2e36b17735e555f8bf848e1070618fa08bbf466d89f1ba062c9ca3aebf140"
+        }
+        _ => return Err(format!("unknown production backend Dockerfile: {relative}").into()),
+    };
+    // Freeze the complete normalized instruction vector as well. The final
+    // audit trusts the pinned base image's cmp/find/awk/sort toolchain, so an
+    // earlier RUN or ENV must not be able to replace or redirect those tools.
+    let expected_instruction_sha256 = match relative {
+        "kernel/nexus-ostd/Dockerfile" => {
+            "a7063f9993ab6100424ce090bb9648ed085e62e2d428966276af02a612ab4048"
+        }
+        "experiments/ostd-virtio-cser-spike/Dockerfile" => {
+            "863db4df637354424a0643a3a927df32762ca39df8f2cd09952b9214d2d91449"
+        }
+        _ => return Err(format!("unknown production backend Dockerfile: {relative}").into()),
+    };
     let logical = continued_shell_lines(dockerfile)?;
+    let instruction_sha256 = sha256(logical.join("\n").as_bytes());
+    if instruction_sha256 != expected_instruction_sha256 {
+        return Err(format!(
+            "{relative} normalized Docker instruction vector drifted: expected {expected_instruction_sha256}, found {instruction_sha256}"
+        )
+        .into());
+    }
+    for (index, line) in logical.iter().enumerate() {
+        let opcode = line
+            .split_ascii_whitespace()
+            .next()
+            .ok_or_else(|| format!("{relative} has an empty Docker instruction"))?;
+        if !opcode.bytes().all(|byte| byte.is_ascii_alphabetic()) {
+            return Err(
+                format!("{relative} has a malformed Docker instruction opcode: {opcode}").into(),
+            );
+        }
+        let uppercase = opcode.to_ascii_uppercase();
+        if opcode != uppercase {
+            return Err(format!(
+                "{relative} Docker instruction must use canonical uppercase: {opcode}"
+            )
+            .into());
+        }
+        if matches!(uppercase.as_str(), "ADD" | "ONBUILD") {
+            return Err(format!("{relative} may not use Docker {uppercase}").into());
+        }
+        if !matches!(
+            uppercase.as_str(),
+            "ARG" | "COPY" | "ENV" | "FROM" | "RUN" | "WORKDIR"
+        ) {
+            return Err(format!("{relative} uses unaudited Docker instruction {uppercase}").into());
+        }
+        if uppercase == "RUN"
+            && index + 1 != logical.len()
+            && (line.contains("/kernel/nexus-ostd/src/cser")
+                || line.contains("/kernel/nexus-ostd/cser-production-sources.txt"))
+        {
+            return Err(format!(
+                "{relative} may mutate the cold CSER tree only through the exact final audit"
+            )
+            .into());
+        }
+    }
+    if logical
+        .iter()
+        .filter(|line| line.starts_with("FROM "))
+        .collect::<Vec<_>>()
+        != ["FROM ${OSDK_IMAGE}"]
+    {
+        return Err(format!("{relative} must retain one exact unnamed final stage").into());
+    }
+    let final_instruction = logical
+        .last()
+        .ok_or_else(|| format!("{relative} has no Docker instructions"))?;
+    let final_audit_sha256 = sha256(final_instruction.as_bytes());
+    if !final_instruction.starts_with("RUN --mount=type=bind,")
+        || final_audit_sha256 != expected_audit_sha256
+    {
+        return Err(format!(
+            "{relative} must end with the exact read-only CSER byte and inventory audit: expected {expected_audit_sha256}, found {final_audit_sha256}"
+        )
+        .into());
+    }
+
     let flat_sources = files
         .iter()
         .filter(|file| !file.contains('/'))
@@ -1417,7 +2115,7 @@ fn validate_backend_docker_source_set(
     let actual = logical
         .iter()
         .filter(|line| {
-            line.starts_with(copy_prefix)
+            line.starts_with("COPY ")
                 && (line.contains("kernel/nexus-ostd/src/cser")
                     || line.contains("/kernel/nexus-ostd/src/cser")
                     || line.contains("kernel/nexus-ostd/cser-production-sources.txt")
@@ -3027,6 +3725,102 @@ mod tests {
     }
 
     #[test]
+    fn backend_docker_cser_gate_rejects_instruction_and_final_image_bypasses() {
+        let root = repository_root();
+        let production_files =
+            cser_production_source_files(&root).expect("canonical production source manifest");
+        for relative in [
+            "kernel/nexus-ostd/Dockerfile",
+            "experiments/ostd-virtio-cser-spike/Dockerfile",
+        ] {
+            let dockerfile = fs::read_to_string(root.join(relative)).expect("read Dockerfile");
+            validate_backend_docker_source_set(relative, &dockerfile, &production_files)
+                .expect("exact single-stage cold CSER image");
+            let insertion = "# The final filesystem mutation proves";
+
+            for (name, instruction) in [
+                (
+                    "lowercase copy",
+                    "copy hidden.rs /kernel/nexus-ostd/src/cser/hidden.rs",
+                ),
+                (
+                    "mixed-case copy",
+                    "CoPy hidden.rs /kernel/nexus-ostd/src/cser/hidden.rs",
+                ),
+                (
+                    "add instruction",
+                    "ADD hidden.rs /kernel/nexus-ostd/src/cser/hidden.rs",
+                ),
+                (
+                    "onbuild instruction",
+                    "ONBUILD COPY hidden.rs /kernel/nexus-ostd/src/cser/hidden.rs",
+                ),
+                (
+                    "wrong-stage copy",
+                    "COPY --from=other-stage /hidden.rs /kernel/nexus-ostd/src/cser/hidden.rs",
+                ),
+                (
+                    "pre-audit run overwrite",
+                    "RUN cp /tmp/hidden.rs /kernel/nexus-ostd/src/cser/hidden.rs",
+                ),
+                (
+                    "audit tool shadow",
+                    "RUN ln -sf /bin/true /usr/local/bin/cmp",
+                ),
+                ("audit path redirect", "ENV PATH=/tmp/attacker:/usr/bin"),
+                ("second final stage", "FROM ${OSDK_IMAGE}"),
+            ] {
+                let mutation =
+                    dockerfile.replacen(insertion, &format!("{instruction}\n{insertion}"), 1);
+                assert_ne!(mutation, dockerfile, "{name} fixture must mutate");
+                assert!(
+                    validate_backend_docker_source_set(relative, &mutation, &production_files)
+                        .is_err(),
+                    "{name} unexpectedly passed for {relative}"
+                );
+            }
+
+            let extra_directive = dockerfile.replacen(
+                PINNED_DOCKER_SYNTAX,
+                &format!("{PINNED_DOCKER_SYNTAX}\n# escape=`"),
+                1,
+            );
+            assert_ne!(extra_directive, dockerfile);
+            validate_backend_docker_source_set(relative, &extra_directive, &production_files)
+                .expect_err("an additional parser directive may change Docker parsing");
+
+            let heredoc = dockerfile.replacen(
+                insertion,
+                concat!(
+                    "RUN <<EOF\n",
+                    "COPY hidden.rs /kernel/nexus-ostd/src/cser/hidden.rs\n",
+                    "EOF\n",
+                    "# The final filesystem mutation proves"
+                ),
+                1,
+            );
+            assert_ne!(heredoc, dockerfile);
+            validate_backend_docker_source_set(relative, &heredoc, &production_files)
+                .expect_err("Docker and shell heredocs are outside the audited grammar");
+
+            let weakened_audit = dockerfile.replacen(
+                "cmp /tmp/nexus-cser-expected /tmp/nexus-cser-actual;",
+                "test -f /tmp/nexus-cser-actual;",
+                1,
+            );
+            assert_ne!(weakened_audit, dockerfile);
+            validate_backend_docker_source_set(relative, &weakened_audit, &production_files)
+                .expect_err("the final exact inventory comparison may not be weakened");
+
+            let post_audit_write = format!(
+                "{dockerfile}\nRUN cp /tmp/hidden.rs /kernel/nexus-ostd/src/cser/hidden.rs\n"
+            );
+            validate_backend_docker_source_set(relative, &post_audit_write, &production_files)
+                .expect_err("no filesystem instruction may follow the final source audit");
+        }
+    }
+
+    #[test]
     fn cser_production_manifest_and_cold_copies_are_exact_closed_sets() {
         let root = repository_root();
         let expected =
@@ -3077,6 +3871,11 @@ mod tests {
             manifest.replacen(
                 "infrastructure/deadline.rs\n",
                 "infrastructure/./deadline.rs\n",
+                1,
+            ),
+            manifest.replacen(
+                "infrastructure/deadline.rs\n",
+                "infrastructure//deadline.rs\n",
                 1,
             ),
         ] {
@@ -3195,6 +3994,40 @@ mod tests {
                 ),
             ),
             (
+                "external module hidden in allowed macro tokens",
+                format!(
+                    "{safe}\npub fn hidden() {{ assert!({{ #[path = \"hidden.rs\"] mod hidden; true }}); }}\n"
+                ),
+            ),
+            (
+                "attribute hidden in allowed macro tokens",
+                format!(
+                    "{safe}\npub fn hidden() {{ assert!({{ #[allow(unused)] let hidden = true; hidden }}); }}\n"
+                ),
+            ),
+            (
+                "allowed macro name imported as include alias",
+                format!(
+                    "{safe}\nuse core::include as assert;\npub fn hidden() {{ assert!(\"hidden.rs\"); }}\n"
+                ),
+            ),
+            (
+                "external glob may import protected macro names",
+                format!("{safe}\nuse core::*;\n"),
+            ),
+            (
+                "unfrozen local glob may import protected macro names",
+                format!("{safe}\nuse super::*;\n"),
+            ),
+            (
+                "unknown source-loading attribute",
+                format!("{safe}\n#[loader(\"hidden.rs\")]\npub fn hidden() {{}}\n"),
+            ),
+            (
+                "macro-use extern crate",
+                format!("{safe}\n#[macro_use]\nextern crate alloc;\n"),
+            ),
+            (
                 "cfg_attr path redirect",
                 format!(
                     "{safe}\n#[path = \"child.rs\"]\n#[cfg_attr(any(), path = \"hidden.rs\")]\nmod child;\n"
@@ -3215,6 +4048,190 @@ mod tests {
         fs::remove_dir_all(&temporary).expect("remove temporary CSER source root");
     }
 
+    #[test]
+    fn cser_test_local_macros_are_exact_frozen_and_file_scoped() {
+        let root = repository_root();
+        let source = fs::read_to_string(
+            root.join(CSER_SOURCE_ROOT)
+                .join(CSER_FROZEN_TEST_MACRO_SOURCE),
+        )
+        .expect("read frozen test-local macro source");
+        let exact = syn::parse_file(&source).expect("parse frozen test-local macro source");
+        reject_unbound_source_constructs(&exact, Path::new(CSER_FROZEN_TEST_MACRO_SOURCE))
+            .expect("the exact frozen definitions and invocation arguments remain audited");
+        reject_unbound_source_constructs(&exact, Path::new("effect_registry.rs"))
+            .expect_err("the same local macro definitions may not move to another source");
+
+        let renamed = source.replacen(
+            "macro_rules! assert_enqueue_plan_change",
+            "macro_rules! assert_enqueue_plan_change_renamed",
+            1,
+        );
+        assert_ne!(renamed, source);
+        let renamed = syn::parse_file(&renamed).expect("parse renamed macro mutation");
+        reject_unbound_source_constructs(&renamed, Path::new(CSER_FROZEN_TEST_MACRO_SOURCE))
+            .expect_err("renaming a frozen macro must fail closed");
+
+        let attributed_definition = source.replacen(
+            "    macro_rules! assert_enqueue_plan_change",
+            "    #[cfg(test)]\n    macro_rules! assert_enqueue_plan_change",
+            1,
+        );
+        assert_ne!(attributed_definition, source);
+        let attributed_definition =
+            syn::parse_file(&attributed_definition).expect("parse attributed macro definition");
+        reject_unbound_source_constructs(
+            &attributed_definition,
+            Path::new(CSER_FROZEN_TEST_MACRO_SOURCE),
+        )
+        .expect_err("a frozen definition may not gain configuration attributes");
+
+        let mutated_body = source.replacen(
+            concat!(
+                "macro_rules! assert_enqueue_plan_change {\n",
+                "        ($change:expr) => {{\n",
+                "            let mut changed_plan = enqueue_plan;"
+            ),
+            concat!(
+                "macro_rules! assert_enqueue_plan_change {\n",
+                "        ($change:expr) => {{\n",
+                "            mod hidden;\n",
+                "            let mut changed_plan = enqueue_plan;"
+            ),
+            1,
+        );
+        assert_ne!(mutated_body, source);
+        let mutated_body =
+            syn::parse_file(&mutated_body).expect("parse macro-body source mutation");
+        reject_unbound_source_constructs(&mutated_body, Path::new(CSER_FROZEN_TEST_MACRO_SOURCE))
+            .expect_err("a frozen macro body may not generate a hidden external module");
+
+        let unknown_invocation = format!("{source}\nunknown_local_source!();\n");
+        let unknown_invocation =
+            syn::parse_file(&unknown_invocation).expect("parse unknown local invocation");
+        reject_unbound_source_constructs(
+            &unknown_invocation,
+            Path::new(CSER_FROZEN_TEST_MACRO_SOURCE),
+        )
+        .expect_err("an unknown local macro invocation must fail closed");
+
+        let removed_invocation =
+            source.replacen("        assert_enqueue_plan_change!(mutate);\n", "", 1);
+        assert_ne!(removed_invocation, source);
+        let removed_invocation =
+            syn::parse_file(&removed_invocation).expect("parse removed invocation mutation");
+        reject_unbound_source_constructs(
+            &removed_invocation,
+            Path::new(CSER_FROZEN_TEST_MACRO_SOURCE),
+        )
+        .expect_err("the exact invocation multiset must remain frozen");
+
+        let attributed_invocation = source.replacen(
+            "        assert_enqueue_plan_change!(mutate);\n",
+            "        #[cfg(test)]\n        assert_enqueue_plan_change!(mutate);\n",
+            1,
+        );
+        assert_ne!(attributed_invocation, source);
+        let attributed_invocation =
+            syn::parse_file(&attributed_invocation).expect("parse attributed macro invocation");
+        reject_unbound_source_constructs(
+            &attributed_invocation,
+            Path::new(CSER_FROZEN_TEST_MACRO_SOURCE),
+        )
+        .expect_err("a frozen invocation may not gain configuration attributes");
+
+        let changed_delimiter = source.replacen(
+            "        assert_enqueue_plan_change!(mutate);\n",
+            "        assert_enqueue_plan_change! { mutate }\n",
+            1,
+        );
+        assert_ne!(changed_delimiter, source);
+        let changed_delimiter =
+            syn::parse_file(&changed_delimiter).expect("parse changed invocation delimiter");
+        reject_unbound_source_constructs(
+            &changed_delimiter,
+            Path::new(CSER_FROZEN_TEST_MACRO_SOURCE),
+        )
+        .expect_err("a frozen invocation may not change delimiter or statement form");
+
+        let opaque_source_in_argument = source.replacen(
+            "        assert_enqueue_plan_change!(mutate);\n",
+            concat!(
+                "        assert_enqueue_plan_change!({\n",
+                "            #[path = \"hidden.rs\"]\n",
+                "            mod hidden;\n",
+                "            mutate\n",
+                "        });\n"
+            ),
+            1,
+        );
+        assert_ne!(opaque_source_in_argument, source);
+        let opaque_source_in_argument = syn::parse_file(&opaque_source_in_argument)
+            .expect("parse opaque macro-argument source mutation");
+        reject_unbound_source_constructs(
+            &opaque_source_in_argument,
+            Path::new(CSER_FROZEN_TEST_MACRO_SOURCE),
+        )
+        .expect_err("macro arguments may not hide an external source module");
+    }
+
+    #[test]
+    fn cser_root_lane_super_glob_is_single_file_frozen() {
+        let root = repository_root();
+        let relative = Path::new("effect_registry/root_lanes.rs");
+        let source = fs::read_to_string(root.join(CSER_SOURCE_ROOT).join(relative))
+            .expect("read root lanes");
+        let exact = syn::parse_file(&source).expect("parse root lanes");
+        reject_unbound_source_constructs(&exact, relative)
+            .expect("the one audited test-local super glob remains exact");
+
+        let removed = source.replacen("    use super::*;\n", "", 1);
+        assert_ne!(removed, source);
+        let removed = syn::parse_file(&removed).expect("parse removed super glob mutation");
+        reject_unbound_source_constructs(&removed, relative).expect_err(
+            "the frozen root-lane super glob may not disappear or move by substitution",
+        );
+
+        let duplicated = source.replacen(
+            "    use super::*;\n",
+            "    use super::*;\n    use super::*;\n",
+            1,
+        );
+        assert_ne!(duplicated, source);
+        let duplicated =
+            syn::parse_file(&duplicated).expect("parse duplicated super glob mutation");
+        reject_unbound_source_constructs(&duplicated, relative)
+            .expect_err("the frozen root-lane super glob may not be duplicated");
+
+        for (name, replacement) in [
+            ("nested super path", "    use super::hidden::*;\n"),
+            ("grouped super path", "    use super::{hidden::*};\n"),
+            ("public super glob", "    pub use super::*;\n"),
+        ] {
+            let mutated = source.replacen("    use super::*;\n", replacement, 1);
+            assert_ne!(mutated, source, "{name} fixture must mutate");
+            let mutated = syn::parse_file(&mutated).expect("parse super glob shape mutation");
+            reject_unbound_source_constructs(&mutated, relative)
+                .expect_err("only the exact unqualified private super glob may be frozen");
+        }
+
+        let ungated = source.replacen("#[cfg(test)]\nmod tests {", "mod tests {", 1);
+        assert_ne!(ungated, source);
+        let ungated = syn::parse_file(&ungated).expect("parse ungated tests module mutation");
+        reject_unbound_source_constructs(&ungated, relative)
+            .expect_err("the frozen super glob must stay in the top-level cfg(test) module");
+
+        let moved = source.replacen(
+            "#[cfg(test)]\nmod tests {",
+            "use super::*;\n\n#[cfg(test)]\nmod tests {",
+            1,
+        );
+        assert_ne!(moved, source);
+        let moved = syn::parse_file(&moved).expect("parse moved super glob mutation");
+        reject_unbound_source_constructs(&moved, relative)
+            .expect_err("a super glob outside the frozen tests module must fail closed");
+    }
+
     #[cfg(unix)]
     #[test]
     fn cser_source_binding_rejects_symlink_sources() {
@@ -3228,8 +4245,9 @@ mod tests {
         let alias = temporary.join("alias.rs");
         fs::write(&source, "pub fn source() {}\n").expect("write temporary source");
         symlink(&source, &alias).expect("create source symlink");
-        require_plain_regular_file(&source, "test source").expect("plain source accepted");
-        require_plain_regular_file(&alias, "test source")
+        require_plain_regular_file_below(&temporary, Path::new("source.rs"), "test source")
+            .expect("plain source accepted");
+        require_plain_regular_file_below(&temporary, Path::new("alias.rs"), "test source")
             .expect_err("source symlink must be rejected");
 
         let source_root = temporary.join("source-root");
@@ -3241,6 +4259,22 @@ mod tests {
         symlink(&target_directory, &alias_directory).expect("create source directory symlink");
         require_plain_regular_file_below(&source_root, Path::new("alias/child.rs"), "test source")
             .expect_err("a symlinked source path component must be rejected");
+
+        let trusted_repository = temporary.join("trusted-repository");
+        let real_kernel = temporary.join("real-kernel");
+        let real_cser = real_kernel.join("nexus-ostd/src/cser");
+        fs::create_dir_all(&trusted_repository).expect("create trusted repository root");
+        fs::create_dir_all(&real_cser).expect("create real CSER source ancestry");
+        fs::write(real_cser.join("source.rs"), "pub fn source() {}\n")
+            .expect("write source below real kernel ancestry");
+        symlink(&real_kernel, trusted_repository.join("kernel"))
+            .expect("create repository kernel ancestor symlink");
+        require_plain_regular_file_below(
+            &trusted_repository,
+            Path::new("kernel/nexus-ostd/src/cser/source.rs"),
+            "manifest-bound source",
+        )
+        .expect_err("a symlink before the CSER root must be rejected from the trusted repo root");
         fs::remove_dir_all(&temporary).expect("remove temporary source directory");
     }
 
@@ -3397,6 +4431,34 @@ mod tests {
             )
             .expect_err("direct backend execution must reject symlinked manifest sources");
 
+            let manifest_ancestor_symlink_bypass = source.replacen(
+                r#" || [[ $(realpath -e -- "$production_source_manifest") != "$production_source_manifest" ]]"#,
+                "",
+                1,
+            );
+            assert_ne!(manifest_ancestor_symlink_bypass, source);
+            validate_backend_source_pair(
+                relative,
+                &manifest_ancestor_symlink_bypass,
+                source_root,
+                &production_files,
+            )
+            .expect_err("direct backend execution must reject symlinked manifest ancestors");
+
+            let source_ancestor_symlink_bypass = source.replacen(
+                r#" || [[ $(realpath -e -- "$source_path") != "$source_path" ]]"#,
+                "",
+                1,
+            );
+            assert_ne!(source_ancestor_symlink_bypass, source);
+            validate_backend_source_pair(
+                relative,
+                &source_ancestor_symlink_bypass,
+                source_root,
+                &production_files,
+            )
+            .expect_err("direct backend execution must reject symlinked source ancestors");
+
             let current_directory_alias_bypass =
                 source.replacen(r#" || $relative == ./* || $relative == *"/./"*"#, "", 1);
             assert_ne!(current_directory_alias_bypass, source);
@@ -3434,6 +4496,84 @@ mod tests {
             assert_ne!(flattened, source);
             validate_backend_source_pair(relative, &flattened, source_root, &production_files)
                 .expect_err("flattened manifest-derived target must be rejected");
+
+            let selective_loop = source.replacen(
+                r#"for relative in "${cser_production_sources[@]}"; do"#,
+                concat!(
+                    "for relative in \"${cser_production_sources[@]}\"; do\n",
+                    "    [[ $relative == device_flight.rs ]] || continue"
+                ),
+                1,
+            );
+            assert_ne!(selective_loop, source);
+            validate_backend_source_pair(relative, &selective_loop, source_root, &production_files)
+                .expect_err("a condition may not narrow the manifest-driven hash and mount loop");
+
+            let reassigned_manifest = source.replacen(
+                r#"mapfile -t cser_production_sources <"$production_source_manifest""#,
+                concat!(
+                    "mapfile -t cser_production_sources <\"$production_source_manifest\"\n",
+                    "cser_production_sources=(device_flight.rs)"
+                ),
+                1,
+            );
+            assert_ne!(reassigned_manifest, source);
+            validate_backend_source_pair(
+                relative,
+                &reassigned_manifest,
+                source_root,
+                &production_files,
+            )
+            .expect_err("the canonical manifest array may not be reassigned before hashing");
+
+            let missing_readonly = source.replacen(
+                "readonly -a cser_production_sources cser_source_hash_inputs cser_source_mount_args\n",
+                "",
+                1,
+            );
+            assert_ne!(missing_readonly, source);
+            validate_backend_source_pair(
+                relative,
+                &missing_readonly,
+                source_root,
+                &production_files,
+            )
+            .expect_err("manifest and derived source arrays must become immutable");
+
+            let inactive_binding = source
+                .replacen(
+                    "production_source_manifest=",
+                    "if false; then\nproduction_source_manifest=",
+                    1,
+                )
+                .replacen("image_key=", "fi\nimage_key=", 1);
+            assert_ne!(inactive_binding, source);
+            validate_backend_source_pair(
+                relative,
+                &inactive_binding,
+                source_root,
+                &production_files,
+            )
+            .expect_err("the exact source-binding block must execute at top level");
+
+            let mount_after_image = source
+                .replacen("        \"${cser_source_mount_args[@]}\" \\\n", "", 1)
+                .replacen(
+                    "        \"$image\" \\\n",
+                    concat!(
+                        "        \"$image\" \\\n",
+                        "        \"${cser_source_mount_args[@]}\" \\\n"
+                    ),
+                    1,
+                );
+            assert_ne!(mount_after_image, source);
+            validate_backend_source_pair(
+                relative,
+                &mount_after_image,
+                source_root,
+                &production_files,
+            )
+            .expect_err("source mounts after the image are container command arguments");
         }
 
         let production_registry =

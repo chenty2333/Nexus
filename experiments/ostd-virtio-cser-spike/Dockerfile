@@ -165,3 +165,28 @@ ENV CARGO_HOME=/root/.cargo \
     PATH=/root/.cargo/bin:/usr/local/grub/bin:/usr/local/qemu/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 WORKDIR /work
+
+# The final filesystem mutation proves that the cold image contains exactly the
+# manifest-derived CSER tree and byte-identical sources from the read-only
+# nexus-root context. No instruction may follow this audit.
+RUN --mount=type=bind,from=nexus-root,source=kernel/nexus-ostd,target=/tmp/nexus-cser-audit,readonly \
+    set -eu; \
+    test -f /tmp/nexus-cser-audit/cser-production-sources.txt; \
+    test ! -L /tmp/nexus-cser-audit/cser-production-sources.txt; \
+    test -f /kernel/nexus-ostd/cser-production-sources.txt; \
+    test ! -L /kernel/nexus-ostd/cser-production-sources.txt; \
+    cmp /tmp/nexus-cser-audit/cser-production-sources.txt \
+        /kernel/nexus-ostd/cser-production-sources.txt; \
+    awk -F/ '{ path=""; for (i=1; i<NF; i++) { path=(path=="" ? $i : path "/" $i); print "d " path } print "f " $0 }' \
+        /kernel/nexus-ostd/cser-production-sources.txt \
+        | LC_ALL=C sort -u > /tmp/nexus-cser-expected; \
+    find /kernel/nexus-ostd/src/cser -mindepth 1 -printf '%y %P\n' \
+        | LC_ALL=C sort > /tmp/nexus-cser-actual; \
+    cmp /tmp/nexus-cser-expected /tmp/nexus-cser-actual; \
+    while IFS= read -r relative; do \
+        test -f "/tmp/nexus-cser-audit/src/cser/$relative"; \
+        test ! -L "/tmp/nexus-cser-audit/src/cser/$relative"; \
+        cmp "/tmp/nexus-cser-audit/src/cser/$relative" \
+            "/kernel/nexus-ostd/src/cser/$relative"; \
+    done < /kernel/nexus-ostd/cser-production-sources.txt; \
+    rm -f /tmp/nexus-cser-expected /tmp/nexus-cser-actual

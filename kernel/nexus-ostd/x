@@ -12,7 +12,8 @@ fi
 exec 9>"$kernel_lock"
 flock 9
 production_source_manifest="$root/cser-production-sources.txt"
-if [[ ! -f $production_source_manifest || -L $production_source_manifest ]]; then
+if [[ ! -f $production_source_manifest || -L $production_source_manifest ]] \
+    || [[ $(realpath -e -- "$production_source_manifest") != "$production_source_manifest" ]]; then
     echo "CSER production source manifest must be a non-symlink regular file: $production_source_manifest" >&2
     exit 1
 fi
@@ -33,7 +34,8 @@ for relative in "${cser_production_sources[@]}"; do
     fi
     source_path="$root/src/cser/$relative"
     target_path="/kernel/nexus-ostd/src/cser/$relative"
-    if [[ ! -f $source_path || -L $source_path ]]; then
+    if [[ ! -f $source_path || -L $source_path ]] \
+        || [[ $(realpath -e -- "$source_path") != "$source_path" ]]; then
         echo "CSER production source must be a non-symlink regular file: $source_path" >&2
         exit 1
     fi
@@ -45,6 +47,8 @@ if ((${#cser_production_sources[@]} == 0)); then
     echo "CSER production source manifest is empty" >&2
     exit 1
 fi
+readonly production_source_manifest
+readonly -a cser_production_sources cser_source_hash_inputs cser_source_mount_args
 # Hash only inputs consumed while building the pinned image. Runtime serial
 # oracles execute from the mounted worktree and must not force an image rebuild.
 image_key=$(sha256sum \
