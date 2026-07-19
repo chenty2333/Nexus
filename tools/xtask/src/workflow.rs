@@ -1323,6 +1323,7 @@ fn audit_cser_attribute(attribute: &syn::Attribute) -> Option<String> {
                 path.value().as_str(),
                 "effect_registry/root_lanes.rs"
                     | "effect_registry/runtime_causal.rs"
+                    | "effect_registry/runtime_task.rs"
                     | "infrastructure/mod.rs"
             ))
             .then(|| format!("path attribute targets unaudited source {}", path.value()))
@@ -2559,7 +2560,7 @@ fn validate_backend_source_pair_semantics(
 fn expected_backend_source_sha256(relative: &str) -> Result<&'static str> {
     match relative {
         "kernel/nexus-ostd/x" => {
-            Ok("4cd29767f47e1ec55cb07e2625065306170d77a818597667ff53c2ce9820d751")
+            Ok("b2f3a6d65ef9996950ad59f21d387c24481e0f099f6cb62b9b4469c6c2ace0c4")
         }
         "experiments/ostd-virtio-cser-spike/x" => {
             Ok("e51d863a8134cfd8b25ff33438441c73a93f6548ea0202fad54a6c4270153ee9")
@@ -2796,10 +2797,10 @@ fn validate_backend_docker_source_set_semantics(
 fn expected_backend_docker_sha256(relative: &str) -> Result<&'static str> {
     match relative {
         "kernel/nexus-ostd/Dockerfile" => {
-            Ok("364e7e18db887513f1f854437aea00c5e96a0bad2670f955f740150349b78893")
+            Ok("104b75cfbf8d9fe18d14a1834d11e58b281efcac6c4ca9640a6d6acbae2b1eb2")
         }
         "experiments/ostd-virtio-cser-spike/Dockerfile" => {
-            Ok("3ecbe03b2eef393e6672cfc18bf98e5f45d4fc65c8eda2726a46d018ccc075d2")
+            Ok("22896c4790e6a2faf76cc641fcf42eb74e8564258efaefc12f427078581593e0")
         }
         _ => Err(format!("unknown production backend Dockerfile: {relative}").into()),
     }

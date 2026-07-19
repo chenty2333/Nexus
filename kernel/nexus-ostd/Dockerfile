@@ -72,6 +72,8 @@ COPY kernel/nexus-ostd/src/cser/effect_registry/root_lanes.rs \
     /kernel/nexus-ostd/src/cser/effect_registry/root_lanes.rs
 COPY kernel/nexus-ostd/src/cser/effect_registry/runtime_causal.rs \
     /kernel/nexus-ostd/src/cser/effect_registry/runtime_causal.rs
+COPY kernel/nexus-ostd/src/cser/effect_registry/runtime_task.rs \
+    /kernel/nexus-ostd/src/cser/effect_registry/runtime_task.rs
 COPY kernel/nexus-ostd/src/cser/infrastructure/continuation.rs \
     /kernel/nexus-ostd/src/cser/infrastructure/continuation.rs
 COPY kernel/nexus-ostd/src/cser/infrastructure/deadline.rs \

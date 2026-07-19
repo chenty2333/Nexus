@@ -720,6 +720,10 @@ check_runtime_fs_same_boot_source() {
         "$root/src/lib.rs"
 }
 
+check_causal_task_facade_source() {
+    bash "$root/scripts/assert-causal-task-facade-source.sh"
+}
+
 check_runtime_fs_same_boot_precommit_source() {
     bash "$root/scripts/assert-runtime-fs-same-boot-precommit-source.sh" \
         "$root/src/personality/linux_fs.rs" \
@@ -1119,6 +1123,7 @@ case "$command" in
         check_oracles
         check_runtime_fs_production_source
         check_runtime_fs_same_boot_source
+        check_causal_task_facade_source
         check_runtime_fs_same_boot_precommit_source
         check_linux_futex_startup_source
         prepare_guest

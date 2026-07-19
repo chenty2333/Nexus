@@ -34,6 +34,9 @@ mod root_lanes;
 #[path = "effect_registry/runtime_causal.rs"]
 pub(crate) mod runtime_causal;
 
+#[path = "effect_registry/runtime_task.rs"]
+pub(crate) mod runtime_task;
+
 #[path = "infrastructure/mod.rs"]
 mod infrastructure;
 
@@ -16870,6 +16873,8 @@ fn supervisor_domain_recovery_primitives_self_test() {
 pub(crate) fn production_identity_registry_self_test() {
     #[cfg(test)]
     runtime_causal::runtime_causal_bootstrap_self_test();
+    #[cfg(test)]
+    runtime_task::causal_task_facade_self_test();
     #[cfg(test)]
     supervisor_domain_recovery_primitives_self_test();
     #[cfg(test)]

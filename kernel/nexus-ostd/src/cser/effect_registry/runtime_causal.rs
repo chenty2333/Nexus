@@ -104,14 +104,14 @@ impl CausalWorkloadLimits {
     __cser_core::cmp::PartialEq,
 )]
 pub(crate) struct CausalWorkloadIdentity {
-    registry_instance: u64,
-    scope: ScopeKey,
-    authority_epoch: u64,
-    root_effect: EffectKey,
-    domain: DomainKey,
-    binding_epoch: u64,
-    request_id: u64,
-    request_generation: u64,
+    pub(super) registry_instance: u64,
+    pub(super) scope: ScopeKey,
+    pub(super) authority_epoch: u64,
+    pub(super) root_effect: EffectKey,
+    pub(super) domain: DomainKey,
+    pub(super) binding_epoch: u64,
+    pub(super) request_id: u64,
+    pub(super) request_generation: u64,
 }
 
 impl CausalWorkloadIdentity {
@@ -138,8 +138,8 @@ impl CausalWorkloadIdentity {
 /// Registry facade can inspect or consume its private infrastructure context.
 #[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(crate) struct CausalWorkloadSession {
-    identity: CausalWorkloadIdentity,
-    context: infrastructure::WorkloadContext,
+    pub(super) identity: CausalWorkloadIdentity,
+    pub(super) context: infrastructure::WorkloadContext,
 }
 
 /// Exact two-phase close authority for one session and one pair of Registry
