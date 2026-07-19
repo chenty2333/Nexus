@@ -272,6 +272,11 @@ const CHECKED_ITEM_OWNERSHIP: &[CheckedItemOwner] = &[
     ),
     owned(
         CheckedItemKind::Function,
+        "device_preparation_outer_credit_self_test",
+        RegistryUnit::Authority,
+    ),
+    owned(
+        CheckedItemKind::Function,
         "production_identity_registry_self_test",
         RegistryUnit::Authority,
     ),

@@ -13,6 +13,7 @@ const FAULT_REGISTRY_SOURCE: &str = registry_source_set::RegistryUnit::Authority
 const KERNEL_SOURCE_DIRECTORY: &str = "kernel/nexus-ostd/src";
 const OUTPUT_DIRECTORY: &str = "target/verification/stage7b";
 const FAULT_OUTPUT: &str = "fault-matrix.jsonl";
+const EXPECTED_REGISTRY_CONSTRUCTORS: usize = 15;
 const SCALE_OUTPUT: &str = "scale.jsonl";
 const PERFORMANCE_OUTPUT: &str = "performance.json";
 const ORACLE_OUTPUT: &str = "oracle.log";
@@ -665,9 +666,11 @@ fn validate_fault_registry_source_set(
                 "Stage 7B textual Registry constructor population overflowed".to_owned()
             })?;
     }
-    if semantic_registry_constructors != 14 || textual_registry_constructors != 14 {
+    if semantic_registry_constructors != EXPECTED_REGISTRY_CONSTRUCTORS
+        || textual_registry_constructors != EXPECTED_REGISTRY_CONSTRUCTORS
+    {
         return Err(format!(
-            "Stage 7B Registry source-set constructor population drifted; hidden sidecars are forbidden (expected 14, observed semantic={semantic_registry_constructors} textual={textual_registry_constructors})"
+            "Stage 7B Registry source-set constructor population drifted; hidden sidecars are forbidden (expected {EXPECTED_REGISTRY_CONSTRUCTORS}, observed semantic={semantic_registry_constructors} textual={textual_registry_constructors})"
         ));
     }
 
@@ -3720,6 +3723,23 @@ mod tests {
             error.contains("checked-item ownership drifted")
                 && error.contains("Stage7bFaultBudget"),
             "duplicate item failed through the wrong source-set gate: {error}"
+        );
+    }
+
+    #[test]
+    fn registry_source_set_rejects_unbound_device_preparation_self_test() {
+        let source = checked_registry_source();
+        let mutated = source.replacen(
+            "    device_preparation_outer_credit_self_test();",
+            "    device_preparation_outer_credit_self_test_disabled();",
+            1,
+        );
+        assert_ne!(mutated, source);
+        let error = validate_fault_registry_source_text(&mutated).unwrap_err();
+        assert!(
+            error.contains("device-preparation credit self-test")
+                && error.contains("must be called exactly once"),
+            "unbound device-preparation self-test failed through the wrong gate: {error}"
         );
     }
 
