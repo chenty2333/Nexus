@@ -2026,11 +2026,50 @@ pub(super) struct DeviceMaterializationPlan {
     base_revision: u64,
 }
 
+/// Exact ordered identity of the four effects created from one preparation.
+/// The digest is redundant by design and is recomputed by the outer Registry;
+/// retaining the keys lets recovery prove which cohort owns transferred
+/// credits instead of trusting an opaque digest alone.
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
+pub(crate) struct DeviceCohortIdentity {
+    pub(crate) block: EffectKey,
+    pub(crate) dma: [EffectKey; 3],
+    pub(crate) digest: u64,
+}
+
+impl DeviceCohortIdentity {
+    pub(crate) const fn ordered_effects(self) -> [EffectKey; 4] {
+        [self.block, self.dma[0], self.dma[1], self.dma[2]]
+    }
+
+    fn validate(self) -> Result<(), InfrastructureError> {
+        let effects = self.ordered_effects();
+        if self.digest == 0
+            || effects
+                .iter()
+                .any(|effect| effect.id() == 0 || effect.generation() == 0)
+            || effects
+                .iter()
+                .enumerate()
+                .any(|(index, effect)| effects[..index].contains(effect))
+        {
+            return Err(InfrastructureError::InvalidIdentity);
+        }
+        Ok(())
+    }
+}
+
 #[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(crate) struct MaterializedDeviceTicket {
     preparation: BearerStamp<DeviceReservationCoordinates>,
     owner: PreparedOwner,
-    cohort_digest: u64,
+    cohort: DeviceCohortIdentity,
 }
 
 #[derive(
@@ -2058,6 +2097,31 @@ impl ValidatedDeviceClosureProof {
     __cser_core::cmp::PartialEq,
 )]
 pub(crate) struct DeviceHardwareReceipt {
+    pub(crate) owned_device: ResourceKey,
+    pub(crate) device: DeviceEnvelope,
+    pub(crate) operation_digest: u64,
+    pub(crate) actor_slot: u32,
+    pub(crate) actor_generation: u64,
+    pub(crate) hardware_receipt_digest: u64,
+}
+
+/// Exact adapter presentation bound to one `PreparedRetained` owner.
+///
+/// This is descriptive evidence, not a bearer: the non-cloneable
+/// `DevicePreparationTicket` remains the authority consumed by materialization.
+/// Repeating every preparation and hardware-owner coordinate prevents a caller
+/// from pairing a valid ticket with a result from another adapter slot,
+/// generation, queue, or descriptor selection.
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
+pub(crate) struct PreparedDeviceIdentity {
+    pub(crate) preparation_id: u64,
+    pub(crate) preparation_generation: u64,
     pub(crate) owned_device: ResourceKey,
     pub(crate) device: DeviceEnvelope,
     pub(crate) operation_digest: u64,
@@ -2126,7 +2190,8 @@ pub(crate) struct DevicePreparationRecoveryProjection {
     pub(crate) state: DevicePreparationRecoveryState,
     pub(crate) credit_ownership: DevicePreparationCreditOwnership,
     pub(crate) prepared_device: Option<DeviceEnvelope>,
-    pub(crate) cohort_digest: Option<u64>,
+    pub(crate) prepared_identity: Option<PreparedDeviceIdentity>,
+    pub(crate) cohort: Option<DeviceCohortIdentity>,
     pub(crate) rollback_receipt: Option<DeviceRollbackReceipt>,
     pub(crate) closure_receipt: Option<RegistryDeviceClosureReceipt>,
 }
@@ -2140,8 +2205,11 @@ pub(crate) struct DevicePreparationRecoveryProjection {
 )]
 pub(super) struct DevicePreparationCreditProjection {
     pub(super) scope: ScopeKey,
+    pub(super) parent_effect: EffectKey,
     pub(super) charges: [CreditCharge; 3],
     pub(super) ownership: DevicePreparationCreditOwnership,
+    pub(super) prepared: Option<PreparedDeviceIdentity>,
+    pub(super) cohort: Option<DeviceCohortIdentity>,
 }
 
 #[derive(
@@ -2902,12 +2970,12 @@ enum DevicePhase {
     },
     Materialized {
         owner: PreparedOwner,
-        cohort_digest: u64,
+        cohort: DeviceCohortIdentity,
         preparation_credits_transferred: bool,
     },
     Released {
         owner: PreparedOwner,
-        cohort_digest: Option<u64>,
+        cohort: Option<DeviceCohortIdentity>,
         closure: RegistryDeviceClosureReceipt,
     },
     Cancelled {

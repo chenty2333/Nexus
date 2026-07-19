@@ -5,12 +5,13 @@ extern crate core as __cser_core;
 
 use super::{
     BearerStamp, DEVICE_DMA_MAPPINGS, DEVICE_PINNED_PAGES, DEVICE_QUEUE_SLOTS, DeviceAdoption,
-    DeviceApplyIntent, DeviceCreditOwnership, DeviceHardwareReceipt, DeviceMaterializationPlan,
-    DevicePhase, DevicePreparationCreditOwnership, DevicePreparationCreditProjection,
-    DevicePreparationRecoveryProjection, DevicePreparationRecoveryState, DevicePreparationTicket,
-    DeviceRecord, DeviceReservationCoordinates, DeviceRollbackReceipt, EffectKey,
-    InfrastructureError, InfrastructureEventKind, InfrastructureKind, InfrastructureState,
-    LedgerMode, LinearResult, MaterializedDeviceTicket, ParentStamp, PreparedOwner,
+    DeviceApplyIntent, DeviceCohortIdentity, DeviceCreditOwnership, DeviceHardwareReceipt,
+    DeviceMaterializationPlan, DevicePhase, DevicePreparationCreditOwnership,
+    DevicePreparationCreditProjection, DevicePreparationRecoveryProjection,
+    DevicePreparationRecoveryState, DevicePreparationTicket, DeviceRecord,
+    DeviceReservationCoordinates, DeviceRollbackReceipt, EffectKey, InfrastructureError,
+    InfrastructureEventKind, InfrastructureKind, InfrastructureState, LedgerMode, LinearResult,
+    MaterializedDeviceTicket, ParentStamp, PreparedDeviceIdentity, PreparedOwner,
     RegistryDeviceClosureReceipt, ReverseIndexRecord, ReverseParent, ScopeInfrastructure,
     ValidatedDeviceClosureProof, WorkloadContext, checked_add, checked_sub, linear_apply,
     preview_bearer_stamp, preview_nonce, preview_nonces, preview_revision,
@@ -447,15 +448,13 @@ impl InfrastructureState {
     pub(in super::super) fn materialize_device_in_candidate(
         &mut self,
         plan: DeviceMaterializationPlan,
-        cohort_digest: u64,
+        cohort: DeviceCohortIdentity,
     ) -> LinearResult<DeviceMaterializationPlan, DeviceMaterializationPlan> {
         linear_apply(plan, |plan| {
             if self.mode != LedgerMode::NonAuthoritativeCandidate {
                 return Err(InfrastructureError::CandidateHasNoAuthority);
             }
-            if cohort_digest == 0 {
-                return Err(InfrastructureError::InvalidIdentity);
-            }
+            cohort.validate()?;
             let stamp = plan.preparation;
             let scope = self.scope_mut(stamp.root.scope)?;
             let record = scope
@@ -491,7 +490,7 @@ impl InfrastructureState {
             record.credit_ownership = DeviceCreditOwnership::Transferred;
             record.phase = DevicePhase::Materialized {
                 owner: plan.owner,
-                cohort_digest,
+                cohort,
                 preparation_credits_transferred: true,
             };
             scope.live.queue_slots = next_queue_slots;
@@ -507,6 +506,42 @@ impl InfrastructureState {
                 preparation: plan.preparation,
                 owner: plan.owner,
                 base_revision: plan.base_revision,
+            })
+        })
+    }
+
+    /// Mints the linear materialized successor only from the authoritative
+    /// record after the containing Registry candidate has been installed.
+    /// Failure returns the exact preparation plan so the outer Registry can
+    /// restore its pre-install snapshot without losing authority.
+    pub(in super::super) fn mint_materialized_device_ticket_after_install(
+        &self,
+        plan: DeviceMaterializationPlan,
+        cohort: DeviceCohortIdentity,
+    ) -> LinearResult<DeviceMaterializationPlan, MaterializedDeviceTicket> {
+        linear_apply(plan, |plan| {
+            self.require_authoritative()?;
+            let stamp = plan.preparation;
+            let scope = self.scope(stamp.root.scope)?;
+            validate_device_bearer(scope, self.registry_instance, &stamp)?;
+            let record = scope
+                .devices
+                .get(stamp.identity.preparation_id)
+                .ok_or(InfrastructureError::UnknownObligation)?;
+            if record.credit_ownership != DeviceCreditOwnership::Transferred
+                || record.phase
+                    != (DevicePhase::Materialized {
+                        owner: plan.owner,
+                        cohort,
+                        preparation_credits_transferred: true,
+                    })
+            {
+                return Err(InfrastructureError::StaleClaim);
+            }
+            Ok(MaterializedDeviceTicket {
+                preparation: plan.preparation,
+                owner: plan.owner,
+                cohort,
             })
         })
     }
@@ -532,10 +567,45 @@ impl InfrastructureState {
                             DevicePreparationCreditOwnership::Released
                         }
                     };
+                    let parent_effect = match record.stamp.parent {
+                        ParentStamp::Effect(parent) => parent,
+                        _ => __cser_core::unreachable!(),
+                    };
+                    let (owner, cohort) = match record.phase {
+                        DevicePhase::PreparedRetained { owner }
+                        | DevicePhase::Materialized { owner, .. }
+                        | DevicePhase::Released { owner, .. } => {
+                            let cohort = match record.phase {
+                                DevicePhase::Materialized { cohort, .. } => Some(cohort),
+                                DevicePhase::Released { cohort, .. } => cohort,
+                                DevicePhase::PreparedRetained { .. }
+                                | DevicePhase::Reserved
+                                | DevicePhase::Applying { .. }
+                                | DevicePhase::Cancelled { .. } => None,
+                            };
+                            (Some(owner), cohort)
+                        }
+                        DevicePhase::Reserved
+                        | DevicePhase::Applying { .. }
+                        | DevicePhase::Cancelled { .. } => (None, None),
+                    };
+                    let prepared = owner.map(|owner| PreparedDeviceIdentity {
+                        preparation_id: record.stamp.identity.preparation_id,
+                        preparation_generation: record.stamp.identity.generation,
+                        owned_device: owner.owned_device,
+                        device: owner.device,
+                        operation_digest: owner.operation_digest,
+                        actor_slot: owner.actor_slot,
+                        actor_generation: owner.actor_generation,
+                        hardware_receipt_digest: owner.hardware_receipt_digest,
+                    });
                     DevicePreparationCreditProjection {
                         scope: *scope,
+                        parent_effect,
                         charges: record.stamp.identity.credit_charges(),
                         ownership,
+                        prepared,
+                        cohort,
                     }
                 })
             })
@@ -553,7 +623,7 @@ impl InfrastructureState {
             let registry_instance = self.registry_instance;
             let scope = self.scope_mut(stamp.root.scope)?;
             validate_device_bearer(scope, registry_instance, &stamp)?;
-            let (owner, cohort_digest) = match scope
+            let (owner, cohort) = match scope
                 .devices
                 .get(stamp.identity.preparation_id)
                 .unwrap()
@@ -561,12 +631,12 @@ impl InfrastructureState {
             {
                 DevicePhase::Materialized {
                     owner,
-                    cohort_digest,
+                    cohort,
                     preparation_credits_transferred: true,
-                } => (owner, cohort_digest),
+                } => (owner, cohort),
                 _ => return Err(InfrastructureError::InvalidState),
             };
-            if owner != ticket.owner || cohort_digest != ticket.cohort_digest {
+            if owner != ticket.owner || cohort != ticket.cohort {
                 return Err(InfrastructureError::StaleClaim);
             }
             let closure = proof.receipt;
@@ -582,7 +652,7 @@ impl InfrastructureState {
                 stamp,
                 DevicePhase::Released {
                     owner,
-                    cohort_digest: Some(cohort_digest),
+                    cohort: Some(cohort),
                     closure,
                 },
             )?;
@@ -623,7 +693,7 @@ impl InfrastructureState {
                 stamp,
                 DevicePhase::Released {
                     owner,
-                    cohort_digest: None,
+                    cohort: None,
                     closure,
                 },
             )?;
@@ -660,62 +730,75 @@ impl InfrastructureState {
             }
             DeviceCreditOwnership::Released => DevicePreparationCreditOwnership::Released,
         };
-        let (state, prepared_device, cohort_digest, rollback_receipt, closure_receipt) =
-            match record.phase {
-                DevicePhase::Reserved => (
-                    DevicePreparationRecoveryState::Reserved,
-                    None,
-                    None,
-                    None,
-                    None,
-                ),
-                DevicePhase::Applying { .. } => (
-                    DevicePreparationRecoveryState::ApplyingHardware,
-                    None,
-                    None,
-                    None,
-                    None,
-                ),
-                DevicePhase::PreparedRetained { owner } => (
-                    DevicePreparationRecoveryState::PreparedRetained,
-                    Some(owner.device),
-                    None,
-                    None,
-                    None,
-                ),
-                DevicePhase::Materialized {
-                    owner,
-                    cohort_digest,
-                    ..
-                } => (
-                    DevicePreparationRecoveryState::Materialized,
-                    Some(owner.device),
-                    Some(cohort_digest),
-                    None,
-                    None,
-                ),
-                DevicePhase::Released {
-                    owner,
-                    cohort_digest,
-                    closure,
-                } => (
-                    DevicePreparationRecoveryState::Released,
-                    Some(owner.device),
-                    cohort_digest,
-                    None,
-                    Some(closure),
-                ),
-                DevicePhase::Cancelled { rollback } => (
-                    DevicePreparationRecoveryState::Cancelled,
-                    None,
-                    None,
-                    rollback,
-                    None,
-                ),
-            };
+        let (state, prepared_device, cohort, rollback_receipt, closure_receipt) = match record.phase
+        {
+            DevicePhase::Reserved => (
+                DevicePreparationRecoveryState::Reserved,
+                None,
+                None,
+                None,
+                None,
+            ),
+            DevicePhase::Applying { .. } => (
+                DevicePreparationRecoveryState::ApplyingHardware,
+                None,
+                None,
+                None,
+                None,
+            ),
+            DevicePhase::PreparedRetained { owner } => (
+                DevicePreparationRecoveryState::PreparedRetained,
+                Some(owner.device),
+                None,
+                None,
+                None,
+            ),
+            DevicePhase::Materialized { owner, cohort, .. } => (
+                DevicePreparationRecoveryState::Materialized,
+                Some(owner.device),
+                Some(cohort),
+                None,
+                None,
+            ),
+            DevicePhase::Released {
+                owner,
+                cohort,
+                closure,
+            } => (
+                DevicePreparationRecoveryState::Released,
+                Some(owner.device),
+                cohort,
+                None,
+                Some(closure),
+            ),
+            DevicePhase::Cancelled { rollback } => (
+                DevicePreparationRecoveryState::Cancelled,
+                None,
+                None,
+                rollback,
+                None,
+            ),
+        };
         let parent_effect = match record.stamp.parent {
             ParentStamp::Effect(parent) => parent,
             _ => return Err(InfrastructureError::ForeignParent),
+        };
+        let prepared_identity = match record.phase {
+            DevicePhase::PreparedRetained { owner }
+            | DevicePhase::Materialized { owner, .. }
+            | DevicePhase::Released { owner, .. } => Some(PreparedDeviceIdentity {
+                preparation_id: record.stamp.identity.preparation_id,
+                preparation_generation: record.stamp.identity.generation,
+                owned_device: owner.owned_device,
+                device: owner.device,
+                operation_digest: owner.operation_digest,
+                actor_slot: owner.actor_slot,
+                actor_generation: owner.actor_generation,
+                hardware_receipt_digest: owner.hardware_receipt_digest,
+            }),
+            DevicePhase::Reserved
+            | DevicePhase::Applying { .. }
+            | DevicePhase::Cancelled { .. } => None,
         };
         Ok(DevicePreparationRecoveryProjection {
             coordinates: record.stamp.identity,
@@ -723,7 +806,8 @@ impl InfrastructureState {
             state,
             credit_ownership,
             prepared_device,
-            cohort_digest,
+            prepared_identity,
+            cohort,
             rollback_receipt,
             closure_receipt,
         })
@@ -787,11 +871,11 @@ impl InfrastructureState {
             DevicePhase::PreparedRetained { owner } => DevicePhase::PreparedRetained { owner },
             DevicePhase::Materialized {
                 owner,
-                cohort_digest,
+                cohort,
                 preparation_credits_transferred,
             } => DevicePhase::Materialized {
                 owner,
-                cohort_digest,
+                cohort,
                 preparation_credits_transferred,
             },
             DevicePhase::Released { .. } | DevicePhase::Cancelled { .. } => {
@@ -827,15 +911,13 @@ impl InfrastructureState {
             DevicePhase::PreparedRetained { .. } => {
                 DeviceAdoption::Prepared(DevicePreparationTicket(stamp))
             }
-            DevicePhase::Materialized {
-                owner,
-                cohort_digest,
-                ..
-            } => DeviceAdoption::Materialized(MaterializedDeviceTicket {
-                preparation: stamp,
-                owner,
-                cohort_digest,
-            }),
+            DevicePhase::Materialized { owner, cohort, .. } => {
+                DeviceAdoption::Materialized(MaterializedDeviceTicket {
+                    preparation: stamp,
+                    owner,
+                    cohort,
+                })
+            }
             DevicePhase::Released { .. } | DevicePhase::Cancelled { .. } => {
                 return Err(InfrastructureError::Invariant("invalid device adoption"));
             }
@@ -871,6 +953,18 @@ impl DevicePreparationTicket {
 
     pub(in super::super) const fn scope(&self) -> super::ScopeKey {
         self.0.root.scope
+    }
+
+    #[cfg(test)]
+    pub(in super::super) const fn duplicate_for_test(&self) -> Self {
+        Self(self.0)
+    }
+
+    #[cfg(test)]
+    pub(in super::super) fn stale_bearer_for_test(&self) -> Self {
+        let mut stamp = self.0;
+        stamp.bearer_generation = stamp.bearer_generation.checked_add(1).unwrap();
+        Self(stamp)
     }
 }
 
@@ -908,19 +1002,21 @@ impl DeviceMaterializationPlan {
         self.owner.device
     }
 
-    pub(in super::super) fn into_preparation_ticket(self) -> DevicePreparationTicket {
-        DevicePreparationTicket(self.preparation)
+    pub(in super::super) const fn prepared_identity(&self) -> PreparedDeviceIdentity {
+        PreparedDeviceIdentity {
+            preparation_id: self.preparation.identity.preparation_id,
+            preparation_generation: self.preparation.identity.generation,
+            owned_device: self.owner.owned_device,
+            device: self.owner.device,
+            operation_digest: self.owner.operation_digest,
+            actor_slot: self.owner.actor_slot,
+            actor_generation: self.owner.actor_generation,
+            hardware_receipt_digest: self.owner.hardware_receipt_digest,
+        }
     }
 
-    pub(in super::super) fn into_materialized_ticket(
-        self,
-        cohort_digest: u64,
-    ) -> MaterializedDeviceTicket {
-        MaterializedDeviceTicket {
-            preparation: self.preparation,
-            owner: self.owner,
-            cohort_digest,
-        }
+    pub(in super::super) fn into_preparation_ticket(self) -> DevicePreparationTicket {
+        DevicePreparationTicket(self.preparation)
     }
 }
 
@@ -980,14 +1076,11 @@ fn finish_device(
     let next_workload_children = preview_workload_child_sub(scope, stamp.workload.request)?;
     let credit_ownership = match terminal {
         DevicePhase::Released {
-            cohort_digest: Some(_),
-            ..
+            cohort: Some(_), ..
         } => DeviceCreditOwnership::Transferred,
-        DevicePhase::Released {
-            cohort_digest: None,
-            ..
+        DevicePhase::Released { cohort: None, .. } | DevicePhase::Cancelled { .. } => {
+            DeviceCreditOwnership::Released
         }
-        | DevicePhase::Cancelled { .. } => DeviceCreditOwnership::Released,
         _ => {
             return Err(InfrastructureError::Invariant(
                 "nonterminal device finish phase",

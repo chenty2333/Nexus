@@ -553,6 +553,34 @@ impl CreditLedger {
         }
     }
 
+    /// Moves one already-retained owner directly into held effect ownership.
+    /// `free` is deliberately untouched: device materialization transfers the
+    /// exact preparation credits and never releases/re-reserves substitutes.
+    fn transfer_retained_to_held(&mut self, charges: &[CreditCharge]) -> Result<(), RegistryError> {
+        for charge in charges {
+            let balance = self
+                .balances
+                .get(&charge.class)
+                .ok_or(RegistryError::UnknownCreditClass)?;
+            if charge.units == 0 || balance.retained < charge.units {
+                return Err(RegistryError::InvalidState);
+            }
+            balance
+                .held
+                .checked_add(charge.units)
+                .ok_or(RegistryError::CounterOverflow)?;
+        }
+        for charge in charges {
+            let balance = self.balances.get_mut(&charge.class).unwrap();
+            balance.retained -= charge.units;
+            balance.held = balance
+                .held
+                .checked_add(charge.units)
+                .expect("validated retained-to-held transfer cannot overflow");
+        }
+        Ok(())
+    }
+
     fn release(
         &mut self,
         charges: &[CreditCharge],
@@ -1828,6 +1856,16 @@ pub(crate) struct DeviceDerivedCohortEntry {
     pub(crate) device: DeviceEnvelope,
 }
 
+/// One successful direct transfer from a retained preparation into the exact
+/// four-effect block/DMA cohort. The materialized ticket is the only linear
+/// successor and remains required by the later exact device-closure path.
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
+pub(crate) struct DeviceCohortMaterialization {
+    pub(crate) registered: [RegisteredEffect; 4],
+    pub(crate) authority: infrastructure::MaterializedDeviceTicket,
+    pub(crate) cohort: infrastructure::DeviceCohortIdentity,
+}
+
 /// One failure-atomic update of an effect's current resource membership.
 ///
 /// `handle` authenticates the complete immutable effect identity. Only the
@@ -1930,6 +1968,12 @@ struct DeviceBatchMembership {
     ordinal: usize,
     size: usize,
     device: DeviceEnvelope,
+}
+
+#[derive(__cser_core::clone::Clone, __cser_core::marker::Copy)]
+enum RegistrationCreditSource {
+    ReserveFree,
+    TransferRetainedPreparation,
 }
 
 /// One root-local source of truth for device publication provenance.
@@ -2099,6 +2143,18 @@ struct DeviceCloseApplyPlan {
 struct DeviceDerivedCohortPlan {
     candidate: EffectRegistry,
     registered: [RegisteredEffect; 4],
+}
+
+/// Fully staged, non-authoritative whole-Registry replacement. The duplicated
+/// base is an exact stale fence for the temporary O(N) implementation; it is
+/// never exposed outside this module and final replacement performs no
+/// allocation or callback.
+struct DeviceCohortMaterializationPlan {
+    base: EffectRegistry,
+    candidate: EffectRegistry,
+    authority: infrastructure::DeviceMaterializationPlan,
+    registered: [RegisteredEffect; 4],
+    cohort: infrastructure::DeviceCohortIdentity,
 }
 
 /// A non-authoritative, exact-scope transaction candidate spanning the
@@ -3631,6 +3687,240 @@ impl EffectRegistry {
             .map_err(Into::into)
     }
 
+    /// Atomically transfers one exact `PreparedRetained` authority into the
+    /// fixed block-plus-three-DMA business cohort. The temporary implementation
+    /// stages a private full Registry replacement, so candidate construction is
+    /// still O(N) and allocator-pressure handling is not yet a production
+    /// claim. The final linearization itself performs no allocation or callback.
+    pub(crate) fn materialize_device_cohort_from_preparation(
+        &mut self,
+        ticket: infrastructure::DevicePreparationTicket,
+        prepared: infrastructure::PreparedDeviceIdentity,
+        entries: [DeviceDerivedCohortEntry; 4],
+    ) -> Result<
+        DeviceCohortMaterialization,
+        DevicePreparationRegistryFailure<infrastructure::DevicePreparationTicket>,
+    > {
+        let plan = self.prepare_device_cohort_materialization(ticket, prepared, entries)?;
+        self.apply_device_cohort_materialization(plan)
+    }
+
+    fn prepare_device_cohort_materialization(
+        &self,
+        ticket: infrastructure::DevicePreparationTicket,
+        prepared: infrastructure::PreparedDeviceIdentity,
+        entries: [DeviceDerivedCohortEntry; 4],
+    ) -> Result<
+        DeviceCohortMaterializationPlan,
+        DevicePreparationRegistryFailure<infrastructure::DevicePreparationTicket>,
+    > {
+        let scope_key = ticket.scope();
+        let scope = match self.scopes.get(&scope_key) {
+            Some(scope) => scope,
+            None => {
+                return Err(DevicePreparationRegistryFailure {
+                    error: RegistryError::UnknownScope,
+                    input: ticket,
+                });
+            }
+        };
+        if scope.phase != ScopePhase::Active {
+            return Err(DevicePreparationRegistryFailure {
+                error: RegistryError::ScopeNotActive,
+                input: ticket,
+            });
+        }
+        let authority = match self.infrastructure.prepare_device_materialization(ticket) {
+            Ok(authority) => authority,
+            Err(failure) => {
+                let (error, input) = failure.into_parts();
+                return Err(DevicePreparationRegistryFailure {
+                    error: error.into(),
+                    input,
+                });
+            }
+        };
+        if authority.prepared_identity() != prepared {
+            return Err(DevicePreparationRegistryFailure {
+                error: RegistryError::InvalidHandle,
+                input: authority.into_preparation_ticket(),
+            });
+        }
+        let entries = match validate_prepared_device_cohort_entries(&authority, prepared, entries) {
+            Ok(entries) => entries,
+            Err(error) => {
+                return Err(DevicePreparationRegistryFailure {
+                    error,
+                    input: authority.into_preparation_ticket(),
+                });
+            }
+        };
+
+        let base = self.clone();
+        let mut candidate = self.clone();
+        candidate.infrastructure = match self.infrastructure.try_private_candidate() {
+            Ok(infrastructure) => infrastructure,
+            Err(error) => {
+                return Err(DevicePreparationRegistryFailure {
+                    error: error.into(),
+                    input: authority.into_preparation_ticket(),
+                });
+            }
+        };
+        let registered = match candidate.register_prepared_device_cohort(&authority, entries) {
+            Ok(registered) => registered,
+            Err(error) => {
+                return Err(DevicePreparationRegistryFailure {
+                    error,
+                    input: authority.into_preparation_ticket(),
+                });
+            }
+        };
+        let cohort = device_cohort_identity(prepared, &registered);
+        let authority = match candidate
+            .infrastructure
+            .materialize_device_in_candidate(authority, cohort)
+        {
+            Ok(authority) => authority,
+            Err(failure) => {
+                let (error, authority) = failure.into_parts();
+                return Err(DevicePreparationRegistryFailure {
+                    error: error.into(),
+                    input: authority.into_preparation_ticket(),
+                });
+            }
+        };
+        if let Err(error) = candidate.check_invariants() {
+            return Err(DevicePreparationRegistryFailure {
+                error,
+                input: authority.into_preparation_ticket(),
+            });
+        }
+        Ok(DeviceCohortMaterializationPlan {
+            base,
+            candidate,
+            authority,
+            registered,
+            cohort,
+        })
+    }
+
+    fn apply_device_cohort_materialization(
+        &mut self,
+        plan: DeviceCohortMaterializationPlan,
+    ) -> Result<
+        DeviceCohortMaterialization,
+        DevicePreparationRegistryFailure<infrastructure::DevicePreparationTicket>,
+    > {
+        let DeviceCohortMaterializationPlan {
+            base,
+            mut candidate,
+            authority,
+            registered,
+            cohort,
+        } = plan;
+        let scope_key = authority.scope();
+        let scope = match self.scopes.get(&scope_key) {
+            Some(scope) => scope,
+            None => {
+                return Err(DevicePreparationRegistryFailure {
+                    error: RegistryError::UnknownScope,
+                    input: authority.into_preparation_ticket(),
+                });
+            }
+        };
+        if scope.phase != ScopePhase::Active {
+            return Err(DevicePreparationRegistryFailure {
+                error: RegistryError::ScopeNotActive,
+                input: authority.into_preparation_ticket(),
+            });
+        }
+        if self != &base {
+            return Err(DevicePreparationRegistryFailure {
+                error: RegistryError::CombinedCandidateStale,
+                input: authority.into_preparation_ticket(),
+            });
+        }
+        if let Err(error) = candidate.check_invariants() {
+            return Err(DevicePreparationRegistryFailure {
+                error,
+                input: authority.into_preparation_ticket(),
+            });
+        }
+        if let Err(error) = candidate
+            .infrastructure
+            .promote_full_candidate_for_install()
+        {
+            return Err(DevicePreparationRegistryFailure {
+                error: error.into(),
+                input: authority.into_preparation_ticket(),
+            });
+        }
+
+        let previous = __cser_core::mem::replace(self, candidate);
+        let materialized = match self
+            .infrastructure
+            .mint_materialized_device_ticket_after_install(authority, cohort)
+        {
+            Ok(materialized) => materialized,
+            Err(failure) => {
+                let (error, authority) = failure.into_parts();
+                *self = previous;
+                return Err(DevicePreparationRegistryFailure {
+                    error: error.into(),
+                    input: authority.into_preparation_ticket(),
+                });
+            }
+        };
+        Ok(DeviceCohortMaterialization {
+            registered,
+            authority: materialized,
+            cohort,
+        })
+    }
+
+    fn register_prepared_device_cohort(
+        &mut self,
+        authority: &infrastructure::DeviceMaterializationPlan,
+        entries: [DeviceDerivedCohortEntry; 4],
+    ) -> Result<[RegisteredEffect; 4], RegistryError> {
+        let [block_entry, dma_a_entry, dma_b_entry, dma_request_entry] = entries;
+        let block = self.register_in_domain_with_credit_source(
+            block_entry.request,
+            block_entry.domain,
+            Some(authority.parent_effect()),
+            Some(block_entry.device),
+            false,
+            RegistrationCreditSource::TransferRetainedPreparation,
+        )?;
+        let block_effect = block.identity.effect();
+        let dma_a = self.register_in_domain_with_credit_source(
+            dma_a_entry.request,
+            dma_a_entry.domain,
+            Some(block_effect),
+            Some(dma_a_entry.device),
+            false,
+            RegistrationCreditSource::TransferRetainedPreparation,
+        )?;
+        let dma_b = self.register_in_domain_with_credit_source(
+            dma_b_entry.request,
+            dma_b_entry.domain,
+            Some(block_effect),
+            Some(dma_b_entry.device),
+            false,
+            RegistrationCreditSource::TransferRetainedPreparation,
+        )?;
+        let dma_request = self.register_in_domain_with_credit_source(
+            dma_request_entry.request,
+            dma_request_entry.domain,
+            Some(block_effect),
+            Some(dma_request_entry.device),
+            false,
+            RegistrationCreditSource::TransferRetainedPreparation,
+        )?;
+        Ok([block, dma_a, dma_b, dma_request])
+    }
+
     /// Prepares the one task-owned fault plan which may later enter the
     /// specialized business/infrastructure install below.  No Registry state
     /// changes here and every failure returns the exact armed task authority.
@@ -4312,6 +4602,25 @@ impl EffectRegistry {
         device: Option<DeviceEnvelope>,
         outcome_required: bool,
     ) -> Result<RegisteredEffect, RegistryError> {
+        self.register_in_domain_with_credit_source(
+            request,
+            domain,
+            parent,
+            device,
+            outcome_required,
+            RegistrationCreditSource::ReserveFree,
+        )
+    }
+
+    fn register_in_domain_with_credit_source(
+        &mut self,
+        request: RegisterRequest,
+        domain: DomainKey,
+        parent: Option<EffectKey>,
+        device: Option<DeviceEnvelope>,
+        outcome_required: bool,
+        credit_source: RegistrationCreditSource,
+    ) -> Result<RegisteredEffect, RegistryError> {
         validate_generation(request.scope.generation)?;
         validate_generation(request.task.generation)?;
         for resource in &request.resources {
@@ -4424,11 +4733,13 @@ impl EffectRegistry {
         let nonce = self.next_nonce;
         let next_nonce = nonce.checked_add(1).ok_or(RegistryError::CounterOverflow)?;
 
-        self.scopes
-            .get_mut(&request.scope)
-            .unwrap()
-            .credits
-            .reserve(&credits)?;
+        let ledger = &mut self.scopes.get_mut(&request.scope).unwrap().credits;
+        match credit_source {
+            RegistrationCreditSource::ReserveFree => ledger.reserve(&credits)?,
+            RegistrationCreditSource::TransferRetainedPreparation => {
+                ledger.transfer_retained_to_held(&credits)?;
+            }
+        }
         self.next_effect_id = next_effect_id;
         self.next_nonce = next_nonce;
         let effect = EffectKey::new(effect_id, 1);
@@ -9727,8 +10038,10 @@ impl EffectRegistry {
                         CreditState::Retained,
                     )?;
                 }
-                infrastructure::DevicePreparationCreditOwnership::TransferredToCohort
-                | infrastructure::DevicePreparationCreditOwnership::Released => {}
+                infrastructure::DevicePreparationCreditOwnership::TransferredToCohort => {
+                    self.check_materialized_device_preparation(&owner)?;
+                }
+                infrastructure::DevicePreparationCreditOwnership::Released => {}
             }
         }
 
@@ -9874,6 +10187,74 @@ impl EffectRegistry {
             }
         }
 
+        Ok(())
+    }
+
+    fn check_materialized_device_preparation(
+        &self,
+        owner: &infrastructure::DevicePreparationCreditProjection,
+    ) -> Result<(), RegistryError> {
+        let prepared = owner.prepared.ok_or(RegistryError::Invariant(
+            "transferred preparation lacks prepared owner",
+        ))?;
+        let cohort = owner.cohort.ok_or(RegistryError::Invariant(
+            "transferred preparation lacks exact cohort",
+        ))?;
+        let effects = cohort.ordered_effects();
+        if cohort.digest != device_cohort_digest(prepared, effects) {
+            return Err(RegistryError::Invariant("device cohort digest mismatch"));
+        }
+        let records = effects.map(|effect| self.effects.get(&effect));
+        let [Some(block), Some(dma_a), Some(dma_b), Some(dma_request)] = records else {
+            return Err(RegistryError::Invariant(
+                "materialized preparation cohort effect missing",
+            ));
+        };
+        let cohort_domain = block.identity.domain;
+        let cohort_task = block.identity.task;
+        if block.identity.scope != owner.scope
+            || block.identity.parent != Some(owner.parent_effect)
+            || block.identity.device != Some(prepared.device)
+            || block.descriptor.digest() != prepared.operation_digest
+            || block
+                .identity
+                .resources
+                .iter()
+                .filter(|resource| **resource == prepared.owned_device)
+                .count()
+                != 1
+            || block.credits.as_slice()
+                != [CreditCharge::new(
+                    owner.charges[0].class,
+                    owner.charges[0].units,
+                )]
+            || block.publication_mode != PublicationMode::None
+        {
+            return Err(RegistryError::Invariant(
+                "materialized block preparation mismatch",
+            ));
+        }
+        let expected_dma = [
+            CreditCharge::new(owner.charges[1].class, 1),
+            CreditCharge::new(owner.charges[2].class, 1),
+        ];
+        for dma in [dma_a, dma_b, dma_request] {
+            if dma.identity.scope != owner.scope
+                || dma.identity.domain != cohort_domain
+                || dma.identity.parent != Some(cohort.block)
+                || dma.identity.task != cohort_task
+                || dma.identity.device != Some(prepared.device)
+                || dma.credits.len() != 2
+                || !expected_dma
+                    .iter()
+                    .all(|expected| dma.credits.contains(expected))
+                || dma.publication_mode != PublicationMode::None
+            {
+                return Err(RegistryError::Invariant(
+                    "materialized DMA preparation mismatch",
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -10809,6 +11190,129 @@ impl EffectRegistry {
     fn take_revoke_sequence(&mut self) -> Result<u64, RegistryError> {
         take_counter(&mut self.next_revoke_sequence)
     }
+}
+
+fn validate_prepared_device_cohort_entries(
+    authority: &infrastructure::DeviceMaterializationPlan,
+    prepared: infrastructure::PreparedDeviceIdentity,
+    entries: [DeviceDerivedCohortEntry; 4],
+) -> Result<[DeviceDerivedCohortEntry; 4], RegistryError> {
+    let mut slots = [None, None, None, None];
+    for entry in entries {
+        let index = entry.batch_index;
+        if index >= slots.len() || slots[index].is_some() {
+            return Err(RegistryError::InvalidState);
+        }
+        slots[index] = Some(entry);
+    }
+    let [Some(block), Some(dma_a), Some(dma_b), Some(dma_request)] = slots else {
+        return Err(RegistryError::InvalidState);
+    };
+    let entries = [block, dma_a, dma_b, dma_request];
+    let coordinates = authority.coordinates();
+    if authority.prepared_identity() != prepared
+        || prepared.preparation_id != coordinates.preparation_id
+        || prepared.preparation_generation != coordinates.generation
+        || prepared.owned_device != coordinates.owned_device
+        || prepared.operation_digest != coordinates.operation_digest
+        || prepared.actor_slot != coordinates.actor_slot
+        || prepared.actor_generation != coordinates.actor_generation
+        || prepared.device != authority.prepared_device()
+        || prepared.hardware_receipt_digest == 0
+    {
+        return Err(RegistryError::InvalidHandle);
+    }
+    if entries[0].parent != DeviceCohortParent::Existing(authority.parent_effect())
+        || entries[1..]
+            .iter()
+            .any(|entry| entry.parent != DeviceCohortParent::BatchIndex(0))
+    {
+        return Err(RegistryError::InvalidState);
+    }
+    let domain = entries[0].domain;
+    let task = entries[0].request.task;
+    for entry in &entries {
+        if entry.request.scope != authority.scope()
+            || entry.device != prepared.device
+            || entry.domain != domain
+            || entry.request.task != task
+            || entry.request.publication != PublicationMode::None
+        {
+            return Err(RegistryError::InvalidState);
+        }
+    }
+    if entries[0].request.descriptor.digest() != prepared.operation_digest
+        || entries[0]
+            .request
+            .resources
+            .iter()
+            .filter(|resource| **resource == prepared.owned_device)
+            .count()
+            != 1
+    {
+        return Err(RegistryError::InvalidHandle);
+    }
+    if entries[0].request.credits.as_slice()
+        != [CreditCharge::new(coordinates.queue_credit_class, 1)]
+    {
+        return Err(RegistryError::InvalidState);
+    }
+    let expected_dma = [
+        CreditCharge::new(coordinates.pinned_credit_class, 1),
+        CreditCharge::new(coordinates.dma_credit_class, 1),
+    ];
+    for entry in &entries[1..] {
+        let credits = entry.request.credits.as_slice();
+        if credits.len() != 2
+            || !expected_dma
+                .iter()
+                .all(|expected| credits.contains(expected))
+        {
+            return Err(RegistryError::InvalidState);
+        }
+    }
+    Ok(entries)
+}
+
+fn device_cohort_identity(
+    prepared: infrastructure::PreparedDeviceIdentity,
+    registered: &[RegisteredEffect; 4],
+) -> infrastructure::DeviceCohortIdentity {
+    let effects = registered.each_ref().map(|effect| effect.identity.effect());
+    infrastructure::DeviceCohortIdentity {
+        block: effects[0],
+        dma: [effects[1], effects[2], effects[3]],
+        digest: device_cohort_digest(prepared, effects),
+    }
+}
+
+fn device_cohort_digest(
+    prepared: infrastructure::PreparedDeviceIdentity,
+    effects: [EffectKey; 4],
+) -> u64 {
+    let mut digest = 0xcbf2_9ce4_8422_2325_u64;
+    for word in [
+        prepared.preparation_id,
+        prepared.preparation_generation,
+        u64::from(prepared.owned_device.namespace()),
+        prepared.owned_device.id(),
+        prepared.owned_device.generation(),
+        prepared.device.device_session(),
+        u64::from(prepared.device.queue()),
+        u64::from(prepared.device.descriptor_token()),
+        prepared.device.device_generation(),
+        prepared.operation_digest,
+        u64::from(prepared.actor_slot),
+        prepared.actor_generation,
+        prepared.hardware_receipt_digest,
+    ] {
+        digest = digest_handoff_word(digest, word);
+    }
+    for effect in effects {
+        digest = digest_handoff_word(digest, effect.id());
+        digest = digest_handoff_word(digest, effect.generation());
+    }
+    nonzero_digest(digest)
 }
 
 fn validate_generation(generation: u64) -> Result<(), RegistryError> {
@@ -14092,6 +14596,561 @@ fn device_preparation_outer_credit_self_test() {
     uncertain.check_invariants().unwrap();
 }
 
+#[cfg(test)]
+fn device_preparation_outer_materialization_self_test() {
+    const SCOPE: ScopeKey = ScopeKey::new(0xdc01, 1);
+    const OWNER: TaskKey = TaskKey::new(0xdc02, 1);
+    const ADAPTER: TaskKey = TaskKey::new(0xdc03, 1);
+    const ADAPTER_DOMAIN: DomainKey = DomainKey::new(0xdc04);
+    const UNRELATED_SCOPE: ScopeKey = ScopeKey::new(0xdc05, 1);
+    const UNRELATED_OWNER: TaskKey = TaskKey::new(0xdc06, 1);
+    const QUEUE: CreditClass = CreditClass::new(0xdc10);
+    const PINNED: CreditClass = CreditClass::new(0xdc11);
+    const DMA: CreditClass = CreditClass::new(0xdc12);
+
+    fn fixture(
+        request_id: u64,
+    ) -> (
+        EffectRegistry,
+        infrastructure::WorkloadContext,
+        infrastructure::DevicePreparationTicket,
+        infrastructure::PreparedDeviceIdentity,
+        [DeviceDerivedCohortEntry; 4],
+        infrastructure::DeviceReservationCoordinates,
+    ) {
+        let mut registry = EffectRegistry::new();
+        registry
+            .create_scope(ScopeConfig {
+                key: SCOPE,
+                authority_epoch: 1,
+                binding_epoch: 1,
+                supervisor: OWNER,
+                // Deliberate spare capacity proves materialization does not
+                // release and reserve substitute credits from `free`.
+                credits: __cser_alloc::vec![
+                    CreditLimit::new(QUEUE, 2),
+                    CreditLimit::new(PINNED, 6),
+                    CreditLimit::new(DMA, 6),
+                ],
+            })
+            .unwrap();
+        registry
+            .add_domain(
+                SCOPE,
+                DomainConfig {
+                    key: ADAPTER_DOMAIN,
+                    binding_epoch: 1,
+                    supervisor: ADAPTER,
+                },
+            )
+            .unwrap();
+        let root = registry
+            .register(RegisterRequest {
+                scope: SCOPE,
+                task: OWNER,
+                operation: OperationClass::new(0xdc20),
+                descriptor: SyscallDescriptor::new(0xdc20, [0; 6]),
+                resources: __cser_alloc::vec![ResourceKey::new(0xdc, 1, 1)],
+                credits: __cser_alloc::vec![],
+                publication: PublicationMode::None,
+            })
+            .unwrap()
+            .identity
+            .effect();
+        registry
+            .enable_infrastructure_for_scope(
+                SCOPE,
+                root,
+                infrastructure::InfrastructureLimits::new(2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 4, 4, 8)
+                    .unwrap(),
+            )
+            .unwrap();
+        let workload = registry
+            .infrastructure
+            .open_workload(
+                infrastructure::WorkloadRootPresentation::new(SCOPE, 1, root),
+                infrastructure::WorkloadRequestPresentation::new(
+                    DomainKey::LEGACY,
+                    1,
+                    request_id,
+                    1,
+                ),
+            )
+            .unwrap();
+
+        registry
+            .create_scope(ScopeConfig {
+                key: UNRELATED_SCOPE,
+                authority_epoch: 1,
+                binding_epoch: 1,
+                supervisor: UNRELATED_OWNER,
+                credits: __cser_alloc::vec![],
+            })
+            .unwrap();
+        let unrelated_root = registry
+            .register(RegisterRequest {
+                scope: UNRELATED_SCOPE,
+                task: UNRELATED_OWNER,
+                operation: OperationClass::new(0xdc21),
+                descriptor: SyscallDescriptor::new(0xdc21, [0; 6]),
+                resources: __cser_alloc::vec![ResourceKey::new(0xdc, request_id, 1)],
+                credits: __cser_alloc::vec![],
+                publication: PublicationMode::None,
+            })
+            .unwrap()
+            .identity
+            .effect();
+        registry
+            .enable_infrastructure_for_scope(
+                UNRELATED_SCOPE,
+                unrelated_root,
+                infrastructure::InfrastructureLimits::new(2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 4, 4, 8)
+                    .unwrap(),
+            )
+            .unwrap();
+
+        let block_descriptor =
+            SyscallDescriptor::new(0xdc30, [request_id as usize, 0, 512, 0, 0, 0]);
+        let owned_device = ResourceKey::new(0xdc40, request_id, 1);
+        let device = DeviceEnvelope::new(request_id + 0x100, 2, 9, 1).unwrap();
+        let coordinates = infrastructure::DeviceReservationCoordinates {
+            preparation_id: request_id + 1,
+            generation: 1,
+            owned_device,
+            queue: device.queue(),
+            device_generation: device.device_generation(),
+            operation_digest: block_descriptor.digest(),
+            queue_credit_class: QUEUE,
+            pinned_credit_class: PINNED,
+            dma_credit_class: DMA,
+            actor_slot: 3,
+            actor_generation: 7,
+        };
+        let ticket = registry
+            .reserve_device_preparation(&workload, root, coordinates)
+            .unwrap();
+        let intent = registry.begin_device_hardware_apply(ticket).unwrap();
+        let hardware = infrastructure::DeviceHardwareReceipt {
+            owned_device,
+            device,
+            operation_digest: coordinates.operation_digest,
+            actor_slot: coordinates.actor_slot,
+            actor_generation: coordinates.actor_generation,
+            hardware_receipt_digest: request_id + 0x200,
+        };
+        let ticket = registry
+            .acknowledge_device_prepared(intent, hardware)
+            .unwrap();
+        let prepared = infrastructure::PreparedDeviceIdentity {
+            preparation_id: coordinates.preparation_id,
+            preparation_generation: coordinates.generation,
+            owned_device,
+            device,
+            operation_digest: coordinates.operation_digest,
+            actor_slot: coordinates.actor_slot,
+            actor_generation: coordinates.actor_generation,
+            hardware_receipt_digest: hardware.hardware_receipt_digest,
+        };
+        let dma_entry =
+            |batch_index: usize, operation: u32, resource_id: u64| DeviceDerivedCohortEntry {
+                batch_index,
+                request: RegisterRequest {
+                    scope: SCOPE,
+                    task: ADAPTER,
+                    operation: OperationClass::new(operation),
+                    descriptor: SyscallDescriptor::new(operation as usize, [0; 6]),
+                    resources: __cser_alloc::vec![ResourceKey::new(0xdc41, resource_id, 1)],
+                    credits: __cser_alloc::vec![
+                        CreditCharge::new(PINNED, 1),
+                        CreditCharge::new(DMA, 1),
+                    ],
+                    publication: PublicationMode::None,
+                },
+                domain: ADAPTER_DOMAIN,
+                parent: DeviceCohortParent::BatchIndex(0),
+                device,
+            };
+        let entries = [
+            DeviceDerivedCohortEntry {
+                batch_index: 0,
+                request: RegisterRequest {
+                    scope: SCOPE,
+                    task: ADAPTER,
+                    operation: OperationClass::new(0xdc30),
+                    descriptor: block_descriptor,
+                    resources: __cser_alloc::vec![owned_device],
+                    credits: __cser_alloc::vec![CreditCharge::new(QUEUE, 1)],
+                    publication: PublicationMode::None,
+                },
+                domain: ADAPTER_DOMAIN,
+                parent: DeviceCohortParent::Existing(root),
+                device,
+            },
+            dma_entry(1, 0xdc31, request_id + 1),
+            dma_entry(2, 0xdc32, request_id + 2),
+            dma_entry(3, 0xdc33, request_id + 3),
+        ];
+        registry.check_invariants().unwrap();
+        (registry, workload, ticket, prepared, entries, coordinates)
+    }
+
+    fn assert_prepared_retained(
+        registry: &EffectRegistry,
+        workload: &infrastructure::WorkloadContext,
+        coordinates: infrastructure::DeviceReservationCoordinates,
+    ) {
+        let projection = registry
+            .query_device_preparation(workload, coordinates.preparation_id, coordinates.generation)
+            .unwrap();
+        __cser_core::assert_eq!(
+            projection.state,
+            infrastructure::DevicePreparationRecoveryState::PreparedRetained
+        );
+        __cser_core::assert_eq!(
+            projection.credit_ownership,
+            infrastructure::DevicePreparationCreditOwnership::RetainedByPreparation
+        );
+        let credits = registry.scope_projection(SCOPE).unwrap().credits;
+        __cser_core::assert_eq!((credits.free, credits.held, credits.retained), (7, 0, 7));
+    }
+
+    fn assert_unrelated_unchanged(before: &EffectRegistry, after: &EffectRegistry) {
+        __cser_core::assert_eq!(
+            before.scopes[&UNRELATED_SCOPE],
+            after.scopes[&UNRELATED_SCOPE]
+        );
+        __cser_core::assert_eq!(
+            before.by_scope.get(&UNRELATED_SCOPE),
+            after.by_scope.get(&UNRELATED_SCOPE)
+        );
+        __cser_core::assert_eq!(
+            before.by_task.get(&UNRELATED_OWNER),
+            after.by_task.get(&UNRELATED_OWNER)
+        );
+        for effect in &before.by_scope[&UNRELATED_SCOPE] {
+            __cser_core::assert_eq!(before.effects[effect], after.effects[effect]);
+        }
+        __cser_core::assert!(
+            after
+                .infrastructure
+                .scope_state_eq_for_test(&before.infrastructure, UNRELATED_SCOPE)
+        );
+    }
+
+    enum RejectCase {
+        Preparation,
+        PreparationGeneration,
+        ActorSlot,
+        ActorGeneration,
+        HardwareDigest,
+        OwnedDevice,
+        OperationDigest,
+        CreditClass,
+        CreditDuplicate,
+        CreditExtra,
+        DeviceSession,
+        DeviceQueue,
+        DescriptorToken,
+        DeviceGeneration,
+        Domain,
+        Task,
+        CohortSlot,
+        Parent,
+        MiddleRegistration,
+    }
+
+    fn reject_case(request_id: u64, case: RejectCase) {
+        let (mut registry, workload, ticket, mut prepared, mut entries, coordinates) =
+            fixture(request_id);
+        match case {
+            RejectCase::Preparation => prepared.preparation_id += 1,
+            RejectCase::PreparationGeneration => prepared.preparation_generation += 1,
+            RejectCase::ActorSlot => prepared.actor_slot += 1,
+            RejectCase::ActorGeneration => prepared.actor_generation += 1,
+            RejectCase::HardwareDigest => prepared.hardware_receipt_digest += 1,
+            RejectCase::OwnedDevice => {
+                prepared.owned_device = ResourceKey::new(0xdc40, request_id + 1, 1);
+            }
+            RejectCase::OperationDigest => prepared.operation_digest += 1,
+            RejectCase::CreditClass => {
+                entries[1].request.credits[0] = CreditCharge::new(QUEUE, 1);
+            }
+            RejectCase::CreditDuplicate => {
+                entries[1].request.credits[1] = CreditCharge::new(PINNED, 1);
+            }
+            RejectCase::CreditExtra => {
+                entries[1].request.credits.push(CreditCharge::new(QUEUE, 1));
+            }
+            RejectCase::DeviceSession => {
+                entries[2].device = DeviceEnvelope::new(
+                    prepared.device.device_session() + 1,
+                    prepared.device.queue(),
+                    prepared.device.descriptor_token(),
+                    prepared.device.device_generation(),
+                )
+                .unwrap();
+            }
+            RejectCase::DeviceQueue => {
+                entries[2].device = DeviceEnvelope::new(
+                    prepared.device.device_session(),
+                    prepared.device.queue() + 1,
+                    prepared.device.descriptor_token(),
+                    prepared.device.device_generation(),
+                )
+                .unwrap();
+            }
+            RejectCase::DescriptorToken => {
+                entries[2].device = DeviceEnvelope::new(
+                    prepared.device.device_session(),
+                    prepared.device.queue(),
+                    prepared.device.descriptor_token() + 1,
+                    prepared.device.device_generation(),
+                )
+                .unwrap();
+            }
+            RejectCase::DeviceGeneration => {
+                entries[2].device = DeviceEnvelope::new(
+                    prepared.device.device_session(),
+                    prepared.device.queue(),
+                    prepared.device.descriptor_token(),
+                    prepared.device.device_generation() + 1,
+                )
+                .unwrap();
+            }
+            RejectCase::Domain => entries[2].domain = DomainKey::new(0xdc99),
+            RejectCase::Task => entries[2].request.task = TaskKey::new(0xdc99, 1),
+            RejectCase::CohortSlot => entries[2].batch_index = 1,
+            RejectCase::Parent => {
+                entries[2].parent = DeviceCohortParent::BatchIndex(1);
+            }
+            RejectCase::MiddleRegistration => {
+                entries[1].request.resources[0] = ResourceKey::new(0xdc41, request_id, 0);
+            }
+        }
+        let before = registry.clone();
+        let failure = registry
+            .materialize_device_cohort_from_preparation(ticket, prepared, entries)
+            .unwrap_err();
+        __cser_core::assert_ne!(failure.error(), &RegistryError::ScopeNotActive);
+        __cser_core::assert_eq!(failure.into_input().coordinates(), coordinates);
+        __cser_core::assert_eq!(registry, before);
+        assert_prepared_retained(&registry, &workload, coordinates);
+        registry.check_invariants().unwrap();
+    }
+
+    let reject_cases = [
+        RejectCase::Preparation,
+        RejectCase::PreparationGeneration,
+        RejectCase::ActorSlot,
+        RejectCase::ActorGeneration,
+        RejectCase::HardwareDigest,
+        RejectCase::OwnedDevice,
+        RejectCase::OperationDigest,
+        RejectCase::CreditClass,
+        RejectCase::CreditDuplicate,
+        RejectCase::CreditExtra,
+        RejectCase::DeviceSession,
+        RejectCase::DeviceQueue,
+        RejectCase::DescriptorToken,
+        RejectCase::DeviceGeneration,
+        RejectCase::Domain,
+        RejectCase::Task,
+        RejectCase::CohortSlot,
+        RejectCase::Parent,
+        RejectCase::MiddleRegistration,
+    ];
+    for (offset, case) in reject_cases.into_iter().enumerate() {
+        reject_case(0xdc80 + offset as u64 * 0x10, case);
+    }
+
+    // A forged bearer generation is rejected without consuming the real
+    // authority; the exact original ticket can still materialize afterwards.
+    let (mut stale, workload, ticket, prepared, entries, coordinates) = fixture(0xde00);
+    let stale_ticket = ticket.stale_bearer_for_test();
+    let before = stale.clone();
+    let failure = stale
+        .materialize_device_cohort_from_preparation(stale_ticket, prepared, entries.clone())
+        .unwrap_err();
+    __cser_core::assert_eq!(
+        failure.error(),
+        &RegistryError::Infrastructure(infrastructure::InfrastructureError::StaleGeneration)
+    );
+    __cser_core::assert_eq!(failure.into_input().coordinates(), coordinates);
+    __cser_core::assert_eq!(stale, before);
+    assert_prepared_retained(&stale, &workload, coordinates);
+    stale
+        .materialize_device_cohort_from_preparation(ticket, prepared, entries)
+        .unwrap();
+
+    // A staged candidate is fenced by any live-base change and returns the
+    // exact authority. The live preparation and unrelated tenant are intact.
+    let (mut stale_base, workload, ticket, prepared, entries, coordinates) = fixture(0xde20);
+    let plan = stale_base
+        .prepare_device_cohort_materialization(ticket, prepared, entries.clone())
+        .unwrap();
+    stale_base.scopes.get_mut(&SCOPE).unwrap().revision += 1;
+    let changed_live = stale_base.clone();
+    let failure = stale_base
+        .apply_device_cohort_materialization(plan)
+        .unwrap_err();
+    __cser_core::assert_eq!(failure.error(), &RegistryError::CombinedCandidateStale);
+    __cser_core::assert_eq!(stale_base, changed_live);
+    let ticket = failure.into_input();
+    assert_prepared_retained(&stale_base, &workload, coordinates);
+    stale_base
+        .materialize_device_cohort_from_preparation(ticket, prepared, entries)
+        .unwrap();
+
+    // Corruption after all candidate staging is still detected before the
+    // authoritative swap; no staged effect, index, or transferred credit leaks.
+    let (mut staged_failure, workload, ticket, prepared, entries, coordinates) = fixture(0xde40);
+    let mut plan = staged_failure
+        .prepare_device_cohort_materialization(ticket, prepared, entries)
+        .unwrap();
+    plan.candidate
+        .scopes
+        .get_mut(&SCOPE)
+        .unwrap()
+        .credits
+        .balances
+        .get_mut(&QUEUE)
+        .unwrap()
+        .held += 1;
+    let before = staged_failure.clone();
+    let failure = staged_failure
+        .apply_device_cohort_materialization(plan)
+        .unwrap_err();
+    __cser_core::assert!(__cser_core::matches!(
+        failure.error(),
+        RegistryError::Invariant(_)
+    ));
+    __cser_core::assert_eq!(failure.into_input().coordinates(), coordinates);
+    __cser_core::assert_eq!(staged_failure, before);
+    assert_prepared_retained(&staged_failure, &workload, coordinates);
+
+    // Even the post-install successor mint is checked against the installed
+    // primary record. A staged successor mismatch rolls the no-allocation
+    // replacement back to the exact previous Registry and returns authority.
+    let (mut successor_failure, workload, ticket, prepared, entries, coordinates) = fixture(0xde50);
+    let mut plan = successor_failure
+        .prepare_device_cohort_materialization(ticket, prepared, entries)
+        .unwrap();
+    plan.cohort.digest ^= 1;
+    let before = successor_failure.clone();
+    let failure = successor_failure
+        .apply_device_cohort_materialization(plan)
+        .unwrap_err();
+    __cser_core::assert_eq!(
+        failure.error(),
+        &RegistryError::Infrastructure(infrastructure::InfrastructureError::StaleClaim)
+    );
+    __cser_core::assert_eq!(failure.into_input().coordinates(), coordinates);
+    __cser_core::assert_eq!(successor_failure, before);
+    assert_prepared_retained(&successor_failure, &workload, coordinates);
+
+    // Revoke is the competing winner on the same `&mut Registry`
+    // linearization. It preserves PreparedRetained for recovery and refuses
+    // to expose new hardware-owned business effects.
+    let (mut revoke_first, workload, ticket, prepared, entries, coordinates) = fixture(0xde60);
+    let plan = revoke_first
+        .prepare_device_cohort_materialization(ticket, prepared, entries)
+        .unwrap();
+    revoke_first.revoke_begin(SCOPE).unwrap();
+    revoke_first
+        .infrastructure
+        .set_closing_lifecycle_for_test(SCOPE);
+    revoke_first.check_invariants().unwrap();
+    let closing = revoke_first.clone();
+    let failure = revoke_first
+        .apply_device_cohort_materialization(plan)
+        .unwrap_err();
+    __cser_core::assert_eq!(failure.error(), &RegistryError::ScopeNotActive);
+    __cser_core::assert_eq!(failure.into_input().coordinates(), coordinates);
+    __cser_core::assert_eq!(revoke_first, closing);
+    assert_prepared_retained(&revoke_first, &workload, coordinates);
+
+    // Materialization-first installs one exact cohort, transfers retained
+    // directly to held while leaving spare free credits untouched, and keeps
+    // the infrastructure preparation live until an exact closure proof.
+    let (mut materialized, workload, ticket, prepared, entries, coordinates) = fixture(0xdea0);
+    let duplicate = ticket.duplicate_for_test();
+    let duplicate_entries = entries.clone();
+    let before = materialized.clone();
+    let outcome = materialized
+        .materialize_device_cohort_from_preparation(ticket, prepared, entries)
+        .unwrap();
+    assert_unrelated_unchanged(&before, &materialized);
+    let credits = materialized.scope_projection(SCOPE).unwrap().credits;
+    __cser_core::assert_eq!((credits.free, credits.held, credits.retained), (7, 7, 0));
+    __cser_core::assert_eq!(outcome.cohort.ordered_effects().len(), 4);
+    __cser_core::assert_eq!(
+        outcome.registered[0].identity.effect(),
+        outcome.cohort.block
+    );
+    __cser_core::assert_eq!(
+        outcome.registered[1..]
+            .iter()
+            .map(|effect| effect.identity.effect())
+            .collect::<__cser_alloc::vec::Vec<_>>(),
+        outcome.cohort.dma
+    );
+    let projection = materialized
+        .query_device_preparation(
+            &workload,
+            coordinates.preparation_id,
+            coordinates.generation,
+        )
+        .unwrap();
+    __cser_core::assert_eq!(
+        projection.state,
+        infrastructure::DevicePreparationRecoveryState::Materialized
+    );
+    __cser_core::assert_eq!(
+        projection.credit_ownership,
+        infrastructure::DevicePreparationCreditOwnership::TransferredToCohort
+    );
+    __cser_core::assert_eq!(projection.prepared_identity, Some(prepared));
+    __cser_core::assert_eq!(projection.cohort, Some(outcome.cohort));
+    __cser_core::assert!(
+        materialized
+            .infrastructure
+            .close_workload(&workload)
+            .is_err()
+    );
+    materialized.check_invariants().unwrap();
+
+    // A test-only duplicate of the consumed bearer cannot create a second
+    // cohort, move credits again, release ownership, or advance any counter.
+    let after_success = materialized.clone();
+    let failure = materialized
+        .materialize_device_cohort_from_preparation(duplicate, prepared, duplicate_entries)
+        .unwrap_err();
+    __cser_core::assert_eq!(
+        failure.error(),
+        &RegistryError::Infrastructure(infrastructure::InfrastructureError::InvalidState)
+    );
+    __cser_core::assert_eq!(failure.into_input().coordinates(), coordinates);
+    __cser_core::assert_eq!(materialized, after_success);
+
+    let selection = materialized.revoke_begin(SCOPE).unwrap();
+    __cser_core::assert_eq!(selection.target_count, 5);
+    materialized
+        .infrastructure
+        .set_closing_lifecycle_for_test(SCOPE);
+    materialized.check_invariants().unwrap();
+    let projection = materialized
+        .query_device_preparation(
+            &workload,
+            coordinates.preparation_id,
+            coordinates.generation,
+        )
+        .unwrap();
+    __cser_core::assert_eq!(
+        projection.state,
+        infrastructure::DevicePreparationRecoveryState::Materialized
+    );
+}
+
 /// Pins the first registry-native production identity chain independently of
 /// the later runtime wiring.  These are real registry records with one shared
 /// credit ledger, distinct service bindings, and immutable effect ancestry;
@@ -14103,6 +15162,8 @@ pub(crate) fn production_identity_registry_self_test() {
     task_owned_fault_outer_transaction_self_test();
     #[cfg(test)]
     device_preparation_outer_credit_self_test();
+    #[cfg(test)]
+    device_preparation_outer_materialization_self_test();
     #[cfg(test)]
     ordinary_domain_crash_rejects_a_forged_fault_origin();
     publication_ack_and_revoke_complete_self_test();

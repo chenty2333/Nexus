@@ -271,16 +271,13 @@ pub(super) fn check_scope_invariants(
                 )
                 | (
                     DevicePhase::Released {
-                        cohort_digest: Some(_),
+                        cohort: Some(_),
                         ..
                     },
                     DeviceCreditOwnership::Transferred
                 )
                 | (
-                    DevicePhase::Released {
-                        cohort_digest: None,
-                        ..
-                    } | DevicePhase::Cancelled { .. },
+                    DevicePhase::Released { cohort: None, .. } | DevicePhase::Cancelled { .. },
                     DeviceCreditOwnership::Released
                 )
         );
@@ -288,6 +285,20 @@ pub(super) fn check_scope_invariants(
             return Err(InfrastructureError::Invariant(
                 "device preparation credit owner mismatch",
             ));
+        }
+        match record.phase {
+            DevicePhase::Materialized { cohort, .. }
+            | DevicePhase::Released {
+                cohort: Some(cohort),
+                ..
+            } => cohort
+                .validate()
+                .map_err(|_| InfrastructureError::Invariant("invalid device cohort identity"))?,
+            DevicePhase::Reserved
+            | DevicePhase::Applying { .. }
+            | DevicePhase::PreparedRetained { .. }
+            | DevicePhase::Released { cohort: None, .. }
+            | DevicePhase::Cancelled { .. } => {}
         }
         match record.phase {
             DevicePhase::Reserved

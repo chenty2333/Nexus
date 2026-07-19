@@ -42,6 +42,19 @@ impl InfrastructureState {
         })
     }
 
+    /// Converts a module-private full transaction candidate into the
+    /// authoritative mode immediately before its containing Registry is
+    /// installed. No state allocation or callback occurs in this final step.
+    pub(in super::super) fn promote_full_candidate_for_install(
+        &mut self,
+    ) -> Result<(), InfrastructureError> {
+        if self.mode != LedgerMode::NonAuthoritativeCandidate {
+            return Err(InfrastructureError::CandidateHasNoAuthority);
+        }
+        self.mode = LedgerMode::Authoritative;
+        Ok(())
+    }
+
     /// Compatibility for the existing module-private full Registry clone.
     /// This preserves the authority mode so equality remains authority-aware;
     /// unlike exact-scope candidates, it must never cross the module boundary
@@ -331,6 +344,13 @@ impl InfrastructureState {
     #[cfg(test)]
     pub(in super::super) fn is_authoritative_for_test(&self) -> bool {
         self.mode == LedgerMode::Authoritative
+    }
+
+    #[cfg(test)]
+    pub(in super::super) fn scope_state_eq_for_test(&self, other: &Self, scope: ScopeKey) -> bool {
+        self.registry_instance == other.registry_instance
+            && self.mode == other.mode
+            && self.scope(scope).ok() == other.scope(scope).ok()
     }
 
     pub(in super::super) fn enable(

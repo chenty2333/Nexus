@@ -487,6 +487,19 @@ recorded `{actor_slot, actor_generation}` selector is descriptive until that
 adapter integration lands. It therefore does not advance the runtime ledger,
 the RFC 0003 causal-coverage claim, or the existing Phase 2 evidence.
 
+The matching Registry-only materialization transition now consumes the exact
+`PreparedRetained` authority and installs one block effect plus three DMA
+descendants in the same linearization as the retained-to-held credit transfer.
+The block owns exactly one queue credit; each DMA descendant owns exactly one
+pinned-page and one DMA-mapping credit. The infrastructure primary record keeps
+the ordered four-effect identity and remains live until exact device-closure
+proof, while the linear successor is minted only after authoritative install.
+This first outer implementation builds an allocation-bearing O(N) private full
+Registry candidate before a no-allocation final replacement. It invokes no
+hardware callback, but bounded multi-tenant cost, typed allocator-pressure
+failure, preallocated adapter storage, and normal runtime use remain explicit
+follow-up non-claims; this paragraph does not promote RFC 0003 evidence.
+
 The primary boot has no real DMA. `tools/workflow/runtime-fs-composition.sh`
 joins it to the independent real Stage 5B boot using those digests plus the
 reconstructed sector SHA
