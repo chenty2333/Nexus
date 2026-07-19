@@ -16,18 +16,19 @@ use super::{
     DelayedCommandRejectionReason, DelayedCommandRejectionReceipt, DelayedCommandTicket,
     DeviceReservationCoordinates, DomainKey, EffectKey, EnqueuedServiceRequest, EnteredTaskLease,
     FaultAccess, FaultDisposition, FaultObservation, FaultPhase, FaultSlotDescriptor,
-    InfrastructureError, InfrastructureKind, InfrastructureLimits, InfrastructureState,
-    LinearFailure, PortalHandle, ReplyAbortAuthority, ReplyDescriptor, ReplyPublicationReceipt,
-    ReservedFaultTask, ResourceKey, ReverseIndexRecord, ReverseParent, ScopeKey,
-    ServiceArmAuthority, ServiceArmPlan, ServiceArmReceipt, ServiceBoundKey,
-    ServiceCancellationPoint, ServiceChildBindingReceipt, ServiceChildReceipt,
-    ServiceClaimantSnapshot, ServiceEnqueueAuthority, ServiceEnqueuePlan, ServiceEnqueueReceipt,
-    ServiceLineageCommitment, ServiceRequestCausalIdentity, ServiceRequestDescriptor,
-    ServiceRequestPhase, ServiceRequestRecoveryState, ServiceRequestTicket, TaskAdoption,
-    TaskAnchorRecoveryState, TaskKey, TaskPhase, TaskWorkDescriptor, TaskWorkRole,
-    UnarmedServiceRequest, UnboundServiceRequest, ValidatedAbortProof, ValidatedCommitProof,
-    ValidatedServiceChildProof, VmAuthorityKey, WakeClaim, WorkloadContext,
-    WorkloadRequestPresentation, WorkloadRootPresentation, bearer_state,
+    InfrastructureClosureProgress, InfrastructureClosureReceipt, InfrastructureError,
+    InfrastructureKind, InfrastructureLimits, InfrastructureState, LinearFailure, PortalHandle,
+    ReplyAbortAuthority, ReplyDescriptor, ReplyPublicationReceipt, ReservedFaultTask, ResourceKey,
+    ReverseIndexRecord, ReverseParent, ScopeKey, ServiceArmAuthority, ServiceArmPlan,
+    ServiceArmReceipt, ServiceBoundKey, ServiceCancellationPoint, ServiceChildBindingReceipt,
+    ServiceChildReceipt, ServiceClaimantSnapshot, ServiceEnqueueAuthority, ServiceEnqueuePlan,
+    ServiceEnqueueReceipt, ServiceLineageCommitment, ServiceRequestCausalIdentity,
+    ServiceRequestDescriptor, ServiceRequestPhase, ServiceRequestRecoveryState,
+    ServiceRequestTicket, TaskAdoption, TaskAnchorRecoveryState, TaskKey, TaskPhase,
+    TaskWorkDescriptor, TaskWorkRole, UnarmedServiceRequest, UnboundServiceRequest,
+    ValidatedAbortProof, ValidatedCommitProof, ValidatedServiceChildProof, VmAuthorityKey,
+    WakeClaim, WorkloadContext, WorkloadRequestPresentation, WorkloadRootPresentation,
+    bearer_state,
 };
 
 const SCOPE: ScopeKey = ScopeKey::new(0x9100, 1);
@@ -5546,12 +5547,117 @@ fn persisted_sequence_high_watermarks_reject_allocator_rollback() {
     assert_invariant_read_only(publication);
 
     let mut closure = base.private_full_clone();
-    let scope = closure.scope_mut(SCOPE).unwrap();
-    scope.workloads.iter_mut().next().unwrap().closure_sequence = Some(1);
-    scope.next_closure_sequence = 2;
+    let plan = closure.prepare_closure_start(SCOPE, 1).unwrap();
+    closure.apply_closure_start(plan);
     closure.check_invariants().unwrap();
     closure.scope_mut(SCOPE).unwrap().next_closure_sequence = 1;
     assert_invariant_read_only(closure);
+}
+
+#[test]
+fn full_scope_closure_is_stamped_blocking_and_exactly_replayable() {
+    let mut live = publication_state();
+    let plan = live.prepare_closure_start(SCOPE, 1).unwrap();
+    let selection = live.apply_closure_start(plan);
+    __cser_core::assert_eq!(
+        live.closure_progress(SCOPE).unwrap(),
+        InfrastructureClosureProgress::Closing(selection)
+    );
+    live.check_invariants().unwrap();
+
+    let before_duplicate = live.private_full_clone();
+    let duplicate = match live.prepare_closure_start(SCOPE, 1) {
+        Ok(_) => __cser_core::panic!("duplicate closure start prepared"),
+        Err(error) => error,
+    };
+    __cser_core::assert_eq!(duplicate, InfrastructureError::ClosureAlreadyStarted);
+    __cser_core::assert_eq!(live, before_duplicate);
+
+    let before_admission = live.private_full_clone();
+    __cser_core::assert_eq!(
+        live.open_workload(
+            WorkloadRootPresentation::new(SCOPE, 1, ROOT),
+            WorkloadRequestPresentation::new(GUEST, 1, 0xa301, 1),
+        ),
+        Err(InfrastructureError::ScopeNotActive)
+    );
+    __cser_core::assert_eq!(live, before_admission);
+
+    let before_finish = live.private_full_clone();
+    let blocked = match live.prepare_closure_finish(selection) {
+        Ok(_) => __cser_core::panic!("live closure prepared completion"),
+        Err(error) => error,
+    };
+    __cser_core::assert_eq!(
+        blocked,
+        InfrastructureError::ClosureBlocked {
+            kind: InfrastructureKind::Continuation,
+            live: 1,
+        }
+    );
+    __cser_core::assert_eq!(live, before_finish);
+
+    let mut impossible_closed = live.private_full_clone();
+    {
+        let closure = impossible_closed
+            .scope_mut(SCOPE)
+            .unwrap()
+            .closure
+            .as_mut()
+            .unwrap();
+        closure.finished = true;
+        closure.receipt = Some(InfrastructureClosureReceipt {
+            registry_instance: 0x9011,
+            scope: SCOPE,
+            authority_epoch: 1,
+            root_effect: ROOT,
+            sequence: closure.sequence,
+            nonce: closure.nonce,
+            closed_revision: 1,
+        });
+    }
+    assert_invariant_message_read_only(
+        impossible_closed,
+        "closed infrastructure scope retains an obligation",
+    );
+
+    let mut missing_stamp = live.private_full_clone();
+    missing_stamp
+        .scope_mut(SCOPE)
+        .unwrap()
+        .continuations
+        .iter_mut()
+        .next()
+        .unwrap()
+        .closure_sequence = None;
+    assert_invariant_message_read_only(missing_stamp, "infrastructure closure cohort mismatch");
+
+    let mut empty = InfrastructureState::new(0x9011);
+    empty
+        .enable(SCOPE, 1, ROOT, limits(), &[(GUEST, 1)])
+        .unwrap();
+    let domain_before = empty.scope(SCOPE).unwrap().domains.clone();
+    let plan = empty.prepare_closure_start(SCOPE, 1).unwrap();
+    let selection = empty.apply_closure_start(plan);
+    let (plan, expected) = empty.prepare_closure_finish(selection).unwrap();
+    let installed = empty.apply_closure_finish(plan);
+    __cser_core::assert_eq!(installed, expected);
+    __cser_core::assert_eq!(empty.scope(SCOPE).unwrap().domains, domain_before);
+    __cser_core::assert_eq!(
+        empty.closure_progress(SCOPE).unwrap(),
+        InfrastructureClosureProgress::Closed(expected)
+    );
+    empty.verify_closure_receipt(expected).unwrap();
+    empty.check_invariants().unwrap();
+
+    let before_substitution = empty.private_full_clone();
+    let mut substituted = expected;
+    substituted.closed_revision += 1;
+    __cser_core::assert_eq!(
+        empty.verify_closure_receipt(substituted),
+        Err(InfrastructureError::InvalidReceipt)
+    );
+    __cser_core::assert_eq!(empty, before_substitution);
 }
 
 #[test]

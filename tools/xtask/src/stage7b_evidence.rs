@@ -1999,10 +1999,14 @@ fn validate_production_device_batch_source_text(source: &str) -> Result<(), Stri
             "selection:RevokeSelection,",
             "next_revoke_sequence:u64,",
             "next_scope_revision:u64,",
+            "infrastructure:Option<infrastructure::InfrastructureClosureStartPlan>,",
             "}"
         )
     {
-        return Err("RevokeBeginPlan must carry exactly selection and validated counters".into());
+        return Err(
+            "RevokeBeginPlan must carry exactly selection, validated counters, and the prepared infrastructure closure"
+                .into(),
+        );
     }
 
     let revoke_gate_start = source
@@ -2081,7 +2085,9 @@ fn validate_production_device_batch_source_text(source: &str) -> Result<(), Stri
         "u64::try_from(target_count).map_err(|_| RegistryError::CounterOverflow)?;",
         "let sequence = self.next_revoke_sequence;",
         "let next_revoke_sequence = sequence\n            .checked_add(1)",
+        ".prepare_closure_start(scope_key, scope.authority_epoch)",
         "Ok(RevokeBeginPlan {",
+        "infrastructure,",
     ] {
         if !revoke_from_revision.contains(required) {
             return Err(format!(
@@ -2103,6 +2109,8 @@ fn validate_production_device_batch_source_text(source: &str) -> Result<(), Stri
         "scope.phase = ScopePhase::Closing;",
         "scope.revision = next_scope_revision;",
         "scope.revoke = Some(RevokeState {",
+        "self.infrastructure.apply_closure_start(plan)",
+        "infrastructure,",
     ] {
         if !revoke_apply.contains(required) {
             return Err(format!(
@@ -2125,6 +2133,65 @@ fn validate_production_device_batch_source_text(source: &str) -> Result<(), Stri
     {
         return Err(
             "revoke apply must use each prevalidated counter exactly once without recomputation"
+                .into(),
+        );
+    }
+
+    let revoke_finish_prepare_start = source
+        .find("    fn prepare_revoke_complete_apply(")
+        .ok_or_else(|| "revoke completion lacks prepare phase".to_owned())?;
+    let revoke_finish_apply_start = source[revoke_finish_prepare_start..]
+        .find("    fn apply_revoke_complete(")
+        .map(|offset| revoke_finish_prepare_start + offset)
+        .ok_or_else(|| "revoke completion lacks apply phase".to_owned())?;
+    let revoke_finish_end = source[revoke_finish_apply_start..]
+        .find("    pub(crate) fn revoke_work_projection(")
+        .map(|offset| revoke_finish_apply_start + offset)
+        .ok_or_else(|| "revoke completion apply boundary is unterminated".to_owned())?;
+    let revoke_finish_prepare =
+        &source[revoke_finish_prepare_start..revoke_finish_apply_start];
+    let revoke_finish_apply = &source[revoke_finish_apply_start..revoke_finish_end];
+    for required in [
+        "self.validate_revoke_selection(selection)?;",
+        ".prepare_closure_finish(infrastructure_selection)?;",
+        "let receipt = ScopeClosureReceipt {",
+        "infrastructure: infrastructure_receipt,",
+        "closed_scope_revision: next_scope_revision,",
+        "Ok(RevokeCompleteApplyPlan {",
+        "infrastructure,",
+        "receipt,",
+    ] {
+        if !revoke_finish_prepare.contains(required) {
+            return Err(format!(
+                "revoke completion prepare lacks combined closure step {required:?}"
+            ));
+        }
+    }
+    if revoke_finish_prepare.contains("&mut self") {
+        return Err("revoke completion preparation must remain read-only".into());
+    }
+    for required in [
+        "self.infrastructure.apply_closure_finish(plan)",
+        "__cser_core::debug_assert_eq!(installed_infrastructure, receipt.infrastructure);",
+        "revoke.closure = Some(receipt);",
+        "scope.phase = ScopePhase::Revoked;",
+        "scope.revision = next_scope_revision;",
+    ] {
+        if !revoke_finish_apply.contains(required) {
+            return Err(format!(
+                "revoke completion apply lacks infallible combined closure install {required:?}"
+            ));
+        }
+    }
+    if revoke_finish_apply.contains('?')
+        || revoke_finish_apply.contains("checked_add")
+        || revoke_finish_apply.contains("saturating_add")
+        || revoke_finish_apply.contains("wrapping_add")
+        || revoke_finish_apply.contains("Vec::")
+        || revoke_finish_apply.contains("BTreeMap")
+    {
+        return Err(
+            "revoke completion apply must remain allocation-free and infallible after prevalidation"
                 .into(),
         );
     }
@@ -4026,6 +4093,32 @@ mod tests {
         assert_ne!(premature_combined_apply, source);
         assert!(validate_fault_registry_source_text(&premature_combined_apply).is_err());
 
+        let skipped_infrastructure_finish_prepare = source.replacen(
+            ".prepare_closure_finish(infrastructure_selection)?;",
+            ".unchecked_closure_finish(infrastructure_selection)?;",
+            1,
+        );
+        assert_ne!(skipped_infrastructure_finish_prepare, source);
+        assert!(
+            validate_fault_registry_source_text(&skipped_infrastructure_finish_prepare).is_err()
+        );
+
+        let skipped_infrastructure_finish_apply = source.replacen(
+            "self.infrastructure.apply_closure_finish(plan)",
+            "self.infrastructure.skip_closure_finish(plan)",
+            1,
+        );
+        assert_ne!(skipped_infrastructure_finish_apply, source);
+        assert!(validate_fault_registry_source_text(&skipped_infrastructure_finish_apply).is_err());
+
+        let dropped_scope_closure_receipt = source.replacen(
+            "revoke.closure = Some(receipt);",
+            "revoke.closure = None;",
+            1,
+        );
+        assert_ne!(dropped_scope_closure_receipt, source);
+        assert!(validate_fault_registry_source_text(&dropped_scope_closure_receipt).is_err());
+
         let reordered_operation_publish = source.replacen(
             "let publication = publish(&plan.batch.receipt);\n        let (receipt, selection) = self.apply_device_close(plan);",
             "let (receipt, selection) = self.apply_device_close(plan);\n        let publication = publish(&receipt);",
@@ -4292,8 +4385,19 @@ mod tests {
         assert_ne!(live_partial_registration, source);
         assert!(validate_fault_registry_source_text(&live_partial_registration).is_err());
 
-        let unchecked_cohort_candidate =
-            source.replacen("candidate.check_invariants()?;", "let _ = &candidate;", 1);
+        let unchecked_cohort_candidate = source.replacen(
+            concat!(
+                "        })?;\n",
+                "        candidate.check_invariants()?;\n",
+                "        Ok(DeviceDerivedCohortPlan {",
+            ),
+            concat!(
+                "        })?;\n",
+                "        let _ = &candidate;\n",
+                "        Ok(DeviceDerivedCohortPlan {",
+            ),
+            1,
+        );
         assert_ne!(unchecked_cohort_candidate, source);
         assert!(validate_fault_registry_source_text(&unchecked_cohort_candidate).is_err());
 

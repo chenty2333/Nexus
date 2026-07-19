@@ -2560,13 +2560,88 @@ pub(super) enum InfrastructureHandoffReadiness {
     BlockedRetained,
 }
 
-#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct InfrastructureClosureSelection {
     registry_instance: u64,
     scope: ScopeKey,
     authority_epoch: u64,
     sequence: u64,
     nonce: u64,
+}
+
+impl InfrastructureClosureSelection {
+    pub(super) fn binds_receipt(self, receipt: InfrastructureClosureReceipt) -> bool {
+        self.registry_instance == receipt.registry_instance
+            && self.scope == receipt.scope
+            && self.authority_epoch == receipt.authority_epoch
+            && self.sequence == receipt.sequence
+            && self.nonce == receipt.nonce
+    }
+
+    pub(super) fn rewrite_registry_instance(&mut self, registry_instance: u64) {
+        self.registry_instance = registry_instance;
+    }
+}
+
+/// Durable completion of one infrastructure-root closure.
+///
+/// The receipt binds the immutable root identity, the exact start selection,
+/// and the revision at which the zero-live check was installed.  It is stored
+/// in the authoritative scope record so a response lost after installation is
+/// recovered byte-for-byte rather than reconstructed from ambient counters.
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
+pub(crate) struct InfrastructureClosureReceipt {
+    registry_instance: u64,
+    scope: ScopeKey,
+    authority_epoch: u64,
+    root_effect: EffectKey,
+    sequence: u64,
+    nonce: u64,
+    closed_revision: u64,
+}
+
+impl InfrastructureClosureReceipt {
+    pub(super) fn rewrite_registry_instance(&mut self, registry_instance: u64) {
+        self.registry_instance = registry_instance;
+    }
+}
+
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
+pub(crate) enum InfrastructureClosureProgress {
+    Active,
+    Closing(InfrastructureClosureSelection),
+    Retained(InfrastructureClosureSelection),
+    Closed(InfrastructureClosureReceipt),
+}
+
+pub(super) struct InfrastructureClosureStartPlan {
+    selection: InfrastructureClosureSelection,
+    next_nonce: u64,
+    next_closure_sequence: u64,
+    next_revision: u64,
+}
+
+pub(super) struct InfrastructureClosureFinishPlan {
+    selection: InfrastructureClosureSelection,
+    receipt: InfrastructureClosureReceipt,
 }
 
 #[derive(
@@ -3409,6 +3484,7 @@ struct ClosureRecord {
     sequence: u64,
     nonce: u64,
     finished: bool,
+    receipt: Option<InfrastructureClosureReceipt>,
 }
 
 #[derive(
@@ -3597,6 +3673,13 @@ pub(super) struct InfrastructureScopeInstallPlan {
 }
 
 fn rewrite_scope_stamps(scope: &mut ScopeInfrastructure, registry_instance: u64) {
+    if let Some(receipt) = scope
+        .closure
+        .as_mut()
+        .and_then(|closure| closure.receipt.as_mut())
+    {
+        receipt.registry_instance = registry_instance;
+    }
     for record in scope.tasks.iter_mut() {
         record.stamp.root.registry_instance = registry_instance;
     }

@@ -8,14 +8,18 @@ use __cser_alloc::vec::Vec;
 #[cfg(test)]
 use super::ClosureRecord;
 use super::{
-    DomainKey, EffectKey, InfrastructureError, InfrastructureEventKind, InfrastructureKind,
-    InfrastructureLimits, InfrastructureRootBinding, InfrastructureScopeInstallPlan,
-    InfrastructureScopeLink, InfrastructureState, LedgerMode, ParentStamp, RequestKey,
-    ReverseIndexRecord, ReverseParent, RootStamp, ScopeInfrastructure, ScopeKey, WorkloadContext,
-    WorkloadPhase, WorkloadRecord, WorkloadRequestPresentation, WorkloadRootPresentation,
-    check_scope_invariants, checked_add, checked_sub, first_live_child_kind, preview_nonce,
-    preview_revision, require_vacancy, rewrite_scope_stamps, validate_active_admission,
-    validate_context, validate_root_presentation, workload_bearer,
+    ContinuationPhase, DeadlinePhase, DelayedCommandPhase, DeviceCreditOwnership, DevicePhase,
+    DomainKey, EffectKey, FaultPhase, InfrastructureClosureFinishPlan,
+    InfrastructureClosureProgress, InfrastructureClosureReceipt, InfrastructureClosureSelection,
+    InfrastructureClosureStartPlan, InfrastructureError, InfrastructureEventKind,
+    InfrastructureKind, InfrastructureLimits, InfrastructureLiveCounts, InfrastructureRootBinding,
+    InfrastructureScopeInstallPlan, InfrastructureScopeLink, InfrastructureState, LedgerMode,
+    ParentStamp, ReplyPhase, RequestKey, ReverseIndexRecord, ReverseParent, RootStamp,
+    ScopeInfrastructure, ScopeKey, ServiceRequestPhase, TaskAnchorPhase, TaskPhase,
+    WorkloadContext, WorkloadPhase, WorkloadRecord, WorkloadRequestPresentation,
+    WorkloadRootPresentation, check_scope_invariants, checked_add, checked_sub,
+    first_live_child_kind, preview_nonce, preview_revision, require_vacancy, rewrite_scope_stamps,
+    validate_active_admission, validate_context, validate_root_presentation, workload_bearer,
 };
 
 impl InfrastructureState {
@@ -320,25 +324,35 @@ impl InfrastructureState {
     #[cfg(test)]
     pub(in super::super) fn set_closing_lifecycle_for_test(&mut self, scope: ScopeKey) {
         let record = self.scope_mut(scope).unwrap();
-        record.active = false;
-        record.closure = Some(ClosureRecord {
-            sequence: 1,
-            nonce: 1,
-            finished: false,
-        });
-        record.next_nonce = record.next_nonce.max(2);
-        record.next_closure_sequence = record.next_closure_sequence.max(2);
+        if record.closure.is_none() {
+            record.active = false;
+            record.closure = Some(ClosureRecord {
+                sequence: 1,
+                nonce: 1,
+                finished: false,
+                receipt: None,
+            });
+            record.next_nonce = record.next_nonce.max(2);
+            record.next_closure_sequence = record.next_closure_sequence.max(2);
+        }
     }
 
     #[cfg(test)]
     pub(in super::super) fn set_revoked_lifecycle_for_test(&mut self, scope: ScopeKey) {
         self.set_closing_lifecycle_for_test(scope);
-        self.scope_mut(scope)
-            .unwrap()
-            .closure
-            .as_mut()
-            .unwrap()
-            .finished = true;
+        let registry_instance = self.registry_instance;
+        let record = self.scope_mut(scope).unwrap();
+        let closure = record.closure.as_mut().unwrap();
+        closure.finished = true;
+        closure.receipt = Some(InfrastructureClosureReceipt {
+            registry_instance,
+            scope,
+            authority_epoch: record.root.authority_epoch,
+            root_effect: record.root.root_effect,
+            sequence: closure.sequence,
+            nonce: closure.nonce,
+            closed_revision: record.revision,
+        });
     }
 
     #[cfg(test)]
@@ -387,6 +401,227 @@ impl InfrastructureState {
 
     pub(in super::super) fn is_enabled(&self, scope: ScopeKey) -> bool {
         self.scopes.iter().any(|(candidate, _)| *candidate == scope)
+    }
+
+    /// Prevalidates the infrastructure half of a full-scope revoke.
+    ///
+    /// A private exact-scope candidate may stage this transition, but it does
+    /// not gain authority by doing so: only the outer Registry can install its
+    /// record. No bearer or selection leaves the Registry module.
+    pub(in super::super) fn prepare_closure_start(
+        &self,
+        scope: ScopeKey,
+        authority_epoch: u64,
+    ) -> Result<InfrastructureClosureStartPlan, InfrastructureError> {
+        if self.mode == LedgerMode::NonAuthoritativeCandidate
+            && (self.scopes.len() != 1 || self.scopes[0].0 != scope)
+        {
+            return Err(InfrastructureError::CandidateHasNoAuthority);
+        }
+        let record = self.scope(scope)?;
+        if record.root.authority_epoch != authority_epoch {
+            return Err(InfrastructureError::StaleAuthority);
+        }
+        if !record.active || record.closure.is_some() {
+            return Err(InfrastructureError::ClosureAlreadyStarted);
+        }
+        let sequence = record.next_closure_sequence;
+        if sequence == 0 {
+            return Err(InfrastructureError::Invariant(
+                "zero infrastructure closure sequence",
+            ));
+        }
+        let next_closure_sequence = sequence
+            .checked_add(1)
+            .ok_or(InfrastructureError::CounterOverflow)?;
+        let (nonce, next_nonce) = preview_nonce(record)?;
+        let next_revision = preview_revision(record)?;
+        Ok(InfrastructureClosureStartPlan {
+            selection: InfrastructureClosureSelection {
+                registry_instance: self.registry_instance,
+                scope,
+                authority_epoch,
+                sequence,
+                nonce,
+            },
+            next_nonce,
+            next_closure_sequence,
+            next_revision,
+        })
+    }
+
+    /// Allocation-free installation of a prevalidated closure start.
+    pub(in super::super) fn apply_closure_start(
+        &mut self,
+        plan: InfrastructureClosureStartPlan,
+    ) -> InfrastructureClosureSelection {
+        let InfrastructureClosureStartPlan {
+            selection,
+            next_nonce,
+            next_closure_sequence,
+            next_revision,
+        } = plan;
+        let record = self
+            .scope_mut(selection.scope)
+            .expect("prevalidated infrastructure scope remains present");
+        stamp_live_closure_cohort(record, selection.sequence);
+        record.active = false;
+        record.closure = Some(super::ClosureRecord {
+            sequence: selection.sequence,
+            nonce: selection.nonce,
+            finished: false,
+            receipt: None,
+        });
+        record.next_nonce = next_nonce;
+        record.next_closure_sequence = next_closure_sequence;
+        record.revision = next_revision;
+        record.events.push(
+            InfrastructureEventKind::ClosureStarted,
+            selection.scope.id(),
+            selection.scope.generation(),
+        );
+        selection
+    }
+
+    pub(in super::super) fn prepare_closure_finish(
+        &self,
+        selection: InfrastructureClosureSelection,
+    ) -> Result<
+        (
+            InfrastructureClosureFinishPlan,
+            InfrastructureClosureReceipt,
+        ),
+        InfrastructureError,
+    > {
+        if self.mode == LedgerMode::NonAuthoritativeCandidate
+            && (self.scopes.len() != 1 || self.scopes[0].0 != selection.scope)
+        {
+            return Err(InfrastructureError::CandidateHasNoAuthority);
+        }
+        if selection.registry_instance != self.registry_instance {
+            return Err(InfrastructureError::ForeignRegistry);
+        }
+        let record = self.scope(selection.scope)?;
+        if record.root.authority_epoch != selection.authority_epoch {
+            return Err(InfrastructureError::StaleAuthority);
+        }
+        let closure = record
+            .closure
+            .ok_or(InfrastructureError::ClosureNotStarted)?;
+        if closure.sequence != selection.sequence || closure.nonce != selection.nonce {
+            return Err(InfrastructureError::StaleClaim);
+        }
+        if closure.finished || closure.receipt.is_some() {
+            return Err(InfrastructureError::InvalidState);
+        }
+        if has_retained_closure_owner(record) {
+            return Err(InfrastructureError::ClosureRetained);
+        }
+        if record.live != InfrastructureLiveCounts::default() {
+            let (kind, live) = first_live_obligation(record).ok_or(
+                InfrastructureError::Invariant("live counts lack a closure obligation"),
+            )?;
+            return Err(InfrastructureError::ClosureBlocked { kind, live });
+        }
+        let closed_revision = preview_revision(record)?;
+        let receipt = InfrastructureClosureReceipt {
+            registry_instance: self.registry_instance,
+            scope: selection.scope,
+            authority_epoch: selection.authority_epoch,
+            root_effect: record.root.root_effect,
+            sequence: selection.sequence,
+            nonce: selection.nonce,
+            closed_revision,
+        };
+        Ok((
+            InfrastructureClosureFinishPlan { selection, receipt },
+            receipt,
+        ))
+    }
+
+    /// Allocation-free installation of a prevalidated zero-live receipt.
+    pub(in super::super) fn apply_closure_finish(
+        &mut self,
+        plan: InfrastructureClosureFinishPlan,
+    ) -> InfrastructureClosureReceipt {
+        let InfrastructureClosureFinishPlan { selection, receipt } = plan;
+        let record = self
+            .scope_mut(selection.scope)
+            .expect("prevalidated infrastructure scope remains present");
+        let closure = record
+            .closure
+            .as_mut()
+            .expect("prevalidated infrastructure closure remains present");
+        closure.finished = true;
+        closure.receipt = Some(receipt);
+        record.revision = receipt.closed_revision;
+        record.events.push(
+            InfrastructureEventKind::ClosureFinished,
+            selection.scope.id(),
+            selection.scope.generation(),
+        );
+        receipt
+    }
+
+    pub(in super::super) fn closure_progress(
+        &self,
+        scope: ScopeKey,
+    ) -> Result<InfrastructureClosureProgress, InfrastructureError> {
+        let record = self.scope(scope)?;
+        let Some(closure) = record.closure else {
+            return if record.active {
+                Ok(InfrastructureClosureProgress::Active)
+            } else {
+                Err(InfrastructureError::Invariant(
+                    "inactive infrastructure scope lacks closure",
+                ))
+            };
+        };
+        let selection = InfrastructureClosureSelection {
+            registry_instance: self.registry_instance,
+            scope,
+            authority_epoch: record.root.authority_epoch,
+            sequence: closure.sequence,
+            nonce: closure.nonce,
+        };
+        if closure.finished {
+            return closure
+                .receipt
+                .map(InfrastructureClosureProgress::Closed)
+                .ok_or(InfrastructureError::Invariant(
+                    "finished infrastructure closure lacks receipt",
+                ));
+        }
+        if closure.receipt.is_some() {
+            return Err(InfrastructureError::Invariant(
+                "unfinished infrastructure closure retains receipt",
+            ));
+        }
+        Ok(if has_retained_closure_owner(record) {
+            InfrastructureClosureProgress::Retained(selection)
+        } else {
+            InfrastructureClosureProgress::Closing(selection)
+        })
+    }
+
+    pub(in super::super) fn verify_closure_receipt(
+        &self,
+        receipt: InfrastructureClosureReceipt,
+    ) -> Result<(), InfrastructureError> {
+        if receipt.registry_instance != self.registry_instance {
+            return Err(InfrastructureError::ForeignRegistry);
+        }
+        let record = self.scope(receipt.scope)?;
+        if record.root.authority_epoch != receipt.authority_epoch
+            || record.root.root_effect != receipt.root_effect
+            || record.revision != receipt.closed_revision
+            || record
+                .closure
+                .is_none_or(|closure| !closure.finished || closure.receipt != Some(receipt))
+        {
+            return Err(InfrastructureError::InvalidReceipt);
+        }
+        Ok(())
     }
 
     pub(super) fn require_authoritative(&self) -> Result<(), InfrastructureError> {
@@ -594,4 +829,140 @@ impl InfrastructureState {
         );
         Ok(())
     }
+}
+
+fn stamp_live_closure_cohort(scope: &mut ScopeInfrastructure, sequence: u64) {
+    for record in scope.workloads.iter_mut() {
+        if record.phase == WorkloadPhase::Open {
+            record.closure_sequence = Some(sequence);
+        }
+    }
+    for record in scope.tasks.iter_mut() {
+        if task_live(record.phase) {
+            record.closure_sequence = Some(sequence);
+        }
+    }
+    for record in scope.service_requests.iter_mut() {
+        if service_live(record.phase) {
+            record.closure_sequence = Some(sequence);
+        }
+    }
+    for record in scope.delayed_commands.iter_mut() {
+        if delayed_live(record.phase) {
+            record.closure_sequence = Some(sequence);
+        }
+    }
+    for record in scope.faults.iter_mut() {
+        if __cser_core::matches!(record.phase, FaultPhase::Reserved | FaultPhase::Armed) {
+            record.closure_sequence = Some(sequence);
+        }
+    }
+    for record in scope.continuations.iter_mut() {
+        if continuation_live(record.phase) {
+            record.closure_sequence = Some(sequence);
+        }
+    }
+    for record in scope.deadlines.iter_mut() {
+        if deadline_live(record.phase) {
+            record.closure_sequence = Some(sequence);
+        }
+    }
+    for record in scope.devices.iter_mut() {
+        if device_live(record.phase) {
+            record.closure_sequence = Some(sequence);
+        }
+    }
+    for record in scope.replies.iter_mut() {
+        if reply_live(record.phase) {
+            record.closure_sequence = Some(sequence);
+        }
+    }
+}
+
+fn has_retained_closure_owner(scope: &ScopeInfrastructure) -> bool {
+    scope
+        .tasks
+        .iter()
+        .any(|record| record.anchor == TaskAnchorPhase::TerminalRetained)
+        || scope.deadlines.iter().any(|record| {
+            __cser_core::matches!(
+                record.phase,
+                DeadlinePhase::ExhaustedRetained { .. } | DeadlinePhase::QuarantinedRetained { .. }
+            )
+        })
+        || scope
+            .devices
+            .iter()
+            .any(|record| record.credit_ownership == DeviceCreditOwnership::Retained)
+}
+
+fn first_live_obligation(scope: &ScopeInfrastructure) -> Option<(InfrastructureKind, u32)> {
+    [
+        (
+            InfrastructureKind::ServiceRequest,
+            scope.live.service_requests,
+        ),
+        (
+            InfrastructureKind::DelayedCommand,
+            scope.live.delayed_commands,
+        ),
+        (InfrastructureKind::Fault, scope.live.faults),
+        (InfrastructureKind::Continuation, scope.live.continuations),
+        (InfrastructureKind::Deadline, scope.live.deadlines),
+        (
+            InfrastructureKind::DevicePreparation,
+            scope.live.device_preparations,
+        ),
+        (InfrastructureKind::Reply, scope.live.replies),
+        (InfrastructureKind::Task, scope.live.tasks),
+        (InfrastructureKind::Workload, scope.live.workloads),
+    ]
+    .into_iter()
+    .find(|(_, live)| *live != 0)
+}
+
+const fn task_live(phase: TaskPhase) -> bool {
+    __cser_core::matches!(phase, TaskPhase::Admitted | TaskPhase::Entered)
+}
+
+const fn service_live(phase: ServiceRequestPhase) -> bool {
+    !__cser_core::matches!(
+        phase,
+        ServiceRequestPhase::Completed { .. } | ServiceRequestPhase::Cancelled { .. }
+    )
+}
+
+const fn delayed_live(phase: DelayedCommandPhase) -> bool {
+    __cser_core::matches!(
+        phase,
+        DelayedCommandPhase::Reserved | DelayedCommandPhase::Publishing { .. }
+    )
+}
+
+const fn continuation_live(phase: ContinuationPhase) -> bool {
+    !__cser_core::matches!(
+        phase,
+        ContinuationPhase::Resumed { .. } | ContinuationPhase::Cancelled
+    )
+}
+
+const fn deadline_live(phase: DeadlinePhase) -> bool {
+    !__cser_core::matches!(
+        phase,
+        DeadlinePhase::Cancelled | DeadlinePhase::Resolved { .. }
+    )
+}
+
+const fn device_live(phase: DevicePhase) -> bool {
+    !__cser_core::matches!(
+        phase,
+        DevicePhase::Released { .. } | DevicePhase::Cancelled { .. }
+    )
+}
+
+const fn reply_live(phase: ReplyPhase) -> bool {
+    !__cser_core::matches!(
+        phase,
+        ReplyPhase::Completed { .. } | ReplyPhase::Cancelled { .. }
+    )
 }

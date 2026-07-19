@@ -393,6 +393,7 @@ pub(super) fn check_scope_invariants(
             "infrastructure live count mismatch",
         ));
     }
+    check_closure_state(scope)?;
     if expected_usage.queue_slots > scope.limits.queue_slots
         || expected_usage.pinned_pages > scope.limits.pinned_pages
         || expected_usage.dma_mappings > scope.limits.dma_mappings
@@ -406,6 +407,134 @@ pub(super) fn check_scope_invariants(
     }) {
         return Err(InfrastructureError::Invariant(
             "finished infrastructure closure retains live obligations",
+        ));
+    }
+    Ok(())
+}
+
+fn check_closure_state(scope: &ScopeInfrastructure) -> Result<(), InfrastructureError> {
+    let sequence = scope.closure.map(|closure| closure.sequence);
+
+    for record in scope.workloads.iter() {
+        check_closure_member(
+            sequence,
+            record.closure_sequence,
+            record.phase == WorkloadPhase::Open,
+        )?;
+    }
+    for record in scope.tasks.iter() {
+        check_closure_member(
+            sequence,
+            record.closure_sequence,
+            task_phase_live(record.phase),
+        )?;
+    }
+    for record in scope.service_requests.iter() {
+        check_closure_member(
+            sequence,
+            record.closure_sequence,
+            service_request_phase_live(record.phase),
+        )?;
+    }
+    for record in scope.delayed_commands.iter() {
+        check_closure_member(
+            sequence,
+            record.closure_sequence,
+            delayed_command_phase_live(record.phase),
+        )?;
+    }
+    for record in scope.faults.iter() {
+        check_closure_member(
+            sequence,
+            record.closure_sequence,
+            __cser_core::matches!(record.phase, FaultPhase::Reserved | FaultPhase::Armed),
+        )?;
+    }
+    for record in scope.continuations.iter() {
+        check_closure_member(
+            sequence,
+            record.closure_sequence,
+            continuation_phase_live(record.phase),
+        )?;
+    }
+    for record in scope.deadlines.iter() {
+        check_closure_member(
+            sequence,
+            record.closure_sequence,
+            deadline_phase_live(record.phase),
+        )?;
+    }
+    for record in scope.devices.iter() {
+        check_closure_member(
+            sequence,
+            record.closure_sequence,
+            device_phase_live(record.phase),
+        )?;
+    }
+    for record in scope.replies.iter() {
+        check_closure_member(
+            sequence,
+            record.closure_sequence,
+            reply_phase_live(record.phase),
+        )?;
+    }
+
+    if let Some(closure) = scope.closure {
+        if closure.finished != closure.receipt.is_some() {
+            return Err(InfrastructureError::Invariant(
+                "infrastructure closure receipt state mismatch",
+            ));
+        }
+        if closure.finished
+            && (scope.live != InfrastructureLiveCounts::default()
+                || scope
+                    .tasks
+                    .iter()
+                    .any(|record| record.anchor == TaskAnchorPhase::TerminalRetained)
+                || scope.deadlines.iter().any(|record| {
+                    __cser_core::matches!(
+                        record.phase,
+                        DeadlinePhase::ExhaustedRetained { .. }
+                            | DeadlinePhase::QuarantinedRetained { .. }
+                    )
+                })
+                || scope
+                    .devices
+                    .iter()
+                    .any(|record| record.credit_ownership == DeviceCreditOwnership::Retained))
+        {
+            return Err(InfrastructureError::Invariant(
+                "closed infrastructure scope retains an obligation",
+            ));
+        }
+        if let Some(receipt) = closure.receipt
+            && (receipt.registry_instance != scope.root.registry_instance
+                || receipt.scope != scope.root.scope
+                || receipt.authority_epoch != scope.root.authority_epoch
+                || receipt.root_effect != scope.root.root_effect
+                || receipt.sequence != closure.sequence
+                || receipt.nonce != closure.nonce
+                || receipt.closed_revision != scope.revision)
+        {
+            return Err(InfrastructureError::Invariant(
+                "invalid infrastructure closure receipt",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn check_closure_member(
+    sequence: Option<u64>,
+    member_sequence: Option<u64>,
+    live: bool,
+) -> Result<(), InfrastructureError> {
+    if member_sequence.is_some_and(|observed| Some(observed) != sequence)
+        || (live && member_sequence != sequence)
+        || (sequence.is_none() && member_sequence.is_some())
+    {
+        return Err(InfrastructureError::Invariant(
+            "infrastructure closure cohort mismatch",
         ));
     }
     Ok(())

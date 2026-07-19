@@ -2276,6 +2276,7 @@ struct RevokeBeginPlan {
     selection: RevokeSelection,
     next_revoke_sequence: u64,
     next_scope_revision: u64,
+    infrastructure: Option<infrastructure::InfrastructureClosureStartPlan>,
 }
 
 struct DeviceIotlbApplyPlan {
@@ -2307,6 +2308,8 @@ struct RevokeCompleteApplyPlan {
     scope: ScopeKey,
     next_scope_revision: u64,
     work: RevokeWorkCounters,
+    infrastructure: Option<infrastructure::InfrastructureClosureFinishPlan>,
+    receipt: ScopeClosureReceipt,
 }
 
 enum PreparedDeviceBatch {
@@ -2456,6 +2459,8 @@ struct RevokeState {
     selected_head: Option<EffectKey>,
     retired_recovery: Option<RecoveryState>,
     work: RevokeWorkCounters,
+    infrastructure: Option<infrastructure::InfrastructureClosureSelection>,
+    closure: Option<ScopeClosureReceipt>,
 }
 
 #[derive(
@@ -2715,6 +2720,60 @@ pub(crate) struct RevokeSelection {
     pub(crate) target_count: usize,
 }
 
+/// Durable completion of the business revoke and its optional causal
+/// infrastructure child. The receipt is installed by the same Registry
+/// transaction that advances the business scope to `Revoked`.
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
+pub(crate) struct ScopeClosureReceipt {
+    registry_instance_id: u64,
+    revoke: RevokeSelection,
+    infrastructure: Option<infrastructure::InfrastructureClosureReceipt>,
+    closed_scope_revision: u64,
+}
+
+impl ScopeClosureReceipt {
+    pub(crate) const fn registry_instance_id(&self) -> u64 {
+        self.registry_instance_id
+    }
+
+    pub(crate) const fn revoke(&self) -> &RevokeSelection {
+        &self.revoke
+    }
+
+    const fn infrastructure(&self) -> Option<infrastructure::InfrastructureClosureReceipt> {
+        self.infrastructure
+    }
+
+    pub(crate) const fn closed_scope_revision(&self) -> u64 {
+        self.closed_scope_revision
+    }
+
+    fn rewrite_registry_instance(&mut self, registry_instance_id: u64) {
+        self.registry_instance_id = registry_instance_id;
+        if let Some(infrastructure) = self.infrastructure.as_mut() {
+            infrastructure.rewrite_registry_instance(registry_instance_id);
+        }
+    }
+}
+
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
+pub(crate) enum ScopeClosureProgress {
+    Active,
+    Closing(RevokeSelection),
+    Retained(RevokeSelection),
+    Closed(ScopeClosureReceipt),
+}
+
 #[derive(
     __cser_core::clone::Clone,
     __cser_core::marker::Copy,
@@ -2866,6 +2925,7 @@ pub(crate) struct ProductionHandoffClosureReceipt {
     freeze: KernelFreezeReceipt,
     decision: OwnershipDecisionReceipt,
     revoke: RevokeSelection,
+    scope_closure: ScopeClosureReceipt,
     terminal_manifest_digest: u64,
     closed_scope_revision: u64,
 }
@@ -2881,6 +2941,10 @@ impl ProductionHandoffClosureReceipt {
 
     pub(crate) const fn terminal_manifest_digest(&self) -> u64 {
         self.terminal_manifest_digest
+    }
+
+    pub(crate) const fn scope_closure(&self) -> &ScopeClosureReceipt {
+        &self.scope_closure
     }
 }
 
@@ -4241,10 +4305,36 @@ impl EffectRegistry {
         scope_key: ScopeKey,
         mut candidate: Self,
     ) -> Result<(), RegistryError> {
-        let keys = self
+        candidate.check_invariants()?;
+        if candidate.instance_id != self.instance_id
+            || candidate.scopes.len() != 1
+            || !candidate.scopes.contains_key(&scope_key)
+        {
+            return Err(RegistryError::CombinedCandidateShapeChanged);
+        }
+        let infrastructure = match (
+            self.infrastructure.is_enabled(scope_key),
+            candidate.infrastructure.is_enabled(scope_key),
+        ) {
+            (true, true) => {
+                let base = self.infrastructure.root_binding(scope_key)?;
+                Some(self.infrastructure.prepare_exact_scope_install(
+                    scope_key,
+                    base,
+                    &mut candidate.infrastructure,
+                )?)
+            }
+            (false, false) => None,
+            _ => {
+                return Err(RegistryError::CombinedCandidateShapeChanged);
+            }
+        };
+        let live_scope = self
             .scopes
             .get(&scope_key)
-            .ok_or(RegistryError::UnknownScope)?
+            .ok_or(RegistryError::UnknownScope)?;
+        self.validate_live_scope_replacement_indexes(scope_key, live_scope)?;
+        let keys = live_scope
             .closure_candidates
             .iter()
             .copied()
@@ -4264,6 +4354,19 @@ impl EffectRegistry {
                 .remove(key)
                 .ok_or(RegistryError::UnknownEffect)?;
             replacements.push((*key, replacement));
+        }
+        if candidate.effects.iter().any(|(key, record)| {
+            keys.contains(key)
+                || record.identity.scope != scope_key
+                || self.effects.get(key) != Some(record)
+        }) || !candidate.by_scope.is_empty()
+            || !candidate.by_task.is_empty()
+            || !candidate.by_resource.is_empty()
+            || !candidate.production.by_domain.is_empty()
+            || !candidate.production.children_by_parent.is_empty()
+            || !candidate.production.leaves_by_scope.is_empty()
+        {
+            return Err(RegistryError::CombinedCandidateShapeChanged);
         }
 
         for key in &keys {
@@ -4285,16 +4388,120 @@ impl EffectRegistry {
             self.production.children_by_parent.remove(key);
         }
         for (key, replacement) in replacements {
-            if let Some(record) = self.effects.get_mut(&key) {
-                *record = replacement;
-            }
+            *self
+                .effects
+                .get_mut(&key)
+                .expect("prevalidated replacement effect remains present") = replacement;
         }
-        if let Some(scope) = self.scopes.get_mut(&scope_key) {
-            *scope = replacement_scope;
+        *self
+            .scopes
+            .get_mut(&scope_key)
+            .expect("prevalidated replacement scope remains present") = replacement_scope;
+        if let Some(infrastructure) = infrastructure {
+            self.infrastructure.install_exact_scope(infrastructure);
         }
         self.next_terminal_sequence = candidate.next_terminal_sequence;
         self.next_publication_sequence = candidate.next_publication_sequence;
         self.next_revoke_sequence = candidate.next_revoke_sequence;
+        Ok(())
+    }
+
+    /// Checks every index entry which the infallible exact-scope install will
+    /// remove. The walk is bounded by this scope's effects, domains, resources,
+    /// and causal children; it never scans unrelated effect history.
+    fn validate_live_scope_replacement_indexes(
+        &self,
+        scope_key: ScopeKey,
+        scope: &ScopeRecord,
+    ) -> Result<(), RegistryError> {
+        let keys = &scope.closure_candidates;
+        if scope.phase != ScopePhase::Active
+            || scope.revoke.is_some()
+            || self.by_scope.get(&scope_key) != Some(keys)
+        {
+            return Err(RegistryError::CombinedCandidateShapeChanged);
+        }
+
+        let leaves = self.production.leaves_by_scope.get(&scope_key);
+        let mut expected_leaf_count = 0_usize;
+        for key in keys {
+            let record = self
+                .effects
+                .get(key)
+                .ok_or(RegistryError::CombinedCandidateShapeChanged)?;
+            if record.identity.scope != scope_key
+                || record.phase.is_terminal()
+                || self
+                    .by_task
+                    .get(&record.identity.task)
+                    .is_none_or(|members| !members.contains(key))
+                || record.current_resources.iter().any(|resource| {
+                    self.by_resource
+                        .get(resource)
+                        .is_none_or(|members| !members.contains(key))
+                })
+                || self
+                    .production
+                    .by_domain
+                    .get(&(scope_key, record.identity.domain))
+                    .is_none_or(|members| !members.contains(key))
+                || record.identity.parent.is_some_and(|parent| {
+                    self.production
+                        .children_by_parent
+                        .get(&parent)
+                        .is_none_or(|members| !members.contains(key))
+                })
+            {
+                return Err(RegistryError::CombinedCandidateShapeChanged);
+            }
+
+            let children = self.production.children_by_parent.get(key);
+            if let Some(children) = children {
+                if children.is_empty()
+                    || children.iter().any(|child| {
+                        !keys.contains(child)
+                            || self
+                                .effects
+                                .get(child)
+                                .is_none_or(|record| record.identity.parent != Some(*key))
+                    })
+                    || leaves.is_some_and(|leaves| leaves.contains(key))
+                {
+                    return Err(RegistryError::CombinedCandidateShapeChanged);
+                }
+            } else {
+                expected_leaf_count = expected_leaf_count
+                    .checked_add(1)
+                    .ok_or(RegistryError::CounterOverflow)?;
+                if leaves.is_none_or(|leaves| !leaves.contains(key)) {
+                    return Err(RegistryError::CombinedCandidateShapeChanged);
+                }
+            }
+        }
+        if leaves.map_or(0, BTreeSet::len) != expected_leaf_count {
+            return Err(RegistryError::CombinedCandidateShapeChanged);
+        }
+
+        for domain in scope.domains.keys() {
+            let observed = self.production.by_domain.get(&(scope_key, *domain));
+            let expected_count = keys
+                .iter()
+                .filter(|effect| self.effects[effect].identity.domain == *domain)
+                .count();
+            if observed.map_or(0, BTreeSet::len) != expected_count
+                || observed.is_some_and(|members| {
+                    members.iter().any(|effect| {
+                        !keys.contains(effect)
+                            || self.effects.get(effect).is_none_or(|record| {
+                                record.identity.scope != scope_key
+                                    || record.identity.domain != *domain
+                            })
+                    })
+                })
+            {
+                return Err(RegistryError::CombinedCandidateShapeChanged);
+            }
+        }
         Ok(())
     }
 
@@ -4327,8 +4534,10 @@ impl EffectRegistry {
     }
 
     /// Returns the complete registry debug projection used by failure-atomic
-    /// before/after checks, with only the allocator-assigned registry
-    /// namespace normalized.
+    /// before/after checks. A registry without handoff history normalizes only
+    /// its allocator-assigned namespace. Handoff receipts remain immutable
+    /// authority in another crate, so a registry with any handoff state keeps
+    /// its original namespace instead of creating a mixed synthetic identity.
     ///
     /// `instance_id` and the matching provenance field embedded in commit
     /// receipts intentionally distinguish otherwise identical live
@@ -4340,7 +4549,13 @@ impl EffectRegistry {
         const NORMALIZED_REGISTRY_INSTANCE: u64 = 1;
 
         let mut normalized = self.clone();
-        normalized.rewrite_registry_instance(NORMALIZED_REGISTRY_INSTANCE);
+        if normalized
+            .scopes
+            .values()
+            .all(|scope| scope.handoff.is_none())
+        {
+            normalized.rewrite_registry_instance(NORMALIZED_REGISTRY_INSTANCE);
+        }
         __cser_alloc::format!("{normalized:?}")
     }
 
@@ -4356,12 +4571,24 @@ impl EffectRegistry {
 
     fn rewrite_registry_instance(&mut self, registry_instance_id: u64) {
         __cser_core::assert_ne!(registry_instance_id, 0);
+        __cser_core::assert!(
+            self.scopes.values().all(|scope| scope.handoff.is_none()),
+            "handoff authority receipts cannot be renamespaced"
+        );
         self.instance_id = registry_instance_id;
         self.infrastructure
             .rewrite_private_registry_instance(registry_instance_id);
         for scope in self.scopes.values_mut() {
             if let Some(device_root) = scope.device_root.as_mut() {
                 device_root.rewrite_registry_instance(registry_instance_id);
+            }
+            if let Some(revoke) = scope.revoke.as_mut() {
+                if let Some(infrastructure) = revoke.infrastructure.as_mut() {
+                    infrastructure.rewrite_registry_instance(registry_instance_id);
+                }
+                if let Some(closure) = revoke.closure.as_mut() {
+                    closure.rewrite_registry_instance(registry_instance_id);
+                }
             }
         }
         for record in self.effects.values_mut() {
@@ -8705,6 +8932,7 @@ impl EffectRegistry {
             return Err(RegistryError::InvalidHandoffReceipt);
         }
         if let Some(closure) = state.closure.clone() {
+            self.verify_handoff_closure(scope_key, &closure)?;
             return Ok(ProductionHandoffProgress::Closed(closure));
         }
         if let Some(thaw) = state.thaw {
@@ -8721,11 +8949,15 @@ impl EffectRegistry {
             .clone()
             .ok_or(RegistryError::InvalidHandoffReceipt)?;
         if scope.phase != ScopePhase::Revoked {
-            let retained = state.cohort.iter().any(|effect| {
-                self.effects
-                    .get(effect)
-                    .is_some_and(|record| record.credit_state == CreditState::Retained)
-            });
+            let retained = match self.query_scope_closure(scope_key)? {
+                ScopeClosureProgress::Closing(observed) if observed == selection => false,
+                ScopeClosureProgress::Retained(observed) if observed == selection => true,
+                _ => {
+                    return Err(RegistryError::Invariant(
+                        "handoff and full-scope closure progress differ",
+                    ));
+                }
+            };
             return Ok(if retained {
                 ProductionHandoffProgress::Retained(selection)
             } else {
@@ -8738,10 +8970,17 @@ impl EffectRegistry {
         {
             return Err(RegistryError::NotQuiescent);
         }
+        let scope_closure = scope
+            .revoke
+            .as_ref()
+            .and_then(|revoke| revoke.closure.clone())
+            .ok_or(RegistryError::InvalidHandoffReceipt)?;
+        self.verify_scope_closure(scope_key, &scope_closure)?;
         let closure = ProductionHandoffClosureReceipt {
             freeze,
             decision,
             revoke: selection,
+            scope_closure,
             terminal_manifest_digest: handoff_terminal_manifest_digest(
                 &state.cohort,
                 &self.effects,
@@ -8763,16 +9002,27 @@ impl EffectRegistry {
         scope_key: ScopeKey,
         receipt: &ProductionHandoffClosureReceipt,
     ) -> Result<(), RegistryError> {
-        let state = self
+        let scope = self
             .scopes
             .get(&scope_key)
-            .ok_or(RegistryError::UnknownScope)?
+            .ok_or(RegistryError::UnknownScope)?;
+        let state = scope
             .handoff
             .as_ref()
             .ok_or(RegistryError::InvalidHandoffReceipt)?;
-        if state.closure.as_ref() != Some(receipt) {
+        if state.closure.as_ref() != Some(receipt)
+            || state.freeze != receipt.freeze
+            || state.decision != Some(receipt.decision)
+            || state.revoke.as_ref() != Some(&receipt.revoke)
+            || receipt.revoke != *receipt.scope_closure.revoke()
+            || receipt.closed_scope_revision != scope.revision
+            || receipt.scope_closure.closed_scope_revision() != scope.revision
+            || handoff_terminal_manifest_digest(&state.cohort, &self.effects)?
+                != receipt.terminal_manifest_digest
+        {
             return Err(RegistryError::InvalidHandoffReceipt);
         }
+        self.verify_scope_closure(scope_key, &receipt.scope_closure)?;
         Ok(())
     }
 
@@ -8969,6 +9219,14 @@ impl EffectRegistry {
         let next_revoke_sequence = sequence
             .checked_add(1)
             .ok_or(RegistryError::CounterOverflow)?;
+        let infrastructure = self
+            .infrastructure
+            .is_enabled(scope_key)
+            .then(|| {
+                self.infrastructure
+                    .prepare_closure_start(scope_key, scope.authority_epoch)
+            })
+            .transpose()?;
         Ok(RevokeBeginPlan {
             selection: RevokeSelection {
                 scope: scope_key,
@@ -8979,6 +9237,7 @@ impl EffectRegistry {
             },
             next_revoke_sequence,
             next_scope_revision,
+            infrastructure,
         })
     }
 
@@ -8987,10 +9246,13 @@ impl EffectRegistry {
             selection,
             next_revoke_sequence,
             next_scope_revision,
+            infrastructure,
         } = plan;
 
         // All validation and overflow checks precede this point. Moving the
         // two indexes is allocation-free and does not visit any target record.
+        let infrastructure =
+            infrastructure.map(|plan| self.infrastructure.apply_closure_start(plan));
         self.next_revoke_sequence = next_revoke_sequence;
         let scope = self
             .scopes
@@ -9018,6 +9280,8 @@ impl EffectRegistry {
             selected_head: None,
             retired_recovery,
             work: RevokeWorkCounters::default(),
+            infrastructure,
+            closure: None,
         });
         selection
     }
@@ -9137,6 +9401,144 @@ impl EffectRegistry {
         Ok(())
     }
 
+    /// Returns the durable full-scope lifecycle without minting authority.
+    ///
+    /// A caller which loses the response after `revoke_complete` receives the
+    /// exact stored `Closed` receipt here. `Retained` is conservative: either
+    /// the business credit ledger or the infrastructure child still names a
+    /// retained owner.
+    pub(crate) fn query_scope_closure(
+        &self,
+        scope_key: ScopeKey,
+    ) -> Result<ScopeClosureProgress, RegistryError> {
+        let scope = self
+            .scopes
+            .get(&scope_key)
+            .ok_or(RegistryError::UnknownScope)?;
+        match scope.phase {
+            ScopePhase::Active => {
+                if scope.revoke.is_some()
+                    || (self.infrastructure.is_enabled(scope_key)
+                        && self.infrastructure.closure_progress(scope_key)?
+                            != infrastructure::InfrastructureClosureProgress::Active)
+                {
+                    return Err(RegistryError::Invariant(
+                        "active scope has closure progress",
+                    ));
+                }
+                Ok(ScopeClosureProgress::Active)
+            }
+            ScopePhase::Closing => {
+                let revoke = scope
+                    .revoke
+                    .as_ref()
+                    .ok_or(RegistryError::Invariant("closing scope lacks revoke"))?;
+                let selection = RevokeSelection {
+                    scope: scope_key,
+                    sequence: revoke.sequence,
+                    closed_authority_epoch: revoke.closed_authority_epoch,
+                    authority_epoch: revoke.authority_epoch,
+                    target_count: revoke.target_count,
+                };
+                let infrastructure_retained = match (
+                    revoke.infrastructure,
+                    self.infrastructure.is_enabled(scope_key),
+                ) {
+                    (Some(expected), true) => {
+                        match self.infrastructure.closure_progress(scope_key)? {
+                            infrastructure::InfrastructureClosureProgress::Closing(observed) => {
+                                if observed != expected {
+                                    return Err(RegistryError::Invariant(
+                                        "infrastructure closure selection drifted",
+                                    ));
+                                }
+                                false
+                            }
+                            infrastructure::InfrastructureClosureProgress::Retained(observed) => {
+                                if observed != expected {
+                                    return Err(RegistryError::Invariant(
+                                        "infrastructure closure selection drifted",
+                                    ));
+                                }
+                                true
+                            }
+                            infrastructure::InfrastructureClosureProgress::Active
+                            | infrastructure::InfrastructureClosureProgress::Closed(_) => {
+                                return Err(RegistryError::Invariant(
+                                    "business and infrastructure closure phases differ",
+                                ));
+                            }
+                        }
+                    }
+                    (None, false) => false,
+                    _ => {
+                        return Err(RegistryError::Invariant(
+                            "business and infrastructure closure ownership differ",
+                        ));
+                    }
+                };
+                let business_retained = scope
+                    .credits
+                    .balances
+                    .values()
+                    .any(|balance| balance.retained != 0);
+                Ok(if infrastructure_retained || business_retained {
+                    ScopeClosureProgress::Retained(selection)
+                } else {
+                    ScopeClosureProgress::Closing(selection)
+                })
+            }
+            ScopePhase::Revoked => {
+                let receipt = scope
+                    .revoke
+                    .as_ref()
+                    .and_then(|revoke| revoke.closure.clone())
+                    .ok_or(RegistryError::Invariant(
+                        "revoked scope lacks closure receipt",
+                    ))?;
+                self.verify_scope_closure(scope_key, &receipt)?;
+                Ok(ScopeClosureProgress::Closed(receipt))
+            }
+        }
+    }
+
+    pub(crate) fn verify_scope_closure(
+        &self,
+        scope_key: ScopeKey,
+        receipt: &ScopeClosureReceipt,
+    ) -> Result<(), RegistryError> {
+        let scope = self
+            .scopes
+            .get(&scope_key)
+            .ok_or(RegistryError::UnknownScope)?;
+        let revoke = scope
+            .revoke
+            .as_ref()
+            .ok_or(RegistryError::InvalidRevokeSelection)?;
+        if scope.phase != ScopePhase::Revoked
+            || self.instance_id != receipt.registry_instance_id
+            || receipt.revoke.scope != scope_key
+            || receipt.closed_scope_revision != scope.revision
+            || revoke.closure.as_ref() != Some(receipt)
+            || revoke.sequence != receipt.revoke.sequence
+            || revoke.closed_authority_epoch != receipt.revoke.closed_authority_epoch
+            || revoke.authority_epoch != receipt.revoke.authority_epoch
+            || revoke.target_count != receipt.revoke.target_count
+        {
+            return Err(RegistryError::InvalidRevokeSelection);
+        }
+        match (revoke.infrastructure, receipt.infrastructure) {
+            (Some(selection), Some(infrastructure)) if selection.binds_receipt(infrastructure) => {
+                self.infrastructure.verify_closure_receipt(infrastructure)?;
+            }
+            (None, None) if !self.infrastructure.is_enabled(scope_key) => {}
+            _ => {
+                return Err(RegistryError::InvalidRevokeSelection);
+            }
+        }
+        Ok(())
+    }
+
     fn prepare_revoke_complete_apply(
         &self,
         selection: &RevokeSelection,
@@ -9243,10 +9645,39 @@ impl EffectRegistry {
         }
         projected_work.completion_members_checked = members_checked;
 
+        let (infrastructure, infrastructure_receipt) = match revoke.infrastructure {
+            Some(infrastructure_selection) => {
+                if !self.infrastructure.is_enabled(selection.scope) {
+                    return Err(RegistryError::Invariant(
+                        "revoke retains missing infrastructure closure",
+                    ));
+                }
+                let (plan, receipt) = self
+                    .infrastructure
+                    .prepare_closure_finish(infrastructure_selection)?;
+                (Some(plan), Some(receipt))
+            }
+            None => {
+                if self.infrastructure.is_enabled(selection.scope) {
+                    return Err(RegistryError::Invariant(
+                        "revoke lacks infrastructure closure",
+                    ));
+                }
+                (None, None)
+            }
+        };
+        let receipt = ScopeClosureReceipt {
+            registry_instance_id: self.instance_id,
+            revoke: selection.clone(),
+            infrastructure: infrastructure_receipt,
+            closed_scope_revision: next_scope_revision,
+        };
         Ok(RevokeCompleteApplyPlan {
             scope: selection.scope,
             next_scope_revision,
             work: projected_work,
+            infrastructure,
+            receipt,
         })
     }
 
@@ -9255,7 +9686,12 @@ impl EffectRegistry {
             scope,
             next_scope_revision,
             work,
+            infrastructure,
+            receipt,
         } = plan;
+        let installed_infrastructure =
+            infrastructure.map(|plan| self.infrastructure.apply_closure_finish(plan));
+        __cser_core::debug_assert_eq!(installed_infrastructure, receipt.infrastructure);
         let scope = self
             .scopes
             .get_mut(&scope)
@@ -9267,6 +9703,7 @@ impl EffectRegistry {
         revoke.work = work;
         revoke.cohort.clear();
         revoke.retired_recovery = None;
+        revoke.closure = Some(receipt);
         scope.phase = ScopePhase::Revoked;
         scope.revision = next_scope_revision;
     }
@@ -9621,11 +10058,43 @@ impl EffectRegistry {
                             ));
                         }
                     }
+                    if let Some(closure) = handoff.closure.as_ref() {
+                        let manifest_digest =
+                            handoff_terminal_manifest_digest(&handoff.cohort, &self.effects)
+                                .map_err(|_| {
+                                    RegistryError::Invariant(
+                                        "handoff closure manifest cannot be recomputed",
+                                    )
+                                })?;
+                        if closure.freeze != handoff.freeze
+                            || handoff.decision != Some(closure.decision)
+                            || handoff.revoke.as_ref() != Some(&closure.revoke)
+                            || closure.revoke != *closure.scope_closure.revoke()
+                            || closure.closed_scope_revision != scope.revision
+                            || closure.scope_closure.closed_scope_revision() != scope.revision
+                            || closure.terminal_manifest_digest != manifest_digest
+                        {
+                            return Err(RegistryError::Invariant(
+                                "stored handoff closure drifted from its authority state",
+                            ));
+                        }
+                        self.verify_scope_closure(*key, &closure.scope_closure)
+                            .map_err(|_| {
+                                RegistryError::Invariant(
+                                    "stored handoff closure has invalid scope receipt",
+                                )
+                            })?;
+                    }
                 }
             }
             if let Some(revoke) = &scope.revoke {
                 let target_count = u64::try_from(revoke.target_count)
                     .map_err(|_| RegistryError::Invariant("revoke target count overflow"))?;
+                if revoke.infrastructure.is_some() != self.infrastructure.is_enabled(*key) {
+                    return Err(RegistryError::Invariant(
+                        "revoke infrastructure ownership mismatch",
+                    ));
+                }
                 if revoke.sequence == 0
                     || revoke.authority_epoch != scope.authority_epoch
                     || revoke
@@ -9644,6 +10113,7 @@ impl EffectRegistry {
                     ScopePhase::Closing => {
                         if revoke.cohort.len() != revoke.target_count
                             || revoke.work.completion_members_checked != 0
+                            || revoke.closure.is_some()
                             || revoke
                                 .selected_head
                                 .is_some_and(|effect| !revoke.cohort.contains(&effect))
@@ -9658,8 +10128,40 @@ impl EffectRegistry {
                             || revoke.work.terminalized != target_count
                             || revoke.work.target_index_removals != target_count
                             || revoke.work.completion_members_checked != target_count
+                            || revoke.closure.is_none()
                         {
                             return Err(RegistryError::Invariant("invalid completed revoke state"));
+                        }
+                        let closure = revoke.closure.as_ref().unwrap();
+                        if closure.registry_instance_id != self.instance_id
+                            || closure.closed_scope_revision != scope.revision
+                            || closure.revoke.scope != *key
+                            || closure.revoke.sequence != revoke.sequence
+                            || closure.revoke.closed_authority_epoch
+                                != revoke.closed_authority_epoch
+                            || closure.revoke.authority_epoch != revoke.authority_epoch
+                            || closure.revoke.target_count != revoke.target_count
+                            || closure.infrastructure.is_some() != revoke.infrastructure.is_some()
+                        {
+                            return Err(RegistryError::Invariant(
+                                "invalid combined scope closure receipt",
+                            ));
+                        }
+                        if let (Some(selection), Some(infrastructure)) =
+                            (revoke.infrastructure, closure.infrastructure)
+                        {
+                            if !selection.binds_receipt(infrastructure) {
+                                return Err(RegistryError::Invariant(
+                                    "infrastructure closure selector and receipt differ",
+                                ));
+                            }
+                            self.infrastructure
+                                .verify_closure_receipt(infrastructure)
+                                .map_err(|_| {
+                                    RegistryError::Invariant(
+                                        "invalid stored infrastructure closure receipt",
+                                    )
+                                })?;
                         }
                     }
                 }
@@ -13488,10 +13990,15 @@ fn combined_scope_candidate_self_test() {
     // Active roots use the current epoch. Closing and revoked roots retain
     // the exact closed epoch while the business scope advances exactly once.
     let (mut closing, target_root, _) = fixture();
+    __cser_core::assert_eq!(
+        closing.query_scope_closure(TARGET).unwrap(),
+        ScopeClosureProgress::Active
+    );
     let selection = closing.revoke_begin(TARGET).unwrap();
-    closing
-        .infrastructure
-        .set_closing_lifecycle_for_test(TARGET);
+    __cser_core::assert_eq!(
+        closing.query_scope_closure(TARGET).unwrap(),
+        ScopeClosureProgress::Closing(selection.clone())
+    );
     closing.check_invariants().unwrap();
 
     let mut rolled_authority = closing.clone();
@@ -13516,10 +14023,124 @@ fn combined_scope_candidate_self_test() {
     // Closing while the business live index has already dropped the root.
     closing.check_invariants().unwrap();
     closing.revoke_complete(&selection).unwrap();
-    closing
-        .infrastructure
-        .set_revoked_lifecycle_for_test(TARGET);
+    let receipt = match closing.query_scope_closure(TARGET).unwrap() {
+        ScopeClosureProgress::Closed(receipt) => receipt,
+        progress => __cser_core::panic!("unexpected closure progress: {progress:?}"),
+    };
+    __cser_core::assert_eq!(receipt.revoke(), &selection);
+    __cser_core::assert!(receipt.infrastructure().is_some());
+    closing.verify_scope_closure(TARGET, &receipt).unwrap();
+    __cser_core::assert_eq!(
+        closing.query_scope_closure(TARGET).unwrap(),
+        ScopeClosureProgress::Closed(receipt.clone())
+    );
+    let mut substituted = receipt.clone();
+    substituted.closed_scope_revision += 1;
+    __cser_core::assert_eq!(
+        closing.verify_scope_closure(TARGET, &substituted),
+        Err(RegistryError::InvalidRevokeSelection)
+    );
     closing.check_invariants().unwrap();
+
+    let mut selector_drift = closing.clone();
+    selector_drift.revoke_begin(UNRELATED).unwrap();
+    let unrelated_infrastructure = selector_drift.scopes[&UNRELATED]
+        .revoke
+        .as_ref()
+        .unwrap()
+        .infrastructure;
+    selector_drift
+        .scopes
+        .get_mut(&TARGET)
+        .unwrap()
+        .revoke
+        .as_mut()
+        .unwrap()
+        .infrastructure = unrelated_infrastructure;
+    __cser_core::assert_eq!(
+        selector_drift.verify_scope_closure(TARGET, &receipt),
+        Err(RegistryError::InvalidRevokeSelection)
+    );
+    __cser_core::assert!(__cser_core::matches!(
+        selector_drift.check_invariants(),
+        Err(RegistryError::Invariant(
+            "infrastructure closure selector and receipt differ"
+        ))
+    ));
+
+    let mut missing_infrastructure_owner = closing.clone();
+    let target_revoke = missing_infrastructure_owner
+        .scopes
+        .get_mut(&TARGET)
+        .unwrap()
+        .revoke
+        .as_mut()
+        .unwrap();
+    target_revoke.infrastructure = None;
+    target_revoke.closure.as_mut().unwrap().infrastructure = None;
+    let missing_owner_receipt = target_revoke.closure.clone().unwrap();
+    __cser_core::assert_eq!(
+        missing_infrastructure_owner.verify_scope_closure(TARGET, &missing_owner_receipt),
+        Err(RegistryError::InvalidRevokeSelection)
+    );
+
+    let mut phase_drift = closing.clone();
+    phase_drift.scopes.get_mut(&TARGET).unwrap().phase = ScopePhase::Active;
+    __cser_core::assert_eq!(
+        phase_drift.verify_scope_closure(TARGET, &receipt),
+        Err(RegistryError::InvalidRevokeSelection)
+    );
+
+    // A live infrastructure obligation blocks the same final transition
+    // without changing either ledger. The pre-revoke workload bearer remains
+    // valid in Closing and drains without advancing a domain binding epoch.
+    let (mut draining, target_root, _) = fixture();
+    let workload = draining
+        .infrastructure
+        .open_workload(
+            infrastructure::WorkloadRootPresentation::new(TARGET, 7, target_root),
+            infrastructure::WorkloadRequestPresentation::new(DomainKey::LEGACY, 1, 0xc091, 1),
+        )
+        .unwrap();
+    let domain_epoch = draining
+        .infrastructure
+        .scope_links()
+        .find(|link| link.scope == TARGET)
+        .unwrap()
+        .domains[0]
+        .1;
+    let selection = draining.revoke_begin(TARGET).unwrap();
+    draining
+        .stage_revoke_terminal(&selection, target_root, TerminalRequest::aborted(-125))
+        .unwrap();
+    let before_blocked_finish = draining.clone();
+    __cser_core::assert_eq!(
+        draining.revoke_complete(&selection),
+        Err(RegistryError::Infrastructure(
+            infrastructure::InfrastructureError::ClosureBlocked {
+                kind: infrastructure::InfrastructureKind::Workload,
+                live: 1,
+            }
+        ))
+    );
+    __cser_core::assert_eq!(draining, before_blocked_finish);
+    draining.infrastructure.close_workload(&workload).unwrap();
+    __cser_core::assert_eq!(
+        draining
+            .infrastructure
+            .scope_links()
+            .find(|link| link.scope == TARGET)
+            .unwrap()
+            .domains[0]
+            .1,
+        domain_epoch
+    );
+    draining.revoke_complete(&selection).unwrap();
+    __cser_core::assert!(__cser_core::matches!(
+        draining.query_scope_closure(TARGET),
+        Ok(ScopeClosureProgress::Closed(_))
+    ));
+    draining.check_invariants().unwrap();
 
     // A target business revision change after candidate construction fences
     // the exact-scope candidate.  The failed install leaves both ledgers and
@@ -13534,6 +14155,25 @@ fn combined_scope_candidate_self_test() {
     ));
     __cser_core::assert_eq!(stale, before_stale_install);
     __cser_core::assert!(stale.infrastructure.is_authoritative_for_test());
+
+    // Every live reverse-index membership used by the final infallible
+    // removal is checked before the first mutation. Internal damage therefore
+    // returns a typed shape error instead of reaching remove_index_member's
+    // TCB assertion midway through installation.
+    let (mut damaged_live, target_root, _) = fixture();
+    let mut revoked_candidate = damaged_live.scope_transaction_candidate(TARGET).unwrap();
+    let selection = revoked_candidate.revoke_begin(TARGET).unwrap();
+    revoked_candidate
+        .stage_revoke_terminal(&selection, target_root, TerminalRequest::aborted(-125))
+        .unwrap();
+    revoked_candidate.revoke_complete(&selection).unwrap();
+    damaged_live.by_task.remove(&TARGET_OWNER);
+    let before_damaged_install = damaged_live.clone();
+    __cser_core::assert_eq!(
+        damaged_live.install_revoked_scope_candidate(TARGET, revoked_candidate),
+        Err(RegistryError::CombinedCandidateShapeChanged)
+    );
+    __cser_core::assert_eq!(damaged_live, before_damaged_install);
 
     // The independent infrastructure base revision is fenced as well; a
     // business revision match cannot authorize an older infrastructure view.
@@ -14344,10 +14984,11 @@ fn device_preparation_outer_credit_self_test() {
     // Revocation wins admission. A Closing scope reports the lifecycle error
     // before reinterpreting its old parent authority as an invalid handle.
     let (mut reserve_closing, workload, root, coordinates) = fixture(0xdb31);
-    reserve_closing.revoke_begin(SCOPE).unwrap();
-    reserve_closing
-        .infrastructure
-        .set_closing_lifecycle_for_test(SCOPE);
+    let selection = reserve_closing.revoke_begin(SCOPE).unwrap();
+    __cser_core::assert_eq!(
+        reserve_closing.query_scope_closure(SCOPE).unwrap(),
+        ScopeClosureProgress::Closing(selection)
+    );
     reserve_closing.check_invariants().unwrap();
     let closing_before = reserve_closing.clone();
     __cser_core::assert_eq!(
@@ -14363,10 +15004,11 @@ fn device_preparation_outer_credit_self_test() {
     let ticket = revoke_first
         .reserve_device_preparation(&workload, root, coordinates)
         .unwrap();
-    revoke_first.revoke_begin(SCOPE).unwrap();
-    revoke_first
-        .infrastructure
-        .set_closing_lifecycle_for_test(SCOPE);
+    let selection = revoke_first.revoke_begin(SCOPE).unwrap();
+    __cser_core::assert_eq!(
+        revoke_first.query_scope_closure(SCOPE).unwrap(),
+        ScopeClosureProgress::Closing(selection)
+    );
     revoke_first.check_invariants().unwrap();
     let closing_before = revoke_first.clone();
     let failure = revoke_first
@@ -14593,6 +15235,11 @@ fn device_preparation_outer_credit_self_test() {
         infrastructure::DevicePreparationCreditOwnership::RetainedByPreparation
     );
     __cser_core::assert_eq!(ticket.coordinates(), coordinates);
+    let selection = uncertain.revoke_begin(SCOPE).unwrap();
+    __cser_core::assert_eq!(
+        uncertain.query_scope_closure(SCOPE).unwrap(),
+        ScopeClosureProgress::Retained(selection)
+    );
     uncertain.check_invariants().unwrap();
 }
 
@@ -18292,6 +18939,54 @@ pub(crate) fn production_handoff_retained_self_test(
         .registry
         .verify_handoff_closure(retained.scope, &local_closure)
         .unwrap();
+    let before_substitution = retained.registry.failure_atomic_projection();
+    let mut substituted = local_closure.clone();
+    substituted.scope_closure.closed_scope_revision += 1;
+    __cser_core::assert_eq!(
+        retained
+            .registry
+            .verify_handoff_closure(retained.scope, &substituted),
+        Err(RegistryError::InvalidHandoffReceipt)
+    );
+    __cser_core::assert_eq!(
+        retained.registry.failure_atomic_projection(),
+        before_substitution
+    );
+
+    let mut stored_drift = retained.registry.clone();
+    stored_drift
+        .scopes
+        .get_mut(&retained.scope)
+        .unwrap()
+        .handoff
+        .as_mut()
+        .unwrap()
+        .closure
+        .as_mut()
+        .unwrap()
+        .revoke
+        .sequence += 1;
+    let drifted_receipt = stored_drift.scopes[&retained.scope]
+        .handoff
+        .as_ref()
+        .unwrap()
+        .closure
+        .clone()
+        .unwrap();
+    __cser_core::assert_eq!(
+        stored_drift.verify_handoff_closure(retained.scope, &drifted_receipt),
+        Err(RegistryError::InvalidHandoffReceipt)
+    );
+    __cser_core::assert_eq!(
+        stored_drift.query_handoff(retained.scope, freeze.freeze()),
+        Err(RegistryError::InvalidHandoffReceipt)
+    );
+    __cser_core::assert!(__cser_core::matches!(
+        stored_drift.check_invariants(),
+        Err(RegistryError::Invariant(
+            "stored handoff closure drifted from its authority state"
+        ))
+    ));
     retained.registry.check_invariants().unwrap();
 }
 
