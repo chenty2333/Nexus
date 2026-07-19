@@ -9135,7 +9135,7 @@ impl EffectRegistry {
         apply_publication: impl FnOnce() -> T,
     ) -> Result<T, RegistryError> {
         let publication = self.prepare_publication_ack(ticket)?;
-        let revoke = self.prepare_revoke_complete_apply(selection, Some(&publication))?;
+        let revoke = self.prepare_revoke_complete_apply(selection, Some(&publication), None)?;
         let applied = apply_publication();
         self.apply_publication_ack(publication);
         self.apply_revoke_complete(revoke);
@@ -9943,7 +9943,7 @@ impl EffectRegistry {
         &mut self,
         selection: &RevokeSelection,
     ) -> Result<(), RegistryError> {
-        let plan = self.prepare_revoke_complete_apply(selection, None)?;
+        let plan = self.prepare_revoke_complete_apply(selection, None, None)?;
         self.apply_revoke_complete(plan);
         Ok(())
     }
@@ -10090,6 +10090,7 @@ impl EffectRegistry {
         &self,
         selection: &RevokeSelection,
         publication: Option<&PublicationAckApplyPlan>,
+        projected_workload_close: Option<&infrastructure::WorkloadCloseIntent>,
     ) -> Result<RevokeCompleteApplyPlan, RegistryError> {
         self.validate_revoke_selection(selection)?;
         if self
@@ -10199,12 +10200,25 @@ impl EffectRegistry {
                         "revoke retains missing infrastructure closure",
                     ));
                 }
-                let (plan, receipt) = self
-                    .infrastructure
-                    .prepare_closure_finish(infrastructure_selection)?;
+                let (plan, receipt) = match projected_workload_close {
+                    Some(close) => self
+                        .infrastructure
+                        .prepare_closure_finish_after_workload_close(
+                            infrastructure_selection,
+                            close,
+                        )?,
+                    None => self
+                        .infrastructure
+                        .prepare_closure_finish(infrastructure_selection)?,
+                };
                 (Some(plan), Some(receipt))
             }
             None => {
+                if projected_workload_close.is_some() {
+                    return Err(RegistryError::Invariant(
+                        "projected workload close lacks infrastructure closure",
+                    ));
+                }
                 if self.infrastructure.is_enabled(selection.scope) {
                     return Err(RegistryError::Invariant(
                         "revoke lacks infrastructure closure",

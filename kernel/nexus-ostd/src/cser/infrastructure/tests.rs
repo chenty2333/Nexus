@@ -7082,6 +7082,160 @@ fn full_scope_closure_is_stamped_blocking_and_exactly_replayable() {
 }
 
 #[test]
+fn workload_close_intent_is_exact_failure_atomic_and_projects_root_finish() {
+    let mut state = InfrastructureState::new(0x9012);
+    state
+        .enable(SCOPE, 1, ROOT, limits(), &[(GUEST, 1)])
+        .unwrap();
+    let workload = state
+        .open_workload(
+            WorkloadRootPresentation::new(SCOPE, 1, ROOT),
+            WorkloadRequestPresentation::new(GUEST, 1, 0xa310, 1),
+        )
+        .unwrap();
+    let selection = state.apply_closure_start(state.prepare_closure_start(SCOPE, 1).unwrap());
+
+    let before_prepare = state.private_full_clone();
+    let intent = state.prepare_workload_close(&workload).unwrap();
+    __cser_core::assert_eq!(state, before_prepare);
+    let (finish, expected) = state
+        .prepare_closure_finish_after_workload_close(selection, &intent)
+        .unwrap();
+    __cser_core::assert_eq!(state, before_prepare);
+
+    // A standalone workload apply is deliberately not a full infrastructure
+    // root closure. Only the separately prepared root finish installs the
+    // durable zero-live receipt.
+    state.apply_workload_close(intent, &workload);
+    __cser_core::assert_eq!(
+        state.closure_progress(SCOPE).unwrap(),
+        InfrastructureClosureProgress::Closing(selection)
+    );
+    let installed = state.apply_closure_finish(finish);
+    __cser_core::assert_eq!(installed, expected);
+    __cser_core::assert_eq!(
+        state.closure_progress(SCOPE).unwrap(),
+        InfrastructureClosureProgress::Closed(expected)
+    );
+    state.check_invariants().unwrap();
+
+    // Independently prepared intents share one base revision, but applying
+    // one closes the bearer and makes the other an exact stale replay.
+    let mut duplicate = InfrastructureState::new(0x9013);
+    duplicate
+        .enable(SCOPE, 1, ROOT, limits(), &[(GUEST, 1)])
+        .unwrap();
+    let workload = duplicate
+        .open_workload(
+            WorkloadRootPresentation::new(SCOPE, 1, ROOT),
+            WorkloadRequestPresentation::new(GUEST, 1, 0xa311, 1),
+        )
+        .unwrap();
+    let first = duplicate.prepare_workload_close(&workload).unwrap();
+    let replay = duplicate.prepare_workload_close(&workload).unwrap();
+    duplicate.apply_workload_close(first, &workload);
+    let before_replay = duplicate.private_full_clone();
+    __cser_core::assert_eq!(
+        duplicate.validate_workload_close_intent(&replay, None),
+        Err(InfrastructureError::InvalidState)
+    );
+    __cser_core::assert_eq!(duplicate, before_replay);
+    duplicate.check_invariants().unwrap();
+
+    // A live child blocks preflight without consuming its exact workload
+    // context or changing any authoritative or diagnostic counter.
+    let mut blocked = InfrastructureState::new(0x9014);
+    blocked
+        .enable(SCOPE, 1, ROOT, limits(), &[(GUEST, 1)])
+        .unwrap();
+    let workload = blocked
+        .open_workload(
+            WorkloadRootPresentation::new(SCOPE, 1, ROOT),
+            WorkloadRequestPresentation::new(GUEST, 1, 0xa312, 1),
+        )
+        .unwrap();
+    let _task = blocked
+        .admit_task(
+            &workload,
+            TaskWorkDescriptor {
+                work_id: 0xa412,
+                generation: 1,
+                task: TaskKey::new(0xa512, 1),
+                role: TaskWorkRole::GuestSyscallWork,
+                vm: Some(VmAuthorityKey::new(0xa612, 1).unwrap()),
+            },
+        )
+        .unwrap();
+    let before_blocked = blocked.private_full_clone();
+    __cser_core::assert_eq!(
+        blocked.prepare_workload_close(&workload).unwrap_err(),
+        InfrastructureError::ClosureBlocked {
+            kind: InfrastructureKind::Task,
+            live: 1,
+        }
+    );
+    __cser_core::assert_eq!(blocked, before_blocked);
+
+    // Counter exhaustion is discovered during preparation, never after an
+    // external side effect or partial close installation.
+    let mut overflow = InfrastructureState::new(0x9015);
+    overflow
+        .enable(SCOPE, 1, ROOT, limits(), &[(GUEST, 1)])
+        .unwrap();
+    let workload = overflow
+        .open_workload(
+            WorkloadRootPresentation::new(SCOPE, 1, ROOT),
+            WorkloadRequestPresentation::new(GUEST, 1, 0xa313, 1),
+        )
+        .unwrap();
+    overflow.scope_mut(SCOPE).unwrap().revision = u64::MAX;
+    let before_overflow = overflow.private_full_clone();
+    __cser_core::assert_eq!(
+        overflow.prepare_workload_close(&workload).unwrap_err(),
+        InfrastructureError::CounterOverflow
+    );
+    __cser_core::assert_eq!(overflow, before_overflow);
+
+    // Neither a different Registry instance nor a same-Registry workload may
+    // substitute for the identity against which the intent was prepared.
+    let mut owner = InfrastructureState::new(0x9016);
+    owner
+        .enable(SCOPE, 1, ROOT, limits(), &[(GUEST, 1)])
+        .unwrap();
+    let owner_workload = owner
+        .open_workload(
+            WorkloadRootPresentation::new(SCOPE, 1, ROOT),
+            WorkloadRequestPresentation::new(GUEST, 1, 0xa314, 1),
+        )
+        .unwrap();
+    let intent = owner.prepare_workload_close(&owner_workload).unwrap();
+    let mut foreign = InfrastructureState::new(0x9017);
+    foreign
+        .enable(SCOPE, 1, ROOT, limits(), &[(GUEST, 1)])
+        .unwrap();
+    let before_foreign = foreign.private_full_clone();
+    __cser_core::assert_eq!(
+        foreign.validate_workload_close_intent(&intent, Some(&owner_workload)),
+        Err(InfrastructureError::ForeignRegistry)
+    );
+    __cser_core::assert_eq!(foreign, before_foreign);
+
+    let second_workload = owner
+        .open_workload(
+            WorkloadRootPresentation::new(SCOPE, 1, ROOT),
+            WorkloadRequestPresentation::new(GUEST, 1, 0xa315, 1),
+        )
+        .unwrap();
+    let first_intent = owner.prepare_workload_close(&owner_workload).unwrap();
+    let before_substitution = owner.private_full_clone();
+    __cser_core::assert_eq!(
+        owner.validate_workload_close_intent(&first_intent, Some(&second_workload)),
+        Err(InfrastructureError::ForeignWorkload)
+    );
+    __cser_core::assert_eq!(owner, before_substitution);
+}
+
+#[test]
 fn observed_fault_requires_atomic_task_and_domain_disposition() {
     let crash = applied_fault_state(FaultDisposition::CrashService);
 

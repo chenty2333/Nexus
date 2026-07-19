@@ -775,6 +775,20 @@ clears it only after the device flight enters `Complete`. Busy admission keeps
 the existing session and Ready hardware flight unchanged instead of creating a
 zero-cookie sentinel.
 
+The Registry core now also has the missing two-phase closure primitive. A
+read-only preflight returns an opaque, non-`Clone`, non-`Copy` close intent
+together with the exact unchanged session, after validating the Registry/root/
+workload stamps, live-child count, and both business and infrastructure
+revisions. The combined core operation then prevalidates the publication ticket,
+revoke selector, publication acknowledgement, projected workload close, and
+full infrastructure-root/business-root finish before it invokes an external
+callback. Its success order is external apply, publication acknowledgement,
+workload close, then full revoke/root finish; those internal applies are
+allocation-free and infallible, and an ordinary error returns both linear close
+inputs without invoking the callback. The compatibility `close_causal_workload`
+helper deliberately closes only the workload. It neither installs an
+infrastructure-root receipt nor advances a business scope out of `Closing`.
+
 This is bootstrap reachability, not complete RFC 0003 causal coverage. The
 profile reserves bounded capacity for eight task, eight delayed-command, eight
 deadline-series, four repeated-fault, four device-attempt, four queue, twelve
@@ -785,12 +799,15 @@ waiter/waker, guest-reply, deadline/retry, request-fault, or device-preparation
 obligations in those tables. No 66-cell source-mapped or observed claim is
 made, the locked-empty causal evidence overlay is unchanged, and existing
 QEMU receipts are not promoted by this source/model tranche. In particular,
-the bootstrap closes its causal workload after guest-write prevalidation but
-before the real guest publication and combined outer acknowledgement/revoke;
-`Closed` preserves exact retry authority, but this is not an atomic causal
-closure boundary. A later tranche still needs a two-phase close intent or one
-combined outer-ack plus causal-close transition before this path can support a
-complete causal-coverage claim.
+the existing `linux_fs` adapter still uses the workload-only compatibility
+helper after guest-write prevalidation and before the real guest publication
+and combined outer acknowledgement/revoke. The new combined core API is not
+wired into that adapter in this tranche. Therefore the current QEMU lane still
+does not observe the corrected atomic causal closure boundary, and its source
+gate reports `adapter_wired=false`, `source_mapped=false`, and `observed=false`.
+A later adapter tranche must retain its close intent through publication and
+switch to the combined operation before any evidence or causal-coverage claim
+can be promoted.
 
 The generic `iommu_probe` adapter remains `Ostd018FailClosed`; its
 `unmap_invalidate_and_wait` still returns `IotlbInvalidationUnavailable` rather

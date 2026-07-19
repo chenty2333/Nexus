@@ -7,13 +7,23 @@ source_file=${1:-$script_root/src/personality/linux_fs.rs}
 lib_file=${2:-$script_root/src/lib.rs}
 device_flight_file=${3:-$script_root/src/cser/device_flight.rs}
 runtime_causal_file=${4:-$script_root/src/cser/effect_registry/runtime_causal.rs}
+infrastructure_root_file=${5:-$script_root/src/cser/infrastructure/root.rs}
+infrastructure_mod_file=${6:-$script_root/src/cser/infrastructure/mod.rs}
+effect_registry_file=${7:-$script_root/src/cser/effect_registry.rs}
 
 fail() {
     echo "runtime filesystem same-boot source assertion: FAIL: $*" >&2
     exit 1
 }
 
-for input in "$source_file" "$lib_file" "$device_flight_file" "$runtime_causal_file"; do
+for input in \
+    "$source_file" \
+    "$lib_file" \
+    "$device_flight_file" \
+    "$runtime_causal_file" \
+    "$infrastructure_root_file" \
+    "$infrastructure_mod_file" \
+    "$effect_registry_file"; do
     [[ -f $input && ! -L $input ]] ||
         fail "implementation source is not a regular non-symlink file: $input"
 done
@@ -186,6 +196,17 @@ prepared_guest_write="$work/prepared-guest-write.rs"
 causal_session="$work/causal-session.rs"
 causal_activation="$work/causal-activation.rs"
 causal_limits="$work/causal-limits.rs"
+causal_close_intent="$work/causal-close-intent.rs"
+causal_close_prepare="$work/causal-close-prepare.rs"
+causal_close_validate="$work/causal-close-validate.rs"
+causal_close_apply="$work/causal-close-apply.rs"
+causal_combined_close="$work/causal-combined-close.rs"
+causal_standalone_close="$work/causal-standalone-close.rs"
+infrastructure_close_prepare="$work/infrastructure-close-prepare.rs"
+infrastructure_close_validate="$work/infrastructure-close-validate.rs"
+infrastructure_close_apply="$work/infrastructure-close-apply.rs"
+infrastructure_projected_finish="$work/infrastructure-projected-finish.rs"
+registry_revoke_prepare="$work/registry-revoke-prepare.rs"
 
 extract_between "$source_file" 'struct FsState {' \
     'struct FsClosureWork {' "$fs_state"
@@ -262,6 +283,43 @@ extract_between "$runtime_causal_file" \
     'impl EffectRegistry {' "$causal_activation"
 extract_between "$source_file" 'const fn same_boot_causal_limits()' \
     'fn new_same_boot_registry()' "$causal_limits"
+extract_between "$runtime_causal_file" \
+    'pub(crate) struct CausalWorkloadCloseIntent {' \
+    'impl CausalWorkloadSession {' "$causal_close_intent"
+extract_between "$runtime_causal_file" \
+    'pub(crate) fn prepare_close_causal_workload(' \
+    'fn validate_causal_workload_close_binding(' "$causal_close_prepare"
+extract_between "$runtime_causal_file" \
+    'fn validate_prepared_causal_workload_close(' \
+    'fn apply_close_causal_workload(' "$causal_close_validate"
+extract_between "$runtime_causal_file" \
+    'fn apply_close_causal_workload(' \
+    'pub(crate) fn acknowledge_publication_close_causal_workload_and_revoke_complete_with_apply<' \
+    "$causal_close_apply"
+extract_between "$runtime_causal_file" \
+    'pub(crate) fn acknowledge_publication_close_causal_workload_and_revoke_complete_with_apply<' \
+    'pub(crate) fn close_causal_workload(' "$causal_combined_close"
+extract_between "$runtime_causal_file" \
+    'pub(crate) fn close_causal_workload(' \
+    '#[cfg(test)]' "$causal_standalone_close"
+extract_between "$infrastructure_root_file" \
+    'pub(in super::super) fn prepare_workload_close(' \
+    'pub(in super::super) fn validate_workload_close_intent(' \
+    "$infrastructure_close_prepare"
+extract_between "$infrastructure_root_file" \
+    'pub(in super::super) fn validate_workload_close_intent(' \
+    'pub(in super::super) fn apply_workload_close(' \
+    "$infrastructure_close_validate"
+extract_between "$infrastructure_root_file" \
+    'pub(in super::super) fn apply_workload_close(' \
+    'pub(in super::super) fn close_workload(' "$infrastructure_close_apply"
+extract_between "$infrastructure_root_file" \
+    'pub(in super::super) fn prepare_closure_finish_after_workload_close(' \
+    'pub(in super::super) fn apply_closure_finish(' "$infrastructure_projected_finish"
+extract_between "$effect_registry_file" \
+    'fn prepare_revoke_complete_apply(' \
+    'fn apply_revoke_complete(&mut self, plan: RevokeCompleteApplyPlan)' \
+    "$registry_revoke_prepare"
 
 # RFC 0001 accepts one root, one production Registry, and one ledger. The
 # legacy in-memory filesystem Registry may remain in the non-facade build, but
@@ -294,6 +352,151 @@ require_count "$causal_activation" \
     'into_parts(self) -> (CausalWorkloadError, CausalActivationRequest)' 1
 require_count "$causal_limits" \
     'CausalWorkloadLimits::new(8, 2, 8, 2, 2, 8, 4, 4, 4, 12, 12, 128)' 1
+
+# The core Registry now owns an exact two-phase causal close transaction. Both
+# close intents are opaque, linear values: preparation is read-only and every
+# ordinary combined failure returns the exact intent/session before any
+# external callback can run.
+causal_close_intent_line=$(line_of_unique "$runtime_causal_file" \
+    'pub(crate) struct CausalWorkloadCloseIntent {')
+causal_close_intent_derive=$(sed -n "$((causal_close_intent_line - 1))p" \
+    "$runtime_causal_file")
+[[ $causal_close_intent_derive == \
+    '#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]' ]] ||
+    fail 'CausalWorkloadCloseIntent gained Clone/Copy or lost its frozen derive set'
+combined_close_failure_line=$(line_of_unique "$runtime_causal_file" \
+    'pub(crate) struct CausalCombinedCloseFailure {')
+combined_close_failure_derive=$(sed -n "$((combined_close_failure_line - 1))p" \
+    "$runtime_causal_file")
+[[ $combined_close_failure_derive == \
+    '#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]' ]] ||
+    fail 'CausalCombinedCloseFailure gained Clone/Copy or lost its frozen derive set'
+workload_close_intent_line=$(line_of_unique "$infrastructure_mod_file" \
+    'pub(super) struct WorkloadCloseIntent {')
+workload_close_intent_derive=$(sed -n "$((workload_close_intent_line - 1))p" \
+    "$infrastructure_mod_file")
+[[ $workload_close_intent_derive == \
+    '#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]' ]] ||
+    fail 'WorkloadCloseIntent gained Clone/Copy or lost its frozen derive set'
+require_count "$causal_close_intent" 'identity: CausalWorkloadIdentity,' 1
+require_count "$causal_close_intent" 'root: PortalHandle,' 1
+require_count "$causal_close_intent" 'registry_scope_revision: u64,' 1
+require_count "$causal_close_intent" \
+    'infrastructure: infrastructure::WorkloadCloseIntent,' 1
+require_count "$causal_close_prepare" '&self,' 1
+reject_fixed "$causal_close_prepare" '&mut self'
+require_count "$causal_close_prepare" \
+    'Result<(CausalWorkloadCloseIntent, CausalWorkloadSession), CausalWorkloadCloseFailure>' 1
+require_count "$causal_close_prepare" \
+    'self.validate_causal_workload_close_binding(session.identity)' 1
+require_count "$causal_close_prepare" \
+    'self.infrastructure.prepare_workload_close(&session.context)' 1
+require_count "$causal_close_prepare" \
+    'Err(error) => return Err(CausalWorkloadCloseFailure { error, session }),' 1
+require_count "$causal_close_prepare" \
+    'error: CausalWorkloadError::Infrastructure(error),' 1
+require_count "$causal_close_validate" 'if intent.identity != session.identity {' 1
+require_count "$causal_close_validate" \
+    'if root != intent.root || registry_scope_revision != intent.registry_scope_revision {' 1
+require_count "$causal_close_validate" \
+    '.validate_workload_close_intent(&intent.infrastructure, Some(&session.context))' 1
+require_count "$causal_close_apply" '&mut self,' 1
+require_count "$causal_close_apply" ') -> CausalWorkloadIdentity {' 1
+reject_fixed "$causal_close_apply" 'Result<'
+reject_fixed "$causal_close_apply" 'validate_workload_close_intent'
+require_count "$causal_close_apply" \
+    '.apply_workload_close(intent.infrastructure, &session.context);' 1
+
+# One and only one failure-only preflight precedes the external boundary. The
+# ticket binds the causal root, the selector binds its scope/closed authority,
+# and projected root finish consumes the exact infrastructure intent.
+for required in \
+    'ticket.scope != identity.scope' \
+    'ticket.effect != identity.root_effect' \
+    'selection.scope != identity.scope' \
+    'selection.closed_authority_epoch != identity.authority_epoch' \
+    'self.prepare_publication_ack(ticket)' \
+    'self.prepare_revoke_complete_apply(' \
+    'Some(&intent.infrastructure),' \
+    'let applied = apply_external();' \
+    'self.apply_publication_ack(publication);' \
+    'let identity = self.apply_close_causal_workload(intent, session);' \
+    'self.apply_revoke_complete(revoke);'; do
+    require_count "$causal_combined_close" "$required" 1
+done
+require_count "$causal_combined_close" \
+    'return Err(CausalCombinedCloseFailure {' 4
+require_count "$causal_combined_close" 'apply_external()' 1
+require_order "$causal_combined_close" \
+    'self.validate_prepared_causal_workload_close(&intent, &session)' \
+    'if ticket.scope != identity.scope' \
+    'let publication = match self.prepare_publication_ack(ticket)' \
+    'let revoke = match self.prepare_revoke_complete_apply(' \
+    'let applied = apply_external();' \
+    'self.apply_publication_ack(publication);' \
+    'let identity = self.apply_close_causal_workload(intent, session);' \
+    'self.apply_revoke_complete(revoke);'
+
+# The infrastructure preflight validates the complete live-child/revision
+# projection and the apply phase only installs those exact precomputed values.
+require_count "$infrastructure_close_prepare" '&self,' 1
+reject_fixed "$infrastructure_close_prepare" '&mut self'
+for required in \
+    'check_scope_invariants(scope)?;' \
+    'validate_context(scope, self.registry_instance, context)?;' \
+    'if record.live_children != 0 {' \
+    'let next_revision = preview_revision(scope)?;' \
+    'let next_live_workloads = checked_sub(scope.live.workloads, 1)?;' \
+    'base_revision: scope.revision,'; do
+    require_count "$infrastructure_close_prepare" "$required" 1
+done
+for required in \
+    'check_scope_invariants(scope)?;' \
+    'validate_context(scope, self.registry_instance, context)?;' \
+    'scope.revision != intent.base_revision' \
+    'preview_revision(scope)? != intent.next_revision' \
+    'checked_sub(scope.live.workloads, 1)? != intent.next_live_workloads'; do
+    require_count "$infrastructure_close_validate" "$required" 1
+done
+reject_fixed "$infrastructure_close_apply" 'Result<'
+reject_fixed "$infrastructure_close_apply" 'validate_workload_close_intent'
+require_order "$infrastructure_close_apply" \
+    '.phase = WorkloadPhase::Closed;' \
+    'scope.live.workloads = intent.next_live_workloads;' \
+    'scope.revision = intent.next_revision;' \
+    'InfrastructureEventKind::WorkloadClosed,'
+for required in \
+    'self.validate_workload_close_intent(close, None)?;' \
+    'close.mint.root.scope != selection.scope' \
+    'close.mint.root.authority_epoch != selection.authority_epoch' \
+    'close.mint.root.root_effect != record.root.root_effect' \
+    'live.workloads = close.next_live_workloads;' \
+    '.next_revision' \
+    '.checked_add(1)' \
+    'first_live_obligation_counts(projected_live)'; do
+    require_at_least "$infrastructure_projected_finish" "$required" 1
+done
+for required in \
+    'projected_workload_close: Option<&infrastructure::WorkloadCloseIntent>,' \
+    'self.validate_revoke_selection(selection)?;' \
+    '.next_scope_revision' \
+    '.checked_add(1)' \
+    'members_checked = members_checked' \
+    '.prepare_closure_finish_after_workload_close(' \
+    'projected workload close lacks infrastructure closure'; do
+    require_at_least "$registry_revoke_prepare" "$required" 1
+done
+reject_fixed "$registry_revoke_prepare" 'apply_closure_finish('
+
+# The compatibility helper remains workload-only. It cannot install a root
+# receipt or advance the business scope out of Closing by itself.
+require_count "$causal_standalone_close" \
+    'match self.prepare_close_causal_workload(session)' 1
+require_count "$causal_standalone_close" \
+    'Ok((intent, session)) => Ok(self.apply_close_causal_workload(intent, session)),' 1
+reject_fixed "$causal_standalone_close" 'apply_revoke_complete'
+reject_fixed "$causal_standalone_close" 'apply_closure_finish'
+reject_fixed "$causal_standalone_close" 'apply_publication_ack'
 require_not_feature_guarded_if_present "$fs_state" 'effects: EffectRegistry,'
 require_not_feature_guarded_if_present "$source_file" \
     'effects: new_production_registry(),'
@@ -785,6 +988,33 @@ if [[ ${NEXUS_SAME_BOOT_SOURCE_PRIMARY_ONLY:-0} != 1 ]]; then
         fi
     }
 
+    require_infrastructure_root_rejection() {
+        if NEXUS_SAME_BOOT_SOURCE_PRIMARY_ONLY=1 bash "$0" \
+            "$source_file" "$lib_file" "$device_flight_file" \
+            "$runtime_causal_file" "$1" "$infrastructure_mod_file" \
+            "$effect_registry_file" >/dev/null 2>&1; then
+            fail "source gate accepted infrastructure root mutation: $2"
+        fi
+    }
+
+    require_infrastructure_mod_rejection() {
+        if NEXUS_SAME_BOOT_SOURCE_PRIMARY_ONLY=1 bash "$0" \
+            "$source_file" "$lib_file" "$device_flight_file" \
+            "$runtime_causal_file" "$infrastructure_root_file" "$1" \
+            "$effect_registry_file" >/dev/null 2>&1; then
+            fail "source gate accepted infrastructure type mutation: $2"
+        fi
+    }
+
+    require_effect_registry_rejection() {
+        if NEXUS_SAME_BOOT_SOURCE_PRIMARY_ONLY=1 bash "$0" \
+            "$source_file" "$lib_file" "$device_flight_file" \
+            "$runtime_causal_file" "$infrastructure_root_file" \
+            "$infrastructure_mod_file" "$1" >/dev/null 2>&1; then
+            fail "source gate accepted Registry mutation: $2"
+        fi
+    }
+
     cp "$source_file" "$work/stale-phase.rs"
     sed -i '1i // ProductionReadPhase compatibility is forbidden' "$work/stale-phase.rs"
     require_mutation "$source_file" "$work/stale-phase.rs" stale-phase
@@ -1130,7 +1360,140 @@ if [[ ${NEXUS_SAME_BOOT_SOURCE_PRIMARY_ONLY:-0} != 1 ]]; then
     require_causal_facade_rejection "$work/cloneable-causal-session.rs" \
         cloneable-causal-session
 
-    [[ $mutations == 31 ]] || fail "expected 31 source mutations, observed $mutations"
+    awk '
+        /#\[derive\(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq\)\]/ {
+            candidate = $0
+            getline next_line
+            if (!changed && next_line ~ /pub\(crate\) struct CausalWorkloadCloseIntent \{/) {
+                sub(/\)\]$/, ", __cser_core::clone::Clone)]", candidate)
+                print candidate
+                print next_line
+                changed = 1
+                next
+            }
+            print candidate
+            print next_line
+            next
+        }
+        { print }
+        END { if (!changed) exit 2 }
+    ' "$runtime_causal_file" >"$work/cloneable-causal-close-intent.rs"
+    require_mutation "$runtime_causal_file" "$work/cloneable-causal-close-intent.rs" \
+        cloneable-causal-close-intent
+    require_causal_facade_rejection "$work/cloneable-causal-close-intent.rs" \
+        cloneable-causal-close-intent
+
+    awk '
+        /#\[derive\(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq\)\]/ {
+            candidate = $0
+            getline next_line
+            if (!changed && next_line ~ /pub\(super\) struct WorkloadCloseIntent \{/) {
+                sub(/\)\]$/, ", __cser_core::clone::Clone)]", candidate)
+                print candidate
+                print next_line
+                changed = 1
+                next
+            }
+            print candidate
+            print next_line
+            next
+        }
+        { print }
+        END { if (!changed) exit 2 }
+    ' "$infrastructure_mod_file" >"$work/cloneable-workload-close-intent.rs"
+    require_mutation "$infrastructure_mod_file" "$work/cloneable-workload-close-intent.rs" \
+        cloneable-workload-close-intent
+    require_infrastructure_mod_rejection "$work/cloneable-workload-close-intent.rs" \
+        cloneable-workload-close-intent
+
+    awk '
+        !changed && /let publication = match self\.prepare_publication_ack\(ticket\)/ {
+            print "        let _early_external = apply_external();"
+            changed = 1
+        }
+        { print }
+        END { if (!changed) exit 2 }
+    ' "$runtime_causal_file" >"$work/external-before-preflight.rs"
+    require_mutation "$runtime_causal_file" "$work/external-before-preflight.rs" \
+        external-before-preflight
+    require_causal_facade_rejection "$work/external-before-preflight.rs" \
+        external-before-preflight
+
+    awk '
+        { lines[NR] = $0 }
+        /let identity = self\.apply_close_causal_workload\(intent, session\);/ {
+            close_line = NR
+        }
+        /self\.apply_revoke_complete\(revoke\);/ { revoke_line = NR }
+        END {
+            if (!close_line || !revoke_line || close_line >= revoke_line) exit 2
+            swap = lines[close_line]
+            lines[close_line] = lines[revoke_line]
+            lines[revoke_line] = swap
+            for (line = 1; line <= NR; line++) print lines[line]
+        }
+    ' "$runtime_causal_file" >"$work/revoke-before-workload-close.rs"
+    require_mutation "$runtime_causal_file" "$work/revoke-before-workload-close.rs" \
+        revoke-before-workload-close
+    require_causal_facade_rejection "$work/revoke-before-workload-close.rs" \
+        revoke-before-workload-close
+
+    cp "$runtime_causal_file" "$work/missing-projected-close.rs"
+    sed -i '0,/Some(\&intent\.infrastructure),/s//None,/' \
+        "$work/missing-projected-close.rs"
+    require_mutation "$runtime_causal_file" "$work/missing-projected-close.rs" \
+        missing-projected-close
+    require_causal_facade_rejection "$work/missing-projected-close.rs" \
+        missing-projected-close
+
+    cp "$runtime_causal_file" "$work/unbound-publication-root.rs"
+    sed -i \
+        '0,/ticket\.effect != identity\.root_effect/s//ticket.effect == identity.root_effect/' \
+        "$work/unbound-publication-root.rs"
+    require_mutation "$runtime_causal_file" "$work/unbound-publication-root.rs" \
+        unbound-publication-root
+    require_causal_facade_rejection "$work/unbound-publication-root.rs" \
+        unbound-publication-root
+
+    awk '
+        /pub\(in super::super\) fn prepare_workload_close\(/ { prepare = 1 }
+        prepare && !changed && /check_scope_invariants\(scope\)\?;/ {
+            print "        let _unchecked_scope = scope;"
+            changed = 1
+            next
+        }
+        { print }
+        END { if (!changed) exit 2 }
+    ' "$infrastructure_root_file" >"$work/unchecked-workload-close-scope.rs"
+    require_mutation "$infrastructure_root_file" "$work/unchecked-workload-close-scope.rs" \
+        unchecked-workload-close-scope
+    require_infrastructure_root_rejection "$work/unchecked-workload-close-scope.rs" \
+        unchecked-workload-close-scope
+
+    awk '
+        /pub\(in super::super\) fn apply_workload_close\(/ { apply = 1 }
+        apply && !changed && /^[[:space:]]*\) \{$/ {
+            sub(/\) \{/, ") -> Result<(), InfrastructureError> {")
+            changed = 1
+        }
+        { print }
+        END { if (!changed) exit 2 }
+    ' "$infrastructure_root_file" >"$work/fallible-workload-close-apply.rs"
+    require_mutation "$infrastructure_root_file" "$work/fallible-workload-close-apply.rs" \
+        fallible-workload-close-apply
+    require_infrastructure_root_rejection "$work/fallible-workload-close-apply.rs" \
+        fallible-workload-close-apply
+
+    cp "$effect_registry_file" "$work/nonprojected-root-finish.rs"
+    sed -i \
+        '0,/\.prepare_closure_finish_after_workload_close(/s//.prepare_closure_finish(/' \
+        "$work/nonprojected-root-finish.rs"
+    require_mutation "$effect_registry_file" "$work/nonprojected-root-finish.rs" \
+        nonprojected-root-finish
+    require_effect_registry_rejection "$work/nonprojected-root-finish.rs" \
+        nonprojected-root-finish
+
+    [[ $mutations == 40 ]] || fail "expected 40 source mutations, observed $mutations"
 fi
 
-echo 'runtime filesystem same-boot source assertions: PASS checkpoint=device_flight accepted_registry=one accepted_ledger=one compatibility_syscalls=payload_only_not_cser causal_bootstrap=workload_only causal_slot=vacant+active+closed exact_outer_ack_retry=true rfc0003_obligations=not_wired source_mapped=false observed=false flight=single_actor_slot_handoff actor_resident=false semantic_identity=registry_issued real_user_service_crash=true fsd_task_key=current-task-bound+951:1->951:2 replacement_construction=post-crash distinct_task_vm=true guest_admission=receipt-before-armed guest_wait_locks=none crash_cohort=filesystem_read_only stale_prepare=queued-v1+failure-atomic old_sender_current_handle=NoSupervisor reply_wakeups=1 published_error=retained ack_revoke=failure_atomic guest_write=prevalidated+infallible_frame_apply fail_stop=before_guest_resume post_terminal_allocation=false facade_companion=false polling=true irq_evidence=false smp=1 legacy_phase=false rfc0001_full_closure=false mutations=31'
+echo 'runtime filesystem same-boot source assertions: PASS checkpoint=device_flight accepted_registry=one accepted_ledger=one compatibility_syscalls=payload_only_not_cser causal_bootstrap=workload+two-phase-core causal_slot=vacant+active+closed causal_close=non-clone+failure-atomic+projected-root-finish combined_order=external+ack+workload+root exact_outer_ack_retry=true rfc0003_obligations=not_wired source_mapped=false observed=false adapter_wired=false flight=single_actor_slot_handoff actor_resident=false semantic_identity=registry_issued real_user_service_crash=true fsd_task_key=current-task-bound+951:1->951:2 replacement_construction=post-crash distinct_task_vm=true guest_admission=receipt-before-armed guest_wait_locks=none crash_cohort=filesystem_read_only stale_prepare=queued-v1+failure-atomic old_sender_current_handle=NoSupervisor reply_wakeups=1 published_error=retained ack_revoke=failure_atomic guest_write=prevalidated+infallible_frame_apply fail_stop=before_guest_resume post_terminal_allocation=false facade_companion=false polling=true irq_evidence=false smp=1 legacy_phase=false rfc0001_full_closure=false mutations=40'

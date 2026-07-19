@@ -14,13 +14,14 @@ use super::{
     InfrastructureClosureSelection, InfrastructureClosureStartPlan, InfrastructureError,
     InfrastructureEventKind, InfrastructureKind, InfrastructureLimits, InfrastructureLiveCounts,
     InfrastructureRootBinding, InfrastructureScopeInstallPlan, InfrastructureScopeLink,
-    InfrastructureState, LedgerMode, ParentStamp, ReplyPhase, RequestKey, ReverseIndexRecord,
-    ReverseParent, RootStamp, ScopeInfrastructure, ScopeKey, ServiceRequestPhase, TaskAnchorPhase,
-    TaskPhase, WorkloadContext, WorkloadPhase, WorkloadRecord, WorkloadRequestPresentation,
-    WorkloadRootPresentation, check_scope_invariants, checked_add, checked_sub,
-    first_live_child_kind, mint_workload_context, prepare_workload_mint, preview_nonce,
-    preview_revision, require_vacancy, rewrite_scope_stamps, validate_active_admission,
-    validate_context, validate_root_presentation, workload_bearer,
+    InfrastructureState, LedgerMode, ParentStamp, PreparedWorkloadMint, ReplyPhase, RequestKey,
+    ReverseIndexRecord, ReverseParent, RootStamp, ScopeInfrastructure, ScopeKey,
+    ServiceRequestPhase, TaskAnchorPhase, TaskPhase, WorkloadCloseIntent, WorkloadContext,
+    WorkloadPhase, WorkloadRecord, WorkloadRequestPresentation, WorkloadRootPresentation,
+    check_scope_invariants, checked_add, checked_sub, first_live_child_kind, mint_workload_context,
+    prepare_workload_mint, preview_nonce, preview_revision, require_vacancy, rewrite_scope_stamps,
+    validate_active_admission, validate_context, validate_root_presentation,
+    validate_workload_mint, workload_bearer,
 };
 
 impl InfrastructureState {
@@ -494,6 +495,37 @@ impl InfrastructureState {
         ),
         InfrastructureError,
     > {
+        self.prepare_closure_finish_inner(selection, None)
+    }
+
+    /// Prevalidates root finish against the exact workload close which the
+    /// outer Registry will apply first under the same exclusive transaction.
+    /// Neither transition is installed here.
+    pub(in super::super) fn prepare_closure_finish_after_workload_close(
+        &self,
+        selection: InfrastructureClosureSelection,
+        close: &WorkloadCloseIntent,
+    ) -> Result<
+        (
+            InfrastructureClosureFinishPlan,
+            InfrastructureClosureReceipt,
+        ),
+        InfrastructureError,
+    > {
+        self.prepare_closure_finish_inner(selection, Some(close))
+    }
+
+    fn prepare_closure_finish_inner(
+        &self,
+        selection: InfrastructureClosureSelection,
+        projected_close: Option<&WorkloadCloseIntent>,
+    ) -> Result<
+        (
+            InfrastructureClosureFinishPlan,
+            InfrastructureClosureReceipt,
+        ),
+        InfrastructureError,
+    > {
         if self.mode == LedgerMode::NonAuthoritativeCandidate
             && (self.scopes.len() != 1 || self.scopes[0].0 != selection.scope)
         {
@@ -518,13 +550,30 @@ impl InfrastructureState {
         if has_retained_closure_owner(record) {
             return Err(InfrastructureError::ClosureRetained);
         }
-        if record.live != InfrastructureLiveCounts::default() {
-            let (kind, live) = first_live_obligation(record).ok_or(
+        let (projected_live, closed_revision) = if let Some(close) = projected_close {
+            self.validate_workload_close_intent(close, None)?;
+            if close.mint.root.scope != selection.scope
+                || close.mint.root.authority_epoch != selection.authority_epoch
+                || close.mint.root.root_effect != record.root.root_effect
+            {
+                return Err(InfrastructureError::ForeignRootEffect);
+            }
+            let mut live = record.live;
+            live.workloads = close.next_live_workloads;
+            let revision = close
+                .next_revision
+                .checked_add(1)
+                .ok_or(InfrastructureError::CounterOverflow)?;
+            (live, revision)
+        } else {
+            (record.live, preview_revision(record)?)
+        };
+        if projected_live != InfrastructureLiveCounts::default() {
+            let (kind, live) = first_live_obligation_counts(projected_live).ok_or(
                 InfrastructureError::Invariant("live counts lack a closure obligation"),
             )?;
             return Err(InfrastructureError::ClosureBlocked { kind, live });
         }
-        let closed_revision = preview_revision(record)?;
         let receipt = InfrastructureClosureReceipt {
             registry_instance: self.registry_instance,
             scope: selection.scope,
@@ -802,18 +851,18 @@ impl InfrastructureState {
         workload_bearer(scope, request_key.id)
     }
 
-    pub(in super::super) fn close_workload(
-        &mut self,
+    /// Prepares one exact workload close without changing the authoritative
+    /// ledger. Every identity, child, revision, and live-count check is
+    /// completed before the non-Copy intent leaves this method.
+    pub(in super::super) fn prepare_workload_close(
+        &self,
         context: &WorkloadContext,
-    ) -> Result<(), InfrastructureError> {
+    ) -> Result<WorkloadCloseIntent, InfrastructureError> {
         self.require_authoritative()?;
-        let registry_instance = self.registry_instance;
-        let scope = self.scope_mut(context.root.scope)?;
-        validate_context(scope, registry_instance, context)?;
+        let scope = self.scope(context.root.scope)?;
+        check_scope_invariants(scope)?;
+        validate_context(scope, self.registry_instance, context)?;
         let record = scope.workloads.get(context.workload.request.id).unwrap();
-        if record.phase == WorkloadPhase::Closed {
-            return Ok(());
-        }
         if record.live_children != 0 {
             return Err(InfrastructureError::ClosureBlocked {
                 kind: first_live_child_kind(scope, record.request)?,
@@ -821,19 +870,108 @@ impl InfrastructureState {
             });
         }
         let next_revision = preview_revision(scope)?;
-        let next_live = checked_sub(scope.live.workloads, 1)?;
-        scope
+        let next_live_workloads = checked_sub(scope.live.workloads, 1)?;
+        Ok(WorkloadCloseIntent {
+            registry_instance: self.registry_instance,
+            mint: PreparedWorkloadMint {
+                root: context.root,
+                domain: context.domain,
+                workload: context.workload,
+                parent: context.parent,
+            },
+            base_revision: scope.revision,
+            next_revision,
+            next_live_workloads,
+        })
+    }
+
+    /// Revalidates an exact prepared close. `context=None` validates the
+    /// intent's private descriptive stamps directly for a projected
+    /// root-finish preflight; it never constructs a second live bearer.
+    pub(in super::super) fn validate_workload_close_intent(
+        &self,
+        intent: &WorkloadCloseIntent,
+        context: Option<&WorkloadContext>,
+    ) -> Result<(), InfrastructureError> {
+        self.require_authoritative()?;
+        if intent.registry_instance != self.registry_instance {
+            return Err(InfrastructureError::ForeignRegistry);
+        }
+        let scope = self.scope(intent.mint.root.scope)?;
+        check_scope_invariants(scope)?;
+        match context {
+            Some(context) => {
+                if context.root != intent.mint.root
+                    || context.domain != intent.mint.domain
+                    || context.workload != intent.mint.workload
+                    || context.parent != intent.mint.parent
+                {
+                    return Err(InfrastructureError::ForeignWorkload);
+                }
+                validate_context(scope, self.registry_instance, context)?;
+            }
+            None => validate_workload_mint(scope, self.registry_instance, intent.mint)?,
+        }
+        let record = scope
             .workloads
-            .get_mut(context.workload.request.id)
-            .unwrap()
-            .phase = WorkloadPhase::Closed;
-        scope.live.workloads = next_live;
-        scope.revision = next_revision;
+            .get(intent.mint.workload.request.id)
+            .ok_or(InfrastructureError::UnknownWorkload)?;
+        if record.live_children != 0 {
+            return Err(InfrastructureError::ClosureBlocked {
+                kind: first_live_child_kind(scope, record.request)?,
+                live: record.live_children,
+            });
+        }
+        if scope.revision != intent.base_revision
+            || preview_revision(scope)? != intent.next_revision
+            || checked_sub(scope.live.workloads, 1)? != intent.next_live_workloads
+        {
+            return Err(InfrastructureError::StaleClaim);
+        }
+        Ok(())
+    }
+
+    /// Allocation-free installation of one fully prevalidated workload close.
+    pub(in super::super) fn apply_workload_close(
+        &mut self,
+        intent: WorkloadCloseIntent,
+        context: &WorkloadContext,
+    ) {
+        __cser_core::debug_assert_eq!(intent.registry_instance, self.registry_instance);
+        __cser_core::debug_assert_eq!(context.root, intent.mint.root);
+        __cser_core::debug_assert_eq!(context.domain, intent.mint.domain);
+        __cser_core::debug_assert_eq!(context.workload, intent.mint.workload);
+        __cser_core::debug_assert_eq!(context.parent, intent.mint.parent);
+        let scope = self
+            .scope_mut(intent.mint.root.scope)
+            .expect("prevalidated workload scope remains present");
+        __cser_core::debug_assert_eq!(scope.revision, intent.base_revision);
+        __cser_core::debug_assert_eq!(
+            scope.live.workloads.checked_sub(1),
+            Some(intent.next_live_workloads)
+        );
+        let workload = scope
+            .workloads
+            .get_mut(intent.mint.workload.request.id)
+            .expect("prevalidated workload remains present");
+        __cser_core::debug_assert_eq!(workload.phase, WorkloadPhase::Open);
+        __cser_core::debug_assert_eq!(workload.live_children, 0);
+        workload.phase = WorkloadPhase::Closed;
+        scope.live.workloads = intent.next_live_workloads;
+        scope.revision = intent.next_revision;
         scope.events.push(
             InfrastructureEventKind::WorkloadClosed,
-            context.workload.request.id,
-            context.workload.request.generation,
+            intent.mint.workload.request.id,
+            intent.mint.workload.request.generation,
         );
+    }
+
+    pub(in super::super) fn close_workload(
+        &mut self,
+        context: &WorkloadContext,
+    ) -> Result<(), InfrastructureError> {
+        let intent = self.prepare_workload_close(context)?;
+        self.apply_workload_close(intent, context);
         Ok(())
     }
 }
@@ -991,25 +1129,25 @@ fn has_retained_closure_owner(scope: &ScopeInfrastructure) -> bool {
 }
 
 fn first_live_obligation(scope: &ScopeInfrastructure) -> Option<(InfrastructureKind, u32)> {
+    first_live_obligation_counts(scope.live)
+}
+
+fn first_live_obligation_counts(
+    live: InfrastructureLiveCounts,
+) -> Option<(InfrastructureKind, u32)> {
     [
-        (
-            InfrastructureKind::ServiceRequest,
-            scope.live.service_requests,
-        ),
-        (
-            InfrastructureKind::DelayedCommand,
-            scope.live.delayed_commands,
-        ),
-        (InfrastructureKind::Fault, scope.live.faults),
-        (InfrastructureKind::Continuation, scope.live.continuations),
-        (InfrastructureKind::Deadline, scope.live.deadlines),
+        (InfrastructureKind::ServiceRequest, live.service_requests),
+        (InfrastructureKind::DelayedCommand, live.delayed_commands),
+        (InfrastructureKind::Fault, live.faults),
+        (InfrastructureKind::Continuation, live.continuations),
+        (InfrastructureKind::Deadline, live.deadlines),
         (
             InfrastructureKind::DevicePreparation,
-            scope.live.device_preparations,
+            live.device_preparations,
         ),
-        (InfrastructureKind::Reply, scope.live.replies),
-        (InfrastructureKind::Task, scope.live.tasks),
-        (InfrastructureKind::Workload, scope.live.workloads),
+        (InfrastructureKind::Reply, live.replies),
+        (InfrastructureKind::Task, live.tasks),
+        (InfrastructureKind::Workload, live.workloads),
     ]
     .into_iter()
     .find(|(_, live)| *live != 0)

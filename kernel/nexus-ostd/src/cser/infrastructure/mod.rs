@@ -2733,6 +2733,21 @@ pub(super) struct InfrastructureClosureFinishPlan {
     receipt: InfrastructureClosureReceipt,
 }
 
+/// Exact, allocation-free workload-close transition prepared against one
+/// authoritative infrastructure revision.
+///
+/// The stamps are descriptive validation material, not a second
+/// [`WorkloadContext`]. This type intentionally implements neither `Clone`
+/// nor `Copy`; only the infrastructure ledger can construct or apply it.
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
+pub(super) struct WorkloadCloseIntent {
+    registry_instance: u64,
+    mint: PreparedWorkloadMint,
+    base_revision: u64,
+    next_revision: u64,
+    next_live_workloads: u32,
+}
+
 #[derive(
     __cser_core::clone::Clone,
     __cser_core::marker::Copy,
@@ -3957,37 +3972,56 @@ fn validate_context(
     registry_instance: u64,
     context: &WorkloadContext,
 ) -> Result<(), InfrastructureError> {
-    if context.root.registry_instance != registry_instance
+    validate_workload_mint(
+        scope,
+        registry_instance,
+        PreparedWorkloadMint {
+            root: context.root,
+            domain: context.domain,
+            workload: context.workload,
+            parent: context.parent,
+        },
+    )
+}
+
+/// Validates only descriptive workload stamps. Unlike `validate_context`, this
+/// helper cannot manufacture or release a live workload bearer.
+fn validate_workload_mint(
+    scope: &ScopeInfrastructure,
+    registry_instance: u64,
+    mint: PreparedWorkloadMint,
+) -> Result<(), InfrastructureError> {
+    if mint.root.registry_instance != registry_instance
         || scope.root.registry_instance != registry_instance
     {
         return Err(InfrastructureError::ForeignRegistry);
     }
-    if context.root.scope != scope.root.scope {
+    if mint.root.scope != scope.root.scope {
         return Err(InfrastructureError::ForeignScope);
     }
-    if context.root.root_effect != scope.root.root_effect {
+    if mint.root.root_effect != scope.root.root_effect {
         return Err(InfrastructureError::ForeignRootEffect);
     }
-    if context.root.authority_epoch != scope.root.authority_epoch {
+    if mint.root.authority_epoch != scope.root.authority_epoch {
         return Err(InfrastructureError::StaleAuthority);
     }
     let record = scope
         .workloads
-        .get(context.workload.request.id)
+        .get(mint.workload.request.id)
         .ok_or(InfrastructureError::UnknownWorkload)?;
-    if record.request != context.workload.request
-        || record.root_effect != context.root.root_effect
-        || record.parent != context.parent
-        || record.domain != context.domain.domain
-        || record.nonce != context.workload.nonce
+    if record.request != mint.workload.request
+        || record.root_effect != mint.root.root_effect
+        || record.parent != mint.parent
+        || record.domain != mint.domain.domain
+        || record.nonce != mint.workload.nonce
     {
         return Err(InfrastructureError::ForeignWorkload);
     }
-    if record.bearer_generation != context.workload.bearer_generation {
+    if record.bearer_generation != mint.workload.bearer_generation {
         return Err(InfrastructureError::StaleGeneration);
     }
-    if record.current_binding_epoch != context.domain.binding_epoch
-        || scope.binding_epoch(context.domain.domain)? != context.domain.binding_epoch
+    if record.current_binding_epoch != mint.domain.binding_epoch
+        || scope.binding_epoch(mint.domain.domain)? != mint.domain.binding_epoch
     {
         return Err(InfrastructureError::StaleBinding);
     }
