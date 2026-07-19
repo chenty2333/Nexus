@@ -467,6 +467,29 @@ for zero mutation. Separate reset and IOTLB tombstones retain three abstract
 owners; timeout does not advance device generation, ResetAck advances it, and
 only IOTLB Ack releases ownership.
 
+The production Registry now has the two private primitives required by the
+kernel supervisor backend, but this checkpoint does not yet wire that backend
+into the filesystem lifecycle. A domain recovery snapshot binds the Registry
+instance, scope, domain, replacement, crash generation, binding, explicit
+manager attempt, and a domain-separated digest. Exact pre-rebind abort clears
+only that attempt's snapshot and Ready proof; it retains the crash cohort and
+unadopted set, records one fixed-size replay receipt, and rejects foreign,
+stale, or conflicting attempts without mutation. Recovery peeking remains a
+pure `unadopted.first()` query, so there is no service-owned mutable selector to
+survive the abort.
+
+The last-resort domain isolation primitive installs a fixed-size quarantine
+marker in the existing binding record, clears supervisor/fallback/Ready
+authority, and does not allocate or advance a binding, revision, or global
+counter. It therefore remains available when those counters are exhausted.
+Effects, recovery state, device state, and the last snapshot remain retained
+and the domain projection exposes the marker. Portal, crash, snapshot, Ready,
+rebind, recover, and adopt entry points reject the marker before considering a
+weaker stale-handle or no-supervisor path. This tranche intentionally provides
+no operator clear/retry operation: a quarantined domain can only be retired
+with its enclosing scope. These host-side Registry tests are not evidence of a
+real OSTD supervisor task, timer, task-reap event, repeated crash, or timeout.
+
 Phase 2 stops at deterministic block preparation. It aborts that prepared
 effect without a device commit and keeps queue-slot, pinned-page, and DMA credit
 capacity free; the returned ELF bytes still come from the in-memory inode. The

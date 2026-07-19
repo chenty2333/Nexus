@@ -1167,7 +1167,7 @@ impl FsState {
         );
         let snapshot = self
             .effects
-            .domain_recovery_snapshot(SCOPE, FILESYSTEM_DOMAIN, FILESYSTEM_V2)
+            .domain_recovery_snapshot(SCOPE, FILESYSTEM_DOMAIN, FILESYSTEM_V2, 1)
             .unwrap();
         assert_eq!(snapshot.effects.len(), 1);
         assert_eq!(snapshot.effects[0].effect, filesystem.identity.effect());
@@ -2144,7 +2144,7 @@ impl FsScenario {
             let mut runtime = self.production.lock();
             let snapshot = runtime
                 .registry
-                .domain_recovery_snapshot(SCOPE, FILESYSTEM_DOMAIN, sender)
+                .domain_recovery_snapshot(SCOPE, FILESYSTEM_DOMAIN, sender, 1)
                 .unwrap();
             assert_eq!(snapshot.effects.len(), 1);
             assert_eq!(snapshot.effects[0].effect, filesystem_effect);

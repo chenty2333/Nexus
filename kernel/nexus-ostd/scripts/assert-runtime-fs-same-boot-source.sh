@@ -420,7 +420,7 @@ require_order "$fsd_v1_runner" \
 # fsd-v2 follows the typed Registry recovery protocol and adopts the exact old
 # handle before either a stale mutation attempt or device work can proceed.
 for required in \
-    '.domain_recovery_snapshot(SCOPE, FILESYSTEM_DOMAIN, sender)' \
+    '.domain_recovery_snapshot(SCOPE, FILESYSTEM_DOMAIN, sender, 1)' \
     '.domain_ready(SCOPE, FILESYSTEM_DOMAIN, sender, &snapshot)' \
     '.rebind_domain(SCOPE, FILESYSTEM_DOMAIN, sender)' \
     '.recover_next_domain(SCOPE, FILESYSTEM_DOMAIN, sender)' \

@@ -2397,6 +2397,8 @@ struct DomainRecoveryState {
     unadopted: BTreeSet<EffectKey>,
     snapshot: Option<DomainRecoverySnapshot>,
     ready: Option<TaskKey>,
+    highest_attempt: u32,
+    last_abort: Option<DomainRecoveryAbortReceipt>,
     origin: DomainRecoveryOrigin,
 }
 
@@ -2442,6 +2444,7 @@ struct DomainBindingRecord {
     fallback_running: bool,
     revision: u64,
     recovery: Option<DomainRecoveryState>,
+    quarantine: Option<DomainQuarantineReceipt>,
 }
 
 #[derive(
@@ -2610,14 +2613,219 @@ pub(crate) struct RecoverySnapshot {
     __cser_core::cmp::PartialEq,
 )]
 pub(crate) struct DomainRecoverySnapshot {
+    registry_instance_id: u64,
     pub(crate) scope: ScopeKey,
     pub(crate) domain: DomainKey,
     pub(crate) replacement: TaskKey,
+    pub(crate) attempt: u32,
     pub(crate) authority_epoch: u64,
     pub(crate) binding_epoch: u64,
+    crash_revision: u64,
     pub(crate) root_revision: u64,
     pub(crate) domain_revision: u64,
     pub(crate) effects: Vec<RecoveryEffectSummary>,
+    digest: [u8; 32],
+}
+
+impl DomainRecoverySnapshot {
+    pub(crate) const fn registry_instance_id(&self) -> u64 {
+        self.registry_instance_id
+    }
+
+    pub(crate) const fn attempt(&self) -> u32 {
+        self.attempt
+    }
+
+    pub(crate) const fn digest(&self) -> [u8; 32] {
+        self.digest
+    }
+}
+
+fn domain_recovery_snapshot_digest(snapshot: &DomainRecoverySnapshot) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"nexus.cser.domain-recovery-snapshot.v1\0");
+    hasher.update(snapshot.scope.id().to_le_bytes());
+    hasher.update(snapshot.scope.generation().to_le_bytes());
+    hasher.update(snapshot.domain.value().to_le_bytes());
+    hasher.update(snapshot.replacement.id().to_le_bytes());
+    hasher.update(snapshot.replacement.generation().to_le_bytes());
+    hasher.update(snapshot.attempt.to_le_bytes());
+    hasher.update(snapshot.authority_epoch.to_le_bytes());
+    hasher.update(snapshot.binding_epoch.to_le_bytes());
+    hasher.update(snapshot.crash_revision.to_le_bytes());
+    hasher.update(snapshot.root_revision.to_le_bytes());
+    hasher.update(snapshot.domain_revision.to_le_bytes());
+    hasher.update((snapshot.effects.len() as u128).to_le_bytes());
+    for effect in &snapshot.effects {
+        hasher.update(effect.effect.id().to_le_bytes());
+        hasher.update(effect.effect.generation().to_le_bytes());
+        hasher.update(effect.binding_epoch.to_le_bytes());
+        let (phase, terminal) = match effect.phase {
+            EffectPhase::Registered => (0_u8, 0_u8),
+            EffectPhase::Prepared => (1, 0),
+            EffectPhase::Committed => (2, 0),
+            EffectPhase::Terminal(TerminalOutcome::Completed) => (3, 1),
+            EffectPhase::Terminal(TerminalOutcome::IndeterminateAfterReset) => (3, 2),
+            EffectPhase::Terminal(TerminalOutcome::Aborted) => (3, 3),
+        };
+        hasher.update([phase, terminal]);
+        hasher.update(effect.descriptor_digest.to_le_bytes());
+        match effect.commit_sequence {
+            Some(sequence) => {
+                hasher.update([1]);
+                hasher.update(sequence.to_le_bytes());
+            }
+            None => hasher.update([0]),
+        }
+        hasher.update([u8::from(effect.outcome_required)]);
+        match effect.outcome {
+            Some(outcome) => {
+                hasher.update([1]);
+                hasher.update([match outcome.class() {
+                    EffectOutcomeClass::Data => 1,
+                    EffectOutcomeClass::Error => 2,
+                    EffectOutcomeClass::Indeterminate => 3,
+                }]);
+                hasher.update(outcome.result().to_le_bytes());
+                hasher.update(outcome.digest());
+            }
+            None => hasher.update([0]),
+        }
+        match effect.terminal_manifest_digest {
+            Some(digest) => {
+                hasher.update([1]);
+                hasher.update(digest);
+            }
+            None => hasher.update([0]),
+        }
+    }
+    hasher.finalize().into()
+}
+
+/// Why one manager-owned, pre-rebind domain recovery attempt was abandoned.
+///
+/// This is deliberately Registry-local instead of depending on the supervisor
+/// crate. The eventual OSTD adapter must translate its typed stop reason at the
+/// private backend boundary.
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
+pub(crate) enum DomainRecoveryAbortReason {
+    ExitedBeforeReady,
+    ReadyTimeout,
+    RecoveryRejected,
+    PartialRecoveryFailed,
+}
+
+/// Fixed-size evidence that one exact recovery attempt was cleared without
+/// consuming or replacing any member of the crash-frozen cohort.
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
+pub(crate) struct DomainRecoveryAbortReceipt {
+    registry_instance_id: u64,
+    scope: ScopeKey,
+    domain: DomainKey,
+    replacement: TaskKey,
+    binding_epoch: u64,
+    crash_revision: u64,
+    attempt: u32,
+    snapshot_digest: [u8; 32],
+    reason: DomainRecoveryAbortReason,
+}
+
+impl DomainRecoveryAbortReceipt {
+    pub(crate) const fn attempt(self) -> u32 {
+        self.attempt
+    }
+
+    pub(crate) const fn reason(self) -> DomainRecoveryAbortReason {
+        self.reason
+    }
+}
+
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
+pub(crate) enum DomainRecoveryAbortOutcome {
+    Aborted(DomainRecoveryAbortReceipt),
+    AlreadyAborted(DomainRecoveryAbortReceipt),
+}
+
+impl DomainRecoveryAbortOutcome {
+    pub(crate) const fn receipt(self) -> DomainRecoveryAbortReceipt {
+        match self {
+            Self::Aborted(receipt) | Self::AlreadyAborted(receipt) => receipt,
+        }
+    }
+}
+
+/// Permanent, counter-independent control-plane fence for one service domain.
+///
+/// The marker lives in the already allocated domain binding record. Installing
+/// it never allocates and never advances a fallible epoch/revision counter.
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
+pub(crate) struct DomainQuarantineReceipt {
+    registry_instance_id: u64,
+    scope: ScopeKey,
+    domain: DomainKey,
+    service: TaskKey,
+    binding_epoch: u64,
+    observed_binding_epoch: Option<u64>,
+    crash_revision: Option<u64>,
+    recovery_attempt: Option<u32>,
+    retained_effects_at_isolation: usize,
+    unadopted_effects_at_isolation: usize,
+}
+
+impl DomainQuarantineReceipt {
+    pub(crate) const fn service(self) -> TaskKey {
+        self.service
+    }
+
+    pub(crate) const fn binding_epoch(self) -> u64 {
+        self.binding_epoch
+    }
+
+    pub(crate) const fn observed_binding_epoch(self) -> Option<u64> {
+        self.observed_binding_epoch
+    }
+}
+
+/// Infallible result of a bounded authority-isolation request. Missing or
+/// invalid coordinates carry no authority to revoke and therefore do not
+/// require an allocated error object.
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
+pub(crate) enum DomainIsolationOutcome {
+    Isolated(DomainQuarantineReceipt),
+    AlreadyIsolated(DomainQuarantineReceipt),
+    UnknownScope,
+    UnknownDomain,
+    InvalidTarget,
 }
 
 #[derive(
@@ -2704,6 +2912,9 @@ pub(crate) struct DomainProjection {
     pub(crate) revision: u64,
     pub(crate) live_effects: usize,
     pub(crate) recovery_remaining: usize,
+    pub(crate) recovery_attempt: Option<u32>,
+    pub(crate) last_aborted_attempt: Option<u32>,
+    pub(crate) quarantine: Option<DomainQuarantineReceipt>,
 }
 
 #[derive(
@@ -3003,8 +3214,12 @@ pub(crate) enum RegistryError {
     InvalidHandle,
     InvalidState,
     SnapshotChanged,
+    ForeignRecoverySnapshot,
+    StaleRecoveryAttempt,
+    ConflictingRecoveryAttempt,
     RecoveryNotReady,
     NotAdoptable,
+    DomainQuarantined,
     LiveDescendants,
     AlreadyTerminal,
     CommitConflict,
@@ -4091,6 +4306,12 @@ impl EffectRegistry {
                 });
             }
         };
+        if binding.quarantine.is_some() {
+            return Err(FaultRegistryFailure {
+                error: RegistryError::DomainQuarantined,
+                input: armed,
+            });
+        }
         if binding.binding_epoch != descriptor.admission_binding_epoch {
             return Err(FaultRegistryFailure {
                 error: RegistryError::StaleBinding,
@@ -4157,6 +4378,9 @@ impl EffectRegistry {
                 .domains
                 .get(&plan.projection.service_domain)
                 .ok_or(RegistryError::UnknownDomain)?;
+            if live_binding.quarantine.is_some() {
+                return Err(RegistryError::DomainQuarantined);
+            }
             let cohort = self
                 .production
                 .by_domain
@@ -4190,6 +4414,9 @@ impl EffectRegistry {
                     .domains
                     .get_mut(&plan.projection.service_domain)
                     .ok_or(RegistryError::UnknownDomain)?;
+                if binding.quarantine.is_some() {
+                    return Err(RegistryError::DomainQuarantined);
+                }
                 let next_domain_revision = binding
                     .revision
                     .checked_add(1)
@@ -4221,6 +4448,8 @@ impl EffectRegistry {
                     unadopted: cohort,
                     snapshot: None,
                     ready: None,
+                    highest_attempt: 0,
+                    last_abort: None,
                     origin: DomainRecoveryOrigin::ServiceFault(DomainFaultRecoveryAnchor {
                         fault_id: plan.projection.fault_id,
                         generation: plan.projection.generation,
@@ -4637,6 +4866,19 @@ impl EffectRegistry {
         self.infrastructure
             .rewrite_private_registry_instance(registry_instance_id);
         for scope in self.scopes.values_mut() {
+            for binding in scope.domains.values_mut() {
+                if let Some(quarantine) = binding.quarantine.as_mut() {
+                    quarantine.registry_instance_id = registry_instance_id;
+                }
+                if let Some(recovery) = binding.recovery.as_mut() {
+                    if let Some(snapshot) = recovery.snapshot.as_mut() {
+                        snapshot.registry_instance_id = registry_instance_id;
+                    }
+                    if let Some(abort) = recovery.last_abort.as_mut() {
+                        abort.registry_instance_id = registry_instance_id;
+                    }
+                }
+            }
             if let Some(device_root) = scope.device_root.as_mut() {
                 device_root.rewrite_registry_instance(registry_instance_id);
             }
@@ -4680,6 +4922,7 @@ impl EffectRegistry {
                 fallback_running: false,
                 revision: 0,
                 recovery: None,
+                quarantine: None,
             },
         );
         self.scopes.insert(
@@ -4740,6 +4983,7 @@ impl EffectRegistry {
                 fallback_running: false,
                 revision: 0,
                 recovery: None,
+                quarantine: None,
             },
         );
         let scope = self.scopes.get_mut(&scope_key).unwrap();
@@ -4775,6 +5019,17 @@ impl EffectRegistry {
                 .recovery
                 .as_ref()
                 .map_or(0, |recovery| recovery.unadopted.len()),
+            recovery_attempt: binding
+                .recovery
+                .as_ref()
+                .and_then(|recovery| recovery.snapshot.as_ref())
+                .map(|snapshot| snapshot.attempt),
+            last_aborted_attempt: binding
+                .recovery
+                .as_ref()
+                .and_then(|recovery| recovery.last_abort)
+                .map(DomainRecoveryAbortReceipt::attempt),
+            quarantine: binding.quarantine,
         })
     }
 
@@ -4926,6 +5181,9 @@ impl EffectRegistry {
                 .domains
                 .get(&domain)
                 .ok_or(RegistryError::UnknownDomain)?;
+            if binding.quarantine.is_some() {
+                return Err(RegistryError::DomainQuarantined);
+            }
             if binding.supervisor.is_none() || binding.fallback_running {
                 return Err(RegistryError::NoSupervisor);
             }
@@ -8232,6 +8490,72 @@ impl EffectRegistry {
             .map_or(0, |recovery| recovery.unadopted.len()))
     }
 
+    /// Permanently removes service authority from one existing domain without
+    /// allocating or advancing a fallible counter.
+    ///
+    /// `observed_binding_epoch` is retained only as an audit hint. It is never
+    /// used to narrow the fence: once installed, the marker blocks every portal
+    /// and recovery entry for the domain until the enclosing scope is retired.
+    /// This tranche deliberately exposes no clear/retry operation.
+    pub(crate) fn isolate_domain_authority(
+        &mut self,
+        scope_key: ScopeKey,
+        domain: DomainKey,
+        service: TaskKey,
+        observed_binding_epoch: Option<u64>,
+    ) -> DomainIsolationOutcome {
+        if domain == DomainKey::LEGACY || service.generation() == 0 {
+            return DomainIsolationOutcome::InvalidTarget;
+        }
+        let retained_effects_at_isolation = self
+            .production
+            .by_domain
+            .get(&(scope_key, domain))
+            .map_or(0, BTreeSet::len);
+        let Some(scope) = self.scopes.get_mut(&scope_key) else {
+            return DomainIsolationOutcome::UnknownScope;
+        };
+        let Some(binding) = scope.domains.get_mut(&domain) else {
+            return DomainIsolationOutcome::UnknownDomain;
+        };
+        if let Some(receipt) = binding.quarantine {
+            return DomainIsolationOutcome::AlreadyIsolated(receipt);
+        }
+        let (crash_revision, recovery_attempt, unadopted_effects_at_isolation) = binding
+            .recovery
+            .as_ref()
+            .map_or((None, None, 0), |recovery| {
+                (
+                    Some(recovery.crash_revision),
+                    recovery.snapshot.as_ref().map(|snapshot| snapshot.attempt),
+                    recovery.unadopted.len(),
+                )
+            });
+        let receipt = DomainQuarantineReceipt {
+            registry_instance_id: self.instance_id,
+            scope: scope_key,
+            domain,
+            service,
+            binding_epoch: binding.binding_epoch,
+            observed_binding_epoch,
+            crash_revision,
+            recovery_attempt,
+            retained_effects_at_isolation,
+            unadopted_effects_at_isolation,
+        };
+
+        // These are fixed-size writes into an existing binding record. In
+        // particular, do not advance binding/revision counters: this fence must
+        // remain available when every counter is already at its maximum.
+        binding.supervisor = None;
+        binding.fallback_running = false;
+        if let Some(recovery) = binding.recovery.as_mut() {
+            recovery.ready = None;
+        }
+        binding.quarantine = Some(receipt);
+        DomainIsolationOutcome::Isolated(receipt)
+    }
+
     pub(crate) fn crash_domain(
         &mut self,
         scope_key: ScopeKey,
@@ -8258,6 +8582,9 @@ impl EffectRegistry {
             .domains
             .get(&domain)
             .ok_or(RegistryError::UnknownDomain)?;
+        if binding.quarantine.is_some() {
+            return Err(RegistryError::DomainQuarantined);
+        }
         if binding.supervisor != Some(sender) || binding.fallback_running {
             return Err(RegistryError::NoSupervisor);
         }
@@ -8287,6 +8614,8 @@ impl EffectRegistry {
             unadopted: cohort.clone(),
             snapshot: None,
             ready: None,
+            highest_attempt: 0,
+            last_abort: None,
             origin: DomainRecoveryOrigin::SupervisorCrash,
         });
         scope.invalidate_recovery_readiness();
@@ -8299,13 +8628,22 @@ impl EffectRegistry {
         })
     }
 
+    /// Captures or exactly replays one manager-numbered recovery attempt.
+    ///
+    /// The attempt number is a fence, not an allocator coordinate. A manager
+    /// may skip numbers after failing before snapshot construction, but it may
+    /// never reuse or move backwards across an aborted attempt.
     pub(crate) fn domain_recovery_snapshot(
         &mut self,
         scope_key: ScopeKey,
         domain: DomainKey,
         replacement: TaskKey,
+        attempt: u32,
     ) -> Result<DomainRecoverySnapshot, RegistryError> {
         validate_generation(replacement.generation)?;
+        if attempt == 0 {
+            return Err(RegistryError::InvalidGeneration);
+        }
         let scope = self
             .scopes
             .get(&scope_key)
@@ -8317,6 +8655,9 @@ impl EffectRegistry {
             .domains
             .get(&domain)
             .ok_or(RegistryError::UnknownDomain)?;
+        if binding.quarantine.is_some() {
+            return Err(RegistryError::DomainQuarantined);
+        }
         if !binding.fallback_running || binding.supervisor.is_some() {
             return Err(RegistryError::InvalidState);
         }
@@ -8324,6 +8665,20 @@ impl EffectRegistry {
             .recovery
             .as_ref()
             .ok_or(RegistryError::InvalidState)?;
+        if let Some(snapshot) = recovery.snapshot.as_ref() {
+            if snapshot.attempt != attempt || snapshot.replacement != replacement {
+                return Err(RegistryError::ConflictingRecoveryAttempt);
+            }
+            if snapshot.registry_instance_id != self.instance_id
+                || snapshot.digest != domain_recovery_snapshot_digest(snapshot)
+            {
+                return Err(RegistryError::ConflictingRecoveryAttempt);
+            }
+            return Ok(snapshot.clone());
+        }
+        if attempt <= recovery.highest_attempt {
+            return Err(RegistryError::StaleRecoveryAttempt);
+        }
         let mut effects = Vec::with_capacity(recovery.cohort.len());
         for effect in &recovery.cohort {
             let record = self
@@ -8344,16 +8699,21 @@ impl EffectRegistry {
                     .and_then(TerminalReceipt::manifest_digest),
             });
         }
-        let snapshot = DomainRecoverySnapshot {
+        let mut snapshot = DomainRecoverySnapshot {
+            registry_instance_id: self.instance_id,
             scope: scope_key,
             domain,
             replacement,
+            attempt,
             authority_epoch: scope.authority_epoch,
             binding_epoch: binding.binding_epoch,
+            crash_revision: recovery.crash_revision,
             root_revision: scope.revision,
             domain_revision: binding.revision,
             effects,
+            digest: [0; 32],
         };
+        snapshot.digest = domain_recovery_snapshot_digest(&snapshot);
         let recovery = self
             .scopes
             .get_mut(&scope_key)
@@ -8364,6 +8724,7 @@ impl EffectRegistry {
             .recovery
             .as_mut()
             .unwrap();
+        recovery.highest_attempt = attempt;
         recovery.snapshot = Some(snapshot.clone());
         recovery.ready = None;
         Ok(snapshot)
@@ -8376,6 +8737,17 @@ impl EffectRegistry {
         replacement: TaskKey,
         snapshot: &DomainRecoverySnapshot,
     ) -> Result<(), RegistryError> {
+        if snapshot.registry_instance_id != self.instance_id {
+            return Err(RegistryError::ForeignRecoverySnapshot);
+        }
+        if snapshot.scope != scope_key
+            || snapshot.domain != domain
+            || snapshot.replacement != replacement
+            || snapshot.attempt == 0
+            || snapshot.digest != domain_recovery_snapshot_digest(snapshot)
+        {
+            return Err(RegistryError::ConflictingRecoveryAttempt);
+        }
         let scope = self
             .scopes
             .get_mut(&scope_key)
@@ -8388,6 +8760,9 @@ impl EffectRegistry {
             .domains
             .get_mut(&domain)
             .ok_or(RegistryError::UnknownDomain)?;
+        if binding.quarantine.is_some() {
+            return Err(RegistryError::DomainQuarantined);
+        }
         if !binding.fallback_running || binding.supervisor.is_some() {
             return Err(RegistryError::InvalidState);
         }
@@ -8401,12 +8776,114 @@ impl EffectRegistry {
             || snapshot.replacement != replacement
             || snapshot.root_revision != scope.revision
             || snapshot.domain_revision != binding.revision
-            || recovery.crash_revision > snapshot.domain_revision
+            || recovery.crash_revision != snapshot.crash_revision
+            || recovery.highest_attempt != snapshot.attempt
         {
             return Err(RegistryError::SnapshotChanged);
         }
         recovery.ready = Some(replacement);
         Ok(())
+    }
+
+    /// Clears one exact pre-rebind recovery attempt while retaining the exact
+    /// live crash cohort and every still-unadopted member.
+    ///
+    /// No mutable recovery selector exists outside the snapshot/Ready pair:
+    /// `recover_next_domain` derives its peek from `unadopted.first()`. Clearing
+    /// these two attempt-local fields therefore also removes all attempt-local
+    /// selector authority without advancing the cohort.
+    pub(crate) fn abort_domain_recovery_attempt(
+        &mut self,
+        scope_key: ScopeKey,
+        domain: DomainKey,
+        replacement: TaskKey,
+        attempt: u32,
+        snapshot: &DomainRecoverySnapshot,
+        reason: DomainRecoveryAbortReason,
+    ) -> Result<DomainRecoveryAbortOutcome, RegistryError> {
+        if snapshot.registry_instance_id != self.instance_id {
+            return Err(RegistryError::ForeignRecoverySnapshot);
+        }
+        if snapshot.scope != scope_key
+            || snapshot.domain != domain
+            || snapshot.replacement != replacement
+            || snapshot.attempt != attempt
+            || attempt == 0
+            || snapshot.digest != domain_recovery_snapshot_digest(snapshot)
+        {
+            return Err(RegistryError::ConflictingRecoveryAttempt);
+        }
+        let expected = DomainRecoveryAbortReceipt {
+            registry_instance_id: self.instance_id,
+            scope: scope_key,
+            domain,
+            replacement,
+            binding_epoch: snapshot.binding_epoch,
+            crash_revision: snapshot.crash_revision,
+            attempt,
+            snapshot_digest: snapshot.digest,
+            reason,
+        };
+        let scope = self
+            .scopes
+            .get(&scope_key)
+            .ok_or(RegistryError::UnknownScope)?;
+        if scope.phase != ScopePhase::Active {
+            return Err(RegistryError::ScopeNotActive);
+        }
+        let binding = scope
+            .domains
+            .get(&domain)
+            .ok_or(RegistryError::UnknownDomain)?;
+        if binding.quarantine.is_some() {
+            return Err(RegistryError::DomainQuarantined);
+        }
+        let recovery = binding
+            .recovery
+            .as_ref()
+            .ok_or(RegistryError::InvalidState)?;
+        match recovery.snapshot.as_ref() {
+            Some(active) => {
+                if attempt < active.attempt {
+                    return Err(RegistryError::StaleRecoveryAttempt);
+                }
+                if active != snapshot
+                    || attempt != recovery.highest_attempt
+                    || snapshot.binding_epoch != binding.binding_epoch
+                    || snapshot.crash_revision != recovery.crash_revision
+                {
+                    return Err(RegistryError::ConflictingRecoveryAttempt);
+                }
+                if !binding.fallback_running || binding.supervisor.is_some() {
+                    return Err(RegistryError::InvalidState);
+                }
+            }
+            None => {
+                if recovery.last_abort == Some(expected) {
+                    return Ok(DomainRecoveryAbortOutcome::AlreadyAborted(expected));
+                }
+                return if attempt < recovery.highest_attempt {
+                    Err(RegistryError::StaleRecoveryAttempt)
+                } else {
+                    Err(RegistryError::ConflictingRecoveryAttempt)
+                };
+            }
+        }
+
+        let recovery = self
+            .scopes
+            .get_mut(&scope_key)
+            .unwrap()
+            .domains
+            .get_mut(&domain)
+            .unwrap()
+            .recovery
+            .as_mut()
+            .unwrap();
+        recovery.snapshot = None;
+        recovery.ready = None;
+        recovery.last_abort = Some(expected);
+        Ok(DomainRecoveryAbortOutcome::Aborted(expected))
     }
 
     pub(crate) fn rebind_domain(
@@ -8427,6 +8904,9 @@ impl EffectRegistry {
             .domains
             .get_mut(&domain)
             .ok_or(RegistryError::UnknownDomain)?;
+        if binding.quarantine.is_some() {
+            return Err(RegistryError::DomainQuarantined);
+        }
         if !binding.fallback_running
             || binding.supervisor.is_some()
             || binding
@@ -8465,6 +8945,9 @@ impl EffectRegistry {
             .domains
             .get(&domain)
             .ok_or(RegistryError::UnknownDomain)?;
+        if binding.quarantine.is_some() {
+            return Err(RegistryError::DomainQuarantined);
+        }
         if binding.supervisor != Some(sender) {
             return Err(RegistryError::NoSupervisor);
         }
@@ -8518,6 +9001,9 @@ impl EffectRegistry {
             .domains
             .get(&domain)
             .ok_or(RegistryError::UnknownDomain)?;
+        if binding.quarantine.is_some() {
+            return Err(RegistryError::DomainQuarantined);
+        }
         if binding.supervisor != Some(sender) || binding.fallback_running {
             return Err(RegistryError::NoSupervisor);
         }
@@ -9928,7 +10414,13 @@ impl EffectRegistry {
                 }
                 match scope.phase {
                     ScopePhase::Active => {
-                        if binding.fallback_running == binding.supervisor.is_some() {
+                        if binding.quarantine.is_some() {
+                            if binding.supervisor.is_some() || binding.fallback_running {
+                                return Err(RegistryError::Invariant(
+                                    "quarantined domain retains authority",
+                                ));
+                            }
+                        } else if binding.fallback_running == binding.supervisor.is_some() {
                             return Err(RegistryError::Invariant("invalid active domain binding"));
                         }
                     }
@@ -9941,11 +10433,37 @@ impl EffectRegistry {
                         }
                     }
                 }
+                if let Some(quarantine) = binding.quarantine {
+                    if *domain == DomainKey::LEGACY
+                        || quarantine.registry_instance_id != self.instance_id
+                        || quarantine.scope != *key
+                        || quarantine.domain != *domain
+                        || quarantine.service.generation() == 0
+                        || quarantine.binding_epoch != binding.binding_epoch
+                    {
+                        return Err(RegistryError::Invariant("invalid domain quarantine marker"));
+                    }
+                    if scope.phase == ScopePhase::Active {
+                        let expected = binding.recovery.as_ref().map_or((None, None), |recovery| {
+                            (
+                                Some(recovery.crash_revision),
+                                recovery.snapshot.as_ref().map(|snapshot| snapshot.attempt),
+                            )
+                        });
+                        if expected != (quarantine.crash_revision, quarantine.recovery_attempt) {
+                            return Err(RegistryError::Invariant(
+                                "domain quarantine recovery marker drift",
+                            ));
+                        }
+                    }
+                }
                 if let Some(recovery) = &binding.recovery {
                     if scope.phase != ScopePhase::Active
                         || recovery.crash_revision == 0
                         || recovery.crash_revision > binding.revision
                         || !recovery.unadopted.is_subset(&recovery.cohort)
+                        || (recovery.highest_attempt == 0
+                            && (recovery.snapshot.is_some() || recovery.last_abort.is_some()))
                     {
                         return Err(RegistryError::Invariant("invalid domain recovery state"));
                     }
@@ -9970,15 +10488,40 @@ impl EffectRegistry {
                         }
                     }
                     if let Some(snapshot) = &recovery.snapshot
-                        && (snapshot.scope != *key
+                        && (snapshot.registry_instance_id != self.instance_id
+                            || snapshot.scope != *key
                             || snapshot.domain != *domain
+                            || snapshot.replacement.generation() == 0
+                            || snapshot.attempt == 0
+                            || snapshot.attempt != recovery.highest_attempt
                             || snapshot.authority_epoch != scope.authority_epoch
                             || snapshot.binding_epoch != binding.binding_epoch
+                            || snapshot.crash_revision != recovery.crash_revision
                             || snapshot.root_revision > scope.revision
-                            || snapshot.domain_revision > binding.revision)
+                            || snapshot.domain_revision > binding.revision
+                            || snapshot.digest != domain_recovery_snapshot_digest(snapshot))
                     {
                         return Err(RegistryError::Invariant(
                             "domain recovery snapshot mismatch",
+                        ));
+                    }
+                    if let Some(abort) = recovery.last_abort
+                        && (abort.registry_instance_id != self.instance_id
+                            || abort.scope != *key
+                            || abort.domain != *domain
+                            || abort.replacement.generation() == 0
+                            || abort.binding_epoch != binding.binding_epoch
+                            || abort.crash_revision != recovery.crash_revision
+                            || abort.attempt == 0
+                            || abort.attempt > recovery.highest_attempt
+                            || abort.snapshot_digest == [0; 32]
+                            || recovery
+                                .snapshot
+                                .as_ref()
+                                .is_some_and(|snapshot| abort.attempt >= snapshot.attempt))
+                    {
+                        return Err(RegistryError::Invariant(
+                            "domain recovery abort receipt mismatch",
                         ));
                     }
                     if let Some(ready) = recovery.ready
@@ -11251,6 +11794,9 @@ impl EffectRegistry {
             .domains
             .get(&handle.domain)
             .ok_or(RegistryError::UnknownDomain)?;
+        if binding.quarantine.is_some() {
+            return Err(RegistryError::DomainQuarantined);
+        }
         if handle.binding_epoch != binding.binding_epoch
             || record.identity.binding_epoch != handle.binding_epoch
         {
@@ -11320,6 +11866,9 @@ impl EffectRegistry {
             .domains
             .get(&handle.domain)
             .ok_or(RegistryError::UnknownDomain)?;
+        if binding.quarantine.is_some() {
+            return Err(RegistryError::DomainQuarantined);
+        }
         if handle.binding_epoch != binding.binding_epoch
             || record.identity.binding_epoch != handle.binding_epoch
         {
@@ -15907,11 +16456,403 @@ fn device_preparation_outer_materialization_self_test() {
     );
 }
 
+#[cfg(test)]
+fn supervisor_domain_recovery_primitives_self_test() {
+    const SCOPE: ScopeKey = ScopeKey::new(0x1a00, 1);
+    const ROOT_OWNER: TaskKey = TaskKey::new(0x1a01, 1);
+    const SERVICE_V1: TaskKey = TaskKey::new(0x1a02, 1);
+    const SERVICE_V2: TaskKey = TaskKey::new(0x1a02, 2);
+    const SERVICE_V3: TaskKey = TaskKey::new(0x1a02, 3);
+    const DOMAIN: DomainKey = DomainKey::new(0x1a);
+    const CREDIT: CreditClass = CreditClass::new(0x1a03);
+
+    fn fixture(with_device: bool) -> (EffectRegistry, RegisteredEffect, Option<RegisteredEffect>) {
+        let mut registry = EffectRegistry::new();
+        registry
+            .create_scope(ScopeConfig {
+                key: SCOPE,
+                authority_epoch: 7,
+                binding_epoch: 1,
+                supervisor: ROOT_OWNER,
+                credits: __cser_alloc::vec![CreditLimit::new(CREDIT, 2)],
+            })
+            .unwrap();
+        registry
+            .add_domain(
+                SCOPE,
+                DomainConfig {
+                    key: DOMAIN,
+                    binding_epoch: 1,
+                    supervisor: SERVICE_V1,
+                },
+            )
+            .unwrap();
+        let root = registry
+            .register_derived(DerivedRegisterRequest {
+                request: RegisterRequest {
+                    scope: SCOPE,
+                    task: SERVICE_V1,
+                    operation: OperationClass::new(0x1a10),
+                    descriptor: SyscallDescriptor::new(17, [0x1a; 6]),
+                    resources: __cser_alloc::vec![],
+                    credits: __cser_alloc::vec![CreditCharge::new(CREDIT, 1)],
+                    publication: PublicationMode::None,
+                },
+                domain: DOMAIN,
+                parent: None,
+            })
+            .unwrap();
+        let child = with_device.then(|| {
+            registry
+                .register_device_derived(DeviceDerivedRegisterRequest {
+                    derived: DerivedRegisterRequest {
+                        request: RegisterRequest {
+                            scope: SCOPE,
+                            task: SERVICE_V1,
+                            operation: OperationClass::new(0x1a11),
+                            descriptor: SyscallDescriptor::new(2, [0x1b; 6]),
+                            resources: __cser_alloc::vec![],
+                            credits: __cser_alloc::vec![CreditCharge::new(CREDIT, 1)],
+                            publication: PublicationMode::None,
+                        },
+                        domain: DOMAIN,
+                        parent: Some(root.identity.effect()),
+                    },
+                    device: DeviceEnvelope::new(0x1a20, 0, 0, 1).unwrap(),
+                })
+                .unwrap()
+        });
+        registry.prepare(SERVICE_V1, root.handle).unwrap();
+        if let Some(child) = child.as_ref() {
+            registry.prepare(SERVICE_V1, child.handle).unwrap();
+        }
+        registry.check_invariants().unwrap();
+        (registry, root, child)
+    }
+
+    let (mut registry, _, _) = fixture(false);
+    registry.crash_domain(SCOPE, DOMAIN, SERVICE_V1).unwrap();
+    let snapshot = registry
+        .domain_recovery_snapshot(SCOPE, DOMAIN, SERVICE_V2, 1)
+        .unwrap();
+    __cser_core::assert_eq!(
+        registry.domain_recovery_snapshot(SCOPE, DOMAIN, SERVICE_V2, 1),
+        Ok(snapshot.clone())
+    );
+    registry
+        .domain_ready(SCOPE, DOMAIN, SERVICE_V2, &snapshot)
+        .unwrap();
+
+    let (mut foreign, _, _) = fixture(false);
+    foreign.crash_domain(SCOPE, DOMAIN, SERVICE_V1).unwrap();
+    let foreign_snapshot = foreign
+        .domain_recovery_snapshot(SCOPE, DOMAIN, SERVICE_V2, 1)
+        .unwrap();
+    let before = registry.clone();
+    __cser_core::assert_eq!(
+        registry.abort_domain_recovery_attempt(
+            SCOPE,
+            DOMAIN,
+            SERVICE_V2,
+            1,
+            &foreign_snapshot,
+            DomainRecoveryAbortReason::ReadyTimeout,
+        ),
+        Err(RegistryError::ForeignRecoverySnapshot)
+    );
+    __cser_core::assert_eq!(registry, before);
+
+    let mut mutated = snapshot.clone();
+    mutated.root_revision += 1;
+    let before = registry.clone();
+    __cser_core::assert_eq!(
+        registry.abort_domain_recovery_attempt(
+            SCOPE,
+            DOMAIN,
+            SERVICE_V2,
+            1,
+            &mutated,
+            DomainRecoveryAbortReason::ReadyTimeout,
+        ),
+        Err(RegistryError::ConflictingRecoveryAttempt)
+    );
+    __cser_core::assert_eq!(registry, before);
+
+    let before = registry.clone();
+    __cser_core::assert_eq!(
+        registry.abort_domain_recovery_attempt(
+            SCOPE,
+            DOMAIN,
+            SERVICE_V3,
+            1,
+            &snapshot,
+            DomainRecoveryAbortReason::ReadyTimeout,
+        ),
+        Err(RegistryError::ConflictingRecoveryAttempt)
+    );
+    __cser_core::assert_eq!(registry, before);
+
+    let (cohort, unadopted, effects) = {
+        let recovery = registry.scopes[&SCOPE].domains[&DOMAIN]
+            .recovery
+            .as_ref()
+            .unwrap();
+        (
+            recovery.cohort.clone(),
+            recovery.unadopted.clone(),
+            registry.effects.clone(),
+        )
+    };
+    let aborted = registry
+        .abort_domain_recovery_attempt(
+            SCOPE,
+            DOMAIN,
+            SERVICE_V2,
+            1,
+            &snapshot,
+            DomainRecoveryAbortReason::ReadyTimeout,
+        )
+        .unwrap();
+    let DomainRecoveryAbortOutcome::Aborted(receipt) = aborted else {
+        __cser_core::panic!("first exact abort replayed unexpectedly");
+    };
+    __cser_core::assert_eq!(receipt.attempt(), 1);
+    __cser_core::assert_eq!(receipt.reason(), DomainRecoveryAbortReason::ReadyTimeout);
+    let recovery = registry.scopes[&SCOPE].domains[&DOMAIN]
+        .recovery
+        .as_ref()
+        .unwrap();
+    __cser_core::assert_eq!(recovery.cohort, cohort);
+    __cser_core::assert_eq!(recovery.unadopted, unadopted);
+    __cser_core::assert_eq!(registry.effects, effects);
+    __cser_core::assert_eq!(recovery.snapshot, None);
+    __cser_core::assert_eq!(recovery.ready, None);
+    __cser_core::assert_eq!(recovery.last_abort, Some(receipt));
+    let projection = registry.domain_projection(SCOPE, DOMAIN).unwrap();
+    __cser_core::assert_eq!(projection.recovery_attempt, None);
+    __cser_core::assert_eq!(projection.last_aborted_attempt, Some(1));
+
+    let before = registry.clone();
+    __cser_core::assert_eq!(
+        registry.abort_domain_recovery_attempt(
+            SCOPE,
+            DOMAIN,
+            SERVICE_V2,
+            1,
+            &snapshot,
+            DomainRecoveryAbortReason::ReadyTimeout,
+        ),
+        Ok(DomainRecoveryAbortOutcome::AlreadyAborted(receipt))
+    );
+    __cser_core::assert_eq!(registry, before);
+    __cser_core::assert_eq!(
+        registry.abort_domain_recovery_attempt(
+            SCOPE,
+            DOMAIN,
+            SERVICE_V2,
+            1,
+            &snapshot,
+            DomainRecoveryAbortReason::RecoveryRejected,
+        ),
+        Err(RegistryError::ConflictingRecoveryAttempt)
+    );
+    __cser_core::assert_eq!(registry, before);
+
+    let retry = registry
+        .domain_recovery_snapshot(SCOPE, DOMAIN, SERVICE_V3, 3)
+        .unwrap();
+    let before = registry.clone();
+    __cser_core::assert_eq!(
+        registry.abort_domain_recovery_attempt(
+            SCOPE,
+            DOMAIN,
+            SERVICE_V2,
+            1,
+            &snapshot,
+            DomainRecoveryAbortReason::ReadyTimeout,
+        ),
+        Err(RegistryError::StaleRecoveryAttempt)
+    );
+    __cser_core::assert_eq!(registry, before);
+    registry
+        .abort_domain_recovery_attempt(
+            SCOPE,
+            DOMAIN,
+            SERVICE_V3,
+            3,
+            &retry,
+            DomainRecoveryAbortReason::ExitedBeforeReady,
+        )
+        .unwrap();
+    registry.check_invariants().unwrap();
+
+    // Independent registries normalize their private namespaces in diagnostic
+    // failure projections, including the new abort receipt provenance.
+    let (mut same, _, _) = fixture(false);
+    same.crash_domain(SCOPE, DOMAIN, SERVICE_V1).unwrap();
+    let same_snapshot = same
+        .domain_recovery_snapshot(SCOPE, DOMAIN, SERVICE_V2, 1)
+        .unwrap();
+    same.abort_domain_recovery_attempt(
+        SCOPE,
+        DOMAIN,
+        SERVICE_V2,
+        1,
+        &same_snapshot,
+        DomainRecoveryAbortReason::ReadyTimeout,
+    )
+    .unwrap();
+    let (mut same_again, _, _) = fixture(false);
+    same_again.crash_domain(SCOPE, DOMAIN, SERVICE_V1).unwrap();
+    let same_again_snapshot = same_again
+        .domain_recovery_snapshot(SCOPE, DOMAIN, SERVICE_V2, 1)
+        .unwrap();
+    same_again
+        .abort_domain_recovery_attempt(
+            SCOPE,
+            DOMAIN,
+            SERVICE_V2,
+            1,
+            &same_again_snapshot,
+            DomainRecoveryAbortReason::ReadyTimeout,
+        )
+        .unwrap();
+    __cser_core::assert_eq!(
+        same.failure_atomic_projection(),
+        same_again.failure_atomic_projection()
+    );
+
+    let (mut quarantined, device_root, device_child) = fixture(true);
+    quarantined.crash_domain(SCOPE, DOMAIN, SERVICE_V1).unwrap();
+    {
+        let scope = quarantined.scopes.get_mut(&SCOPE).unwrap();
+        scope.revision = u64::MAX;
+        let binding = scope.domains.get_mut(&DOMAIN).unwrap();
+        binding.binding_epoch = u64::MAX;
+        binding.revision = u64::MAX;
+    }
+    let quarantine_snapshot = quarantined
+        .domain_recovery_snapshot(SCOPE, DOMAIN, SERVICE_V2, 11)
+        .unwrap();
+    quarantined
+        .domain_ready(SCOPE, DOMAIN, SERVICE_V2, &quarantine_snapshot)
+        .unwrap();
+    let effects_before = quarantined.effects.clone();
+    let indexes_before = quarantined.production.clone();
+    let device_before = quarantined.scopes[&SCOPE].device_root.clone();
+    let recovery_before = quarantined.scopes[&SCOPE].domains[&DOMAIN].recovery.clone();
+    let isolated =
+        quarantined.isolate_domain_authority(SCOPE, DOMAIN, SERVICE_V2, Some(u64::MAX - 1));
+    let DomainIsolationOutcome::Isolated(quarantine) = isolated else {
+        __cser_core::panic!("first quarantine fence did not install");
+    };
+    __cser_core::assert_eq!(quarantine.service(), SERVICE_V2);
+    __cser_core::assert_eq!(quarantine.binding_epoch(), u64::MAX);
+    __cser_core::assert_eq!(quarantine.observed_binding_epoch(), Some(u64::MAX - 1));
+    __cser_core::assert_eq!(quarantined.effects, effects_before);
+    __cser_core::assert_eq!(quarantined.production, indexes_before);
+    __cser_core::assert_eq!(quarantined.scopes[&SCOPE].device_root, device_before);
+    let after_recovery = quarantined.scopes[&SCOPE].domains[&DOMAIN]
+        .recovery
+        .as_ref()
+        .unwrap();
+    let before_recovery = recovery_before.as_ref().unwrap();
+    __cser_core::assert_eq!(after_recovery.cohort, before_recovery.cohort);
+    __cser_core::assert_eq!(after_recovery.unadopted, before_recovery.unadopted);
+    __cser_core::assert_eq!(after_recovery.snapshot, before_recovery.snapshot);
+    __cser_core::assert_eq!(after_recovery.ready, None);
+    let projection = quarantined.domain_projection(SCOPE, DOMAIN).unwrap();
+    __cser_core::assert_eq!(projection.supervisor, None);
+    __cser_core::assert!(!projection.fallback_running);
+    __cser_core::assert_eq!(projection.quarantine, Some(quarantine));
+    __cser_core::assert_eq!(projection.live_effects, 2);
+    __cser_core::assert_eq!(projection.recovery_remaining, 2);
+    __cser_core::assert!(quarantined.device_root_installed(SCOPE).unwrap());
+
+    let before = quarantined.clone();
+    __cser_core::assert_eq!(
+        quarantined.isolate_domain_authority(SCOPE, DOMAIN, SERVICE_V2, Some(u64::MAX - 1),),
+        DomainIsolationOutcome::AlreadyIsolated(quarantine)
+    );
+    __cser_core::assert_eq!(quarantined, before);
+    __cser_core::assert_eq!(
+        quarantined.isolate_domain_authority(SCOPE, DOMAIN, SERVICE_V3, None),
+        DomainIsolationOutcome::AlreadyIsolated(quarantine)
+    );
+    __cser_core::assert_eq!(quarantined, before);
+
+    // Marker-first rejection does not allow stale handles or recovery receipts
+    // to select a weaker error path after the permanent fence is installed.
+    __cser_core::assert_eq!(
+        quarantined.descriptor(SERVICE_V2, device_root.handle),
+        Err(RegistryError::DomainQuarantined)
+    );
+    __cser_core::assert_eq!(
+        quarantined.domain_recovery_snapshot(SCOPE, DOMAIN, SERVICE_V3, 12),
+        Err(RegistryError::DomainQuarantined)
+    );
+    __cser_core::assert_eq!(
+        quarantined.domain_ready(SCOPE, DOMAIN, SERVICE_V2, &quarantine_snapshot),
+        Err(RegistryError::DomainQuarantined)
+    );
+    __cser_core::assert_eq!(
+        quarantined.rebind_domain(SCOPE, DOMAIN, SERVICE_V2),
+        Err(RegistryError::DomainQuarantined)
+    );
+    __cser_core::assert_eq!(
+        quarantined.recover_next_domain(SCOPE, DOMAIN, SERVICE_V2),
+        Err(RegistryError::DomainQuarantined)
+    );
+    __cser_core::assert_eq!(
+        quarantined.adopt_domain(SCOPE, DOMAIN, SERVICE_V2, device_root.handle),
+        Err(RegistryError::DomainQuarantined)
+    );
+    __cser_core::assert_eq!(
+        quarantined.abort_domain_recovery_attempt(
+            SCOPE,
+            DOMAIN,
+            SERVICE_V2,
+            11,
+            &quarantine_snapshot,
+            DomainRecoveryAbortReason::ReadyTimeout,
+        ),
+        Err(RegistryError::DomainQuarantined)
+    );
+    __cser_core::assert_eq!(
+        quarantined.register_derived(DerivedRegisterRequest {
+            request: RegisterRequest {
+                scope: SCOPE,
+                task: SERVICE_V2,
+                operation: OperationClass::new(0x1a12),
+                descriptor: SyscallDescriptor::new(18, [0; 6]),
+                resources: __cser_alloc::vec![],
+                credits: __cser_alloc::vec![CreditCharge::new(CREDIT, 1)],
+                publication: PublicationMode::None,
+            },
+            domain: DOMAIN,
+            parent: Some(device_child.unwrap().identity.effect()),
+        }),
+        Err(RegistryError::DomainQuarantined)
+    );
+    __cser_core::assert_eq!(quarantined, before);
+    quarantined.check_invariants().unwrap();
+
+    let mut renamespaced = quarantined.clone();
+    renamespaced.rewrite_registry_instance(0x1afe);
+    renamespaced.check_invariants().unwrap();
+    __cser_core::assert_eq!(
+        quarantined.failure_atomic_projection(),
+        renamespaced.failure_atomic_projection()
+    );
+}
+
 /// Pins the first registry-native production identity chain independently of
 /// the later runtime wiring.  These are real registry records with one shared
 /// credit ledger, distinct service bindings, and immutable effect ancestry;
 /// no synthetic cohort or side ledger is constructed for the assertion.
 pub(crate) fn production_identity_registry_self_test() {
+    #[cfg(test)]
+    supervisor_domain_recovery_primitives_self_test();
     #[cfg(test)]
     combined_scope_candidate_self_test();
     #[cfg(test)]
@@ -16106,7 +17047,7 @@ pub(crate) fn production_identity_registry_self_test() {
         Some(block_supervisor)
     );
     let snapshot = registry
-        .domain_recovery_snapshot(scope, FILESYSTEM_DOMAIN, filesystem_v2)
+        .domain_recovery_snapshot(scope, FILESYSTEM_DOMAIN, filesystem_v2, 1)
         .unwrap();
     __cser_core::assert_eq!(snapshot.effects.len(), 1);
     __cser_core::assert_eq!(snapshot.effects[0].effect, filesystem.identity.effect());

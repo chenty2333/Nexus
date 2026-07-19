@@ -528,6 +528,8 @@ fn map_registry_error(error: RegistryError) -> PortalFailure {
         RegistryError::ScopeAlreadyExists
         | RegistryError::DomainAlreadyExists
         | RegistryError::CommitConflict
+        | RegistryError::ForeignRecoverySnapshot
+        | RegistryError::ConflictingRecoveryAttempt
         | RegistryError::InvalidBatchReceipt
         | RegistryError::InvalidHandoffReceipt => {
             (PortalErrorCode::Conflict, RetryClass::AfterQuery)
@@ -538,9 +540,12 @@ fn map_registry_error(error: RegistryError) -> PortalFailure {
         | RegistryError::UnknownCreditClass => (PortalErrorCode::NotFound, RetryClass::Never),
         RegistryError::CreditExhausted => (PortalErrorCode::NoCredit, RetryClass::AfterCapacity),
         RegistryError::CounterOverflow => (PortalErrorCode::Backpressure, RetryClass::Never),
-        RegistryError::StaleAuthority | RegistryError::StaleBinding => {
+        RegistryError::StaleAuthority
+        | RegistryError::StaleBinding
+        | RegistryError::StaleRecoveryAttempt => {
             (PortalErrorCode::StaleHandle, RetryClass::AfterQuery)
         }
+        RegistryError::DomainQuarantined => (PortalErrorCode::PermissionDenied, RetryClass::Never),
         RegistryError::NoSupervisor => (PortalErrorCode::CallerMismatch, RetryClass::AfterQuery),
         RegistryError::InvalidHandle => (PortalErrorCode::InvalidHandle, RetryClass::Never),
         RegistryError::AlreadyTerminal => {

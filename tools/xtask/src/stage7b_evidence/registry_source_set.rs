@@ -282,6 +282,11 @@ const CHECKED_ITEM_OWNERSHIP: &[CheckedItemOwner] = &[
     ),
     owned(
         CheckedItemKind::Function,
+        "supervisor_domain_recovery_primitives_self_test",
+        RegistryUnit::Authority,
+    ),
+    owned(
+        CheckedItemKind::Function,
         "production_identity_registry_self_test",
         RegistryUnit::Authority,
     ),
