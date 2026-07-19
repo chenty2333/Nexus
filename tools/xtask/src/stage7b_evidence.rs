@@ -10,6 +10,10 @@ const INPUT: &str = "kernel/nexus-ostd/artifacts/stage7b-evaluation.log";
 const RUNTIME_METADATA: &str = "kernel/nexus-ostd/artifacts/stage7b-runtime-metadata.env";
 const EVALUATOR_SOURCE: &str = "kernel/nexus-ostd/src/evaluation/stage7b.rs";
 const FAULT_REGISTRY_SOURCE: &str = registry_source_set::RegistryUnit::Authority.path();
+const DEVICE_INFRASTRUCTURE_MODULE_SOURCE: &str =
+    "kernel/nexus-ostd/src/cser/infrastructure/mod.rs";
+const DEVICE_INFRASTRUCTURE_SOURCE: &str =
+    "kernel/nexus-ostd/src/cser/infrastructure/device.rs";
 const KERNEL_SOURCE_DIRECTORY: &str = "kernel/nexus-ostd/src";
 const OUTPUT_DIRECTORY: &str = "target/verification/stage7b";
 const FAULT_OUTPUT: &str = "fault-matrix.jsonl";
@@ -569,9 +573,350 @@ fn validate_fault_sources(root: &Path) -> Result<(), String> {
         format!("required Stage 7B evaluator source is missing: {EVALUATOR_SOURCE}")
     })?;
     let registry = registry_source_set::RegistrySourceSet::read_current(root)?;
+    let device_module = read_regular(root, DEVICE_INFRASTRUCTURE_MODULE_SOURCE, false)?
+        .ok_or_else(|| {
+            format!(
+                "required compact Device module source is missing: {DEVICE_INFRASTRUCTURE_MODULE_SOURCE}"
+            )
+        })?;
+    let device = read_regular(root, DEVICE_INFRASTRUCTURE_SOURCE, false)?.ok_or_else(|| {
+        format!(
+            "required compact Device implementation source is missing: {DEVICE_INFRASTRUCTURE_SOURCE}"
+        )
+    })?;
     validate_fault_evaluator_source_text(&source)?;
     validate_fault_registry_source_set(&registry)?;
+    validate_device_compact_bearer_source_text(
+        &device_module,
+        &device,
+        registry.source(registry_source_set::RegistryUnit::Authority)?,
+    )?;
     validate_non_device_candidate_callers(root)
+}
+
+fn braced_source_item<'a>(source: &'a str, marker: &str) -> Result<&'a str, String> {
+    let start = source
+        .find(marker)
+        .ok_or_else(|| format!("source lacks checked item {marker:?}"))?;
+    let open = source[start..]
+        .find('{')
+        .map(|offset| start + offset)
+        .ok_or_else(|| format!("checked item {marker:?} has no body"))?;
+    let mut depth = 0_u32;
+    for (offset, byte) in source[open..].bytes().enumerate() {
+        match byte {
+            b'{' => depth = depth
+                .checked_add(1)
+                .ok_or_else(|| format!("checked item {marker:?} brace depth overflowed"))?,
+            b'}' => {
+                depth = depth
+                    .checked_sub(1)
+                    .ok_or_else(|| format!("checked item {marker:?} closed before it opened"))?;
+                if depth == 0 {
+                    return Ok(&source[start..open + offset + 1]);
+                }
+            }
+            _ => {}
+        }
+    }
+    Err(format!("checked item {marker:?} body is unterminated"))
+}
+
+fn compact_source(source: &str) -> String {
+    source
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect()
+}
+
+fn validate_device_compact_bearer_source_text(
+    module: &str,
+    device: &str,
+    registry: &str,
+) -> Result<(), String> {
+    syn::parse_file(module)
+        .map_err(|error| format!("compact Device module source does not parse: {error}"))?;
+    syn::parse_file(device)
+        .map_err(|error| format!("compact Device implementation source does not parse: {error}"))?;
+
+    let key = braced_source_item(module, "struct BearerKey<State: bearer_state::Sealed>")?;
+    let compact_key = compact_source(key);
+    let expected_key = concat!(
+        "structBearerKey<State:bearer_state::Sealed>{",
+        "authority:AuthorityKey,",
+        "slot:u64,",
+        "object_generation:u64,",
+        "bearer_generation:u64,",
+        "nonce:u64,",
+        "state:PhantomData<fn()->State>,",
+        "}",
+    );
+    if compact_key != expected_key {
+        return Err(
+            "Device/shared BearerKey must remain the exact compact authority/slot/object-generation/bearer-generation/nonce typestate key"
+                .into(),
+        );
+    }
+    let key_start = module
+        .find("struct BearerKey<State: bearer_state::Sealed>")
+        .unwrap();
+    let derive_start = module[..key_start]
+        .rfind("#[derive(")
+        .ok_or_else(|| "compact BearerKey lacks an explicit derive boundary".to_owned())?;
+    let key_derive = &module[derive_start..key_start];
+    if key_derive.contains("clone::Clone") || key_derive.contains("marker::Copy") {
+        return Err("compact BearerKey must remain non-Clone and non-Copy".into());
+    }
+
+    let compact_module = compact_source(module);
+    for declaration in [
+        "pub(crate)structDevicePreparationTicket(BearerKey<bearer_state::DeviceReserved>);",
+        "pub(crate)structDeviceApplyIntent(BearerKey<bearer_state::DeviceApplying>);",
+        "pub(crate)structPreparedDeviceTicket(BearerKey<bearer_state::DevicePrepared>);",
+        "pub(super)structDeviceMaterializationPlan(BearerKey<bearer_state::DevicePrepared>);",
+        "pub(crate)structMaterializedDeviceTicket(BearerKey<bearer_state::DeviceMaterialized>);",
+    ] {
+        if compact_module.matches(declaration).count() != 1 {
+            return Err(format!(
+                "Device authority wrapper must remain one exact compact typestate declaration: {declaration}"
+            ));
+        }
+    }
+    for bound in [
+        "size_of::<BearerKey<bearer_state::DeviceReserved>>()<=64",
+        "size_of::<BearerKey<bearer_state::DeviceApplying>>()<=64",
+        "size_of::<BearerKey<bearer_state::DevicePrepared>>()<=64",
+        "size_of::<BearerKey<bearer_state::DeviceMaterialized>>()<=64",
+        "size_of::<DevicePreparationTicket>()<=96",
+        "size_of::<DeviceApplyIntent>()<=96",
+        "size_of::<PreparedDeviceTicket>()<=96",
+        "size_of::<DeviceMaterializationPlan>()<=96",
+        "size_of::<MaterializedDeviceTicket>()<=96",
+        "size_of::<LinearFailure<DevicePreparationTicket>>()<=120",
+        "size_of::<LinearFailure<DeviceApplyIntent>>()<=120",
+        "size_of::<LinearFailure<PreparedDeviceTicket>>()<=120",
+        "size_of::<LinearFailure<DeviceMaterializationPlan>>()<=120",
+        "size_of::<LinearFailure<MaterializedDeviceTicket>>()<=120",
+    ] {
+        if !compact_module.contains(bound) {
+            return Err(format!(
+                "compact Device authority lacks compile-time size bound {bound:?}"
+            ));
+        }
+    }
+
+    let candidate_methods = [
+        "reserve_device_preparation_in_candidate",
+        "prepare_cancel_reserved_device_in_candidate",
+        "apply_cancel_reserved_device_in_candidate",
+        "prepare_begin_device_hardware_apply_in_candidate",
+        "apply_begin_device_hardware_apply_in_candidate",
+        "prepare_device_apply_rollback_in_candidate",
+        "apply_device_apply_rollback_in_candidate",
+        "prepare_device_prepared_in_candidate",
+        "apply_device_prepared_in_candidate",
+        "prepare_materialize_device_in_candidate",
+        "apply_materialize_device_in_candidate",
+    ];
+    for method in candidate_methods {
+        let item = braced_source_item(device, &format!("fn {method}("))?;
+        if item.contains("mint_device_key") || item.contains("_ticket_after_install") {
+            return Err(format!(
+                "non-authoritative Device candidate method {method} must not mint bearer authority"
+            ));
+        }
+    }
+    for method in [
+        "apply_cancel_reserved_device_in_candidate",
+        "apply_begin_device_hardware_apply_in_candidate",
+        "apply_device_apply_rollback_in_candidate",
+        "apply_device_prepared_in_candidate",
+        "apply_materialize_device_in_candidate",
+    ] {
+        let item = braced_source_item(device, &format!("fn {method}("))?;
+        let header = item.split_once('{').unwrap().0;
+        if header.contains("Result<") {
+            return Err(format!(
+                "prevalidated Device candidate apply {method} must remain infallible"
+            ));
+        }
+    }
+
+    if device.matches("validate_device_key(").count() != 12
+        || device
+            .matches("record.stamp.bearer_generation = prepared.bearer_generation;")
+            .count()
+            != 5
+        || device
+            .matches("next_device_bearer_generation(record)?")
+            .count()
+            != 5
+    {
+        return Err(
+            "Device transitions must preserve the exact full-record validation and five successor/terminal/adoption generation advances"
+                .into(),
+        );
+    }
+    for method in [
+        "prepare_cancel_reserved_device",
+        "prepare_begin_device_hardware_apply",
+        "prepare_device_apply_rollback",
+        "prepare_device_prepared",
+        "prepare_device_materialization",
+        "describe_device_materialization",
+        "prepare_materialize_device_in_candidate",
+        "release_materialized_device",
+        "release_unmaterialized_retained_device",
+        "device_preparation_coordinates",
+        "device_apply_coordinates",
+        "prepared_device_coordinates",
+    ] {
+        let item = braced_source_item(device, &format!("fn {method}("))?;
+        if !item.contains("validate_device_key(") {
+            return Err(format!(
+                "Device transition/query {method} must revalidate its compact key through the authoritative primary"
+            ));
+        }
+    }
+    let reservation = braced_source_item(device, "fn reserve_device_preparation_for_mode(")?;
+    for required in [
+        "require_device_ledger_mode(self, expected_mode)?;",
+        "validate_context(scope, registry_instance, context)?;",
+        "ParentStamp::Effect(parent_effect)",
+        "require_vacancy(\n            &scope.reverse_indexes",
+        "DeviceReservationInstall",
+    ] {
+        if !reservation.contains(required) {
+            return Err(format!(
+                "Device reservation preflight/apply lacks authoritative check {required:?}"
+            ));
+        }
+    }
+    let adoption = braced_source_item(device, "fn adopt_device_after_fence(")?;
+    for required in [
+        "validate_context(scope, registry_instance, context)?;",
+        "validate_device_record_historical(scope, registry_instance, record)?;",
+        "next_device_bearer_generation(record)?",
+        "reverse_index_for_device_record(record)?",
+        "self.apply_device_adoption(prepared);",
+    ] {
+        if !adoption.contains(required) {
+            return Err(format!(
+                "Device adoption preflight/apply lacks authoritative check {required:?}"
+            ));
+        }
+    }
+    let key_validation = braced_source_item(device, "fn validate_device_key<")?;
+    for required in [
+        "key.authority.registry_instance != registry_instance",
+        "key.authority.scope != scope.root.scope",
+        "key.authority.authority_epoch != scope.root.authority_epoch",
+        "record.stamp.identity.preparation_id != key.slot",
+        "record.stamp.identity.generation != key.object_generation",
+        "record.stamp.bearer_generation != key.bearer_generation",
+        "record.stamp.nonce != key.nonce",
+        "validate_device_record(scope, registry_instance, record)?;",
+    ] {
+        if !key_validation.contains(required) {
+            return Err(format!(
+                "compact Device key validation lacks coordinate/full-primary check {required:?}"
+            ));
+        }
+    }
+    let record_validation = braced_source_item(device, "fn validate_device_record_body(")?;
+    for required in [
+        "record.stamp.identity.validate()?;",
+        "reverse_index_for_device_record(record)?",
+        "missing device reverse index",
+        "device reverse index mismatch",
+        "validate_prepared_owner(record, owner)",
+        "DevicePhase::Materialized",
+        "DevicePhase::Released",
+        "DevicePhase::Cancelled",
+    ] {
+        if !record_validation.contains(required) {
+            return Err(format!(
+                "Device primary-record validation lacks phase/owner/index check {required:?}"
+            ));
+        }
+    }
+
+    let candidate_validation =
+        braced_source_item(device, "fn validate_materialized_device_candidate(")?;
+    for required in [
+        "LedgerMode::NonAuthoritativeCandidate",
+        "plan.0.authority.registry_instance != self.registry_instance",
+        "plan.0.authority.scope != scope.root.scope",
+        "plan.0.authority.authority_epoch != scope.root.authority_epoch",
+        "record.stamp.identity.preparation_id != plan.0.slot",
+        "checked_add(1)",
+        "DeviceCreditOwnership::Transferred",
+        "DevicePhase::Materialized",
+        "validate_device_record(scope, self.registry_instance, record)",
+    ] {
+        if !candidate_validation.contains(required) {
+            return Err(format!(
+                "materialized Device candidate validation lacks authoritative binding {required:?}"
+            ));
+        }
+    }
+    let mint = braced_source_item(
+        device,
+        "fn mint_materialized_device_ticket_after_install(",
+    )?;
+    if mint.split_once('{').unwrap().0.contains("Result<")
+        || !mint.contains("installed_device_successor(self, &previous)")
+        || !mint.contains("DeviceCreditOwnership::Transferred")
+        || !mint.contains("bearer_state::DeviceMaterialized")
+    {
+        return Err(
+            "materialized Device successor mint must remain authoritative-primary-backed and infallible"
+                .into(),
+        );
+    }
+
+    if registry
+        .matches("mint_materialized_device_ticket_after_install(")
+        .count()
+        != 1
+    {
+        return Err(
+            "production Registry must have exactly one post-install materialized Device mint"
+                .into(),
+        );
+    }
+    for required in [
+        "device preparation parent effect missing",
+        "parent.identity.scope != owner.scope",
+    ] {
+        if !registry.contains(required) {
+            return Err(format!(
+                "outer Registry Device invariant lacks primary-parent check {required:?}"
+            ));
+        }
+    }
+    let apply = braced_source_item(registry, "fn apply_device_cohort_materialization(")?;
+    let ordered = [
+        "candidate.check_invariants()",
+        "validate_materialized_device_candidate(&authority, cohort)",
+        "promote_full_candidate_for_install()",
+        "*self = candidate;",
+        "mint_materialized_device_ticket_after_install(authority, cohort)",
+    ];
+    let mut previous = 0_usize;
+    for (index, step) in ordered.into_iter().enumerate() {
+        let position = apply
+            .find(step)
+            .ok_or_else(|| format!("Device materialization apply lacks ordered step {step:?}"))?;
+        if index != 0 && position <= previous {
+            return Err(
+                "Device materialization must finish candidate validation/promotion before authoritative install and only then mint"
+                    .into(),
+            );
+        }
+        previous = position;
+    }
+    Ok(())
 }
 
 fn validate_non_device_candidate_callers(root: &Path) -> Result<(), String> {
@@ -3731,6 +4076,14 @@ mod tests {
         include_str!("../../../kernel/nexus-ostd/src/cser/effect_registry.rs").into()
     }
 
+    fn checked_device_module_source() -> String {
+        include_str!("../../../kernel/nexus-ostd/src/cser/infrastructure/mod.rs").into()
+    }
+
+    fn checked_device_source() -> String {
+        include_str!("../../../kernel/nexus-ostd/src/cser/infrastructure/device.rs").into()
+    }
+
     fn checked_registry_source_set() -> registry_source_set::RegistrySourceSet {
         registry_source_set::RegistrySourceSet::from_authority(&checked_registry_source())
     }
@@ -3753,8 +4106,93 @@ mod tests {
     fn fault_source_gate_accepts_typed_receipt_projection_pipeline() {
         validate_fault_evaluator_source_text(&checked_evaluator_source()).unwrap();
         validate_fault_registry_source_set(&checked_registry_source_set()).unwrap();
+        validate_device_compact_bearer_source_text(
+            &checked_device_module_source(),
+            &checked_device_source(),
+            &checked_registry_source(),
+        )
+        .unwrap();
         validate_non_device_candidate_caller_counts(&checked_non_device_candidate_callers())
             .unwrap();
+    }
+
+    #[test]
+    fn compact_device_source_gate_rejects_authority_payload_and_clone_drift() {
+        let module = checked_device_module_source();
+        let payload = module.replacen(
+            "pub(crate) struct PreparedDeviceTicket(BearerKey<bearer_state::DevicePrepared>);",
+            "pub(crate) struct PreparedDeviceTicket { key: BearerKey<bearer_state::DevicePrepared>, owner: PreparedOwner }",
+            1,
+        );
+        assert_ne!(payload, module);
+        let error = validate_device_compact_bearer_source_text(
+            &payload,
+            &checked_device_source(),
+            &checked_registry_source(),
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("compact typestate declaration"),
+            "payload drift failed through the wrong gate: {error}"
+        );
+
+        let cloneable = module.replacen(
+            "#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]\nstruct BearerKey<State: bearer_state::Sealed>",
+            "#[derive(__cser_core::clone::Clone, __cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]\nstruct BearerKey<State: bearer_state::Sealed>",
+            1,
+        );
+        assert_ne!(cloneable, module);
+        let error = validate_device_compact_bearer_source_text(
+            &cloneable,
+            &checked_device_source(),
+            &checked_registry_source(),
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("non-Clone and non-Copy"),
+            "Clone drift failed through the wrong gate: {error}"
+        );
+    }
+
+    #[test]
+    fn compact_device_source_gate_rejects_candidate_mint_and_preinstall_mint() {
+        let device = checked_device_source();
+        let candidate_mint = device.replacen(
+            "__cser_core::debug_assert_eq!(self.mode, LedgerMode::NonAuthoritativeCandidate);",
+            "let _ = mint_device_key::<bearer_state::DevicePrepared>(record);\n        __cser_core::debug_assert_eq!(self.mode, LedgerMode::NonAuthoritativeCandidate);",
+            1,
+        );
+        assert_ne!(candidate_mint, device);
+        let error = validate_device_compact_bearer_source_text(
+            &checked_device_module_source(),
+            &candidate_mint,
+            &checked_registry_source(),
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("must not mint bearer authority"),
+            "candidate mint failed through the wrong gate: {error}"
+        );
+
+        let registry = checked_registry_source();
+        let preinstall_mint = registry.replacen(
+            "        *self = candidate;\n        let materialized = self\n            .infrastructure\n            .mint_materialized_device_ticket_after_install(authority, cohort);",
+            "        let materialized = self\n            .infrastructure\n            .mint_materialized_device_ticket_after_install(authority, cohort);\n        *self = candidate;",
+            1,
+        );
+        assert_ne!(preinstall_mint, registry);
+        let error = validate_device_compact_bearer_source_text(
+            &checked_device_module_source(),
+            &device,
+            &preinstall_mint,
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("before authoritative install")
+                || error.contains("only then mint")
+                || error.contains("ordered step"),
+            "preinstall mint failed through the wrong gate: {error}"
+        );
     }
 
     #[test]
@@ -4429,8 +4867,8 @@ mod tests {
         assert!(validate_fault_registry_source_text(&unchecked_cohort_candidate).is_err());
 
         let allocating_cohort_apply = source.replacen(
-            "*self = candidate;",
-            "self.effects.insert(effect, record);\n        *self = candidate;",
+            "*self = candidate;\n        registered",
+            "self.effects.insert(effect, record);\n        *self = candidate;\n        registered",
             1,
         );
         assert_ne!(allocating_cohort_apply, source);
@@ -5138,6 +5576,17 @@ mod tests {
         let registry = root.join(FAULT_REGISTRY_SOURCE);
         fs::create_dir_all(registry.parent().unwrap()).unwrap();
         fs::write(&registry, checked_registry_source()).unwrap();
+        for (relative, source) in [
+            (
+                DEVICE_INFRASTRUCTURE_MODULE_SOURCE,
+                checked_device_module_source(),
+            ),
+            (DEVICE_INFRASTRUCTURE_SOURCE, checked_device_source()),
+        ] {
+            let path = root.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, source).unwrap();
+        }
         for (relative, source) in [
             (
                 "kernel/nexus-ostd/src/cser/composition.rs",

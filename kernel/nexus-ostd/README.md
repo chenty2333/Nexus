@@ -487,14 +487,23 @@ recorded `{actor_slot, actor_generation}` selector is descriptive until that
 adapter integration lands. It therefore does not advance the runtime ledger,
 the RFC 0003 causal-coverage claim, or the existing Phase 2 evidence.
 
-The matching Registry-only materialization transition now consumes the exact
-`PreparedRetained` authority and installs one block effect plus three DMA
-descendants in the same linearization as the retained-to-held credit transfer.
+The matching Registry-only materialization transition now consumes an exact,
+sealed compact `PreparedRetained` bearer and installs one block effect plus
+three DMA descendants in the same linearization as the retained-to-held credit
+transfer. Device bearers contain only registry/scope/preparation identity,
+authority epoch, bearer generation, and nonce; prepared owner, device envelope,
+operation and hardware-receipt digests, parent, revisions, and cohort remain in
+the authoritative primary record and are revalidated through it. Candidate
+prepare/apply stages borrow compact authority and cannot mint the live
+successor. All fallible cohort and candidate checks finish before the
+authoritative replacement, after which successor mint is infallible. Every
+terminal or adopted transition advances the bearer generation, and adoption
+revalidates the historical reverse index before mutation.
+
 The block owns exactly one queue credit; each DMA descendant owns exactly one
-pinned-page and one DMA-mapping credit. The infrastructure primary record keeps
-the ordered four-effect identity and remains live until exact device-closure
-proof, while the linear successor is minted only after authoritative install.
-This first outer implementation builds an allocation-bearing O(N) private full
+pinned-page and one DMA-mapping credit. The primary record keeps the ordered
+four-effect identity and remains live until exact device-closure proof. This
+first outer implementation still builds an allocation-bearing O(N) private full
 Registry candidate before a no-allocation final replacement. It invokes no
 hardware callback, but bounded multi-tenant cost, typed allocator-pressure
 failure, preallocated adapter storage, and normal runtime use remain explicit

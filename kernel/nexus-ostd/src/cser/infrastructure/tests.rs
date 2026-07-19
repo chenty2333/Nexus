@@ -14,10 +14,13 @@ use super::{
     DeadlineReconciliationOutcome, DeadlineReconciliationReceipt, DeadlineRecoveryState,
     DeadlineSupervisorRetry, DelayedCommandDescriptor, DelayedCommandIntent, DelayedCommandReceipt,
     DelayedCommandRejectionReason, DelayedCommandRejectionReceipt, DelayedCommandTicket,
-    DeviceReservationCoordinates, DomainKey, EffectKey, EnqueuedServiceRequest, EnteredTaskLease,
+    DeviceAdoption, DeviceApplyIntent, DeviceCohortIdentity, DeviceEnvelope, DeviceHardwareReceipt,
+    DeviceMaterializationPlan, DevicePreparationTicket, DeviceReservationCoordinates,
+    DeviceRollbackReceipt, DomainKey, EffectKey, EnqueuedServiceRequest, EnteredTaskLease,
     FaultAccess, FaultDisposition, FaultObservation, FaultPhase, FaultSlotDescriptor,
     InfrastructureClosureProgress, InfrastructureClosureReceipt, InfrastructureError,
-    InfrastructureKind, InfrastructureLimits, InfrastructureState, LinearFailure, PortalHandle,
+    InfrastructureKind, InfrastructureLimits, InfrastructureState, LinearFailure,
+    MaterializedDeviceTicket, PortalHandle, PreparedDeviceTicket, RegistryDeviceClosureReceipt,
     ReplyAbortAuthority, ReplyAckReceipt, ReplyAdoption, ReplyClaim, ReplyDescriptor,
     ReplyPublicationIntent, ReplyPublicationReceipt, ReplyRecord, ReservedFaultTask, ResourceKey,
     ReverseIndexRecord, ReverseParent, ScopeKey, ServiceArmAuthority, ServiceArmPlan,
@@ -27,9 +30,9 @@ use super::{
     ServiceRequestDescriptor, ServiceRequestPhase, ServiceRequestRecoveryState,
     ServiceRequestTicket, TaskAdoption, TaskAnchorRecoveryState, TaskKey, TaskPhase,
     TaskWorkDescriptor, TaskWorkRole, UnarmedServiceRequest, UnboundServiceRequest,
-    ValidatedAbortProof, ValidatedCommitProof, ValidatedServiceChildProof, VmAuthorityKey,
-    WakeClaim, WorkloadContext, WorkloadRequestPresentation, WorkloadRootPresentation,
-    bearer_state,
+    ValidatedAbortProof, ValidatedCommitProof, ValidatedDeviceClosureProof,
+    ValidatedServiceChildProof, VmAuthorityKey, WakeClaim, WorkloadContext,
+    WorkloadRequestPresentation, WorkloadRootPresentation, bearer_state,
 };
 
 const SCOPE: ScopeKey = ScopeKey::new(0x9100, 1);
@@ -50,6 +53,135 @@ const COMPACT_SERVICE_REQUEST: u64 = 0xd800;
 const COMPACT_RESPONSE_SLOT: u64 = 0xd900;
 const COMPACT_REPLY: u64 = 0xda00;
 const COMPACT_REPLY_EFFECT: u64 = 0xda10;
+const COMPACT_DEVICE_PREPARATION: u64 = 0xda00;
+
+fn compact_device_coordinates() -> DeviceReservationCoordinates {
+    DeviceReservationCoordinates {
+        preparation_id: COMPACT_DEVICE_PREPARATION,
+        generation: 1,
+        owned_device: ResourceKey::new(0xda, 1, 1),
+        queue: 2,
+        device_generation: 1,
+        operation_digest: 0xda01,
+        queue_credit_class: super::super::CreditClass::new(0xda02),
+        pinned_credit_class: super::super::CreditClass::new(0xda03),
+        dma_credit_class: super::super::CreditClass::new(0xda04),
+        actor_slot: 3,
+        actor_generation: 1,
+    }
+}
+
+fn compact_reserved_device_state(
+    registry_instance: u64,
+) -> (
+    InfrastructureState,
+    WorkloadContext,
+    DevicePreparationTicket,
+    DeviceReservationCoordinates,
+) {
+    let (mut state, workload, _) = compact_task_state(registry_instance);
+    let coordinates = compact_device_coordinates();
+    let ticket = state
+        .reserve_device_preparation(&workload, ROOT, coordinates)
+        .unwrap();
+    (state, workload, ticket, coordinates)
+}
+
+fn compact_prepared_device_state(
+    registry_instance: u64,
+) -> (
+    InfrastructureState,
+    WorkloadContext,
+    PreparedDeviceTicket,
+    DeviceReservationCoordinates,
+) {
+    let (mut state, workload, ticket, coordinates) =
+        compact_reserved_device_state(registry_instance);
+    let intent = state.begin_device_hardware_apply(ticket).unwrap();
+    let device = DeviceEnvelope::new(
+        registry_instance + 1,
+        coordinates.queue,
+        7,
+        coordinates.device_generation,
+    )
+    .unwrap();
+    let prepared = state
+        .acknowledge_device_prepared(
+            intent,
+            DeviceHardwareReceipt {
+                owned_device: coordinates.owned_device,
+                device,
+                operation_digest: coordinates.operation_digest,
+                actor_slot: coordinates.actor_slot,
+                actor_generation: coordinates.actor_generation,
+                hardware_receipt_digest: registry_instance + 2,
+            },
+        )
+        .unwrap();
+    (state, workload, prepared, coordinates)
+}
+
+fn compact_materialized_device_state(
+    registry_instance: u64,
+) -> (
+    InfrastructureState,
+    WorkloadContext,
+    MaterializedDeviceTicket,
+    DeviceReservationCoordinates,
+    DeviceEnvelope,
+) {
+    let (mut state, workload, prepared, coordinates) =
+        compact_prepared_device_state(registry_instance);
+    let authority = state.prepare_device_materialization(prepared).unwrap();
+    let cohort = DeviceCohortIdentity {
+        block: EffectKey::new(registry_instance + 0x10, 1),
+        dma: [
+            EffectKey::new(registry_instance + 0x11, 1),
+            EffectKey::new(registry_instance + 0x12, 1),
+            EffectKey::new(registry_instance + 0x13, 1),
+        ],
+        digest: registry_instance + 0x14,
+    };
+    let mut candidate = state.try_private_candidate().unwrap();
+    let materialization = candidate
+        .prepare_materialize_device_in_candidate(&authority, cohort)
+        .unwrap();
+    candidate.apply_materialize_device_in_candidate(materialization, cohort);
+    candidate
+        .validate_materialized_device_candidate(&authority, cohort)
+        .unwrap();
+    candidate.promote_full_candidate_for_install().unwrap();
+    state = candidate;
+    let materialized = state.mint_materialized_device_ticket_after_install(authority, cohort);
+    let device = DeviceEnvelope::new(
+        registry_instance + 1,
+        coordinates.queue,
+        7,
+        coordinates.device_generation,
+    )
+    .unwrap();
+    (state, workload, materialized, coordinates, device)
+}
+
+fn adopt_compact_device_workload(state: &mut InfrastructureState) -> WorkloadContext {
+    *state
+        .scope_mut(SCOPE)
+        .unwrap()
+        .binding_epoch_mut(GUEST)
+        .unwrap() = 2;
+    state
+        .adopt_workload_after_fence(
+            WorkloadRootPresentation::new(SCOPE, 1, ROOT),
+            WorkloadRequestPresentation::new(GUEST, 2, COMPACT_REQUEST, 1),
+        )
+        .unwrap()
+}
+
+fn device_key_coordinates<State: bearer_state::Sealed>(
+    key: &BearerKey<State>,
+) -> (u64, ScopeKey, u64, u64, u64, u64, u64) {
+    service_key_coordinates(key)
+}
 
 fn compact_task_state(
     registry_instance: u64,
@@ -928,6 +1060,529 @@ fn service_compact_authority_layout_is_bounded() {
     __cser_core::assert!(__cser_core::mem::size_of::<ServiceArmReceipt>() <= 1_408);
     __cser_core::assert!(__cser_core::mem::size_of::<ServiceClaimantSnapshot>() <= 320);
     __cser_core::assert!(__cser_core::mem::size_of::<ServiceChildBindingReceipt>() <= 384);
+}
+
+#[test]
+fn device_compact_authority_layout_is_bounded() {
+    __cser_core::assert!(
+        __cser_core::mem::size_of::<BearerKey<bearer_state::DeviceReserved>>() <= 64
+    );
+    __cser_core::assert!(
+        __cser_core::mem::size_of::<BearerKey<bearer_state::DeviceApplying>>() <= 64
+    );
+    __cser_core::assert!(
+        __cser_core::mem::size_of::<BearerKey<bearer_state::DevicePrepared>>() <= 64
+    );
+    __cser_core::assert!(
+        __cser_core::mem::size_of::<BearerKey<bearer_state::DeviceMaterialized>>() <= 64
+    );
+    __cser_core::assert!(__cser_core::mem::size_of::<DevicePreparationTicket>() <= 96);
+    __cser_core::assert!(__cser_core::mem::size_of::<DeviceApplyIntent>() <= 96);
+    __cser_core::assert!(__cser_core::mem::size_of::<PreparedDeviceTicket>() <= 96);
+    __cser_core::assert!(__cser_core::mem::size_of::<DeviceMaterializationPlan>() <= 96);
+    __cser_core::assert!(__cser_core::mem::size_of::<MaterializedDeviceTicket>() <= 96);
+    __cser_core::assert!(
+        __cser_core::mem::size_of::<LinearFailure<DevicePreparationTicket>>() <= 120
+    );
+    __cser_core::assert!(__cser_core::mem::size_of::<LinearFailure<DeviceApplyIntent>>() <= 120);
+    __cser_core::assert!(__cser_core::mem::size_of::<LinearFailure<PreparedDeviceTicket>>() <= 120);
+    __cser_core::assert!(
+        __cser_core::mem::size_of::<LinearFailure<DeviceMaterializationPlan>>() <= 120
+    );
+    __cser_core::assert!(
+        __cser_core::mem::size_of::<LinearFailure<MaterializedDeviceTicket>>() <= 120
+    );
+}
+
+#[test]
+fn device_compact_key_rejects_each_stale_coordinate_without_mutation() {
+    fn reject(
+        state: &mut InfrastructureState,
+        ticket: &DevicePreparationTicket,
+        expected: InfrastructureError,
+        mutate: impl FnOnce(&mut DevicePreparationTicket),
+    ) {
+        let mut presented = ticket.duplicate_for_test();
+        mutate(&mut presented);
+        let exact = device_key_coordinates(&presented.0);
+        let before = state.private_full_clone();
+        let failure = state.begin_device_hardware_apply(presented).unwrap_err();
+        __cser_core::assert_eq!(failure.error(), expected);
+        __cser_core::assert_eq!(*state, before);
+        __cser_core::assert_eq!(device_key_coordinates(&failure.into_input().0), exact);
+    }
+
+    let (mut state, _, ticket, _) = compact_reserved_device_state(0xda10);
+    reject(
+        &mut state,
+        &ticket,
+        InfrastructureError::ForeignRegistry,
+        |presented| presented.0.authority.registry_instance += 1,
+    );
+    reject(
+        &mut state,
+        &ticket,
+        InfrastructureError::NotEnabled,
+        |presented| presented.0.authority.scope = ScopeKey::new(0xda11, 1),
+    );
+    reject(
+        &mut state,
+        &ticket,
+        InfrastructureError::StaleAuthority,
+        |presented| presented.0.authority.authority_epoch += 1,
+    );
+    reject(
+        &mut state,
+        &ticket,
+        InfrastructureError::UnknownObligation,
+        |presented| presented.0.slot += 1,
+    );
+    reject(
+        &mut state,
+        &ticket,
+        InfrastructureError::StaleGeneration,
+        |presented| presented.0.object_generation += 1,
+    );
+    reject(
+        &mut state,
+        &ticket,
+        InfrastructureError::StaleGeneration,
+        |presented| presented.0.bearer_generation += 1,
+    );
+    reject(
+        &mut state,
+        &ticket,
+        InfrastructureError::StaleGeneration,
+        |presented| presented.0.nonce += 1,
+    );
+
+    state.begin_device_hardware_apply(ticket).unwrap();
+    state.check_invariants().unwrap();
+}
+
+#[test]
+fn device_transition_revalidates_primary_lineage_phase_and_reverse_index() {
+    fn reject(
+        mut state: InfrastructureState,
+        ticket: &DevicePreparationTicket,
+        expected: InfrastructureError,
+        mutate: impl FnOnce(&mut InfrastructureState),
+    ) {
+        mutate(&mut state);
+        let presented = ticket.duplicate_for_test();
+        let exact = device_key_coordinates(&presented.0);
+        let before = state.private_full_clone();
+        let failure = state.begin_device_hardware_apply(presented).unwrap_err();
+        __cser_core::assert_eq!(failure.error(), expected);
+        __cser_core::assert_eq!(state, before);
+        __cser_core::assert_eq!(device_key_coordinates(&failure.into_input().0), exact);
+    }
+
+    let (state, _, ticket, coordinates) = compact_reserved_device_state(0xda20);
+    reject(
+        state.private_full_clone(),
+        &ticket,
+        InfrastructureError::ForeignRootEffect,
+        |candidate| {
+            candidate
+                .scope_mut(SCOPE)
+                .unwrap()
+                .devices
+                .get_mut(coordinates.preparation_id)
+                .unwrap()
+                .stamp
+                .root
+                .root_effect = EffectKey::new(ROOT.id() + 1, ROOT.generation());
+        },
+    );
+    reject(
+        state.private_full_clone(),
+        &ticket,
+        InfrastructureError::StaleBinding,
+        |candidate| {
+            candidate
+                .scope_mut(SCOPE)
+                .unwrap()
+                .devices
+                .get_mut(coordinates.preparation_id)
+                .unwrap()
+                .stamp
+                .domain
+                .binding_epoch += 1;
+        },
+    );
+    reject(
+        state.private_full_clone(),
+        &ticket,
+        InfrastructureError::ForeignWorkload,
+        |candidate| {
+            candidate
+                .scope_mut(SCOPE)
+                .unwrap()
+                .devices
+                .get_mut(coordinates.preparation_id)
+                .unwrap()
+                .stamp
+                .workload
+                .nonce += 1;
+        },
+    );
+    reject(
+        state.private_full_clone(),
+        &ticket,
+        InfrastructureError::ForeignParent,
+        |candidate| {
+            candidate
+                .scope_mut(SCOPE)
+                .unwrap()
+                .devices
+                .get_mut(coordinates.preparation_id)
+                .unwrap()
+                .stamp
+                .parent = super::ParentStamp::RootEffect(ROOT);
+        },
+    );
+    reject(
+        state.private_full_clone(),
+        &ticket,
+        InfrastructureError::Invariant("device reverse index mismatch"),
+        |candidate| {
+            let scope = candidate.scope_mut(SCOPE).unwrap();
+            let nonce = scope
+                .devices
+                .get(coordinates.preparation_id)
+                .unwrap()
+                .stamp
+                .nonce;
+            scope
+                .reverse_indexes
+                .get_mut(nonce)
+                .unwrap()
+                .actor_generation = Some(coordinates.actor_generation + 1);
+        },
+    );
+    reject(
+        state,
+        &ticket,
+        InfrastructureError::InvalidState,
+        |candidate| {
+            let record = candidate
+                .scope_mut(SCOPE)
+                .unwrap()
+                .devices
+                .get_mut(coordinates.preparation_id)
+                .unwrap();
+            record.apply_generation = 1;
+            record.credit_ownership = super::DeviceCreditOwnership::Retained;
+            record.phase = super::DevicePhase::Applying {
+                apply_generation: 1,
+                apply_nonce: 0xda21,
+            };
+        },
+    );
+}
+
+#[test]
+fn device_success_and_terminal_paths_advance_bearer_generation() {
+    fn closure_proof(
+        registry_instance: u64,
+        device: DeviceEnvelope,
+        batch_sequence: Option<u64>,
+    ) -> ValidatedDeviceClosureProof {
+        ValidatedDeviceClosureProof::new(RegistryDeviceClosureReceipt {
+            registry_instance_id: registry_instance,
+            scope: SCOPE,
+            enrollment_sequence: 1,
+            batch_sequence,
+            device,
+            sequence: 1,
+            outcome: super::super::DeviceClosureResult::Completed(0),
+        })
+    }
+
+    let (mut cancelled, _, reserved, coordinates) = compact_reserved_device_state(0xda22);
+    let reserved_generation = reserved.0.bearer_generation;
+    cancelled.cancel_reserved_device(reserved).unwrap();
+    let record = cancelled
+        .scope(SCOPE)
+        .unwrap()
+        .devices
+        .get(coordinates.preparation_id)
+        .unwrap();
+    __cser_core::assert_eq!(record.stamp.bearer_generation, reserved_generation + 1);
+    __cser_core::assert!(__cser_core::matches!(
+        record.phase,
+        super::DevicePhase::Cancelled { rollback: None }
+    ));
+    cancelled.check_invariants().unwrap();
+
+    let (mut rolled_back, _, reserved, coordinates) = compact_reserved_device_state(0xda23);
+    let intent = rolled_back.begin_device_hardware_apply(reserved).unwrap();
+    let applying_generation = intent.0.bearer_generation;
+    rolled_back
+        .acknowledge_device_apply_rollback(
+            intent,
+            DeviceRollbackReceipt {
+                owned_device: coordinates.owned_device,
+                queue: coordinates.queue,
+                device_generation: coordinates.device_generation,
+                operation_digest: coordinates.operation_digest,
+                actor_slot: coordinates.actor_slot,
+                actor_generation: coordinates.actor_generation,
+                rollback_receipt_digest: 0xda24,
+            },
+        )
+        .unwrap();
+    let record = rolled_back
+        .scope(SCOPE)
+        .unwrap()
+        .devices
+        .get(coordinates.preparation_id)
+        .unwrap();
+    __cser_core::assert_eq!(record.stamp.bearer_generation, applying_generation + 1);
+    __cser_core::assert!(__cser_core::matches!(
+        record.phase,
+        super::DevicePhase::Cancelled { rollback: Some(_) }
+    ));
+    rolled_back.check_invariants().unwrap();
+
+    let (mut unmaterialized, _, prepared, coordinates) = compact_prepared_device_state(0xda25);
+    let prepared_generation = prepared.0.bearer_generation;
+    let device =
+        DeviceEnvelope::new(0xda26, coordinates.queue, 7, coordinates.device_generation).unwrap();
+    unmaterialized
+        .release_unmaterialized_retained_device(prepared, closure_proof(0xda25, device, None))
+        .unwrap();
+    let record = unmaterialized
+        .scope(SCOPE)
+        .unwrap()
+        .devices
+        .get(coordinates.preparation_id)
+        .unwrap();
+    __cser_core::assert_eq!(record.stamp.bearer_generation, prepared_generation + 1);
+    __cser_core::assert!(__cser_core::matches!(
+        record.phase,
+        super::DevicePhase::Released { cohort: None, .. }
+    ));
+    unmaterialized.check_invariants().unwrap();
+
+    let (mut materialized, _, ticket, coordinates, device) =
+        compact_materialized_device_state(0xda27);
+    let materialized_generation = ticket.0.bearer_generation;
+    materialized
+        .release_materialized_device(ticket, closure_proof(0xda27, device, Some(1)))
+        .unwrap();
+    let record = materialized
+        .scope(SCOPE)
+        .unwrap()
+        .devices
+        .get(coordinates.preparation_id)
+        .unwrap();
+    __cser_core::assert_eq!(record.stamp.bearer_generation, materialized_generation + 1);
+    __cser_core::assert!(__cser_core::matches!(
+        record.phase,
+        super::DevicePhase::Released {
+            cohort: Some(_),
+            ..
+        }
+    ));
+    materialized.check_invariants().unwrap();
+}
+
+#[test]
+fn device_adoption_fences_every_live_typestate_and_is_failure_atomic() {
+    fn assert_next_generation(previous: u64, current: u64) {
+        __cser_core::assert_eq!(current, previous.checked_add(1).unwrap());
+    }
+
+    let (mut reserved_state, _, reserved, coordinates) = compact_reserved_device_state(0xda30);
+    let reserved_generation = reserved.0.bearer_generation;
+    let adopted_workload = adopt_compact_device_workload(&mut reserved_state);
+    let adopted_reserved = reserved_state
+        .adopt_device_after_fence(
+            &adopted_workload,
+            coordinates.preparation_id,
+            coordinates.generation,
+        )
+        .unwrap();
+    let DeviceAdoption::Reserved(current_reserved) = adopted_reserved else {
+        __cser_core::panic!("reserved adoption changed typestate");
+    };
+    assert_next_generation(reserved_generation, current_reserved.0.bearer_generation);
+    __cser_core::assert_eq!(
+        reserved_state.device_preparation_coordinates(&reserved),
+        Err(InfrastructureError::StaleGeneration)
+    );
+    reserved_state
+        .device_preparation_coordinates(&current_reserved)
+        .unwrap();
+
+    let (mut applying_state, _, reserved, coordinates) = compact_reserved_device_state(0xda40);
+    let applying = applying_state
+        .begin_device_hardware_apply(reserved)
+        .unwrap();
+    let old_bearer_generation = applying.0.bearer_generation;
+    let (old_apply_generation, old_apply_nonce) = {
+        let record = applying_state
+            .scope(SCOPE)
+            .unwrap()
+            .devices
+            .get(coordinates.preparation_id)
+            .unwrap();
+        let super::DevicePhase::Applying {
+            apply_generation,
+            apply_nonce,
+        } = record.phase
+        else {
+            __cser_core::unreachable!();
+        };
+        (apply_generation, apply_nonce)
+    };
+    let adopted_workload = adopt_compact_device_workload(&mut applying_state);
+    let adopted_applying = applying_state
+        .adopt_device_after_fence(
+            &adopted_workload,
+            coordinates.preparation_id,
+            coordinates.generation,
+        )
+        .unwrap();
+    let DeviceAdoption::ReplayApply(current_applying) = adopted_applying else {
+        __cser_core::panic!("applying adoption changed typestate");
+    };
+    assert_next_generation(old_bearer_generation, current_applying.0.bearer_generation);
+    let record = applying_state
+        .scope(SCOPE)
+        .unwrap()
+        .devices
+        .get(coordinates.preparation_id)
+        .unwrap();
+    let super::DevicePhase::Applying {
+        apply_generation,
+        apply_nonce,
+    } = record.phase
+    else {
+        __cser_core::unreachable!();
+    };
+    assert_next_generation(old_apply_generation, apply_generation);
+    __cser_core::assert_ne!(apply_nonce, old_apply_nonce);
+    __cser_core::assert_eq!(
+        applying_state.device_apply_coordinates(&applying),
+        Err(InfrastructureError::StaleGeneration)
+    );
+    applying_state
+        .device_apply_coordinates(&current_applying)
+        .unwrap();
+
+    let (mut prepared_state, _, prepared, coordinates) = compact_prepared_device_state(0xda50);
+    let prepared_generation = prepared.0.bearer_generation;
+    let adopted_workload = adopt_compact_device_workload(&mut prepared_state);
+    let adopted_prepared = prepared_state
+        .adopt_device_after_fence(
+            &adopted_workload,
+            coordinates.preparation_id,
+            coordinates.generation,
+        )
+        .unwrap();
+    let DeviceAdoption::Prepared(current_prepared) = adopted_prepared else {
+        __cser_core::panic!("prepared adoption changed typestate");
+    };
+    assert_next_generation(prepared_generation, current_prepared.0.bearer_generation);
+    __cser_core::assert_eq!(
+        prepared_state.prepared_device_coordinates(&prepared),
+        Err(InfrastructureError::StaleGeneration)
+    );
+    prepared_state
+        .prepared_device_coordinates(&current_prepared)
+        .unwrap();
+
+    let (mut materialized_state, _, prepared, coordinates) = compact_prepared_device_state(0xda60);
+    let authority = materialized_state
+        .prepare_device_materialization(prepared)
+        .unwrap();
+    let cohort = DeviceCohortIdentity {
+        block: EffectKey::new(0xda61, 1),
+        dma: [
+            EffectKey::new(0xda62, 1),
+            EffectKey::new(0xda63, 1),
+            EffectKey::new(0xda64, 1),
+        ],
+        digest: 0xda65,
+    };
+    let mut candidate = materialized_state.try_private_candidate().unwrap();
+    let materialization = candidate
+        .prepare_materialize_device_in_candidate(&authority, cohort)
+        .unwrap();
+    candidate.apply_materialize_device_in_candidate(materialization, cohort);
+    let foreign_authority = DeviceMaterializationPlan(BearerKey {
+        authority: AuthorityKey {
+            registry_instance: authority.0.authority.registry_instance + 1,
+            scope: authority.0.authority.scope,
+            authority_epoch: authority.0.authority.authority_epoch,
+        },
+        slot: authority.0.slot,
+        object_generation: authority.0.object_generation,
+        bearer_generation: authority.0.bearer_generation,
+        nonce: authority.0.nonce,
+        state: __cser_core::marker::PhantomData,
+    });
+    __cser_core::assert_eq!(
+        candidate.validate_materialized_device_candidate(&foreign_authority, cohort),
+        Err(InfrastructureError::ForeignRegistry)
+    );
+    candidate
+        .validate_materialized_device_candidate(&authority, cohort)
+        .unwrap();
+    candidate.promote_full_candidate_for_install().unwrap();
+    materialized_state = candidate;
+    let materialized =
+        materialized_state.mint_materialized_device_ticket_after_install(authority, cohort);
+    let materialized_generation = materialized.0.bearer_generation;
+    let adopted_workload = adopt_compact_device_workload(&mut materialized_state);
+    let adopted_materialized = materialized_state
+        .adopt_device_after_fence(
+            &adopted_workload,
+            coordinates.preparation_id,
+            coordinates.generation,
+        )
+        .unwrap();
+    let DeviceAdoption::Materialized(current_materialized) = adopted_materialized else {
+        __cser_core::panic!("materialized adoption changed typestate");
+    };
+    assert_next_generation(
+        materialized_generation,
+        current_materialized.0.bearer_generation,
+    );
+    __cser_core::assert_eq!(materialized.0.nonce, current_materialized.0.nonce);
+
+    let (mut failed_state, _, _, coordinates) = compact_prepared_device_state(0xda70);
+    let adopted_workload = adopt_compact_device_workload(&mut failed_state);
+    let nonce = failed_state
+        .scope(SCOPE)
+        .unwrap()
+        .devices
+        .get(coordinates.preparation_id)
+        .unwrap()
+        .stamp
+        .nonce;
+    failed_state
+        .scope_mut(SCOPE)
+        .unwrap()
+        .reverse_indexes
+        .get_mut(nonce)
+        .unwrap()
+        .actor_slot = Some(coordinates.actor_slot + 1);
+    let before = failed_state.private_full_clone();
+    __cser_core::assert_eq!(
+        failed_state.adopt_device_after_fence(
+            &adopted_workload,
+            coordinates.preparation_id,
+            coordinates.generation,
+        ),
+        Err(InfrastructureError::Invariant(
+            "device reverse index mismatch"
+        ))
+    );
+    __cser_core::assert_eq!(failed_state, before);
 }
 
 #[test]

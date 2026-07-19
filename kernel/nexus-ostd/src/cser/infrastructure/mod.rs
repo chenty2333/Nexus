@@ -396,6 +396,14 @@ mod bearer_state {
     pub(super) enum ReplyPublishing {}
     #[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
     pub(super) enum ReplyAcknowledged {}
+    #[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
+    pub(super) enum DeviceReserved {}
+    #[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
+    pub(super) enum DeviceApplying {}
+    #[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
+    pub(super) enum DevicePrepared {}
+    #[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
+    pub(super) enum DeviceMaterialized {}
 
     impl Sealed for ContinuationPending {}
     impl Sealed for ContinuationClaimed {}
@@ -426,6 +434,10 @@ mod bearer_state {
     impl Sealed for ReplyClaimed {}
     impl Sealed for ReplyPublishing {}
     impl Sealed for ReplyAcknowledged {}
+    impl Sealed for DeviceReserved {}
+    impl Sealed for DeviceApplying {}
+    impl Sealed for DevicePrepared {}
+    impl Sealed for DeviceMaterialized {}
 }
 
 /// Opaque, state-typed authority for one fixed infrastructure slot.
@@ -2022,21 +2034,16 @@ impl DeviceReservationCoordinates {
 }
 
 #[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
-pub(crate) struct DevicePreparationTicket(BearerStamp<DeviceReservationCoordinates>);
+pub(crate) struct DevicePreparationTicket(BearerKey<bearer_state::DeviceReserved>);
 
 #[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
-pub(crate) struct DeviceApplyIntent {
-    preparation: BearerStamp<DeviceReservationCoordinates>,
-    apply_generation: u64,
-    apply_nonce: u64,
-}
+pub(crate) struct DeviceApplyIntent(BearerKey<bearer_state::DeviceApplying>);
 
 #[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
-pub(super) struct DeviceMaterializationPlan {
-    preparation: BearerStamp<DeviceReservationCoordinates>,
-    owner: PreparedOwner,
-    base_revision: u64,
-}
+pub(crate) struct PreparedDeviceTicket(BearerKey<bearer_state::DevicePrepared>);
+
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
+pub(super) struct DeviceMaterializationPlan(BearerKey<bearer_state::DevicePrepared>);
 
 /// Exact ordered identity of the four effects created from one preparation.
 /// The digest is redundant by design and is recomputed by the outer Registry;
@@ -2078,11 +2085,71 @@ impl DeviceCohortIdentity {
 }
 
 #[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
-pub(crate) struct MaterializedDeviceTicket {
-    preparation: BearerStamp<DeviceReservationCoordinates>,
-    owner: PreparedOwner,
-    cohort: DeviceCohortIdentity,
+pub(crate) struct MaterializedDeviceTicket(BearerKey<bearer_state::DeviceMaterialized>);
+
+/// Non-authority selector returned by a candidate reservation.  It cannot
+/// perform a transition or mint a bearer until the exact candidate is installed
+/// into the authoritative Registry.
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
+pub(super) struct DeviceReservationInstall {
+    scope: ScopeKey,
+    preparation_id: u64,
+    generation: u64,
 }
+
+/// Ephemeral, descriptive view rebuilt from the authoritative primary record.
+/// It is never accepted as authority and is intentionally absent from every
+/// compact bearer.
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
+pub(super) struct PreparedDeviceDescription {
+    pub(super) coordinates: DeviceReservationCoordinates,
+    pub(super) scope: ScopeKey,
+    pub(super) parent_effect: EffectKey,
+    pub(super) prepared: PreparedDeviceIdentity,
+}
+
+const _: () = {
+    __cser_core::assert!(
+        __cser_core::mem::size_of::<BearerKey<bearer_state::DeviceReserved>>() <= 64
+    );
+    __cser_core::assert!(
+        __cser_core::mem::size_of::<BearerKey<bearer_state::DeviceApplying>>() <= 64
+    );
+    __cser_core::assert!(
+        __cser_core::mem::size_of::<BearerKey<bearer_state::DevicePrepared>>() <= 64
+    );
+    __cser_core::assert!(
+        __cser_core::mem::size_of::<BearerKey<bearer_state::DeviceMaterialized>>() <= 64
+    );
+    __cser_core::assert!(__cser_core::mem::size_of::<DevicePreparationTicket>() <= 96);
+    __cser_core::assert!(__cser_core::mem::size_of::<DeviceApplyIntent>() <= 96);
+    __cser_core::assert!(__cser_core::mem::size_of::<PreparedDeviceTicket>() <= 96);
+    __cser_core::assert!(__cser_core::mem::size_of::<DeviceMaterializationPlan>() <= 96);
+    __cser_core::assert!(__cser_core::mem::size_of::<MaterializedDeviceTicket>() <= 96);
+    __cser_core::assert!(
+        __cser_core::mem::size_of::<LinearFailure<DevicePreparationTicket>>() <= 120
+    );
+    __cser_core::assert!(__cser_core::mem::size_of::<LinearFailure<DeviceApplyIntent>>() <= 120);
+    __cser_core::assert!(__cser_core::mem::size_of::<LinearFailure<PreparedDeviceTicket>>() <= 120);
+    __cser_core::assert!(
+        __cser_core::mem::size_of::<LinearFailure<DeviceMaterializationPlan>>() <= 120
+    );
+    __cser_core::assert!(
+        __cser_core::mem::size_of::<LinearFailure<MaterializedDeviceTicket>>() <= 120
+    );
+};
 
 #[derive(
     __cser_core::clone::Clone,
@@ -2120,7 +2187,7 @@ pub(crate) struct DeviceHardwareReceipt {
 /// Exact adapter presentation bound to one `PreparedRetained` owner.
 ///
 /// This is descriptive evidence, not a bearer: the non-cloneable
-/// `DevicePreparationTicket` remains the authority consumed by materialization.
+/// `PreparedDeviceTicket` remains the authority consumed by materialization.
 /// Repeating every preparation and hardware-owner coordinate prevents a caller
 /// from pairing a valid ticket with a result from another adapter slot,
 /// generation, queue, or descriptor selection.
@@ -3098,7 +3165,7 @@ enum DeviceCreditOwnership {
 pub(crate) enum DeviceAdoption {
     Reserved(DevicePreparationTicket),
     ReplayApply(DeviceApplyIntent),
-    Prepared(DevicePreparationTicket),
+    Prepared(PreparedDeviceTicket),
     Materialized(MaterializedDeviceTicket),
 }
 
@@ -4477,22 +4544,6 @@ fn next_deadline_bearer_generation(record: &DeadlineRecord) -> Result<u64, Infra
         .bearer_generation
         .checked_add(1)
         .ok_or(InfrastructureError::CounterOverflow)
-}
-
-fn validate_device_bearer(
-    scope: &ScopeInfrastructure,
-    registry_instance: u64,
-    stamp: &BearerStamp<DeviceReservationCoordinates>,
-) -> Result<(), InfrastructureError> {
-    validate_stamp_common(scope, registry_instance, stamp)?;
-    let record = scope
-        .devices
-        .get(stamp.identity.preparation_id)
-        .ok_or(InfrastructureError::UnknownObligation)?;
-    if record.stamp != *stamp {
-        return Err(InfrastructureError::StaleGeneration);
-    }
-    Ok(())
 }
 
 fn first_live_child_kind(

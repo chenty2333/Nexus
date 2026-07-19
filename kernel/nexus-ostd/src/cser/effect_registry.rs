@@ -3458,7 +3458,7 @@ impl EffectRegistry {
 
         let charges = coordinates.credit_charges();
         let mut candidate = self.combined_scope_candidate(scope_key)?;
-        let ticket = candidate
+        let reservation = candidate
             .replacement
             .infrastructure
             .reserve_device_preparation_in_candidate(context, parent_effect, coordinates)?;
@@ -3471,7 +3471,9 @@ impl EffectRegistry {
         advance_device_preparation_scope(candidate_scope)?;
         let install = self.prepare_combined_scope_install(candidate)?;
         self.install_combined_scope(install);
-        Ok(ticket)
+        Ok(self
+            .infrastructure
+            .mint_reserved_device_ticket_after_install(reservation))
     }
 
     /// Pre-hardware cancellation. The exact ticket is returned on every
@@ -3481,7 +3483,16 @@ impl EffectRegistry {
         ticket: infrastructure::DevicePreparationTicket,
     ) -> Result<(), DevicePreparationRegistryFailure<infrastructure::DevicePreparationTicket>> {
         let scope_key = ticket.scope();
-        let charges = ticket.coordinates().credit_charges();
+        let coordinates = match self.infrastructure.device_preparation_coordinates(&ticket) {
+            Ok(coordinates) => coordinates,
+            Err(error) => {
+                return Err(DevicePreparationRegistryFailure {
+                    error: error.into(),
+                    input: ticket,
+                });
+            }
+        };
+        let charges = coordinates.credit_charges();
         let mut candidate = match self.combined_scope_candidate(scope_key) {
             Ok(candidate) => candidate,
             Err(error) => {
@@ -3491,8 +3502,7 @@ impl EffectRegistry {
                 });
             }
         };
-        let candidate_scope = candidate.replacement.scopes.get_mut(&scope_key).unwrap();
-        if let Err(error) = candidate_scope
+        if let Err(error) = candidate.replacement.scopes[&scope_key]
             .credits
             .validate_release(&charges, CreditState::Held)
         {
@@ -3501,35 +3511,39 @@ impl EffectRegistry {
                 input: ticket,
             });
         }
-        let returned = match candidate
+        let prepared = match candidate
             .replacement
             .infrastructure
-            .cancel_reserved_device_in_candidate(ticket)
+            .prepare_cancel_reserved_device_in_candidate(&ticket)
         {
-            Ok(ticket) => ticket,
-            Err(failure) => {
-                let (error, input) = failure.into_parts();
+            Ok(prepared) => prepared,
+            Err(error) => {
                 return Err(DevicePreparationRegistryFailure {
                     error: error.into(),
-                    input,
+                    input: ticket,
                 });
             }
         };
+        let candidate_scope = candidate.replacement.scopes.get_mut(&scope_key).unwrap();
         candidate_scope
             .credits
             .release_validated(&charges, CreditState::Held);
         if let Err(error) = advance_device_preparation_scope(candidate_scope) {
             return Err(DevicePreparationRegistryFailure {
                 error,
-                input: returned,
+                input: ticket,
             });
         }
+        candidate
+            .replacement
+            .infrastructure
+            .apply_cancel_reserved_device_in_candidate(prepared);
         let install = match self.prepare_combined_scope_install(candidate) {
             Ok(install) => install,
             Err(error) => {
                 return Err(DevicePreparationRegistryFailure {
                     error,
-                    input: returned,
+                    input: ticket,
                 });
             }
         };
@@ -3547,7 +3561,16 @@ impl EffectRegistry {
         DevicePreparationRegistryFailure<infrastructure::DevicePreparationTicket>,
     > {
         let scope_key = ticket.scope();
-        let charges = ticket.coordinates().credit_charges();
+        let coordinates = match self.infrastructure.device_preparation_coordinates(&ticket) {
+            Ok(coordinates) => coordinates,
+            Err(error) => {
+                return Err(DevicePreparationRegistryFailure {
+                    error: error.into(),
+                    input: ticket,
+                });
+            }
+        };
+        let charges = coordinates.credit_charges();
         let scope = match self.scopes.get(&scope_key) {
             Some(scope) => scope,
             None => {
@@ -3572,8 +3595,7 @@ impl EffectRegistry {
                 });
             }
         };
-        let candidate_scope = candidate.replacement.scopes.get_mut(&scope_key).unwrap();
-        if let Err(error) = candidate_scope
+        if let Err(error) = candidate.replacement.scopes[&scope_key]
             .credits
             .validate_retain(&charges, CreditState::Held)
         {
@@ -3582,40 +3604,46 @@ impl EffectRegistry {
                 input: ticket,
             });
         }
-        let intent = match candidate
+        let prepared = match candidate
             .replacement
             .infrastructure
-            .begin_device_hardware_apply_in_candidate(ticket)
+            .prepare_begin_device_hardware_apply_in_candidate(&ticket)
         {
-            Ok(intent) => intent,
-            Err(failure) => {
-                let (error, input) = failure.into_parts();
+            Ok(prepared) => prepared,
+            Err(error) => {
                 return Err(DevicePreparationRegistryFailure {
                     error: error.into(),
-                    input,
+                    input: ticket,
                 });
             }
         };
+        let candidate_scope = candidate.replacement.scopes.get_mut(&scope_key).unwrap();
         candidate_scope
             .credits
             .retain_validated(&charges, CreditState::Held);
         if let Err(error) = advance_device_preparation_scope(candidate_scope) {
             return Err(DevicePreparationRegistryFailure {
                 error,
-                input: intent.into_preparation_ticket(),
+                input: ticket,
             });
         }
+        candidate
+            .replacement
+            .infrastructure
+            .apply_begin_device_hardware_apply_in_candidate(prepared);
         let install = match self.prepare_combined_scope_install(candidate) {
             Ok(install) => install,
             Err(error) => {
                 return Err(DevicePreparationRegistryFailure {
                     error,
-                    input: intent.into_preparation_ticket(),
+                    input: ticket,
                 });
             }
         };
         self.install_combined_scope(install);
-        Ok(intent)
+        Ok(self
+            .infrastructure
+            .mint_device_apply_intent_after_install(ticket))
     }
 
     /// Acknowledges exact rollback evidence and releases the retained credit
@@ -3629,7 +3657,16 @@ impl EffectRegistry {
         DevicePreparationRegistryFailure<infrastructure::DeviceApplyIntent>,
     > {
         let scope_key = intent.scope();
-        let charges = intent.coordinates().credit_charges();
+        let coordinates = match self.infrastructure.device_apply_coordinates(&intent) {
+            Ok(coordinates) => coordinates,
+            Err(error) => {
+                return Err(DevicePreparationRegistryFailure {
+                    error: error.into(),
+                    input: intent,
+                });
+            }
+        };
+        let charges = coordinates.credit_charges();
         let mut candidate = match self.combined_scope_candidate(scope_key) {
             Ok(candidate) => candidate,
             Err(error) => {
@@ -3639,8 +3676,7 @@ impl EffectRegistry {
                 });
             }
         };
-        let candidate_scope = candidate.replacement.scopes.get_mut(&scope_key).unwrap();
-        if let Err(error) = candidate_scope
+        if let Err(error) = candidate.replacement.scopes[&scope_key]
             .credits
             .validate_release(&charges, CreditState::Retained)
         {
@@ -3649,40 +3685,44 @@ impl EffectRegistry {
                 input: intent,
             });
         }
-        let (returned, receipt) = match candidate
+        let prepared = match candidate
             .replacement
             .infrastructure
-            .acknowledge_device_apply_rollback_in_candidate(intent, rollback)
+            .prepare_device_apply_rollback_in_candidate(&intent, rollback)
         {
-            Ok(applied) => applied,
-            Err(failure) => {
-                let (error, input) = failure.into_parts();
+            Ok(prepared) => prepared,
+            Err(error) => {
                 return Err(DevicePreparationRegistryFailure {
                     error: error.into(),
-                    input,
+                    input: intent,
                 });
             }
         };
+        let candidate_scope = candidate.replacement.scopes.get_mut(&scope_key).unwrap();
         candidate_scope
             .credits
             .release_validated(&charges, CreditState::Retained);
         if let Err(error) = advance_device_preparation_scope(candidate_scope) {
             return Err(DevicePreparationRegistryFailure {
                 error,
-                input: returned,
+                input: intent,
             });
         }
+        candidate
+            .replacement
+            .infrastructure
+            .apply_device_apply_rollback_in_candidate(prepared, rollback);
         let install = match self.prepare_combined_scope_install(candidate) {
             Ok(install) => install,
             Err(error) => {
                 return Err(DevicePreparationRegistryFailure {
                     error,
-                    input: returned,
+                    input: intent,
                 });
             }
         };
         self.install_combined_scope(install);
-        Ok(receipt)
+        Ok(rollback)
     }
 
     /// Hardware acknowledgement contains no callback and leaves the exact
@@ -3692,7 +3732,7 @@ impl EffectRegistry {
         intent: infrastructure::DeviceApplyIntent,
         receipt: infrastructure::DeviceHardwareReceipt,
     ) -> Result<
-        infrastructure::DevicePreparationTicket,
+        infrastructure::PreparedDeviceTicket,
         DevicePreparationRegistryFailure<infrastructure::DeviceApplyIntent>,
     > {
         let scope_key = intent.scope();
@@ -3705,17 +3745,16 @@ impl EffectRegistry {
                 });
             }
         };
-        let returned = match candidate
+        let prepared = match candidate
             .replacement
             .infrastructure
-            .acknowledge_device_prepared_in_candidate(intent, receipt)
+            .prepare_device_prepared_in_candidate(&intent, receipt)
         {
-            Ok(intent) => intent,
-            Err(failure) => {
-                let (error, input) = failure.into_parts();
+            Ok(prepared) => prepared,
+            Err(error) => {
                 return Err(DevicePreparationRegistryFailure {
                     error: error.into(),
-                    input,
+                    input: intent,
                 });
             }
         };
@@ -3723,20 +3762,26 @@ impl EffectRegistry {
         if let Err(error) = advance_device_preparation_scope(candidate_scope) {
             return Err(DevicePreparationRegistryFailure {
                 error,
-                input: returned,
+                input: intent,
             });
         }
+        candidate
+            .replacement
+            .infrastructure
+            .apply_device_prepared_in_candidate(prepared, receipt);
         let install = match self.prepare_combined_scope_install(candidate) {
             Ok(install) => install,
             Err(error) => {
                 return Err(DevicePreparationRegistryFailure {
                     error,
-                    input: returned,
+                    input: intent,
                 });
             }
         };
         self.install_combined_scope(install);
-        Ok(returned.into_preparation_ticket())
+        Ok(self
+            .infrastructure
+            .mint_prepared_device_ticket_after_install(intent))
     }
 
     pub(crate) fn query_device_preparation(
@@ -3758,12 +3803,12 @@ impl EffectRegistry {
     /// claim. The final linearization itself performs no allocation or callback.
     pub(crate) fn materialize_device_cohort_from_preparation(
         &mut self,
-        ticket: infrastructure::DevicePreparationTicket,
+        ticket: infrastructure::PreparedDeviceTicket,
         prepared: infrastructure::PreparedDeviceIdentity,
         entries: [DeviceDerivedCohortEntry; 4],
     ) -> Result<
         DeviceCohortMaterialization,
-        DevicePreparationRegistryFailure<infrastructure::DevicePreparationTicket>,
+        DevicePreparationRegistryFailure<infrastructure::PreparedDeviceTicket>,
     > {
         let plan = self.prepare_device_cohort_materialization(ticket, prepared, entries)?;
         self.apply_device_cohort_materialization(plan)
@@ -3771,12 +3816,12 @@ impl EffectRegistry {
 
     fn prepare_device_cohort_materialization(
         &self,
-        ticket: infrastructure::DevicePreparationTicket,
+        ticket: infrastructure::PreparedDeviceTicket,
         prepared: infrastructure::PreparedDeviceIdentity,
         entries: [DeviceDerivedCohortEntry; 4],
     ) -> Result<
         DeviceCohortMaterializationPlan,
-        DevicePreparationRegistryFailure<infrastructure::DevicePreparationTicket>,
+        DevicePreparationRegistryFailure<infrastructure::PreparedDeviceTicket>,
     > {
         let scope_key = ticket.scope();
         let scope = match self.scopes.get(&scope_key) {
@@ -3804,18 +3849,31 @@ impl EffectRegistry {
                 });
             }
         };
-        if authority.prepared_identity() != prepared {
+        let description = match self
+            .infrastructure
+            .describe_device_materialization(&authority)
+        {
+            Ok(description) => description,
+            Err(error) => {
+                return Err(DevicePreparationRegistryFailure {
+                    error: error.into(),
+                    input: authority.into_prepared_device_ticket(),
+                });
+            }
+        };
+        if description.prepared != prepared {
             return Err(DevicePreparationRegistryFailure {
                 error: RegistryError::InvalidHandle,
-                input: authority.into_preparation_ticket(),
+                input: authority.into_prepared_device_ticket(),
             });
         }
-        let entries = match validate_prepared_device_cohort_entries(&authority, prepared, entries) {
+        let entries = match validate_prepared_device_cohort_entries(description, prepared, entries)
+        {
             Ok(entries) => entries,
             Err(error) => {
                 return Err(DevicePreparationRegistryFailure {
                     error,
-                    input: authority.into_preparation_ticket(),
+                    input: authority.into_prepared_device_ticket(),
                 });
             }
         };
@@ -3827,37 +3885,39 @@ impl EffectRegistry {
             Err(error) => {
                 return Err(DevicePreparationRegistryFailure {
                     error: error.into(),
-                    input: authority.into_preparation_ticket(),
+                    input: authority.into_prepared_device_ticket(),
                 });
             }
         };
-        let registered = match candidate.register_prepared_device_cohort(&authority, entries) {
+        let registered = match candidate.register_prepared_device_cohort(description, entries) {
             Ok(registered) => registered,
             Err(error) => {
                 return Err(DevicePreparationRegistryFailure {
                     error,
-                    input: authority.into_preparation_ticket(),
+                    input: authority.into_prepared_device_ticket(),
                 });
             }
         };
         let cohort = device_cohort_identity(prepared, &registered);
-        let authority = match candidate
+        let materialization = match candidate
             .infrastructure
-            .materialize_device_in_candidate(authority, cohort)
+            .prepare_materialize_device_in_candidate(&authority, cohort)
         {
-            Ok(authority) => authority,
-            Err(failure) => {
-                let (error, authority) = failure.into_parts();
+            Ok(materialization) => materialization,
+            Err(error) => {
                 return Err(DevicePreparationRegistryFailure {
                     error: error.into(),
-                    input: authority.into_preparation_ticket(),
+                    input: authority.into_prepared_device_ticket(),
                 });
             }
         };
+        candidate
+            .infrastructure
+            .apply_materialize_device_in_candidate(materialization, cohort);
         if let Err(error) = candidate.check_invariants() {
             return Err(DevicePreparationRegistryFailure {
                 error,
-                input: authority.into_preparation_ticket(),
+                input: authority.into_prepared_device_ticket(),
             });
         }
         Ok(DeviceCohortMaterializationPlan {
@@ -3874,7 +3934,7 @@ impl EffectRegistry {
         plan: DeviceCohortMaterializationPlan,
     ) -> Result<
         DeviceCohortMaterialization,
-        DevicePreparationRegistryFailure<infrastructure::DevicePreparationTicket>,
+        DevicePreparationRegistryFailure<infrastructure::PreparedDeviceTicket>,
     > {
         let DeviceCohortMaterializationPlan {
             base,
@@ -3889,26 +3949,35 @@ impl EffectRegistry {
             None => {
                 return Err(DevicePreparationRegistryFailure {
                     error: RegistryError::UnknownScope,
-                    input: authority.into_preparation_ticket(),
+                    input: authority.into_prepared_device_ticket(),
                 });
             }
         };
         if scope.phase != ScopePhase::Active {
             return Err(DevicePreparationRegistryFailure {
                 error: RegistryError::ScopeNotActive,
-                input: authority.into_preparation_ticket(),
+                input: authority.into_prepared_device_ticket(),
             });
         }
         if self != &base {
             return Err(DevicePreparationRegistryFailure {
                 error: RegistryError::CombinedCandidateStale,
-                input: authority.into_preparation_ticket(),
+                input: authority.into_prepared_device_ticket(),
             });
         }
         if let Err(error) = candidate.check_invariants() {
             return Err(DevicePreparationRegistryFailure {
                 error,
-                input: authority.into_preparation_ticket(),
+                input: authority.into_prepared_device_ticket(),
+            });
+        }
+        if let Err(error) = candidate
+            .infrastructure
+            .validate_materialized_device_candidate(&authority, cohort)
+        {
+            return Err(DevicePreparationRegistryFailure {
+                error: error.into(),
+                input: authority.into_prepared_device_ticket(),
             });
         }
         if let Err(error) = candidate
@@ -3917,25 +3986,14 @@ impl EffectRegistry {
         {
             return Err(DevicePreparationRegistryFailure {
                 error: error.into(),
-                input: authority.into_preparation_ticket(),
+                input: authority.into_prepared_device_ticket(),
             });
         }
 
-        let previous = __cser_core::mem::replace(self, candidate);
-        let materialized = match self
+        *self = candidate;
+        let materialized = self
             .infrastructure
-            .mint_materialized_device_ticket_after_install(authority, cohort)
-        {
-            Ok(materialized) => materialized,
-            Err(failure) => {
-                let (error, authority) = failure.into_parts();
-                *self = previous;
-                return Err(DevicePreparationRegistryFailure {
-                    error: error.into(),
-                    input: authority.into_preparation_ticket(),
-                });
-            }
-        };
+            .mint_materialized_device_ticket_after_install(authority, cohort);
         Ok(DeviceCohortMaterialization {
             registered,
             authority: materialized,
@@ -3945,14 +4003,14 @@ impl EffectRegistry {
 
     fn register_prepared_device_cohort(
         &mut self,
-        authority: &infrastructure::DeviceMaterializationPlan,
+        description: infrastructure::PreparedDeviceDescription,
         entries: [DeviceDerivedCohortEntry; 4],
     ) -> Result<[RegisteredEffect; 4], RegistryError> {
         let [block_entry, dma_a_entry, dma_b_entry, dma_request_entry] = entries;
         let block = self.register_in_domain_with_credit_source(
             block_entry.request,
             block_entry.domain,
-            Some(authority.parent_effect()),
+            Some(description.parent_effect),
             Some(block_entry.device),
             false,
             RegistrationCreditSource::TransferRetainedPreparation,
@@ -10523,6 +10581,17 @@ impl EffectRegistry {
         // record rather than trusting stored CreditLedger totals. Once
         // materialized, the same units are attributed only to EffectRecords.
         for owner in self.infrastructure.device_preparation_credit_projections() {
+            let parent = self
+                .effects
+                .get(&owner.parent_effect)
+                .ok_or(RegistryError::Invariant(
+                    "device preparation parent effect missing",
+                ))?;
+            if parent.identity.scope != owner.scope {
+                return Err(RegistryError::Invariant(
+                    "device preparation parent scope mismatch",
+                ));
+            }
             match owner.ownership {
                 infrastructure::DevicePreparationCreditOwnership::HeldByPreparation => {
                     add_expected_credits(
@@ -11695,7 +11764,7 @@ impl EffectRegistry {
 }
 
 fn validate_prepared_device_cohort_entries(
-    authority: &infrastructure::DeviceMaterializationPlan,
+    description: infrastructure::PreparedDeviceDescription,
     prepared: infrastructure::PreparedDeviceIdentity,
     entries: [DeviceDerivedCohortEntry; 4],
 ) -> Result<[DeviceDerivedCohortEntry; 4], RegistryError> {
@@ -11711,20 +11780,20 @@ fn validate_prepared_device_cohort_entries(
         return Err(RegistryError::InvalidState);
     };
     let entries = [block, dma_a, dma_b, dma_request];
-    let coordinates = authority.coordinates();
-    if authority.prepared_identity() != prepared
+    let coordinates = description.coordinates;
+    if description.prepared != prepared
         || prepared.preparation_id != coordinates.preparation_id
         || prepared.preparation_generation != coordinates.generation
         || prepared.owned_device != coordinates.owned_device
         || prepared.operation_digest != coordinates.operation_digest
         || prepared.actor_slot != coordinates.actor_slot
         || prepared.actor_generation != coordinates.actor_generation
-        || prepared.device != authority.prepared_device()
+        || prepared.device != description.prepared.device
         || prepared.hardware_receipt_digest == 0
     {
         return Err(RegistryError::InvalidHandle);
     }
-    if entries[0].parent != DeviceCohortParent::Existing(authority.parent_effect())
+    if entries[0].parent != DeviceCohortParent::Existing(description.parent_effect)
         || entries[1..]
             .iter()
             .any(|entry| entry.parent != DeviceCohortParent::BatchIndex(0))
@@ -11734,7 +11803,7 @@ fn validate_prepared_device_cohort_entries(
     let domain = entries[0].domain;
     let task = entries[0].request.task;
     for entry in &entries {
-        if entry.request.scope != authority.scope()
+        if entry.request.scope != description.scope
             || entry.device != prepared.device
             || entry.domain != domain
             || entry.request.task != task
@@ -15017,7 +15086,10 @@ fn device_preparation_outer_credit_self_test() {
     __cser_core::assert_eq!(failure.error(), &RegistryError::ScopeNotActive);
     __cser_core::assert_eq!(revoke_first, closing_before);
     let ticket = failure.into_input();
-    __cser_core::assert_eq!(ticket.coordinates(), coordinates);
+    __cser_core::assert_eq!(
+        (ticket.preparation_id(), ticket.generation()),
+        (coordinates.preparation_id, coordinates.generation)
+    );
     let projection = revoke_first
         .query_device_preparation(
             &workload,
@@ -15047,19 +15119,19 @@ fn device_preparation_outer_credit_self_test() {
     __cser_core::assert_eq!((released.free, released.held, released.retained), (7, 0, 0));
     revoke_first.check_invariants().unwrap();
 
-    // A staged successor never escapes a rejected combined install. Converting
-    // it back to the sole input bearer still validates the unchanged live
-    // Reserved record.
+    // Candidate staging borrows the sole input bearer. A rejected install
+    // therefore returns no candidate authority and leaves the exact original
+    // key valid for the unchanged live Reserved record.
     let (mut stale_install, workload, root, coordinates) = fixture(0xdb35);
     let ticket = stale_install
         .reserve_device_preparation(&workload, root, coordinates)
         .unwrap();
     let charges = coordinates.credit_charges();
     let mut candidate = stale_install.combined_scope_candidate(SCOPE).unwrap();
-    let intent = candidate
+    let prepared = candidate
         .replacement
         .infrastructure
-        .begin_device_hardware_apply_in_candidate(ticket)
+        .prepare_begin_device_hardware_apply_in_candidate(&ticket)
         .unwrap();
     let candidate_scope = candidate.replacement.scopes.get_mut(&SCOPE).unwrap();
     candidate_scope
@@ -15070,12 +15142,15 @@ fn device_preparation_outer_credit_self_test() {
         .credits
         .retain_validated(&charges, CreditState::Held);
     advance_device_preparation_scope(candidate_scope).unwrap();
+    candidate
+        .replacement
+        .infrastructure
+        .apply_begin_device_hardware_apply_in_candidate(prepared);
     candidate.base_registry_revision += 1;
     __cser_core::assert!(__cser_core::matches!(
         stale_install.prepare_combined_scope_install(candidate),
         Err(RegistryError::CombinedCandidateStale)
     ));
-    let ticket = intent.into_preparation_ticket();
     __cser_core::assert_eq!(
         stale_install
             .query_device_preparation(
@@ -15099,7 +15174,10 @@ fn device_preparation_outer_credit_self_test() {
         .unwrap_err();
     __cser_core::assert_eq!(failure.error(), &RegistryError::CounterOverflow);
     let returned = failure.into_input();
-    __cser_core::assert_eq!(returned.coordinates(), coordinates);
+    __cser_core::assert_eq!(
+        (returned.preparation_id(), returned.generation()),
+        (coordinates.preparation_id, coordinates.generation)
+    );
     __cser_core::assert_eq!(
         cancel_overflow
             .query_device_preparation(
@@ -15182,7 +15260,11 @@ fn device_preparation_outer_credit_self_test() {
         .acknowledge_device_apply_rollback(intent, rollback)
         .unwrap_err();
     __cser_core::assert_eq!(failure.error(), &RegistryError::CounterOverflow);
-    __cser_core::assert_eq!(failure.into_input().coordinates(), coordinates);
+    let returned = failure.into_input();
+    __cser_core::assert_eq!(
+        (returned.preparation_id(), returned.generation()),
+        (coordinates.preparation_id, coordinates.generation)
+    );
     __cser_core::assert_eq!(
         rollback_overflow
             .query_device_preparation(
@@ -15234,7 +15316,10 @@ fn device_preparation_outer_credit_self_test() {
         projection.credit_ownership,
         infrastructure::DevicePreparationCreditOwnership::RetainedByPreparation
     );
-    __cser_core::assert_eq!(ticket.coordinates(), coordinates);
+    __cser_core::assert_eq!(
+        (ticket.preparation_id(), ticket.generation()),
+        (coordinates.preparation_id, coordinates.generation)
+    );
     let selection = uncertain.revoke_begin(SCOPE).unwrap();
     __cser_core::assert_eq!(
         uncertain.query_scope_closure(SCOPE).unwrap(),
@@ -15260,7 +15345,7 @@ fn device_preparation_outer_materialization_self_test() {
     ) -> (
         EffectRegistry,
         infrastructure::WorkloadContext,
-        infrastructure::DevicePreparationTicket,
+        infrastructure::PreparedDeviceTicket,
         infrastructure::PreparedDeviceIdentity,
         [DeviceDerivedCohortEntry; 4],
         infrastructure::DeviceReservationCoordinates,
@@ -15579,7 +15664,11 @@ fn device_preparation_outer_materialization_self_test() {
             .materialize_device_cohort_from_preparation(ticket, prepared, entries)
             .unwrap_err();
         __cser_core::assert_ne!(failure.error(), &RegistryError::ScopeNotActive);
-        __cser_core::assert_eq!(failure.into_input().coordinates(), coordinates);
+        let returned = failure.into_input();
+        __cser_core::assert_eq!(
+            (returned.preparation_id(), returned.generation()),
+            (coordinates.preparation_id, coordinates.generation)
+        );
         __cser_core::assert_eq!(registry, before);
         assert_prepared_retained(&registry, &workload, coordinates);
         registry.check_invariants().unwrap();
@@ -15622,7 +15711,11 @@ fn device_preparation_outer_materialization_self_test() {
         failure.error(),
         &RegistryError::Infrastructure(infrastructure::InfrastructureError::StaleGeneration)
     );
-    __cser_core::assert_eq!(failure.into_input().coordinates(), coordinates);
+    let returned = failure.into_input();
+    __cser_core::assert_eq!(
+        (returned.preparation_id(), returned.generation()),
+        (coordinates.preparation_id, coordinates.generation)
+    );
     __cser_core::assert_eq!(stale, before);
     assert_prepared_retained(&stale, &workload, coordinates);
     stale
@@ -15671,13 +15764,17 @@ fn device_preparation_outer_materialization_self_test() {
         failure.error(),
         RegistryError::Invariant(_)
     ));
-    __cser_core::assert_eq!(failure.into_input().coordinates(), coordinates);
+    let returned = failure.into_input();
+    __cser_core::assert_eq!(
+        (returned.preparation_id(), returned.generation()),
+        (coordinates.preparation_id, coordinates.generation)
+    );
     __cser_core::assert_eq!(staged_failure, before);
     assert_prepared_retained(&staged_failure, &workload, coordinates);
 
-    // Even the post-install successor mint is checked against the installed
-    // primary record. A staged successor mismatch rolls the no-allocation
-    // replacement back to the exact previous Registry and returns authority.
+    // The final candidate-to-authoritative cohort binding is checked before
+    // the swap. A staged mismatch leaves the exact previous Registry intact
+    // and returns authority; post-install mint is then infallible.
     let (mut successor_failure, workload, ticket, prepared, entries, coordinates) = fixture(0xde50);
     let mut plan = successor_failure
         .prepare_device_cohort_materialization(ticket, prepared, entries)
@@ -15691,7 +15788,11 @@ fn device_preparation_outer_materialization_self_test() {
         failure.error(),
         &RegistryError::Infrastructure(infrastructure::InfrastructureError::StaleClaim)
     );
-    __cser_core::assert_eq!(failure.into_input().coordinates(), coordinates);
+    let returned = failure.into_input();
+    __cser_core::assert_eq!(
+        (returned.preparation_id(), returned.generation()),
+        (coordinates.preparation_id, coordinates.generation)
+    );
     __cser_core::assert_eq!(successor_failure, before);
     assert_prepared_retained(&successor_failure, &workload, coordinates);
 
@@ -15712,7 +15813,11 @@ fn device_preparation_outer_materialization_self_test() {
         .apply_device_cohort_materialization(plan)
         .unwrap_err();
     __cser_core::assert_eq!(failure.error(), &RegistryError::ScopeNotActive);
-    __cser_core::assert_eq!(failure.into_input().coordinates(), coordinates);
+    let returned = failure.into_input();
+    __cser_core::assert_eq!(
+        (returned.preparation_id(), returned.generation()),
+        (coordinates.preparation_id, coordinates.generation)
+    );
     __cser_core::assert_eq!(revoke_first, closing);
     assert_prepared_retained(&revoke_first, &workload, coordinates);
 
@@ -15774,9 +15879,13 @@ fn device_preparation_outer_materialization_self_test() {
         .unwrap_err();
     __cser_core::assert_eq!(
         failure.error(),
-        &RegistryError::Infrastructure(infrastructure::InfrastructureError::InvalidState)
+        &RegistryError::Infrastructure(infrastructure::InfrastructureError::StaleGeneration)
     );
-    __cser_core::assert_eq!(failure.into_input().coordinates(), coordinates);
+    let returned = failure.into_input();
+    __cser_core::assert_eq!(
+        (returned.preparation_id(), returned.generation()),
+        (coordinates.preparation_id, coordinates.generation)
+    );
     __cser_core::assert_eq!(materialized, after_success);
 
     let selection = materialized.revoke_begin(SCOPE).unwrap();
