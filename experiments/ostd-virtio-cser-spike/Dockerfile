@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 
 ARG OSDK_IMAGE=asterinas/osdk:0.18.0-20260603@sha256:a7540bfcd262ae52471f86353a87663d91941958e503557863738d13de4aace3
-FROM ${OSDK_IMAGE}
+FROM ${OSDK_IMAGE} AS build
 
 RUN rustup target add --toolchain nightly-2026-04-03 x86_64-unknown-none \
     && cargo install cargo-osdk --version 0.18.0 --locked
@@ -166,27 +166,55 @@ ENV CARGO_HOME=/root/.cargo \
 
 WORKDIR /work
 
-# The final filesystem mutation proves that the cold image contains exactly the
-# manifest-derived CSER tree and byte-identical sources from the read-only
-# nexus-root context. No instruction may follow this audit.
-RUN --mount=type=bind,from=nexus-root,source=kernel/nexus-ostd,target=/tmp/nexus-cser-audit,readonly \
+# Audit the immutable build-stage snapshot with a fresh pinned toolchain. No
+# repository-controlled build step executes in this stage, and both the
+# candidate root and nexus-root context are mounted read-only.
+FROM ${OSDK_IMAGE} AS cser-verifier
+RUN --network=none \
+    --mount=type=bind,from=build,source=/,target=/candidate-root,readonly \
+    --mount=type=bind,from=nexus-root,source=kernel/nexus-ostd,target=/expected-kernel,readonly \
     set -eu; \
-    test -f /tmp/nexus-cser-audit/cser-production-sources.txt; \
-    test ! -L /tmp/nexus-cser-audit/cser-production-sources.txt; \
-    test -f /kernel/nexus-ostd/cser-production-sources.txt; \
-    test ! -L /kernel/nexus-ostd/cser-production-sources.txt; \
-    cmp /tmp/nexus-cser-audit/cser-production-sources.txt \
-        /kernel/nexus-ostd/cser-production-sources.txt; \
-    awk -F/ '{ path=""; for (i=1; i<NF; i++) { path=(path=="" ? $i : path "/" $i); print "d " path } print "f " $0 }' \
-        /kernel/nexus-ostd/cser-production-sources.txt \
-        | LC_ALL=C sort -u > /tmp/nexus-cser-expected; \
-    find /kernel/nexus-ostd/src/cser -mindepth 1 -printf '%y %P\n' \
-        | LC_ALL=C sort > /tmp/nexus-cser-actual; \
-    cmp /tmp/nexus-cser-expected /tmp/nexus-cser-actual; \
+    test ! -e /candidate-root/nexus-cser-verified; \
+    test ! -L /candidate-root/nexus-cser-verified; \
+    test ! -e /verified; \
+    test ! -L /verified; \
+    test -f /expected-kernel/cser-production-sources.txt; \
+    test ! -L /expected-kernel/cser-production-sources.txt; \
+    test -f /candidate-root/kernel/nexus-ostd/cser-production-sources.txt; \
+    test ! -L /candidate-root/kernel/nexus-ostd/cser-production-sources.txt; \
+    /usr/bin/cmp /expected-kernel/cser-production-sources.txt \
+        /candidate-root/kernel/nexus-ostd/cser-production-sources.txt; \
+    /usr/bin/awk -F/ '{ path=""; for (i=1; i<NF; i++) { path=(path=="" ? $i : path "/" $i); print "d " path } print "f " $0 }' \
+        /candidate-root/kernel/nexus-ostd/cser-production-sources.txt \
+        | LC_ALL=C /usr/bin/sort -u > /tmp/nexus-cser-expected; \
+    /usr/bin/find /candidate-root/kernel/nexus-ostd/src/cser \
+        -mindepth 1 -printf '%y %P\n' \
+        | LC_ALL=C /usr/bin/sort > /tmp/nexus-cser-candidate; \
+    /usr/bin/cmp /tmp/nexus-cser-expected /tmp/nexus-cser-candidate; \
+    { \
+        printf '%s\n' nexus.cser.image-source-proof.v1; \
+        /usr/bin/sha256sum \
+            /candidate-root/kernel/nexus-ostd/cser-production-sources.txt; \
+    } > /tmp/nexus-cser-proof-input; \
     while IFS= read -r relative; do \
-        test -f "/tmp/nexus-cser-audit/src/cser/$relative"; \
-        test ! -L "/tmp/nexus-cser-audit/src/cser/$relative"; \
-        cmp "/tmp/nexus-cser-audit/src/cser/$relative" \
-            "/kernel/nexus-ostd/src/cser/$relative"; \
-    done < /kernel/nexus-ostd/cser-production-sources.txt; \
-    rm -f /tmp/nexus-cser-expected /tmp/nexus-cser-actual
+        test -f "/expected-kernel/src/cser/$relative"; \
+        test ! -L "/expected-kernel/src/cser/$relative"; \
+        /usr/bin/cmp "/expected-kernel/src/cser/$relative" \
+            "/candidate-root/kernel/nexus-ostd/src/cser/$relative"; \
+        /usr/bin/sha256sum \
+            "/candidate-root/kernel/nexus-ostd/src/cser/$relative" \
+            >> /tmp/nexus-cser-proof-input; \
+    done < /candidate-root/kernel/nexus-ostd/cser-production-sources.txt; \
+    proof_digest=$(/usr/bin/sha256sum /tmp/nexus-cser-proof-input \
+        | /usr/bin/cut -d ' ' -f1); \
+    printf 'nexus.cser.image-source-proof.v1\n%s\n' "$proof_digest" > /verified; \
+    chmod 0444 /verified; \
+    test -f /verified; \
+    test ! -L /verified; \
+    test "$(/usr/bin/stat -c %a /verified)" = 444
+
+# The sole final-stage mutation creates a direct-root, read-only proof marker.
+# The verifier first proved that the build snapshot did not already own this
+# path, so this COPY cannot traverse a repository-controlled parent symlink.
+FROM build AS final
+COPY --from=cser-verifier /verified /nexus-cser-verified

@@ -10,13 +10,16 @@
 
 #![allow(dead_code)]
 
-use alloc::{
+extern crate alloc as __cser_alloc;
+extern crate core as __cser_core;
+
+use __cser_alloc::{
     boxed::Box,
     collections::{BTreeMap, BTreeSet},
     string::String,
     vec::Vec,
 };
-use core::sync::atomic::{AtomicU64, Ordering};
+use __cser_core::sync::atomic::{AtomicU64, Ordering};
 
 use cser_transition_gates::handoff::{
     FreezeContext as KernelFreezeContext, FreezeReceipt as KernelFreezeReceipt,
@@ -32,7 +35,15 @@ mod infrastructure;
 
 static NEXT_REGISTRY_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::Ord,
+    __cser_core::cmp::PartialEq,
+    __cser_core::cmp::PartialOrd,
+)]
 pub(crate) struct ScopeKey {
     id: u64,
     generation: u64,
@@ -52,7 +63,15 @@ impl ScopeKey {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::Ord,
+    __cser_core::cmp::PartialEq,
+    __cser_core::cmp::PartialOrd,
+)]
 pub(crate) struct TaskKey {
     id: u64,
     generation: u64,
@@ -61,7 +80,15 @@ pub(crate) struct TaskKey {
 /// Identifies one independently restartable service domain inside a root
 /// authority scope. Domain zero is reserved for the legacy single-binding API;
 /// production-identity successors use explicit nonzero domains.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::Ord,
+    __cser_core::cmp::PartialEq,
+    __cser_core::cmp::PartialOrd,
+)]
 pub(crate) struct DomainKey(u32);
 
 impl DomainKey {
@@ -90,7 +117,15 @@ impl TaskKey {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::Ord,
+    __cser_core::cmp::PartialEq,
+    __cser_core::cmp::PartialOrd,
+)]
 pub(crate) struct ResourceKey {
     namespace: u32,
     id: u64,
@@ -119,7 +154,15 @@ impl ResourceKey {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::Ord,
+    __cser_core::cmp::PartialEq,
+    __cser_core::cmp::PartialOrd,
+)]
 pub(crate) struct EffectKey {
     id: u64,
     generation: u64,
@@ -139,7 +182,15 @@ impl EffectKey {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::Ord,
+    __cser_core::cmp::PartialEq,
+    __cser_core::cmp::PartialOrd,
+)]
 pub(crate) struct OperationClass(u32);
 
 impl OperationClass {
@@ -160,7 +211,15 @@ impl OperationClass {
 /// [`KernelRootAuthority`] still authorize every transition.  In particular,
 /// a device adapter cannot replace the workload effect by presenting matching
 /// integers from another registry, root, or session.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::Ord,
+    __cser_core::cmp::PartialEq,
+    __cser_core::cmp::PartialOrd,
+)]
 pub(crate) struct DeviceEnvelope {
     device_session: u64,
     queue: u16,
@@ -231,7 +290,13 @@ impl DeviceEnvelope {
 /// The descriptor is copied out for inspection but has no mutating API.  A
 /// portal operation presents an opaque [`PortalHandle`], never a rewritten set
 /// of syscall argument registers.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct SyscallDescriptor {
     number: usize,
     arguments: [usize; 6],
@@ -266,7 +331,15 @@ impl SyscallDescriptor {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::Ord,
+    __cser_core::cmp::PartialEq,
+    __cser_core::cmp::PartialOrd,
+)]
 pub(crate) struct CreditClass(u16);
 
 impl CreditClass {
@@ -279,7 +352,13 @@ impl CreditClass {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct CreditLimit {
     class: CreditClass,
     units: u64,
@@ -291,7 +370,13 @@ impl CreditLimit {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct CreditCharge {
     class: CreditClass,
     units: u64,
@@ -311,7 +396,13 @@ impl CreditCharge {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 struct CreditBalance {
     capacity: u64,
     free: u64,
@@ -320,7 +411,12 @@ struct CreditBalance {
     retained: u64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 struct CreditLedger {
     balances: BTreeMap<CreditClass, CreditBalance>,
 }
@@ -436,7 +532,7 @@ impl CreditLedger {
                 CreditState::Held => balance.held -= charge.units,
                 CreditState::Committed => balance.committed -= charge.units,
                 CreditState::Retained | CreditState::Released => {
-                    unreachable!("retention source was prevalidated")
+                    __cser_core::unreachable!("retention source was prevalidated")
                 }
             }
             balance.retained = balance
@@ -504,7 +600,7 @@ impl CreditLedger {
                 CreditState::Held => balance.held -= charge.units,
                 CreditState::Committed => balance.committed -= charge.units,
                 CreditState::Retained => balance.retained -= charge.units,
-                CreditState::Released => unreachable!(),
+                CreditState::Released => __cser_core::unreachable!(),
             }
             balance.free = balance
                 .free
@@ -581,7 +677,13 @@ impl CreditLedger {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct CreditTotals {
     pub(crate) capacity: u64,
     pub(crate) free: u64,
@@ -590,7 +692,13 @@ pub(crate) struct CreditTotals {
     pub(crate) retained: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 enum CreditState {
     Held,
     Committed,
@@ -598,21 +706,39 @@ enum CreditState {
     Released,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) enum ScopePhase {
     Active,
     Closing,
     Revoked,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) enum TerminalOutcome {
     Completed,
     IndeterminateAfterReset,
     Aborted,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) enum EffectPhase {
     Registered,
     Prepared,
@@ -622,7 +748,7 @@ pub(crate) enum EffectPhase {
 
 impl EffectPhase {
     pub(crate) const fn is_terminal(self) -> bool {
-        matches!(self, Self::Terminal(_))
+        __cser_core::matches!(self, Self::Terminal(_))
     }
 }
 
@@ -632,7 +758,13 @@ impl EffectPhase {
 /// adapters translate their wire enum at the boundary and store the resulting
 /// record here so the Registry, rather than an adapter-local phase machine,
 /// remains authoritative for whether an outcome exists.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) enum EffectOutcomeClass {
     Data,
     Error,
@@ -640,7 +772,13 @@ pub(crate) enum EffectOutcomeClass {
 }
 
 /// Canonical backend outcome attached exactly once after commit.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct EffectOutcomeRecord {
     class: EffectOutcomeClass,
     result: i64,
@@ -676,13 +814,24 @@ impl EffectOutcomeRecord {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) enum PublicationMode {
     None,
     Required,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct EffectIdentity {
     effect: EffectKey,
     scope: ScopeKey,
@@ -747,7 +896,13 @@ impl EffectIdentity {
 ///
 /// Fields are intentionally private.  A future portal ABI may serialize the
 /// values, but callers cannot construct a valid handle through this module.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct PortalHandle {
     scope: ScopeKey,
     effect: EffectKey,
@@ -779,7 +934,13 @@ impl PortalHandle {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct CommitMetadata {
     result: i64,
     domain_revision: u64,
@@ -794,7 +955,12 @@ impl CommitMetadata {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct CommitReceipt {
     registry_instance_id: u64,
     effect: EffectKey,
@@ -833,7 +999,12 @@ impl CommitReceipt {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) enum CommitOutcome {
     Applied(CommitReceipt),
     AlreadyCommitted(CommitReceipt),
@@ -845,7 +1016,13 @@ pub(crate) enum CommitOutcome {
 /// root-gated device publication to validate effects from several service
 /// domains without pretending that one domain supervisor owns another
 /// domain's portal handle.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct KernelRootAuthority {
     registry_instance_id: u64,
     scope: ScopeKey,
@@ -865,7 +1042,12 @@ impl KernelRootAuthority {
 
 /// Receipt for one root-wide publication batch whose hardware commit point is
 /// supplied by the caller's infallible closure.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct DeviceBatchCommitReceipt {
     registry_instance_id: u64,
     scope: ScopeKey,
@@ -880,7 +1062,12 @@ pub(crate) struct DeviceBatchCommitReceipt {
 /// publication point. Registration may continue while a scope is merely
 /// device-backed, but no generic commit is permitted once any device effect
 /// exists, and no registration is permitted after this receipt is minted.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct DeviceBatchEnrollmentReceipt {
     registry_instance_id: u64,
     scope: ScopeKey,
@@ -962,7 +1149,7 @@ impl DeviceBatchCommitReceipt {
 
 /// A full replay returns the authoritative receipt without executing the
 /// publication closure a second time.
-#[derive(Debug)]
+#[derive(__cser_core::fmt::Debug)]
 pub(crate) enum DeviceBatchCommitOutcome<T> {
     Applied {
         receipt: DeviceBatchCommitReceipt,
@@ -986,7 +1173,13 @@ impl<T> DeviceBatchCommitOutcome<T> {
 /// Every field is private: a caller may copy an issued identity for retry, but
 /// cannot construct an operation that aliases another Registry, enrollment,
 /// device, root owner, or caller nonce.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct DeviceCloseOperationId {
     registry_instance_id: u64,
     scope: ScopeKey,
@@ -1030,7 +1223,7 @@ impl DeviceCloseOperationId {
 /// Fresh publication and an exact same-operation recovery are the only two
 /// successful production close results. Recovery never republishes and never
 /// advances Registry state.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(crate) enum DeviceCloseOutcome<T> {
     Applied {
         receipt: DeviceBatchCommitReceipt,
@@ -1049,7 +1242,13 @@ pub(crate) enum DeviceCloseOutcome<T> {
 /// the exact operation and batch before entering the hardware publication
 /// closure, but that closure did not return.  The caller must fence the device
 /// rather than retry publication or claim a precommit abort.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) enum DevicePublishedStatus {
     Legacy,
     PossiblyPublished,
@@ -1062,7 +1261,12 @@ pub(crate) enum DevicePublishedStatus {
 /// remains stored in the root for recovery validation; legacy or corrupt
 /// committed roots remain honestly classified as published even when their
 /// batch sequence or new idempotency record is missing.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct DevicePublishedObligation {
     registry_instance_id: u64,
     scope: ScopeKey,
@@ -1154,7 +1358,12 @@ impl DevicePublishedObligation {
 // Keep the published obligation inline so reporting a possibly published
 // operation remains allocation-free and cannot lose its recovery authority.
 #[allow(clippy::large_enum_variant)]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) enum DeviceCloseError {
     Unpublished(RegistryError),
     Published {
@@ -1164,14 +1373,26 @@ pub(crate) enum DeviceCloseError {
 }
 
 /// Honest backend result retained through reset and IOTLB closure.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) enum DeviceClosureResult {
     Completed(i64),
     IndeterminateAfterReset,
     AbortedBeforeCommit,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct DeviceCompletionReceipt {
     registry_instance_id: u64,
     scope: ScopeKey,
@@ -1197,7 +1418,13 @@ impl DeviceCompletionReceipt {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct DeviceResetTicket {
     registry_instance_id: u64,
     scope: ScopeKey,
@@ -1216,7 +1443,12 @@ impl DeviceResetTicket {
 /// One failure-atomic ownership claim for a replayed device publication.
 /// Returning this value means revocation is already Closing and reset owns the
 /// completion race; there is no caller-visible candidate-only state.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 struct DeviceReplayResetClaim {
     selection: RevokeSelection,
     reset_ticket: DeviceResetTicket,
@@ -1226,14 +1458,25 @@ struct DeviceReplayResetClaim {
 /// the caller's prevalidated hardware cancel/reset intent ran exactly once,
 /// the root is Closing, every enrolled credit is retained, and the reset
 /// ticket is installed with an honest `AbortedBeforeCommit` outcome.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct DevicePrecommitCloseReceipt {
     pub(crate) selection: RevokeSelection,
     pub(crate) enrollment: DeviceBatchEnrollmentReceipt,
     pub(crate) reset_ticket: DeviceResetTicket,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct DeviceResetTombstone {
     ticket: DeviceResetTicket,
     sequence: u64,
@@ -1245,7 +1488,13 @@ impl DeviceResetTombstone {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct DeviceResetReceipt {
     registry_instance_id: u64,
     scope: ScopeKey,
@@ -1271,7 +1520,13 @@ impl DeviceResetReceipt {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct DeviceIotlbTicket {
     registry_instance_id: u64,
     scope: ScopeKey,
@@ -1288,7 +1543,13 @@ impl DeviceIotlbTicket {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct DeviceIotlbTombstone {
     ticket: DeviceIotlbTicket,
     sequence: u64,
@@ -1300,7 +1561,13 @@ impl DeviceIotlbTombstone {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct DeviceClosureReceipt {
     registry_instance_id: u64,
     scope: ScopeKey,
@@ -1325,7 +1592,12 @@ impl DeviceClosureReceipt {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct TerminalRequest {
     outcome: TerminalOutcome,
     result: i64,
@@ -1385,7 +1657,12 @@ impl TerminalRequest {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct TerminalReceipt {
     effect: EffectKey,
     outcome: TerminalOutcome,
@@ -1419,7 +1696,12 @@ impl TerminalReceipt {
 
 /// A receipt extracted while the runtime lock is held and acknowledged only
 /// after the corresponding continuation is published outside that lock.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct PublicationTicket {
     effect: EffectKey,
     scope: ScopeKey,
@@ -1443,13 +1725,23 @@ impl PublicationTicket {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct Terminalization {
     pub(crate) receipt: TerminalReceipt,
     pub(crate) publication: Option<PublicationTicket>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct RegisterRequest {
     pub(crate) scope: ScopeKey,
     pub(crate) task: TaskKey,
@@ -1466,7 +1758,12 @@ pub(crate) struct RegisterRequest {
 /// New workload paths use this wrapper so domain membership and immutable
 /// ancestry are installed by the registry in the same transition as identity,
 /// credit, and reverse-index state.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct DerivedRegisterRequest {
     pub(crate) request: RegisterRequest,
     pub(crate) domain: DomainKey,
@@ -1475,7 +1772,12 @@ pub(crate) struct DerivedRegisterRequest {
 
 /// Registers a derived effect whose immutable identity is tied to one exact
 /// device session, queue, descriptor token, and device generation.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct DeviceDerivedRegisterRequest {
     pub(crate) derived: DerivedRegisterRequest,
     pub(crate) device: DeviceEnvelope,
@@ -1483,7 +1785,13 @@ pub(crate) struct DeviceDerivedRegisterRequest {
 
 /// Resolves one parent without requiring a caller to predict an effect key
 /// that the Registry has not allocated yet.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) enum DeviceCohortParent {
     Existing(EffectKey),
     BatchIndex(usize),
@@ -1495,7 +1803,12 @@ pub(crate) enum DeviceCohortParent {
 /// DMA owners. Keeping the index explicit lets validation reject duplicate,
 /// missing, self, forward, and out-of-range references before the live
 /// Registry changes.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct DeviceDerivedCohortEntry {
     pub(crate) batch_index: usize,
     pub(crate) request: RegisterRequest,
@@ -1508,19 +1821,34 @@ pub(crate) struct DeviceDerivedCohortEntry {
 ///
 /// `handle` authenticates the complete immutable effect identity. Only the
 /// registry's current reverse-index association changes.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct ResourceMove {
     pub(crate) handle: PortalHandle,
     pub(crate) current_resources: Vec<ResourceKey>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct RegisteredEffect {
     pub(crate) identity: EffectIdentity,
     pub(crate) handle: PortalHandle,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct EffectView {
     pub(crate) identity: EffectIdentity,
     /// Mutable current membership used by domain indexes. The authenticated
@@ -1554,7 +1882,12 @@ impl EffectView {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 struct EffectRecord {
     identity: EffectIdentity,
     current_resources: BTreeSet<ResourceKey>,
@@ -1574,7 +1907,13 @@ struct EffectRecord {
     publication_acks: u8,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 struct DeviceBatchMembership {
     sequence: u64,
     ordinal: usize,
@@ -1589,7 +1928,12 @@ struct DeviceBatchMembership {
 /// `Publishing` is installed before the external publication closure and is a
 /// valid conservative state after unwind. `Applied` is reached only after the
 /// prevalidated batch and revoke transitions have both been applied.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 enum DevicePublicationProvenance {
     None,
     Legacy,
@@ -1605,7 +1949,7 @@ enum DevicePublicationProvenance {
 
 impl DevicePublicationProvenance {
     const fn is_none(&self) -> bool {
-        matches!(self, Self::None)
+        __cser_core::matches!(self, Self::None)
     }
 
     const fn operation(&self) -> Option<DeviceCloseOperationId> {
@@ -1644,7 +1988,12 @@ impl DevicePublicationProvenance {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 struct DeviceRootState {
     initial_device: DeviceEnvelope,
     current_device: DeviceEnvelope,
@@ -1767,6 +2116,9 @@ struct CombinedScopeInstallPlan {
 /// must add narrow editor methods that stage records only; external apply
 /// remains after authoritative installation.
 mod combined_scope_editor {
+    extern crate alloc as __cser_alloc;
+    extern crate core as __cser_core;
+
     use super::{CombinedScopeCandidate, RegistryError};
 
     pub(super) struct Editor<'a> {
@@ -1922,7 +2274,12 @@ impl EffectRecord {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct ScopeConfig {
     pub(crate) key: ScopeKey,
     pub(crate) authority_epoch: u64,
@@ -1931,14 +2288,25 @@ pub(crate) struct ScopeConfig {
     pub(crate) credits: Vec<CreditLimit>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct DomainConfig {
     pub(crate) key: DomainKey,
     pub(crate) binding_epoch: u64,
     pub(crate) supervisor: TaskKey,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 struct RecoveryState {
     crash_revision: u64,
     cohort: BTreeSet<EffectKey>,
@@ -1947,7 +2315,12 @@ struct RecoveryState {
     ready: Option<TaskKey>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 struct DomainRecoveryState {
     crash_revision: u64,
     cohort: BTreeSet<EffectKey>,
@@ -1956,7 +2329,12 @@ struct DomainRecoveryState {
     ready: Option<TaskKey>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 struct DomainBindingRecord {
     binding_epoch: u64,
     supervisor: Option<TaskKey>,
@@ -1965,7 +2343,12 @@ struct DomainBindingRecord {
     recovery: Option<DomainRecoveryState>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 struct RevokeState {
     sequence: u64,
     cohort: BTreeSet<EffectKey>,
@@ -1977,7 +2360,14 @@ struct RevokeState {
     work: RevokeWorkCounters,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::default::Default,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 struct RevokeWorkCounters {
     begin_target_record_visits: u64,
     next_calls: u64,
@@ -1989,13 +2379,24 @@ struct RevokeWorkCounters {
     history_effect_visits: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 enum RevokeRecordAccess {
     Begin,
     Transition,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 struct ScopeRecord {
     key: ScopeKey,
     phase: ScopePhase,
@@ -2017,7 +2418,7 @@ struct ScopeRecord {
     handoff: Option<ProductionHandoffState>,
 }
 
-#[derive(Default)]
+#[derive(__cser_core::default::Default)]
 struct ExpectedReverseIndexes {
     by_scope: BTreeMap<ScopeKey, BTreeSet<EffectKey>>,
     by_domain: BTreeMap<(ScopeKey, DomainKey), BTreeSet<EffectKey>>,
@@ -2027,7 +2428,13 @@ struct ExpectedReverseIndexes {
     leaves_by_scope: BTreeMap<ScopeKey, BTreeSet<EffectKey>>,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::fmt::Debug,
+    __cser_core::default::Default,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 struct ProductionIndexes {
     by_domain: BTreeMap<(ScopeKey, DomainKey), BTreeSet<EffectKey>>,
     children_by_parent: BTreeMap<EffectKey, BTreeSet<EffectKey>>,
@@ -2051,7 +2458,12 @@ impl ScopeRecord {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct RecoveryEffectSummary {
     pub(crate) effect: EffectKey,
     pub(crate) binding_epoch: u64,
@@ -2063,7 +2475,12 @@ pub(crate) struct RecoveryEffectSummary {
     pub(crate) terminal_manifest_digest: Option<[u8; 32]>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct RecoverySnapshot {
     pub(crate) scope: ScopeKey,
     pub(crate) replacement: TaskKey,
@@ -2074,7 +2491,12 @@ pub(crate) struct RecoverySnapshot {
     pub(crate) effects: Vec<RecoveryEffectSummary>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct DomainRecoverySnapshot {
     pub(crate) scope: ScopeKey,
     pub(crate) domain: DomainKey,
@@ -2086,7 +2508,12 @@ pub(crate) struct DomainRecoverySnapshot {
     pub(crate) effects: Vec<RecoveryEffectSummary>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct RecoveryItem {
     pub(crate) handle: PortalHandle,
     pub(crate) descriptor: SyscallDescriptor,
@@ -2097,7 +2524,12 @@ pub(crate) struct RecoveryItem {
     pub(crate) terminal_manifest_digest: Option<[u8; 32]>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct CrashReceipt {
     pub(crate) scope: ScopeKey,
     pub(crate) previous_binding_epoch: u64,
@@ -2105,14 +2537,25 @@ pub(crate) struct CrashReceipt {
     pub(crate) cohort: BTreeSet<EffectKey>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct RebindReceipt {
     pub(crate) scope: ScopeKey,
     pub(crate) binding_epoch: u64,
     pub(crate) supervisor: TaskKey,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct DomainCrashReceipt {
     pub(crate) scope: ScopeKey,
     pub(crate) domain: DomainKey,
@@ -2121,7 +2564,13 @@ pub(crate) struct DomainCrashReceipt {
     pub(crate) cohort: BTreeSet<EffectKey>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct DomainRebindReceipt {
     pub(crate) scope: ScopeKey,
     pub(crate) domain: DomainKey,
@@ -2129,7 +2578,13 @@ pub(crate) struct DomainRebindReceipt {
     pub(crate) supervisor: TaskKey,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct DomainProjection {
     pub(crate) binding_epoch: u64,
     pub(crate) supervisor: Option<TaskKey>,
@@ -2139,7 +2594,12 @@ pub(crate) struct DomainProjection {
     pub(crate) recovery_remaining: usize,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct RevokeSelection {
     pub(crate) scope: ScopeKey,
     pub(crate) sequence: u64,
@@ -2148,7 +2608,13 @@ pub(crate) struct RevokeSelection {
     pub(crate) target_count: usize,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct RevokeWorkProjection {
     pub(crate) target_count: usize,
     pub(crate) begin_target_record_visits: u64,
@@ -2163,20 +2629,36 @@ pub(crate) struct RevokeWorkProjection {
     pub(crate) target_state: ScopePhase,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) enum RevokeDisposition {
     Abort,
     Drain(CommitReceipt),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct RevokeEffect {
     pub(crate) effect: EffectKey,
     pub(crate) disposition: RevokeDisposition,
     pub(crate) publication_required: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct RegistryProjection {
     pub(crate) phase: ScopePhase,
     pub(crate) authority_epoch: u64,
@@ -2190,7 +2672,13 @@ pub(crate) struct RegistryProjection {
     pub(crate) credits: CreditTotals,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) enum HandoffFreezeReadiness {
     ReadyToCommit,
     NeedsAbort,
@@ -2198,7 +2686,13 @@ pub(crate) enum HandoffFreezeReadiness {
     BlockedRetained,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct ProductionHandoffFreezeReceipt {
     freeze: KernelFreezeReceipt,
     readiness: HandoffFreezeReadiness,
@@ -2224,14 +2718,25 @@ impl ProductionHandoffFreezeReceipt {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct HandoffAbortProgress {
     pub(crate) aborted: usize,
     pub(crate) publications: Vec<PublicationTicket>,
     pub(crate) readiness: HandoffFreezeReadiness,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct HandoffThawReceipt {
     freeze: KernelFreezeReceipt,
     decision: OwnershipDecisionReceipt,
@@ -2244,7 +2749,12 @@ impl HandoffThawReceipt {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct ProductionHandoffClosureReceipt {
     freeze: KernelFreezeReceipt,
     decision: OwnershipDecisionReceipt,
@@ -2267,7 +2777,12 @@ impl ProductionHandoffClosureReceipt {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) enum ProductionHandoffProgress {
     Frozen(HandoffFreezeReadiness),
     Aborted(HandoffThawReceipt),
@@ -2276,7 +2791,12 @@ pub(crate) enum ProductionHandoffProgress {
     Closed(ProductionHandoffClosureReceipt),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 struct ProductionHandoffState {
     freeze: KernelFreezeReceipt,
     cohort: BTreeSet<EffectKey>,
@@ -2287,7 +2807,12 @@ struct ProductionHandoffState {
     closure: Option<ProductionHandoffClosureReceipt>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) enum RegistryError {
     InvalidGeneration,
     InvalidCreditConfiguration,
@@ -2337,13 +2862,19 @@ impl From<infrastructure::InfrastructureError> for RegistryError {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 enum DevicePublicationMode {
     Unique,
     DisabledNonDeviceCandidate,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(crate) struct EffectRegistry {
     instance_id: u64,
     device_publication_mode: DevicePublicationMode,
@@ -2570,7 +3101,7 @@ impl EffectRegistry {
             limits,
             &domains,
         )?;
-        debug_assert!(self.check_infrastructure_root_links().is_ok());
+        __cser_core::debug_assert!(self.check_infrastructure_root_links().is_ok());
         Ok(())
     }
 
@@ -2792,7 +3323,7 @@ impl EffectRegistry {
     /// The live Registry retains authority throughout; neither candidate is
     /// ever promoted as a whole.
     fn install_combined_scope(&mut self, plan: CombinedScopeInstallPlan) {
-        debug_assert!(self.scopes.contains_key(&plan.scope));
+        __cser_core::debug_assert!(self.scopes.contains_key(&plan.scope));
         *self.scopes.get_mut(&plan.scope).unwrap() = plan.replacement_scope;
         self.infrastructure.install_exact_scope(plan.infrastructure);
     }
@@ -2904,7 +3435,7 @@ impl EffectRegistry {
 
         let mut normalized = self.clone();
         normalized.rewrite_registry_instance(NORMALIZED_REGISTRY_INSTANCE);
-        alloc::format!("{normalized:?}")
+        __cser_alloc::format!("{normalized:?}")
     }
 
     #[cfg(test)]
@@ -2918,7 +3449,7 @@ impl EffectRegistry {
     }
 
     fn rewrite_registry_instance(&mut self, registry_instance_id: u64) {
-        assert_ne!(registry_instance_id, 0);
+        __cser_core::assert_ne!(registry_instance_id, 0);
         self.instance_id = registry_instance_id;
         self.infrastructure
             .rewrite_private_registry_instance(registry_instance_id);
@@ -3672,7 +4203,7 @@ impl EffectRegistry {
             }
             let record = self.effects.get(&effect).unwrap();
             if scope_key != Some(record.identity.scope)
-                || !matches!(
+                || !__cser_core::matches!(
                     record.phase,
                     EffectPhase::Registered | EffectPhase::Prepared
                 )
@@ -3918,7 +4449,7 @@ impl EffectRegistry {
             let record = &self.effects[effect];
             if record.identity.scope != scope_key
                 || record.identity.authority_epoch != closed_authority_epoch
-                || !matches!(
+                || !__cser_core::matches!(
                     record.phase,
                     EffectPhase::Registered | EffectPhase::Prepared
                 )
@@ -4055,7 +4586,7 @@ impl EffectRegistry {
                 .ok_or(RegistryError::UnknownEffect)?;
             if record.identity.scope != scope_key
                 || record.identity.authority_epoch != scope.authority_epoch
-                || !matches!(
+                || !__cser_core::matches!(
                     record.phase,
                     EffectPhase::Registered | EffectPhase::Prepared
                 )
@@ -4179,7 +4710,7 @@ impl EffectRegistry {
                 .get(effect)
                 .ok_or(RegistryError::UnknownEffect)?;
             let phase_valid = if installs_enrollment {
-                matches!(
+                __cser_core::matches!(
                     record.phase,
                     EffectPhase::Registered | EffectPhase::Prepared
                 )
@@ -4374,7 +4905,7 @@ impl EffectRegistry {
                     .device_root
                     .as_mut()
                     .expect("prevalidated legacy device root remains present");
-                debug_assert!(root.publication.is_none());
+                __cser_core::debug_assert!(root.publication.is_none());
                 root.publication = DevicePublicationProvenance::Legacy;
                 Ok(DeviceBatchCommitOutcome::Applied {
                     receipt,
@@ -4532,7 +5063,7 @@ impl EffectRegistry {
             .device_root
             .as_mut()
             .expect("prevalidated publishing device root remains present");
-        debug_assert!(root.publication.is_none());
+        __cser_core::debug_assert!(root.publication.is_none());
         root.publication = DevicePublicationProvenance::Publishing {
             operation,
             batch: stored_batch,
@@ -4565,7 +5096,7 @@ impl EffectRegistry {
             .as_mut()
             .expect("prevalidated device-close root remains present");
         let publishing =
-            core::mem::replace(&mut root.publication, DevicePublicationProvenance::None);
+            __cser_core::mem::replace(&mut root.publication, DevicePublicationProvenance::None);
         root.publication = match publishing {
             DevicePublicationProvenance::Publishing {
                 operation: stored_operation,
@@ -4576,7 +5107,9 @@ impl EffectRegistry {
                     batch,
                 }
             }
-            _ => unreachable!("prevalidated Publishing provenance cannot drift under root lock"),
+            _ => __cser_core::unreachable!(
+                "prevalidated Publishing provenance cannot drift under root lock"
+            ),
         };
         (receipt, selection)
     }
@@ -4644,7 +5177,7 @@ impl EffectRegistry {
         }
         let selection = Self::device_revoke_selection(operation.scope, scope)
             .ok_or(RegistryError::InvalidState)?;
-        if !matches!(scope.phase, ScopePhase::Closing | ScopePhase::Revoked)
+        if !__cser_core::matches!(scope.phase, ScopePhase::Closing | ScopePhase::Revoked)
             || selection.closed_authority_epoch != operation.authority_epoch
             || selection.target_count != stored.commits.len()
         {
@@ -4800,11 +5333,12 @@ impl EffectRegistry {
             .get(&presented.scope)
             .and_then(|scope| scope.device_root.as_ref())
             .ok_or(RegistryError::InvalidBatchReceipt)?;
-        let publication_matches = matches!(&root.publication, DevicePublicationProvenance::Legacy)
-            || matches!(
-                &root.publication,
-                DevicePublicationProvenance::Applied { batch, .. } if batch == presented
-            );
+        let publication_matches =
+            __cser_core::matches!(&root.publication, DevicePublicationProvenance::Legacy)
+                || __cser_core::matches!(
+                    &root.publication,
+                    DevicePublicationProvenance::Applied { batch, .. } if batch == presented
+                );
         if root.batch_sequence != Some(presented.batch_sequence)
             || root.initial_device != presented.device
             || !publication_matches
@@ -5230,7 +5764,7 @@ impl EffectRegistry {
         {
             return Err(RegistryError::InvalidState);
         }
-        if matches!(
+        if __cser_core::matches!(
             root.outcome,
             Some(
                 DeviceClosureResult::IndeterminateAfterReset
@@ -5822,13 +6356,13 @@ impl EffectRegistry {
                 .effects
                 .get(effect)
                 .ok_or(RegistryError::UnknownEffect)?;
-            let valid_unpublished = matches!(
+            let valid_unpublished = __cser_core::matches!(
                 record.phase,
                 EffectPhase::Registered | EffectPhase::Prepared
             ) && (record.credit_state == CreditState::Held
                 || (record.credit_state == CreditState::Retained && retained_unpublished));
             let valid_published = record.phase == EffectPhase::Committed
-                && matches!(
+                && __cser_core::matches!(
                     record.credit_state,
                     CreditState::Committed | CreditState::Retained
                 );
@@ -6137,8 +6671,8 @@ impl EffectRegistry {
             return Err(RegistryError::InvalidBatchReceipt);
         }
 
-        let mut slots = alloc::vec![None::<CommitReceipt>; first.size];
-        let mut device_slots = alloc::vec![false; first.size];
+        let mut slots = __cser_alloc::vec![None::<CommitReceipt>; first.size];
+        let mut device_slots = __cser_alloc::vec![false; first.size];
         let mut authority_epoch = None;
         for record in self.effects.values() {
             let Some(membership) = record.device_batch else {
@@ -6972,7 +7506,7 @@ impl EffectRegistry {
         record.pending_publication = None;
         record.publication_acks = 1;
         scope_record.pending_publications = next_pending_publications;
-        assert!(
+        __cser_core::assert!(
             scope_record.handoff_candidates.remove(&effect),
             "acknowledged publication must leave the handoff index"
         );
@@ -7091,7 +7625,7 @@ impl EffectRegistry {
         loop {
             let next = cohort.iter().copied().find(|effect| {
                 self.effects.get(effect).is_some_and(|record| {
-                    matches!(
+                    __cser_core::matches!(
                         record.phase,
                         EffectPhase::Registered | EffectPhase::Prepared
                     ) && self
@@ -7487,7 +8021,7 @@ impl EffectRegistry {
             return Err(RegistryError::InvalidState);
         }
         if scope.device_root.as_ref().is_some_and(|root| {
-            matches!(
+            __cser_core::matches!(
                 root.publication,
                 DevicePublicationProvenance::Publishing { .. }
             )
@@ -7534,9 +8068,9 @@ impl EffectRegistry {
             .scopes
             .get_mut(&selection.scope)
             .expect("validated revoke scope must remain present");
-        let cohort = core::mem::take(&mut scope.closure_candidates);
+        let cohort = __cser_core::mem::take(&mut scope.closure_candidates);
         let retired_recovery = scope.recovery.take();
-        debug_assert_eq!(cohort.len(), selection.target_count);
+        __cser_core::debug_assert_eq!(cohort.len(), selection.target_count);
         scope.authority_epoch = selection.authority_epoch;
         scope.phase = ScopePhase::Closing;
         scope.supervisor = None;
@@ -8133,7 +8667,7 @@ impl EffectRegistry {
                     return Err(RegistryError::Invariant("invalid revoke accounting"));
                 }
                 match scope.phase {
-                    ScopePhase::Active => unreachable!(),
+                    ScopePhase::Active => __cser_core::unreachable!(),
                     ScopePhase::Closing => {
                         if revoke.cohort.len() != revoke.target_count
                             || revoke.work.completion_members_checked != 0
@@ -8281,7 +8815,7 @@ impl EffectRegistry {
                         || record.terminalizations != 0
                         || record.publication_acks != 0
                         || record.pending_publication.is_some()
-                        || !matches!(
+                        || !__cser_core::matches!(
                             record.credit_state,
                             CreditState::Committed | CreditState::Retained
                         )
@@ -8417,7 +8951,7 @@ impl EffectRegistry {
                 }
                 device_batches.insert((record.identity.scope, membership.sequence));
             } else if record.identity.device.is_some()
-                && matches!(
+                && __cser_core::matches!(
                     record.phase,
                     EffectPhase::Committed
                         | EffectPhase::Terminal(TerminalOutcome::Completed)
@@ -8795,7 +9329,10 @@ impl EffectRegistry {
                         || stored != &batch
                         || selection.closed_authority_epoch != operation.authority_epoch
                         || selection.target_count != enrollment.effects.len()
-                        || !matches!(scope.phase, ScopePhase::Closing | ScopePhase::Revoked)
+                        || !__cser_core::matches!(
+                            scope.phase,
+                            ScopePhase::Closing | ScopePhase::Revoked
+                        )
                     {
                         return Err(RegistryError::Invariant(
                             "device close operation identity drift",
@@ -9355,7 +9892,7 @@ impl EffectRegistry {
         scope.revision = next_scope_revision;
         scope.pending_publications = next_pending_publications;
         if ticket.is_none() {
-            assert!(
+            __cser_core::assert!(
                 scope.handoff_candidates.remove(&effect),
                 "terminal effect without publication must leave the handoff index"
             );
@@ -9422,7 +9959,7 @@ impl EffectRegistry {
                 .or_default()
                 .insert(identity.effect);
         }
-        assert!(
+        __cser_core::assert!(
             self.scopes
                 .get_mut(&identity.scope)
                 .expect("effect scope must exist before reverse-index insertion")
@@ -9430,7 +9967,7 @@ impl EffectRegistry {
                 .insert(identity.effect),
             "effect must be new to the closure candidate index"
         );
-        assert!(
+        __cser_core::assert!(
             self.scopes
                 .get_mut(&identity.scope)
                 .expect("effect scope must exist before handoff-index insertion")
@@ -9445,7 +9982,7 @@ impl EffectRegistry {
                 .entry(parent)
                 .or_default();
             let was_leaf = children.is_empty();
-            assert!(
+            __cser_core::assert!(
                 children.insert(identity.effect),
                 "derived effect must be new to its parent index"
             );
@@ -9453,7 +9990,7 @@ impl EffectRegistry {
                 remove_index_member(&mut self.production.leaves_by_scope, identity.scope, parent);
             }
         }
-        assert!(
+        __cser_core::assert!(
             self.production
                 .leaves_by_scope
                 .entry(identity.scope)
@@ -9494,11 +10031,11 @@ impl EffectRegistry {
                     .effects
                     .get(&parent)
                     .expect("live child must reference a known parent");
-                assert!(
+                __cser_core::assert!(
                     !parent_record.phase.is_terminal(),
                     "a live child cannot outlive its parent"
                 );
-                assert!(
+                __cser_core::assert!(
                     self.production
                         .leaves_by_scope
                         .entry(identity.scope)
@@ -9513,18 +10050,18 @@ impl EffectRegistry {
             .get_mut(&identity.scope)
             .expect("effect scope must exist during reverse-index removal");
         match scope.phase {
-            ScopePhase::Active => assert!(
+            ScopePhase::Active => __cser_core::assert!(
                 scope.closure_candidates.remove(&identity.effect),
                 "active effect must exist in the closure candidate index"
             ),
-            ScopePhase::Closing => assert!(
+            ScopePhase::Closing => __cser_core::assert!(
                 scope
                     .revoke
                     .as_ref()
                     .is_some_and(|revoke| revoke.cohort.contains(&identity.effect)),
                 "closing effect must remain in the frozen revoke cohort"
             ),
-            ScopePhase::Revoked => panic!("revoked scope cannot retain a live effect"),
+            ScopePhase::Revoked => __cser_core::panic!("revoked scope cannot retain a live effect"),
         }
     }
 
@@ -9624,7 +10161,7 @@ fn handoff_readiness(
         if record.pending_publication.is_some() {
             publication_pending = true;
         }
-        if matches!(
+        if __cser_core::matches!(
             record.phase,
             EffectPhase::Registered | EffectPhase::Prepared
         ) {
@@ -9760,7 +10297,7 @@ fn causal_commit_matches(
             && (source.identity.domain != target.domain
                 || causal.binding_epoch <= target.binding_epoch)
             && source.commit.as_ref() == Some(causal)
-            && matches!(
+            && __cser_core::matches!(
                 source.phase,
                 EffectPhase::Committed
                     | EffectPhase::Terminal(TerminalOutcome::Completed)
@@ -9837,13 +10374,13 @@ fn remove_index_member<K: Ord + Copy>(
     effect: EffectKey,
 ) {
     let remove_entry = if let Some(members) = index.get_mut(&key) {
-        assert!(
+        __cser_core::assert!(
             members.remove(&effect),
             "effect must exist in every reverse index"
         );
         members.is_empty()
     } else {
-        panic!("effect reverse index is missing");
+        __cser_core::panic!("effect reverse index is missing");
     };
     if remove_entry {
         index.remove(&key);
@@ -9878,7 +10415,13 @@ fn add_expected_credits(
 /// A production-registry fixture used by the Stage 7B structural and timing
 /// evaluators. `n` is the total live population, `k` is the target scope's
 /// live population, and `h` is retained terminal history.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct Stage7bFixtureConfig {
     pub(crate) n: usize,
     pub(crate) k: usize,
@@ -9888,7 +10431,15 @@ pub(crate) struct Stage7bFixtureConfig {
 /// Exact Stage 7B fault-matrix identity.  Credit capacity is frozen here so a
 /// fault adapter cannot manufacture a passing ledger from a gate population
 /// such as `waiter_count` or `effect_count`.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::Ord,
+    __cser_core::cmp::PartialEq,
+    __cser_core::cmp::PartialOrd,
+)]
 pub(crate) enum Stage7bFaultCase {
     SchedulerLeaseExpiryBeforeProposal,
     SchedulerCrashAfterProposalBeforePick,
@@ -9951,7 +10502,15 @@ impl Stage7bFaultCase {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::Ord,
+    __cser_core::cmp::PartialEq,
+    __cser_core::cmp::PartialOrd,
+)]
 pub(crate) enum Stage7bFaultOperation {
     SchedulerFallbackPick,
     PagerContinuation,
@@ -9973,7 +10532,15 @@ impl Stage7bFaultOperation {
 /// The semantic half of a composite credit authority.  The opaque registry
 /// handle is held separately in [`Stage7bFaultCredit`]; every commit and
 /// terminal transition must present this exact case/operation/identity again.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::Ord,
+    __cser_core::cmp::PartialEq,
+    __cser_core::cmp::PartialOrd,
+)]
 pub(crate) struct Stage7bFaultBinding {
     case: Stage7bFaultCase,
     operation: Stage7bFaultOperation,
@@ -9998,7 +10565,13 @@ impl Stage7bFaultBinding {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) enum Stage7bFaultTerminal {
     Aborted(i64),
     Completed(i64),
@@ -10006,7 +10579,7 @@ pub(crate) enum Stage7bFaultTerminal {
 
 /// Linear pairing of one semantic authority and one opaque production
 /// registry handle.  It is intentionally neither `Clone` nor `Copy`.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(crate) struct Stage7bFaultCredit {
     instance_id: u64,
     binding: Stage7bFaultBinding,
@@ -10015,7 +10588,13 @@ pub(crate) struct Stage7bFaultCredit {
     terminalized: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct Stage7bFaultBudgetProjection {
     pub(crate) case: Stage7bFaultCase,
     pub(crate) instance_id: u64,
@@ -10044,7 +10623,7 @@ impl Stage7bFaultBudgetProjection {
     }
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(crate) struct Stage7bFaultBudget {
     case: Stage7bFaultCase,
     instance_id: u64,
@@ -10060,7 +10639,7 @@ pub(crate) struct Stage7bFaultBudget {
 /// Read-only, complete failure-atomicity snapshot of one case-local ledger.
 /// Its fields remain private so cloning this value cannot mint usable Registry
 /// handles or transition authority.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(crate) struct Stage7bFaultBudgetState {
     case: Stage7bFaultCase,
     instance_id: u64,
@@ -10111,7 +10690,7 @@ impl Stage7bFaultBudget {
             authority_epoch: 1,
             binding_epoch: 1,
             supervisor: task,
-            credits: alloc::vec![CreditLimit::new(credit, units)],
+            credits: __cser_alloc::vec![CreditLimit::new(credit, units)],
         })?;
         registry.check_invariants()?;
         Ok(Self {
@@ -10168,8 +10747,8 @@ impl Stage7bFaultBudget {
                         .map_err(|_| RegistryError::CounterOverflow)?,
                 ],
             ),
-            resources: alloc::vec![ResourceKey::new(namespace, resource_id, 1)],
-            credits: alloc::vec![CreditCharge::new(self.credit, 1)],
+            resources: __cser_alloc::vec![ResourceKey::new(namespace, resource_id, 1)],
+            credits: __cser_alloc::vec![CreditCharge::new(self.credit, 1)],
             publication: PublicationMode::None,
         })?;
         self.bindings.insert(binding);
@@ -10308,14 +10887,20 @@ impl Stage7bFaultBudget {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct Stage7bNoCreditProjection {
     pub(crate) case: Stage7bFaultCase,
     pub(crate) binding: Stage7bFaultBinding,
     pub(crate) consumed: bool,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(crate) struct Stage7bNoCredit {
     case: Stage7bFaultCase,
     binding: Stage7bFaultBinding,
@@ -10354,14 +10939,14 @@ impl Stage7bNoCredit {
     }
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(crate) struct Stage7bActiveFixture {
     config: Stage7bFixtureConfig,
     registry: EffectRegistry,
     target_scope: ScopeKey,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(crate) struct Stage7bCompleteFixture {
     config: Stage7bFixtureConfig,
     registry: EffectRegistry,
@@ -10390,7 +10975,13 @@ impl Clone for Stage7bCompleteFixture {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct Stage7bScaleObservation {
     pub(crate) config: Stage7bFixtureConfig,
     pub(crate) work: RevokeWorkProjection,
@@ -10426,7 +11017,7 @@ impl Stage7bActiveFixture {
             credits: if target_capacity == 0 {
                 Vec::new()
             } else {
-                alloc::vec![CreditLimit::new(TARGET_CREDIT, target_capacity)]
+                __cser_alloc::vec![CreditLimit::new(TARGET_CREDIT, target_capacity)]
             },
         })?;
         for (key, supervisor, credit, units) in [
@@ -10443,7 +11034,7 @@ impl Stage7bActiveFixture {
                 authority_epoch: 1,
                 binding_epoch: 1,
                 supervisor,
-                credits: alloc::vec![CreditLimit::new(credit, units)],
+                credits: __cser_alloc::vec![CreditLimit::new(credit, units)],
             })?;
         }
 
@@ -10624,8 +11215,8 @@ fn register_stage7b_effect(
             0x7b00,
             [namespace_argument, ordinal_argument, 0, 0, 0, 0],
         ),
-        resources: alloc::vec![ResourceKey::new(namespace, resource_id, 1)],
-        credits: alloc::vec![CreditCharge::new(credit, 1)],
+        resources: __cser_alloc::vec![ResourceKey::new(namespace, resource_id, 1)],
+        credits: __cser_alloc::vec![CreditCharge::new(credit, 1)],
         publication: PublicationMode::None,
     })
 }
@@ -10650,7 +11241,13 @@ fn drain_stage7b_selection(
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct RegistrySelfTestReceipt {
     pub(crate) effects: usize,
     pub(crate) recovery_adoptions: usize,
@@ -10674,7 +11271,7 @@ fn bounded_kernel_completion_during_recovery_self_test() {
             authority_epoch: 112,
             binding_epoch: 1,
             supervisor: v1,
-            credits: alloc::vec![CreditLimit::new(credit, 1)],
+            credits: __cser_alloc::vec![CreditLimit::new(credit, 1)],
         })
         .unwrap();
     let effect = registry
@@ -10683,8 +11280,8 @@ fn bounded_kernel_completion_during_recovery_self_test() {
             task,
             operation: OperationClass::new(9),
             descriptor: SyscallDescriptor::new(202, [0x402020, 129, 1, 0, 0, 0]),
-            resources: alloc::vec![ResourceKey::new(9, 1, 1)],
-            credits: alloc::vec![CreditCharge::new(credit, 1)],
+            resources: __cser_alloc::vec![ResourceKey::new(9, 1, 1)],
+            credits: __cser_alloc::vec![CreditCharge::new(credit, 1)],
             publication: PublicationMode::Required,
         })
         .unwrap();
@@ -10694,7 +11291,7 @@ fn bounded_kernel_completion_during_recovery_self_test() {
         .unwrap()
     {
         CommitOutcome::Applied(receipt) => receipt,
-        CommitOutcome::AlreadyCommitted(_) => unreachable!(),
+        CommitOutcome::AlreadyCommitted(_) => __cser_core::unreachable!(),
     };
 
     registry.crash(scope, v1).unwrap();
@@ -10702,8 +11299,8 @@ fn bounded_kernel_completion_during_recovery_self_test() {
     registry.ready(scope, v2, &stale_snapshot).unwrap();
     let terminal = registry.stage_kernel_completion(&commit).unwrap();
     registry.check_invariants().unwrap();
-    assert_eq!(registry.recovery_remaining(scope), Ok(0));
-    assert_eq!(
+    __cser_core::assert_eq!(registry.recovery_remaining(scope), Ok(0));
+    __cser_core::assert_eq!(
         registry.rebind(scope, v2),
         Err(RegistryError::RecoveryNotReady),
     );
@@ -10712,12 +11309,12 @@ fn bounded_kernel_completion_during_recovery_self_test() {
         .unwrap();
 
     let snapshot = registry.recovery_snapshot(scope, v2).unwrap();
-    assert!(snapshot.effects.is_empty());
+    __cser_core::assert!(snapshot.effects.is_empty());
     registry.ready(scope, v2, &snapshot).unwrap();
     registry.rebind(scope, v2).unwrap();
-    assert!(registry.recover_next(scope, v2).unwrap().is_none());
+    __cser_core::assert!(registry.recover_next(scope, v2).unwrap().is_none());
     let selection = registry.revoke_begin(scope).unwrap();
-    assert!(registry.revoke_next(&selection).unwrap().is_none());
+    __cser_core::assert!(registry.revoke_next(&selection).unwrap().is_none());
     registry.revoke_complete(&selection).unwrap();
     registry.check_invariants().unwrap();
 }
@@ -10735,7 +11332,7 @@ fn committed_causal_test_registry(
             authority_epoch: 1,
             binding_epoch: 1,
             supervisor: task,
-            credits: alloc::vec![CreditLimit::new(credit, 1)],
+            credits: __cser_alloc::vec![CreditLimit::new(credit, 1)],
         })
         .unwrap();
     let registered = registry
@@ -10744,8 +11341,8 @@ fn committed_causal_test_registry(
             task,
             operation: OperationClass::new(namespace),
             descriptor: SyscallDescriptor::new(namespace as usize, [0; 6]),
-            resources: alloc::vec![ResourceKey::new(namespace, 1, 1)],
-            credits: alloc::vec![CreditCharge::new(credit, 1)],
+            resources: __cser_alloc::vec![ResourceKey::new(namespace, 1, 1)],
+            credits: __cser_alloc::vec![CreditCharge::new(credit, 1)],
             publication: PublicationMode::None,
         })
         .unwrap();
@@ -10755,7 +11352,7 @@ fn committed_causal_test_registry(
         .unwrap()
     {
         CommitOutcome::Applied(receipt) => receipt,
-        CommitOutcome::AlreadyCommitted(_) => unreachable!(),
+        CommitOutcome::AlreadyCommitted(_) => __cser_core::unreachable!(),
     };
     registry.check_invariants().unwrap();
     (registry, registered.handle, commit)
@@ -10777,7 +11374,7 @@ pub(crate) fn stage7b_causal_commit_self_test() {
             authority_epoch: 1,
             binding_epoch: 1,
             supervisor: POSITIVE_TASK,
-            credits: alloc::vec![CreditLimit::new(POSITIVE_CREDIT, 2)],
+            credits: __cser_alloc::vec![CreditLimit::new(POSITIVE_CREDIT, 2)],
         })
         .unwrap();
     let source = positive
@@ -10786,8 +11383,8 @@ pub(crate) fn stage7b_causal_commit_self_test() {
             task: POSITIVE_TASK,
             operation: OperationClass::new(1),
             descriptor: SyscallDescriptor::new(1, [1, 0, 0, 0, 0, 0]),
-            resources: alloc::vec![ResourceKey::new(0x7bca, 1, 1)],
-            credits: alloc::vec![CreditCharge::new(POSITIVE_CREDIT, 1)],
+            resources: __cser_alloc::vec![ResourceKey::new(0x7bca, 1, 1)],
+            credits: __cser_alloc::vec![CreditCharge::new(POSITIVE_CREDIT, 1)],
             publication: PublicationMode::None,
         })
         .unwrap();
@@ -10797,8 +11394,8 @@ pub(crate) fn stage7b_causal_commit_self_test() {
             task: POSITIVE_TASK,
             operation: OperationClass::new(2),
             descriptor: SyscallDescriptor::new(2, [2, 0, 0, 0, 0, 0]),
-            resources: alloc::vec![ResourceKey::new(0x7bca, 2, 1)],
-            credits: alloc::vec![CreditCharge::new(POSITIVE_CREDIT, 1)],
+            resources: __cser_alloc::vec![ResourceKey::new(0x7bca, 2, 1)],
+            credits: __cser_alloc::vec![CreditCharge::new(POSITIVE_CREDIT, 1)],
             publication: PublicationMode::None,
         })
         .unwrap();
@@ -10808,7 +11405,7 @@ pub(crate) fn stage7b_causal_commit_self_test() {
         .unwrap()
     {
         CommitOutcome::Applied(receipt) => receipt,
-        CommitOutcome::AlreadyCommitted(_) => unreachable!(),
+        CommitOutcome::AlreadyCommitted(_) => __cser_core::unreachable!(),
     };
     let target_terminal = positive
         .stage_terminal(
@@ -10817,7 +11414,7 @@ pub(crate) fn stage7b_causal_commit_self_test() {
             TerminalRequest::completed_by(2, source_commit.clone()),
         )
         .unwrap();
-    assert_eq!(
+    __cser_core::assert_eq!(
         target_terminal.receipt.outcome(),
         TerminalOutcome::Completed
     );
@@ -10839,7 +11436,7 @@ pub(crate) fn stage7b_causal_commit_self_test() {
                 authority_epoch: 1,
                 binding_epoch: 1,
                 supervisor: task,
-                credits: alloc::vec![CreditLimit::new(credit, 1)],
+                credits: __cser_alloc::vec![CreditLimit::new(credit, 1)],
             })
             .unwrap();
     }
@@ -10849,8 +11446,8 @@ pub(crate) fn stage7b_causal_commit_self_test() {
             task: TASK_A,
             operation: OperationClass::new(3),
             descriptor: SyscallDescriptor::new(3, [0; 6]),
-            resources: alloc::vec![ResourceKey::new(0x7bcb, 1, 1)],
-            credits: alloc::vec![CreditCharge::new(CREDIT_A, 1)],
+            resources: __cser_alloc::vec![ResourceKey::new(0x7bcb, 1, 1)],
+            credits: __cser_alloc::vec![CreditCharge::new(CREDIT_A, 1)],
             publication: PublicationMode::None,
         })
         .unwrap();
@@ -10860,8 +11457,8 @@ pub(crate) fn stage7b_causal_commit_self_test() {
             task: TASK_B,
             operation: OperationClass::new(4),
             descriptor: SyscallDescriptor::new(4, [0; 6]),
-            resources: alloc::vec![ResourceKey::new(0x7bcc, 1, 1)],
-            credits: alloc::vec![CreditCharge::new(CREDIT_B, 1)],
+            resources: __cser_alloc::vec![ResourceKey::new(0x7bcc, 1, 1)],
+            credits: __cser_alloc::vec![CreditCharge::new(CREDIT_B, 1)],
             publication: PublicationMode::None,
         })
         .unwrap();
@@ -10872,17 +11469,17 @@ pub(crate) fn stage7b_causal_commit_self_test() {
         .unwrap()
     {
         CommitOutcome::Applied(receipt) => receipt,
-        CommitOutcome::AlreadyCommitted(_) => unreachable!(),
+        CommitOutcome::AlreadyCommitted(_) => __cser_core::unreachable!(),
     };
     let commit_b = match cross_scope
         .commit(TASK_B, effect_b.handle, CommitMetadata::new(4, 1))
         .unwrap()
     {
         CommitOutcome::Applied(receipt) => receipt,
-        CommitOutcome::AlreadyCommitted(_) => unreachable!(),
+        CommitOutcome::AlreadyCommitted(_) => __cser_core::unreachable!(),
     };
     let cross_scope_before = cross_scope.clone();
-    assert_eq!(
+    __cser_core::assert_eq!(
         cross_scope.stage_terminal(
             TASK_A,
             effect_a.handle,
@@ -10890,8 +11487,8 @@ pub(crate) fn stage7b_causal_commit_self_test() {
         ),
         Err(RegistryError::CommitConflict)
     );
-    assert_eq!(cross_scope, cross_scope_before);
-    assert_eq!(
+    __cser_core::assert_eq!(cross_scope, cross_scope_before);
+    __cser_core::assert_eq!(
         cross_scope.stage_terminal(
             TASK_B,
             effect_b.handle,
@@ -10899,7 +11496,7 @@ pub(crate) fn stage7b_causal_commit_self_test() {
         ),
         Err(RegistryError::CommitConflict)
     );
-    assert_eq!(cross_scope, cross_scope_before);
+    __cser_core::assert_eq!(cross_scope, cross_scope_before);
     cross_scope.stage_kernel_completion(&commit_a).unwrap();
     cross_scope.stage_kernel_completion(&commit_b).unwrap();
     cross_scope.check_invariants().unwrap();
@@ -10911,24 +11508,24 @@ pub(crate) fn stage7b_causal_commit_self_test() {
         committed_causal_test_registry(SHARED_SCOPE, SHARED_TASK, SHARED_CREDIT, 0x7bd0);
     let (mut second, second_handle, second_commit) =
         committed_causal_test_registry(SHARED_SCOPE, SHARED_TASK, SHARED_CREDIT, 0x7bd0);
-    assert_ne!(
+    __cser_core::assert_ne!(
         first_commit.registry_instance_id,
         second_commit.registry_instance_id
     );
-    assert_eq!(first_commit.effect, second_commit.effect);
-    assert_eq!(first_commit.scope, second_commit.scope);
-    assert_eq!(first_commit.authority_epoch, second_commit.authority_epoch);
-    assert_eq!(first_commit.binding_epoch, second_commit.binding_epoch);
-    assert_eq!(first_commit.sequence, second_commit.sequence);
-    assert_eq!(first_commit.result, second_commit.result);
-    assert_eq!(first_commit.domain_revision, second_commit.domain_revision);
-    assert_eq!(
+    __cser_core::assert_eq!(first_commit.effect, second_commit.effect);
+    __cser_core::assert_eq!(first_commit.scope, second_commit.scope);
+    __cser_core::assert_eq!(first_commit.authority_epoch, second_commit.authority_epoch);
+    __cser_core::assert_eq!(first_commit.binding_epoch, second_commit.binding_epoch);
+    __cser_core::assert_eq!(first_commit.sequence, second_commit.sequence);
+    __cser_core::assert_eq!(first_commit.result, second_commit.result);
+    __cser_core::assert_eq!(first_commit.domain_revision, second_commit.domain_revision);
+    __cser_core::assert_eq!(
         first_commit.descriptor_digest,
         second_commit.descriptor_digest
     );
     let first_before = first.clone();
     let second_before = second.clone();
-    assert_eq!(
+    __cser_core::assert_eq!(
         first.stage_terminal(
             SHARED_TASK,
             first_handle,
@@ -10936,9 +11533,9 @@ pub(crate) fn stage7b_causal_commit_self_test() {
         ),
         Err(RegistryError::CommitConflict)
     );
-    assert_eq!(first, first_before);
-    assert_eq!(second, second_before);
-    assert_eq!(
+    __cser_core::assert_eq!(first, first_before);
+    __cser_core::assert_eq!(second, second_before);
+    __cser_core::assert_eq!(
         second.stage_terminal(
             SHARED_TASK,
             second_handle,
@@ -10946,8 +11543,8 @@ pub(crate) fn stage7b_causal_commit_self_test() {
         ),
         Err(RegistryError::CommitConflict)
     );
-    assert_eq!(first, first_before);
-    assert_eq!(second, second_before);
+    __cser_core::assert_eq!(first, first_before);
+    __cser_core::assert_eq!(second, second_before);
     first.stage_kernel_completion(&first_commit).unwrap();
     second.stage_kernel_completion(&second_commit).unwrap();
     first.check_invariants().unwrap();
@@ -10967,7 +11564,7 @@ fn stage7b_registry_refactor_self_test() {
             authority_epoch: 1,
             binding_epoch: 1,
             supervisor: atomic_task,
-            credits: alloc::vec![CreditLimit::new(atomic_credit, 1)],
+            credits: __cser_alloc::vec![CreditLimit::new(atomic_credit, 1)],
         })
         .unwrap();
     let request = || RegisterRequest {
@@ -10975,35 +11572,35 @@ fn stage7b_registry_refactor_self_test() {
         task: atomic_task,
         operation: OperationClass::new(0x7bf0),
         descriptor: SyscallDescriptor::new(0x7bf0, [0; 6]),
-        resources: alloc::vec![ResourceKey::new(0x7bf0, 1, 1)],
-        credits: alloc::vec![CreditCharge::new(atomic_credit, 1)],
+        resources: __cser_alloc::vec![ResourceKey::new(0x7bf0, 1, 1)],
+        credits: __cser_alloc::vec![CreditCharge::new(atomic_credit, 1)],
         publication: PublicationMode::None,
     };
     atomic.scopes.get_mut(&atomic_scope).unwrap().revision = u64::MAX;
     let before = atomic.clone();
-    assert_eq!(
+    __cser_core::assert_eq!(
         atomic.register(request()),
         Err(RegistryError::CounterOverflow)
     );
-    assert_eq!(atomic, before);
+    __cser_core::assert_eq!(atomic, before);
     atomic.scopes.get_mut(&atomic_scope).unwrap().revision = 0;
     let registered = atomic.register(request()).unwrap();
     atomic.scopes.get_mut(&atomic_scope).unwrap().revision = u64::MAX;
     let before = atomic.clone();
-    assert_eq!(
+    __cser_core::assert_eq!(
         atomic.prepare(atomic_task, registered.handle),
         Err(RegistryError::CounterOverflow)
     );
-    assert_eq!(atomic, before);
+    __cser_core::assert_eq!(atomic, before);
     atomic.scopes.get_mut(&atomic_scope).unwrap().revision = 1;
     atomic.prepare(atomic_task, registered.handle).unwrap();
     atomic.scopes.get_mut(&atomic_scope).unwrap().revision = u64::MAX;
     let before = atomic.clone();
-    assert_eq!(
+    __cser_core::assert_eq!(
         atomic.crash(atomic_scope, atomic_task),
         Err(RegistryError::CounterOverflow)
     );
-    assert_eq!(atomic, before);
+    __cser_core::assert_eq!(atomic, before);
     {
         let scope = atomic.scopes.get_mut(&atomic_scope).unwrap();
         scope.revision = 2;
@@ -11015,15 +11612,15 @@ fn stage7b_registry_refactor_self_test() {
             .binding_epoch = u64::MAX;
     }
     let before = atomic.clone();
-    assert_eq!(
+    __cser_core::assert_eq!(
         atomic.crash(atomic_scope, atomic_task),
         Err(RegistryError::CounterOverflow)
     );
-    assert_eq!(atomic, before);
+    __cser_core::assert_eq!(atomic, before);
 
     let config = Stage7bFixtureConfig { n: 8, k: 3, h: 2 };
     let fixture = Stage7bActiveFixture::new(config).unwrap();
-    assert_eq!(fixture.target_projection().unwrap().live_effects, config.k);
+    __cser_core::assert_eq!(fixture.target_projection().unwrap().live_effects, config.k);
     fixture.check_invariants().unwrap();
 
     // The three zero-valued scale metrics are real counters, not constants in
@@ -11088,66 +11685,66 @@ fn stage7b_registry_refactor_self_test() {
         .registry
         .revoke_work_projection(&instrumented_selection)
         .unwrap();
-    assert_eq!(work.begin_target_record_visits, 1);
-    assert_eq!(work.unrelated_effect_visits, 1);
-    assert_eq!(work.history_effect_visits, 1);
+    __cser_core::assert_eq!(work.begin_target_record_visits, 1);
+    __cser_core::assert_eq!(work.unrelated_effect_visits, 1);
+    __cser_core::assert_eq!(work.history_effect_visits, 1);
 
     let mut closed = fixture.clone();
     let selection = closed.close_all().unwrap();
     let observation = closed.observation(&selection).unwrap();
-    assert_eq!(observation.config, config);
-    assert_eq!(observation.work.target_count, 3);
-    assert_eq!(observation.work.begin_target_record_visits, 0);
-    assert_eq!(observation.work.next_calls, 4);
-    assert_eq!(observation.work.head_selections, 3);
-    assert_eq!(observation.work.terminalized, 3);
-    assert_eq!(observation.work.completion_members_checked, 3);
-    assert_eq!(observation.work.target_index_removals, 3);
-    assert_eq!(observation.work.unrelated_effect_visits, 0);
-    assert_eq!(observation.work.history_effect_visits, 0);
-    assert_eq!(observation.work.pending_targets, 0);
-    assert_eq!(observation.work.target_state, ScopePhase::Revoked);
-    assert_eq!(observation.target.phase, ScopePhase::Revoked);
+    __cser_core::assert_eq!(observation.config, config);
+    __cser_core::assert_eq!(observation.work.target_count, 3);
+    __cser_core::assert_eq!(observation.work.begin_target_record_visits, 0);
+    __cser_core::assert_eq!(observation.work.next_calls, 4);
+    __cser_core::assert_eq!(observation.work.head_selections, 3);
+    __cser_core::assert_eq!(observation.work.terminalized, 3);
+    __cser_core::assert_eq!(observation.work.completion_members_checked, 3);
+    __cser_core::assert_eq!(observation.work.target_index_removals, 3);
+    __cser_core::assert_eq!(observation.work.unrelated_effect_visits, 0);
+    __cser_core::assert_eq!(observation.work.history_effect_visits, 0);
+    __cser_core::assert_eq!(observation.work.pending_targets, 0);
+    __cser_core::assert_eq!(observation.work.target_state, ScopePhase::Revoked);
+    __cser_core::assert_eq!(observation.target.phase, ScopePhase::Revoked);
     closed.check_invariants().unwrap();
     let before = closed.registry.clone();
-    assert_eq!(closed.begin(), Err(RegistryError::ScopeNotActive));
-    assert_eq!(closed.registry, before);
+    __cser_core::assert_eq!(closed.begin(), Err(RegistryError::ScopeNotActive));
+    __cser_core::assert_eq!(closed.registry, before);
 
     let mut empty = Stage7bActiveFixture::new(Stage7bFixtureConfig { n: 4, k: 0, h: 3 }).unwrap();
     let empty_active = empty.target_projection().unwrap();
-    assert_eq!(empty_active.credits.capacity, 0);
-    assert_eq!(empty_active.credits.free, 0);
-    assert_eq!(empty_active.credits.held, 0);
-    assert_eq!(empty_active.credits.committed, 0);
+    __cser_core::assert_eq!(empty_active.credits.capacity, 0);
+    __cser_core::assert_eq!(empty_active.credits.free, 0);
+    __cser_core::assert_eq!(empty_active.credits.held, 0);
+    __cser_core::assert_eq!(empty_active.credits.committed, 0);
     let selection = empty.close_all().unwrap();
     let empty_observation = empty.observation(&selection).unwrap();
-    assert_eq!(empty_observation.work.target_count, 0);
-    assert_eq!(empty_observation.work.next_calls, 1);
-    assert_eq!(empty_observation.work.head_selections, 0);
-    assert_eq!(empty_observation.work.terminalized, 0);
-    assert_eq!(empty_observation.work.completion_members_checked, 0);
-    assert_eq!(empty_observation.work.target_state, ScopePhase::Revoked);
-    assert_eq!(empty_observation.target.credits, empty_active.credits);
+    __cser_core::assert_eq!(empty_observation.work.target_count, 0);
+    __cser_core::assert_eq!(empty_observation.work.next_calls, 1);
+    __cser_core::assert_eq!(empty_observation.work.head_selections, 0);
+    __cser_core::assert_eq!(empty_observation.work.terminalized, 0);
+    __cser_core::assert_eq!(empty_observation.work.completion_members_checked, 0);
+    __cser_core::assert_eq!(empty_observation.work.target_state, ScopePhase::Revoked);
+    __cser_core::assert_eq!(empty_observation.target.credits, empty_active.credits);
     empty.check_invariants().unwrap();
 
     // Unknown and overflow failures do not consume the revoke sequence or
     // alter any registry-owned state.
     let mut unknown = fixture.clone();
     let before = unknown.registry.clone();
-    assert_eq!(
+    __cser_core::assert_eq!(
         unknown.registry.revoke_begin(ScopeKey::new(0xffff, 1)),
         Err(RegistryError::UnknownScope)
     );
-    assert_eq!(unknown.registry, before);
+    __cser_core::assert_eq!(unknown.registry, before);
 
     let mut sequence_overflow = fixture.clone();
     sequence_overflow.registry.next_revoke_sequence = u64::MAX;
     let before = sequence_overflow.registry.clone();
-    assert_eq!(
+    __cser_core::assert_eq!(
         sequence_overflow.begin(),
         Err(RegistryError::CounterOverflow)
     );
-    assert_eq!(sequence_overflow.registry, before);
+    __cser_core::assert_eq!(sequence_overflow.registry, before);
 
     let mut authority_overflow = fixture.clone();
     authority_overflow
@@ -11157,11 +11754,11 @@ fn stage7b_registry_refactor_self_test() {
         .unwrap()
         .authority_epoch = u64::MAX;
     let before = authority_overflow.registry.clone();
-    assert_eq!(
+    __cser_core::assert_eq!(
         authority_overflow.begin(),
         Err(RegistryError::CounterOverflow)
     );
-    assert_eq!(authority_overflow.registry, before);
+    __cser_core::assert_eq!(authority_overflow.registry, before);
 
     let mut revision_overflow = fixture.clone();
     revision_overflow
@@ -11171,21 +11768,21 @@ fn stage7b_registry_refactor_self_test() {
         .unwrap()
         .revision = u64::MAX;
     let before = revision_overflow.registry.clone();
-    assert_eq!(
+    __cser_core::assert_eq!(
         revision_overflow.begin(),
         Err(RegistryError::CounterOverflow)
     );
-    assert_eq!(revision_overflow.registry, before);
+    __cser_core::assert_eq!(revision_overflow.registry, before);
 
     let mut tampered = fixture.clone();
     let mut selection = tampered.begin().unwrap();
     selection.closed_authority_epoch += 1;
     let before = tampered.registry.clone();
-    assert_eq!(
+    __cser_core::assert_eq!(
         tampered.registry.revoke_next(&selection),
         Err(RegistryError::InvalidRevokeSelection)
     );
-    assert_eq!(tampered.registry, before);
+    __cser_core::assert_eq!(tampered.registry, before);
 
     let mut complete_overflow = fixture.prepare_complete_baseline().unwrap();
     complete_overflow
@@ -11195,11 +11792,11 @@ fn stage7b_registry_refactor_self_test() {
         .unwrap()
         .revision = u64::MAX;
     let before = complete_overflow.registry.clone();
-    assert_eq!(
+    __cser_core::assert_eq!(
         complete_overflow.complete(),
         Err(RegistryError::CounterOverflow)
     );
-    assert_eq!(complete_overflow.registry, before);
+    __cser_core::assert_eq!(complete_overflow.registry, before);
 
     let mut terminal_overflow =
         Stage7bActiveFixture::new(Stage7bFixtureConfig { n: 2, k: 1, h: 0 }).unwrap();
@@ -11212,7 +11809,7 @@ fn stage7b_registry_refactor_self_test() {
         .effect;
     terminal_overflow.registry.next_terminal_sequence = u64::MAX;
     let before = terminal_overflow.registry.clone();
-    assert_eq!(
+    __cser_core::assert_eq!(
         terminal_overflow.registry.stage_revoke_terminal(
             &selection,
             effect,
@@ -11220,7 +11817,7 @@ fn stage7b_registry_refactor_self_test() {
         ),
         Err(RegistryError::CounterOverflow)
     );
-    assert_eq!(terminal_overflow.registry, before);
+    __cser_core::assert_eq!(terminal_overflow.registry, before);
 
     let mut publication_overflow =
         Stage7bActiveFixture::new(Stage7bFixtureConfig { n: 2, k: 1, h: 0 }).unwrap();
@@ -11245,7 +11842,7 @@ fn stage7b_registry_refactor_self_test() {
         .unwrap();
     publication_overflow.registry.next_publication_sequence = u64::MAX;
     let before = publication_overflow.registry.clone();
-    assert_eq!(
+    __cser_core::assert_eq!(
         publication_overflow.registry.stage_revoke_terminal(
             &selection,
             effect,
@@ -11253,7 +11850,7 @@ fn stage7b_registry_refactor_self_test() {
         ),
         Err(RegistryError::CounterOverflow)
     );
-    assert_eq!(publication_overflow.registry, before);
+    __cser_core::assert_eq!(publication_overflow.registry, before);
 
     let mut revision_overflow =
         Stage7bActiveFixture::new(Stage7bFixtureConfig { n: 2, k: 1, h: 0 }).unwrap();
@@ -11271,7 +11868,7 @@ fn stage7b_registry_refactor_self_test() {
         .unwrap()
         .revision = u64::MAX;
     let before = revision_overflow.registry.clone();
-    assert_eq!(
+    __cser_core::assert_eq!(
         revision_overflow.registry.stage_revoke_terminal(
             &selection,
             effect,
@@ -11279,7 +11876,7 @@ fn stage7b_registry_refactor_self_test() {
         ),
         Err(RegistryError::CounterOverflow)
     );
-    assert_eq!(revision_overflow.registry, before);
+    __cser_core::assert_eq!(revision_overflow.registry, before);
 
     let mut ack_overflow =
         Stage7bActiveFixture::new(Stage7bFixtureConfig { n: 2, k: 1, h: 0 }).unwrap();
@@ -11308,7 +11905,7 @@ fn stage7b_registry_refactor_self_test() {
         .unwrap()
         .publication
         .unwrap();
-    assert_eq!(
+    __cser_core::assert_eq!(
         ack_overflow
             .target_projection()
             .unwrap()
@@ -11322,11 +11919,11 @@ fn stage7b_registry_refactor_self_test() {
         .unwrap()
         .revision = u64::MAX;
     let before = ack_overflow.registry.clone();
-    assert_eq!(
+    __cser_core::assert_eq!(
         ack_overflow.registry.acknowledge_publication(&ticket),
         Err(RegistryError::CounterOverflow)
     );
-    assert_eq!(ack_overflow.registry, before);
+    __cser_core::assert_eq!(ack_overflow.registry, before);
 
     let mut commit_overflow =
         Stage7bActiveFixture::new(Stage7bFixtureConfig { n: 2, k: 1, h: 0 }).unwrap();
@@ -11350,13 +11947,13 @@ fn stage7b_registry_refactor_self_test() {
         .unwrap()
         .revision = u64::MAX;
     let before = commit_overflow.registry.clone();
-    assert_eq!(
+    __cser_core::assert_eq!(
         commit_overflow
             .registry
             .commit(supervisor, handle, CommitMetadata::new(1, 1)),
         Err(RegistryError::CounterOverflow)
     );
-    assert_eq!(commit_overflow.registry, before);
+    __cser_core::assert_eq!(commit_overflow.registry, before);
 
     // Re-reading a selected head is idempotent: it neither skips the target
     // nor counts a second head selection.
@@ -11365,18 +11962,18 @@ fn stage7b_registry_refactor_self_test() {
     let selection = duplicate.begin().unwrap();
     let first = duplicate.registry.revoke_next(&selection).unwrap().unwrap();
     let second = duplicate.registry.revoke_next(&selection).unwrap().unwrap();
-    assert_eq!(first, second);
+    __cser_core::assert_eq!(first, second);
     let work = duplicate
         .registry
         .revoke_work_projection(&selection)
         .unwrap();
-    assert_eq!(work.next_calls, 2);
-    assert_eq!(work.head_selections, 1);
+    __cser_core::assert_eq!(work.next_calls, 2);
+    __cser_core::assert_eq!(work.head_selections, 1);
     duplicate
         .registry
         .stage_revoke_terminal(&selection, first.effect, TerminalRequest::aborted(-125))
         .unwrap();
-    assert!(
+    __cser_core::assert!(
         duplicate
             .registry
             .revoke_next(&selection)
@@ -11392,20 +11989,20 @@ fn stage7b_registry_refactor_self_test() {
     let mut commit_first =
         Stage7bActiveFixture::new(Stage7bFixtureConfig { n: 1, k: 1, h: 0 }).unwrap();
     let handle = commit_first.prepare_single_target().unwrap();
-    assert!(matches!(
+    __cser_core::assert!(__cser_core::matches!(
         commit_first.commit_single_target(handle).unwrap(),
         CommitOutcome::Applied(_)
     ));
     let selection = commit_first.begin().unwrap();
     commit_first.finish_revoke(&selection).unwrap();
-    assert_eq!(
+    __cser_core::assert_eq!(
         commit_first.single_target_terminal(handle).unwrap(),
         TerminalOutcome::Completed
     );
     let observation = commit_first.observation(&selection).unwrap();
-    assert_eq!(observation.target.credits.free, 1);
-    assert_eq!(observation.target.credits.held, 0);
-    assert_eq!(observation.target.credits.committed, 0);
+    __cser_core::assert_eq!(observation.target.credits.free, 1);
+    __cser_core::assert_eq!(observation.target.credits.held, 0);
+    __cser_core::assert_eq!(observation.target.credits.committed, 0);
     commit_first.check_invariants().unwrap();
 
     let mut revoke_first =
@@ -11413,23 +12010,23 @@ fn stage7b_registry_refactor_self_test() {
     let handle = revoke_first.prepare_single_target().unwrap();
     let selection = revoke_first.begin().unwrap();
     revoke_first.finish_revoke(&selection).unwrap();
-    assert_eq!(
+    __cser_core::assert_eq!(
         revoke_first.commit_single_target(handle),
         Err(RegistryError::StaleAuthority)
     );
-    assert_eq!(
+    __cser_core::assert_eq!(
         revoke_first.single_target_terminal(handle).unwrap(),
         TerminalOutcome::Aborted
     );
     let observation = revoke_first.observation(&selection).unwrap();
-    assert_eq!(observation.target.credits.free, 1);
-    assert_eq!(observation.target.credits.held, 0);
-    assert_eq!(observation.target.credits.committed, 0);
+    __cser_core::assert_eq!(observation.target.credits.free, 1);
+    __cser_core::assert_eq!(observation.target.credits.held, 0);
+    __cser_core::assert_eq!(observation.target.credits.committed, 0);
     revoke_first.check_invariants().unwrap();
 }
 
 fn publication_ack_and_revoke_complete_self_test() {
-    use core::cell::Cell;
+    use __cser_core::cell::Cell;
 
     const SCOPE: ScopeKey = ScopeKey::new(0x1f00, 1);
     const SUPERVISOR: TaskKey = TaskKey::new(0x1f00, 1);
@@ -11445,7 +12042,7 @@ fn publication_ack_and_revoke_complete_self_test() {
             authority_epoch: 1,
             binding_epoch: 1,
             supervisor: SUPERVISOR,
-            credits: alloc::vec![CreditLimit::new(CREDIT, 2)],
+            credits: __cser_alloc::vec![CreditLimit::new(CREDIT, 2)],
         })
         .unwrap();
     registry
@@ -11464,8 +12061,8 @@ fn publication_ack_and_revoke_complete_self_test() {
             task: ROOT_TASK,
             operation: OperationClass::new(1),
             descriptor: SyscallDescriptor::new(1, [0; 6]),
-            resources: alloc::vec![ResourceKey::new(0x1f0, 1, 1)],
-            credits: alloc::vec![CreditCharge::new(CREDIT, 1)],
+            resources: __cser_alloc::vec![ResourceKey::new(0x1f0, 1, 1)],
+            credits: __cser_alloc::vec![CreditCharge::new(CREDIT, 1)],
             publication: PublicationMode::Required,
         })
         .unwrap();
@@ -11476,8 +12073,8 @@ fn publication_ack_and_revoke_complete_self_test() {
                 task: CHILD_TASK,
                 operation: OperationClass::new(2),
                 descriptor: SyscallDescriptor::new(2, [0; 6]),
-                resources: alloc::vec![ResourceKey::new(0x1f0, 2, 1)],
-                credits: alloc::vec![CreditCharge::new(CREDIT, 1)],
+                resources: __cser_alloc::vec![ResourceKey::new(0x1f0, 2, 1)],
+                credits: __cser_alloc::vec![CreditCharge::new(CREDIT, 1)],
                 publication: PublicationMode::Required,
             },
             domain: CHILD_DOMAIN,
@@ -11489,7 +12086,7 @@ fn publication_ack_and_revoke_complete_self_test() {
 
     let selection = registry.revoke_begin(SCOPE).unwrap();
     let selected_child = registry.revoke_next(&selection).unwrap().unwrap();
-    assert_eq!(selected_child.effect, child.identity.effect());
+    __cser_core::assert_eq!(selected_child.effect, child.identity.effect());
     let child_ticket = registry
         .stage_revoke_terminal(
             &selection,
@@ -11500,7 +12097,7 @@ fn publication_ack_and_revoke_complete_self_test() {
         .publication
         .unwrap();
     let selected_root = registry.revoke_next(&selection).unwrap().unwrap();
-    assert_eq!(selected_root.effect, root.identity.effect());
+    __cser_core::assert_eq!(selected_root.effect, root.identity.effect());
     let root_ticket = registry
         .stage_revoke_terminal(
             &selection,
@@ -11510,12 +12107,12 @@ fn publication_ack_and_revoke_complete_self_test() {
         .unwrap()
         .publication
         .unwrap();
-    assert!(registry.revoke_next(&selection).unwrap().is_none());
+    __cser_core::assert!(registry.revoke_next(&selection).unwrap().is_none());
     registry.check_invariants().unwrap();
 
     let two_pending_before = registry.clone();
     let two_pending_applies = Cell::new(0_u8);
-    assert_eq!(
+    __cser_core::assert_eq!(
         registry.acknowledge_publication_and_revoke_complete_with_apply(
             &child_ticket,
             &selection,
@@ -11523,8 +12120,8 @@ fn publication_ack_and_revoke_complete_self_test() {
         ),
         Err(RegistryError::NotQuiescent)
     );
-    assert_eq!(two_pending_applies.get(), 0);
-    assert_eq!(registry, two_pending_before);
+    __cser_core::assert_eq!(two_pending_applies.get(), 0);
+    __cser_core::assert_eq!(registry, two_pending_before);
 
     registry.acknowledge_publication(&child_ticket).unwrap();
     registry.check_invariants().unwrap();
@@ -11535,7 +12132,7 @@ fn publication_ack_and_revoke_complete_self_test() {
     let mut wrong = ready.clone();
     let wrong_before = wrong.clone();
     let wrong_applies = Cell::new(0_u8);
-    assert_eq!(
+    __cser_core::assert_eq!(
         wrong.acknowledge_publication_and_revoke_complete_with_apply(
             &root_ticket,
             &wrong_selection,
@@ -11543,14 +12140,14 @@ fn publication_ack_and_revoke_complete_self_test() {
         ),
         Err(RegistryError::InvalidRevokeSelection)
     );
-    assert_eq!(wrong_applies.get(), 0);
-    assert_eq!(wrong, wrong_before);
+    __cser_core::assert_eq!(wrong_applies.get(), 0);
+    __cser_core::assert_eq!(wrong, wrong_before);
 
     let mut overflow = ready.clone();
     overflow.scopes.get_mut(&SCOPE).unwrap().revision = u64::MAX - 1;
     let overflow_before = overflow.clone();
     let overflow_applies = Cell::new(0_u8);
-    assert_eq!(
+    __cser_core::assert_eq!(
         overflow.acknowledge_publication_and_revoke_complete_with_apply(
             &root_ticket,
             &selection,
@@ -11558,12 +12155,12 @@ fn publication_ack_and_revoke_complete_self_test() {
         ),
         Err(RegistryError::CounterOverflow)
     );
-    assert_eq!(overflow_applies.get(), 0);
-    assert_eq!(overflow, overflow_before);
+    __cser_core::assert_eq!(overflow_applies.get(), 0);
+    __cser_core::assert_eq!(overflow, overflow_before);
 
     let revision_before = registry.scopes[&SCOPE].revision;
     let successful_applies = Cell::new(0_u8);
-    assert_eq!(
+    __cser_core::assert_eq!(
         registry
             .acknowledge_publication_and_revoke_complete_with_apply(
                 &root_ticket,
@@ -11576,12 +12173,12 @@ fn publication_ack_and_revoke_complete_self_test() {
             .unwrap(),
         0x51
     );
-    assert_eq!(successful_applies.get(), 1);
-    assert_eq!(registry.scopes[&SCOPE].revision, revision_before + 2);
+    __cser_core::assert_eq!(successful_applies.get(), 1);
+    __cser_core::assert_eq!(registry.scopes[&SCOPE].revision, revision_before + 2);
     let projection = registry.scope_projection(SCOPE).unwrap();
-    assert_eq!(projection.phase, ScopePhase::Revoked);
-    assert_eq!(projection.pending_publications, 0);
-    assert_eq!(projection.credits.free, projection.credits.capacity);
+    __cser_core::assert_eq!(projection.phase, ScopePhase::Revoked);
+    __cser_core::assert_eq!(projection.pending_publications, 0);
+    __cser_core::assert_eq!(projection.credits.free, projection.credits.capacity);
     registry.check_invariants().unwrap();
 }
 
@@ -11606,7 +12203,7 @@ fn combined_scope_candidate_self_test() {
                     authority_epoch: 7,
                     binding_epoch: 1,
                     supervisor: owner,
-                    credits: alloc::vec![CreditLimit::new(credit, 1)],
+                    credits: __cser_alloc::vec![CreditLimit::new(credit, 1)],
                 })
                 .unwrap();
         }
@@ -11616,8 +12213,8 @@ fn combined_scope_candidate_self_test() {
                 task: TARGET_OWNER,
                 operation: OperationClass::new(0xc081),
                 descriptor: SyscallDescriptor::new(0xc081, [0; 6]),
-                resources: alloc::vec![ResourceKey::new(0xc081, 1, 1)],
-                credits: alloc::vec![CreditCharge::new(TARGET_CREDIT, 1)],
+                resources: __cser_alloc::vec![ResourceKey::new(0xc081, 1, 1)],
+                credits: __cser_alloc::vec![CreditCharge::new(TARGET_CREDIT, 1)],
                 publication: PublicationMode::None,
             })
             .unwrap()
@@ -11629,8 +12226,8 @@ fn combined_scope_candidate_self_test() {
                 task: UNRELATED_OWNER,
                 operation: OperationClass::new(0xc082),
                 descriptor: SyscallDescriptor::new(0xc082, [0; 6]),
-                resources: alloc::vec![ResourceKey::new(0xc082, 1, 1)],
-                credits: alloc::vec![CreditCharge::new(UNRELATED_CREDIT, 1)],
+                resources: __cser_alloc::vec![ResourceKey::new(0xc082, 1, 1)],
+                credits: __cser_alloc::vec![CreditCharge::new(UNRELATED_CREDIT, 1)],
                 publication: PublicationMode::None,
             })
             .unwrap()
@@ -11658,33 +12255,33 @@ fn combined_scope_candidate_self_test() {
         .infrastructure
         .corrupt_domain_epoch_for_test(TARGET, DomainKey::LEGACY, 2);
     let before = wrong_domain_epoch.clone();
-    assert!(matches!(
+    __cser_core::assert!(__cser_core::matches!(
         wrong_domain_epoch.check_invariants(),
         Err(RegistryError::Invariant(_))
     ));
-    assert_eq!(wrong_domain_epoch, before);
+    __cser_core::assert_eq!(wrong_domain_epoch, before);
 
     let (mut extra_domain, _, _) = fixture();
     extra_domain
         .infrastructure
         .add_domain_for_test(TARGET, DomainKey::new(0xc0f0), 1);
     let before = extra_domain.clone();
-    assert!(matches!(
+    __cser_core::assert!(__cser_core::matches!(
         extra_domain.check_invariants(),
         Err(RegistryError::Invariant(_))
     ));
-    assert_eq!(extra_domain, before);
+    __cser_core::assert_eq!(extra_domain, before);
 
     let (mut wrong_lifecycle, _, _) = fixture();
     wrong_lifecycle
         .infrastructure
         .set_closing_lifecycle_for_test(TARGET);
     let before = wrong_lifecycle.clone();
-    assert!(matches!(
+    __cser_core::assert!(__cser_core::matches!(
         wrong_lifecycle.check_invariants(),
         Err(RegistryError::Invariant(_))
     ));
-    assert_eq!(wrong_lifecycle, before);
+    __cser_core::assert_eq!(wrong_lifecycle, before);
 
     // Active roots use the current epoch. Closing and revoked roots retain
     // the exact closed epoch while the business scope advances exactly once.
@@ -11702,16 +12299,16 @@ fn combined_scope_candidate_self_test() {
         .unwrap()
         .authority_epoch += 1;
     let before = rolled_authority.clone();
-    assert!(matches!(
+    __cser_core::assert!(__cser_core::matches!(
         rolled_authority.check_invariants(),
         Err(RegistryError::Invariant(_))
     ));
-    assert_eq!(rolled_authority, before);
+    __cser_core::assert_eq!(rolled_authority, before);
 
     let terminal = closing
         .stage_revoke_terminal(&selection, target_root, TerminalRequest::aborted(-125))
         .unwrap();
-    assert!(terminal.publication.is_none());
+    __cser_core::assert!(terminal.publication.is_none());
     // The last member is terminal before revoke completion.  This is a legal
     // public Registry return state: the immutable infrastructure root remains
     // Closing while the business live index has already dropped the root.
@@ -11729,12 +12326,12 @@ fn combined_scope_candidate_self_test() {
     let stale_candidate = stale.combined_scope_candidate(TARGET).unwrap();
     stale.scopes.get_mut(&TARGET).unwrap().revision += 1;
     let before_stale_install = stale.clone();
-    assert!(matches!(
+    __cser_core::assert!(__cser_core::matches!(
         stale.prepare_combined_scope_install(stale_candidate),
         Err(RegistryError::CombinedCandidateStale),
     ));
-    assert_eq!(stale, before_stale_install);
-    assert!(stale.infrastructure.is_authoritative_for_test());
+    __cser_core::assert_eq!(stale, before_stale_install);
+    __cser_core::assert!(stale.infrastructure.is_authoritative_for_test());
 
     // The independent infrastructure base revision is fenced as well; a
     // business revision match cannot authorize an older infrastructure view.
@@ -11746,14 +12343,14 @@ fn combined_scope_candidate_self_test() {
         .infrastructure
         .advance_authoritative_scope_revision_for_test(TARGET);
     let before_stale_install = stale_infrastructure.clone();
-    assert!(matches!(
+    __cser_core::assert!(__cser_core::matches!(
         stale_infrastructure.prepare_combined_scope_install(stale_candidate),
         Err(RegistryError::Infrastructure(
             infrastructure::InfrastructureError::StaleAuthority
         )),
     ));
-    assert_eq!(stale_infrastructure, before_stale_install);
-    assert!(
+    __cser_core::assert_eq!(stale_infrastructure, before_stale_install);
+    __cser_core::assert!(
         stale_infrastructure
             .infrastructure
             .is_authoritative_for_test()
@@ -11769,14 +12366,14 @@ fn combined_scope_candidate_self_test() {
         .infrastructure
         .corrupt_candidate_sequence_for_test(TARGET);
     let before_invalid_infrastructure = invalid_infrastructure.clone();
-    assert!(matches!(
+    __cser_core::assert!(__cser_core::matches!(
         invalid_infrastructure.prepare_combined_scope_install(candidate),
         Err(RegistryError::Infrastructure(
             infrastructure::InfrastructureError::Invariant(_)
         )),
     ));
-    assert_eq!(invalid_infrastructure, before_invalid_infrastructure);
-    assert!(
+    __cser_core::assert_eq!(invalid_infrastructure, before_invalid_infrastructure);
+    __cser_core::assert!(
         invalid_infrastructure
             .infrastructure
             .is_authoritative_for_test()
@@ -11791,11 +12388,11 @@ fn combined_scope_candidate_self_test() {
         .infrastructure
         .corrupt_candidate_root_for_test(TARGET, unrelated_root);
     let before_invalid_root = invalid_root.clone();
-    assert!(matches!(
+    __cser_core::assert!(__cser_core::matches!(
         invalid_root.prepare_combined_scope_install(candidate),
         Err(RegistryError::Invariant(_)),
     ));
-    assert_eq!(invalid_root, before_invalid_root);
+    __cser_core::assert_eq!(invalid_root, before_invalid_root);
 
     // The business Registry's own invariant checker rejects a malformed
     // candidate before either authoritative scope is replaced.
@@ -11803,21 +12400,21 @@ fn combined_scope_candidate_self_test() {
     let mut candidate = invalid_business.combined_scope_candidate(TARGET).unwrap();
     candidate.replacement.scopes.get_mut(&TARGET).unwrap().key = ScopeKey::new(0xc0ff, 1);
     let before_invalid_business = invalid_business.clone();
-    assert!(matches!(
+    __cser_core::assert!(__cser_core::matches!(
         invalid_business.prepare_combined_scope_install(candidate),
         Err(RegistryError::Invariant(_)),
     ));
-    assert_eq!(invalid_business, before_invalid_business);
+    __cser_core::assert_eq!(invalid_business, before_invalid_business);
 
     // A fallible staging step is also failure-atomic: no install plan exists
     // until the closure returns success and both validation gates pass.
     let (mut stage_failure, _, _) = fixture();
     let before_stage_failure = stage_failure.clone();
-    assert_eq!(
+    __cser_core::assert_eq!(
         stage_failure.combined_scope_transaction(TARGET, |_| Err(RegistryError::InvalidState)),
         Err(RegistryError::InvalidState),
     );
-    assert_eq!(stage_failure, before_stage_failure);
+    __cser_core::assert_eq!(stage_failure, before_stage_failure);
 
     // This foundation is deliberately shape-preserving.  A global allocator
     // or target EffectRecord change is rejected rather than partly installed.
@@ -11825,11 +12422,11 @@ fn combined_scope_candidate_self_test() {
     let mut candidate = changed_shape.combined_scope_candidate(TARGET).unwrap();
     candidate.replacement.next_effect_id += 1;
     let before_changed_shape = changed_shape.clone();
-    assert!(matches!(
+    __cser_core::assert!(__cser_core::matches!(
         changed_shape.prepare_combined_scope_install(candidate),
         Err(RegistryError::CombinedCandidateShapeChanged),
     ));
-    assert_eq!(changed_shape, before_changed_shape);
+    __cser_core::assert_eq!(changed_shape, before_changed_shape);
 
     // Success replaces exactly the target business scope and target
     // infrastructure scope.  Effect records, allocators, and the unrelated
@@ -11856,11 +12453,11 @@ fn combined_scope_candidate_self_test() {
     success
         .combined_scope_transaction(TARGET, |editor| editor.advance_scope_revisions())
         .unwrap();
-    assert_eq!(
+    __cser_core::assert_eq!(
         success.scopes[&TARGET].revision,
         target_registry_revision + 1
     );
-    assert_eq!(
+    __cser_core::assert_eq!(
         success
             .infrastructure
             .root_binding(TARGET)
@@ -11868,14 +12465,14 @@ fn combined_scope_candidate_self_test() {
             .revision,
         target_infrastructure_revision + 1,
     );
-    assert_eq!(success.effects[&target_root], target_effect_before);
-    assert_eq!(success.scopes[&UNRELATED], unrelated_scope_before);
-    assert_eq!(success.effects[&unrelated_root], unrelated_effect_before);
-    assert_eq!(
+    __cser_core::assert_eq!(success.effects[&target_root], target_effect_before);
+    __cser_core::assert_eq!(success.scopes[&UNRELATED], unrelated_scope_before);
+    __cser_core::assert_eq!(success.effects[&unrelated_root], unrelated_effect_before);
+    __cser_core::assert_eq!(
         success.infrastructure.root_binding(UNRELATED).unwrap(),
         unrelated_infrastructure_before,
     );
-    assert_eq!(
+    __cser_core::assert_eq!(
         (
             success.next_effect_id,
             success.next_nonce,
@@ -11886,7 +12483,7 @@ fn combined_scope_candidate_self_test() {
         ),
         allocator_projection,
     );
-    assert!(success.infrastructure.is_authoritative_for_test());
+    __cser_core::assert!(success.infrastructure.is_authoritative_for_test());
     success.check_invariants().unwrap();
 }
 
@@ -11930,7 +12527,7 @@ pub(crate) fn production_identity_registry_self_test() {
             authority_epoch: 7,
             binding_epoch: 1,
             supervisor: legacy_supervisor,
-            credits: alloc::vec![
+            credits: __cser_alloc::vec![
                 CreditLimit::new(PERSONALITY_CREDIT, 1),
                 CreditLimit::new(FILESYSTEM_CREDIT, 1),
                 CreditLimit::new(BLOCK_CREDIT, 1),
@@ -11962,7 +12559,7 @@ pub(crate) fn production_identity_registry_self_test() {
             authority_epoch: 9,
             binding_epoch: 1,
             supervisor: unrelated_supervisor,
-            credits: alloc::vec![CreditLimit::new(UNRELATED_CREDIT, 1)],
+            credits: __cser_alloc::vec![CreditLimit::new(UNRELATED_CREDIT, 1)],
         })
         .unwrap();
     let unrelated = registry
@@ -11971,8 +12568,8 @@ pub(crate) fn production_identity_registry_self_test() {
             task: unrelated_supervisor,
             operation: OperationClass::new(0x2ff),
             descriptor: SyscallDescriptor::new(0x2ff, [0; 6]),
-            resources: alloc::vec![ResourceKey::new(0x2f, 1, 1)],
-            credits: alloc::vec![CreditCharge::new(UNRELATED_CREDIT, 1)],
+            resources: __cser_alloc::vec![ResourceKey::new(0x2f, 1, 1)],
+            credits: __cser_alloc::vec![CreditCharge::new(UNRELATED_CREDIT, 1)],
             publication: PublicationMode::None,
         })
         .unwrap();
@@ -11984,8 +12581,8 @@ pub(crate) fn production_identity_registry_self_test() {
                 task: personality_task,
                 operation: OperationClass::new(0x201),
                 descriptor: SyscallDescriptor::new(0, [17, 0, 0, 0, 0, 0]),
-                resources: alloc::vec![personality_resource],
-                credits: alloc::vec![CreditCharge::new(PERSONALITY_CREDIT, 1)],
+                resources: __cser_alloc::vec![personality_resource],
+                credits: __cser_alloc::vec![CreditCharge::new(PERSONALITY_CREDIT, 1)],
                 publication: PublicationMode::None,
             },
             domain: PERSONALITY_DOMAIN,
@@ -11999,8 +12596,8 @@ pub(crate) fn production_identity_registry_self_test() {
                 task: filesystem_task,
                 operation: OperationClass::new(0x202),
                 descriptor: SyscallDescriptor::new(17, [3, 0x1000, 4096, 0, 0, 0]),
-                resources: alloc::vec![filesystem_resource],
-                credits: alloc::vec![CreditCharge::new(FILESYSTEM_CREDIT, 1)],
+                resources: __cser_alloc::vec![filesystem_resource],
+                credits: __cser_alloc::vec![CreditCharge::new(FILESYSTEM_CREDIT, 1)],
                 publication: PublicationMode::None,
             },
             domain: FILESYSTEM_DOMAIN,
@@ -12014,8 +12611,8 @@ pub(crate) fn production_identity_registry_self_test() {
                 task: block_task,
                 operation: OperationClass::new(0x203),
                 descriptor: SyscallDescriptor::new(0x203, [0, 8, 0x1000, 4096, 0, 0]),
-                resources: alloc::vec![block_resource],
-                credits: alloc::vec![CreditCharge::new(BLOCK_CREDIT, 1)],
+                resources: __cser_alloc::vec![block_resource],
+                credits: __cser_alloc::vec![CreditCharge::new(BLOCK_CREDIT, 1)],
                 publication: PublicationMode::None,
             },
             domain: BLOCK_DOMAIN,
@@ -12023,18 +12620,18 @@ pub(crate) fn production_identity_registry_self_test() {
         })
         .unwrap();
 
-    assert_eq!(personality.identity.scope(), scope);
-    assert_eq!(filesystem.identity.scope(), scope);
-    assert_eq!(block.identity.scope(), scope);
-    assert_eq!(personality.identity.domain(), PERSONALITY_DOMAIN);
-    assert_eq!(filesystem.identity.domain(), FILESYSTEM_DOMAIN);
-    assert_eq!(block.identity.domain(), BLOCK_DOMAIN);
-    assert_eq!(personality.identity.parent(), None);
-    assert_eq!(
+    __cser_core::assert_eq!(personality.identity.scope(), scope);
+    __cser_core::assert_eq!(filesystem.identity.scope(), scope);
+    __cser_core::assert_eq!(block.identity.scope(), scope);
+    __cser_core::assert_eq!(personality.identity.domain(), PERSONALITY_DOMAIN);
+    __cser_core::assert_eq!(filesystem.identity.domain(), FILESYSTEM_DOMAIN);
+    __cser_core::assert_eq!(block.identity.domain(), BLOCK_DOMAIN);
+    __cser_core::assert_eq!(personality.identity.parent(), None);
+    __cser_core::assert_eq!(
         filesystem.identity.parent(),
         Some(personality.identity.effect())
     );
-    assert_eq!(block.identity.parent(), Some(filesystem.identity.effect()));
+    __cser_core::assert_eq!(block.identity.parent(), Some(filesystem.identity.effect()));
 
     registry
         .prepare(personality_supervisor, personality.handle)
@@ -12047,17 +12644,17 @@ pub(crate) fn production_identity_registry_self_test() {
     let crash = registry
         .crash_domain(scope, FILESYSTEM_DOMAIN, filesystem_v1)
         .unwrap();
-    assert_eq!(crash.cohort, BTreeSet::from([filesystem.identity.effect()]));
+    __cser_core::assert_eq!(crash.cohort, BTreeSet::from([filesystem.identity.effect()]));
     let before_stale_parent = registry.clone();
-    assert_eq!(
+    __cser_core::assert_eq!(
         registry.register_derived(DerivedRegisterRequest {
             request: RegisterRequest {
                 scope,
                 task: block_task,
                 operation: OperationClass::new(0x204),
                 descriptor: SyscallDescriptor::new(0x204, [0; 6]),
-                resources: alloc::vec![ResourceKey::new(0x20, 4, 1)],
-                credits: alloc::vec![CreditCharge::new(BLOCK_CREDIT, 1)],
+                resources: __cser_alloc::vec![ResourceKey::new(0x20, 4, 1)],
+                credits: __cser_alloc::vec![CreditCharge::new(BLOCK_CREDIT, 1)],
                 publication: PublicationMode::None,
             },
             domain: BLOCK_DOMAIN,
@@ -12065,15 +12662,15 @@ pub(crate) fn production_identity_registry_self_test() {
         }),
         Err(RegistryError::StaleBinding)
     );
-    assert_eq!(registry, before_stale_parent);
-    assert_eq!(
+    __cser_core::assert_eq!(registry, before_stale_parent);
+    __cser_core::assert_eq!(
         registry
             .domain_projection(scope, PERSONALITY_DOMAIN)
             .unwrap()
             .supervisor,
         Some(personality_supervisor)
     );
-    assert_eq!(
+    __cser_core::assert_eq!(
         registry
             .domain_projection(scope, BLOCK_DOMAIN)
             .unwrap()
@@ -12083,8 +12680,8 @@ pub(crate) fn production_identity_registry_self_test() {
     let snapshot = registry
         .domain_recovery_snapshot(scope, FILESYSTEM_DOMAIN, filesystem_v2)
         .unwrap();
-    assert_eq!(snapshot.effects.len(), 1);
-    assert_eq!(snapshot.effects[0].effect, filesystem.identity.effect());
+    __cser_core::assert_eq!(snapshot.effects.len(), 1);
+    __cser_core::assert_eq!(snapshot.effects[0].effect, filesystem.identity.effect());
     registry
         .domain_ready(scope, FILESYSTEM_DOMAIN, filesystem_v2, &snapshot)
         .unwrap();
@@ -12095,51 +12692,51 @@ pub(crate) fn production_identity_registry_self_test() {
         .recover_next_domain(scope, FILESYSTEM_DOMAIN, filesystem_v2)
         .unwrap()
         .unwrap();
-    assert_eq!(recovery.handle.effect(), filesystem.identity.effect());
+    __cser_core::assert_eq!(recovery.handle.effect(), filesystem.identity.effect());
     let filesystem_v2_handle = registry
         .adopt_domain(scope, FILESYSTEM_DOMAIN, filesystem_v2, recovery.handle)
         .unwrap();
-    assert_eq!(
+    __cser_core::assert_eq!(
         registry.domain_recovery_remaining(scope, FILESYSTEM_DOMAIN),
         Ok(0)
     );
     let after_adopt = registry.effect_view(filesystem.identity.effect()).unwrap();
-    assert_eq!(
+    __cser_core::assert_eq!(
         after_adopt.identity.effect(),
         before_adopt.identity.effect()
     );
-    assert_eq!(after_adopt.identity.scope(), before_adopt.identity.scope());
-    assert_eq!(
+    __cser_core::assert_eq!(after_adopt.identity.scope(), before_adopt.identity.scope());
+    __cser_core::assert_eq!(
         after_adopt.identity.domain(),
         before_adopt.identity.domain()
     );
-    assert_eq!(
+    __cser_core::assert_eq!(
         after_adopt.identity.parent(),
         before_adopt.identity.parent()
     );
-    assert_eq!(after_adopt.identity.task(), before_adopt.identity.task());
-    assert_eq!(
+    __cser_core::assert_eq!(after_adopt.identity.task(), before_adopt.identity.task());
+    __cser_core::assert_eq!(
         after_adopt.identity.operation(),
         before_adopt.identity.operation()
     );
-    assert_eq!(
+    __cser_core::assert_eq!(
         after_adopt.identity.authority_epoch(),
         before_adopt.identity.authority_epoch()
     );
-    assert_eq!(
+    __cser_core::assert_eq!(
         after_adopt.identity.origin_binding_epoch(),
         before_adopt.identity.origin_binding_epoch()
     );
-    assert_eq!(
+    __cser_core::assert_eq!(
         after_adopt.identity.resources(),
         before_adopt.identity.resources()
     );
-    assert_eq!(
+    __cser_core::assert_eq!(
         after_adopt.current_resources,
         before_adopt.current_resources
     );
-    assert_eq!(after_adopt.identity.binding_epoch(), 2);
-    assert_eq!(
+    __cser_core::assert_eq!(after_adopt.identity.binding_epoch(), 2);
+    __cser_core::assert_eq!(
         registry.descriptor(filesystem_v2, filesystem.handle),
         Err(RegistryError::StaleBinding)
     );
@@ -12153,11 +12750,11 @@ pub(crate) fn production_identity_registry_self_test() {
     registry.check_invariants().unwrap();
 
     let selection = registry.revoke_begin(scope).unwrap();
-    assert_eq!(selection.target_count, 3);
+    __cser_core::assert_eq!(selection.target_count, 3);
     for domain in [PERSONALITY_DOMAIN, FILESYSTEM_DOMAIN, BLOCK_DOMAIN] {
         let projection = registry.domain_projection(scope, domain).unwrap();
-        assert_eq!(projection.supervisor, None);
-        assert!(!projection.fallback_running);
+        __cser_core::assert_eq!(projection.supervisor, None);
+        __cser_core::assert!(!projection.fallback_running);
     }
     let before_rejected_commits = registry.clone();
     for (sender, handle) in [
@@ -12165,12 +12762,12 @@ pub(crate) fn production_identity_registry_self_test() {
         (filesystem_v2, filesystem_v2_handle),
         (block_supervisor, block.handle),
     ] {
-        assert_eq!(
+        __cser_core::assert_eq!(
             registry.commit(sender, handle, CommitMetadata::new(0, 0)),
             Err(RegistryError::StaleAuthority)
         );
     }
-    assert_eq!(registry, before_rejected_commits);
+    __cser_core::assert_eq!(registry, before_rejected_commits);
 
     for expected in [
         block.identity.effect(),
@@ -12178,29 +12775,29 @@ pub(crate) fn production_identity_registry_self_test() {
         personality.identity.effect(),
     ] {
         let next = registry.revoke_next(&selection).unwrap().unwrap();
-        assert_eq!(next.effect, expected);
-        assert_eq!(next.disposition, RevokeDisposition::Abort);
+        __cser_core::assert_eq!(next.effect, expected);
+        __cser_core::assert_eq!(next.disposition, RevokeDisposition::Abort);
         let terminal = registry
             .stage_revoke_terminal(&selection, expected, TerminalRequest::aborted(-125))
             .unwrap();
-        assert_eq!(terminal.receipt.effect(), expected);
-        assert!(terminal.publication.is_none());
+        __cser_core::assert_eq!(terminal.receipt.effect(), expected);
+        __cser_core::assert!(terminal.publication.is_none());
     }
-    assert!(registry.revoke_next(&selection).unwrap().is_none());
+    __cser_core::assert!(registry.revoke_next(&selection).unwrap().is_none());
     registry.revoke_complete(&selection).unwrap();
     let target = registry.scope_projection(scope).unwrap();
-    assert_eq!(target.phase, ScopePhase::Revoked);
-    assert_eq!(target.credits.capacity, 3);
-    assert_eq!(target.credits.free, 3);
-    assert_eq!(target.credits.held, 0);
-    assert_eq!(target.credits.committed, 0);
+    __cser_core::assert_eq!(target.phase, ScopePhase::Revoked);
+    __cser_core::assert_eq!(target.credits.capacity, 3);
+    __cser_core::assert_eq!(target.credits.free, 3);
+    __cser_core::assert_eq!(target.credits.held, 0);
+    __cser_core::assert_eq!(target.credits.committed, 0);
     let work = registry.revoke_work_projection(&selection).unwrap();
-    assert_eq!(work.target_count, 3);
-    assert_eq!(work.terminalized, 3);
-    assert_eq!(work.target_index_removals, 3);
-    assert_eq!(work.unrelated_effect_visits, 0);
-    assert_eq!(work.history_effect_visits, 0);
-    assert_eq!(registry.effects_for_scope(unrelated_scope).len(), 1);
+    __cser_core::assert_eq!(work.target_count, 3);
+    __cser_core::assert_eq!(work.terminalized, 3);
+    __cser_core::assert_eq!(work.target_index_removals, 3);
+    __cser_core::assert_eq!(work.unrelated_effect_visits, 0);
+    __cser_core::assert_eq!(work.history_effect_visits, 0);
+    __cser_core::assert_eq!(registry.effects_for_scope(unrelated_scope).len(), 1);
 
     registry
         .stage_terminal(
@@ -12210,8 +12807,8 @@ pub(crate) fn production_identity_registry_self_test() {
         )
         .unwrap();
     let unrelated_projection = registry.scope_projection(unrelated_scope).unwrap();
-    assert_eq!(unrelated_projection.credits.free, 1);
-    assert_eq!(unrelated_projection.credits.held, 0);
+    __cser_core::assert_eq!(unrelated_projection.credits.free, 1);
+    __cser_core::assert_eq!(unrelated_projection.credits.held, 0);
     production_device_batch_registry_self_test(&mut registry);
     registry.check_invariants().unwrap();
 }
@@ -12221,7 +12818,7 @@ pub(crate) fn production_identity_registry_self_test() {
 /// authority, and one publish closure. All negative fixtures clone this same
 /// registry state; none creates a detached evaluator registry or ledger.
 fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
-    use core::cell::Cell;
+    use __cser_core::cell::Cell;
 
     const SCOPE: ScopeKey = ScopeKey::new(0x300, 1);
     const ROOT_OWNER: TaskKey = TaskKey::new(0x300, 1);
@@ -12243,7 +12840,7 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
             authority_epoch: 17,
             binding_epoch: 1,
             supervisor: ROOT_OWNER,
-            credits: alloc::vec![
+            credits: __cser_alloc::vec![
                 CreditLimit::new(CONTROL, 2),
                 CreditLimit::new(FILESYSTEM_OP, 1),
                 CreditLimit::new(QUEUE_SLOT, 1),
@@ -12272,12 +12869,12 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
     }
 
     let mut non_device_candidate = registry.clone_non_device_candidate().unwrap();
-    assert_eq!(
+    __cser_core::assert_eq!(
         non_device_candidate.kernel_root_authority(SCOPE, ROOT_OWNER),
         Err(RegistryError::InvalidDeviceEnvelope)
     );
     let non_device_before_registration = non_device_candidate.clone();
-    assert_eq!(
+    __cser_core::assert_eq!(
         non_device_candidate.register_device_derived(DeviceDerivedRegisterRequest {
             derived: DerivedRegisterRequest {
                 request: RegisterRequest {
@@ -12285,8 +12882,8 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
                     task: VIRTIO,
                     operation: OperationClass::new(3),
                     descriptor: SyscallDescriptor::new(3, [0, 0, 512, 0, 0, 0]),
-                    resources: alloc::vec![ResourceKey::new(0x31, 3, 1)],
-                    credits: alloc::vec![CreditCharge::new(QUEUE_SLOT, 1)],
+                    resources: __cser_alloc::vec![ResourceKey::new(0x31, 3, 1)],
+                    credits: __cser_alloc::vec![CreditCharge::new(QUEUE_SLOT, 1)],
                     publication: PublicationMode::None,
                 },
                 domain: VIRTIO_DOMAIN,
@@ -12296,7 +12893,7 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
         }),
         Err(RegistryError::InvalidDeviceEnvelope)
     );
-    assert_eq!(non_device_candidate, non_device_before_registration);
+    __cser_core::assert_eq!(non_device_candidate, non_device_before_registration);
     non_device_candidate.check_invariants().unwrap();
 
     let syscall = registry
@@ -12306,8 +12903,8 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
                 task: PERSONALITY,
                 operation: OperationClass::new(1),
                 descriptor: SyscallDescriptor::new(17, [3, 0x1000, 4, 0, 0, 0]),
-                resources: alloc::vec![ResourceKey::new(0x31, 1, 1)],
-                credits: alloc::vec![CreditCharge::new(CONTROL, 1)],
+                resources: __cser_alloc::vec![ResourceKey::new(0x31, 1, 1)],
+                credits: __cser_alloc::vec![CreditCharge::new(CONTROL, 1)],
                 publication: PublicationMode::None,
             },
             domain: PERSONALITY_DOMAIN,
@@ -12321,16 +12918,16 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
                 task: FILESYSTEM,
                 operation: OperationClass::new(2),
                 descriptor: SyscallDescriptor::new(17, [3, 0x1000, 4, 0, 0, 0]),
-                resources: alloc::vec![ResourceKey::new(0x31, 2, 1)],
-                credits: alloc::vec![CreditCharge::new(FILESYSTEM_OP, 1)],
+                resources: __cser_alloc::vec![ResourceKey::new(0x31, 2, 1)],
+                credits: __cser_alloc::vec![CreditCharge::new(FILESYSTEM_OP, 1)],
                 publication: PublicationMode::None,
             },
             domain: FILESYSTEM_DOMAIN,
             parent: Some(syscall.identity.effect()),
         })
         .unwrap();
-    assert_eq!(registry.device_root_installed(SCOPE), Ok(false));
-    assert_eq!(
+    __cser_core::assert_eq!(registry.device_root_installed(SCOPE), Ok(false));
+    __cser_core::assert_eq!(
         registry.device_root_installed(ScopeKey::new(0xdead, 1)),
         Err(RegistryError::UnknownScope)
     );
@@ -12343,8 +12940,8 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
                     task: VIRTIO,
                     operation: OperationClass::new(3),
                     descriptor: SyscallDescriptor::new(3, [0, 0, 512, 0, 0, 0]),
-                    resources: alloc::vec![ResourceKey::new(0x31, 3, 1)],
-                    credits: alloc::vec![CreditCharge::new(QUEUE_SLOT, 1)],
+                    resources: __cser_alloc::vec![ResourceKey::new(0x31, 3, 1)],
+                    credits: __cser_alloc::vec![CreditCharge::new(QUEUE_SLOT, 1)],
                     publication: PublicationMode::None,
                 },
                 domain: VIRTIO_DOMAIN,
@@ -12358,8 +12955,8 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
                     task: VIRTIO,
                     operation: OperationClass::new(4),
                     descriptor: SyscallDescriptor::new(4, [0; 6]),
-                    resources: alloc::vec![ResourceKey::new(0x31, 4, 1)],
-                    credits: alloc::vec![CreditCharge::new(DMA_OWNER, 1)],
+                    resources: __cser_alloc::vec![ResourceKey::new(0x31, 4, 1)],
+                    credits: __cser_alloc::vec![CreditCharge::new(DMA_OWNER, 1)],
                     publication: PublicationMode::None,
                 },
                 domain: VIRTIO_DOMAIN,
@@ -12373,8 +12970,8 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
                     task: VIRTIO,
                     operation: OperationClass::new(5),
                     descriptor: SyscallDescriptor::new(5, [0; 6]),
-                    resources: alloc::vec![ResourceKey::new(0x31, 5, 1)],
-                    credits: alloc::vec![CreditCharge::new(DMA_OWNER, 1)],
+                    resources: __cser_alloc::vec![ResourceKey::new(0x31, 5, 1)],
+                    credits: __cser_alloc::vec![CreditCharge::new(DMA_OWNER, 1)],
                     publication: PublicationMode::None,
                 },
                 domain: VIRTIO_DOMAIN,
@@ -12388,8 +12985,8 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
                     task: VIRTIO,
                     operation: OperationClass::new(6),
                     descriptor: SyscallDescriptor::new(6, [0; 6]),
-                    resources: alloc::vec![ResourceKey::new(0x31, 6, 1)],
-                    credits: alloc::vec![CreditCharge::new(DMA_OWNER, 1)],
+                    resources: __cser_alloc::vec![ResourceKey::new(0x31, 6, 1)],
+                    credits: __cser_alloc::vec![CreditCharge::new(DMA_OWNER, 1)],
                     publication: PublicationMode::None,
                 },
                 domain: VIRTIO_DOMAIN,
@@ -12402,16 +12999,16 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
         |label: &str, entries: [DeviceDerivedCohortEntry; 4], expected: RegistryError| {
             let mut negative = registry.clone();
             let before = negative.clone();
-            assert_eq!(
+            __cser_core::assert_eq!(
                 negative.register_device_derived_cohort(entries),
                 Err(expected),
                 "{label}"
             );
-            assert_eq!(negative, before, "{label}");
+            __cser_core::assert_eq!(negative, before, "{label}");
         };
 
     let mut credit_failure = device_cohort();
-    credit_failure[1].request.credits = alloc::vec![CreditCharge::new(DMA_OWNER, 4)];
+    credit_failure[1].request.credits = __cser_alloc::vec![CreditCharge::new(DMA_OWNER, 4)];
     reject_cohort(
         "middle credit",
         credit_failure,
@@ -12419,7 +13016,7 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
     );
 
     let mut resource_failure = device_cohort();
-    resource_failure[1].request.resources = alloc::vec![ResourceKey::new(0x31, 4, 0)];
+    resource_failure[1].request.resources = __cser_alloc::vec![ResourceKey::new(0x31, 4, 0)];
     reject_cohort(
         "middle resource",
         resource_failure,
@@ -12477,33 +13074,33 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
     let mut counter_failure = registry.clone();
     counter_failure.next_effect_id = u64::MAX - 1;
     let counter_before = counter_failure.clone();
-    assert_eq!(
+    __cser_core::assert_eq!(
         counter_failure.register_device_derived_cohort(device_cohort()),
         Err(RegistryError::CounterOverflow)
     );
-    assert_eq!(counter_failure, counter_before);
+    __cser_core::assert_eq!(counter_failure, counter_before);
 
     let mut disabled_cohort = registry.clone_non_device_candidate().unwrap();
     let disabled_cohort_before = disabled_cohort.clone();
-    assert_eq!(
+    __cser_core::assert_eq!(
         disabled_cohort.register_device_derived_cohort(device_cohort()),
         Err(RegistryError::InvalidDeviceEnvelope)
     );
-    assert_eq!(disabled_cohort, disabled_cohort_before);
+    __cser_core::assert_eq!(disabled_cohort, disabled_cohort_before);
 
     let [block, dma_a, dma_b, dma_request] = registry
         .register_device_derived_cohort(device_cohort())
         .unwrap();
-    assert_eq!(registry.device_root_installed(SCOPE), Ok(true));
-    assert!(matches!(
+    __cser_core::assert_eq!(registry.device_root_installed(SCOPE), Ok(true));
+    __cser_core::assert!(__cser_core::matches!(
         registry.clone_non_device_candidate(),
         Err(RegistryError::InvalidDeviceEnvelope)
     ));
 
     let registered = [&syscall, &filesystem, &block, &dma_a, &dma_b, &dma_request];
-    assert_eq!(block.identity.parent(), Some(filesystem.identity.effect()));
+    __cser_core::assert_eq!(block.identity.parent(), Some(filesystem.identity.effect()));
     for dma in [&dma_a, &dma_b, &dma_request] {
-        assert_eq!(dma.identity.parent(), Some(block.identity.effect()));
+        __cser_core::assert_eq!(dma.identity.parent(), Some(block.identity.effect()));
     }
     for (sender, effect) in [
         (PERSONALITY, &syscall),
@@ -12515,8 +13112,8 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
     ] {
         registry.prepare(sender, effect.handle).unwrap();
     }
-    assert_eq!(registry.effects_for_scope(SCOPE).len(), 6);
-    assert_eq!(
+    __cser_core::assert_eq!(registry.effects_for_scope(SCOPE).len(), 6);
+    __cser_core::assert_eq!(
         registered
             .iter()
             .filter(|effect| effect.identity.device.is_some())
@@ -12546,11 +13143,11 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
     let mut disabled_enrollment = registry.clone();
     disabled_enrollment.device_publication_mode = DevicePublicationMode::DisabledNonDeviceCandidate;
     let disabled_enrollment_before = disabled_enrollment.clone();
-    assert_eq!(
+    __cser_core::assert_eq!(
         disabled_enrollment.enroll_device_batch(authority, &handles, device),
         Err(RegistryError::InvalidDeviceEnvelope)
     );
-    assert_eq!(disabled_enrollment, disabled_enrollment_before);
+    __cser_core::assert_eq!(disabled_enrollment, disabled_enrollment_before);
 
     for (label, wrong_device, expected) in [
         (
@@ -12577,29 +13174,32 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
         let mut negative = registry.clone();
         let before = negative.clone();
         let result = negative.enroll_device_batch(authority, &handles, wrong_device);
-        assert!(matches!(result, Err(error) if error == expected), "{label}");
-        assert_eq!(negative, before, "{label}");
+        __cser_core::assert!(
+            __cser_core::matches!(result, Err(error) if error == expected),
+            "{label}"
+        );
+        __cser_core::assert_eq!(negative, before, "{label}");
     }
 
     let mut missing = registry.clone();
     let missing_before = missing.clone();
-    assert!(matches!(
+    __cser_core::assert!(__cser_core::matches!(
         missing.enroll_device_batch(authority, &handles[..handles.len() - 1], device),
         Err(RegistryError::InvalidState)
     ));
-    assert_eq!(missing, missing_before);
+    __cser_core::assert_eq!(missing, missing_before);
 
     let mut wrong_ancestry = registry.clone();
     let ancestry_before = wrong_ancestry.clone();
-    assert_eq!(
+    __cser_core::assert_eq!(
         wrong_ancestry.register_derived(DerivedRegisterRequest {
             request: RegisterRequest {
                 scope: SCOPE,
                 task: PERSONALITY,
                 operation: OperationClass::new(7),
                 descriptor: SyscallDescriptor::new(7, [0; 6]),
-                resources: alloc::vec![ResourceKey::new(0x31, 7, 1)],
-                credits: alloc::vec![CreditCharge::new(CONTROL, 1)],
+                resources: __cser_alloc::vec![ResourceKey::new(0x31, 7, 1)],
+                credits: __cser_alloc::vec![CreditCharge::new(CONTROL, 1)],
                 publication: PublicationMode::None,
             },
             domain: PERSONALITY_DOMAIN,
@@ -12607,18 +13207,18 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
         }),
         Err(RegistryError::InvalidState)
     );
-    assert_eq!(wrong_ancestry, ancestry_before);
+    __cser_core::assert_eq!(wrong_ancestry, ancestry_before);
 
     // Merely deriving a device child reserves the whole root. A non-device
     // ancestor cannot acquire a partial authoritative commit before explicit
     // enrollment or hardware publication.
     let mut split = registry.clone();
     let split_before = split.clone();
-    assert_eq!(
+    __cser_core::assert_eq!(
         split.commit(PERSONALITY, syscall.handle, commits[0].1),
         Err(RegistryError::InvalidDeviceEnvelope)
     );
-    assert_eq!(split, split_before);
+    __cser_core::assert_eq!(split, split_before);
 
     // Conversely, a service cannot attach a device-derived child beneath an
     // ancestor that was already committed through the generic path.
@@ -12633,7 +13233,7 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
             authority_epoch: 1,
             binding_epoch: 1,
             supervisor: attach_owner,
-            credits: alloc::vec![CreditLimit::new(CONTROL, 2)],
+            credits: __cser_alloc::vec![CreditLimit::new(CONTROL, 2)],
         })
         .unwrap();
     attached_after_commit
@@ -12653,8 +13253,8 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
                 task: attach_service,
                 operation: OperationClass::new(1),
                 descriptor: SyscallDescriptor::new(1, [0; 6]),
-                resources: alloc::vec![],
-                credits: alloc::vec![CreditCharge::new(CONTROL, 1)],
+                resources: __cser_alloc::vec![],
+                credits: __cser_alloc::vec![CreditCharge::new(CONTROL, 1)],
                 publication: PublicationMode::None,
             },
             domain: attach_domain,
@@ -12672,7 +13272,7 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
         )
         .unwrap();
     let attach_before = attached_after_commit.clone();
-    assert_eq!(
+    __cser_core::assert_eq!(
         attached_after_commit.register_device_derived(DeviceDerivedRegisterRequest {
             derived: DerivedRegisterRequest {
                 request: RegisterRequest {
@@ -12680,8 +13280,8 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
                     task: attach_service,
                     operation: OperationClass::new(2),
                     descriptor: SyscallDescriptor::new(2, [0; 6]),
-                    resources: alloc::vec![],
-                    credits: alloc::vec![CreditCharge::new(CONTROL, 1)],
+                    resources: __cser_alloc::vec![],
+                    credits: __cser_alloc::vec![CreditCharge::new(CONTROL, 1)],
                     publication: PublicationMode::None,
                 },
                 domain: attach_domain,
@@ -12691,31 +13291,31 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
         }),
         Err(RegistryError::InvalidState)
     );
-    assert_eq!(attached_after_commit, attach_before);
+    __cser_core::assert_eq!(attached_after_commit, attach_before);
 
     // If revoke wins the device-root/enrollment window, generic Abort remains
     // blocked. A Closing-only emergency freeze records the exact prepared live
     // cohort as cancel-only before ownership can be retained and closed.
     let mut pending_direct = registry.clone();
     let pending_direct_before = pending_direct.clone();
-    assert_eq!(
+    __cser_core::assert_eq!(
         pending_direct.stage_terminal(VIRTIO, dma_a.handle, TerminalRequest::aborted(-125),),
         Err(RegistryError::DeviceClosurePending)
     );
-    assert_eq!(pending_direct, pending_direct_before);
+    __cser_core::assert_eq!(pending_direct, pending_direct_before);
 
     let assert_pending_precommit_error =
         |candidate: &mut EffectRegistry, expected: RegistryError| {
             let before = candidate.clone();
             let hardware_calls = Cell::new(0_u8);
-            assert_eq!(
+            __cser_core::assert_eq!(
                 candidate.close_pending_device_precommit_with_apply(SCOPE, |_| {
                     hardware_calls.set(hardware_calls.get().checked_add(1).unwrap())
                 }),
                 Err(expected)
             );
-            assert_eq!(hardware_calls.get(), 0);
-            assert_eq!(*candidate, before);
+            __cser_core::assert_eq!(hardware_calls.get(), 0);
+            __cser_core::assert_eq!(*candidate, before);
         };
 
     let mut compound_pending = registry.clone();
@@ -12732,40 +13332,40 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
                     .checked_add(1)
                     .unwrap(),
             );
-            assert_eq!(ticket.batch_sequence, None);
-            assert_eq!(ticket.device(), device);
+            __cser_core::assert_eq!(ticket.batch_sequence, None);
+            __cser_core::assert_eq!(ticket.device(), device);
             ticket.sequence
         })
         .unwrap();
-    assert_eq!(compound_pending_hardware_calls.get(), 1);
-    assert_eq!(
+    __cser_core::assert_eq!(compound_pending_hardware_calls.get(), 1);
+    __cser_core::assert_eq!(
         compound_pending_hardware,
         compound_pending_close.reset_ticket.sequence
     );
-    assert_eq!(compound_pending_close.selection.scope, SCOPE);
-    assert_eq!(compound_pending_close.selection.target_count, 6);
-    assert!(compound_pending_close.enrollment.cancel_only());
-    assert_eq!(compound_pending_close.enrollment.effects().len(), 6);
-    assert_eq!(
+    __cser_core::assert_eq!(compound_pending_close.selection.scope, SCOPE);
+    __cser_core::assert_eq!(compound_pending_close.selection.target_count, 6);
+    __cser_core::assert!(compound_pending_close.enrollment.cancel_only());
+    __cser_core::assert_eq!(compound_pending_close.enrollment.effects().len(), 6);
+    __cser_core::assert_eq!(
         compound_pending
             .scope_projection(SCOPE)
             .unwrap()
             .authority_epoch,
         compound_pending_before.authority_epoch + 1
     );
-    assert_eq!(
+    __cser_core::assert_eq!(
         compound_pending.scope_projection(SCOPE).unwrap().revision,
         compound_pending_before.revision + 3
     );
-    assert_eq!(
+    __cser_core::assert_eq!(
         compound_pending.next_revoke_sequence,
         compound_pending_revoke_sequence + 1
     );
-    assert_eq!(
+    __cser_core::assert_eq!(
         compound_pending.next_device_enrollment_sequence,
         compound_pending_enrollment_sequence + 1
     );
-    assert_eq!(
+    __cser_core::assert_eq!(
         compound_pending.next_device_closure_sequence,
         compound_pending_closure_sequence + 1
     );
@@ -12773,21 +13373,21 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
         .device_root
         .as_ref()
         .unwrap();
-    assert_eq!(
+    __cser_core::assert_eq!(
         compound_pending_root.enrollment.as_ref(),
         Some(&compound_pending_close.enrollment)
     );
-    assert_eq!(
+    __cser_core::assert_eq!(
         compound_pending_root.outcome,
         Some(DeviceClosureResult::AbortedBeforeCommit)
     );
-    assert_eq!(
+    __cser_core::assert_eq!(
         compound_pending_root.reset_ticket,
         Some(compound_pending_close.reset_ticket)
     );
     let compound_pending_credits = compound_pending.scope_projection(SCOPE).unwrap().credits;
-    assert_eq!(compound_pending_credits.held, 0);
-    assert_eq!(compound_pending_credits.retained, 6);
+    __cser_core::assert_eq!(compound_pending_credits.held, 0);
+    __cser_core::assert_eq!(compound_pending_credits.retained, 6);
     compound_pending.check_invariants().unwrap();
 
     let mut pending_revoke_overflow = registry.clone();
@@ -12888,8 +13488,8 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
         .get_mut(&SCOPE)
         .unwrap()
         .closure_candidates;
-    assert!(pending_wrong_candidates.remove(&dma_a.identity.effect()));
-    assert!(pending_wrong_candidates.insert(EffectKey::new(u64::MAX, 1)));
+    __cser_core::assert!(pending_wrong_candidates.remove(&dma_a.identity.effect()));
+    __cser_core::assert!(pending_wrong_candidates.insert(EffectKey::new(u64::MAX, 1)));
     assert_pending_precommit_error(
         &mut pending_wrong_revoke_cohort,
         RegistryError::InvalidState,
@@ -12913,7 +13513,7 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
         .unwrap()
         .unwrap();
     let pending_before_abort = pending_cancel.clone();
-    assert_eq!(
+    __cser_core::assert_eq!(
         pending_cancel.stage_revoke_terminal(
             &pending_selection,
             pending_head.effect,
@@ -12921,13 +13521,13 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
         ),
         Err(RegistryError::DeviceClosurePending)
     );
-    assert_eq!(pending_cancel, pending_before_abort);
+    __cser_core::assert_eq!(pending_cancel, pending_before_abort);
     let cancel_enrollment = pending_cancel.freeze_pending_device_cancel(SCOPE).unwrap();
-    assert!(cancel_enrollment.cancel_only());
+    __cser_core::assert!(cancel_enrollment.cancel_only());
     let cancel_ticket = pending_cancel
         .begin_unpublished_device_cancel(&cancel_enrollment)
         .unwrap();
-    assert_eq!(
+    __cser_core::assert_eq!(
         pending_cancel
             .scope_projection(SCOPE)
             .unwrap()
@@ -12942,7 +13542,7 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
     let (cancel_closure, ()) = pending_cancel
         .acknowledge_device_iotlb_with_apply(&cancel_iotlb, |_| ())
         .unwrap();
-    assert_eq!(
+    __cser_core::assert_eq!(
         cancel_closure.outcome(),
         DeviceClosureResult::AbortedBeforeCommit
     );
@@ -12958,7 +13558,7 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
             .revoke_next(&pending_selection)
             .unwrap()
             .unwrap();
-        assert_eq!(next.effect, expected);
+        __cser_core::assert_eq!(next.effect, expected);
         pending_cancel
             .stage_device_batch_terminal(&cancel_closure, expected, TerminalRequest::aborted(-125))
             .unwrap();
@@ -12974,15 +13574,15 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
                 task: PERSONALITY,
                 operation: OperationClass::new(8),
                 descriptor: SyscallDescriptor::new(8, [0; 6]),
-                resources: alloc::vec![],
-                credits: alloc::vec![CreditCharge::new(CONTROL, 1)],
+                resources: __cser_alloc::vec![],
+                credits: __cser_alloc::vec![CreditCharge::new(CONTROL, 1)],
                 publication: PublicationMode::None,
             },
             domain: PERSONALITY_DOMAIN,
             parent: Some(dma_request.identity.effect()),
         })
         .unwrap();
-    assert_eq!(
+    __cser_core::assert_eq!(
         registered_cancel
             .effect_view(registered_child.identity.effect())
             .unwrap()
@@ -12993,12 +13593,12 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
     let registered_enrollment = registered_cancel
         .freeze_pending_device_cancel(SCOPE)
         .unwrap();
-    assert!(registered_enrollment.cancel_only());
-    assert_eq!(registered_enrollment.effects().len(), 7);
+    __cser_core::assert!(registered_enrollment.cancel_only());
+    __cser_core::assert_eq!(registered_enrollment.effects().len(), 7);
     let registered_ticket = registered_cancel
         .begin_unpublished_device_cancel(&registered_enrollment)
         .unwrap();
-    assert_eq!(
+    __cser_core::assert_eq!(
         registered_cancel
             .scope_projection(SCOPE)
             .unwrap()
@@ -13029,7 +13629,7 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
             .unwrap();
         registered_closed += 1;
     }
-    assert_eq!(registered_closed, 7);
+    __cser_core::assert_eq!(registered_closed, 7);
     registered_cancel
         .revoke_complete(&registered_selection)
         .unwrap();
@@ -13038,10 +13638,10 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
     let enrollment = registry
         .enroll_device_batch(authority, &handles, device)
         .unwrap();
-    assert_eq!(enrollment.scope(), SCOPE);
-    assert_eq!(enrollment.enrollment_sequence(), 1);
-    assert_eq!(enrollment.device(), device);
-    assert_eq!(enrollment.effects().len(), 6);
+    __cser_core::assert_eq!(enrollment.scope(), SCOPE);
+    __cser_core::assert_eq!(enrollment.enrollment_sequence(), 1);
+    __cser_core::assert_eq!(enrollment.device(), device);
+    __cser_core::assert_eq!(enrollment.effects().len(), 6);
 
     let assert_enrolled_precommit_error =
         |candidate: &mut EffectRegistry,
@@ -13049,14 +13649,14 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
          expected: RegistryError| {
             let before = candidate.clone();
             let hardware_calls = Cell::new(0_u8);
-            assert_eq!(
+            __cser_core::assert_eq!(
                 candidate.close_enrolled_device_precommit_with_apply(presented, |_| {
                     hardware_calls.set(hardware_calls.get().checked_add(1).unwrap())
                 }),
                 Err(expected)
             );
-            assert_eq!(hardware_calls.get(), 0);
-            assert_eq!(*candidate, before);
+            __cser_core::assert_eq!(hardware_calls.get(), 0);
+            __cser_core::assert_eq!(*candidate, before);
         };
 
     let mut compound_enrolled = registry.clone();
@@ -13073,40 +13673,40 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
                     .checked_add(1)
                     .unwrap(),
             );
-            assert_eq!(ticket.batch_sequence, None);
-            assert_eq!(ticket.device(), device);
+            __cser_core::assert_eq!(ticket.batch_sequence, None);
+            __cser_core::assert_eq!(ticket.device(), device);
             ticket.sequence
         })
         .unwrap();
-    assert_eq!(compound_enrolled_hardware_calls.get(), 1);
-    assert_eq!(
+    __cser_core::assert_eq!(compound_enrolled_hardware_calls.get(), 1);
+    __cser_core::assert_eq!(
         compound_enrolled_hardware,
         compound_enrolled_close.reset_ticket.sequence
     );
-    assert_eq!(compound_enrolled_close.selection.scope, SCOPE);
-    assert_eq!(compound_enrolled_close.selection.target_count, 6);
-    assert_eq!(compound_enrolled_close.enrollment, enrollment);
-    assert!(!compound_enrolled_close.enrollment.cancel_only());
-    assert_eq!(
+    __cser_core::assert_eq!(compound_enrolled_close.selection.scope, SCOPE);
+    __cser_core::assert_eq!(compound_enrolled_close.selection.target_count, 6);
+    __cser_core::assert_eq!(compound_enrolled_close.enrollment, enrollment);
+    __cser_core::assert!(!compound_enrolled_close.enrollment.cancel_only());
+    __cser_core::assert_eq!(
         compound_enrolled
             .scope_projection(SCOPE)
             .unwrap()
             .authority_epoch,
         compound_enrolled_before.authority_epoch + 1
     );
-    assert_eq!(
+    __cser_core::assert_eq!(
         compound_enrolled.scope_projection(SCOPE).unwrap().revision,
         compound_enrolled_before.revision + 2
     );
-    assert_eq!(
+    __cser_core::assert_eq!(
         compound_enrolled.next_revoke_sequence,
         compound_enrolled_revoke_sequence + 1
     );
-    assert_eq!(
+    __cser_core::assert_eq!(
         compound_enrolled.next_device_enrollment_sequence,
         compound_enrolled_enrollment_sequence
     );
-    assert_eq!(
+    __cser_core::assert_eq!(
         compound_enrolled.next_device_closure_sequence,
         compound_enrolled_closure_sequence + 1
     );
@@ -13114,21 +13714,21 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
         .device_root
         .as_ref()
         .unwrap();
-    assert_eq!(
+    __cser_core::assert_eq!(
         compound_enrolled_root.enrollment.as_ref(),
         Some(&compound_enrolled_close.enrollment)
     );
-    assert_eq!(
+    __cser_core::assert_eq!(
         compound_enrolled_root.outcome,
         Some(DeviceClosureResult::AbortedBeforeCommit)
     );
-    assert_eq!(
+    __cser_core::assert_eq!(
         compound_enrolled_root.reset_ticket,
         Some(compound_enrolled_close.reset_ticket)
     );
     let compound_enrolled_credits = compound_enrolled.scope_projection(SCOPE).unwrap().credits;
-    assert_eq!(compound_enrolled_credits.held, 0);
-    assert_eq!(compound_enrolled_credits.retained, 6);
+    __cser_core::assert_eq!(compound_enrolled_credits.held, 0);
+    __cser_core::assert_eq!(compound_enrolled_credits.retained, 6);
     compound_enrolled.check_invariants().unwrap();
 
     let mut enrolled_revoke_overflow = registry.clone();
@@ -13244,8 +13844,8 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
         .get_mut(&SCOPE)
         .unwrap()
         .closure_candidates;
-    assert!(enrolled_wrong_candidates.remove(&dma_a.identity.effect()));
-    assert!(enrolled_wrong_candidates.insert(EffectKey::new(u64::MAX, 1)));
+    __cser_core::assert!(enrolled_wrong_candidates.remove(&dma_a.identity.effect()));
+    __cser_core::assert!(enrolled_wrong_candidates.insert(EffectKey::new(u64::MAX, 1)));
     assert_enrolled_precommit_error(
         &mut enrolled_wrong_revoke_cohort,
         &enrollment,
@@ -13268,15 +13868,15 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
     assert_pending_precommit_error(&mut pending_with_enrollment, RegistryError::InvalidState);
 
     let enrollment_before_registration = registry.clone();
-    assert_eq!(
+    __cser_core::assert_eq!(
         registry.register_derived(DerivedRegisterRequest {
             request: RegisterRequest {
                 scope: SCOPE,
                 task: PERSONALITY,
                 operation: OperationClass::new(7),
                 descriptor: SyscallDescriptor::new(7, [0; 6]),
-                resources: alloc::vec![],
-                credits: alloc::vec![CreditCharge::new(CONTROL, 1)],
+                resources: __cser_alloc::vec![],
+                credits: __cser_alloc::vec![CreditCharge::new(CONTROL, 1)],
                 publication: PublicationMode::None,
             },
             domain: PERSONALITY_DOMAIN,
@@ -13284,20 +13884,20 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
         }),
         Err(RegistryError::InvalidState)
     );
-    assert_eq!(*registry, enrollment_before_registration);
+    __cser_core::assert_eq!(*registry, enrollment_before_registration);
 
     let mut foreign_registry = registry.clone();
     foreign_registry.rewrite_registry_instance(registry.instance_id + 1);
     let foreign_before = foreign_registry.clone();
     let foreign_publications = Cell::new(0_u8);
-    assert!(matches!(
+    __cser_core::assert!(__cser_core::matches!(
         foreign_registry.commit_device_batch_with_publish(authority, &enrollment, &commits, |_| {
             foreign_publications.set(1)
         },),
         Err(RegistryError::InvalidBatchReceipt)
     ));
-    assert_eq!(foreign_publications.get(), 0);
-    assert_eq!(foreign_registry, foreign_before);
+    __cser_core::assert_eq!(foreign_publications.get(), 0);
+    __cser_core::assert_eq!(foreign_registry, foreign_before);
 
     let unrelated_authority = registry
         .kernel_root_authority(ScopeKey::new(0x2ff, 1), TaskKey::new(0x2ff, 1))
@@ -13305,7 +13905,7 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
     let mut wrong_root = registry.clone();
     let wrong_root_before = wrong_root.clone();
     let wrong_root_publications = Cell::new(0_u8);
-    assert!(matches!(
+    __cser_core::assert!(__cser_core::matches!(
         wrong_root.commit_device_batch_with_publish(
             unrelated_authority,
             &enrollment,
@@ -13314,54 +13914,54 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
         ),
         Err(RegistryError::InvalidBatchReceipt)
     ));
-    assert_eq!(wrong_root_publications.get(), 0);
-    assert_eq!(wrong_root, wrong_root_before);
+    __cser_core::assert_eq!(wrong_root_publications.get(), 0);
+    __cser_core::assert_eq!(wrong_root, wrong_root_before);
 
     let mut forged_enrollment = enrollment.clone();
     forged_enrollment.device.device_generation += 1;
     let forged_before = registry.clone();
     let forged_publications = Cell::new(0_u8);
-    assert!(matches!(
+    __cser_core::assert!(__cser_core::matches!(
         registry.commit_device_batch_with_publish(authority, &forged_enrollment, &commits, |_| {
             forged_publications.set(1)
         },),
         Err(RegistryError::InvalidBatchReceipt)
     ));
-    assert_eq!(forged_publications.get(), 0);
-    assert_eq!(*registry, forged_before);
+    __cser_core::assert_eq!(forged_publications.get(), 0);
+    __cser_core::assert_eq!(*registry, forged_before);
 
     let mut overflow = registry.clone();
     overflow.next_device_batch_sequence = u64::MAX;
     let overflow_before = overflow.clone();
     let overflow_publications = Cell::new(0_u8);
-    assert!(matches!(
+    __cser_core::assert!(__cser_core::matches!(
         overflow.commit_device_batch_with_publish(authority, &enrollment, &commits, |_| {
             overflow_publications.set(1)
         },),
         Err(RegistryError::CounterOverflow)
     ));
-    assert_eq!(overflow_publications.get(), 0);
-    assert_eq!(overflow, overflow_before);
+    __cser_core::assert_eq!(overflow_publications.get(), 0);
+    __cser_core::assert_eq!(overflow, overflow_before);
 
     let mut revoke_first = registry.clone();
     let revoke_first_selection = revoke_first.revoke_begin(SCOPE).unwrap();
     let revoke_first_before = revoke_first.clone();
     let revoke_first_publications = Cell::new(0_u8);
-    assert!(matches!(
+    __cser_core::assert!(__cser_core::matches!(
         revoke_first.commit_device_batch_with_publish(authority, &enrollment, &commits, |_| {
             revoke_first_publications.set(1)
         },),
         Err(RegistryError::StaleAuthority)
     ));
-    assert_eq!(revoke_first_publications.get(), 0);
-    assert_eq!(revoke_first, revoke_first_before);
+    __cser_core::assert_eq!(revoke_first_publications.get(), 0);
+    __cser_core::assert_eq!(revoke_first, revoke_first_before);
     let selected = revoke_first
         .revoke_next(&revoke_first_selection)
         .unwrap()
         .unwrap();
-    assert_eq!(selected.disposition, RevokeDisposition::Abort);
+    __cser_core::assert_eq!(selected.disposition, RevokeDisposition::Abort);
     let before_early_abort = revoke_first.clone();
-    assert_eq!(
+    __cser_core::assert_eq!(
         revoke_first.stage_revoke_terminal(
             &revoke_first_selection,
             selected.effect,
@@ -13369,41 +13969,41 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
         ),
         Err(RegistryError::DeviceClosurePending)
     );
-    assert_eq!(revoke_first, before_early_abort);
+    __cser_core::assert_eq!(revoke_first, before_early_abort);
     let cancel = revoke_first
         .begin_unpublished_device_cancel(&enrollment)
         .unwrap();
     let retained = revoke_first.scope_projection(SCOPE).unwrap().credits;
-    assert_eq!(retained.held, 0);
-    assert_eq!(retained.retained, 6);
+    __cser_core::assert_eq!(retained.held, 0);
+    __cser_core::assert_eq!(retained.retained, 6);
     let mut forged_cancel = cancel;
     forged_cancel.sequence = forged_cancel.sequence.checked_add(1).unwrap();
     let before_forged_cancel = revoke_first.clone();
-    assert_eq!(
+    __cser_core::assert_eq!(
         revoke_first.retain_device_reset_timeout(&forged_cancel),
         Err(RegistryError::InvalidBatchReceipt)
     );
-    assert_eq!(revoke_first, before_forged_cancel);
+    __cser_core::assert_eq!(revoke_first, before_forged_cancel);
     let mut foreign_cancel = cancel;
     foreign_cancel.registry_instance_id =
         foreign_cancel.registry_instance_id.checked_add(1).unwrap();
     let before_foreign_cancel = revoke_first.clone();
-    assert_eq!(
+    __cser_core::assert_eq!(
         revoke_first.retain_device_reset_timeout(&foreign_cancel),
         Err(RegistryError::InvalidBatchReceipt)
     );
-    assert_eq!(revoke_first, before_foreign_cancel);
+    __cser_core::assert_eq!(revoke_first, before_foreign_cancel);
     let mut cancel_overflow = revoke_first.clone();
     cancel_overflow.next_device_closure_sequence = u64::MAX;
     let before_cancel_overflow = cancel_overflow.clone();
-    assert_eq!(
+    __cser_core::assert_eq!(
         cancel_overflow.retain_device_reset_timeout(&cancel),
         Err(RegistryError::CounterOverflow)
     );
-    assert_eq!(cancel_overflow, before_cancel_overflow);
+    __cser_core::assert_eq!(cancel_overflow, before_cancel_overflow);
     let cancel_tombstone = revoke_first.retain_device_reset_timeout(&cancel).unwrap();
-    assert_eq!(cancel_tombstone.device(), device);
-    assert_eq!(
+    __cser_core::assert_eq!(cancel_tombstone.device(), device);
+    __cser_core::assert_eq!(
         revoke_first.scope_projection(SCOPE).unwrap().credits,
         retained
     );
@@ -13414,7 +14014,7 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
         .get_mut(&enrollment.effects[0])
         .unwrap()
         .credit_state = CreditState::Held;
-    assert_eq!(
+    __cser_core::assert_eq!(
         mixed_unpublished_retention.check_invariants(),
         Err(RegistryError::Invariant(
             "retained unpublished credits lack uniform closing precommit abort"
@@ -13428,119 +14028,119 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
             .unwrap()
             .credit_state = CreditState::Held;
     }
-    assert_eq!(
+    __cser_core::assert_eq!(
         held_unpublished_abort.check_invariants(),
         Err(RegistryError::Invariant(
             "retained unpublished credits lack uniform closing precommit abort"
         ))
     );
     let before_cancel_replay = revoke_first.clone();
-    assert_eq!(
+    __cser_core::assert_eq!(
         revoke_first.retain_device_reset_timeout(&cancel),
         Err(RegistryError::InvalidBatchReceipt)
     );
-    assert_eq!(revoke_first, before_cancel_replay);
+    __cser_core::assert_eq!(revoke_first, before_cancel_replay);
     let mut cancel_retry_overflow = revoke_first.clone();
     cancel_retry_overflow.next_device_closure_sequence = u64::MAX;
     let before_cancel_retry_overflow = cancel_retry_overflow.clone();
-    assert_eq!(
+    __cser_core::assert_eq!(
         cancel_retry_overflow.retry_device_reset(&cancel_tombstone),
         Err(RegistryError::CounterOverflow)
     );
-    assert_eq!(cancel_retry_overflow, before_cancel_retry_overflow);
+    __cser_core::assert_eq!(cancel_retry_overflow, before_cancel_retry_overflow);
     let cancel_retry = revoke_first.retry_device_reset(&cancel_tombstone).unwrap();
     let before_cancel_retry_replay = revoke_first.clone();
-    assert_eq!(
+    __cser_core::assert_eq!(
         revoke_first.retry_device_reset(&cancel_tombstone),
         Err(RegistryError::InvalidBatchReceipt)
     );
-    assert_eq!(revoke_first, before_cancel_retry_replay);
+    __cser_core::assert_eq!(revoke_first, before_cancel_retry_replay);
     let mut final_reset_timeout = revoke_first.clone();
     let final_reset_tombstone = final_reset_timeout
         .retain_device_reset_timeout(&cancel_retry)
         .unwrap();
     final_reset_timeout.check_invariants().unwrap();
     let before_final_reset_retry = final_reset_timeout.clone();
-    assert_eq!(
+    __cser_core::assert_eq!(
         final_reset_timeout.retry_device_reset(&final_reset_tombstone),
         Err(RegistryError::InvalidBatchReceipt)
     );
-    assert_eq!(final_reset_timeout, before_final_reset_retry);
+    __cser_core::assert_eq!(final_reset_timeout, before_final_reset_retry);
     let (reset, ()) = revoke_first
         .acknowledge_device_reset_with_apply(&cancel_retry, |_| ())
         .unwrap();
-    assert_eq!(reset.outcome(), DeviceClosureResult::AbortedBeforeCommit);
+    __cser_core::assert_eq!(reset.outcome(), DeviceClosureResult::AbortedBeforeCommit);
     let iotlb = revoke_first.begin_device_iotlb(&reset).unwrap();
     let mut forged_iotlb = iotlb;
     forged_iotlb.sequence = forged_iotlb.sequence.checked_add(1).unwrap();
     let before_forged_iotlb = revoke_first.clone();
-    assert_eq!(
+    __cser_core::assert_eq!(
         revoke_first.retain_device_iotlb_timeout(&forged_iotlb),
         Err(RegistryError::InvalidBatchReceipt)
     );
-    assert_eq!(revoke_first, before_forged_iotlb);
+    __cser_core::assert_eq!(revoke_first, before_forged_iotlb);
     let mut foreign_iotlb = iotlb;
     foreign_iotlb.registry_instance_id = foreign_iotlb.registry_instance_id.checked_add(1).unwrap();
     let before_foreign_iotlb = revoke_first.clone();
-    assert_eq!(
+    __cser_core::assert_eq!(
         revoke_first.retain_device_iotlb_timeout(&foreign_iotlb),
         Err(RegistryError::InvalidBatchReceipt)
     );
-    assert_eq!(revoke_first, before_foreign_iotlb);
+    __cser_core::assert_eq!(revoke_first, before_foreign_iotlb);
     let mut iotlb_overflow = revoke_first.clone();
     iotlb_overflow.next_device_closure_sequence = u64::MAX;
     let before_iotlb_overflow = iotlb_overflow.clone();
-    assert_eq!(
+    __cser_core::assert_eq!(
         iotlb_overflow.retain_device_iotlb_timeout(&iotlb),
         Err(RegistryError::CounterOverflow)
     );
-    assert_eq!(iotlb_overflow, before_iotlb_overflow);
+    __cser_core::assert_eq!(iotlb_overflow, before_iotlb_overflow);
     let iotlb_tombstone = revoke_first.retain_device_iotlb_timeout(&iotlb).unwrap();
-    assert_eq!(iotlb_tombstone.device(), reset.new_device());
-    assert_eq!(
+    __cser_core::assert_eq!(iotlb_tombstone.device(), reset.new_device());
+    __cser_core::assert_eq!(
         revoke_first.scope_projection(SCOPE).unwrap().credits,
         retained
     );
     revoke_first.check_invariants().unwrap();
     let before_iotlb_replay = revoke_first.clone();
-    assert_eq!(
+    __cser_core::assert_eq!(
         revoke_first.retain_device_iotlb_timeout(&iotlb),
         Err(RegistryError::InvalidBatchReceipt)
     );
-    assert_eq!(revoke_first, before_iotlb_replay);
+    __cser_core::assert_eq!(revoke_first, before_iotlb_replay);
     let mut iotlb_retry_overflow = revoke_first.clone();
     iotlb_retry_overflow.next_device_closure_sequence = u64::MAX;
     let before_iotlb_retry_overflow = iotlb_retry_overflow.clone();
-    assert_eq!(
+    __cser_core::assert_eq!(
         iotlb_retry_overflow.retry_device_iotlb(&reset, &iotlb_tombstone),
         Err(RegistryError::CounterOverflow)
     );
-    assert_eq!(iotlb_retry_overflow, before_iotlb_retry_overflow);
+    __cser_core::assert_eq!(iotlb_retry_overflow, before_iotlb_retry_overflow);
     let iotlb_retry = revoke_first
         .retry_device_iotlb(&reset, &iotlb_tombstone)
         .unwrap();
     let before_iotlb_retry_replay = revoke_first.clone();
-    assert_eq!(
+    __cser_core::assert_eq!(
         revoke_first.retry_device_iotlb(&reset, &iotlb_tombstone),
         Err(RegistryError::InvalidBatchReceipt)
     );
-    assert_eq!(revoke_first, before_iotlb_retry_replay);
+    __cser_core::assert_eq!(revoke_first, before_iotlb_retry_replay);
     let mut final_iotlb_timeout = revoke_first.clone();
     let final_iotlb_tombstone = final_iotlb_timeout
         .retain_device_iotlb_timeout(&iotlb_retry)
         .unwrap();
     final_iotlb_timeout.check_invariants().unwrap();
     let before_final_iotlb_retry = final_iotlb_timeout.clone();
-    assert_eq!(
+    __cser_core::assert_eq!(
         final_iotlb_timeout.retry_device_iotlb(&reset, &final_iotlb_tombstone),
         Err(RegistryError::InvalidBatchReceipt)
     );
-    assert_eq!(final_iotlb_timeout, before_final_iotlb_retry);
+    __cser_core::assert_eq!(final_iotlb_timeout, before_final_iotlb_retry);
     let (cancelled, ()) = revoke_first
         .acknowledge_device_iotlb_with_apply(&iotlb_retry, |_| ())
         .unwrap();
-    assert!(!cancelled.published());
-    assert_eq!(
+    __cser_core::assert!(!cancelled.published());
+    __cser_core::assert_eq!(
         cancelled.outcome(),
         DeviceClosureResult::AbortedBeforeCommit
     );
@@ -13556,13 +14156,13 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
             .revoke_next(&revoke_first_selection)
             .unwrap()
             .unwrap();
-        assert_eq!(next.effect, expected);
-        assert_eq!(next.disposition, RevokeDisposition::Abort);
+        __cser_core::assert_eq!(next.effect, expected);
+        __cser_core::assert_eq!(next.disposition, RevokeDisposition::Abort);
         revoke_first
             .stage_device_batch_terminal(&cancelled, expected, TerminalRequest::aborted(-125))
             .unwrap();
     }
-    assert!(
+    __cser_core::assert!(
         revoke_first
             .revoke_next(&revoke_first_selection)
             .unwrap()
@@ -13571,7 +14171,7 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
     revoke_first
         .revoke_complete(&revoke_first_selection)
         .unwrap();
-    assert_eq!(
+    __cser_core::assert_eq!(
         revoke_first.scope_projection(SCOPE).unwrap().credits.free,
         7
     );
@@ -13580,16 +14180,16 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
     let close_operation = registry
         .mint_device_close_operation(&enrollment, 0x51_0001)
         .unwrap();
-    assert_eq!(close_operation.registry_instance_id(), registry.instance_id);
-    assert_eq!(close_operation.scope(), SCOPE);
-    assert_eq!(close_operation.authority_epoch(), 17);
-    assert_eq!(
+    __cser_core::assert_eq!(close_operation.registry_instance_id(), registry.instance_id);
+    __cser_core::assert_eq!(close_operation.scope(), SCOPE);
+    __cser_core::assert_eq!(close_operation.authority_epoch(), 17);
+    __cser_core::assert_eq!(
         close_operation.enrollment_sequence(),
         enrollment.enrollment_sequence()
     );
-    assert_eq!(close_operation.device(), device);
-    assert_eq!(close_operation.caller_nonce(), 0x51_0001);
-    assert_eq!(
+    __cser_core::assert_eq!(close_operation.device(), device);
+    __cser_core::assert_eq!(close_operation.caller_nonce(), 0x51_0001);
+    __cser_core::assert_eq!(
         registry.mint_device_close_operation(&enrollment, 0),
         Err(RegistryError::InvalidGeneration)
     );
@@ -13604,29 +14204,29 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
     let interrupted_plan = interrupted_close
         .prepare_device_close(close_operation, authority, &enrollment, &commits)
         .unwrap();
-    assert_eq!(
+    __cser_core::assert_eq!(
         interrupted_plan.publishing_revision,
         interrupted_before.revision + 1
     );
-    assert_eq!(
+    __cser_core::assert_eq!(
         interrupted_plan.batch.next_scope_revision,
         interrupted_before.revision + 2
     );
-    assert_eq!(
+    __cser_core::assert_eq!(
         interrupted_plan.revoke.next_scope_revision,
         interrupted_before.revision + 3
     );
     let interrupted_batch = interrupted_plan.stored_batch.clone();
     let abandoned_apply = interrupted_close.install_device_close_publishing(interrupted_plan);
-    assert_eq!(
+    __cser_core::assert_eq!(
         interrupted_close.scope_projection(SCOPE).unwrap().revision,
         interrupted_before.revision + 1
     );
-    assert_eq!(
+    __cser_core::assert_eq!(
         interrupted_close.scope_projection(SCOPE).unwrap().phase,
         ScopePhase::Active
     );
-    assert!(matches!(
+    __cser_core::assert!(__cser_core::matches!(
         &interrupted_close.scopes[&SCOPE]
             .device_root
             .as_ref()
@@ -13637,11 +14237,11 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
     ));
     interrupted_close.check_invariants().unwrap();
     let publishing_before_revoke = interrupted_close.clone();
-    assert_eq!(
+    __cser_core::assert_eq!(
         interrupted_close.revoke_begin(SCOPE),
         Err(RegistryError::DeviceClosurePending)
     );
-    assert_eq!(interrupted_close, publishing_before_revoke);
+    __cser_core::assert_eq!(interrupted_close, publishing_before_revoke);
 
     // Independently harden the legacy unpublished-cancel API even against an
     // already-corrupt Closing+Publishing state. It must never convert a
@@ -13653,11 +14253,11 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
     let mut forced_closing = interrupted_close.clone();
     forced_closing.apply_revoke_begin(abandoned_revoke);
     let forced_closing_before = forced_closing.clone();
-    assert_eq!(
+    __cser_core::assert_eq!(
         forced_closing.begin_unpublished_device_cancel(&enrollment),
         Err(RegistryError::InvalidState)
     );
-    assert_eq!(forced_closing, forced_closing_before);
+    __cser_core::assert_eq!(forced_closing, forced_closing_before);
 
     let interrupted_retry_before = interrupted_close.clone();
     let interrupted_retry_publications = Cell::new(0_u8);
@@ -13672,32 +14272,32 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
         },
     ) {
         Err(DeviceCloseError::Published { obligation, error }) => {
-            assert_eq!(
+            __cser_core::assert_eq!(
                 obligation.status(),
                 DevicePublishedStatus::PossiblyPublished
             );
-            assert_eq!(obligation.operation(), Some(close_operation));
-            assert_eq!(
+            __cser_core::assert_eq!(obligation.operation(), Some(close_operation));
+            __cser_core::assert_eq!(
                 obligation.batch_sequence(),
                 Some(interrupted_batch.batch_sequence())
             );
-            assert_eq!(obligation.phase(), ScopePhase::Active);
-            assert_eq!(obligation.revoke(), None);
-            assert_eq!(error, RegistryError::InvalidState);
+            __cser_core::assert_eq!(obligation.phase(), ScopePhase::Active);
+            __cser_core::assert_eq!(obligation.revoke(), None);
+            __cser_core::assert_eq!(error, RegistryError::InvalidState);
         }
-        _ => panic!("interrupted publication was retried or classified unpublished"),
+        _ => __cser_core::panic!("interrupted publication was retried or classified unpublished"),
     }
-    assert_eq!(interrupted_retry_publications.get(), 0);
-    assert_eq!(interrupted_close, interrupted_retry_before);
+    __cser_core::assert_eq!(interrupted_retry_publications.get(), 0);
+    __cser_core::assert_eq!(interrupted_close, interrupted_retry_before);
     let interrupted_cancel_applies = Cell::new(0_u8);
-    assert_eq!(
+    __cser_core::assert_eq!(
         interrupted_close.close_enrolled_device_precommit_with_apply(&enrollment, |_| {
             interrupted_cancel_applies.set(1)
         }),
         Err(RegistryError::InvalidState)
     );
-    assert_eq!(interrupted_cancel_applies.get(), 0);
-    assert_eq!(interrupted_close, interrupted_retry_before);
+    __cser_core::assert_eq!(interrupted_cancel_applies.get(), 0);
+    __cser_core::assert_eq!(interrupted_close, interrupted_retry_before);
 
     let mut fresh_close = registry.clone();
     let fresh_close_before = fresh_close.scope_projection(SCOPE).unwrap();
@@ -13726,49 +14326,49 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
             publication,
             selection,
         } => {
-            assert_eq!(publication, device.descriptor_token());
+            __cser_core::assert_eq!(publication, device.descriptor_token());
             (receipt, selection)
         }
-        DeviceCloseOutcome::Recovered { .. } => panic!("fresh device close recovered"),
+        DeviceCloseOutcome::Recovered { .. } => __cser_core::panic!("fresh device close recovered"),
     };
-    assert_eq!(fresh_close_publications.get(), 1);
-    assert_eq!(fresh_close_receipt.scope(), SCOPE);
-    assert_eq!(fresh_close_selection.scope, SCOPE);
-    assert_eq!(fresh_close_selection.target_count, 6);
-    assert_eq!(
+    __cser_core::assert_eq!(fresh_close_publications.get(), 1);
+    __cser_core::assert_eq!(fresh_close_receipt.scope(), SCOPE);
+    __cser_core::assert_eq!(fresh_close_selection.scope, SCOPE);
+    __cser_core::assert_eq!(fresh_close_selection.target_count, 6);
+    __cser_core::assert_eq!(
         fresh_close.scope_projection(SCOPE).unwrap().authority_epoch,
         fresh_close_before.authority_epoch + 1
     );
-    assert_eq!(
+    __cser_core::assert_eq!(
         fresh_close.scope_projection(SCOPE).unwrap().revision,
         fresh_close_before.revision + 3
     );
-    assert_eq!(
+    __cser_core::assert_eq!(
         fresh_close.next_revoke_sequence,
         fresh_close_revoke_sequence + 1
     );
-    assert_eq!(
+    __cser_core::assert_eq!(
         fresh_close.next_commit_sequence,
         fresh_close_commit_sequence + 6
     );
-    assert_eq!(
+    __cser_core::assert_eq!(
         fresh_close.next_device_batch_sequence,
         fresh_close_batch_sequence + 1
     );
-    assert_eq!(
+    __cser_core::assert_eq!(
         fresh_close.next_device_enrollment_sequence,
         fresh_close_enrollment_sequence
     );
-    assert_eq!(
+    __cser_core::assert_eq!(
         fresh_close.next_device_closure_sequence,
         fresh_close_closure_sequence
     );
-    assert_eq!(
+    __cser_core::assert_eq!(
         fresh_close.scope_projection(SCOPE).unwrap().phase,
         ScopePhase::Closing
     );
     let fresh_close_root = fresh_close.scopes[&SCOPE].device_root.as_ref().unwrap();
-    assert!(matches!(
+    __cser_core::assert!(__cser_core::matches!(
         &fresh_close_root.publication,
         DevicePublicationProvenance::Applied { operation, batch }
             if *operation == close_operation && batch == &fresh_close_receipt
@@ -13784,19 +14384,19 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
         batch: rewritten_batch,
     } = &rewritten_root.publication
     else {
-        panic!("rewritten close lost applied provenance");
+        __cser_core::panic!("rewritten close lost applied provenance");
     };
-    assert_eq!(
+    __cser_core::assert_eq!(
         rewritten_operation.registry_instance_id(),
         rewritten_close_id
     );
-    assert_eq!(rewritten_operation.scope(), SCOPE);
-    assert_eq!(
+    __cser_core::assert_eq!(rewritten_operation.scope(), SCOPE);
+    __cser_core::assert_eq!(
         rewritten_operation.caller_nonce(),
         close_operation.caller_nonce()
     );
-    assert_eq!(rewritten_batch.registry_instance_id(), rewritten_close_id);
-    assert!(
+    __cser_core::assert_eq!(rewritten_batch.registry_instance_id(), rewritten_close_id);
+    __cser_core::assert!(
         rewritten_batch
             .commits()
             .iter()
@@ -13820,13 +14420,13 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
         .unwrap()
     {
         DeviceCloseOutcome::Recovered { receipt, selection } => {
-            assert_eq!(receipt, fresh_close_receipt);
-            assert_eq!(selection, fresh_close_selection);
+            __cser_core::assert_eq!(receipt, fresh_close_receipt);
+            __cser_core::assert_eq!(selection, fresh_close_selection);
         }
-        DeviceCloseOutcome::Applied { .. } => panic!("same operation republished"),
+        DeviceCloseOutcome::Applied { .. } => __cser_core::panic!("same operation republished"),
     }
-    assert_eq!(closing_recovery_publications.get(), 0);
-    assert_eq!(fresh_close, before_closing_recovery);
+    __cser_core::assert_eq!(closing_recovery_publications.get(), 0);
+    __cser_core::assert_eq!(fresh_close, before_closing_recovery);
 
     let assert_published_close_error =
         |candidate: &mut EffectRegistry,
@@ -13843,29 +14443,32 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
                 |_| publish_calls.set(publish_calls.get().checked_add(1).unwrap()),
             ) {
                 Err(DeviceCloseError::Published { obligation, .. }) => {
-                    assert_eq!(obligation.registry_instance_id(), registry.instance_id);
-                    assert_eq!(obligation.scope(), SCOPE);
-                    assert_eq!(obligation.device(), device);
-                    assert_eq!(
+                    __cser_core::assert_eq!(
+                        obligation.registry_instance_id(),
+                        registry.instance_id
+                    );
+                    __cser_core::assert_eq!(obligation.scope(), SCOPE);
+                    __cser_core::assert_eq!(obligation.device(), device);
+                    __cser_core::assert_eq!(
                         obligation.batch_sequence(),
                         Some(fresh_close_receipt.batch_sequence())
                     );
-                    assert_eq!(obligation.operation(), Some(close_operation));
-                    assert_eq!(obligation.phase(), ScopePhase::Closing);
-                    assert_eq!(obligation.revoke(), Some(&fresh_close_selection));
-                    assert_eq!(obligation.reset_ticket(), None);
-                    assert_eq!(obligation.reset_tombstone(), None);
-                    assert!(!obligation.reset_retry_issued());
-                    assert_eq!(obligation.reset_receipt(), None);
-                    assert_eq!(obligation.iotlb_ticket(), None);
-                    assert_eq!(obligation.iotlb_tombstone(), None);
-                    assert!(!obligation.iotlb_retry_issued());
-                    assert_eq!(obligation.closure(), None);
+                    __cser_core::assert_eq!(obligation.operation(), Some(close_operation));
+                    __cser_core::assert_eq!(obligation.phase(), ScopePhase::Closing);
+                    __cser_core::assert_eq!(obligation.revoke(), Some(&fresh_close_selection));
+                    __cser_core::assert_eq!(obligation.reset_ticket(), None);
+                    __cser_core::assert_eq!(obligation.reset_tombstone(), None);
+                    __cser_core::assert!(!obligation.reset_retry_issued());
+                    __cser_core::assert_eq!(obligation.reset_receipt(), None);
+                    __cser_core::assert_eq!(obligation.iotlb_ticket(), None);
+                    __cser_core::assert_eq!(obligation.iotlb_tombstone(), None);
+                    __cser_core::assert!(!obligation.iotlb_retry_issued());
+                    __cser_core::assert_eq!(obligation.closure(), None);
                 }
-                _ => panic!("published input drift lacked ownership obligation"),
+                _ => __cser_core::panic!("published input drift lacked ownership obligation"),
             }
-            assert_eq!(publish_calls.get(), 0);
-            assert_eq!(*candidate, before);
+            __cser_core::assert_eq!(publish_calls.get(), 0);
+            __cser_core::assert_eq!(*candidate, before);
         };
 
     let mut wrong_operation = close_operation;
@@ -13939,22 +14542,22 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
         |_| corrupt_publish_calls.set(corrupt_publish_calls.get().checked_add(1).unwrap()),
     ) {
         Err(DeviceCloseError::Published { obligation, error }) => {
-            assert_eq!(
+            __cser_core::assert_eq!(
                 obligation.batch_sequence(),
                 Some(fresh_close_receipt.batch_sequence())
             );
-            assert_eq!(obligation.operation(), Some(close_operation));
-            assert_eq!(error, RegistryError::InvalidBatchReceipt);
+            __cser_core::assert_eq!(obligation.operation(), Some(close_operation));
+            __cser_core::assert_eq!(error, RegistryError::InvalidBatchReceipt);
         }
-        _ => panic!("corrupt operation state was misclassified as unpublished"),
+        _ => __cser_core::panic!("corrupt operation state was misclassified as unpublished"),
     }
-    assert_eq!(corrupt_publish_calls.get(), 0);
-    assert_eq!(corrupt_operation_state, corrupt_before);
+    __cser_core::assert_eq!(corrupt_publish_calls.get(), 0);
+    __cser_core::assert_eq!(corrupt_operation_state, corrupt_before);
 
     let assert_fresh_close_overflow = |candidate: &mut EffectRegistry| {
         let before = candidate.clone();
         let publish_calls = Cell::new(0_u8);
-        assert!(matches!(
+        __cser_core::assert!(__cser_core::matches!(
             candidate.commit_or_recover_device_close_with_apply(
                 close_operation,
                 authority,
@@ -13966,8 +14569,8 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
                 RegistryError::CounterOverflow
             ))
         ));
-        assert_eq!(publish_calls.get(), 0);
-        assert_eq!(*candidate, before);
+        __cser_core::assert_eq!(publish_calls.get(), 0);
+        __cser_core::assert_eq!(*candidate, before);
     };
 
     let mut close_revoke_overflow = registry.clone();
@@ -14025,7 +14628,7 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
         .unwrap();
     let close_authority_before = close_authority_overflow.clone();
     let authority_publish_calls = Cell::new(0_u8);
-    assert!(matches!(
+    __cser_core::assert!(__cser_core::matches!(
         close_authority_overflow.commit_or_recover_device_close_with_apply(
             overflow_operation,
             overflow_authority,
@@ -14037,8 +14640,8 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
             RegistryError::CounterOverflow
         ))
     ));
-    assert_eq!(authority_publish_calls.get(), 0);
-    assert_eq!(close_authority_overflow, close_authority_before);
+    __cser_core::assert_eq!(authority_publish_calls.get(), 0);
+    __cser_core::assert_eq!(close_authority_overflow, close_authority_before);
 
     let mut revoked_recovery = fresh_close.clone();
     let reset_ticket = revoked_recovery
@@ -14063,7 +14666,7 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
             .revoke_next(&fresh_close_selection)
             .unwrap()
             .unwrap();
-        assert_eq!(next.effect, expected);
+        __cser_core::assert_eq!(next.effect, expected);
         revoked_recovery
             .stage_device_batch_terminal(
                 &closure,
@@ -14072,7 +14675,7 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
             )
             .unwrap();
     }
-    assert!(
+    __cser_core::assert!(
         revoked_recovery
             .revoke_next(&fresh_close_selection)
             .unwrap()
@@ -14081,7 +14684,7 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
     revoked_recovery
         .revoke_complete(&fresh_close_selection)
         .unwrap();
-    assert_eq!(
+    __cser_core::assert_eq!(
         revoked_recovery.scope_projection(SCOPE).unwrap().phase,
         ScopePhase::Revoked
     );
@@ -14102,13 +14705,13 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
         .unwrap()
     {
         DeviceCloseOutcome::Recovered { receipt, selection } => {
-            assert_eq!(receipt, fresh_close_receipt);
-            assert_eq!(selection, fresh_close_selection);
+            __cser_core::assert_eq!(receipt, fresh_close_receipt);
+            __cser_core::assert_eq!(selection, fresh_close_selection);
         }
-        DeviceCloseOutcome::Applied { .. } => panic!("revoked operation republished"),
+        DeviceCloseOutcome::Applied { .. } => __cser_core::panic!("revoked operation republished"),
     }
-    assert_eq!(revoked_recovery_publications.get(), 0);
-    assert_eq!(revoked_recovery, before_revoked_recovery);
+    __cser_core::assert_eq!(revoked_recovery_publications.get(), 0);
+    __cser_core::assert_eq!(revoked_recovery, before_revoked_recovery);
 
     let legacy_operation = registry
         .mint_device_close_operation(&enrollment, 0x51_1001)
@@ -14116,8 +14719,8 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
     let publications = Cell::new(0_u8);
     let receipt = match registry
         .commit_device_batch_with_publish(authority, &enrollment, &commits, |prepared| {
-            assert_eq!(prepared.commits().len(), 6);
-            assert_eq!(prepared.device_effects().len(), 4);
+            __cser_core::assert_eq!(prepared.commits().len(), 6);
+            __cser_core::assert_eq!(prepared.device_effects().len(), 4);
             publications.set(publications.get() + 1);
             prepared.device().descriptor_token()
         })
@@ -14127,29 +14730,29 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
             receipt,
             publication,
         } => {
-            assert_eq!(publication, 0);
+            __cser_core::assert_eq!(publication, 0);
             receipt
         }
         DeviceBatchCommitOutcome::AlreadyCommitted { .. } => {
-            panic!("fresh device batch replayed")
+            __cser_core::panic!("fresh device batch replayed")
         }
     };
-    assert_eq!(publications.get(), 1);
-    assert_eq!(receipt.registry_instance_id(), registry.instance_id);
-    assert_eq!(receipt.scope(), SCOPE);
-    assert_eq!(receipt.authority_epoch(), 17);
-    assert_eq!(receipt.batch_sequence(), 1);
-    assert_eq!(receipt.device(), device);
-    assert_eq!(receipt.commits().len(), 6);
-    assert_eq!(receipt.device_effects().len(), 4);
+    __cser_core::assert_eq!(publications.get(), 1);
+    __cser_core::assert_eq!(receipt.registry_instance_id(), registry.instance_id);
+    __cser_core::assert_eq!(receipt.scope(), SCOPE);
+    __cser_core::assert_eq!(receipt.authority_epoch(), 17);
+    __cser_core::assert_eq!(receipt.batch_sequence(), 1);
+    __cser_core::assert_eq!(receipt.device(), device);
+    __cser_core::assert_eq!(receipt.commits().len(), 6);
+    __cser_core::assert_eq!(receipt.device_effects().len(), 4);
     registry.validate_device_batch_receipt(&receipt).unwrap();
     registry.check_invariants().unwrap();
     let committed = registry.scope_projection(SCOPE).unwrap().credits;
-    assert_eq!(committed.capacity, 7);
-    assert_eq!(committed.free, 1);
-    assert_eq!(committed.held, 0);
-    assert_eq!(committed.committed, 6);
-    assert_eq!(committed.retained, 0);
+    __cser_core::assert_eq!(committed.capacity, 7);
+    __cser_core::assert_eq!(committed.free, 1);
+    __cser_core::assert_eq!(committed.held, 0);
+    __cser_core::assert_eq!(committed.committed, 6);
+    __cser_core::assert_eq!(committed.retained, 0);
 
     let replay_publications = Cell::new(0_u8);
     match registry
@@ -14159,11 +14762,13 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
         .unwrap()
     {
         DeviceBatchCommitOutcome::AlreadyCommitted { receipt: replay } => {
-            assert_eq!(replay, receipt)
+            __cser_core::assert_eq!(replay, receipt)
         }
-        DeviceBatchCommitOutcome::Applied { .. } => panic!("device batch published twice"),
+        DeviceBatchCommitOutcome::Applied { .. } => {
+            __cser_core::panic!("device batch published twice")
+        }
     }
-    assert_eq!(replay_publications.get(), 0);
+    __cser_core::assert_eq!(replay_publications.get(), 0);
 
     let legacy_before = registry.clone();
     let legacy_publish_calls = Cell::new(0_u8);
@@ -14175,123 +14780,123 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
         |_| legacy_publish_calls.set(legacy_publish_calls.get().checked_add(1).unwrap()),
     ) {
         Err(DeviceCloseError::Published { obligation, error }) => {
-            assert_eq!(obligation.registry_instance_id(), registry.instance_id);
-            assert_eq!(obligation.scope(), SCOPE);
-            assert_eq!(obligation.device(), device);
-            assert_eq!(obligation.batch_sequence(), Some(receipt.batch_sequence()));
-            assert_eq!(obligation.operation(), None);
-            assert_eq!(obligation.phase(), ScopePhase::Active);
-            assert_eq!(obligation.revoke(), None);
-            assert_eq!(obligation.reset_ticket(), None);
-            assert_eq!(obligation.closure(), None);
-            assert_eq!(error, RegistryError::InvalidState);
+            __cser_core::assert_eq!(obligation.registry_instance_id(), registry.instance_id);
+            __cser_core::assert_eq!(obligation.scope(), SCOPE);
+            __cser_core::assert_eq!(obligation.device(), device);
+            __cser_core::assert_eq!(obligation.batch_sequence(), Some(receipt.batch_sequence()));
+            __cser_core::assert_eq!(obligation.operation(), None);
+            __cser_core::assert_eq!(obligation.phase(), ScopePhase::Active);
+            __cser_core::assert_eq!(obligation.revoke(), None);
+            __cser_core::assert_eq!(obligation.reset_ticket(), None);
+            __cser_core::assert_eq!(obligation.closure(), None);
+            __cser_core::assert_eq!(error, RegistryError::InvalidState);
         }
-        _ => panic!("legacy committed state was not an honest Published error"),
+        _ => __cser_core::panic!("legacy committed state was not an honest Published error"),
     }
-    assert_eq!(legacy_publish_calls.get(), 0);
-    assert_eq!(*registry, legacy_before);
+    __cser_core::assert_eq!(legacy_publish_calls.get(), 0);
+    __cser_core::assert_eq!(*registry, legacy_before);
 
     let replay_before = registry.clone();
-    assert_eq!(
+    __cser_core::assert_eq!(
         registry.commit(PERSONALITY, syscall.handle, commits[0].1),
         Err(RegistryError::InvalidDeviceEnvelope)
     );
-    assert_eq!(*registry, replay_before);
+    __cser_core::assert_eq!(*registry, replay_before);
 
     let mut wrong_receipt = receipt.clone();
     wrong_receipt.device.device_generation += 1;
-    assert_eq!(
+    __cser_core::assert_eq!(
         registry.validate_device_batch_receipt(&wrong_receipt),
         Err(RegistryError::StaleDeviceGeneration)
     );
     let mut wrong_receipt = receipt.clone();
     wrong_receipt.device.device_session += 1;
-    assert_eq!(
+    __cser_core::assert_eq!(
         registry.validate_device_batch_receipt(&wrong_receipt),
         Err(RegistryError::InvalidBatchReceipt)
     );
     let mut wrong_receipt = receipt.clone();
     wrong_receipt.commits.swap(0, 1);
-    assert_eq!(
+    __cser_core::assert_eq!(
         registry.validate_device_batch_receipt(&wrong_receipt),
         Err(RegistryError::InvalidBatchReceipt)
     );
     let mut wrong_receipt = receipt.clone();
     wrong_receipt.device_effects.pop();
-    assert_eq!(
+    __cser_core::assert_eq!(
         registry.validate_device_batch_receipt(&wrong_receipt),
         Err(RegistryError::InvalidBatchReceipt)
     );
     let mut wrong_receipt = receipt.clone();
     wrong_receipt.registry_instance_id += 1;
-    assert_eq!(
+    __cser_core::assert_eq!(
         registry.validate_device_batch_receipt(&wrong_receipt),
         Err(RegistryError::InvalidBatchReceipt)
     );
 
     let mut wrong_completion_result = registry.clone();
     let wrong_completion_before = wrong_completion_result.clone();
-    assert_eq!(
+    __cser_core::assert_eq!(
         wrong_completion_result.record_device_completion(&receipt, device, 512),
         Err(RegistryError::CommitConflict)
     );
-    assert_eq!(wrong_completion_result, wrong_completion_before);
+    __cser_core::assert_eq!(wrong_completion_result, wrong_completion_before);
 
     // Normal completion still requires whole-device reset and IOTLB closure.
     let mut normal = registry.clone();
     let completion = normal
         .record_device_completion(&receipt, device, 4)
         .unwrap();
-    assert_eq!(completion.device(), device);
-    assert_eq!(completion.result(), 4);
-    assert_eq!(completion.causal_root(), syscall.identity.effect());
+    __cser_core::assert_eq!(completion.device(), device);
+    __cser_core::assert_eq!(completion.result(), 4);
+    __cser_core::assert_eq!(completion.causal_root(), syscall.identity.effect());
     let reset_ticket = normal.begin_device_reset(&receipt).unwrap();
     let reset_applies = Cell::new(0_u8);
     let (reset, ()) = normal
         .acknowledge_device_reset_with_apply(&reset_ticket, |prepared| {
-            assert_eq!(prepared.old_device(), device);
+            __cser_core::assert_eq!(prepared.old_device(), device);
             reset_applies.set(1);
         })
         .unwrap();
-    assert_eq!(reset_applies.get(), 1);
-    assert_eq!(reset.old_device(), device);
-    assert_eq!(reset.new_device().device_generation(), 2);
-    assert_eq!(reset.outcome(), DeviceClosureResult::Completed(4));
+    __cser_core::assert_eq!(reset_applies.get(), 1);
+    __cser_core::assert_eq!(reset.old_device(), device);
+    __cser_core::assert_eq!(reset.new_device().device_generation(), 2);
+    __cser_core::assert_eq!(reset.outcome(), DeviceClosureResult::Completed(4));
     let iotlb = normal.begin_device_iotlb(&reset).unwrap();
     let mut iotlb_overflow = normal.clone();
     iotlb_overflow.next_device_closure_sequence = u64::MAX;
     let iotlb_overflow_before = iotlb_overflow.clone();
     let overflow_applies = Cell::new(0_u8);
-    assert!(matches!(
+    __cser_core::assert!(__cser_core::matches!(
         iotlb_overflow.acknowledge_device_iotlb_with_apply(&iotlb, |_| { overflow_applies.set(1) }),
         Err(RegistryError::CounterOverflow)
     ));
-    assert_eq!(overflow_applies.get(), 0);
-    assert_eq!(iotlb_overflow, iotlb_overflow_before);
+    __cser_core::assert_eq!(overflow_applies.get(), 0);
+    __cser_core::assert_eq!(iotlb_overflow, iotlb_overflow_before);
 
     let iotlb_applies = Cell::new(0_u8);
     let (normal_closure, ()) = normal
         .acknowledge_device_iotlb_with_apply(&iotlb, |prepared| {
-            assert_eq!(prepared.device(), reset.new_device());
+            __cser_core::assert_eq!(prepared.device(), reset.new_device());
             iotlb_applies.set(1);
         })
         .unwrap();
-    assert_eq!(iotlb_applies.get(), 1);
+    __cser_core::assert_eq!(iotlb_applies.get(), 1);
     let normal_after_closure = normal.clone();
     let duplicate_applies = Cell::new(0_u8);
-    assert_eq!(
+    __cser_core::assert_eq!(
         normal.acknowledge_device_iotlb_with_apply(&iotlb, |_| duplicate_applies.set(1)),
         Err(RegistryError::InvalidBatchReceipt)
     );
-    assert_eq!(duplicate_applies.get(), 0);
-    assert_eq!(normal, normal_after_closure);
-    assert_eq!(normal_closure.outcome(), DeviceClosureResult::Completed(4));
+    __cser_core::assert_eq!(duplicate_applies.get(), 0);
+    __cser_core::assert_eq!(normal, normal_after_closure);
+    __cser_core::assert_eq!(normal_closure.outcome(), DeviceClosureResult::Completed(4));
     let normal_before_generic = normal.clone();
-    assert_eq!(
+    __cser_core::assert_eq!(
         normal.stage_kernel_completion(receipt.commit_for(dma_a.identity.effect()).unwrap()),
         Err(RegistryError::DeviceClosurePending)
     );
-    assert_eq!(normal, normal_before_generic);
+    __cser_core::assert_eq!(normal, normal_before_generic);
     for expected in [
         dma_a.identity.effect(),
         dma_b.identity.effect(),
@@ -14310,16 +14915,16 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
             .unwrap();
     }
     let normal_projection = normal.scope_projection(SCOPE).unwrap();
-    assert_eq!(normal_projection.live_effects, 0);
-    assert_eq!(normal_projection.credits.free, 7);
-    assert_eq!(normal_projection.credits.retained, 0);
+    __cser_core::assert_eq!(normal_projection.live_effects, 0);
+    __cser_core::assert_eq!(normal_projection.credits.free, 7);
+    __cser_core::assert_eq!(normal_projection.credits.retained, 0);
     normal.check_invariants().unwrap();
 
     // Published ownership with no authoritative completion becomes a real
     // indeterminate terminal only when reset advances the device generation.
     let mut indeterminate = registry.clone();
     let reset_ticket = indeterminate.begin_device_reset(&receipt).unwrap();
-    assert_eq!(
+    __cser_core::assert_eq!(
         indeterminate.scopes[&SCOPE]
             .device_root
             .as_ref()
@@ -14330,7 +14935,7 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
     let (reset, ()) = indeterminate
         .acknowledge_device_reset_with_apply(&reset_ticket, |_| ())
         .unwrap();
-    assert_eq!(
+    __cser_core::assert_eq!(
         reset.outcome(),
         DeviceClosureResult::IndeterminateAfterReset
     );
@@ -14345,7 +14950,7 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
             TerminalRequest::indeterminate_after_reset(-5),
         )
         .unwrap();
-    assert_eq!(
+    __cser_core::assert_eq!(
         indeterminate
             .effect_view(dma_a.identity.effect())
             .unwrap()
@@ -14358,31 +14963,32 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
     registry.validate_device_batch_receipt(&receipt).unwrap();
     let after_revoke = registry.clone();
     let late_publications = Cell::new(0_u8);
-    assert!(matches!(
+    __cser_core::assert!(__cser_core::matches!(
         registry.commit_device_batch_with_publish(authority, &enrollment, &commits, |_| {
             late_publications.set(1)
         },),
         Err(RegistryError::StaleAuthority)
     ));
-    assert_eq!(late_publications.get(), 0);
-    assert_eq!(*registry, after_revoke);
+    __cser_core::assert_eq!(late_publications.get(), 0);
+    __cser_core::assert_eq!(*registry, after_revoke);
 
     let selected = registry.revoke_next(&selection).unwrap().unwrap();
-    assert_eq!(selected.effect, dma_a.identity.effect());
+    __cser_core::assert_eq!(selected.effect, dma_a.identity.effect());
     let before_generic_drain = registry.clone();
-    assert_eq!(
+    __cser_core::assert_eq!(
         registry.stage_revoke_terminal(
             &selection,
             selected.effect,
             TerminalRequest::completed(match selected.disposition {
                 RevokeDisposition::Drain(ref commit) => commit.result(),
-                RevokeDisposition::Abort => panic!("committed device batch became abortable"),
+                RevokeDisposition::Abort =>
+                    __cser_core::panic!("committed device batch became abortable"),
             }),
         ),
         Err(RegistryError::DeviceClosurePending)
     );
-    assert_eq!(*registry, before_generic_drain);
-    assert_eq!(
+    __cser_core::assert_eq!(*registry, before_generic_drain);
+    __cser_core::assert_eq!(
         registry.revoke_complete(&selection),
         Err(RegistryError::NotQuiescent)
     );
@@ -14392,14 +14998,14 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
         .unwrap();
     let reset_ticket = registry.begin_device_reset(&receipt).unwrap();
     let reset_tombstone = registry.retain_device_reset_timeout(&reset_ticket).unwrap();
-    assert_eq!(reset_tombstone.device(), device);
+    __cser_core::assert_eq!(reset_tombstone.device(), device);
     let retained = registry.scope_projection(SCOPE).unwrap().credits;
-    assert_eq!(retained.free, 1);
-    assert_eq!(retained.held, 0);
-    assert_eq!(retained.committed, 0);
-    assert_eq!(retained.retained, 6);
+    __cser_core::assert_eq!(retained.free, 1);
+    __cser_core::assert_eq!(retained.held, 0);
+    __cser_core::assert_eq!(retained.committed, 0);
+    __cser_core::assert_eq!(retained.retained, 6);
     registry.check_invariants().unwrap();
-    assert_eq!(
+    __cser_core::assert_eq!(
         registry.revoke_complete(&selection),
         Err(RegistryError::NotQuiescent)
     );
@@ -14408,45 +15014,45 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
     let (reset, ()) = registry
         .acknowledge_device_reset_with_apply(&retry, |_| reset_applies.set(1))
         .unwrap();
-    assert_eq!(reset_applies.get(), 1);
-    assert_eq!(reset.new_device().device_generation(), 2);
-    assert_eq!(reset.outcome(), DeviceClosureResult::Completed(4));
+    __cser_core::assert_eq!(reset_applies.get(), 1);
+    __cser_core::assert_eq!(reset.new_device().device_generation(), 2);
+    __cser_core::assert_eq!(reset.outcome(), DeviceClosureResult::Completed(4));
     registry.check_invariants().unwrap();
 
     let before_late_completion = registry.clone();
-    assert_eq!(
+    __cser_core::assert_eq!(
         registry.record_device_completion(&receipt, device, 4),
         Err(RegistryError::StaleDeviceGeneration)
     );
-    assert_eq!(*registry, before_late_completion);
+    __cser_core::assert_eq!(*registry, before_late_completion);
 
     let iotlb = registry.begin_device_iotlb(&reset).unwrap();
     let iotlb_tombstone = registry.retain_device_iotlb_timeout(&iotlb).unwrap();
-    assert_eq!(iotlb_tombstone.device().device_generation(), 2);
+    __cser_core::assert_eq!(iotlb_tombstone.device().device_generation(), 2);
     let iotlb_retry = registry
         .retry_device_iotlb(&reset, &iotlb_tombstone)
         .unwrap();
     let (closure, ()) = registry
         .acknowledge_device_iotlb_with_apply(&iotlb_retry, |_| ())
         .unwrap();
-    assert_eq!(closure.device().device_generation(), 2);
-    assert_eq!(closure.outcome(), DeviceClosureResult::Completed(4));
+    __cser_core::assert_eq!(closure.device().device_generation(), 2);
+    __cser_core::assert_eq!(closure.outcome(), DeviceClosureResult::Completed(4));
     registry.validate_device_closure_receipt(&closure).unwrap();
     registry.check_invariants().unwrap();
     let mut stale_closure = closure;
     stale_closure.device = device;
     let before_stale_closure = registry.clone();
-    assert_eq!(
+    __cser_core::assert_eq!(
         registry.validate_device_closure_receipt(&stale_closure),
         Err(RegistryError::StaleDeviceGeneration)
     );
-    assert_eq!(*registry, before_stale_closure);
+    __cser_core::assert_eq!(*registry, before_stale_closure);
     let mut forged_closure = closure;
     forged_closure.batch_sequence = forged_closure
         .batch_sequence
         .and_then(|sequence| sequence.checked_add(1));
     let before_forged_closure = registry.clone();
-    assert_eq!(
+    __cser_core::assert_eq!(
         registry.stage_device_batch_terminal(
             &forged_closure,
             dma_a.identity.effect(),
@@ -14454,7 +15060,7 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
         ),
         Err(RegistryError::InvalidBatchReceipt)
     );
-    assert_eq!(*registry, before_forged_closure);
+    __cser_core::assert_eq!(*registry, before_forged_closure);
 
     for expected in [
         dma_a.identity.effect(),
@@ -14465,25 +15071,27 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
         syscall.identity.effect(),
     ] {
         let next = registry.revoke_next(&selection).unwrap().unwrap();
-        assert_eq!(next.effect, expected);
+        __cser_core::assert_eq!(next.effect, expected);
         let result = match next.disposition {
             RevokeDisposition::Drain(commit) => commit.result(),
-            RevokeDisposition::Abort => panic!("committed device batch became abortable"),
+            RevokeDisposition::Abort => {
+                __cser_core::panic!("committed device batch became abortable")
+            }
         };
         registry
             .stage_device_batch_terminal(&closure, expected, TerminalRequest::completed(result))
             .unwrap();
     }
-    assert!(registry.revoke_next(&selection).unwrap().is_none());
+    __cser_core::assert!(registry.revoke_next(&selection).unwrap().is_none());
     registry.revoke_complete(&selection).unwrap();
     registry.validate_device_batch_receipt(&receipt).unwrap();
     let closed = registry.scope_projection(SCOPE).unwrap();
-    assert_eq!(closed.phase, ScopePhase::Revoked);
-    assert_eq!(closed.live_effects, 0);
-    assert_eq!(closed.credits.free, 7);
-    assert_eq!(closed.credits.held, 0);
-    assert_eq!(closed.credits.committed, 0);
-    assert_eq!(closed.credits.retained, 0);
+    __cser_core::assert_eq!(closed.phase, ScopePhase::Revoked);
+    __cser_core::assert_eq!(closed.live_effects, 0);
+    __cser_core::assert_eq!(closed.credits.free, 7);
+    __cser_core::assert_eq!(closed.credits.held, 0);
+    __cser_core::assert_eq!(closed.credits.committed, 0);
+    __cser_core::assert_eq!(closed.credits.retained, 0);
     registry.check_invariants().unwrap();
 }
 
@@ -14511,7 +15119,7 @@ pub(crate) fn bounded_registry_self_test() -> RegistrySelfTestReceipt {
             authority_epoch: 111,
             binding_epoch: 1,
             supervisor: v1,
-            credits: alloc::vec![
+            credits: __cser_alloc::vec![
                 CreditLimit::new(WAIT_CREDIT, 1),
                 CreditLimit::new(SYSCALL_CREDIT, 1),
             ],
@@ -14524,8 +15132,8 @@ pub(crate) fn bounded_registry_self_test() -> RegistrySelfTestReceipt {
             task: waiter,
             operation: OperationClass::new(1),
             descriptor: SyscallDescriptor::new(202, [0x402010, 128, 0, 0, 0, 0]),
-            resources: alloc::vec![futex_a],
-            credits: alloc::vec![CreditCharge::new(WAIT_CREDIT, 1)],
+            resources: __cser_alloc::vec![futex_a],
+            credits: __cser_alloc::vec![CreditCharge::new(WAIT_CREDIT, 1)],
             publication: PublicationMode::Required,
         })
         .unwrap();
@@ -14537,8 +15145,8 @@ pub(crate) fn bounded_registry_self_test() -> RegistrySelfTestReceipt {
             task: caller,
             operation: OperationClass::new(3),
             descriptor: SyscallDescriptor::new(202, [0x402010, 131, 0, 1, 0x402018, 0]),
-            resources: alloc::vec![futex_a, futex_b],
-            credits: alloc::vec![CreditCharge::new(SYSCALL_CREDIT, 1)],
+            resources: __cser_alloc::vec![futex_a, futex_b],
+            credits: __cser_alloc::vec![CreditCharge::new(SYSCALL_CREDIT, 1)],
             publication: PublicationMode::Required,
         })
         .unwrap();
@@ -14549,7 +15157,7 @@ pub(crate) fn bounded_registry_self_test() -> RegistrySelfTestReceipt {
             &[(requeue.handle, CommitMetadata::new(1, 7))],
             &[ResourceMove {
                 handle: wait.handle,
-                current_resources: alloc::vec![futex_b],
+                current_resources: __cser_alloc::vec![futex_b],
             }],
         )
         .unwrap()
@@ -14557,14 +15165,14 @@ pub(crate) fn bounded_registry_self_test() -> RegistrySelfTestReceipt {
         .unwrap()
     {
         CommitOutcome::Applied(receipt) => receipt,
-        CommitOutcome::AlreadyCommitted(_) => unreachable!(),
+        CommitOutcome::AlreadyCommitted(_) => __cser_core::unreachable!(),
     };
-    assert!(
+    __cser_core::assert!(
         !registry
             .effects_for_resource(futex_a)
             .contains(&wait.identity.effect())
     );
-    assert!(
+    __cser_core::assert!(
         registry
             .effects_for_resource(futex_b)
             .contains(&wait.identity.effect())
@@ -14572,7 +15180,7 @@ pub(crate) fn bounded_registry_self_test() -> RegistrySelfTestReceipt {
     registry.check_invariants().unwrap();
 
     let crash = registry.crash(scope, v1).unwrap();
-    assert_eq!(crash.cohort.len(), 2);
+    __cser_core::assert_eq!(crash.cohort.len(), 2);
     let snapshot = registry.recovery_snapshot(scope, v2).unwrap();
     registry.ready(scope, v2, &snapshot).unwrap();
     registry.rebind(scope, v2).unwrap();
@@ -14583,9 +15191,9 @@ pub(crate) fn bounded_registry_self_test() -> RegistrySelfTestReceipt {
         let handle = registry.adopt(scope, v2, item.handle).unwrap();
         adopted.insert(effect, handle);
     }
-    assert_eq!(adopted.len(), 2);
-    assert_eq!(registry.recovery_remaining(scope).unwrap(), 0);
-    assert_eq!(
+    __cser_core::assert_eq!(adopted.len(), 2);
+    __cser_core::assert_eq!(registry.recovery_remaining(scope).unwrap(), 0);
+    __cser_core::assert_eq!(
         registry
             .commit(
                 v2,
@@ -14597,7 +15205,7 @@ pub(crate) fn bounded_registry_self_test() -> RegistrySelfTestReceipt {
     );
 
     let selection = registry.revoke_begin(scope).unwrap();
-    assert_eq!(
+    __cser_core::assert_eq!(
         registry.prepare(v2, *adopted.get(&wait.identity.effect()).unwrap()),
         Err(RegistryError::StaleAuthority)
     );
@@ -14613,7 +15221,7 @@ pub(crate) fn bounded_registry_self_test() -> RegistrySelfTestReceipt {
             .unwrap();
         tickets.push(terminal.publication.unwrap());
     }
-    assert_eq!(
+    __cser_core::assert_eq!(
         registry.revoke_complete(&selection),
         Err(RegistryError::NotQuiescent)
     );
@@ -14623,10 +15231,10 @@ pub(crate) fn bounded_registry_self_test() -> RegistrySelfTestReceipt {
     registry.revoke_complete(&selection).unwrap();
     registry.check_invariants().unwrap();
     let projection = registry.scope_projection(scope).unwrap();
-    assert_eq!(projection.phase, ScopePhase::Revoked);
-    assert_eq!(projection.live_effects, 0);
-    assert_eq!(projection.pending_publications, 0);
-    assert_eq!(projection.credits.free, projection.credits.capacity);
+    __cser_core::assert_eq!(projection.phase, ScopePhase::Revoked);
+    __cser_core::assert_eq!(projection.live_effects, 0);
+    __cser_core::assert_eq!(projection.pending_publications, 0);
+    __cser_core::assert_eq!(projection.credits.free, projection.credits.capacity);
 
     // A diagnostic before/after hash must not depend on how many unrelated
     // negative registries happened to be allocated earlier in the boot. The
@@ -14635,12 +15243,12 @@ pub(crate) fn bounded_registry_self_test() -> RegistrySelfTestReceipt {
     let renamespaced_id = registry.instance_id.checked_add(1).unwrap();
     renamespaced.rewrite_registry_instance(renamespaced_id);
     renamespaced.check_invariants().unwrap();
-    assert_ne!(registry.instance_id, renamespaced.instance_id);
-    assert_ne!(
-        alloc::format!("{registry:?}"),
-        alloc::format!("{renamespaced:?}")
+    __cser_core::assert_ne!(registry.instance_id, renamespaced.instance_id);
+    __cser_core::assert_ne!(
+        __cser_alloc::format!("{registry:?}"),
+        __cser_alloc::format!("{renamespaced:?}")
     );
-    assert_eq!(
+    __cser_core::assert_eq!(
         registry.failure_atomic_projection(),
         renamespaced.failure_atomic_projection()
     );
@@ -14661,7 +15269,7 @@ pub(crate) fn bounded_registry_self_test() -> RegistrySelfTestReceipt {
 /// workload population is pinned by `production_device_batch_registry_self_test`;
 /// this smaller harness isolates the pending-enrollment publication boundary so
 /// Loom does not turn graph construction into the race under test.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(crate) struct ProductionDeviceBatchRaceFixture {
     registry: EffectRegistry,
     scope: ScopeKey,
@@ -14685,7 +15293,7 @@ impl ProductionDeviceBatchRaceFixture {
         const CONTROL_CREDIT: CreditClass = CreditClass::new(0x3f1);
         const DEVICE_CREDIT: CreditClass = CreditClass::new(0x3f2);
 
-        assert!(registry.scopes.is_empty());
+        __cser_core::assert!(registry.scopes.is_empty());
         let device = DeviceEnvelope::new(0x3f, 0, 0, 1).unwrap();
         registry
             .create_scope(ScopeConfig {
@@ -14693,7 +15301,7 @@ impl ProductionDeviceBatchRaceFixture {
                 authority_epoch: 31,
                 binding_epoch: 1,
                 supervisor: ROOT_OWNER,
-                credits: alloc::vec![
+                credits: __cser_alloc::vec![
                     CreditLimit::new(CONTROL_CREDIT, 1),
                     CreditLimit::new(DEVICE_CREDIT, 1),
                 ],
@@ -14720,8 +15328,8 @@ impl ProductionDeviceBatchRaceFixture {
                     task: CONTROL,
                     operation: OperationClass::new(1),
                     descriptor: SyscallDescriptor::new(17, [0; 6]),
-                    resources: alloc::vec![ResourceKey::new(0x3f, 1, 1)],
-                    credits: alloc::vec![CreditCharge::new(CONTROL_CREDIT, 1)],
+                    resources: __cser_alloc::vec![ResourceKey::new(0x3f, 1, 1)],
+                    credits: __cser_alloc::vec![CreditCharge::new(CONTROL_CREDIT, 1)],
                     publication: PublicationMode::None,
                 },
                 domain: CONTROL_DOMAIN,
@@ -14736,8 +15344,8 @@ impl ProductionDeviceBatchRaceFixture {
                         task: DEVICE,
                         operation: OperationClass::new(2),
                         descriptor: SyscallDescriptor::new(2, [0; 6]),
-                        resources: alloc::vec![ResourceKey::new(0x3f, 2, 1)],
-                        credits: alloc::vec![CreditCharge::new(DEVICE_CREDIT, 1)],
+                        resources: __cser_alloc::vec![ResourceKey::new(0x3f, 2, 1)],
+                        credits: __cser_alloc::vec![CreditCharge::new(DEVICE_CREDIT, 1)],
                         publication: PublicationMode::None,
                     },
                     domain: DEVICE_DOMAIN,
@@ -14871,7 +15479,7 @@ impl ProductionDeviceBatchRaceFixture {
     }
 
     pub(crate) fn failure_atomic_projection(&self) -> String {
-        alloc::format!("{self:?}")
+        __cser_alloc::format!("{self:?}")
     }
 
     pub(crate) fn is_quiescent(&self) -> bool {
@@ -14917,7 +15525,7 @@ pub(crate) fn production_handoff_retained_self_test(
         .registry
         .freeze_admission(blocked.scope, prepare)
         .unwrap();
-    assert_eq!(freeze.readiness(), HandoffFreezeReadiness::BlockedRetained);
+    __cser_core::assert_eq!(freeze.readiness(), HandoffFreezeReadiness::BlockedRetained);
     let commit = OwnershipDecisionReceipt::new(
         freeze.freeze(),
         LogPosition::new(0xa21).unwrap(),
@@ -14926,11 +15534,11 @@ pub(crate) fn production_handoff_retained_self_test(
     )
     .unwrap();
     let before = blocked.registry.failure_atomic_projection();
-    assert_eq!(
+    __cser_core::assert_eq!(
         blocked.registry.commit_handoff_close(blocked.scope, commit),
         Err(RegistryError::HandoffNotReady)
     );
-    assert_eq!(blocked.registry.failure_atomic_projection(), before);
+    __cser_core::assert_eq!(blocked.registry.failure_atomic_projection(), before);
 
     let mut retained = ProductionDeviceBatchRaceFixture::from_empty_registry(retained_registry);
     retained.commit().unwrap();
@@ -14953,21 +15561,21 @@ pub(crate) fn production_handoff_retained_self_test(
         .unwrap()
     {
         ProductionHandoffProgress::Closing(selection) => selection,
-        other => panic!("unexpected committed handoff progress: {other:?}"),
+        other => __cser_core::panic!("unexpected committed handoff progress: {other:?}"),
     };
     let reset_ticket = retained.registry.begin_device_reset(&batch).unwrap();
     let tombstone = retained
         .registry
         .retain_device_reset_timeout(&reset_ticket)
         .unwrap();
-    assert_eq!(
+    __cser_core::assert_eq!(
         retained
             .registry
             .query_handoff(retained.scope, freeze.freeze())
             .unwrap(),
         ProductionHandoffProgress::Retained(selection.clone())
     );
-    assert_eq!(
+    __cser_core::assert_eq!(
         retained
             .registry
             .commit_handoff_close(retained.scope, commit)
@@ -14986,7 +15594,10 @@ pub(crate) fn production_handoff_retained_self_test(
         .acknowledge_device_iotlb_with_apply(&iotlb, |_| ())
         .unwrap();
     while let Some(effect) = retained.registry.revoke_next(&selection).unwrap() {
-        assert!(matches!(effect.disposition, RevokeDisposition::Drain(_)));
+        __cser_core::assert!(__cser_core::matches!(
+            effect.disposition,
+            RevokeDisposition::Drain(_)
+        ));
         retained
             .registry
             .stage_device_batch_terminal(
@@ -15003,7 +15614,7 @@ pub(crate) fn production_handoff_retained_self_test(
         .unwrap()
     {
         ProductionHandoffProgress::Closed(receipt) => receipt,
-        other => panic!("unexpected recovered handoff progress: {other:?}"),
+        other => __cser_core::panic!("unexpected recovered handoff progress: {other:?}"),
     };
     retained
         .registry
@@ -15033,7 +15644,7 @@ pub(crate) fn retained_semantic_test_fixture() -> RetainedSemanticTestFixture {
         .registry
         .mint_device_close_operation(&enrollment, 0x3f_0001)
         .unwrap();
-    assert!(matches!(
+    __cser_core::assert!(__cser_core::matches!(
         fixture
             .registry
             .commit_or_recover_device_close_with_apply(
@@ -15054,12 +15665,12 @@ pub(crate) fn retained_semantic_test_fixture() -> RetainedSemanticTestFixture {
         authority,
         &enrollment,
         &commits,
-        |_| panic!("foreign close operation republished"),
+        |_| __cser_core::panic!("foreign close operation republished"),
     ) {
         Err(DeviceCloseError::Published { obligation, error }) => (obligation, error),
-        _ => panic!("foreign close operation lacked authoritative obligation"),
+        _ => __cser_core::panic!("foreign close operation lacked authoritative obligation"),
     };
-    assert_eq!(obligation.operation(), Some(exact_operation));
+    __cser_core::assert_eq!(obligation.operation(), Some(exact_operation));
 
     RetainedSemanticTestFixture {
         exact_operation,

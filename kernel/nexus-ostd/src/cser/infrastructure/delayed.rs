@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: MPL-2.0
 
+extern crate alloc as __cser_alloc;
+extern crate core as __cser_core;
+
 use super::service::{validate_bound_service_request, validate_live_service_child_binding};
 use super::{
     BearerStamp, BoundServiceRequest, DelayedCommandDescriptor, DelayedCommandIntent,
@@ -258,7 +261,7 @@ impl InfrastructureState {
         validate_delayed_command_bearer(scope, registry_instance, &stamp)?;
         if receipt.target_effect != stamp.identity.target.effect()
             || receipt.evidence_digest == 0
-            || matches!(receipt.reason, DelayedCommandRejectionReason::StaleTarget)
+            || __cser_core::matches!(receipt.reason, DelayedCommandRejectionReason::StaleTarget)
                 && scope.binding_epoch(stamp.identity.destination_domain)?
                     == stamp.identity.destination_binding_epoch
         {
@@ -269,7 +272,7 @@ impl InfrastructureState {
             .get(stamp.identity.command_id)
             .unwrap()
             .phase;
-        if publishing != matches!(phase, DelayedCommandPhase::Publishing { .. })
+        if publishing != __cser_core::matches!(phase, DelayedCommandPhase::Publishing { .. })
             || (!publishing && phase != DelayedCommandPhase::Reserved)
         {
             return Err(InfrastructureError::InvalidState);
@@ -378,7 +381,7 @@ fn finish_delayed_command(
 }
 
 pub(super) fn delayed_command_phase_live(phase: DelayedCommandPhase) -> bool {
-    matches!(
+    __cser_core::matches!(
         phase,
         DelayedCommandPhase::Reserved | DelayedCommandPhase::Publishing { .. }
     )

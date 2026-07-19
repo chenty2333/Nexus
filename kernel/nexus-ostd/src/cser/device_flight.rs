@@ -7,7 +7,10 @@
 //! owned by their adapters; in particular, this is not a second ledger and it
 //! never reconstructs Registry state from a projection or history scan.
 
-use core::num::NonZeroU64;
+extern crate alloc as __cser_alloc;
+extern crate core as __cser_core;
+
+use __cser_core::num::NonZeroU64;
 
 use crate::effect_registry::{
     CommitMetadata, DeviceBatchCommitReceipt, DeviceBatchEnrollmentReceipt, DeviceCloseError,
@@ -17,7 +20,13 @@ use crate::effect_registry::{
 };
 
 /// Immutable correlation identity shared by task, recovery, and IRQ actors.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct DeviceFlightKey {
     operation: DeviceCloseOperationId,
     cookie: NonZeroU64,
@@ -61,7 +70,12 @@ pub(crate) fn mint_device_flight_key(
 }
 
 /// Semantic ownership returned by a successful or recovered device commit.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct PublishedSemantic {
     key: DeviceFlightKey,
     batch: DeviceBatchCommitReceipt,
@@ -100,7 +114,12 @@ impl PublishedSemantic {
 /// correlation deliberately uses only a nonzero runtime cookie and the complete
 /// authoritative Registry receipt. It never fabricates a
 /// [`DeviceCloseOperationId`].
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct PrecommitCloseSemantic {
     cookie: NonZeroU64,
     receipt: DevicePrecommitCloseReceipt,
@@ -168,7 +187,13 @@ pub(crate) fn close_pending_device_flight_precommit_with_apply<T>(
 ///
 /// This classification never replaces the authoritative Registry error stored
 /// beside the obligation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) enum RetainReason {
     TransitionRejected,
     HardwareAuthorityUnavailable,
@@ -176,7 +201,12 @@ pub(crate) enum RetainReason {
 }
 
 /// Discoverable fail-closed state for a batch that may already be published.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct RetainedSemantic {
     attempted_cookie: NonZeroU64,
     key: Option<DeviceFlightKey>,
@@ -251,7 +281,7 @@ impl RetainedSemantic {
 }
 
 /// Semantic successor of the Registry's applied/recovered close operation.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(crate) enum DeviceFlightCloseOutcome<T> {
     Applied {
         published: PublishedSemantic,
@@ -324,11 +354,11 @@ pub(crate) fn retained_semantic_self_test() {
         },
     )
     .unwrap();
-    assert_eq!(exact.cookie(), exact_key.cookie());
-    assert_eq!(exact.key(), Some(exact_key));
-    assert_eq!(exact.reason(), RetainReason::TransitionRejected);
-    assert_eq!(exact.obligation(), &fixture.obligation);
-    assert_eq!(exact.error(), &fixture.error);
+    __cser_core::assert_eq!(exact.cookie(), exact_key.cookie());
+    __cser_core::assert_eq!(exact.key(), Some(exact_key));
+    __cser_core::assert_eq!(exact.reason(), RetainReason::TransitionRejected);
+    __cser_core::assert_eq!(exact.obligation(), &fixture.obligation);
+    __cser_core::assert_eq!(exact.error(), &fixture.error);
 
     let foreign_key = DeviceFlightKey::from_operation(fixture.foreign_operation).unwrap();
     let foreign = RetainedSemantic::from_close_error(
@@ -340,9 +370,9 @@ pub(crate) fn retained_semantic_self_test() {
         },
     )
     .unwrap();
-    assert_eq!(foreign.cookie(), foreign_key.cookie());
-    assert_eq!(foreign.key(), None);
-    assert_eq!(foreign.reason(), RetainReason::SemanticIdentityMismatch);
-    assert_eq!(foreign.obligation(), &fixture.obligation);
-    assert_eq!(foreign.error(), &fixture.error);
+    __cser_core::assert_eq!(foreign.cookie(), foreign_key.cookie());
+    __cser_core::assert_eq!(foreign.key(), None);
+    __cser_core::assert_eq!(foreign.reason(), RetainReason::SemanticIdentityMismatch);
+    __cser_core::assert_eq!(foreign.obligation(), &fixture.obligation);
+    __cser_core::assert_eq!(foreign.error(), &fixture.error);
 }

@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: MPL-2.0
 
+extern crate alloc as __cser_alloc;
+extern crate core as __cser_core;
+
 use super::{
     DeadlineAdoption, DeadlineClockBasis, DeadlineDescriptor, DeadlineExhaustedDisposition,
     DeadlineExpiryAuthority, DeadlineExpiryReceipt, DeadlineLease, DeadlinePhase,
@@ -305,7 +308,7 @@ impl InfrastructureState {
             if exhausted {
                 return Err(InfrastructureError::ClosureRetained);
             }
-            if !matches!(
+            if !__cser_core::matches!(
                 record.phase,
                 DeadlinePhase::Fired {
                     expiry_nonce,
@@ -591,7 +594,7 @@ impl InfrastructureState {
             return Err(InfrastructureError::StaleBinding);
         }
         let previous_phase = record.phase;
-        if matches!(
+        if __cser_core::matches!(
             previous_phase,
             DeadlinePhase::Cancelled | DeadlinePhase::Resolved { .. }
         ) {
@@ -599,7 +602,7 @@ impl InfrastructureState {
         }
         validate_deadline_reverse_index(scope, record)?;
         let bearer_generation = next_deadline_bearer_generation(record)?;
-        let nonce_count = usize::from(!matches!(previous_phase, DeadlinePhase::Armed));
+        let nonce_count = usize::from(!__cser_core::matches!(previous_phase, DeadlinePhase::Armed));
         let (nonces, next_nonce) = preview_nonces(scope, nonce_count)?;
         let next_revision = preview_revision(scope)?;
         let index_slot = record.series_nonce;
@@ -706,7 +709,7 @@ fn deadline_expiry_scope(expiry: &DeadlineExpiryReceipt) -> ScopeKey {
 }
 
 fn deadline_expiry_is_exhausted(expiry: &DeadlineExpiryReceipt) -> bool {
-    matches!(expiry.0, DeadlineExpiryAuthority::Exhausted(_))
+    __cser_core::matches!(expiry.0, DeadlineExpiryAuthority::Exhausted(_))
 }
 
 fn validate_deadline_expiry<'a>(
@@ -717,7 +720,7 @@ fn validate_deadline_expiry<'a>(
     match &expiry.0 {
         DeadlineExpiryAuthority::Fired(key) => {
             let record = validate_deadline_key(scope, registry_instance, key)?;
-            if !matches!(
+            if !__cser_core::matches!(
                 record.phase,
                 DeadlinePhase::Fired { expiry_nonce, .. }
                     if expiry_nonce == record.stamp.nonce
@@ -728,7 +731,7 @@ fn validate_deadline_expiry<'a>(
         }
         DeadlineExpiryAuthority::Exhausted(key) => {
             let record = validate_deadline_key(scope, registry_instance, key)?;
-            if !matches!(
+            if !__cser_core::matches!(
                 record.phase,
                 DeadlinePhase::ExhaustedRetained { expiry_nonce, .. }
                     if expiry_nonce == record.stamp.nonce
@@ -837,7 +840,7 @@ fn apply_deadline_finish(scope: &mut ScopeInfrastructure, finish: PreparedDeadli
         .unwrap()
         .live_children = finish.next_task_children;
     scope.events.push(
-        if matches!(finish.terminal, DeadlinePhase::Cancelled) {
+        if __cser_core::matches!(finish.terminal, DeadlinePhase::Cancelled) {
             InfrastructureEventKind::DeadlineCancelled
         } else {
             InfrastructureEventKind::DeadlineResolved

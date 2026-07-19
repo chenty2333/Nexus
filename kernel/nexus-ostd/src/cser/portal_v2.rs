@@ -14,6 +14,9 @@
 //! ownership, persistent recovery, and a user/kernel transport are deliberately
 //! not advertised as completed by this module.
 
+extern crate alloc as __cser_alloc;
+extern crate core as __cser_core;
+
 use nexus_portal_abi::{
     CapabilityOffer, ClosureReceipt, ClosureStatus, CommitEffectRequest, CompleteEffectRequest,
     CompletionDisposition, CreateScopeFlags, CreateScopeRequest, CreditKind, Digest, EffectHandle,
@@ -70,7 +73,13 @@ pub(crate) const PORTAL_V2_KERNEL_OFFER: CapabilityOffer = CapabilityOffer {
         .union(ProviderCapabilities::SESSION_QUERY),
 };
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 struct RegisterSpec {
     parent: EffectHandle,
     operation_class: u32,
@@ -79,20 +88,38 @@ struct RegisterSpec {
     credit_units: u32,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 struct OutcomeSpec {
     kind: OutcomeKind,
     result: i64,
     digest: Digest,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 struct CompletionSpec {
     disposition: CompletionDisposition,
     terminal_digest: Digest,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 struct StageRecord {
     request_digest: Digest,
     receipt: ReceiptHandle,
@@ -102,7 +129,13 @@ struct StageRecord {
     phase: AbiEffectPhase,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 struct RevokeRecord {
     request_digest: Digest,
     reason: RevokeReason,
@@ -114,7 +147,13 @@ struct RevokeRecord {
     closure_digest: Digest,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 struct ScopeSlot {
     selector: ScopeHandle,
     key: ScopeKey,
@@ -131,7 +170,13 @@ struct ScopeSlot {
     revoke: Option<RevokeRecord>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 struct EffectSlot {
     selector: EffectHandle,
     scope: ScopeHandle,
@@ -146,13 +191,25 @@ struct EffectSlot {
     latest_receipt: ReceiptHandle,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 enum ReceiptSubject {
     Scope(ScopeKey),
     Effect(EffectKey),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 struct ReceiptSlot {
     selector: ReceiptHandle,
     subject: ReceiptSubject,
@@ -164,7 +221,13 @@ struct ReceiptSlot {
     receipt_digest: Digest,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 struct ReceiptReservation {
     index: usize,
     selector: ReceiptHandle,
@@ -174,7 +237,7 @@ struct ReceiptReservation {
     kind: ReceiptKind,
 }
 
-#[derive(Clone, Copy)]
+#[derive(__cser_core::clone::Clone, __cser_core::marker::Copy)]
 struct ReceiptDigestContext {
     authority_epoch: u64,
     binding_epoch: u64,
@@ -237,9 +300,9 @@ impl<'registry, const SCOPE_SLOTS: usize, const EFFECT_SLOTS: usize, const RECEI
             registry,
             session,
             owner,
-            scopes: core::array::from_fn(|_| None),
-            effects: core::array::from_fn(|_| None),
-            receipts: core::array::from_fn(|_| None),
+            scopes: __cser_core::array::from_fn(|_| None),
+            effects: __cser_core::array::from_fn(|_| None),
+            receipts: __cser_core::array::from_fn(|_| None),
             next_scope_sequence: 1,
             next_effect_sequence: 1,
             next_receipt_sequence: 1,
@@ -373,8 +436,8 @@ impl<'registry, const SCOPE_SLOTS: usize, const EFFECT_SLOTS: usize, const RECEI
                 subject_selector,
             },
         );
-        debug_assert!(!selector.is_null());
-        debug_assert!(!receipt_digest.is_zero());
+        __cser_core::debug_assert!(!selector.is_null());
+        __cser_core::debug_assert!(!receipt_digest.is_zero());
         Ok(ReceiptReservation {
             index,
             selector,
@@ -392,7 +455,7 @@ impl<'registry, const SCOPE_SLOTS: usize, const EFFECT_SLOTS: usize, const RECEI
         authority_epoch: u64,
         binding_epoch: u64,
     ) {
-        debug_assert!(self.receipts[reservation.index].is_none());
+        __cser_core::debug_assert!(self.receipts[reservation.index].is_none());
         self.receipts[reservation.index] = Some(ReceiptSlot {
             selector: reservation.selector,
             subject,
@@ -589,7 +652,7 @@ fn descriptor_for(request: RegisterEffectRequest) -> SyscallDescriptor {
     )
 }
 
-#[derive(Clone, Copy)]
+#[derive(__cser_core::clone::Clone, __cser_core::marker::Copy)]
 struct DigestMixer {
     lanes: [u64; 4],
 }
@@ -857,8 +920,8 @@ fn dispatch_test_request<B: PortalBackend, const REPLAY: usize, T: RequestBody>(
     dispatcher: &mut PortalDispatcher<B, REPLAY>,
     request_id: u64,
     request: &T,
-) -> alloc::vec::Vec<u8> {
-    let mut body = alloc::vec![0; T::WIRE_SIZE];
+) -> __cser_alloc::vec::Vec<u8> {
+    let mut body = __cser_alloc::vec![0; T::WIRE_SIZE];
     request.encode_wire(&mut body).unwrap();
     let header = MessageHeader::new(
         MessageKind::Request,
@@ -867,10 +930,10 @@ fn dispatch_test_request<B: PortalBackend, const REPLAY: usize, T: RequestBody>(
         request_id,
     )
     .unwrap();
-    let mut input = alloc::vec![0; MAX_MESSAGE_SIZE];
+    let mut input = __cser_alloc::vec![0; MAX_MESSAGE_SIZE];
     let input_length = encode_message(header, &body, &mut input).unwrap();
     input.truncate(input_length);
-    let mut output = alloc::vec![0; MAX_MESSAGE_SIZE];
+    let mut output = __cser_alloc::vec![0; MAX_MESSAGE_SIZE];
     let output_length = dispatcher.dispatch(&input, &mut output).unwrap();
     output.truncate(output_length);
     output
@@ -879,8 +942,8 @@ fn dispatch_test_request<B: PortalBackend, const REPLAY: usize, T: RequestBody>(
 #[cfg(test)]
 fn decode_test_response<T: ResponseBody>(response: &[u8], opcode: nexus_portal_abi::Opcode) -> T {
     let message = decode_message(response).unwrap();
-    assert_eq!(message.header.kind(), MessageKind::Response);
-    assert_eq!(message.header.opcode(), opcode);
+    __cser_core::assert_eq!(message.header.kind(), MessageKind::Response);
+    __cser_core::assert_eq!(message.header.opcode(), opcode);
     T::decode_wire(message.body).unwrap()
 }
 
@@ -986,13 +1049,13 @@ pub(crate) fn production_portal_v2_self_test() {
         PortalDispatcher::<_, 8>::new(PORTAL_V2_KERNEL_OFFER, session, wire_adapter).unwrap();
     let abi_bytes = dispatch_test_request(&mut dispatcher, 1, &QueryAbiRequest::new());
     let abi = decode_test_response::<AbiResponse>(&abi_bytes, nexus_portal_abi::Opcode::QueryAbi);
-    assert_eq!(abi.offer(), PORTAL_V2_KERNEL_OFFER);
-    assert_eq!(abi.limits().max_scopes(), 1);
-    assert_eq!(abi.limits().max_effects_per_scope(), 1);
-    assert_eq!(abi.limits().max_effect_selectors(), 1);
-    assert_eq!(abi.limits().max_tombstones_per_scope(), 1);
-    assert_eq!(abi.limits().max_receipts(), 16);
-    assert_eq!(abi.limits().max_replay_entries(), 8);
+    __cser_core::assert_eq!(abi.offer(), PORTAL_V2_KERNEL_OFFER);
+    __cser_core::assert_eq!(abi.limits().max_scopes(), 1);
+    __cser_core::assert_eq!(abi.limits().max_effects_per_scope(), 1);
+    __cser_core::assert_eq!(abi.limits().max_effect_selectors(), 1);
+    __cser_core::assert_eq!(abi.limits().max_tombstones_per_scope(), 1);
+    __cser_core::assert_eq!(abi.limits().max_receipts(), 16);
+    __cser_core::assert_eq!(abi.limits().max_replay_entries(), 8);
 
     let negotiation = NegotiateRequest::new(CapabilityRequest {
         requested_portal: PORTAL_V2_KERNEL_OFFER.portal,
@@ -1005,9 +1068,9 @@ pub(crate) fn production_portal_v2_self_test() {
         &negotiated_bytes,
         nexus_portal_abi::Opcode::Negotiate,
     );
-    assert_eq!(negotiated.session(), session);
-    assert_eq!(negotiated.selected().portal, PORTAL_V2_KERNEL_OFFER.portal);
-    assert_eq!(
+    __cser_core::assert_eq!(negotiated.session(), session);
+    __cser_core::assert_eq!(negotiated.selected().portal, PORTAL_V2_KERNEL_OFFER.portal);
+    __cser_core::assert_eq!(
         negotiated.selected().provider,
         PORTAL_V2_KERNEL_OFFER.provider
     );
@@ -1027,15 +1090,15 @@ pub(crate) fn production_portal_v2_self_test() {
     .unwrap();
     let oversized_bytes = dispatch_test_request(&mut dispatcher, 90, &oversized_create);
     let oversized_message = decode_message(&oversized_bytes).unwrap();
-    assert_eq!(oversized_message.header.kind(), MessageKind::Error);
-    assert_eq!(
+    __cser_core::assert_eq!(oversized_message.header.kind(), MessageKind::Error);
+    __cser_core::assert_eq!(
         ErrorResponse::decode_wire(oversized_message.body)
             .unwrap()
             .failure()
             .code(),
         PortalErrorCode::LimitExceeded
     );
-    assert_eq!(
+    __cser_core::assert_eq!(
         dispatch_test_request(&mut dispatcher, 90, &oversized_create),
         oversized_bytes
     );
@@ -1081,8 +1144,8 @@ pub(crate) fn production_portal_v2_self_test() {
         &registered_bytes,
         nexus_portal_abi::Opcode::Register,
     );
-    assert_eq!(registered.phase(), AbiEffectPhase::Registered);
-    assert_eq!(
+    __cser_core::assert_eq!(registered.phase(), AbiEffectPhase::Registered);
+    __cser_core::assert_eq!(
         dispatch_test_request(&mut dispatcher, 4, &register),
         registered_bytes
     );
@@ -1094,7 +1157,7 @@ pub(crate) fn production_portal_v2_self_test() {
         ),
         nexus_portal_abi::Opcode::Prepare,
     );
-    assert_eq!(prepared.phase(), AbiEffectPhase::Prepared);
+    __cser_core::assert_eq!(prepared.phase(), AbiEffectPhase::Prepared);
     let committed = decode_test_response::<LifecycleReceipt>(
         &dispatch_test_request(
             &mut dispatcher,
@@ -1103,7 +1166,7 @@ pub(crate) fn production_portal_v2_self_test() {
         ),
         nexus_portal_abi::Opcode::Commit,
     );
-    assert_eq!(committed.phase(), AbiEffectPhase::Committed);
+    __cser_core::assert_eq!(committed.phase(), AbiEffectPhase::Committed);
     let outcome = decode_test_response::<LifecycleReceipt>(
         &dispatch_test_request(
             &mut dispatcher,
@@ -1119,7 +1182,7 @@ pub(crate) fn production_portal_v2_self_test() {
         ),
         nexus_portal_abi::Opcode::RecordOutcome,
     );
-    assert_eq!(outcome.phase(), AbiEffectPhase::OutcomeRecorded);
+    __cser_core::assert_eq!(outcome.phase(), AbiEffectPhase::OutcomeRecorded);
     let complete_request = CompleteEffectRequest::new(
         context(66),
         registered.effect(),
@@ -1132,8 +1195,8 @@ pub(crate) fn production_portal_v2_self_test() {
         &completed_bytes,
         nexus_portal_abi::Opcode::Complete,
     );
-    assert_eq!(completed.phase(), AbiEffectPhase::Completed);
-    assert_eq!(
+    __cser_core::assert_eq!(completed.phase(), AbiEffectPhase::Completed);
+    __cser_core::assert_eq!(
         dispatch_test_request(&mut dispatcher, 8, &complete_request),
         completed_bytes
     );
@@ -1145,11 +1208,11 @@ pub(crate) fn production_portal_v2_self_test() {
         ),
         nexus_portal_abi::Opcode::QueryEffect,
     );
-    assert_eq!(observation.phase(), AbiEffectPhase::Completed);
-    assert_eq!(observation.outcome().unwrap().kind(), OutcomeKind::Data);
-    assert_eq!(observation.outcome().unwrap().result(), 37);
-    assert_eq!(observation.outcome().unwrap().digest(), test_digest(65));
-    assert_eq!(observation.terminal_digest(), Some(test_digest(67)));
+    __cser_core::assert_eq!(observation.phase(), AbiEffectPhase::Completed);
+    __cser_core::assert_eq!(observation.outcome().unwrap().kind(), OutcomeKind::Data);
+    __cser_core::assert_eq!(observation.outcome().unwrap().result(), 37);
+    __cser_core::assert_eq!(observation.outcome().unwrap().digest(), test_digest(65));
+    __cser_core::assert_eq!(observation.terminal_digest(), Some(test_digest(67)));
     let receipt = decode_test_response::<ReceiptObservation>(
         &dispatch_test_request(
             &mut dispatcher,
@@ -1158,8 +1221,8 @@ pub(crate) fn production_portal_v2_self_test() {
         ),
         nexus_portal_abi::Opcode::QueryReceipt,
     );
-    assert_eq!(receipt.status(), ReceiptStatus::Consumed);
-    assert_eq!(dispatcher.replay_len(), 7);
+    __cser_core::assert_eq!(receipt.status(), ReceiptStatus::Consumed);
+    __cser_core::assert_eq!(dispatcher.replay_len(), 7);
 
     // Receipt pressure must fail before prepare mutates the Registry.  A stale
     // context is also distinguished from capacity pressure and leaves the
@@ -1186,8 +1249,8 @@ pub(crate) fn production_portal_v2_self_test() {
             .unwrap(),
         )
         .unwrap_err();
-    assert_eq!(stale.code(), PortalErrorCode::GenerationMismatch);
-    assert_eq!(
+    __cser_core::assert_eq!(stale.code(), PortalErrorCode::GenerationMismatch);
+    __cser_core::assert_eq!(
         pressure
             .prepare(
                 PrepareEffectRequest::new(
@@ -1208,8 +1271,8 @@ pub(crate) fn production_portal_v2_self_test() {
     let after = pressure
         .query_effect(session, QueryEffectRequest::new(pressure_effect.effect()))
         .unwrap();
-    assert_eq!(before, after);
-    assert_eq!(after.phase(), AbiEffectPhase::Registered);
+    __cser_core::assert_eq!(before, after);
+    __cser_core::assert_eq!(after.phase(), AbiEffectPhase::Registered);
     pressure.registry.check_invariants().unwrap();
 
     // Queue and page admission are independent Registry ledgers. Exhausting
@@ -1255,9 +1318,9 @@ pub(crate) fn production_portal_v2_self_test() {
             .unwrap(),
         )
         .unwrap_err();
-    assert_eq!(exhausted_queue.code(), PortalErrorCode::NoCredit);
-    assert_eq!(exhausted_queue.retry(), RetryClass::AfterCapacity);
-    assert_eq!(
+    __cser_core::assert_eq!(exhausted_queue.code(), PortalErrorCode::NoCredit);
+    __cser_core::assert_eq!(exhausted_queue.retry(), RetryClass::AfterCapacity);
+    __cser_core::assert_eq!(
         credit_adapter
             .query_scope(session, QueryScopeRequest::new(credit_scope.scope()))
             .unwrap(),
@@ -1311,9 +1374,9 @@ pub(crate) fn production_portal_v2_self_test() {
             .unwrap(),
         )
         .unwrap_err();
-    assert_eq!(tombstone_failure.code(), PortalErrorCode::Backpressure);
-    assert_eq!(tombstone_failure.retry(), RetryClass::Never);
-    assert_eq!(
+    __cser_core::assert_eq!(tombstone_failure.code(), PortalErrorCode::Backpressure);
+    __cser_core::assert_eq!(tombstone_failure.retry(), RetryClass::Never);
+    __cser_core::assert_eq!(
         tombstone_adapter
             .query_effect(session, QueryEffectRequest::new(blocked_tombstone.effect()),)
             .unwrap(),
@@ -1322,7 +1385,7 @@ pub(crate) fn production_portal_v2_self_test() {
     let before_tombstone_revoke = tombstone_adapter
         .query_scope(session, QueryScopeRequest::new(tombstone_scope.scope()))
         .unwrap();
-    assert_eq!(
+    __cser_core::assert_eq!(
         tombstone_adapter
             .revoke(
                 RevokeScopeRequest::new(
@@ -1341,7 +1404,7 @@ pub(crate) fn production_portal_v2_self_test() {
             .code(),
         PortalErrorCode::Backpressure
     );
-    assert_eq!(
+    __cser_core::assert_eq!(
         tombstone_adapter
             .query_scope(session, QueryScopeRequest::new(tombstone_scope.scope()))
             .unwrap(),
@@ -1366,7 +1429,7 @@ pub(crate) fn production_portal_v2_self_test() {
             .unwrap(),
         )
         .unwrap();
-    assert_eq!(prepared_a.phase(), AbiEffectPhase::Prepared);
+    __cser_core::assert_eq!(prepared_a.phase(), AbiEffectPhase::Prepared);
     let committed_a = adapter
         .commit(
             CommitEffectRequest::new(
@@ -1386,7 +1449,7 @@ pub(crate) fn production_portal_v2_self_test() {
     )
     .unwrap();
     let outcome_a = adapter.record_outcome(outcome_request_a).unwrap();
-    assert_eq!(
+    __cser_core::assert_eq!(
         adapter.record_outcome(outcome_request_a).unwrap(),
         outcome_a
     );
@@ -1402,8 +1465,8 @@ pub(crate) fn production_portal_v2_self_test() {
             .unwrap(),
         )
         .unwrap_err();
-    assert_eq!(conflict.code(), PortalErrorCode::Conflict);
-    assert_eq!(
+    __cser_core::assert_eq!(conflict.code(), PortalErrorCode::Conflict);
+    __cser_core::assert_eq!(
         adapter
             .query_effect(session, QueryEffectRequest::new(effect_a.effect()))
             .unwrap()
@@ -1421,15 +1484,15 @@ pub(crate) fn production_portal_v2_self_test() {
             .unwrap(),
         )
         .unwrap();
-    assert_eq!(completed_a.phase(), AbiEffectPhase::Completed);
-    assert_eq!(
+    __cser_core::assert_eq!(completed_a.phase(), AbiEffectPhase::Completed);
+    __cser_core::assert_eq!(
         adapter
             .query_receipt(session, QueryReceiptRequest::new(committed_a.receipt()),)
             .unwrap()
             .status(),
         ReceiptStatus::Consumed
     );
-    assert_eq!(
+    __cser_core::assert_eq!(
         adapter
             .query_receipt(session, QueryReceiptRequest::new(outcome_a.receipt()))
             .unwrap()
@@ -1464,7 +1527,7 @@ pub(crate) fn production_portal_v2_self_test() {
     let before_revoke = adapter
         .query_scope(session, QueryScopeRequest::new(scope.scope()))
         .unwrap();
-    assert_eq!(
+    __cser_core::assert_eq!(
         adapter
             .revoke(
                 RevokeScopeRequest::new(revoke_context, scope.scope(), RevokeReason::Requested)
@@ -1474,7 +1537,7 @@ pub(crate) fn production_portal_v2_self_test() {
             .code(),
         PortalErrorCode::Conflict
     );
-    assert_eq!(
+    __cser_core::assert_eq!(
         adapter
             .query_scope(session, QueryScopeRequest::new(scope.scope()))
             .unwrap(),
@@ -1499,27 +1562,27 @@ pub(crate) fn production_portal_v2_self_test() {
                 .unwrap(),
         )
         .unwrap();
-    assert_eq!(closure.status(), ClosureStatus::Closed);
+    __cser_core::assert_eq!(closure.status(), ClosureStatus::Closed);
     let closed = adapter
         .query_scope(session, QueryScopeRequest::new(scope.scope()))
         .unwrap();
-    assert_eq!(closed.phase(), AbiScopePhase::Revoked);
-    assert_eq!(closed.live_effects(), 0);
-    assert_eq!(
+    __cser_core::assert_eq!(closed.phase(), AbiScopePhase::Revoked);
+    __cser_core::assert_eq!(closed.live_effects(), 0);
+    __cser_core::assert_eq!(
         adapter
             .query_effect(session, QueryEffectRequest::new(effect_b.effect()))
             .unwrap()
             .phase(),
         AbiEffectPhase::Completed
     );
-    assert_eq!(
+    __cser_core::assert_eq!(
         adapter
             .query_effect(session, QueryEffectRequest::new(effect_c.effect()))
             .unwrap()
             .phase(),
         AbiEffectPhase::Aborted
     );
-    assert_eq!(
+    __cser_core::assert_eq!(
         adapter
             .query_receipt(session, QueryReceiptRequest::new(closure.receipt()))
             .unwrap()
@@ -1655,7 +1718,7 @@ impl<const SCOPE_SLOTS: usize, const EFFECT_SLOTS: usize, const RECEIPT_SLOTS: u
             receipt.receipt_digest,
         )
         .map_err(map_wire_invariant)?;
-        let mut credits = alloc::vec![];
+        let mut credits = __cser_alloc::vec![];
         if request.queue_credits() != 0 {
             credits.push(CreditLimit::new(
                 PORTAL_QUEUE_CREDIT_CLASS,
@@ -1832,8 +1895,8 @@ impl<const SCOPE_SLOTS: usize, const EFFECT_SLOTS: usize, const RECEIPT_SLOTS: u
                     task: self.owner,
                     operation: OperationClass::new(request.operation_class()),
                     descriptor: descriptor_for(request),
-                    resources: alloc::vec![],
-                    credits: alloc::vec![CreditCharge::new(
+                    resources: __cser_alloc::vec![],
+                    credits: __cser_alloc::vec![CreditCharge::new(
                         credit_class,
                         u64::from(request.credit_units()),
                     )],
@@ -1990,7 +2053,7 @@ impl<const SCOPE_SLOTS: usize, const EFFECT_SLOTS: usize, const RECEIPT_SLOTS: u
                 CommitMetadata::new(0, request.domain_revision()),
             )
             .map_err(map_registry_error)?;
-        if !matches!(outcome, CommitOutcome::Applied(_)) {
+        if !__cser_core::matches!(outcome, CommitOutcome::Applied(_)) {
             return Err(failure(
                 PortalErrorCode::InternalInvariant,
                 RetryClass::Never,
@@ -2158,8 +2221,10 @@ impl<const SCOPE_SLOTS: usize, const EFFECT_SLOTS: usize, const RECEIPT_SLOTS: u
                 )
             }
             CompletionDisposition::AbortedBeforeCommit => {
-                if !matches!(view.phase, EffectPhase::Registered | EffectPhase::Prepared)
-                    || view.outcome.is_some()
+                if !__cser_core::matches!(
+                    view.phase,
+                    EffectPhase::Registered | EffectPhase::Prepared
+                ) || view.outcome.is_some()
                 {
                     return Err(failure(PortalErrorCode::OutOfOrder, RetryClass::AfterQuery));
                 }

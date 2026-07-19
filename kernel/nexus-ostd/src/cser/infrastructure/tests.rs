@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: MPL-2.0
 
+extern crate alloc as __cser_alloc;
+extern crate core as __cser_core;
+
 use super::{
     AuthorityKey, BearerKey, BoundServiceRequest, ContinuationAckReceipt, ContinuationAdoption,
     ContinuationDescriptor, ContinuationLease, ContinuationPublicationAckReceipt,
@@ -220,7 +223,7 @@ fn compact_bound_service_state_with_sibling_response(
         let service_record = scope.service_requests.get(COMPACT_SERVICE_REQUEST).unwrap();
         let parent = match service_record.stamp.parent {
             super::ParentStamp::Task(parent) => parent,
-            _ => unreachable!(),
+            _ => __cser_core::unreachable!(),
         };
         EnteredTaskLease(scope.tasks.get(parent.work_id).unwrap().stamp)
     };
@@ -391,7 +394,7 @@ fn synchronously_substitute_service_response(
                 binding_receipt,
             }
         }
-        _ => panic!("response substitution requires a live bound service"),
+        _ => __cser_core::panic!("response substitution requires a live bound service"),
     };
     state.check_invariants().unwrap();
 }
@@ -434,9 +437,9 @@ fn assert_enqueue_receipt_mutation_rejected(
     let failure = state
         .acknowledge_service_enqueue(authority, receipt)
         .unwrap_err();
-    assert_eq!(failure.error(), InfrastructureError::InvalidReceipt);
-    assert_eq!(state, before);
-    assert_eq!(
+    __cser_core::assert_eq!(failure.error(), InfrastructureError::InvalidReceipt);
+    __cser_core::assert_eq!(state, before);
+    __cser_core::assert_eq!(
         service_bound_key_coordinates(&failure.into_input().0),
         presented
     );
@@ -462,9 +465,9 @@ fn assert_arm_receipt_mutation_rejected(
     let failure = state
         .acknowledge_service_arm(authority, receipt)
         .unwrap_err();
-    assert_eq!(failure.error(), InfrastructureError::InvalidReceipt);
-    assert_eq!(state, before);
-    assert_eq!(
+    __cser_core::assert_eq!(failure.error(), InfrastructureError::InvalidReceipt);
+    __cser_core::assert_eq!(state, before);
+    __cser_core::assert_eq!(
         service_bound_key_coordinates(&failure.into_input().0),
         presented
     );
@@ -567,10 +570,10 @@ fn assert_deadline_key_rejected_without_mutation(
     let failure = state
         .fire_deadline(deadline, DeadlineClockBasis::ObservedCallbackTick, 10)
         .unwrap_err();
-    assert_eq!(failure.error(), expected_error);
-    assert_eq!(state, before);
+    __cser_core::assert_eq!(failure.error(), expected_error);
+    __cser_core::assert_eq!(state, before);
     let returned = failure.into_input();
-    assert_eq!(
+    __cser_core::assert_eq!(
         (
             returned.0.authority.registry_instance,
             returned.0.authority.scope,
@@ -586,52 +589,83 @@ fn assert_deadline_key_rejected_without_mutation(
 
 #[test]
 fn continuation_compact_authority_layout_is_bounded() {
-    assert!(core::mem::size_of::<AuthorityKey>() <= 32);
-    assert!(core::mem::size_of::<BearerKey<bearer_state::ContinuationPending>>() <= 64);
-    assert!(core::mem::size_of::<ContinuationLease>() <= 96);
-    assert!(core::mem::size_of::<WakeClaim>() <= 96);
-    assert!(core::mem::size_of::<ContinuationPublicationAuthority>() <= 96);
-    assert!(core::mem::size_of::<ContinuationPublicationAckReceipt>() <= 96);
-    assert!(core::mem::size_of::<ContinuationAckReceipt>() <= 96);
-    assert!(core::mem::size_of::<ContinuationResumeAuthority>() <= 96);
-    assert!(core::mem::size_of::<ContinuationResumeReceipt>() <= 96);
-    assert!(core::mem::size_of::<LinearFailure<ContinuationLease>>() <= 120);
-    assert!(core::mem::size_of::<LinearFailure<WakeClaim>>() <= 120);
-    assert!(core::mem::size_of::<LinearFailure<ContinuationPublicationAuthority>>() <= 120);
-    assert!(core::mem::size_of::<LinearFailure<ContinuationAckReceipt>>() <= 120);
-    assert!(core::mem::size_of::<LinearFailure<ContinuationResumeAuthority>>() <= 120);
+    __cser_core::assert!(__cser_core::mem::size_of::<AuthorityKey>() <= 32);
+    __cser_core::assert!(
+        __cser_core::mem::size_of::<BearerKey<bearer_state::ContinuationPending>>() <= 64
+    );
+    __cser_core::assert!(__cser_core::mem::size_of::<ContinuationLease>() <= 96);
+    __cser_core::assert!(__cser_core::mem::size_of::<WakeClaim>() <= 96);
+    __cser_core::assert!(__cser_core::mem::size_of::<ContinuationPublicationAuthority>() <= 96);
+    __cser_core::assert!(__cser_core::mem::size_of::<ContinuationPublicationAckReceipt>() <= 96);
+    __cser_core::assert!(__cser_core::mem::size_of::<ContinuationAckReceipt>() <= 96);
+    __cser_core::assert!(__cser_core::mem::size_of::<ContinuationResumeAuthority>() <= 96);
+    __cser_core::assert!(__cser_core::mem::size_of::<ContinuationResumeReceipt>() <= 96);
+    __cser_core::assert!(__cser_core::mem::size_of::<LinearFailure<ContinuationLease>>() <= 120);
+    __cser_core::assert!(__cser_core::mem::size_of::<LinearFailure<WakeClaim>>() <= 120);
+    __cser_core::assert!(
+        __cser_core::mem::size_of::<LinearFailure<ContinuationPublicationAuthority>>() <= 120
+    );
+    __cser_core::assert!(
+        __cser_core::mem::size_of::<LinearFailure<ContinuationAckReceipt>>() <= 120
+    );
+    __cser_core::assert!(
+        __cser_core::mem::size_of::<LinearFailure<ContinuationResumeAuthority>>() <= 120
+    );
 }
 
 #[test]
 fn service_compact_authority_layout_is_bounded() {
-    assert!(core::mem::size_of::<BearerKey<bearer_state::ServiceReservedUnbound>>() <= 64);
-    assert!(core::mem::size_of::<ServiceBoundKey<bearer_state::ServiceReservedBound>>() <= 96);
-    assert!(core::mem::size_of::<ServiceBoundKey<bearer_state::ServiceEnqueuePublishing>>() <= 96);
-    assert!(core::mem::size_of::<ServiceBoundKey<bearer_state::ServiceQueueWritten>>() <= 96);
-    assert!(core::mem::size_of::<ServiceBoundKey<bearer_state::ServiceArmPublishing>>() <= 96);
-    assert!(core::mem::size_of::<ServiceBoundKey<bearer_state::ServiceArmed>>() <= 96);
-    assert!(core::mem::size_of::<ServiceBoundKey<bearer_state::ServiceChildBound>>() <= 96);
-    assert!(core::mem::size_of::<UnboundServiceRequest>() <= 96);
-    assert!(core::mem::size_of::<ServiceRequestTicket>() <= 96);
-    assert!(core::mem::size_of::<ServiceEnqueueAuthority>() <= 96);
-    assert!(core::mem::size_of::<UnarmedServiceRequest>() <= 96);
-    assert!(core::mem::size_of::<ServiceArmAuthority>() <= 96);
-    assert!(core::mem::size_of::<EnqueuedServiceRequest>() <= 96);
-    assert!(core::mem::size_of::<BoundServiceRequest>() <= 96);
-    assert!(core::mem::size_of::<LinearFailure<UnboundServiceRequest>>() <= 120);
-    assert!(core::mem::size_of::<LinearFailure<ServiceRequestTicket>>() <= 120);
-    assert!(core::mem::size_of::<LinearFailure<ServiceEnqueueAuthority>>() <= 120);
-    assert!(core::mem::size_of::<LinearFailure<UnarmedServiceRequest>>() <= 120);
-    assert!(core::mem::size_of::<LinearFailure<ServiceArmAuthority>>() <= 120);
-    assert!(core::mem::size_of::<LinearFailure<EnqueuedServiceRequest>>() <= 120);
-    assert!(core::mem::size_of::<LinearFailure<BoundServiceRequest>>() <= 120);
-    assert!(core::mem::size_of::<ServiceRequestCausalIdentity>() <= 512);
-    assert!(core::mem::size_of::<ServiceEnqueuePlan>() <= 512);
-    assert!(core::mem::size_of::<ServiceEnqueueReceipt>() <= 640);
-    assert!(core::mem::size_of::<ServiceArmPlan>() <= 1_280);
-    assert!(core::mem::size_of::<ServiceArmReceipt>() <= 1_408);
-    assert!(core::mem::size_of::<ServiceClaimantSnapshot>() <= 320);
-    assert!(core::mem::size_of::<ServiceChildBindingReceipt>() <= 384);
+    __cser_core::assert!(
+        __cser_core::mem::size_of::<BearerKey<bearer_state::ServiceReservedUnbound>>() <= 64
+    );
+    __cser_core::assert!(
+        __cser_core::mem::size_of::<ServiceBoundKey<bearer_state::ServiceReservedBound>>() <= 96
+    );
+    __cser_core::assert!(
+        __cser_core::mem::size_of::<ServiceBoundKey<bearer_state::ServiceEnqueuePublishing>>()
+            <= 96
+    );
+    __cser_core::assert!(
+        __cser_core::mem::size_of::<ServiceBoundKey<bearer_state::ServiceQueueWritten>>() <= 96
+    );
+    __cser_core::assert!(
+        __cser_core::mem::size_of::<ServiceBoundKey<bearer_state::ServiceArmPublishing>>() <= 96
+    );
+    __cser_core::assert!(
+        __cser_core::mem::size_of::<ServiceBoundKey<bearer_state::ServiceArmed>>() <= 96
+    );
+    __cser_core::assert!(
+        __cser_core::mem::size_of::<ServiceBoundKey<bearer_state::ServiceChildBound>>() <= 96
+    );
+    __cser_core::assert!(__cser_core::mem::size_of::<UnboundServiceRequest>() <= 96);
+    __cser_core::assert!(__cser_core::mem::size_of::<ServiceRequestTicket>() <= 96);
+    __cser_core::assert!(__cser_core::mem::size_of::<ServiceEnqueueAuthority>() <= 96);
+    __cser_core::assert!(__cser_core::mem::size_of::<UnarmedServiceRequest>() <= 96);
+    __cser_core::assert!(__cser_core::mem::size_of::<ServiceArmAuthority>() <= 96);
+    __cser_core::assert!(__cser_core::mem::size_of::<EnqueuedServiceRequest>() <= 96);
+    __cser_core::assert!(__cser_core::mem::size_of::<BoundServiceRequest>() <= 96);
+    __cser_core::assert!(
+        __cser_core::mem::size_of::<LinearFailure<UnboundServiceRequest>>() <= 120
+    );
+    __cser_core::assert!(__cser_core::mem::size_of::<LinearFailure<ServiceRequestTicket>>() <= 120);
+    __cser_core::assert!(
+        __cser_core::mem::size_of::<LinearFailure<ServiceEnqueueAuthority>>() <= 120
+    );
+    __cser_core::assert!(
+        __cser_core::mem::size_of::<LinearFailure<UnarmedServiceRequest>>() <= 120
+    );
+    __cser_core::assert!(__cser_core::mem::size_of::<LinearFailure<ServiceArmAuthority>>() <= 120);
+    __cser_core::assert!(
+        __cser_core::mem::size_of::<LinearFailure<EnqueuedServiceRequest>>() <= 120
+    );
+    __cser_core::assert!(__cser_core::mem::size_of::<LinearFailure<BoundServiceRequest>>() <= 120);
+    __cser_core::assert!(__cser_core::mem::size_of::<ServiceRequestCausalIdentity>() <= 512);
+    __cser_core::assert!(__cser_core::mem::size_of::<ServiceEnqueuePlan>() <= 512);
+    __cser_core::assert!(__cser_core::mem::size_of::<ServiceEnqueueReceipt>() <= 640);
+    __cser_core::assert!(__cser_core::mem::size_of::<ServiceArmPlan>() <= 1_280);
+    __cser_core::assert!(__cser_core::mem::size_of::<ServiceArmReceipt>() <= 1_408);
+    __cser_core::assert!(__cser_core::mem::size_of::<ServiceClaimantSnapshot>() <= 320);
+    __cser_core::assert!(__cser_core::mem::size_of::<ServiceChildBindingReceipt>() <= 384);
 }
 
 #[test]
@@ -675,7 +709,7 @@ fn service_lineage_commitment_schema_has_frozen_vectors_and_full_field_coverage(
             registration_digest: 0x40b,
         },
     };
-    assert_eq!(
+    __cser_core::assert_eq!(
         super::service::service_response_commitment(response),
         ServiceLineageCommitment([
             0x4d, 0xc6, 0x06, 0x7a, 0x80, 0xec, 0xf3, 0x60, 0x5d, 0x55, 0xae, 0xc7, 0x2d, 0x28,
@@ -684,7 +718,7 @@ fn service_lineage_commitment_schema_has_frozen_vectors_and_full_field_coverage(
         ])
     );
     let bound = super::service::service_bound_commitment(response, binding);
-    assert_eq!(
+    __cser_core::assert_eq!(
         bound,
         ServiceLineageCommitment([
             0xc8, 0x1e, 0x33, 0xdb, 0x9f, 0xdc, 0x9b, 0xd0, 0x06, 0xd3, 0x63, 0xe6, 0x22, 0x53,
@@ -732,7 +766,7 @@ fn service_lineage_commitment_schema_has_frozen_vectors_and_full_field_coverage(
         apply_generation: 2,
         apply_nonce: 0x50d,
     };
-    assert_eq!(
+    __cser_core::assert_eq!(
         super::service::service_enqueue_plan_commitment(enqueue_plan),
         ServiceLineageCommitment([
             0x24, 0xf7, 0xe9, 0x68, 0x1f, 0x22, 0x69, 0x2f, 0x7d, 0xc5, 0xde, 0xc9, 0x7e, 0x94,
@@ -748,7 +782,7 @@ fn service_lineage_commitment_schema_has_frozen_vectors_and_full_field_coverage(
         payload_generation: 15,
         transport_receipt_digest: 0x50e,
     };
-    assert_eq!(
+    __cser_core::assert_eq!(
         super::service::service_enqueue_receipt_commitment(enqueue_receipt),
         ServiceLineageCommitment([
             0x5e, 0x35, 0x6e, 0x39, 0xbf, 0x1f, 0xcd, 0x44, 0x4a, 0x1b, 0x36, 0x11, 0xc7, 0xa4,
@@ -763,7 +797,7 @@ fn service_lineage_commitment_schema_has_frozen_vectors_and_full_field_coverage(
         arm_generation: 4,
         arm_nonce: 0x50f,
     };
-    assert_eq!(
+    __cser_core::assert_eq!(
         super::service::service_arm_plan_commitment(arm_plan),
         ServiceLineageCommitment([
             0x65, 0x9f, 0x34, 0xed, 0xc7, 0x39, 0x38, 0xd7, 0xe8, 0xc0, 0x16, 0x7c, 0x6d, 0x0c,
@@ -779,7 +813,7 @@ fn service_lineage_commitment_schema_has_frozen_vectors_and_full_field_coverage(
         bound_continuation_generation: 2,
         transport_receipt_digest: 0x510,
     };
-    assert_eq!(
+    __cser_core::assert_eq!(
         super::service::service_armed_commitment(enqueue_receipt, arm_receipt),
         ServiceLineageCommitment([
             0x88, 0x49, 0x24, 0xe4, 0x9e, 0x29, 0x4f, 0xf5, 0x0f, 0x8f, 0x66, 0xb5, 0x7a, 0x5b,
@@ -787,7 +821,7 @@ fn service_lineage_commitment_schema_has_frozen_vectors_and_full_field_coverage(
             0xbe, 0x0f, 0xd0, 0xcc,
         ])
     );
-    assert_eq!(
+    __cser_core::assert_eq!(
         super::service::service_child_bound_commitment(
             enqueue_receipt,
             arm_receipt,
@@ -805,13 +839,13 @@ fn service_lineage_commitment_schema_has_frozen_vectors_and_full_field_coverage(
         ($change:expr) => {{
             let mut changed_plan = enqueue_plan;
             ($change)(&mut changed_plan);
-            assert_ne!(
+            __cser_core::assert_ne!(
                 super::service::service_enqueue_plan_commitment(changed_plan),
                 super::service::service_enqueue_plan_commitment(enqueue_plan)
             );
             let mut changed_queue = enqueue_receipt;
             changed_queue.plan = changed_plan;
-            assert_ne!(
+            __cser_core::assert_ne!(
                 super::service::service_enqueue_receipt_commitment(changed_queue),
                 super::service::service_enqueue_receipt_commitment(enqueue_receipt)
             );
@@ -819,11 +853,11 @@ fn service_lineage_commitment_schema_has_frozen_vectors_and_full_field_coverage(
             changed_arm_plan.queue_receipt = changed_queue;
             let mut changed_arm = arm_receipt;
             changed_arm.plan = changed_arm_plan;
-            assert_ne!(
+            __cser_core::assert_ne!(
                 super::service::service_armed_commitment(changed_queue, changed_arm),
                 super::service::service_armed_commitment(enqueue_receipt, arm_receipt)
             );
-            assert_ne!(
+            __cser_core::assert_ne!(
                 super::service::service_child_bound_commitment(
                     changed_queue,
                     changed_arm,
@@ -843,23 +877,23 @@ fn service_lineage_commitment_schema_has_frozen_vectors_and_full_field_coverage(
         ($change:expr) => {{
             let mut changed_queue = enqueue_receipt;
             ($change)(&mut changed_queue);
-            assert_ne!(
+            __cser_core::assert_ne!(
                 super::service::service_enqueue_receipt_commitment(changed_queue),
                 super::service::service_enqueue_receipt_commitment(enqueue_receipt)
             );
             let mut changed_arm_plan = arm_plan;
             changed_arm_plan.queue_receipt = changed_queue;
-            assert_ne!(
+            __cser_core::assert_ne!(
                 super::service::service_arm_plan_commitment(changed_arm_plan),
                 super::service::service_arm_plan_commitment(arm_plan)
             );
             let mut changed_arm = arm_receipt;
             changed_arm.plan = changed_arm_plan;
-            assert_ne!(
+            __cser_core::assert_ne!(
                 super::service::service_armed_commitment(changed_queue, changed_arm),
                 super::service::service_armed_commitment(enqueue_receipt, arm_receipt)
             );
-            assert_ne!(
+            __cser_core::assert_ne!(
                 super::service::service_child_bound_commitment(
                     changed_queue,
                     changed_arm,
@@ -879,17 +913,17 @@ fn service_lineage_commitment_schema_has_frozen_vectors_and_full_field_coverage(
         ($change:expr) => {{
             let mut changed_plan = arm_plan;
             ($change)(&mut changed_plan);
-            assert_ne!(
+            __cser_core::assert_ne!(
                 super::service::service_arm_plan_commitment(changed_plan),
                 super::service::service_arm_plan_commitment(arm_plan)
             );
             let mut changed_arm = arm_receipt;
             changed_arm.plan = changed_plan;
-            assert_ne!(
+            __cser_core::assert_ne!(
                 super::service::service_armed_commitment(enqueue_receipt, changed_arm),
                 super::service::service_armed_commitment(enqueue_receipt, arm_receipt)
             );
-            assert_ne!(
+            __cser_core::assert_ne!(
                 super::service::service_child_bound_commitment(
                     enqueue_receipt,
                     changed_arm,
@@ -909,11 +943,11 @@ fn service_lineage_commitment_schema_has_frozen_vectors_and_full_field_coverage(
         ($change:expr) => {{
             let mut changed = arm_receipt;
             ($change)(&mut changed);
-            assert_ne!(
+            __cser_core::assert_ne!(
                 super::service::service_armed_commitment(enqueue_receipt, changed),
                 super::service::service_armed_commitment(enqueue_receipt, arm_receipt)
             );
-            assert_ne!(
+            __cser_core::assert_ne!(
                 super::service::service_child_bound_commitment(
                     enqueue_receipt,
                     changed,
@@ -1092,11 +1126,11 @@ fn service_lineage_commitment_schema_has_frozen_vectors_and_full_field_coverage(
     for mutate in response_mutations {
         let mut substituted = response;
         mutate(&mut substituted);
-        assert_ne!(
+        __cser_core::assert_ne!(
             super::service::service_response_commitment(substituted),
             super::service::service_response_commitment(response)
         );
-        assert_ne!(
+        __cser_core::assert_ne!(
             super::service::service_bound_commitment(substituted, binding),
             bound
         );
@@ -1106,7 +1140,7 @@ fn service_lineage_commitment_schema_has_frozen_vectors_and_full_field_coverage(
         assert_arm_plan_change!(|value: &mut ServiceArmPlan| {
             mutate(&mut value.causal.response)
         });
-        assert_ne!(
+        __cser_core::assert_ne!(
             super::service::service_child_bound_commitment(
                 enqueue_receipt,
                 arm_receipt,
@@ -1205,11 +1239,11 @@ fn service_lineage_commitment_schema_has_frozen_vectors_and_full_field_coverage(
     for mutate in binding_mutations {
         let mut substituted = binding;
         mutate(&mut substituted);
-        assert_ne!(
+        __cser_core::assert_ne!(
             super::service::service_bound_commitment(response, substituted),
             bound
         );
-        assert_ne!(
+        __cser_core::assert_ne!(
             super::service::service_child_bound_commitment(
                 enqueue_receipt,
                 arm_receipt,
@@ -1240,28 +1274,28 @@ fn service_bind_is_owned_atomic_and_returns_exact_unbound_authority_on_failure()
             },
         )
         .unwrap_err();
-    assert_eq!(failure.error(), InfrastructureError::StaleBinding);
-    assert_eq!(state, before);
+    __cser_core::assert_eq!(failure.error(), InfrastructureError::StaleBinding);
+    __cser_core::assert_eq!(state, before);
     let unbound = failure.into_input();
-    assert_eq!(service_key_coordinates(&unbound.0), presented);
-    assert_eq!(state.scope(SCOPE).unwrap().live.continuations, 0);
+    __cser_core::assert_eq!(service_key_coordinates(&unbound.0), presented);
+    __cser_core::assert_eq!(state.scope(SCOPE).unwrap().live.continuations, 0);
 
     let bound = state
         .bind_service_response_continuation(unbound, compact_response_descriptor())
         .unwrap();
-    assert_eq!(bound.0.bearer_generation, 2);
+    __cser_core::assert_eq!(bound.0.bearer_generation, 2);
     let scope = state.scope(SCOPE).unwrap();
     let service = scope.service_requests.get(COMPACT_SERVICE_REQUEST).unwrap();
     let continuation = scope.continuations.get(COMPACT_CONTINUATION).unwrap();
-    assert_eq!(service.bound_continuation, Some(continuation.stamp));
-    assert_eq!(
+    __cser_core::assert_eq!(service.bound_continuation, Some(continuation.stamp));
+    __cser_core::assert_eq!(
         continuation.service_owner,
         Some(super::RequestKey {
             id: COMPACT_SERVICE_REQUEST,
             generation: 1,
         })
     );
-    assert_eq!(continuation.stamp.bearer_generation, 1);
+    __cser_core::assert_eq!(continuation.stamp.bearer_generation, 1);
     state.check_invariants().unwrap();
 }
 
@@ -1283,13 +1317,13 @@ fn service_owned_continuation_rejects_independent_fenced_adoption() {
         .adopt_task_after_fence(&workload, COMPACT_WORK, 1)
         .unwrap();
     let before = state.private_full_clone();
-    assert_eq!(
+    __cser_core::assert_eq!(
         state
             .adopt_continuation_after_fence(&workload, COMPACT_CONTINUATION, 1, 2)
             .unwrap_err(),
         InfrastructureError::InvalidState
     );
-    assert_eq!(state, before);
+    __cser_core::assert_eq!(state, before);
 }
 
 #[test]
@@ -1307,11 +1341,11 @@ fn service_transition_rejects_substituted_reverse_index_without_mutation() {
     let failure = state
         .bind_service_response_continuation(unbound, compact_response_descriptor())
         .unwrap_err();
-    assert_eq!(failure.error(), InfrastructureError::InvalidState);
-    assert_eq!(state, before);
+    __cser_core::assert_eq!(failure.error(), InfrastructureError::InvalidState);
+    __cser_core::assert_eq!(state, before);
     let unbound = failure.into_input();
-    assert_eq!(service_key_coordinates(&unbound.0), presented);
-    assert_eq!(state.scope(SCOPE).unwrap().live.continuations, 0);
+    __cser_core::assert_eq!(service_key_coordinates(&unbound.0), presented);
+    __cser_core::assert_eq!(state.scope(SCOPE).unwrap().live.continuations, 0);
 }
 
 #[test]
@@ -1320,14 +1354,14 @@ fn service_unbound_cancel_has_no_continuation_authority_or_post_queue_path() {
     let receipt = state
         .cancel_unbound_service_request(unbound, ValidatedAbortProof::new(0xd0a2))
         .unwrap();
-    assert_eq!(receipt.point, ServiceCancellationPoint::ReservedUnbound);
-    assert_eq!(receipt.response, None);
-    assert_eq!(receipt.bearer_generation, 2);
+    __cser_core::assert_eq!(receipt.point, ServiceCancellationPoint::ReservedUnbound);
+    __cser_core::assert_eq!(receipt.response, None);
+    __cser_core::assert_eq!(receipt.bearer_generation, 2);
     let scope = state.scope(SCOPE).unwrap();
-    assert_eq!(scope.live.continuations, 0);
+    __cser_core::assert_eq!(scope.live.continuations, 0);
     let service = scope.service_requests.get(COMPACT_SERVICE_REQUEST).unwrap();
-    assert!(service.bound_continuation.is_none());
-    assert!(matches!(
+    __cser_core::assert!(service.bound_continuation.is_none());
+    __cser_core::assert!(__cser_core::matches!(
         service.phase,
         ServiceRequestPhase::Cancelled {
             receipt: stored
@@ -1353,7 +1387,7 @@ fn service_unbound_cancel_has_no_continuation_authority_or_post_queue_path() {
 fn service_external_receipts_are_exact_and_claim_child_is_one_transition() {
     let (mut state, service) = compact_bound_service_state(0xd0a3);
     let (enqueue_plan, enqueue_authority) = state.begin_service_enqueue(service).unwrap();
-    assert_eq!(enqueue_plan.bearer_generation, 3);
+    __cser_core::assert_eq!(enqueue_plan.bearer_generation, 3);
     let enqueue_coordinates = service_bound_key_coordinates(&enqueue_authority.0);
     let mut bad_enqueue = service_enqueue_receipt(enqueue_plan, 0xd0a4);
     bad_enqueue.plan.apply_nonce = bad_enqueue.plan.apply_nonce.checked_add(1).unwrap();
@@ -1361,10 +1395,10 @@ fn service_external_receipts_are_exact_and_claim_child_is_one_transition() {
     let failure = state
         .acknowledge_service_enqueue(enqueue_authority, bad_enqueue)
         .unwrap_err();
-    assert_eq!(failure.error(), InfrastructureError::InvalidReceipt);
-    assert_eq!(state, before_bad_enqueue);
+    __cser_core::assert_eq!(failure.error(), InfrastructureError::InvalidReceipt);
+    __cser_core::assert_eq!(state, before_bad_enqueue);
     let enqueue_authority = failure.into_input();
-    assert_eq!(
+    __cser_core::assert_eq!(
         service_bound_key_coordinates(&enqueue_authority.0),
         enqueue_coordinates
     );
@@ -1384,11 +1418,11 @@ fn service_external_receipts_are_exact_and_claim_child_is_one_transition() {
     let failure = state
         .cancel_bound_service_request(forged_reserved, ValidatedAbortProof::new(0xd0a5))
         .unwrap_err();
-    assert_eq!(failure.error(), InfrastructureError::InvalidState);
-    assert_eq!(state, before_forbidden_cancel);
+    __cser_core::assert_eq!(failure.error(), InfrastructureError::InvalidState);
+    __cser_core::assert_eq!(state, before_forbidden_cancel);
 
     let (arm_plan, arm_authority) = state.begin_service_arm(unarmed).unwrap();
-    assert_eq!(arm_plan.bearer_generation, 5);
+    __cser_core::assert_eq!(arm_plan.bearer_generation, 5);
     let arm_coordinates = service_bound_key_coordinates(&arm_authority.0);
     let mut bad_arm = service_arm_receipt(arm_plan, 0xd0a6);
     bad_arm.plan.arm_nonce = bad_arm.plan.arm_nonce.checked_add(1).unwrap();
@@ -1396,10 +1430,10 @@ fn service_external_receipts_are_exact_and_claim_child_is_one_transition() {
     let failure = state
         .acknowledge_service_arm(arm_authority, bad_arm)
         .unwrap_err();
-    assert_eq!(failure.error(), InfrastructureError::InvalidReceipt);
-    assert_eq!(state, before_bad_arm);
+    __cser_core::assert_eq!(failure.error(), InfrastructureError::InvalidReceipt);
+    __cser_core::assert_eq!(state, before_bad_arm);
     let arm_authority = failure.into_input();
-    assert_eq!(
+    __cser_core::assert_eq!(
         service_bound_key_coordinates(&arm_authority.0),
         arm_coordinates
     );
@@ -1438,10 +1472,10 @@ fn service_external_receipts_are_exact_and_claim_child_is_one_transition() {
             }),
         )
         .unwrap_err();
-    assert_eq!(failure.error(), InfrastructureError::InvalidReceipt);
-    assert_eq!(state, before_invalid_child);
+    __cser_core::assert_eq!(failure.error(), InfrastructureError::InvalidReceipt);
+    __cser_core::assert_eq!(state, before_invalid_child);
     let enqueued = failure.into_input();
-    assert_eq!(
+    __cser_core::assert_eq!(
         service_bound_key_coordinates(&enqueued.0),
         enqueued_coordinates
     );
@@ -1456,15 +1490,15 @@ fn service_external_receipts_are_exact_and_claim_child_is_one_transition() {
             }),
         )
         .unwrap();
-    assert_eq!(bound.0.bearer_generation, 7);
+    __cser_core::assert_eq!(bound.0.bearer_generation, 7);
     let service = state
         .scope(SCOPE)
         .unwrap()
         .service_requests
         .get(COMPACT_SERVICE_REQUEST)
         .unwrap();
-    assert_eq!(state.scope(SCOPE).unwrap().revision, before_revision + 1);
-    assert!(matches!(
+    __cser_core::assert_eq!(state.scope(SCOPE).unwrap().revision, before_revision + 1);
+    __cser_core::assert!(__cser_core::matches!(
         service.phase,
         ServiceRequestPhase::ChildBound {
             binding_receipt,
@@ -1508,9 +1542,9 @@ fn service_claim_and_completion_preview_failures_are_atomic() {
             }),
         )
         .unwrap_err();
-    assert_eq!(failure.error(), InfrastructureError::CounterOverflow);
-    assert_eq!(state, before);
-    assert_eq!(
+    __cser_core::assert_eq!(failure.error(), InfrastructureError::CounterOverflow);
+    __cser_core::assert_eq!(state, before);
+    __cser_core::assert_eq!(
         service_bound_key_coordinates(&failure.into_input().0),
         presented
     );
@@ -1522,9 +1556,9 @@ fn service_claim_and_completion_preview_failures_are_atomic() {
     let failure = revision_state
         .complete_service_request(bound, 0xd0e1)
         .unwrap_err();
-    assert_eq!(failure.error(), InfrastructureError::CounterOverflow);
-    assert_eq!(revision_state, before);
-    assert_eq!(
+    __cser_core::assert_eq!(failure.error(), InfrastructureError::CounterOverflow);
+    __cser_core::assert_eq!(revision_state, before);
+    __cser_core::assert_eq!(
         service_bound_key_coordinates(&failure.into_input().0),
         presented
     );
@@ -1542,12 +1576,12 @@ fn service_claim_and_completion_preview_failures_are_atomic() {
     let failure = workload_state
         .complete_service_request(bound, 0xd101)
         .unwrap_err();
-    assert_eq!(
+    __cser_core::assert_eq!(
         failure.error(),
         InfrastructureError::Invariant("live counter underflow")
     );
-    assert_eq!(workload_state, before);
-    assert_eq!(
+    __cser_core::assert_eq!(workload_state, before);
+    __cser_core::assert_eq!(
         service_bound_key_coordinates(&failure.into_input().0),
         presented
     );
@@ -1565,12 +1599,12 @@ fn service_claim_and_completion_preview_failures_are_atomic() {
     let failure = parent_state
         .complete_service_request(bound, 0xd121)
         .unwrap_err();
-    assert_eq!(
+    __cser_core::assert_eq!(
         failure.error(),
         InfrastructureError::Invariant("live counter underflow")
     );
-    assert_eq!(parent_state, before);
-    assert_eq!(
+    __cser_core::assert_eq!(parent_state, before);
+    __cser_core::assert_eq!(
         service_bound_key_coordinates(&failure.into_input().0),
         presented
     );
@@ -1583,9 +1617,9 @@ fn service_bound_keys_reject_synchronous_response_lineage_substitution() {
     synchronously_substitute_service_response(&mut state, sibling);
     let before = state.private_full_clone();
     let failure = state.begin_service_enqueue(ticket).unwrap_err();
-    assert_eq!(failure.error(), InfrastructureError::InvalidReceipt);
-    assert_eq!(state, before);
-    assert_eq!(
+    __cser_core::assert_eq!(failure.error(), InfrastructureError::InvalidReceipt);
+    __cser_core::assert_eq!(state, before);
+    __cser_core::assert_eq!(
         service_bound_key_coordinates(&failure.into_input().0),
         coordinates
     );
@@ -1598,9 +1632,9 @@ fn service_bound_keys_reject_synchronous_response_lineage_substitution() {
     let failure = state
         .acknowledge_service_enqueue(authority, service_enqueue_receipt(plan, 0xd512))
         .unwrap_err();
-    assert_eq!(failure.error(), InfrastructureError::InvalidReceipt);
-    assert_eq!(state, before);
-    assert_eq!(
+    __cser_core::assert_eq!(failure.error(), InfrastructureError::InvalidReceipt);
+    __cser_core::assert_eq!(state, before);
+    __cser_core::assert_eq!(
         service_bound_key_coordinates(&failure.into_input().0),
         coordinates
     );
@@ -1617,9 +1651,9 @@ fn service_bound_keys_reject_synchronous_response_lineage_substitution() {
     synchronously_substitute_service_response(&mut state, sibling);
     let before = state.private_full_clone();
     let failure = state.begin_service_arm(unarmed).unwrap_err();
-    assert_eq!(failure.error(), InfrastructureError::InvalidReceipt);
-    assert_eq!(state, before);
-    assert_eq!(
+    __cser_core::assert_eq!(failure.error(), InfrastructureError::InvalidReceipt);
+    __cser_core::assert_eq!(state, before);
+    __cser_core::assert_eq!(
         service_bound_key_coordinates(&failure.into_input().0),
         coordinates
     );
@@ -1639,9 +1673,9 @@ fn service_bound_keys_reject_synchronous_response_lineage_substitution() {
     let failure = state
         .acknowledge_service_arm(arm_authority, service_arm_receipt(arm_plan, 0xd517))
         .unwrap_err();
-    assert_eq!(failure.error(), InfrastructureError::InvalidReceipt);
-    assert_eq!(state, before);
-    assert_eq!(
+    __cser_core::assert_eq!(failure.error(), InfrastructureError::InvalidReceipt);
+    __cser_core::assert_eq!(state, before);
+    __cser_core::assert_eq!(
         service_bound_key_coordinates(&failure.into_input().0),
         coordinates
     );
@@ -1672,9 +1706,9 @@ fn service_bound_keys_reject_synchronous_response_lineage_substitution() {
             }),
         )
         .unwrap_err();
-    assert_eq!(failure.error(), InfrastructureError::InvalidReceipt);
-    assert_eq!(state, before);
-    assert_eq!(
+    __cser_core::assert_eq!(failure.error(), InfrastructureError::InvalidReceipt);
+    __cser_core::assert_eq!(state, before);
+    __cser_core::assert_eq!(
         service_bound_key_coordinates(&failure.into_input().0),
         coordinates
     );
@@ -1706,9 +1740,9 @@ fn service_bound_keys_reject_synchronous_response_lineage_substitution() {
     synchronously_substitute_service_response(&mut state, sibling);
     let before = state.private_full_clone();
     let failure = state.complete_service_request(bound, 0xd536).unwrap_err();
-    assert_eq!(failure.error(), InfrastructureError::InvalidReceipt);
-    assert_eq!(state, before);
-    assert_eq!(
+    __cser_core::assert_eq!(failure.error(), InfrastructureError::InvalidReceipt);
+    __cser_core::assert_eq!(state, before);
+    __cser_core::assert_eq!(
         service_bound_key_coordinates(&failure.into_input().0),
         coordinates
     );
@@ -1749,7 +1783,7 @@ fn service_bound_keys_reject_synchronous_response_lineage_substitution() {
                 arm_receipt,
                 binding_receipt,
             } => (queue_receipt, arm_receipt, binding_receipt),
-            _ => unreachable!(),
+            _ => __cser_core::unreachable!(),
         };
         arm_receipt.transport_receipt_digest += 1;
         let lineage = super::service::service_child_bound_commitment(
@@ -1769,9 +1803,9 @@ fn service_bound_keys_reject_synchronous_response_lineage_substitution() {
     let coordinates = service_bound_key_coordinates(&bound.0);
     let before = state.private_full_clone();
     let failure = state.complete_service_request(bound, 0xd566).unwrap_err();
-    assert_eq!(failure.error(), InfrastructureError::InvalidReceipt);
-    assert_eq!(state, before);
-    assert_eq!(
+    __cser_core::assert_eq!(failure.error(), InfrastructureError::InvalidReceipt);
+    __cser_core::assert_eq!(state, before);
+    __cser_core::assert_eq!(
         service_bound_key_coordinates(&failure.into_input().0),
         coordinates
     );
@@ -1795,7 +1829,7 @@ fn service_phase_keys_reject_synchronous_plan_and_receipt_substitution() {
         {
             *apply_generation += 1;
         } else {
-            unreachable!();
+            __cser_core::unreachable!();
         }
     }
     plan.apply_generation += 1;
@@ -1805,9 +1839,9 @@ fn service_phase_keys_reject_synchronous_plan_and_receipt_substitution() {
     let failure = state
         .acknowledge_service_enqueue(authority, service_enqueue_receipt(plan, 0xd541))
         .unwrap_err();
-    assert_eq!(failure.error(), InfrastructureError::InvalidReceipt);
-    assert_eq!(state, before);
-    assert_eq!(
+    __cser_core::assert_eq!(failure.error(), InfrastructureError::InvalidReceipt);
+    __cser_core::assert_eq!(state, before);
+    __cser_core::assert_eq!(
         service_bound_key_coordinates(&failure.into_input().0),
         coordinates
     );
@@ -1830,15 +1864,15 @@ fn service_phase_keys_reject_synchronous_plan_and_receipt_substitution() {
     {
         queue_receipt.transport_receipt_digest += 1;
     } else {
-        unreachable!();
+        __cser_core::unreachable!();
     }
     state.check_invariants().unwrap();
     let coordinates = service_bound_key_coordinates(&unarmed.0);
     let before = state.private_full_clone();
     let failure = state.begin_service_arm(unarmed).unwrap_err();
-    assert_eq!(failure.error(), InfrastructureError::InvalidReceipt);
-    assert_eq!(state, before);
-    assert_eq!(
+    __cser_core::assert_eq!(failure.error(), InfrastructureError::InvalidReceipt);
+    __cser_core::assert_eq!(state, before);
+    __cser_core::assert_eq!(
         service_bound_key_coordinates(&failure.into_input().0),
         coordinates
     );
@@ -1863,7 +1897,7 @@ fn service_phase_keys_reject_synchronous_plan_and_receipt_substitution() {
         if let ServiceRequestPhase::Arming { arm_generation, .. } = &mut record.phase {
             *arm_generation += 1;
         } else {
-            unreachable!();
+            __cser_core::unreachable!();
         }
     }
     arm_plan.arm_generation += 1;
@@ -1873,9 +1907,9 @@ fn service_phase_keys_reject_synchronous_plan_and_receipt_substitution() {
     let failure = state
         .acknowledge_service_arm(arm_authority, service_arm_receipt(arm_plan, 0xd546))
         .unwrap_err();
-    assert_eq!(failure.error(), InfrastructureError::InvalidReceipt);
-    assert_eq!(state, before);
-    assert_eq!(
+    __cser_core::assert_eq!(failure.error(), InfrastructureError::InvalidReceipt);
+    __cser_core::assert_eq!(state, before);
+    __cser_core::assert_eq!(
         service_bound_key_coordinates(&failure.into_input().0),
         coordinates
     );
@@ -1902,7 +1936,7 @@ fn service_phase_keys_reject_synchronous_plan_and_receipt_substitution() {
     {
         arm_receipt.transport_receipt_digest += 1;
     } else {
-        unreachable!();
+        __cser_core::unreachable!();
     }
     state.check_invariants().unwrap();
     let claimant = add_service_claimant(&mut state, 0xd550);
@@ -1918,9 +1952,9 @@ fn service_phase_keys_reject_synchronous_plan_and_receipt_substitution() {
             }),
         )
         .unwrap_err();
-    assert_eq!(failure.error(), InfrastructureError::InvalidReceipt);
-    assert_eq!(state, before);
-    assert_eq!(
+    __cser_core::assert_eq!(failure.error(), InfrastructureError::InvalidReceipt);
+    __cser_core::assert_eq!(state, before);
+    __cser_core::assert_eq!(
         service_bound_key_coordinates(&failure.into_input().0),
         coordinates
     );
@@ -2014,16 +2048,16 @@ fn service_external_receipts_bind_every_causal_coordinate_family() {
 #[test]
 fn continuation_retry_returns_exact_authority_without_mutation() {
     let (mut state, _, _, continuation) = compact_continuation_state(0xd001);
-    assert_eq!(compact_bearer_generation(&state), 1);
+    __cser_core::assert_eq!(compact_bearer_generation(&state), 1);
 
     let before_claim = state.private_full_clone();
     let failure = state.claim_continuation(continuation, 0).unwrap_err();
-    assert_eq!(failure.error(), InfrastructureError::InvalidIdentity);
-    assert_eq!(state, before_claim);
+    __cser_core::assert_eq!(failure.error(), InfrastructureError::InvalidIdentity);
+    __cser_core::assert_eq!(state, before_claim);
     let continuation = failure.into_input();
 
     let claim = state.claim_continuation(continuation, 0xd8).unwrap();
-    assert_eq!(compact_bearer_generation(&state), 2);
+    __cser_core::assert_eq!(compact_bearer_generation(&state), 2);
     let before_publication = state.private_full_clone();
     let failure = state
         .begin_continuation_publication(
@@ -2036,8 +2070,8 @@ fn continuation_retry_returns_exact_authority_without_mutation() {
             },
         )
         .unwrap_err();
-    assert_eq!(failure.error(), InfrastructureError::InvalidReceipt);
-    assert_eq!(state, before_publication);
+    __cser_core::assert_eq!(failure.error(), InfrastructureError::InvalidReceipt);
+    __cser_core::assert_eq!(state, before_publication);
     let claim = failure.into_input();
 
     let publication = state
@@ -2051,10 +2085,10 @@ fn continuation_retry_returns_exact_authority_without_mutation() {
             },
         )
         .unwrap();
-    assert_eq!(compact_bearer_generation(&state), 3);
+    __cser_core::assert_eq!(compact_bearer_generation(&state), 3);
     let publication_plan = publication.plan();
-    assert_eq!(publication_plan, publication.plan());
-    assert_eq!(
+    __cser_core::assert_eq!(publication_plan, publication.plan());
+    __cser_core::assert_eq!(
         publication_plan.descriptor.continuation_id,
         COMPACT_CONTINUATION
     );
@@ -2077,8 +2111,8 @@ fn continuation_retry_returns_exact_authority_without_mutation() {
     let failure = state
         .acknowledge_continuation_publication(authority, acknowledgement)
         .unwrap_err();
-    assert_eq!(failure.error(), InfrastructureError::InvalidReceipt);
-    assert_eq!(state, before_ack);
+    __cser_core::assert_eq!(failure.error(), InfrastructureError::InvalidReceipt);
+    __cser_core::assert_eq!(state, before_ack);
     let authority = failure.into_input();
     let failure = state
         .acknowledge_continuation_publication(
@@ -2090,8 +2124,8 @@ fn continuation_retry_returns_exact_authority_without_mutation() {
             },
         )
         .unwrap_err();
-    assert_eq!(failure.error(), InfrastructureError::InvalidReceipt);
-    assert_eq!(state, before_ack);
+    __cser_core::assert_eq!(failure.error(), InfrastructureError::InvalidReceipt);
+    __cser_core::assert_eq!(state, before_ack);
     let authority = failure.into_input();
     let acknowledgement = ContinuationPublicationAckReceipt {
         external_receipt_digest: 0xd9,
@@ -2100,13 +2134,13 @@ fn continuation_retry_returns_exact_authority_without_mutation() {
     let ack = state
         .acknowledge_continuation_publication(authority, acknowledgement)
         .unwrap();
-    assert_eq!(compact_bearer_generation(&state), 4);
+    __cser_core::assert_eq!(compact_bearer_generation(&state), 4);
 
     let resume = state.begin_continuation_resume(ack).unwrap();
-    assert_eq!(compact_bearer_generation(&state), 5);
+    __cser_core::assert_eq!(compact_bearer_generation(&state), 5);
     let resume_plan = resume.plan();
-    assert_eq!(resume_plan, resume.plan());
-    assert_eq!(resume_plan.publication_ack, acknowledgement);
+    __cser_core::assert_eq!(resume_plan, resume.plan());
+    __cser_core::assert_eq!(resume_plan.publication_ack, acknowledgement);
     let completion = ContinuationResumeReceipt {
         continuation_id: resume_plan.descriptor.continuation_id,
         generation: resume_plan.descriptor.generation,
@@ -2125,8 +2159,8 @@ fn continuation_retry_returns_exact_authority_without_mutation() {
     let failure = state
         .complete_continuation_resume(resume.into_authority(), completion)
         .unwrap_err();
-    assert_eq!(failure.error(), InfrastructureError::InvalidReceipt);
-    assert_eq!(state, before_complete);
+    __cser_core::assert_eq!(failure.error(), InfrastructureError::InvalidReceipt);
+    __cser_core::assert_eq!(state, before_complete);
     let authority = failure.into_input();
     state
         .complete_continuation_resume(
@@ -2137,7 +2171,7 @@ fn continuation_retry_returns_exact_authority_without_mutation() {
             },
         )
         .unwrap();
-    assert_eq!(compact_bearer_generation(&state), 6);
+    __cser_core::assert_eq!(compact_bearer_generation(&state), 6);
     state.check_invariants().unwrap();
 }
 
@@ -2149,14 +2183,14 @@ fn foreign_registry_rejects_compact_continuation_and_returns_it() {
     let before_foreign = foreign.private_full_clone();
 
     let failure = foreign.claim_continuation(continuation, 0xda).unwrap_err();
-    assert_eq!(failure.error(), InfrastructureError::ForeignRegistry);
-    assert_eq!(foreign, before_foreign);
-    assert_eq!(owner, before_owner);
+    __cser_core::assert_eq!(failure.error(), InfrastructureError::ForeignRegistry);
+    __cser_core::assert_eq!(foreign, before_foreign);
+    __cser_core::assert_eq!(owner, before_owner);
 
     owner
         .claim_continuation(failure.into_input(), 0xda)
         .unwrap();
-    assert_eq!(compact_bearer_generation(&owner), 2);
+    __cser_core::assert_eq!(compact_bearer_generation(&owner), 2);
 }
 
 #[test]
@@ -2174,14 +2208,14 @@ fn continuation_adoption_fences_old_compact_bearer() {
         )
         .unwrap();
     let before_parent_adoption = state.private_full_clone();
-    assert_eq!(
+    __cser_core::assert_eq!(
         state
             .adopt_continuation_after_fence(&workload, COMPACT_CONTINUATION, 1, 2)
             .unwrap_err(),
         InfrastructureError::StaleBinding
     );
-    assert_eq!(state, before_parent_adoption);
-    assert!(matches!(
+    __cser_core::assert_eq!(state, before_parent_adoption);
+    __cser_core::assert!(__cser_core::matches!(
         state
             .adopt_task_after_fence(&workload, COMPACT_WORK, 1)
             .unwrap(),
@@ -2203,30 +2237,30 @@ fn continuation_adoption_fences_old_compact_bearer() {
         .remove(index_slot)
         .unwrap();
     let before_missing_index = missing_index.private_full_clone();
-    assert_eq!(
+    __cser_core::assert_eq!(
         missing_index
             .adopt_continuation_after_fence(&workload, COMPACT_CONTINUATION, 1, 2)
             .unwrap_err(),
         InfrastructureError::Invariant("missing continuation reverse index")
     );
-    assert_eq!(missing_index, before_missing_index);
+    __cser_core::assert_eq!(missing_index, before_missing_index);
 
     let current = match state
         .adopt_continuation_after_fence(&workload, COMPACT_CONTINUATION, 1, 2)
         .unwrap()
     {
         ContinuationAdoption::Pending(lease) => lease,
-        _ => panic!("pending continuation adopted into the wrong phase"),
+        _ => __cser_core::panic!("pending continuation adopted into the wrong phase"),
     };
-    assert_eq!(compact_bearer_generation(&state), 2);
+    __cser_core::assert_eq!(compact_bearer_generation(&state), 2);
     state.check_invariants().unwrap();
 
     let before_stale = state.private_full_clone();
     let failure = state.claim_continuation(stale, 0xdb).unwrap_err();
-    assert_eq!(failure.error(), InfrastructureError::StaleGeneration);
-    assert_eq!(state, before_stale);
+    __cser_core::assert_eq!(failure.error(), InfrastructureError::StaleGeneration);
+    __cser_core::assert_eq!(state, before_stale);
     state.claim_continuation(current, 0xdb).unwrap();
-    assert_eq!(compact_bearer_generation(&state), 3);
+    __cser_core::assert_eq!(compact_bearer_generation(&state), 3);
 }
 
 #[test]
@@ -2274,7 +2308,7 @@ fn continuation_adoption_retains_exact_historical_publication_ack() {
             WorkloadRequestPresentation::new(GUEST, 2, COMPACT_REQUEST, 1),
         )
         .unwrap();
-    assert!(matches!(
+    __cser_core::assert!(__cser_core::matches!(
         state
             .adopt_task_after_fence(&workload, COMPACT_WORK, 1)
             .unwrap(),
@@ -2285,24 +2319,24 @@ fn continuation_adoption_retains_exact_historical_publication_ack() {
         .unwrap()
     {
         ContinuationAdoption::Acknowledged(ack) => ack,
-        _ => panic!("acknowledged continuation adopted into the wrong phase"),
+        _ => __cser_core::panic!("acknowledged continuation adopted into the wrong phase"),
     };
     let projection = state
         .query_continuation(&workload, COMPACT_CONTINUATION, 1)
         .unwrap();
-    assert_eq!(projection.descriptor.source_binding_epoch, 2);
-    assert_eq!(projection.publication_ack, Some(acknowledgement));
-    assert_eq!(projection.publication_ack.unwrap().source_binding_epoch, 1);
+    __cser_core::assert_eq!(projection.descriptor.source_binding_epoch, 2);
+    __cser_core::assert_eq!(projection.publication_ack, Some(acknowledgement));
+    __cser_core::assert_eq!(projection.publication_ack.unwrap().source_binding_epoch, 1);
 
     let before_stale = state.private_full_clone();
     let failure = state.begin_continuation_resume(stale_ack).unwrap_err();
-    assert_eq!(failure.error(), InfrastructureError::StaleGeneration);
-    assert_eq!(state, before_stale);
+    __cser_core::assert_eq!(failure.error(), InfrastructureError::StaleGeneration);
+    __cser_core::assert_eq!(state, before_stale);
 
     let stale_resume = state.begin_continuation_resume(current_ack).unwrap();
     let stale_resume_plan = stale_resume.plan();
-    assert_eq!(stale_resume_plan.descriptor.source_binding_epoch, 2);
-    assert_eq!(stale_resume_plan.publication_ack, acknowledgement);
+    __cser_core::assert_eq!(stale_resume_plan.descriptor.source_binding_epoch, 2);
+    __cser_core::assert_eq!(stale_resume_plan.publication_ack, acknowledgement);
 
     *state
         .scope_mut(SCOPE)
@@ -2315,7 +2349,7 @@ fn continuation_adoption_retains_exact_historical_publication_ack() {
             WorkloadRequestPresentation::new(GUEST, 3, COMPACT_REQUEST, 1),
         )
         .unwrap();
-    assert!(matches!(
+    __cser_core::assert!(__cser_core::matches!(
         state
             .adopt_task_after_fence(&workload, COMPACT_WORK, 1)
             .unwrap(),
@@ -2326,7 +2360,7 @@ fn continuation_adoption_retains_exact_historical_publication_ack() {
         .unwrap()
     {
         ContinuationAdoption::ReplayResume(resume) => resume,
-        _ => panic!("resuming continuation adopted into the wrong phase"),
+        _ => __cser_core::panic!("resuming continuation adopted into the wrong phase"),
     };
     let before_stale_resume = state.private_full_clone();
     let failure = state
@@ -2335,12 +2369,12 @@ fn continuation_adoption_retains_exact_historical_publication_ack() {
             continuation_resume_receipt(stale_resume_plan, 0xdb03),
         )
         .unwrap_err();
-    assert_eq!(failure.error(), InfrastructureError::StaleGeneration);
-    assert_eq!(state, before_stale_resume);
+    __cser_core::assert_eq!(failure.error(), InfrastructureError::StaleGeneration);
+    __cser_core::assert_eq!(state, before_stale_resume);
 
     let current_resume_plan = current_resume.plan();
-    assert_eq!(current_resume_plan.descriptor.source_binding_epoch, 3);
-    assert_eq!(current_resume_plan.publication_ack, acknowledgement);
+    __cser_core::assert_eq!(current_resume_plan.descriptor.source_binding_epoch, 3);
+    __cser_core::assert_eq!(current_resume_plan.publication_ack, acknowledgement);
     let before_substitution = state.private_full_clone();
     let failure = state
         .complete_continuation_resume(
@@ -2348,8 +2382,8 @@ fn continuation_adoption_retains_exact_historical_publication_ack() {
             continuation_resume_receipt(stale_resume_plan, 0xdb03),
         )
         .unwrap_err();
-    assert_eq!(failure.error(), InfrastructureError::InvalidReceipt);
-    assert_eq!(state, before_substitution);
+    __cser_core::assert_eq!(failure.error(), InfrastructureError::InvalidReceipt);
+    __cser_core::assert_eq!(state, before_substitution);
     state
         .complete_continuation_resume(
             failure.into_input(),
@@ -2359,8 +2393,8 @@ fn continuation_adoption_retains_exact_historical_publication_ack() {
     let projection = state
         .query_continuation(&workload, COMPACT_CONTINUATION, 1)
         .unwrap();
-    assert_eq!(projection.publication_ack, Some(acknowledgement));
-    assert_eq!(
+    __cser_core::assert_eq!(projection.publication_ack, Some(acknowledgement));
+    __cser_core::assert_eq!(
         projection.resume_receipt,
         Some(continuation_resume_receipt(current_resume_plan, 0xdb04))
     );
@@ -2405,7 +2439,7 @@ fn continuation_adoption_retains_exact_historical_publication_ack() {
 fn service_cancel_returns_fresh_compact_continuation_authority() {
     let (mut state, service) = compact_bound_service_state(0xd031);
     let workload = super::workload_bearer(state.scope(SCOPE).unwrap(), COMPACT_REQUEST).unwrap();
-    assert_eq!(compact_bearer_generation(&state), 1);
+    __cser_core::assert_eq!(compact_bearer_generation(&state), 1);
     let historical_generation = state
         .scope(SCOPE)
         .unwrap()
@@ -2415,18 +2449,18 @@ fn service_cancel_returns_fresh_compact_continuation_authority() {
         .bound_continuation
         .unwrap()
         .bearer_generation;
-    assert_eq!(historical_generation, 1);
+    __cser_core::assert_eq!(historical_generation, 1);
 
     let cancelled = state
         .cancel_bound_service_request(service, ValidatedAbortProof::new(0xdc))
         .unwrap();
-    assert_eq!(cancelled.receipt.bearer_generation, 3);
-    assert_eq!(
+    __cser_core::assert_eq!(cancelled.receipt.bearer_generation, 3);
+    __cser_core::assert_eq!(
         cancelled.receipt.response.unwrap().continuation_id,
         COMPACT_CONTINUATION
     );
-    assert_eq!(compact_bearer_generation(&state), 2);
-    assert!(
+    __cser_core::assert_eq!(compact_bearer_generation(&state), 2);
+    __cser_core::assert!(
         state
             .scope(SCOPE)
             .unwrap()
@@ -2439,12 +2473,12 @@ fn service_cancel_returns_fresh_compact_continuation_authority() {
     let projection = state
         .query_service_request(&workload, COMPACT_SERVICE_REQUEST, 1)
         .unwrap();
-    assert_eq!(projection.state, ServiceRequestRecoveryState::Cancelled);
-    assert_eq!(projection.cancellation_receipt, Some(cancelled.receipt));
-    assert_eq!(projection.enqueue_receipt, None);
-    assert_eq!(projection.arm_receipt, None);
-    assert_eq!(projection.child_binding_receipt, None);
-    assert_eq!(projection.completion_receipt, None);
+    __cser_core::assert_eq!(projection.state, ServiceRequestRecoveryState::Cancelled);
+    __cser_core::assert_eq!(projection.cancellation_receipt, Some(cancelled.receipt));
+    __cser_core::assert_eq!(projection.enqueue_receipt, None);
+    __cser_core::assert_eq!(projection.arm_receipt, None);
+    __cser_core::assert_eq!(projection.child_binding_receipt, None);
+    __cser_core::assert_eq!(projection.completion_receipt, None);
 
     let mut lower_generation = state.private_full_clone();
     if let ServiceRequestPhase::Cancelled { receipt } = &mut lower_generation
@@ -2460,7 +2494,7 @@ fn service_cancel_returns_fresh_compact_continuation_authority() {
     assert_invariant_read_only(lower_generation);
 
     state.claim_continuation(cancelled.response, 0xdd).unwrap();
-    assert_eq!(compact_bearer_generation(&state), 3);
+    __cser_core::assert_eq!(compact_bearer_generation(&state), 3);
     state.check_invariants().unwrap();
 }
 
@@ -2522,13 +2556,13 @@ fn service_completion_returns_fresh_compact_continuation_authority() {
         .create_continuation(&alternate_workload_parent, alternate_workload_response)
         .unwrap();
     let (enqueue_plan, enqueue_authority) = state.begin_service_enqueue(service).unwrap();
-    assert_eq!(enqueue_plan.bearer_generation, 3);
+    __cser_core::assert_eq!(enqueue_plan.bearer_generation, 3);
     let enqueue_receipt = service_enqueue_receipt(enqueue_plan, 0xde);
     let unarmed = state
         .acknowledge_service_enqueue(enqueue_authority, enqueue_receipt)
         .unwrap();
     let (arm_plan, arm_authority) = state.begin_service_arm(unarmed).unwrap();
-    assert_eq!(arm_plan.bearer_generation, 5);
+    __cser_core::assert_eq!(arm_plan.bearer_generation, 5);
     let arm_receipt = service_arm_receipt(arm_plan, 0xdf);
     let enqueued = state
         .acknowledge_service_arm(arm_authority, arm_receipt)
@@ -2602,12 +2636,12 @@ fn service_completion_returns_fresh_compact_continuation_authority() {
     {
         binding_receipt = Some(stored);
     }
-    assert!(binding_receipt.is_some());
+    __cser_core::assert!(binding_receipt.is_some());
     let binding_receipt = binding_receipt.unwrap();
-    assert_eq!(binding_receipt.service_bearer_generation, 7);
-    assert_eq!(binding_receipt.claim_generation, 1);
-    assert_eq!(binding_receipt.claimant.task, claimant.0.identity);
-    assert_eq!(
+    __cser_core::assert_eq!(binding_receipt.service_bearer_generation, 7);
+    __cser_core::assert_eq!(binding_receipt.claim_generation, 1);
+    __cser_core::assert_eq!(binding_receipt.claimant.task, claimant.0.identity);
+    __cser_core::assert_eq!(
         binding_receipt.claimant.task_bearer_generation,
         claimant.0.bearer_generation
     );
@@ -2647,20 +2681,20 @@ fn service_completion_returns_fresh_compact_continuation_authority() {
             mutate(binding_receipt);
             replaced = true;
         }
-        assert!(replaced);
+        __cser_core::assert!(replaced);
         assert_invariant_read_only(substituted.private_full_clone());
         let coordinates = service_bound_key_coordinates(&bound.0);
         let before = substituted.private_full_clone();
         let failure = substituted
             .complete_service_request(bound, 0xe9)
             .unwrap_err();
-        assert!(matches!(
+        __cser_core::assert!(__cser_core::matches!(
             failure.error(),
             InfrastructureError::InvalidReceipt | InfrastructureError::InvalidState
         ));
-        assert_eq!(substituted, before);
+        __cser_core::assert_eq!(substituted, before);
         bound = failure.into_input();
-        assert_eq!(service_bound_key_coordinates(&bound.0), coordinates);
+        __cser_core::assert_eq!(service_bound_key_coordinates(&bound.0), coordinates);
     }
 
     let mut substituted_claimant = state.private_full_clone();
@@ -2701,7 +2735,7 @@ fn service_completion_returns_fresh_compact_continuation_authority() {
                 arm_receipt,
                 binding_receipt,
             } => (queue_receipt, arm_receipt, binding_receipt),
-            _ => unreachable!(),
+            _ => __cser_core::unreachable!(),
         };
         substituted_binding.claimant = alternate_snapshot;
         substituted_binding.child = ServiceChildReceipt {
@@ -2727,10 +2761,10 @@ fn service_completion_returns_fresh_compact_continuation_authority() {
     let failure = substituted_claimant
         .complete_service_request(bound, 0xe9)
         .unwrap_err();
-    assert_eq!(failure.error(), InfrastructureError::InvalidReceipt);
-    assert_eq!(substituted_claimant, before);
+    __cser_core::assert_eq!(failure.error(), InfrastructureError::InvalidReceipt);
+    __cser_core::assert_eq!(substituted_claimant, before);
     bound = failure.into_input();
-    assert_eq!(service_bound_key_coordinates(&bound.0), coordinates);
+    __cser_core::assert_eq!(service_bound_key_coordinates(&bound.0), coordinates);
 
     let mut corrupted_claimant = state.private_full_clone();
     corrupted_claimant
@@ -2745,21 +2779,21 @@ fn service_completion_returns_fresh_compact_continuation_authority() {
     let failure = corrupted_claimant
         .complete_service_request(bound, 0xe9)
         .unwrap_err();
-    assert_eq!(failure.error(), InfrastructureError::InvalidState);
-    assert_eq!(corrupted_claimant, before_corrupt_completion);
+    __cser_core::assert_eq!(failure.error(), InfrastructureError::InvalidState);
+    __cser_core::assert_eq!(corrupted_claimant, before_corrupt_completion);
     bound = failure.into_input();
-    assert_eq!(
+    __cser_core::assert_eq!(
         service_bound_key_coordinates(&bound.0),
         corrupted_bound_coordinates
     );
 
     let before_early_reap = state.private_full_clone();
     let failure = state.reap_task(claimant).unwrap_err();
-    assert!(matches!(
+    __cser_core::assert!(__cser_core::matches!(
         failure.error(),
         InfrastructureError::ClosureBlocked { live: 1, .. }
     ));
-    assert_eq!(state, before_early_reap);
+    __cser_core::assert_eq!(state, before_early_reap);
     let _claimant = failure.into_input();
     let claim_nonce = state
         .scope(SCOPE)
@@ -2769,20 +2803,20 @@ fn service_completion_returns_fresh_compact_continuation_authority() {
         .unwrap()
         .claim_nonce_high_water;
     let outcome = state.complete_service_request(bound, 0xe9).unwrap();
-    assert_eq!(outcome.receipt.bearer_generation, 8);
-    assert_eq!(compact_bearer_generation(&state), 2);
+    __cser_core::assert_eq!(outcome.receipt.bearer_generation, 8);
+    __cser_core::assert_eq!(compact_bearer_generation(&state), 2);
     let service = state
         .scope(SCOPE)
         .unwrap()
         .service_requests
         .get(COMPACT_SERVICE_REQUEST)
         .unwrap();
-    assert!(service.bound_continuation.is_none());
-    assert_eq!(
+    __cser_core::assert!(service.bound_continuation.is_none());
+    __cser_core::assert_eq!(
         service.bound_commitment,
         Some(outcome.receipt.lineage_commitment)
     );
-    assert!(matches!(
+    __cser_core::assert!(__cser_core::matches!(
         service.phase,
         ServiceRequestPhase::Completed {
             queue_receipt: stored_queue,
@@ -2793,18 +2827,18 @@ fn service_completion_returns_fresh_compact_continuation_authority() {
             && receipt.binding_receipt == binding_receipt
             && receipt == outcome.receipt
     ));
-    assert_eq!(service.apply_nonce_high_water, enqueue_plan.apply_nonce);
-    assert_eq!(service.arm_nonce_high_water, arm_plan.arm_nonce);
-    assert_eq!(service.claim_nonce_high_water, claim_nonce);
+    __cser_core::assert_eq!(service.apply_nonce_high_water, enqueue_plan.apply_nonce);
+    __cser_core::assert_eq!(service.arm_nonce_high_water, arm_plan.arm_nonce);
+    __cser_core::assert_eq!(service.claim_nonce_high_water, claim_nonce);
     let projection = state
         .query_service_request(&guest_workload, COMPACT_SERVICE_REQUEST, 1)
         .unwrap();
-    assert_eq!(projection.state, ServiceRequestRecoveryState::Completed);
-    assert_eq!(projection.enqueue_receipt, Some(enqueue_receipt));
-    assert_eq!(projection.arm_receipt, Some(arm_receipt));
-    assert_eq!(projection.child_binding_receipt, Some(binding_receipt));
-    assert_eq!(projection.completion_receipt, Some(outcome.receipt));
-    assert_eq!(projection.cancellation_receipt, None);
+    __cser_core::assert_eq!(projection.state, ServiceRequestRecoveryState::Completed);
+    __cser_core::assert_eq!(projection.enqueue_receipt, Some(enqueue_receipt));
+    __cser_core::assert_eq!(projection.arm_receipt, Some(arm_receipt));
+    __cser_core::assert_eq!(projection.child_binding_receipt, Some(binding_receipt));
+    __cser_core::assert_eq!(projection.completion_receipt, Some(outcome.receipt));
+    __cser_core::assert_eq!(projection.cancellation_receipt, None);
 
     let mut synchronously_lowered_bearers = state.private_full_clone();
     {
@@ -2824,7 +2858,7 @@ fn service_completion_returns_fresh_compact_continuation_authority() {
                 arm_receipt,
                 receipt,
             } => (queue_receipt, arm_receipt, receipt),
-            _ => unreachable!(),
+            _ => __cser_core::unreachable!(),
         };
         queue_receipt.plan.bearer_generation -= 1;
         arm_receipt.plan.queue_receipt = queue_receipt;
@@ -2945,7 +2979,7 @@ fn service_completion_returns_fresh_compact_continuation_authority() {
             receipt.response = substituted_response;
             replaced = true;
         }
-        assert!(replaced);
+        __cser_core::assert!(replaced);
         assert_invariant_read_only(substituted);
     }
 
@@ -2968,34 +3002,46 @@ fn service_completion_returns_fresh_compact_continuation_authority() {
     if let TaskAdoption::Entered(entered) = adopted_claimant {
         entered_claimant = Some(entered);
     }
-    assert!(entered_claimant.is_some());
+    __cser_core::assert!(entered_claimant.is_some());
     state.reap_task(entered_claimant.unwrap()).unwrap();
     state.check_invariants().unwrap();
 
     state.claim_continuation(outcome.response, 0xea).unwrap();
-    assert_eq!(compact_bearer_generation(&state), 3);
+    __cser_core::assert_eq!(compact_bearer_generation(&state), 3);
     state.check_invariants().unwrap();
 }
 
 #[test]
 fn deadline_compact_authority_layout_is_bounded() {
-    assert!(core::mem::size_of::<BearerKey<bearer_state::DeadlineArmed>>() <= 64);
-    assert!(core::mem::size_of::<BearerKey<bearer_state::DeadlineFired>>() <= 64);
-    assert!(core::mem::size_of::<BearerKey<bearer_state::DeadlineExhausted>>() <= 64);
-    assert!(core::mem::size_of::<BearerKey<bearer_state::DeadlineQuarantined>>() <= 64);
-    assert!(core::mem::size_of::<DeadlineLease>() <= 96);
-    assert!(core::mem::size_of::<DeadlineExpiryReceipt>() <= 96);
-    assert!(core::mem::size_of::<DeadlineQuarantineTicket>() <= 96);
-    assert!(core::mem::size_of::<LinearFailure<DeadlineLease>>() <= 120);
-    assert!(core::mem::size_of::<LinearFailure<DeadlineExpiryReceipt>>() <= 120);
-    assert!(core::mem::size_of::<LinearFailure<DeadlineQuarantineTicket>>() <= 120);
+    __cser_core::assert!(
+        __cser_core::mem::size_of::<BearerKey<bearer_state::DeadlineArmed>>() <= 64
+    );
+    __cser_core::assert!(
+        __cser_core::mem::size_of::<BearerKey<bearer_state::DeadlineFired>>() <= 64
+    );
+    __cser_core::assert!(
+        __cser_core::mem::size_of::<BearerKey<bearer_state::DeadlineExhausted>>() <= 64
+    );
+    __cser_core::assert!(
+        __cser_core::mem::size_of::<BearerKey<bearer_state::DeadlineQuarantined>>() <= 64
+    );
+    __cser_core::assert!(__cser_core::mem::size_of::<DeadlineLease>() <= 96);
+    __cser_core::assert!(__cser_core::mem::size_of::<DeadlineExpiryReceipt>() <= 96);
+    __cser_core::assert!(__cser_core::mem::size_of::<DeadlineQuarantineTicket>() <= 96);
+    __cser_core::assert!(__cser_core::mem::size_of::<LinearFailure<DeadlineLease>>() <= 120);
+    __cser_core::assert!(
+        __cser_core::mem::size_of::<LinearFailure<DeadlineExpiryReceipt>>() <= 120
+    );
+    __cser_core::assert!(
+        __cser_core::mem::size_of::<LinearFailure<DeadlineQuarantineTicket>>() <= 120
+    );
 }
 
 #[test]
 fn device_closure_deadline_fails_closed_without_device_owner() {
     let (mut state, _, entered, _) = compact_deadline_state(0xf001, 2);
     let before = state.private_full_clone();
-    assert_eq!(
+    __cser_core::assert_eq!(
         state
             .arm_deadline(
                 &entered,
@@ -3013,7 +3059,7 @@ fn device_closure_deadline_fails_closed_without_device_owner() {
             .unwrap_err(),
         InfrastructureError::NotEnabled
     );
-    assert_eq!(state, before);
+    __cser_core::assert_eq!(state, before);
 }
 
 #[test]
@@ -3024,44 +3070,44 @@ fn deadline_rearm_is_failure_atomic_and_exhaustion_is_retained() {
     let failure = state
         .fire_deadline(deadline, DeadlineClockBasis::ObservedCallbackTick, 9)
         .unwrap_err();
-    assert_eq!(failure.error(), InfrastructureError::InvalidState);
-    assert_eq!(state, before_early);
+    __cser_core::assert_eq!(failure.error(), InfrastructureError::InvalidState);
+    __cser_core::assert_eq!(state, before_early);
     let deadline = failure.into_input();
 
     let expiry = state
         .fire_deadline(deadline, DeadlineClockBasis::ObservedCallbackTick, 10)
         .unwrap();
     let fired = deadline_coordinates(&state);
-    assert_eq!((fired.0, fired.1), (1, 2));
-    assert_ne!(fired.2, initial_nonce);
+    __cser_core::assert_eq!((fired.0, fired.1), (1, 2));
+    __cser_core::assert_ne!(fired.2, initial_nonce);
     let projection = state
         .query_deadline(&workload, COMPACT_DEADLINE, 1)
         .unwrap();
-    assert_eq!(projection.state, DeadlineRecoveryState::Fired);
-    assert_eq!(projection.observed_tick, Some(10));
+    __cser_core::assert_eq!(projection.state, DeadlineRecoveryState::Fired);
+    __cser_core::assert_eq!(projection.observed_tick, Some(10));
 
     let before_bad_generation = state.private_full_clone();
     let failure = state.rearm_deadline(expiry, 3, 15).unwrap_err();
-    assert_eq!(failure.error(), InfrastructureError::StaleGeneration);
-    assert_eq!(state, before_bad_generation);
+    __cser_core::assert_eq!(failure.error(), InfrastructureError::StaleGeneration);
+    __cser_core::assert_eq!(state, before_bad_generation);
     let expiry = failure.into_input();
     let deadline = state.rearm_deadline(expiry, 2, 15).unwrap();
     let rearmed = deadline_coordinates(&state);
-    assert_eq!((rearmed.0, rearmed.1), (2, 3));
-    assert_ne!(rearmed.2, fired.2);
+    __cser_core::assert_eq!((rearmed.0, rearmed.1), (2, 3));
+    __cser_core::assert_ne!(rearmed.2, fired.2);
 
     let exhausted = state
         .fire_deadline(deadline, DeadlineClockBasis::ObservedCallbackTick, 15)
         .unwrap();
-    assert_eq!(deadline_coordinates(&state).1, 4);
+    __cser_core::assert_eq!(deadline_coordinates(&state).1, 4);
     let before_retained = state.private_full_clone();
     let failure = state.rearm_deadline(exhausted, 3, 20).unwrap_err();
-    assert_eq!(failure.error(), InfrastructureError::ClosureRetained);
-    assert_eq!(state, before_retained);
+    __cser_core::assert_eq!(failure.error(), InfrastructureError::ClosureRetained);
+    __cser_core::assert_eq!(state, before_retained);
     let exhausted = failure.into_input();
     let failure = state.resolve_fired_deadline(exhausted).unwrap_err();
-    assert_eq!(failure.error(), InfrastructureError::ClosureRetained);
-    assert_eq!(state, before_retained);
+    __cser_core::assert_eq!(failure.error(), InfrastructureError::ClosureRetained);
+    __cser_core::assert_eq!(state, before_retained);
     state.check_invariants().unwrap();
 }
 
@@ -3075,9 +3121,9 @@ fn foreign_registry_returns_exact_deadline_authority() {
     let failure = foreign
         .fire_deadline(deadline, DeadlineClockBasis::ObservedCallbackTick, 10)
         .unwrap_err();
-    assert_eq!(failure.error(), InfrastructureError::ForeignRegistry);
-    assert_eq!(foreign, before_foreign);
-    assert_eq!(owner, before_owner);
+    __cser_core::assert_eq!(failure.error(), InfrastructureError::ForeignRegistry);
+    __cser_core::assert_eq!(foreign, before_foreign);
+    __cser_core::assert_eq!(owner, before_owner);
 
     owner
         .fire_deadline(
@@ -3086,7 +3132,7 @@ fn foreign_registry_returns_exact_deadline_authority() {
             10,
         )
         .unwrap();
-    assert_eq!(deadline_coordinates(&owner).1, 2);
+    __cser_core::assert_eq!(deadline_coordinates(&owner).1, 2);
 }
 
 #[test]
@@ -3134,7 +3180,9 @@ fn deadline_expiry_typestate_must_match_the_authoritative_phase() {
         .unwrap();
     let fired_key = match fired.0 {
         DeadlineExpiryAuthority::Fired(key) => key,
-        DeadlineExpiryAuthority::Exhausted(_) => panic!("nonterminal attempt exhausted"),
+        DeadlineExpiryAuthority::Exhausted(_) => {
+            __cser_core::panic!("nonterminal attempt exhausted")
+        }
     };
     let forged_exhausted = DeadlineExpiryReceipt(DeadlineExpiryAuthority::Exhausted(BearerKey {
         authority: fired_key.authority,
@@ -3142,7 +3190,7 @@ fn deadline_expiry_typestate_must_match_the_authoritative_phase() {
         object_generation: fired_key.object_generation,
         bearer_generation: fired_key.bearer_generation,
         nonce: fired_key.nonce,
-        state: core::marker::PhantomData,
+        state: __cser_core::marker::PhantomData,
     }));
     let before_fired = fired_state.private_full_clone();
     let failure = fired_state
@@ -3155,8 +3203,8 @@ fn deadline_expiry_typestate_must_match_the_authoritative_phase() {
             None,
         )
         .unwrap_err();
-    assert_eq!(failure.error(), InfrastructureError::StaleClaim);
-    assert_eq!(fired_state, before_fired);
+    __cser_core::assert_eq!(failure.error(), InfrastructureError::StaleClaim);
+    __cser_core::assert_eq!(fired_state, before_fired);
 
     let (mut exhausted_state, _, _, deadline) = compact_deadline_state(0xf02a, 1);
     let exhausted = exhausted_state
@@ -3164,7 +3212,9 @@ fn deadline_expiry_typestate_must_match_the_authoritative_phase() {
         .unwrap();
     let exhausted_key = match exhausted.0 {
         DeadlineExpiryAuthority::Exhausted(key) => key,
-        DeadlineExpiryAuthority::Fired(_) => panic!("terminal attempt did not exhaust"),
+        DeadlineExpiryAuthority::Fired(_) => {
+            __cser_core::panic!("terminal attempt did not exhaust")
+        }
     };
     let forged_fired = DeadlineExpiryReceipt(DeadlineExpiryAuthority::Fired(BearerKey {
         authority: exhausted_key.authority,
@@ -3172,14 +3222,14 @@ fn deadline_expiry_typestate_must_match_the_authoritative_phase() {
         object_generation: exhausted_key.object_generation,
         bearer_generation: exhausted_key.bearer_generation,
         nonce: exhausted_key.nonce,
-        state: core::marker::PhantomData,
+        state: __cser_core::marker::PhantomData,
     }));
     let before_exhausted = exhausted_state.private_full_clone();
     let failure = exhausted_state
         .resolve_fired_deadline(forged_fired)
         .unwrap_err();
-    assert_eq!(failure.error(), InfrastructureError::StaleClaim);
-    assert_eq!(exhausted_state, before_exhausted);
+    __cser_core::assert_eq!(failure.error(), InfrastructureError::StaleClaim);
+    __cser_core::assert_eq!(exhausted_state, before_exhausted);
 }
 
 #[test]
@@ -3206,8 +3256,8 @@ fn supervisor_retry_mints_new_object_bearer_and_nonce() {
             }),
         )
         .unwrap_err();
-    assert_eq!(failure.error(), InfrastructureError::InvalidReceipt);
-    assert_eq!(state, before_invalid);
+    __cser_core::assert_eq!(failure.error(), InfrastructureError::InvalidReceipt);
+    __cser_core::assert_eq!(state, before_invalid);
 
     let deadline = match state
         .reconcile_exhausted_deadline(
@@ -3223,19 +3273,19 @@ fn supervisor_retry_mints_new_object_bearer_and_nonce() {
         .unwrap()
     {
         DeadlineReconciliationOutcome::Retried(deadline) => deadline,
-        _ => panic!("supervisor retry returned the wrong outcome"),
+        _ => __cser_core::panic!("supervisor retry returned the wrong outcome"),
     };
     let retried = deadline_coordinates(&state);
-    assert_eq!((retried.0, retried.1), (2, 3));
-    assert_ne!(retried.2, exhausted_coordinates.2);
+    __cser_core::assert_eq!((retried.0, retried.1), (2, 3));
+    __cser_core::assert_ne!(retried.2, exhausted_coordinates.2);
     let projection = state
         .query_deadline(&workload, COMPACT_DEADLINE, 2)
         .unwrap();
-    assert_eq!(projection.state, DeadlineRecoveryState::Armed);
-    assert_eq!(projection.reconciliation, Some(reconciliation));
-    assert_eq!(projection.descriptor.attempt, 1);
-    assert_eq!(projection.descriptor.max_attempts, 2);
-    assert_eq!(projection.descriptor.backoff_ticks, 4);
+    __cser_core::assert_eq!(projection.state, DeadlineRecoveryState::Armed);
+    __cser_core::assert_eq!(projection.reconciliation, Some(reconciliation));
+    __cser_core::assert_eq!(projection.descriptor.attempt, 1);
+    __cser_core::assert_eq!(projection.descriptor.max_attempts, 2);
+    __cser_core::assert_eq!(projection.descriptor.backoff_ticks, 4);
     state.check_invariants().unwrap();
 
     let mut high_water_rollback = state.private_full_clone();
@@ -3243,7 +3293,7 @@ fn supervisor_retry_mints_new_object_bearer_and_nonce() {
     assert_invariant_read_only(high_water_rollback);
 
     state.cancel_deadline(deadline).unwrap();
-    assert_eq!(deadline_coordinates(&state).1, 4);
+    __cser_core::assert_eq!(deadline_coordinates(&state).1, 4);
     state.check_invariants().unwrap();
 }
 
@@ -3262,10 +3312,10 @@ fn quarantined_deadline_adoption_fences_stale_ticket_and_is_failure_atomic() {
         .unwrap()
     {
         DeadlineReconciliationOutcome::Quarantined(ticket) => ticket,
-        _ => panic!("quarantine reconciliation returned the wrong outcome"),
+        _ => __cser_core::panic!("quarantine reconciliation returned the wrong outcome"),
     };
     let quarantined = deadline_coordinates(&state);
-    assert_eq!(quarantined.1, 3);
+    __cser_core::assert_eq!(quarantined.1, 3);
     let before_bad_release = state.private_full_clone();
     let failure = state
         .resolve_quarantined_deadline(
@@ -3273,8 +3323,8 @@ fn quarantined_deadline_adoption_fences_stale_ticket_and_is_failure_atomic() {
             DeadlineQuarantineReleaseReceipt { evidence_digest: 0 },
         )
         .unwrap_err();
-    assert_eq!(failure.error(), InfrastructureError::InvalidReceipt);
-    assert_eq!(state, before_bad_release);
+    __cser_core::assert_eq!(failure.error(), InfrastructureError::InvalidReceipt);
+    __cser_core::assert_eq!(state, before_bad_release);
     let stale_ticket = failure.into_input();
 
     *state
@@ -3289,14 +3339,14 @@ fn quarantined_deadline_adoption_fences_stale_ticket_and_is_failure_atomic() {
         )
         .unwrap();
     let before_parent_adoption = state.private_full_clone();
-    assert_eq!(
+    __cser_core::assert_eq!(
         state
             .adopt_deadline_after_fence(&workload, COMPACT_DEADLINE, 1)
             .unwrap_err(),
         InfrastructureError::StaleBinding
     );
-    assert_eq!(state, before_parent_adoption);
-    assert!(matches!(
+    __cser_core::assert_eq!(state, before_parent_adoption);
+    __cser_core::assert!(__cser_core::matches!(
         state
             .adopt_task_after_fence(&workload, COMPACT_DEADLINE_WORK, 1)
             .unwrap(),
@@ -3318,24 +3368,24 @@ fn quarantined_deadline_adoption_fences_stale_ticket_and_is_failure_atomic() {
         .remove(index_slot)
         .unwrap();
     let before_missing_index = missing_index.private_full_clone();
-    assert_eq!(
+    __cser_core::assert_eq!(
         missing_index
             .adopt_deadline_after_fence(&workload, COMPACT_DEADLINE, 1)
             .unwrap_err(),
         InfrastructureError::Invariant("missing deadline reverse index")
     );
-    assert_eq!(missing_index, before_missing_index);
+    __cser_core::assert_eq!(missing_index, before_missing_index);
 
     let current_ticket = match state
         .adopt_deadline_after_fence(&workload, COMPACT_DEADLINE, 1)
         .unwrap()
     {
         DeadlineAdoption::Quarantined(ticket) => ticket,
-        _ => panic!("quarantined deadline adopted into the wrong phase"),
+        _ => __cser_core::panic!("quarantined deadline adopted into the wrong phase"),
     };
     let adopted = deadline_coordinates(&state);
-    assert_eq!(adopted.1, 4);
-    assert_ne!(adopted.2, quarantined.2);
+    __cser_core::assert_eq!(adopted.1, 4);
+    __cser_core::assert_ne!(adopted.2, quarantined.2);
     let before_stale = state.private_full_clone();
     let failure = state
         .resolve_quarantined_deadline(
@@ -3345,8 +3395,8 @@ fn quarantined_deadline_adoption_fences_stale_ticket_and_is_failure_atomic() {
             },
         )
         .unwrap_err();
-    assert_eq!(failure.error(), InfrastructureError::StaleGeneration);
-    assert_eq!(state, before_stale);
+    __cser_core::assert_eq!(failure.error(), InfrastructureError::StaleGeneration);
+    __cser_core::assert_eq!(state, before_stale);
 
     state
         .resolve_quarantined_deadline(
@@ -3356,13 +3406,13 @@ fn quarantined_deadline_adoption_fences_stale_ticket_and_is_failure_atomic() {
             },
         )
         .unwrap();
-    assert_eq!(deadline_coordinates(&state).1, 5);
+    __cser_core::assert_eq!(deadline_coordinates(&state).1, 5);
     let projection = state
         .query_deadline(&workload, COMPACT_DEADLINE, 1)
         .unwrap();
-    assert_eq!(projection.state, DeadlineRecoveryState::Resolved);
-    assert_eq!(projection.reconciliation, Some(quarantine_receipt));
-    assert_eq!(projection.terminal_evidence_digest, Some(0xf43));
+    __cser_core::assert_eq!(projection.state, DeadlineRecoveryState::Resolved);
+    __cser_core::assert_eq!(projection.reconciliation, Some(quarantine_receipt));
+    __cser_core::assert_eq!(projection.terminal_evidence_digest, Some(0xf43));
     state.check_invariants().unwrap();
 
     let mut mismatched_reconciliation = state.private_full_clone();
@@ -3383,8 +3433,8 @@ fn quarantined_deadline_adoption_fences_stale_ticket_and_is_failure_atomic() {
 fn deadline_terminal_paths_advance_bearer_generation() {
     let (mut cancelled, cancelled_workload, _, deadline) = compact_deadline_state(0xf051, 2);
     cancelled.cancel_deadline(deadline).unwrap();
-    assert_eq!(deadline_coordinates(&cancelled).1, 2);
-    assert_eq!(
+    __cser_core::assert_eq!(deadline_coordinates(&cancelled).1, 2);
+    __cser_core::assert_eq!(
         cancelled
             .query_deadline(&cancelled_workload, COMPACT_DEADLINE, 1)
             .unwrap()
@@ -3398,8 +3448,8 @@ fn deadline_terminal_paths_advance_bearer_generation() {
         .fire_deadline(deadline, DeadlineClockBasis::ObservedCallbackTick, 10)
         .unwrap();
     resolved.resolve_fired_deadline(fired).unwrap();
-    assert_eq!(deadline_coordinates(&resolved).1, 3);
-    assert_eq!(
+    __cser_core::assert_eq!(deadline_coordinates(&resolved).1, 3);
+    __cser_core::assert_eq!(
         resolved
             .query_deadline(&resolved_workload, COMPACT_DEADLINE, 1)
             .unwrap()
@@ -3412,7 +3462,7 @@ fn deadline_terminal_paths_advance_bearer_generation() {
     let exhausted = aborted
         .fire_deadline(deadline, DeadlineClockBasis::ObservedCallbackTick, 10)
         .unwrap();
-    assert!(matches!(
+    __cser_core::assert!(__cser_core::matches!(
         aborted
             .reconcile_exhausted_deadline(
                 exhausted,
@@ -3425,7 +3475,7 @@ fn deadline_terminal_paths_advance_bearer_generation() {
             .unwrap(),
         DeadlineReconciliationOutcome::Aborted
     ));
-    assert_eq!(deadline_coordinates(&aborted).1, 3);
+    __cser_core::assert_eq!(deadline_coordinates(&aborted).1, 3);
     aborted.check_invariants().unwrap();
 }
 
@@ -3525,7 +3575,7 @@ fn test_service_key<State: bearer_state::Sealed>(
         object_generation: record.stamp.identity.generation,
         bearer_generation: record.stamp.bearer_generation,
         nonce: record.stamp.nonce,
-        state: core::marker::PhantomData,
+        state: __cser_core::marker::PhantomData,
     }
 }
 
@@ -3579,7 +3629,7 @@ fn test_service_bound_key<State: bearer_state::Sealed>(
             response,
             binding_receipt,
         ),
-        _ => panic!("test service bound key requires a live bound phase"),
+        _ => __cser_core::panic!("test service bound key requires a live bound phase"),
     };
     ServiceBoundKey {
         authority: AuthorityKey {
@@ -3592,7 +3642,7 @@ fn test_service_bound_key<State: bearer_state::Sealed>(
         bearer_generation: record.stamp.bearer_generation,
         nonce: record.stamp.nonce,
         lineage_commitment,
-        state: core::marker::PhantomData,
+        state: __cser_core::marker::PhantomData,
     }
 }
 
@@ -3602,7 +3652,7 @@ fn record_service_causal_identity(
 ) -> ServiceRequestCausalIdentity {
     let parent_task = match record.stamp.parent {
         super::ParentStamp::Task(parent) => parent,
-        _ => unreachable!(),
+        _ => __cser_core::unreachable!(),
     };
     ServiceRequestCausalIdentity {
         registry_instance: record.stamp.root.registry_instance,
@@ -3633,11 +3683,11 @@ fn test_bound_service_authority(
 
 fn assert_invariant_read_only(state: InfrastructureState) {
     let before = state.private_full_clone();
-    assert!(matches!(
+    __cser_core::assert!(__cser_core::matches!(
         state.check_invariants(),
         Err(InfrastructureError::Invariant(_))
     ));
-    assert_eq!(state, before);
+    __cser_core::assert_eq!(state, before);
 }
 
 fn publication_state() -> InfrastructureState {
@@ -3966,7 +4016,7 @@ fn terminal_service_history_survives_fence_and_adoption_but_live_owner_stays_str
         response.source_binding_epoch = 2;
         replaced = true;
     }
-    assert!(replaced);
+    __cser_core::assert!(replaced);
     assert_invariant_read_only(pre_adoption_substitution);
 
     *terminal
@@ -4002,7 +4052,7 @@ fn terminal_service_history_survives_fence_and_adoption_but_live_owner_stays_str
         response.source_binding_epoch = 2;
         replaced = true;
     }
-    assert!(replaced);
+    __cser_core::assert!(replaced);
     assert_invariant_read_only(post_adoption_substitution);
 }
 

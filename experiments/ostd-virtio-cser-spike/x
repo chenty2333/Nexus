@@ -1,15 +1,37 @@
-#!/usr/bin/env bash
+#!/usr/bin/bash -p
 set -euo pipefail
 
-root=$(cd "$(dirname "$0")" && pwd)
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+readonly PATH
+root=$(cd "$(/usr/bin/dirname "$0")" && pwd)
 repo_root=$(cd "$root/../.." && pwd)
+docker_bin=/usr/bin/docker
+if [[ ! -f $docker_bin || ! -x $docker_bin || -L $docker_bin ]] \
+    || [[ $(/usr/bin/realpath -e -- "$docker_bin") != "$docker_bin" ]]; then
+    echo "Docker CLI must be the non-symlink executable $docker_bin" >&2
+    exit 1
+fi
+readonly docker_bin
+capture_helper="$root/scripts/qemu-stream-capture.sh"
+capture_helper_sha256=b05544fb66e5d124fb141696accb1933742de561469f1c9e4a12eef3c6c5e7b7
+if [[ ! -f $capture_helper || -L $capture_helper ]] \
+    || [[ $(/usr/bin/realpath -e -- "$capture_helper") != "$capture_helper" ]]; then
+    echo "QEMU capture helper must be a non-symlink regular file: $capture_helper" >&2
+    exit 1
+fi
+if [[ $(/usr/bin/sha256sum -- "$capture_helper" | /usr/bin/cut -d ' ' -f1) \
+    != "$capture_helper_sha256" ]]; then
+    echo "QEMU capture helper source drifted: $capture_helper" >&2
+    exit 1
+fi
+readonly capture_helper capture_helper_sha256
 repo_lock="/tmp/nexus-workflow-${repo_root//\//_}.lock"
 if [[ ${NEXUS_ROOT_LOCK_HELD:-0} != 1 ]]; then
     exec 8>"$repo_lock"
     flock 8
 fi
 # shellcheck source=scripts/qemu-stream-capture.sh
-source "$root/scripts/qemu-stream-capture.sh"
+source "$capture_helper"
 lock_key=$(printf '%s' "$root" | sha256sum | cut -c1-16)
 exec 9>"/tmp/nexus-ostd-virtio-cser-spike-$lock_key.lock"
 flock 9
@@ -109,7 +131,7 @@ build_image() {
     if [[ ${NEXUS_REBUILD:-0} == 1 ]]; then
         rebuild_args=(--no-cache)
     fi
-    docker build \
+    command "$docker_bin" build \
         "${rebuild_args[@]}" \
         --build-context "nexus-root=$repo_root" \
         --platform linux/amd64 \
@@ -118,7 +140,7 @@ build_image() {
 }
 
 container() {
-    docker run --rm \
+    command "$docker_bin" run --rm \
         --init \
         --platform linux/amd64 \
         --network none \
@@ -139,7 +161,8 @@ container() {
 }
 
 ensure_image() {
-    if [[ ${NEXUS_REBUILD:-0} == 1 ]] || ! docker image inspect "$image" >/dev/null 2>&1; then
+    if [[ ${NEXUS_REBUILD:-0} == 1 ]] \
+        || ! command "$docker_bin" image inspect "$image" >/dev/null 2>&1; then
         build_image
     fi
 }

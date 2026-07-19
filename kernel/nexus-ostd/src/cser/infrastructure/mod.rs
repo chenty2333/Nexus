@@ -9,8 +9,11 @@
 //! non-authoritative transaction candidate. Bearer values are linear Rust
 //! values: none implements `Clone` or `Copy`, and a query never recreates one.
 
-use alloc::vec::Vec;
-use core::marker::PhantomData;
+extern crate alloc as __cser_alloc;
+extern crate core as __cser_core;
+
+use __cser_alloc::vec::Vec;
+use __cser_core::marker::PhantomData;
 
 mod continuation;
 mod deadline;
@@ -34,7 +37,13 @@ use super::{
     DeviceEnvelope, DomainKey, EffectKey, PortalHandle, ResourceKey, ScopeKey, TaskKey,
 };
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct InfrastructureLimits {
     pub(crate) workloads: u32,
     pub(crate) tasks: u32,
@@ -102,7 +111,13 @@ impl InfrastructureLimits {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) enum InfrastructureKind {
     Workload,
     Task,
@@ -115,7 +130,13 @@ pub(crate) enum InfrastructureKind {
     Reply,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) enum InfrastructureError {
     InvalidLimits,
     AllocationFailed,
@@ -158,7 +179,7 @@ pub(crate) enum InfrastructureError {
 /// The authoritative record is unchanged and the exact input is returned;
 /// callers never have to manufacture a fence merely to recover authority
 /// from validation, quota, or stale-observation errors.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(crate) struct LinearFailure<T> {
     error: InfrastructureError,
     input: T,
@@ -190,13 +211,25 @@ fn linear_apply<I, O>(
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 enum LedgerMode {
     Authoritative,
     NonAuthoritativeCandidate,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 struct RequestKey {
     id: u64,
     generation: u64,
@@ -211,7 +244,13 @@ impl RequestKey {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 struct RootStamp {
     registry_instance: u64,
     scope: ScopeKey,
@@ -219,20 +258,38 @@ struct RootStamp {
     root_effect: EffectKey,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 struct DomainStamp {
     domain: DomainKey,
     binding_epoch: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 struct WorkloadStamp {
     request: RequestKey,
     nonce: u64,
     bearer_generation: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 enum ParentStamp {
     RootEffect(EffectKey),
     Request(RequestKey),
@@ -240,7 +297,13 @@ enum ParentStamp {
     Effect(EffectKey),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 struct BearerStamp<I> {
     root: RootStamp,
     domain: DomainStamp,
@@ -257,7 +320,7 @@ struct BearerStamp<I> {
 /// it through a borrow, but only the authoritative record may mint a successor
 /// bearer.  The root effect and all domain/workload/parent coordinates remain
 /// in that record and are revalidated on every action.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 struct AuthorityKey {
     registry_instance: u64,
     scope: ScopeKey,
@@ -265,39 +328,42 @@ struct AuthorityKey {
 }
 
 mod bearer_state {
+    extern crate alloc as __cser_alloc;
+    extern crate core as __cser_core;
+
     pub(super) trait Sealed {}
 
-    #[derive(Debug, Eq, PartialEq)]
+    #[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
     pub(super) enum ContinuationPending {}
-    #[derive(Debug, Eq, PartialEq)]
+    #[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
     pub(super) enum ContinuationClaimed {}
-    #[derive(Debug, Eq, PartialEq)]
+    #[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
     pub(super) enum ContinuationPublishing {}
-    #[derive(Debug, Eq, PartialEq)]
+    #[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
     pub(super) enum ContinuationAcknowledged {}
-    #[derive(Debug, Eq, PartialEq)]
+    #[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
     pub(super) enum ContinuationResuming {}
-    #[derive(Debug, Eq, PartialEq)]
+    #[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
     pub(super) enum ServiceReservedUnbound {}
-    #[derive(Debug, Eq, PartialEq)]
+    #[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
     pub(super) enum ServiceReservedBound {}
-    #[derive(Debug, Eq, PartialEq)]
+    #[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
     pub(super) enum ServiceEnqueuePublishing {}
-    #[derive(Debug, Eq, PartialEq)]
+    #[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
     pub(super) enum ServiceQueueWritten {}
-    #[derive(Debug, Eq, PartialEq)]
+    #[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
     pub(super) enum ServiceArmPublishing {}
-    #[derive(Debug, Eq, PartialEq)]
+    #[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
     pub(super) enum ServiceArmed {}
-    #[derive(Debug, Eq, PartialEq)]
+    #[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
     pub(super) enum ServiceChildBound {}
-    #[derive(Debug, Eq, PartialEq)]
+    #[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
     pub(super) enum DeadlineArmed {}
-    #[derive(Debug, Eq, PartialEq)]
+    #[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
     pub(super) enum DeadlineFired {}
-    #[derive(Debug, Eq, PartialEq)]
+    #[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
     pub(super) enum DeadlineExhausted {}
-    #[derive(Debug, Eq, PartialEq)]
+    #[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
     pub(super) enum DeadlineQuarantined {}
 
     impl Sealed for ContinuationPending {}
@@ -324,7 +390,7 @@ mod bearer_state {
 /// workload snapshot.  Those facts have exactly one authoritative copy in
 /// the family record; a key is accepted only after revalidating that full
 /// record and matching all of the compact coordinates below.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 struct BearerKey<State: bearer_state::Sealed> {
     authority: AuthorityKey,
     slot: u64,
@@ -339,7 +405,13 @@ struct BearerKey<State: bearer_state::Sealed> {
 /// This value is not authority and cannot be used in place of an opaque
 /// [`WorkloadContext`]. The authoritative Registry revalidates every field
 /// before admitting a transition.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(super) struct WorkloadRootPresentation {
     scope: ScopeKey,
     authority_epoch: u64,
@@ -360,7 +432,13 @@ impl WorkloadRootPresentation {
 ///
 /// The request remains descriptive: construction grants no bearer authority,
 /// and the Registry validates the domain epoch and generational identity.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(super) struct WorkloadRequestPresentation {
     domain: DomainKey,
     binding_epoch: u64,
@@ -385,7 +463,7 @@ impl WorkloadRequestPresentation {
 }
 
 /// Opaque, root-specific request context. It is not a process-global context.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(crate) struct WorkloadContext {
     root: RootStamp,
     domain: DomainStamp,
@@ -393,7 +471,13 @@ pub(crate) struct WorkloadContext {
     parent: ParentStamp,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) enum TaskWorkRole {
     GuestSyscallWork,
     ServiceRequest,
@@ -401,7 +485,13 @@ pub(crate) enum TaskWorkRole {
     SupervisorControl,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct VmAuthorityKey {
     id: u64,
     generation: u64,
@@ -424,7 +514,13 @@ impl VmAuthorityKey {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct TaskWorkDescriptor {
     pub(crate) work_id: u64,
     pub(crate) generation: u64,
@@ -438,7 +534,7 @@ impl TaskWorkDescriptor {
         if self.work_id == 0
             || self.generation == 0
             || self.task.generation() == 0
-            || (matches!(
+            || (__cser_core::matches!(
                 self.role,
                 TaskWorkRole::GuestSyscallWork
                     | TaskWorkRole::ServiceRequest
@@ -453,15 +549,21 @@ impl TaskWorkDescriptor {
 
 /// A root-specific runnable/work admission. It must not be described as the
 /// lifetime authority for a process task which existed before the root.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(crate) struct TaskLease(BearerStamp<TaskWorkDescriptor>);
 
 /// Successor returned exactly once by the entry claim. An admitted lease can
 /// no longer be reused to run or reap the work item.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(crate) struct EnteredTaskLease(BearerStamp<TaskWorkDescriptor>);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) enum TaskRecoveryState {
     Admitted,
     Entered,
@@ -470,20 +572,32 @@ pub(crate) enum TaskRecoveryState {
     Reaped,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct TaskRecoveryProjection {
     pub(crate) descriptor: TaskWorkDescriptor,
     pub(crate) state: TaskRecoveryState,
     pub(crate) live_children: u32,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(crate) enum TaskAdoption {
     Admitted(TaskLease),
     Entered(EnteredTaskLease),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct ServiceRequestDescriptor {
     pub(crate) request_id: u64,
     pub(crate) generation: u64,
@@ -518,20 +632,26 @@ impl ServiceRequestDescriptor {
 
 /// Compact authority for a reserved service request which owns no response
 /// continuation.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(crate) struct UnboundServiceRequest(BearerKey<bearer_state::ServiceReservedUnbound>);
 
 /// Compact authority for a reserved request and its Registry-owned response
 /// continuation. The continuation has no independently minted bearer while
 /// this authority is live.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(crate) struct ServiceRequestTicket(ServiceBoundKey<bearer_state::ServiceReservedBound>);
 
 /// Copyable, descriptive causal identity for an external service action.
 ///
 /// This is a complete snapshot of the Registry-owned request coordinates. It
 /// carries no bearer state and therefore cannot authorize a transition.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct ServiceRequestCausalIdentity {
     pub(crate) registry_instance: u64,
     pub(crate) scope: ScopeKey,
@@ -550,12 +670,18 @@ pub(crate) struct ServiceRequestCausalIdentity {
 }
 
 /// One-shot authority for acknowledging an externally applied queue write.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(crate) struct ServiceEnqueueAuthority(ServiceBoundKey<bearer_state::ServiceEnqueuePublishing>);
 
 /// Copyable instructions for the external queue write. Copying this plan does
 /// not copy authority; acknowledgement consumes [`ServiceEnqueueAuthority`].
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct ServiceEnqueuePlan {
     pub(crate) causal: ServiceRequestCausalIdentity,
     pub(crate) bearer_generation: u64,
@@ -563,7 +689,13 @@ pub(crate) struct ServiceEnqueuePlan {
     pub(crate) apply_nonce: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct ServiceEnqueueReceipt {
     pub(crate) plan: ServiceEnqueuePlan,
     pub(crate) queue: ResourceKey,
@@ -573,16 +705,22 @@ pub(crate) struct ServiceEnqueueReceipt {
     pub(crate) transport_receipt_digest: u64,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(crate) struct UnarmedServiceRequest(ServiceBoundKey<bearer_state::ServiceQueueWritten>);
 
 /// One-shot authority for acknowledging external response-slot arming.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(crate) struct ServiceArmAuthority(ServiceBoundKey<bearer_state::ServiceArmPublishing>);
 
 /// Copyable instructions for response-slot arming. The plan is descriptive;
 /// acknowledgement consumes the separate compact authority.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct ServiceArmPlan {
     pub(crate) causal: ServiceRequestCausalIdentity,
     pub(crate) queue_receipt: ServiceEnqueueReceipt,
@@ -591,7 +729,13 @@ pub(crate) struct ServiceArmPlan {
     pub(crate) arm_nonce: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct ServiceArmReceipt {
     pub(crate) plan: ServiceArmPlan,
     pub(crate) response_slot_id: u64,
@@ -601,10 +745,16 @@ pub(crate) struct ServiceArmReceipt {
     pub(crate) transport_receipt_digest: u64,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(crate) struct EnqueuedServiceRequest(ServiceBoundKey<bearer_state::ServiceArmed>);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct ServiceChildReceipt {
     pub(crate) child_effect: EffectKey,
     pub(crate) registration_digest: u64,
@@ -614,7 +764,13 @@ pub(crate) struct ServiceChildReceipt {
 ///
 /// This snapshot is descriptive evidence only. In particular, it cannot be
 /// converted into an [`EnteredTaskLease`] or used as task authority.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct ServiceClaimantSnapshot {
     pub(crate) registry_instance: u64,
     pub(crate) scope: ScopeKey,
@@ -632,7 +788,13 @@ pub(crate) struct ServiceClaimantSnapshot {
 }
 
 /// Immutable evidence for the atomic claim-and-child-binding transition.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct ServiceChildBindingReceipt {
     pub(crate) request_id: u64,
     pub(crate) generation: u64,
@@ -646,7 +808,7 @@ pub(crate) struct ServiceChildBindingReceipt {
 /// Temporary proof supplied by the already validated outer Registry
 /// transaction. It is not a production source mapping and does not expose an
 /// intermediate claimed service authority.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(super) struct ValidatedServiceChildProof {
     receipt: ServiceChildReceipt,
 }
@@ -658,7 +820,13 @@ impl ValidatedServiceChildProof {
 }
 
 /// Canonical SHA-256 commitment to one service response lineage.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct ServiceLineageCommitment([u8; 32]);
 
 /// Compact authority for every service state after response binding.
@@ -672,7 +840,7 @@ pub(crate) struct ServiceLineageCommitment([u8; 32]);
 /// rewrite both arbitrary kernel memory and the caller-held authority/evidence
 /// and recompute every SHA-256 value. The state remains sealed and the key
 /// remains non-`Clone`/non-`Copy`.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 struct ServiceBoundKey<State: bearer_state::Sealed> {
     authority: AuthorityKey,
     slot: u64,
@@ -683,10 +851,16 @@ struct ServiceBoundKey<State: bearer_state::Sealed> {
     state: PhantomData<fn() -> State>,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(crate) struct BoundServiceRequest(ServiceBoundKey<bearer_state::ServiceChildBound>);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct ServiceCompletionReceipt {
     pub(crate) request_id: u64,
     pub(crate) generation: u64,
@@ -699,19 +873,31 @@ pub(crate) struct ServiceCompletionReceipt {
     pub(crate) result_digest: u64,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(crate) struct ServiceCompletionOutcome {
     pub(crate) receipt: ServiceCompletionReceipt,
     pub(crate) response: ContinuationLease,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) enum ServiceCancellationPoint {
     ReservedUnbound,
     ReservedBound,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct ServiceCancellationReceipt {
     pub(crate) request_id: u64,
     pub(crate) generation: u64,
@@ -721,13 +907,19 @@ pub(crate) struct ServiceCancellationReceipt {
     pub(crate) response: Option<ContinuationDescriptor>,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(crate) struct BoundServiceCancellationOutcome {
     pub(crate) receipt: ServiceCancellationReceipt,
     pub(crate) response: ContinuationLease,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) enum ServiceRequestRecoveryState {
     ReservedUnbound,
     ReservedBound,
@@ -740,7 +932,13 @@ pub(crate) enum ServiceRequestRecoveryState {
     Cancelled,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct ServiceRequestRecoveryProjection {
     pub(crate) descriptor: ServiceRequestDescriptor,
     pub(crate) state: ServiceRequestRecoveryState,
@@ -753,35 +951,62 @@ pub(crate) struct ServiceRequestRecoveryProjection {
 }
 
 const _: () = {
-    assert!(core::mem::size_of::<ServiceBoundKey<bearer_state::ServiceReservedBound>>() <= 96);
-    assert!(core::mem::size_of::<ServiceBoundKey<bearer_state::ServiceEnqueuePublishing>>() <= 96);
-    assert!(core::mem::size_of::<ServiceBoundKey<bearer_state::ServiceQueueWritten>>() <= 96);
-    assert!(core::mem::size_of::<ServiceBoundKey<bearer_state::ServiceArmPublishing>>() <= 96);
-    assert!(core::mem::size_of::<ServiceBoundKey<bearer_state::ServiceArmed>>() <= 96);
-    assert!(core::mem::size_of::<ServiceBoundKey<bearer_state::ServiceChildBound>>() <= 96);
-    assert!(core::mem::size_of::<UnboundServiceRequest>() <= 96);
-    assert!(core::mem::size_of::<ServiceRequestTicket>() <= 96);
-    assert!(core::mem::size_of::<ServiceEnqueueAuthority>() <= 96);
-    assert!(core::mem::size_of::<UnarmedServiceRequest>() <= 96);
-    assert!(core::mem::size_of::<ServiceArmAuthority>() <= 96);
-    assert!(core::mem::size_of::<EnqueuedServiceRequest>() <= 96);
-    assert!(core::mem::size_of::<BoundServiceRequest>() <= 96);
-    assert!(core::mem::size_of::<LinearFailure<UnboundServiceRequest>>() <= 120);
-    assert!(core::mem::size_of::<LinearFailure<ServiceRequestTicket>>() <= 120);
-    assert!(core::mem::size_of::<LinearFailure<ServiceEnqueueAuthority>>() <= 120);
-    assert!(core::mem::size_of::<LinearFailure<UnarmedServiceRequest>>() <= 120);
-    assert!(core::mem::size_of::<LinearFailure<ServiceArmAuthority>>() <= 120);
-    assert!(core::mem::size_of::<LinearFailure<EnqueuedServiceRequest>>() <= 120);
-    assert!(core::mem::size_of::<LinearFailure<BoundServiceRequest>>() <= 120);
-    assert!(core::mem::size_of::<ServiceEnqueuePlan>() <= 512);
-    assert!(core::mem::size_of::<ServiceEnqueueReceipt>() <= 640);
-    assert!(core::mem::size_of::<ServiceArmPlan>() <= 1_280);
-    assert!(core::mem::size_of::<ServiceArmReceipt>() <= 1_408);
-    assert!(core::mem::size_of::<ServiceChildBindingReceipt>() <= 384);
-    assert!(core::mem::size_of::<ServiceCompletionReceipt>() <= 512);
+    __cser_core::assert!(
+        __cser_core::mem::size_of::<ServiceBoundKey<bearer_state::ServiceReservedBound>>() <= 96
+    );
+    __cser_core::assert!(
+        __cser_core::mem::size_of::<ServiceBoundKey<bearer_state::ServiceEnqueuePublishing>>()
+            <= 96
+    );
+    __cser_core::assert!(
+        __cser_core::mem::size_of::<ServiceBoundKey<bearer_state::ServiceQueueWritten>>() <= 96
+    );
+    __cser_core::assert!(
+        __cser_core::mem::size_of::<ServiceBoundKey<bearer_state::ServiceArmPublishing>>() <= 96
+    );
+    __cser_core::assert!(
+        __cser_core::mem::size_of::<ServiceBoundKey<bearer_state::ServiceArmed>>() <= 96
+    );
+    __cser_core::assert!(
+        __cser_core::mem::size_of::<ServiceBoundKey<bearer_state::ServiceChildBound>>() <= 96
+    );
+    __cser_core::assert!(__cser_core::mem::size_of::<UnboundServiceRequest>() <= 96);
+    __cser_core::assert!(__cser_core::mem::size_of::<ServiceRequestTicket>() <= 96);
+    __cser_core::assert!(__cser_core::mem::size_of::<ServiceEnqueueAuthority>() <= 96);
+    __cser_core::assert!(__cser_core::mem::size_of::<UnarmedServiceRequest>() <= 96);
+    __cser_core::assert!(__cser_core::mem::size_of::<ServiceArmAuthority>() <= 96);
+    __cser_core::assert!(__cser_core::mem::size_of::<EnqueuedServiceRequest>() <= 96);
+    __cser_core::assert!(__cser_core::mem::size_of::<BoundServiceRequest>() <= 96);
+    __cser_core::assert!(
+        __cser_core::mem::size_of::<LinearFailure<UnboundServiceRequest>>() <= 120
+    );
+    __cser_core::assert!(__cser_core::mem::size_of::<LinearFailure<ServiceRequestTicket>>() <= 120);
+    __cser_core::assert!(
+        __cser_core::mem::size_of::<LinearFailure<ServiceEnqueueAuthority>>() <= 120
+    );
+    __cser_core::assert!(
+        __cser_core::mem::size_of::<LinearFailure<UnarmedServiceRequest>>() <= 120
+    );
+    __cser_core::assert!(__cser_core::mem::size_of::<LinearFailure<ServiceArmAuthority>>() <= 120);
+    __cser_core::assert!(
+        __cser_core::mem::size_of::<LinearFailure<EnqueuedServiceRequest>>() <= 120
+    );
+    __cser_core::assert!(__cser_core::mem::size_of::<LinearFailure<BoundServiceRequest>>() <= 120);
+    __cser_core::assert!(__cser_core::mem::size_of::<ServiceEnqueuePlan>() <= 512);
+    __cser_core::assert!(__cser_core::mem::size_of::<ServiceEnqueueReceipt>() <= 640);
+    __cser_core::assert!(__cser_core::mem::size_of::<ServiceArmPlan>() <= 1_280);
+    __cser_core::assert!(__cser_core::mem::size_of::<ServiceArmReceipt>() <= 1_408);
+    __cser_core::assert!(__cser_core::mem::size_of::<ServiceChildBindingReceipt>() <= 384);
+    __cser_core::assert!(__cser_core::mem::size_of::<ServiceCompletionReceipt>() <= 512);
 };
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct DelayedCommandDescriptor {
     pub(crate) command_id: u64,
     pub(crate) generation: u64,
@@ -814,17 +1039,23 @@ impl DelayedCommandDescriptor {
     }
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(crate) struct DelayedCommandTicket(BearerStamp<DelayedCommandDescriptor>);
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(crate) struct DelayedCommandIntent {
     command: BearerStamp<DelayedCommandDescriptor>,
     apply_generation: u64,
     apply_nonce: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct DelayedCommandReceipt {
     pub(crate) actor_slot: u32,
     pub(crate) actor_generation: u64,
@@ -832,21 +1063,39 @@ pub(crate) struct DelayedCommandReceipt {
     pub(crate) transport_receipt_digest: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) enum DelayedCommandRejectionReason {
     StaleTarget,
     RequestAborted,
     ClosureDrain,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct DelayedCommandRejectionReceipt {
     pub(crate) reason: DelayedCommandRejectionReason,
     pub(crate) target_effect: EffectKey,
     pub(crate) evidence_digest: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) enum DelayedCommandRecoveryState {
     Reserved,
     PublicationUncertain,
@@ -854,7 +1103,13 @@ pub(crate) enum DelayedCommandRecoveryState {
     Rejected,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct DelayedCommandRecoveryProjection {
     pub(crate) descriptor: DelayedCommandDescriptor,
     pub(crate) state: DelayedCommandRecoveryState,
@@ -862,7 +1117,7 @@ pub(crate) struct DelayedCommandRecoveryProjection {
     pub(crate) rejection: Option<DelayedCommandRejectionReceipt>,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(super) struct ValidatedAbortProof {
     evidence_digest: u64,
 }
@@ -873,14 +1128,26 @@ impl ValidatedAbortProof {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) enum FaultAccess {
     Read,
     Write,
     Execute,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct FaultDescriptor {
     pub(crate) fault_id: u64,
     pub(crate) generation: u64,
@@ -909,19 +1176,31 @@ impl FaultDescriptor {
     }
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(crate) struct FaultEvent(BearerStamp<FaultDescriptor>);
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(crate) struct ArmedFaultEvent(BearerStamp<FaultDescriptor>);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) enum FaultDisposition {
     CrashService,
     IsolateTask,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct FaultObservation {
     pub(crate) task: TaskKey,
     pub(crate) vm_generation: u64,
@@ -932,7 +1211,13 @@ pub(crate) struct FaultObservation {
     pub(crate) evidence_digest: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct ServiceFaultProjection {
     pub(crate) fault_id: u64,
     pub(crate) generation: u64,
@@ -945,7 +1230,7 @@ pub(crate) struct ServiceFaultProjection {
     pub(crate) evidence_digest: u64,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(crate) struct ServiceFaultReceipt {
     fault: BearerStamp<FaultDescriptor>,
     projection: ServiceFaultProjection,
@@ -953,21 +1238,27 @@ pub(crate) struct ServiceFaultReceipt {
     receipt_nonce: u64,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(crate) struct ServiceCrashCause {
     projection: ServiceFaultProjection,
     consume_generation: u64,
     consume_nonce: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct FaultRecoveryProjection {
     pub(crate) descriptor: FaultDescriptor,
     pub(crate) receipt: Option<ServiceFaultProjection>,
     pub(crate) consumed: bool,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(super) struct FaultDispositionPlan {
     event: BearerStamp<FaultDescriptor>,
     task: BearerStamp<TaskWorkDescriptor>,
@@ -979,7 +1270,13 @@ pub(super) struct FaultDispositionPlan {
     next_nonce: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(super) struct AppliedFaultDisposition {
     event: BearerStamp<FaultDescriptor>,
     projection: ServiceFaultProjection,
@@ -987,7 +1284,13 @@ pub(super) struct AppliedFaultDisposition {
     receipt_nonce: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct ContinuationDescriptor {
     pub(crate) continuation_id: u64,
     pub(crate) generation: u64,
@@ -1009,13 +1312,19 @@ impl ContinuationDescriptor {
     }
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(crate) struct ContinuationLease(BearerKey<bearer_state::ContinuationPending>);
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(crate) struct WakeClaim(BearerKey<bearer_state::ContinuationClaimed>);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct ContinuationPublicationReceipt {
     pub(crate) vm_generation: u64,
     pub(crate) source_domain: DomainKey,
@@ -1025,7 +1334,13 @@ pub(crate) struct ContinuationPublicationReceipt {
 
 /// External publication acknowledgement.  This value is descriptive evidence,
 /// not authority: only the separate one-shot publication bearer may consume it.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct ContinuationPublicationAckReceipt {
     pub(crate) continuation_id: u64,
     pub(crate) generation: u64,
@@ -1041,13 +1356,19 @@ pub(crate) struct ContinuationPublicationAckReceipt {
     pub(crate) external_receipt_digest: u64,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(crate) struct ContinuationPublicationAuthority(BearerKey<bearer_state::ContinuationPublishing>);
 
 /// Copyable instructions for the external publication apply. Copying this
 /// value never copies authority; acknowledgement consumes the separate opaque
 /// authority exactly once.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct ContinuationPublicationPlan {
     pub(crate) descriptor: ContinuationDescriptor,
     pub(crate) claim_generation: u64,
@@ -1058,7 +1379,7 @@ pub(crate) struct ContinuationPublicationPlan {
     pub(crate) receipt: ContinuationPublicationReceipt,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(crate) struct ContinuationPublicationIntent {
     authority: ContinuationPublicationAuthority,
     plan: ContinuationPublicationPlan,
@@ -1075,17 +1396,23 @@ impl ContinuationPublicationIntent {
 }
 
 /// Receipt which alone gates the post-publication resume path.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(crate) struct ContinuationAckReceipt(BearerKey<bearer_state::ContinuationAcknowledged>);
 
 /// Persisted-before-wake successor. Replaying this intent after a fence is
 /// idempotent by the Registry-minted publication sequence.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(crate) struct ContinuationResumeAuthority(BearerKey<bearer_state::ContinuationResuming>);
 
 /// Copyable instructions for the external resume apply. Completion consumes
 /// the separate linear authority, never this descriptor.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct ContinuationResumePlan {
     pub(crate) descriptor: ContinuationDescriptor,
     pub(crate) publication_ack: ContinuationPublicationAckReceipt,
@@ -1097,7 +1424,7 @@ pub(crate) struct ContinuationResumePlan {
     pub(crate) resume_nonce: u64,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(crate) struct ContinuationResumeIntent {
     authority: ContinuationResumeAuthority,
     plan: ContinuationResumePlan,
@@ -1113,7 +1440,13 @@ impl ContinuationResumeIntent {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct ContinuationResumeReceipt {
     pub(crate) continuation_id: u64,
     pub(crate) generation: u64,
@@ -1129,7 +1462,13 @@ pub(crate) struct ContinuationResumeReceipt {
     pub(crate) external_receipt_digest: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) enum ContinuationRecoveryState {
     Pending,
     Claimed,
@@ -1140,7 +1479,13 @@ pub(crate) enum ContinuationRecoveryState {
     Cancelled,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct ContinuationRecoveryProjection {
     pub(crate) descriptor: ContinuationDescriptor,
     pub(crate) parent_task: TaskWorkDescriptor,
@@ -1150,7 +1495,7 @@ pub(crate) struct ContinuationRecoveryProjection {
     pub(crate) resume_receipt: Option<ContinuationResumeReceipt>,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(crate) enum ContinuationAdoption {
     Pending(ContinuationLease),
     Claimed(WakeClaim),
@@ -1160,23 +1505,37 @@ pub(crate) enum ContinuationAdoption {
 }
 
 const _: () = {
-    assert!(core::mem::size_of::<AuthorityKey>() <= 32);
-    assert!(core::mem::size_of::<BearerKey<bearer_state::ContinuationPending>>() <= 64);
-    assert!(core::mem::size_of::<ContinuationLease>() <= 96);
-    assert!(core::mem::size_of::<WakeClaim>() <= 96);
-    assert!(core::mem::size_of::<ContinuationPublicationAuthority>() <= 96);
-    assert!(core::mem::size_of::<ContinuationPublicationAckReceipt>() <= 96);
-    assert!(core::mem::size_of::<ContinuationAckReceipt>() <= 96);
-    assert!(core::mem::size_of::<ContinuationResumeAuthority>() <= 96);
-    assert!(core::mem::size_of::<ContinuationResumeReceipt>() <= 96);
-    assert!(core::mem::size_of::<LinearFailure<ContinuationLease>>() <= 120);
-    assert!(core::mem::size_of::<LinearFailure<WakeClaim>>() <= 120);
-    assert!(core::mem::size_of::<LinearFailure<ContinuationPublicationAuthority>>() <= 120);
-    assert!(core::mem::size_of::<LinearFailure<ContinuationAckReceipt>>() <= 120);
-    assert!(core::mem::size_of::<LinearFailure<ContinuationResumeAuthority>>() <= 120);
+    __cser_core::assert!(__cser_core::mem::size_of::<AuthorityKey>() <= 32);
+    __cser_core::assert!(
+        __cser_core::mem::size_of::<BearerKey<bearer_state::ContinuationPending>>() <= 64
+    );
+    __cser_core::assert!(__cser_core::mem::size_of::<ContinuationLease>() <= 96);
+    __cser_core::assert!(__cser_core::mem::size_of::<WakeClaim>() <= 96);
+    __cser_core::assert!(__cser_core::mem::size_of::<ContinuationPublicationAuthority>() <= 96);
+    __cser_core::assert!(__cser_core::mem::size_of::<ContinuationPublicationAckReceipt>() <= 96);
+    __cser_core::assert!(__cser_core::mem::size_of::<ContinuationAckReceipt>() <= 96);
+    __cser_core::assert!(__cser_core::mem::size_of::<ContinuationResumeAuthority>() <= 96);
+    __cser_core::assert!(__cser_core::mem::size_of::<ContinuationResumeReceipt>() <= 96);
+    __cser_core::assert!(__cser_core::mem::size_of::<LinearFailure<ContinuationLease>>() <= 120);
+    __cser_core::assert!(__cser_core::mem::size_of::<LinearFailure<WakeClaim>>() <= 120);
+    __cser_core::assert!(
+        __cser_core::mem::size_of::<LinearFailure<ContinuationPublicationAuthority>>() <= 120
+    );
+    __cser_core::assert!(
+        __cser_core::mem::size_of::<LinearFailure<ContinuationAckReceipt>>() <= 120
+    );
+    __cser_core::assert!(
+        __cser_core::mem::size_of::<LinearFailure<ContinuationResumeAuthority>>() <= 120
+    );
 };
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) enum DeadlinePurpose {
     Wait,
     Retry,
@@ -1184,14 +1543,26 @@ pub(crate) enum DeadlinePurpose {
     DeviceClosure,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) enum DeadlineClockBasis {
     /// Count observed by the injected timer callback. This tranche does not
     /// claim wall-clock or true monotonic-time semantics.
     ObservedCallbackTick,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct DeadlineDescriptor {
     pub(crate) series_id: u64,
     pub(crate) generation: u64,
@@ -1225,10 +1596,10 @@ impl DeadlineDescriptor {
     }
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(crate) struct DeadlineLease(BearerKey<bearer_state::DeadlineArmed>);
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 enum DeadlineExpiryAuthority {
     Fired(BearerKey<bearer_state::DeadlineFired>),
     Exhausted(BearerKey<bearer_state::DeadlineExhausted>),
@@ -1237,10 +1608,16 @@ enum DeadlineExpiryAuthority {
 /// Opaque fired/exhausted authority. The observed tick and expiry nonce have
 /// one authoritative copy in `DeadlineRecord`; this value only selects the
 /// exact object and bearer generation which may consume them.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(crate) struct DeadlineExpiryReceipt(DeadlineExpiryAuthority);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) enum DeadlineRecoveryState {
     Armed,
     Fired,
@@ -1250,7 +1627,13 @@ pub(crate) enum DeadlineRecoveryState {
     Resolved,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct DeadlineRecoveryProjection {
     pub(crate) descriptor: DeadlineDescriptor,
     pub(crate) parent_task: TaskWorkDescriptor,
@@ -1260,14 +1643,26 @@ pub(crate) struct DeadlineRecoveryProjection {
     pub(crate) terminal_evidence_digest: Option<u64>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) enum DeadlineExhaustedDisposition {
     AbortWork,
     RetryBySupervisor,
     Quarantine,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct DeadlineReconciliationReceipt {
     pub(crate) disposition: DeadlineExhaustedDisposition,
     /// Opaque evidence selected by the crate-private adapter.
@@ -1278,7 +1673,13 @@ pub(crate) struct DeadlineReconciliationReceipt {
     pub(crate) evidence_digest: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct DeadlineSupervisorRetry {
     pub(crate) generation: u64,
     pub(crate) deadline_tick: u64,
@@ -1286,10 +1687,16 @@ pub(crate) struct DeadlineSupervisorRetry {
     pub(crate) backoff_ticks: u64,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(crate) struct DeadlineQuarantineTicket(BearerKey<bearer_state::DeadlineQuarantined>);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct DeadlineQuarantineReleaseReceipt {
     /// Opaque evidence selected by the crate-private adapter.
     ///
@@ -1298,14 +1705,14 @@ pub(crate) struct DeadlineQuarantineReleaseReceipt {
     pub(crate) evidence_digest: u64,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(crate) enum DeadlineReconciliationOutcome {
     Aborted,
     Retried(DeadlineLease),
     Quarantined(DeadlineQuarantineTicket),
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(crate) enum DeadlineAdoption {
     Armed(DeadlineLease),
     Fired(DeadlineExpiryReceipt),
@@ -1314,19 +1721,37 @@ pub(crate) enum DeadlineAdoption {
 }
 
 const _: () = {
-    assert!(core::mem::size_of::<BearerKey<bearer_state::DeadlineArmed>>() <= 64);
-    assert!(core::mem::size_of::<BearerKey<bearer_state::DeadlineFired>>() <= 64);
-    assert!(core::mem::size_of::<BearerKey<bearer_state::DeadlineExhausted>>() <= 64);
-    assert!(core::mem::size_of::<BearerKey<bearer_state::DeadlineQuarantined>>() <= 64);
-    assert!(core::mem::size_of::<DeadlineLease>() <= 96);
-    assert!(core::mem::size_of::<DeadlineExpiryReceipt>() <= 96);
-    assert!(core::mem::size_of::<DeadlineQuarantineTicket>() <= 96);
-    assert!(core::mem::size_of::<LinearFailure<DeadlineLease>>() <= 120);
-    assert!(core::mem::size_of::<LinearFailure<DeadlineExpiryReceipt>>() <= 120);
-    assert!(core::mem::size_of::<LinearFailure<DeadlineQuarantineTicket>>() <= 120);
+    __cser_core::assert!(
+        __cser_core::mem::size_of::<BearerKey<bearer_state::DeadlineArmed>>() <= 64
+    );
+    __cser_core::assert!(
+        __cser_core::mem::size_of::<BearerKey<bearer_state::DeadlineFired>>() <= 64
+    );
+    __cser_core::assert!(
+        __cser_core::mem::size_of::<BearerKey<bearer_state::DeadlineExhausted>>() <= 64
+    );
+    __cser_core::assert!(
+        __cser_core::mem::size_of::<BearerKey<bearer_state::DeadlineQuarantined>>() <= 64
+    );
+    __cser_core::assert!(__cser_core::mem::size_of::<DeadlineLease>() <= 96);
+    __cser_core::assert!(__cser_core::mem::size_of::<DeadlineExpiryReceipt>() <= 96);
+    __cser_core::assert!(__cser_core::mem::size_of::<DeadlineQuarantineTicket>() <= 96);
+    __cser_core::assert!(__cser_core::mem::size_of::<LinearFailure<DeadlineLease>>() <= 120);
+    __cser_core::assert!(
+        __cser_core::mem::size_of::<LinearFailure<DeadlineExpiryReceipt>>() <= 120
+    );
+    __cser_core::assert!(
+        __cser_core::mem::size_of::<LinearFailure<DeadlineQuarantineTicket>>() <= 120
+    );
 };
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct DeviceReservationCoordinates {
     pub(crate) preparation_id: u64,
     pub(crate) generation: u64,
@@ -1360,31 +1785,37 @@ impl DeviceReservationCoordinates {
     }
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(crate) struct DevicePreparationTicket(BearerStamp<DeviceReservationCoordinates>);
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(crate) struct DeviceApplyIntent {
     preparation: BearerStamp<DeviceReservationCoordinates>,
     apply_generation: u64,
     apply_nonce: u64,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(super) struct DeviceMaterializationPlan {
     preparation: BearerStamp<DeviceReservationCoordinates>,
     owner: PreparedOwner,
     base_revision: u64,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(crate) struct MaterializedDeviceTicket {
     preparation: BearerStamp<DeviceReservationCoordinates>,
     owner: PreparedOwner,
     cohort_digest: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(super) struct ValidatedDeviceClosureProof {
     receipt: RegistryDeviceClosureReceipt,
 }
@@ -1395,7 +1826,13 @@ impl ValidatedDeviceClosureProof {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct DeviceHardwareReceipt {
     pub(crate) owned_device: ResourceKey,
     pub(crate) device: DeviceEnvelope,
@@ -1404,7 +1841,13 @@ pub(crate) struct DeviceHardwareReceipt {
     pub(crate) hardware_receipt_digest: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct DeviceRollbackReceipt {
     pub(crate) owned_device: ResourceKey,
     pub(crate) queue: u16,
@@ -1414,7 +1857,13 @@ pub(crate) struct DeviceRollbackReceipt {
     pub(crate) rollback_receipt_digest: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) enum DevicePreparationRecoveryState {
     Reserved,
     ApplyingHardware,
@@ -1424,7 +1873,13 @@ pub(crate) enum DevicePreparationRecoveryState {
     Cancelled,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct DevicePreparationRecoveryProjection {
     pub(crate) coordinates: DeviceReservationCoordinates,
     pub(crate) parent_effect: EffectKey,
@@ -1435,7 +1890,13 @@ pub(crate) struct DevicePreparationRecoveryProjection {
     pub(crate) closure_receipt: Option<RegistryDeviceClosureReceipt>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 struct PreparedOwner {
     owned_device: ResourceKey,
     device: DeviceEnvelope,
@@ -1444,7 +1905,13 @@ struct PreparedOwner {
     hardware_receipt_digest: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct ReplyDescriptor {
     pub(crate) reply_id: u64,
     pub(crate) generation: u64,
@@ -1481,17 +1948,17 @@ impl ReplyDescriptor {
     }
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(crate) struct ReplyRecord(BearerStamp<ReplyDescriptor>);
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(crate) struct ReplyClaim {
     reply: BearerStamp<ReplyDescriptor>,
     claim_generation: u64,
     claim_nonce: u64,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(crate) struct ReplyPublicationIntent {
     reply: BearerStamp<ReplyDescriptor>,
     claim_generation: u64,
@@ -1500,7 +1967,13 @@ pub(crate) struct ReplyPublicationIntent {
     apply_nonce: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct ReplyPublicationReceipt {
     pub(crate) payload_slot: u32,
     pub(crate) payload_generation: u64,
@@ -1515,7 +1988,7 @@ pub(crate) struct ReplyPublicationReceipt {
 }
 
 /// Receipt which alone gates the guest wake following reply publication.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(crate) struct ReplyAckReceipt {
     reply: BearerStamp<ReplyDescriptor>,
     backend_effect: EffectKey,
@@ -1525,7 +1998,13 @@ pub(crate) struct ReplyAckReceipt {
     ack_nonce: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct ReplyCompletionReceipt {
     pub(crate) reply_id: u64,
     pub(crate) generation: u64,
@@ -1534,7 +2013,7 @@ pub(crate) struct ReplyCompletionReceipt {
     pub(crate) external_apply_digest: u64,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(super) struct ValidatedCommitProof {
     receipt: RegistryCommitReceipt,
 }
@@ -1545,7 +2024,13 @@ impl ValidatedCommitProof {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) enum ReplyRecoveryState {
     Prepared,
     Claimed,
@@ -1555,7 +2040,13 @@ pub(crate) enum ReplyRecoveryState {
     Cancelled,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct ReplyRecoveryProjection {
     pub(crate) descriptor: ReplyDescriptor,
     pub(crate) backend_effect: EffectKey,
@@ -1566,7 +2057,7 @@ pub(crate) struct ReplyRecoveryProjection {
     pub(crate) completion_receipt: Option<ReplyCompletionReceipt>,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(crate) enum ReplyAdoption {
     Prepared(ReplyRecord),
     Claimed(ReplyClaim),
@@ -1574,7 +2065,14 @@ pub(crate) enum ReplyAdoption {
     Acknowledged(ReplyAckReceipt),
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::default::Default,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct InfrastructureLiveCounts {
     pub(crate) workloads: u32,
     pub(crate) tasks: u32,
@@ -1596,14 +2094,27 @@ pub(crate) struct InfrastructureLiveCounts {
 /// reservation coordinates.  It is deliberately separate from
 /// [`InfrastructureLiveCounts`]: the latter is stored accounting which must
 /// be checked, never an input to this recomputation.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::default::Default,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct ResourceUsage {
     pub(crate) queue_slots: u32,
     pub(crate) pinned_pages: u32,
     pub(crate) dma_mappings: u32,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) enum InfrastructureEventKind {
     WorkloadOpened,
     WorkloadAdopted,
@@ -1656,7 +2167,13 @@ pub(crate) enum InfrastructureEventKind {
     ScopeRevoked,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct InfrastructureEvent {
     pub(crate) sequence: u64,
     pub(crate) kind: InfrastructureEventKind,
@@ -1664,7 +2181,12 @@ pub(crate) struct InfrastructureEvent {
     pub(crate) generation: u64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct InfrastructureDiagnostics {
     pub(crate) scope: ScopeKey,
     pub(crate) authority_epoch: u64,
@@ -1676,7 +2198,14 @@ pub(crate) struct InfrastructureDiagnostics {
     pub(crate) dropped_events: u64,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::default::Default,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct InfrastructureRecoveryProjection {
     pub(crate) revision: u64,
     pub(crate) domain: Option<DomainKey>,
@@ -1688,7 +2217,13 @@ pub(crate) struct InfrastructureRecoveryProjection {
     pub(crate) digest: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(super) enum InfrastructureHandoffReadiness {
     Ready,
     NeedsAbort,
@@ -1696,7 +2231,7 @@ pub(super) enum InfrastructureHandoffReadiness {
     BlockedRetained,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(crate) struct InfrastructureClosureSelection {
     registry_instance: u64,
     scope: ScopeKey,
@@ -1705,7 +2240,13 @@ pub(crate) struct InfrastructureClosureSelection {
     nonce: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) enum InfrastructureClosureWorkState {
     Cancellable,
     MustIsolate,
@@ -1716,7 +2257,13 @@ pub(crate) enum InfrastructureClosureWorkState {
     Workload,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(crate) struct InfrastructureClosureWork {
     pub(crate) kind: InfrastructureKind,
     pub(crate) id: u64,
@@ -1724,13 +2271,24 @@ pub(crate) struct InfrastructureClosureWork {
     pub(crate) state: InfrastructureClosureWorkState,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 enum WorkloadPhase {
     Open,
     Closed,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 struct WorkloadRecord {
     request: RequestKey,
     root_effect: EffectKey,
@@ -1745,7 +2303,13 @@ struct WorkloadRecord {
     closure_sequence: Option<u64>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 enum TaskPhase {
     Admitted,
     Entered,
@@ -1754,7 +2318,12 @@ enum TaskPhase {
     Reaped,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 struct TaskRecord {
     stamp: BearerStamp<TaskWorkDescriptor>,
     phase: TaskPhase,
@@ -1762,7 +2331,13 @@ struct TaskRecord {
     closure_sequence: Option<u64>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 enum ServiceRequestPhase {
     ReservedUnbound,
     ReservedBound,
@@ -1797,7 +2372,12 @@ enum ServiceRequestPhase {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 struct ServiceRequestStateRecord {
     stamp: BearerStamp<ServiceRequestDescriptor>,
     bound_continuation: Option<BearerStamp<ContinuationDescriptor>>,
@@ -1819,7 +2399,13 @@ struct ServiceRequestStateRecord {
     closure_sequence: Option<u64>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 enum DelayedCommandPhase {
     Reserved,
     Publishing {
@@ -1834,7 +2420,12 @@ enum DelayedCommandPhase {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 struct DelayedCommandStateRecord {
     stamp: BearerStamp<DelayedCommandDescriptor>,
     apply_generation: u64,
@@ -1842,7 +2433,13 @@ struct DelayedCommandStateRecord {
     closure_sequence: Option<u64>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 enum FaultPhase {
     Reserved,
     Observed {
@@ -1854,7 +2451,12 @@ enum FaultPhase {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 struct FaultStateRecord {
     stamp: BearerStamp<FaultDescriptor>,
     phase: FaultPhase,
@@ -1862,7 +2464,13 @@ struct FaultStateRecord {
     closure_sequence: Option<u64>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 enum ContinuationPhase {
     Pending,
     Claimed {
@@ -1899,7 +2507,12 @@ enum ContinuationPhase {
     Cancelled,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 struct ContinuationRecord {
     stamp: BearerStamp<ContinuationDescriptor>,
     origin_source: DomainStamp,
@@ -1913,7 +2526,13 @@ struct ContinuationRecord {
     closure_sequence: Option<u64>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 enum DeadlinePhase {
     Armed,
     Fired {
@@ -1937,7 +2556,12 @@ enum DeadlinePhase {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 struct DeadlineRecord {
     stamp: BearerStamp<DeadlineDescriptor>,
     series_nonce: u64,
@@ -1948,7 +2572,13 @@ struct DeadlineRecord {
     closure_sequence: Option<u64>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 enum DevicePhase {
     Reserved,
     Applying {
@@ -1973,7 +2603,7 @@ enum DevicePhase {
     },
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(crate) enum DeviceAdoption {
     Reserved(DevicePreparationTicket),
     ReplayApply(DeviceApplyIntent),
@@ -1981,7 +2611,12 @@ pub(crate) enum DeviceAdoption {
     Materialized(MaterializedDeviceTicket),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 struct DeviceRecord {
     stamp: BearerStamp<DeviceReservationCoordinates>,
     apply_generation: u64,
@@ -1989,7 +2624,13 @@ struct DeviceRecord {
     closure_sequence: Option<u64>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 enum ReplyPhase {
     Prepared,
     Claimed {
@@ -2015,7 +2656,12 @@ enum ReplyPhase {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 struct ReplyStateRecord {
     stamp: BearerStamp<ReplyDescriptor>,
     backend_commit: RegistryCommitReceipt,
@@ -2078,7 +2724,13 @@ impl SlotIdentity for DeviceRecord {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 enum ReverseParent {
     RootEffect(EffectKey),
     Request(RequestKey),
@@ -2086,7 +2738,13 @@ enum ReverseParent {
     Effect(EffectKey),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 struct ReverseIndexRecord {
     slot: u64,
     kind: InfrastructureKind,
@@ -2114,7 +2772,12 @@ impl SlotIdentity for ReplyStateRecord {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 struct FixedSlots<T> {
     slots: Vec<Option<T>>,
 }
@@ -2196,7 +2859,12 @@ impl<T: SlotIdentity> FixedSlots<T> {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 struct EventRing {
     slots: Vec<Option<InfrastructureEvent>>,
     next: usize,
@@ -2288,14 +2956,25 @@ impl FixedSlots<InfrastructureEventSlot> {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 struct ClosureRecord {
     sequence: u64,
     nonce: u64,
     finished: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 struct ScopeInfrastructure {
     root: RootStamp,
     active: bool,
@@ -2418,7 +3097,13 @@ impl ScopeInfrastructure {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(super) struct DomainFencePlan {
     scope: ScopeKey,
     domain: DomainKey,
@@ -2427,14 +3112,20 @@ pub(super) struct DomainFencePlan {
     next_revision: u64,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(super) struct InfrastructureState {
     registry_instance: u64,
     mode: LedgerMode,
     scopes: Vec<(ScopeKey, ScopeInfrastructure)>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(super) struct InfrastructureRootBinding {
     pub(super) scope: ScopeKey,
     pub(super) authority_epoch: u64,
@@ -2457,7 +3148,7 @@ pub(super) struct InfrastructureScopeLink<'a> {
 /// A fully prevalidated replacement for exactly one infrastructure scope.
 /// The slot index and replacement are private so the outer Registry can only
 /// install it through the infallible final step below.
-#[derive(Debug)]
+#[derive(__cser_core::fmt::Debug)]
 pub(super) struct InfrastructureScopeInstallPlan {
     slot: usize,
     replacement: ScopeInfrastructure,
@@ -3036,7 +3727,7 @@ fn first_live_child_kind(
 ) -> Result<InfrastructureKind, InfrastructureError> {
     if scope.tasks.iter().any(|record| {
         record.stamp.workload.request == request
-            && matches!(record.phase, TaskPhase::Admitted | TaskPhase::Entered)
+            && __cser_core::matches!(record.phase, TaskPhase::Admitted | TaskPhase::Entered)
     }) {
         return Ok(InfrastructureKind::Task);
     }
@@ -3051,13 +3742,14 @@ fn first_live_child_kind(
         return Ok(InfrastructureKind::DelayedCommand);
     }
     if scope.faults.iter().any(|record| {
-        record.stamp.workload.request == request && matches!(record.phase, FaultPhase::Reserved)
+        record.stamp.workload.request == request
+            && __cser_core::matches!(record.phase, FaultPhase::Reserved)
     }) {
         return Ok(InfrastructureKind::Fault);
     }
     if scope.continuations.iter().any(|record| {
         record.stamp.workload.request == request
-            && !matches!(
+            && !__cser_core::matches!(
                 record.phase,
                 ContinuationPhase::Resumed { .. } | ContinuationPhase::Cancelled
             )
@@ -3066,7 +3758,7 @@ fn first_live_child_kind(
     }
     if scope.deadlines.iter().any(|record| {
         record.stamp.workload.request == request
-            && !matches!(
+            && !__cser_core::matches!(
                 record.phase,
                 DeadlinePhase::Cancelled | DeadlinePhase::Resolved { .. }
             )
@@ -3082,7 +3774,7 @@ fn first_live_child_kind(
     }
     if scope.replies.iter().any(|record| {
         record.stamp.workload.request == request
-            && !matches!(
+            && !__cser_core::matches!(
                 record.phase,
                 ReplyPhase::Completed { .. } | ReplyPhase::Cancelled { .. }
             )
@@ -3107,7 +3799,7 @@ fn first_task_child_kind(
         return Ok(InfrastructureKind::ServiceRequest);
     }
     if scope.service_requests.iter().any(|record| {
-        matches!(
+        __cser_core::matches!(
             record.phase,
             ServiceRequestPhase::ChildBound {
                 binding_receipt,
@@ -3124,16 +3816,14 @@ fn first_task_child_kind(
     {
         return Ok(InfrastructureKind::DelayedCommand);
     }
-    if scope
-        .faults
-        .iter()
-        .any(|record| record.stamp.parent == parent && matches!(record.phase, FaultPhase::Reserved))
-    {
+    if scope.faults.iter().any(|record| {
+        record.stamp.parent == parent && __cser_core::matches!(record.phase, FaultPhase::Reserved)
+    }) {
         return Ok(InfrastructureKind::Fault);
     }
     if scope.continuations.iter().any(|record| {
         record.stamp.parent == parent
-            && !matches!(
+            && !__cser_core::matches!(
                 record.phase,
                 ContinuationPhase::Resumed { .. } | ContinuationPhase::Cancelled
             )
@@ -3142,7 +3832,7 @@ fn first_task_child_kind(
     }
     if scope.deadlines.iter().any(|record| {
         record.stamp.parent == parent
-            && !matches!(
+            && !__cser_core::matches!(
                 record.phase,
                 DeadlinePhase::Cancelled | DeadlinePhase::Resolved { .. }
             )
@@ -3151,7 +3841,7 @@ fn first_task_child_kind(
     }
     if scope.replies.iter().any(|record| {
         record.stamp.parent == parent
-            && !matches!(
+            && !__cser_core::matches!(
                 record.phase,
                 ReplyPhase::Completed { .. } | ReplyPhase::Cancelled { .. }
             )

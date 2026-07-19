@@ -19,6 +19,9 @@
 //! path; that path must be implemented here from actual Registry receipts and
 //! projections before these transitions are wired into production.
 
+extern crate alloc as __cser_alloc;
+extern crate core as __cser_core;
+
 use sha2::{Digest as _, Sha256};
 
 const ROOT_CONTRACT_SCHEMA: &[u8] = b"nexus.cser.root-contract.v2-unreleased";
@@ -28,7 +31,13 @@ const ROOT_DIGEST_SIZE: usize = 32;
 
 /// RFC root-lineage coordinates. Authority epoch remains a separate contract
 /// coordinate because revoke advances it without allocating a new scope lane.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(super) struct RootLineage {
     registry_instance: u64,
     scope_id: u64,
@@ -72,7 +81,13 @@ impl RootLineage {
 
 /// Descriptive lookup selector decoded from a Registry-issued opaque handle.
 /// It is not authority and can never allocate an unknown scope.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(super) struct RootSelector {
     lineage: RootLineage,
 }
@@ -93,7 +108,13 @@ impl RootSelector {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(super) struct RootPolicy {
     flags: u32,
     max_effects: u32,
@@ -122,7 +143,13 @@ impl RootPolicy {
 
 /// Copyable description of a root contract before the table assigns its fixed
 /// scope id and generation. It carries no mutation authority.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(super) struct RootContractTemplate {
     authority_epoch: u64,
     binding_epoch: u64,
@@ -178,7 +205,13 @@ impl RootContractTemplate {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 struct CanonicalRootDigest([u8; ROOT_DIGEST_SIZE]);
 
 impl CanonicalRootDigest {
@@ -228,14 +261,26 @@ fn digest_u32(hasher: &mut Sha256, value: u32) {
     hasher.update(value.to_le_bytes());
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(super) enum RootRetention {
     Full,
     AckedRetained,
     Compact,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 struct AckedEvidence {
     closure_sequence: u64,
     closure_receipt_digest: [u8; ROOT_DIGEST_SIZE],
@@ -271,13 +316,25 @@ impl AckedEvidence {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 struct ClearanceEvidence {
     revision: u64,
     digest: [u8; ROOT_DIGEST_SIZE],
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 enum RootLane {
     Full {
         lineage: RootLineage,
@@ -385,7 +442,13 @@ impl RootLane {
 }
 
 /// Copyable diagnostic projection. It grants no authority.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(super) struct RootLaneObservation {
     lineage: RootLineage,
     contract_digest: CanonicalRootDigest,
@@ -423,7 +486,13 @@ impl RootLaneObservation {
 }
 
 /// Descriptive result. No variant contains root execution authority.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(super) enum RootAdmissionStatus {
     AllocatedFull(RootLaneObservation),
     AdvancedFull(RootLaneObservation),
@@ -432,13 +501,25 @@ pub(super) enum RootAdmissionStatus {
     ExistingCompact(RootLaneObservation),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(super) enum RootTransitionStatus {
     Applied(RootLaneObservation),
     ExactReplay(RootLaneObservation),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 pub(super) enum RootLaneError {
     ZeroCapacity,
     CapacityUnrepresentable,
@@ -493,7 +574,7 @@ pub(super) enum RootLaneError {
 }
 
 /// Failure that returns the exact non-duplicable input without mutation.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(super) struct LinearRootFailure<P> {
     error: RootLaneError,
     proof: P,
@@ -512,7 +593,7 @@ impl<P> LinearRootFailure<P> {
 /// Compact coordinate for one table-owned pending authority record. The slot
 /// and monotonically increasing generation prevent a stale bearer from
 /// selecting a later reservation after the fixed slot is reused.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 struct BearerKey {
     registry_instance: u64,
     slot_id: u64,
@@ -521,14 +602,14 @@ struct BearerKey {
 
 /// Fresh operation authority. The complete template remains in the table;
 /// this non-duplicable bearer contains only an opaque reservation coordinate.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(super) struct FreshScopePermit {
     key: BearerKey,
 }
 
 /// Sealed closure acknowledgement. The verified receipt projection remains in
 /// the table rather than being duplicated into the linear bearer.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(super) struct ClosureAckPermit {
     key: BearerKey,
 }
@@ -536,7 +617,13 @@ pub(super) struct ClosureAckPermit {
 /// Complete authoritative zero-check required before final root compaction.
 /// The type and constructor are private so the parent cannot substitute raw
 /// caller-provided counters for a Registry projection.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 struct RetainedClearanceProjection {
     revision: u64,
     retained_owners: u32,
@@ -634,19 +721,25 @@ impl RetainedClearanceProjection {
 
 /// Sealed final-clearance authority. The private mint accepts only the complete
 /// zero-checked projection above.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(super) struct ClearancePermit {
     key: BearerKey,
 }
 
 /// Exact compact-predecessor authority. The predecessor evidence and fresh
 /// target remain in the fixed pending table slot selected by this key.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(super) struct CompactLanePermit {
     key: BearerKey,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 enum PendingProof {
     Fresh {
         template: RootContractTemplate,
@@ -674,7 +767,13 @@ enum PendingProof {
     },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 struct PendingReservation {
     generation: u64,
     proof: PendingProof,
@@ -684,22 +783,28 @@ struct PendingReservation {
 // expectations. The selector plus fresh bearer is the largest fallible linear
 // input; every failure returns only the exact compact bearer and typed error.
 const _: () = {
-    assert!(core::mem::size_of::<BearerKey>() <= 64);
-    assert!(core::mem::size_of::<FreshScopePermit>() <= 64);
-    assert!(core::mem::size_of::<ClosureAckPermit>() <= 64);
-    assert!(core::mem::size_of::<ClearancePermit>() <= 64);
-    assert!(core::mem::size_of::<CompactLanePermit>() <= 64);
-    assert!(core::mem::size_of::<RootSelector>() + core::mem::size_of::<FreshScopePermit>() <= 96);
-    assert!(core::mem::size_of::<LinearRootFailure<FreshScopePermit>>() <= 120);
-    assert!(core::mem::size_of::<LinearRootFailure<ClosureAckPermit>>() <= 120);
-    assert!(core::mem::size_of::<LinearRootFailure<ClearancePermit>>() <= 120);
-    assert!(core::mem::size_of::<LinearRootFailure<CompactLanePermit>>() <= 120);
+    __cser_core::assert!(__cser_core::mem::size_of::<BearerKey>() <= 64);
+    __cser_core::assert!(__cser_core::mem::size_of::<FreshScopePermit>() <= 64);
+    __cser_core::assert!(__cser_core::mem::size_of::<ClosureAckPermit>() <= 64);
+    __cser_core::assert!(__cser_core::mem::size_of::<ClearancePermit>() <= 64);
+    __cser_core::assert!(__cser_core::mem::size_of::<CompactLanePermit>() <= 64);
+    __cser_core::assert!(
+        __cser_core::mem::size_of::<RootSelector>()
+            + __cser_core::mem::size_of::<FreshScopePermit>()
+            <= 96
+    );
+    __cser_core::assert!(__cser_core::mem::size_of::<LinearRootFailure<FreshScopePermit>>() <= 120);
+    __cser_core::assert!(__cser_core::mem::size_of::<LinearRootFailure<ClosureAckPermit>>() <= 120);
+    __cser_core::assert!(__cser_core::mem::size_of::<LinearRootFailure<ClearancePermit>>() <= 120);
+    __cser_core::assert!(
+        __cser_core::mem::size_of::<LinearRootFailure<CompactLanePermit>>() <= 120
+    );
 };
 
 /// Unique bounded table owned by one `EffectRegistry`.
 ///
 /// This type deliberately does not implement `Clone` or `Copy`.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(super) struct RootLaneTable<const LANES: usize> {
     registry_instance: u64,
     next_bearer_generation: u64,
@@ -708,7 +813,13 @@ pub(super) struct RootLaneTable<const LANES: usize> {
 }
 
 #[cfg(test)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
 struct RootLaneFullSnapshot<const LANES: usize> {
     next_bearer_generation: u64,
     lanes: [Option<RootLane>; LANES],
@@ -790,7 +901,7 @@ impl<const LANES: usize> RootLaneTable<LANES> {
         observation: RootLaneObservation,
         projection: RetainedClearanceProjection,
     ) -> Result<ClearancePermit, RootLaneError> {
-        if !matches!(
+        if !__cser_core::matches!(
             observation.retention,
             RootRetention::AckedRetained | RootRetention::Compact
         ) {
@@ -1306,7 +1417,10 @@ impl<const LANES: usize> RootLaneTable<LANES> {
 
 #[cfg(test)]
 mod tests {
-    use core::mem::size_of;
+    extern crate alloc as __cser_alloc;
+    extern crate core as __cser_core;
+
+    use __cser_core::mem::size_of;
 
     use super::*;
 
@@ -1384,23 +1498,23 @@ mod tests {
 
     #[test]
     fn validates_capacity_selector_and_each_zero_contract_coordinate() {
-        assert_eq!(
+        __cser_core::assert_eq!(
             RootLaneTable::<0>::new(REGISTRY),
             Err(RootLaneError::ZeroCapacity)
         );
-        assert_eq!(
+        __cser_core::assert_eq!(
             RootLaneTable::<1>::new(0),
             Err(RootLaneError::ZeroRegistryInstance)
         );
-        assert_eq!(
+        __cser_core::assert_eq!(
             RootSelector::new(0, 1, 1),
             Err(RootLaneError::ZeroRegistryInstance)
         );
-        assert_eq!(
+        __cser_core::assert_eq!(
             RootSelector::new(REGISTRY, 0, 1),
             Err(RootLaneError::ZeroScopeId)
         );
-        assert_eq!(
+        __cser_core::assert_eq!(
             RootSelector::new(REGISTRY, 1, 0),
             Err(RootLaneError::ZeroScopeGeneration)
         );
@@ -1432,7 +1546,7 @@ mod tests {
                 RootLaneError::ZeroRequestKey,
             ),
         ] {
-            assert_eq!(result, Err(expected));
+            __cser_core::assert_eq!(result, Err(expected));
         }
     }
 
@@ -1440,7 +1554,7 @@ mod tests {
     fn canonical_contract_digest_is_frozen_and_every_field_is_bound() {
         let lineage = RootLineage::new(REGISTRY, 1, 1).unwrap();
         let original = template(0x71);
-        assert_eq!(
+        __cser_core::assert_eq!(
             canonical_contract_digest(lineage, original).into_bytes(),
             [
                 0x1d, 0x28, 0x91, 0xf2, 0xee, 0x50, 0x49, 0x93, 0x7f, 0x16, 0xcb, 0xba, 0x30, 0xfa,
@@ -1455,7 +1569,7 @@ mod tests {
             RootLineage::new(REGISTRY, 1, 2).unwrap(),
         ];
         for mutation in lineages {
-            assert_ne!(
+            __cser_core::assert_ne!(
                 canonical_contract_digest(mutation, original),
                 canonical_contract_digest(lineage, original)
             );
@@ -1507,7 +1621,7 @@ mod tests {
             },
         ];
         for mutation in mutations {
-            assert_ne!(
+            __cser_core::assert_ne!(
                 canonical_contract_digest(lineage, mutation),
                 canonical_contract_digest(lineage, original)
             );
@@ -1520,45 +1634,45 @@ mod tests {
         let first_permit = fresh(&mut table, 1);
         let first = table.allocate(first_permit).unwrap();
         let RootAdmissionStatus::AllocatedFull(first) = first else {
-            panic!("unexpected allocation status");
+            __cser_core::panic!("unexpected allocation status");
         };
-        assert_eq!(first.lineage.scope_id(), 1);
-        assert_eq!(first.lineage.scope_generation(), 1);
-        assert_eq!(first.request_key(), request_key(1));
+        __cser_core::assert_eq!(first.lineage.scope_id(), 1);
+        __cser_core::assert_eq!(first.lineage.scope_generation(), 1);
+        __cser_core::assert_eq!(first.request_key(), request_key(1));
 
         let second_permit = fresh(&mut table, 2);
         let second = table.allocate(second_permit).unwrap();
         let RootAdmissionStatus::AllocatedFull(second) = second else {
-            panic!("unexpected allocation status");
+            __cser_core::panic!("unexpected allocation status");
         };
-        assert_eq!(second.lineage.scope_id(), 2);
-        assert_eq!(second.lineage.scope_generation(), 1);
+        __cser_core::assert_eq!(second.lineage.scope_id(), 2);
+        __cser_core::assert_eq!(second.lineage.scope_generation(), 1);
 
         let exhausted = fresh(&mut table, 3);
         let exhausted_coordinate = key_coordinate(&exhausted.key);
         let before = table.full_snapshot();
         let failure = table.allocate(exhausted).unwrap_err();
-        assert_eq!(failure.error(), RootLaneError::CapacityExhausted);
+        __cser_core::assert_eq!(failure.error(), RootLaneError::CapacityExhausted);
         let returned = failure.into_proof();
-        assert_eq!(key_coordinate(&returned.key), exhausted_coordinate);
-        assert_eq!(
+        __cser_core::assert_eq!(key_coordinate(&returned.key), exhausted_coordinate);
+        __cser_core::assert_eq!(
             table.pending_proof(&returned.key).unwrap().1,
             PendingProof::Fresh {
                 template: template(3)
             }
         );
-        assert_eq!(table.full_snapshot(), before);
+        __cser_core::assert_eq!(table.full_snapshot(), before);
 
         let mut foreign_table = RootLaneTable::<1>::new(REGISTRY + 1).unwrap();
         let foreign = foreign_table.reserve_fresh(template(4)).unwrap();
         let foreign_coordinate = key_coordinate(&foreign.key);
         let failure = table.allocate(foreign).unwrap_err();
-        assert_eq!(failure.error(), RootLaneError::ForeignRegistry);
-        assert_eq!(
+        __cser_core::assert_eq!(failure.error(), RootLaneError::ForeignRegistry);
+        __cser_core::assert_eq!(
             key_coordinate(&failure.into_proof().key),
             foreign_coordinate
         );
-        assert_eq!(table.full_snapshot(), before);
+        __cser_core::assert_eq!(table.full_snapshot(), before);
     }
 
     #[test]
@@ -1570,8 +1684,8 @@ mod tests {
 
         let replacement = fresh(&mut table, 2);
         let replacement_coordinate = key_coordinate(&replacement.key);
-        assert_eq!(first_coordinate.1, replacement_coordinate.1);
-        assert_ne!(first_coordinate.2, replacement_coordinate.2);
+        __cser_core::assert_eq!(first_coordinate.1, replacement_coordinate.1);
+        __cser_core::assert_ne!(first_coordinate.2, replacement_coordinate.2);
 
         // Only this child-module test can construct a raw stale coordinate.
         let stale = FreshScopePermit {
@@ -1583,11 +1697,11 @@ mod tests {
         };
         let before = table.full_snapshot();
         let failure = table.allocate(stale).unwrap_err();
-        assert_eq!(failure.error(), RootLaneError::StalePermit);
+        __cser_core::assert_eq!(failure.error(), RootLaneError::StalePermit);
         let returned = failure.into_proof();
-        assert_eq!(key_coordinate(&returned.key), first_coordinate);
-        assert_eq!(table.full_snapshot(), before);
-        assert!(table.pending_proof(&replacement.key).is_ok());
+        __cser_core::assert_eq!(key_coordinate(&returned.key), first_coordinate);
+        __cser_core::assert_eq!(table.full_snapshot(), before);
+        __cser_core::assert!(table.pending_proof(&replacement.key).is_ok());
     }
 
     #[test]
@@ -1597,34 +1711,34 @@ mod tests {
         table.allocate(permit).unwrap();
         let before = table.full_snapshot();
         let selector = observation(&table, 1).selector();
-        assert!(matches!(
+        __cser_core::assert!(__cser_core::matches!(
             table.recover(selector, template(1)),
             Ok(RootAdmissionStatus::ExistingFull(_))
         ));
-        assert_eq!(
+        __cser_core::assert_eq!(
             table.recover(selector, template(2)),
             Err(RootLaneError::IdentityConflict { generation: 1 })
         );
-        assert_eq!(
+        __cser_core::assert_eq!(
             table.recover(RootSelector::new(REGISTRY, 2, 1).unwrap(), template(2)),
             Err(RootLaneError::UnknownScope)
         );
-        assert_eq!(
+        __cser_core::assert_eq!(
             table.recover(RootSelector::new(REGISTRY, 1, 2).unwrap(), template(1)),
             Err(RootLaneError::UnknownGeneration {
                 presented: 2,
                 current: 1,
             })
         );
-        assert_eq!(
+        __cser_core::assert_eq!(
             table.recover(
                 RootSelector::new(REGISTRY, u64::MAX, 1).unwrap(),
                 template(1),
             ),
             Err(RootLaneError::UnknownScope)
         );
-        assert_eq!(table.full_snapshot(), before);
-        assert_eq!(table.len(), 1);
+        __cser_core::assert_eq!(table.full_snapshot(), before);
+        __cser_core::assert_eq!(table.len(), 1);
     }
 
     #[test]
@@ -1642,36 +1756,42 @@ mod tests {
         let foreign_coordinate = key_coordinate(&foreign.key);
         let before = table.full_snapshot();
         let failure = table.acknowledge_retained(foreign).unwrap_err();
-        assert_eq!(failure.error(), RootLaneError::ForeignRegistry);
-        assert_eq!(
+        __cser_core::assert_eq!(failure.error(), RootLaneError::ForeignRegistry);
+        __cser_core::assert_eq!(
             key_coordinate(&failure.into_proof().key),
             foreign_coordinate
         );
-        assert_eq!(table.full_snapshot(), before);
+        __cser_core::assert_eq!(table.full_snapshot(), before);
 
         let acknowledgement_permit = acknowledgement(&mut table, full, 3, 4);
         let applied = table.acknowledge_retained(acknowledgement_permit).unwrap();
-        assert!(matches!(applied, RootTransitionStatus::Applied(_)));
+        __cser_core::assert!(__cser_core::matches!(
+            applied,
+            RootTransitionStatus::Applied(_)
+        ));
         let retained = observation(&table, 1);
-        assert_eq!(retained.request_key(), request_key(1));
+        __cser_core::assert_eq!(retained.request_key(), request_key(1));
         let acknowledgement_permit = acknowledgement(&mut table, retained, 3, 4);
         let replay = table.acknowledge_retained(acknowledgement_permit).unwrap();
-        assert!(matches!(replay, RootTransitionStatus::ExactReplay(_)));
+        __cser_core::assert!(__cser_core::matches!(
+            replay,
+            RootTransitionStatus::ExactReplay(_)
+        ));
         let conflicting = acknowledgement(&mut table, retained, 3, 5);
         let conflicting_coordinate = key_coordinate(&conflicting.key);
         let before_conflict = table.full_snapshot();
         let failure = table.acknowledge_retained(conflicting).unwrap_err();
-        assert_eq!(failure.error(), RootLaneError::ClosureEvidenceConflict);
-        assert_eq!(
+        __cser_core::assert_eq!(failure.error(), RootLaneError::ClosureEvidenceConflict);
+        __cser_core::assert_eq!(
             key_coordinate(&failure.into_proof().key),
             conflicting_coordinate
         );
-        assert_eq!(table.full_snapshot(), before_conflict);
+        __cser_core::assert_eq!(table.full_snapshot(), before_conflict);
     }
 
     #[test]
     fn clearance_projection_mechanically_rejects_every_live_category() {
-        assert_eq!(
+        __cser_core::assert_eq!(
             RetainedClearanceProjection::new(0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
             Err(RootLaneError::ZeroClearanceRevision)
         );
@@ -1713,7 +1833,7 @@ mod tests {
                 RootLaneError::IotlbOwnersRemain,
             ),
         ] {
-            assert_eq!(projection, Err(expected));
+            __cser_core::assert_eq!(projection, Err(expected));
         }
     }
 
@@ -1723,7 +1843,7 @@ mod tests {
         let permit = fresh(&mut table, 1);
         table.allocate(permit).unwrap();
         let full = observation(&table, 1);
-        assert_eq!(
+        __cser_core::assert_eq!(
             table.reserve_clearance(full, zero_projection(1)),
             Err(RootLaneError::InvalidRetention {
                 expected: RootRetention::AckedRetained,
@@ -1736,13 +1856,19 @@ mod tests {
         let retained = observation(&table, 1);
         let clearance_permit = clearance(&mut table, retained, 5);
         let applied = table.compact(clearance_permit).unwrap();
-        assert!(matches!(applied, RootTransitionStatus::Applied(_)));
+        __cser_core::assert!(__cser_core::matches!(
+            applied,
+            RootTransitionStatus::Applied(_)
+        ));
         let compact = observation(&table, 1);
-        assert_eq!(compact.request_key(), request_key(1));
+        __cser_core::assert_eq!(compact.request_key(), request_key(1));
         let clearance_permit = clearance(&mut table, compact, 5);
         let replay = table.compact(clearance_permit).unwrap();
-        assert!(matches!(replay, RootTransitionStatus::ExactReplay(_)));
-        assert!(matches!(
+        __cser_core::assert!(__cser_core::matches!(
+            replay,
+            RootTransitionStatus::ExactReplay(_)
+        ));
+        __cser_core::assert!(__cser_core::matches!(
             table.recover(compact.selector(), template(1)),
             Ok(RootAdmissionStatus::ExistingCompact(_))
         ));
@@ -1751,12 +1877,12 @@ mod tests {
         let conflicting_coordinate = key_coordinate(&conflicting.key);
         let before = table.full_snapshot();
         let failure = table.compact(conflicting).unwrap_err();
-        assert_eq!(failure.error(), RootLaneError::ClearanceEvidenceConflict);
-        assert_eq!(
+        __cser_core::assert_eq!(failure.error(), RootLaneError::ClearanceEvidenceConflict);
+        __cser_core::assert_eq!(
             key_coordinate(&failure.into_proof().key),
             conflicting_coordinate
         );
-        assert_eq!(table.full_snapshot(), before);
+        __cser_core::assert_eq!(table.full_snapshot(), before);
     }
 
     #[test]
@@ -1770,12 +1896,12 @@ mod tests {
         let duplicate_coordinate = key_coordinate(&duplicate.key);
         let before = table.full_snapshot();
         let failure = table.allocate(duplicate).unwrap_err();
-        assert_eq!(failure.error(), RootLaneError::RequestKeyInUse);
-        assert_eq!(
+        __cser_core::assert_eq!(failure.error(), RootLaneError::RequestKeyInUse);
+        __cser_core::assert_eq!(
             key_coordinate(&failure.into_proof().key),
             duplicate_coordinate
         );
-        assert_eq!(table.full_snapshot(), before);
+        __cser_core::assert_eq!(table.full_snapshot(), before);
 
         let duplicate = fresh(&mut table, 1);
         let duplicate_coordinate = key_coordinate(&duplicate.key);
@@ -1783,12 +1909,12 @@ mod tests {
         let failure = table
             .prepare_advance(compact.selector(), duplicate)
             .unwrap_err();
-        assert_eq!(failure.error(), RootLaneError::RequestKeyInUse);
-        assert_eq!(
+        __cser_core::assert_eq!(failure.error(), RootLaneError::RequestKeyInUse);
+        __cser_core::assert_eq!(
             key_coordinate(&failure.into_proof().key),
             duplicate_coordinate
         );
-        assert_eq!(table.full_snapshot(), before);
+        __cser_core::assert_eq!(table.full_snapshot(), before);
     }
 
     #[test]
@@ -1801,19 +1927,19 @@ mod tests {
         let permit = table.prepare_advance(compact.selector(), fresh).unwrap();
         let advanced = table.advance(permit).unwrap();
         let RootAdmissionStatus::AdvancedFull(advanced) = advanced else {
-            panic!("unexpected advance status");
+            __cser_core::panic!("unexpected advance status");
         };
-        assert_eq!(advanced.lineage.scope_id(), 1);
-        assert_eq!(advanced.lineage.scope_generation(), 2);
-        assert_eq!(advanced.request_key(), request_key(2));
-        assert_eq!(
+        __cser_core::assert_eq!(advanced.lineage.scope_id(), 1);
+        __cser_core::assert_eq!(advanced.lineage.scope_generation(), 2);
+        __cser_core::assert_eq!(advanced.request_key(), request_key(2));
+        __cser_core::assert_eq!(
             table.recover(compact.selector(), template(1)),
             Err(RootLaneError::StaleGeneration {
                 presented: 1,
                 current: 2,
             })
         );
-        assert!(matches!(
+        __cser_core::assert!(__cser_core::matches!(
             table.recover(advanced.selector(), template(2)),
             Ok(RootAdmissionStatus::ExistingFull(_))
         ));
@@ -1837,7 +1963,7 @@ mod tests {
         table.advance(winner).unwrap();
         let before = table.full_snapshot();
         let failure = table.advance(stale).unwrap_err();
-        assert_eq!(
+        __cser_core::assert_eq!(
             failure.error(),
             RootLaneError::StaleGeneration {
                 presented: 1,
@@ -1845,12 +1971,12 @@ mod tests {
             }
         );
         let returned = failure.into_proof();
-        assert_eq!(key_coordinate(&returned.key), stale_coordinate);
-        assert!(matches!(
+        __cser_core::assert_eq!(key_coordinate(&returned.key), stale_coordinate);
+        __cser_core::assert!(__cser_core::matches!(
             table.pending_proof(&returned.key).unwrap().1,
             PendingProof::Advance { target, .. } if target.request_key() == request_key(3)
         ));
-        assert_eq!(table.full_snapshot(), before);
+        __cser_core::assert_eq!(table.full_snapshot(), before);
     }
 
     #[test]
@@ -1896,54 +2022,54 @@ mod tests {
         let permit_coordinate = key_coordinate(&permit.key);
         let before = table.full_snapshot();
         let failure = table.advance(permit).unwrap_err();
-        assert_eq!(failure.error(), RootLaneError::CounterOverflow);
+        __cser_core::assert_eq!(failure.error(), RootLaneError::CounterOverflow);
         let returned = failure.into_proof();
-        assert_eq!(key_coordinate(&returned.key), permit_coordinate);
-        assert!(matches!(
+        __cser_core::assert_eq!(key_coordinate(&returned.key), permit_coordinate);
+        __cser_core::assert!(__cser_core::matches!(
             table.pending_proof(&returned.key).unwrap().1,
             PendingProof::Advance { target, .. } if target.request_key() == request_key(2)
         ));
-        assert_eq!(table.full_snapshot(), before);
+        __cser_core::assert_eq!(table.full_snapshot(), before);
     }
 
     #[test]
     fn representation_is_bounded_and_full_test_snapshot_covers_contract_state() {
-        assert!(
+        __cser_core::assert!(
             size_of::<RootLane>() <= 224,
             "RootLane={}",
             size_of::<RootLane>()
         );
-        assert!(
+        __cser_core::assert!(
             size_of::<RootLaneObservation>() <= 224,
             "RootLaneObservation grew to {} bytes",
             size_of::<RootLaneObservation>()
         );
-        assert!(
+        __cser_core::assert!(
             size_of::<FreshScopePermit>() <= 64,
             "FreshScopePermit grew to {} bytes",
             size_of::<FreshScopePermit>()
         );
-        assert!(
+        __cser_core::assert!(
             size_of::<ClosureAckPermit>() <= 64,
             "ClosureAckPermit grew to {} bytes",
             size_of::<ClosureAckPermit>()
         );
-        assert!(
+        __cser_core::assert!(
             size_of::<ClearancePermit>() <= 64,
             "ClearancePermit grew to {} bytes",
             size_of::<ClearancePermit>()
         );
-        assert!(
+        __cser_core::assert!(
             size_of::<CompactLanePermit>() <= 64,
             "CompactLanePermit grew to {} bytes",
             size_of::<CompactLanePermit>()
         );
-        assert!(size_of::<FreshScopePermit>() + size_of::<RootSelector>() <= 96);
-        assert!(size_of::<LinearRootFailure<FreshScopePermit>>() <= 120);
-        assert!(size_of::<LinearRootFailure<ClosureAckPermit>>() <= 120);
-        assert!(size_of::<LinearRootFailure<ClearancePermit>>() <= 120);
-        assert!(size_of::<LinearRootFailure<CompactLanePermit>>() <= 120);
-        assert_eq!(
+        __cser_core::assert!(size_of::<FreshScopePermit>() + size_of::<RootSelector>() <= 96);
+        __cser_core::assert!(size_of::<LinearRootFailure<FreshScopePermit>>() <= 120);
+        __cser_core::assert!(size_of::<LinearRootFailure<ClosureAckPermit>>() <= 120);
+        __cser_core::assert!(size_of::<LinearRootFailure<ClearancePermit>>() <= 120);
+        __cser_core::assert!(size_of::<LinearRootFailure<CompactLanePermit>>() <= 120);
+        __cser_core::assert_eq!(
             size_of::<RootLaneTable<4>>(),
             2 * size_of::<u64>()
                 + 4 * size_of::<Option<RootLane>>()
@@ -1955,8 +2081,8 @@ mod tests {
         table.allocate(permit).unwrap();
         let before = table.full_snapshot();
         let Some(RootLane::Full { template, .. }) = before.lanes[0] else {
-            panic!("full contract missing from test snapshot");
+            __cser_core::panic!("full contract missing from test snapshot");
         };
-        assert_eq!(template, super::tests::template(1));
+        __cser_core::assert_eq!(template, super::tests::template(1));
     }
 }

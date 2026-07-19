@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: MPL-2.0
 
+extern crate alloc as __cser_alloc;
+extern crate core as __cser_core;
+
 use super::continuation::{apply_service_owned_continuation, prepare_service_owned_continuation};
 use super::{
     AuthorityKey, BearerKey, BearerStamp, BoundServiceCancellationOutcome, BoundServiceRequest,
@@ -829,7 +832,7 @@ fn mint_service_key<State: bearer_state::Sealed>(
         object_generation: stamp.identity.generation,
         bearer_generation: stamp.bearer_generation,
         nonce: stamp.nonce,
-        state: core::marker::PhantomData,
+        state: __cser_core::marker::PhantomData,
     }
 }
 
@@ -848,7 +851,7 @@ fn mint_service_bound_key<State: bearer_state::Sealed>(
         bearer_generation: stamp.bearer_generation,
         nonce: stamp.nonce,
         lineage_commitment,
-        state: core::marker::PhantomData,
+        state: __cser_core::marker::PhantomData,
     }
 }
 
@@ -1876,7 +1879,7 @@ fn two_task_records_mut(
 }
 
 pub(super) fn service_request_phase_live(phase: ServiceRequestPhase) -> bool {
-    !matches!(
+    !__cser_core::matches!(
         phase,
         ServiceRequestPhase::Completed { .. } | ServiceRequestPhase::Cancelled { .. }
     )

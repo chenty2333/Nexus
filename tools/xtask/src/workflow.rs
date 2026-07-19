@@ -645,7 +645,12 @@ fn validate_cold_rebuild_contract(root: &Path, frontdoor: &str) -> Result<()> {
                 .into());
             }
         }
-        if !source.contains("docker run --rm \\\n        --init") {
+        let container_prefix = if relative == "x" {
+            "docker run --rm \\\n        --init"
+        } else {
+            "command \"$docker_bin\" run --rm \\\n        --init"
+        };
+        if !source.contains(container_prefix) {
             return Err(format!("{relative} does not run containers under Docker init").into());
         }
     }
@@ -848,7 +853,7 @@ const CSER_FROZEN_TEST_MACRO_SOURCE: &str = "infrastructure/tests.rs";
 const CSER_FROZEN_TEST_MACROS: [(&str, &str, &[&str]); 4] = [
     (
         "assert_arm_plan_change",
-        "bd2acb1dd7cea6e3eb3c24f1bafee4ff2023464a86b08afe912cdca0560a4faf",
+        "4959d9dbf245fc82844e03fdefa640b496370eb523e915782b6807e818bda649",
         &[
             "3f440ef4a088f91b6de87db5324412e5b94073df5603a4d6c68b9ca31b71e24e",
             "596dee08fa52460dad17dbc37fb3078dcae936a81fabbc39e7f16282d03fe726",
@@ -858,12 +863,12 @@ const CSER_FROZEN_TEST_MACROS: [(&str, &str, &[&str]); 4] = [
     ),
     (
         "assert_arm_receipt_change",
-        "dfa418c41e5ed6d2824147b29738cc301f25452f2f1ffa4222bd14f0e651199d",
+        "6e6e413450d8081c04cb6c765324790d45fca6c854659b16e1c34277e52390e9",
         &["3f440ef4a088f91b6de87db5324412e5b94073df5603a4d6c68b9ca31b71e24e"],
     ),
     (
         "assert_enqueue_plan_change",
-        "2eb227aea66a16f5748e30c0cb13b06018a76d2a5a26b8a22f8e0fb91b9571dc",
+        "79c19ae03fa756fbcd24e997df71b221afd94079ab6e8144eaf5434e52b05173",
         &[
             "3f440ef4a088f91b6de87db5324412e5b94073df5603a4d6c68b9ca31b71e24e",
             "8d3f14cc12732bc75f6de7a2f68d2178692339a098a2813a1de2a72b518ad0d6",
@@ -873,7 +878,7 @@ const CSER_FROZEN_TEST_MACROS: [(&str, &str, &[&str]); 4] = [
     ),
     (
         "assert_enqueue_receipt_change",
-        "d432f6b9f6831896a733bafa9afa71efa28fe341c4d0542ade5fa3331aa54807",
+        "92a4ba8cb309c3de3f9ede77da959cbca264de38e3e9057859b1d92af3cfa8d5",
         &["3f440ef4a088f91b6de87db5324412e5b94073df5603a4d6c68b9ca31b71e24e"],
     ),
 ];
@@ -968,17 +973,17 @@ impl<'a> CserSourceMacroAudit<'a> {
 fn audited_cser_macro_path(name: &str) -> bool {
     matches!(
         name,
-        "alloc::format"
-            | "alloc::vec"
-            | "assert"
-            | "assert_eq"
-            | "assert_ne"
-            | "debug_assert"
-            | "debug_assert_eq"
-            | "debug_assert_ne"
-            | "matches"
-            | "panic"
-            | "unreachable"
+        "__cser_alloc::format"
+            | "__cser_alloc::vec"
+            | "__cser_core::assert"
+            | "__cser_core::assert_eq"
+            | "__cser_core::assert_ne"
+            | "__cser_core::debug_assert"
+            | "__cser_core::debug_assert_eq"
+            | "__cser_core::debug_assert_ne"
+            | "__cser_core::matches"
+            | "__cser_core::panic"
+            | "__cser_core::unreachable"
     )
 }
 
@@ -1008,7 +1013,16 @@ fn macro_path_before_bang(tokens: &[proc_macro2::TokenTree], bang_index: usize) 
         cursor -= 3;
     }
     segments.reverse();
-    Some(segments.join("::"))
+    let name = segments.join("::");
+    let absolute = cursor >= 2
+        && matches!(
+            (&tokens[cursor - 2], &tokens[cursor - 1]),
+            (
+                proc_macro2::TokenTree::Punct(first),
+                proc_macro2::TokenTree::Punct(second)
+            ) if first.as_char() == ':' && second.as_char() == ':'
+        );
+    Some(if absolute { format!("::{name}") } else { name })
 }
 
 fn reject_unreviewed_nested_macro(tokens: proc_macro2::TokenStream) -> Option<String> {
@@ -1048,17 +1062,33 @@ fn reject_source_construct_inside_macro(tokens: proc_macro2::TokenStream) -> Opt
         {
             return Some(rejected);
         }
-        if matches!(token, proc_macro2::TokenTree::Ident(ident) if ident == "mod") {
-            return Some("module item inside opaque macro tokens");
+        if let proc_macro2::TokenTree::Ident(ident) = token {
+            match ident.to_string().as_str() {
+                "mod" => return Some("module item inside opaque macro tokens"),
+                "use" | "extern" | "macro" | "macro_rules" => {
+                    return Some("binding item inside opaque macro tokens");
+                }
+                _ => {}
+            }
         }
         if matches!(token, proc_macro2::TokenTree::Punct(punctuation) if punctuation.as_char() == '#')
-            && matches!(
+        {
+            let bracket_offset = if matches!(
                 tokens.get(index + 1),
+                Some(proc_macro2::TokenTree::Punct(punctuation))
+                    if punctuation.as_char() == '!'
+            ) {
+                2
+            } else {
+                1
+            };
+            if matches!(
+                tokens.get(index + bracket_offset),
                 Some(proc_macro2::TokenTree::Group(group))
                     if group.delimiter() == proc_macro2::Delimiter::Bracket
-            )
-        {
-            return Some("attribute inside opaque macro tokens");
+            ) {
+                return Some("attribute inside opaque macro tokens");
+            }
         }
     }
     None
@@ -1071,18 +1101,18 @@ fn frozen_cser_test_macro(name: &str) -> bool {
 }
 
 fn source_macro_name(source_macro: &syn::Macro) -> Option<String> {
-    if source_macro.path.leading_colon.is_some() {
-        return None;
-    }
-    Some(
-        source_macro
-            .path
-            .segments
-            .iter()
-            .map(|segment| segment.ident.to_string())
-            .collect::<Vec<_>>()
-            .join("::"),
-    )
+    let name = source_macro
+        .path
+        .segments
+        .iter()
+        .map(|segment| segment.ident.to_string())
+        .collect::<Vec<_>>()
+        .join("::");
+    Some(if source_macro.path.leading_colon.is_some() {
+        format!("::{name}")
+    } else {
+        name
+    })
 }
 
 fn protected_cser_source_name(name: &str) -> bool {
@@ -1090,10 +1120,19 @@ fn protected_cser_source_name(name: &str) -> bool {
         || matches!(
             name,
             "alloc"
+                | "core"
+                | "__cser_alloc"
+                | "__cser_core"
+                | "assert"
+                | "assert_eq"
+                | "assert_ne"
                 | "Clone"
                 | "Copy"
                 | "Debug"
                 | "Default"
+                | "debug_assert"
+                | "debug_assert_eq"
+                | "debug_assert_ne"
                 | "Eq"
                 | "Ord"
                 | "PartialEq"
@@ -1102,8 +1141,13 @@ fn protected_cser_source_name(name: &str) -> bool {
                 | "cfg"
                 | "derive"
                 | "doc"
+                | "format"
+                | "matches"
+                | "panic"
                 | "path"
                 | "test"
+                | "unreachable"
+                | "vec"
         )
         || frozen_cser_test_macro(name)
 }
@@ -1164,26 +1208,33 @@ fn audit_cser_attribute(attribute: &syn::Attribute) -> Option<String> {
             };
             let mut seen = BTreeSet::new();
             for path in paths {
-                if path.leading_colon.is_some() || path.segments.len() != 1 {
-                    return Some("derive attribute uses a qualified trait".to_owned());
-                }
-                let trait_name = path.segments[0].ident.to_string();
-                if !matches!(
-                    trait_name.as_str(),
-                    "Clone"
-                        | "Copy"
-                        | "Debug"
-                        | "Default"
-                        | "Eq"
-                        | "Ord"
-                        | "PartialEq"
-                        | "PartialOrd"
-                ) {
+                let trait_path = path
+                    .segments
+                    .iter()
+                    .map(|segment| segment.ident.to_string())
+                    .collect::<Vec<_>>()
+                    .join("::");
+                let trait_name = match trait_path.as_str() {
+                    "__cser_core::clone::Clone" => "Clone",
+                    "__cser_core::marker::Copy" => "Copy",
+                    "__cser_core::fmt::Debug" => "Debug",
+                    "__cser_core::default::Default" => "Default",
+                    "__cser_core::cmp::Eq" => "Eq",
+                    "__cser_core::cmp::Ord" => "Ord",
+                    "__cser_core::cmp::PartialEq" => "PartialEq",
+                    "__cser_core::cmp::PartialOrd" => "PartialOrd",
+                    _ => {
+                        return Some(format!(
+                            "derive attribute uses unaudited trait path {trait_path}"
+                        ));
+                    }
+                };
+                if path.leading_colon.is_some() {
                     return Some(format!(
-                        "derive attribute uses unaudited trait {trait_name}"
+                        "derive attribute uses an absolute path instead of the local sysroot alias: {trait_path}"
                     ));
                 }
-                if !seen.insert(trait_name.clone()) {
+                if !seen.insert(trait_name) {
                     return Some(format!("derive attribute duplicates trait {trait_name}"));
                 }
             }
@@ -1250,9 +1301,16 @@ fn audit_cser_attribute(attribute: &syn::Attribute) -> Option<String> {
     }
 }
 
+// A module-local `extern crate core/alloc as __cser_*` closes lexical owner
+// shadowing, including inline-module consumers. It does not make rustc itself
+// a root of trust: the pinned compiler/sysroot, Cargo manifests/configuration,
+// build-std's actual --extern coordinates, and the absence of an injected
+// compiler wrapper remain explicit build TCB inputs.
 struct CserSourceProvenanceAudit<'a> {
     source_relative: &'a Path,
     frozen_super_globs: usize,
+    local_sysroot_aliases: BTreeMap<Vec<String>, (usize, usize)>,
+    inline_module_scopes: BTreeSet<Vec<String>>,
     module_path: Vec<String>,
     frozen_test_module: bool,
     rejected: Option<String>,
@@ -1263,6 +1321,8 @@ impl<'a> CserSourceProvenanceAudit<'a> {
         Self {
             source_relative,
             frozen_super_globs: 0,
+            local_sysroot_aliases: BTreeMap::new(),
+            inline_module_scopes: BTreeSet::new(),
             module_path: Vec::new(),
             frozen_test_module: false,
             rejected: None,
@@ -1272,6 +1332,30 @@ impl<'a> CserSourceProvenanceAudit<'a> {
     fn finish(self) -> Option<String> {
         if self.rejected.is_some() {
             return self.rejected;
+        }
+        let mut expected_alias_scopes = self.inline_module_scopes;
+        expected_alias_scopes.insert(Vec::new());
+        let actual_alias_scopes = self
+            .local_sysroot_aliases
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if actual_alias_scopes != expected_alias_scopes {
+            return Some(format!(
+                "CSER source local sysroot alias scopes differ; expected={expected_alias_scopes:?}, actual={actual_alias_scopes:?}"
+            ));
+        }
+        for scope in expected_alias_scopes {
+            let aliases = self
+                .local_sysroot_aliases
+                .get(&scope)
+                .copied()
+                .unwrap_or_default();
+            if aliases != (1, 1) {
+                return Some(format!(
+                    "CSER module {scope:?} must retain one exact local alloc/core alias; found={aliases:?}"
+                ));
+            }
         }
         let expected =
             usize::from(self.source_relative == Path::new("effect_registry/root_lanes.rs"));
@@ -1316,6 +1400,13 @@ impl<'ast> syn::visit::Visit<'ast> for CserSourceProvenanceAudit<'_> {
         if self.rejected.is_some() {
             return;
         }
+        if protected_cser_source_name(&item_mod.ident.to_string()) {
+            self.rejected = Some(format!(
+                "module binds protected source name {}",
+                item_mod.ident
+            ));
+            return;
+        }
         let was_frozen_test_module = self.frozen_test_module;
         self.frozen_test_module = self.module_path.is_empty()
             && item_mod.ident == "tests"
@@ -1327,24 +1418,51 @@ impl<'ast> syn::visit::Visit<'ast> for CserSourceProvenanceAudit<'_> {
                         && list.tokens.to_string() == "test"
             );
         self.module_path.push(item_mod.ident.to_string());
+        if item_mod.content.is_some() {
+            self.inline_module_scopes.insert(self.module_path.clone());
+        }
         syn::visit::visit_item_mod(self, item_mod);
         self.module_path.pop();
         self.frozen_test_module = was_frozen_test_module;
     }
 
     fn visit_item_extern_crate(&mut self, extern_crate: &'ast syn::ItemExternCrate) {
-        let binding = extern_crate
-            .rename
-            .as_ref()
-            .map_or(&extern_crate.ident, |(_, rename)| rename)
-            .to_string();
-        if self.rejected.is_none() && protected_cser_source_name(&binding) {
-            self.rejected = Some(format!(
-                "extern crate binds protected source name {binding}"
-            ));
+        if self.rejected.is_some() {
+            return;
         }
-        if self.rejected.is_none() {
-            syn::visit::visit_item_extern_crate(self, extern_crate);
+        let exact_private_alias = extern_crate.attrs.is_empty()
+            && matches!(extern_crate.vis, syn::Visibility::Inherited)
+            && extern_crate
+                .rename
+                .as_ref()
+                .is_some_and(|(_, rename)| {
+                    (extern_crate.ident == "alloc" && rename == "__cser_alloc")
+                        || (extern_crate.ident == "core" && rename == "__cser_core")
+                });
+        if !exact_private_alias {
+            let binding = extern_crate
+                .rename
+                .as_ref()
+                .map_or(&extern_crate.ident, |(_, rename)| rename);
+            self.rejected = Some(format!(
+                "extern crate {binding} is not an exact private module-root CSER sysroot alias"
+            ));
+            return;
+        }
+        let aliases = self
+            .local_sysroot_aliases
+            .entry(self.module_path.clone())
+            .or_default();
+        if extern_crate.ident == "alloc" {
+            aliases.0 += 1;
+            if aliases.0 != 1 {
+                self.rejected = Some("duplicate __cser_alloc sysroot alias".to_owned());
+            }
+        } else {
+            aliases.1 += 1;
+            if aliases.1 != 1 {
+                self.rejected = Some("duplicate __cser_core sysroot alias".to_owned());
+            }
         }
     }
 }
@@ -1799,8 +1917,24 @@ fn validate_backend_source_pair(
     source_root: &str,
     files: &[String],
 ) -> Result<()> {
+    if source.lines().next() != Some("#!/usr/bin/bash -p") {
+        return Err(format!(
+            "{relative} must use the exact privileged absolute Bash interpreter"
+        )
+        .into());
+    }
     let logical = continued_shell_lines(source)?;
     let active = logical.join("\n");
+    // Raw bytes, including the interpreter line, are checked only after the
+    // semantic gates below. This keeps each negative test on its intended
+    // rejection branch while still binding every late function and command.
+    let expected_source_sha256 = match relative {
+        "kernel/nexus-ostd/x" => "4cd29767f47e1ec55cb07e2625065306170d77a818597667ff53c2ce9820d751",
+        "experiments/ostd-virtio-cser-spike/x" => {
+            "e51d863a8134cfd8b25ff33438441c73a93f6548ea0202fad54a6c4270153ee9"
+        }
+        _ => return Err(format!("unknown production backend workflow: {relative}").into()),
+    };
     let expected_manifest_assignment = match relative {
         "kernel/nexus-ostd/x" => {
             r#"production_source_manifest="$root/cser-production-sources.txt""#
@@ -1823,9 +1957,9 @@ fn validate_backend_source_pair(
         _ => return Err(format!("unknown production backend workflow: {relative}").into()),
     };
     let expected_prelude_sha256 = match relative {
-        "kernel/nexus-ostd/x" => "8ae3066a58c4759d2b3bf86ba2edf3a4309f66c46ddc8e3c5b72a22921b0b9f3",
+        "kernel/nexus-ostd/x" => "d4df2814513b02f39046f899da30b40815502e705918ddd5a2d83c6b475b2c55",
         "experiments/ostd-virtio-cser-spike/x" => {
-            "ac34448a81a2c78cffe4d3e6d02f303544e80e2684412bd9bf48fe1d36a8fedd"
+            "c287287fbe0148687c7fd2f3b2b8585b34bea8c94f49275dfa70d7a6321f252f"
         }
         _ => return Err(format!("unknown production backend workflow: {relative}").into()),
     };
@@ -1864,6 +1998,16 @@ fn validate_backend_source_pair(
         .into());
     }
     for required in [
+        "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "readonly PATH",
+        "docker_bin=/usr/bin/docker",
+        r#"if [[ ! -f $docker_bin || ! -x $docker_bin || -L $docker_bin ]] || [[ $(/usr/bin/realpath -e -- "$docker_bin") != "$docker_bin" ]]; then"#,
+        "readonly docker_bin",
+        r#"capture_helper="$root/scripts/qemu-stream-capture.sh""#,
+        "capture_helper_sha256=b05544fb66e5d124fb141696accb1933742de561469f1c9e4a12eef3c6c5e7b7",
+        r#"if [[ ! -f $capture_helper || -L $capture_helper ]] || [[ $(/usr/bin/realpath -e -- "$capture_helper") != "$capture_helper" ]]; then"#,
+        r#"if [[ $(/usr/bin/sha256sum -- "$capture_helper" | /usr/bin/cut -d ' ' -f1) != "$capture_helper_sha256" ]]; then"#,
+        "readonly capture_helper capture_helper_sha256",
         expected_manifest_assignment,
         r#"if [[ ! -f $production_source_manifest || -L $production_source_manifest ]] || [[ $(realpath -e -- "$production_source_manifest") != "$production_source_manifest" ]]; then"#,
         r#"mapfile -t cser_production_sources <"$production_source_manifest""#,
@@ -1890,6 +2034,17 @@ fn validate_backend_source_pair(
     {
         return Err(format!(
             "{relative} must derive hash and mount arrays only once from the canonical manifest"
+        )
+        .into());
+    }
+    let expected_helper_sources = if relative == "kernel/nexus-ostd/x" {
+        4
+    } else {
+        1
+    };
+    if active.matches(r#"source "$capture_helper""#).count() != expected_helper_sources {
+        return Err(format!(
+            "{relative} must source only the raw-frozen QEMU capture helper at its exact reviewed sites"
         )
         .into());
     }
@@ -1930,7 +2085,7 @@ fn validate_backend_source_pair(
     let container_lines = continued_shell_lines(container)?;
     let docker_runs = container_lines
         .iter()
-        .filter(|line| line.starts_with("docker run --rm "))
+        .filter(|line| line.starts_with(r#"command "$docker_bin" run --rm "#))
         .collect::<Vec<_>>();
     if docker_runs.len() != 1 {
         return Err(format!("{relative} must have one canonical container command").into());
@@ -1970,6 +2125,13 @@ fn validate_backend_source_pair(
             .into());
         }
     }
+    let source_sha256 = sha256(source.as_bytes());
+    if source_sha256 != expected_source_sha256 {
+        return Err(format!(
+            "{relative} raw authority source drifted: expected {expected_source_sha256}, found {source_sha256}"
+        )
+        .into());
+    }
     Ok(())
 }
 
@@ -1978,6 +2140,10 @@ fn validate_backend_docker_source_set(
     dockerfile: &str,
     files: &[String],
 ) -> Result<()> {
+    // The fresh verifier stage prevents repository-controlled build steps from
+    // replacing the candidate tree or its audit tools. The pinned frontend/base
+    // image, BuildKit stage-snapshot and read-only-mount semantics, and the
+    // host-context snapshot between this gate and BuildKit remain explicit TCB.
     if dockerfile.lines().next() != Some(PINNED_DOCKER_SYNTAX) {
         return Err(format!("{relative} must retain the exact pinned Docker syntax").into());
     }
@@ -2006,38 +2172,25 @@ fn validate_backend_docker_source_set(
         "experiments/ostd-virtio-cser-spike/Dockerfile" => "COPY --from=nexus-root ",
         _ => return Err(format!("unknown production backend Dockerfile: {relative}").into()),
     };
-    // This freezes the normalized final RUN instruction. It is intentionally
-    // paired with semantic instruction checks and real BuildKit execution so a
-    // digest update cannot silently weaken the cold-image byte/inventory proof.
-    let expected_audit_sha256 = match relative {
+    let expected_verifier_sha256 = match relative {
         "kernel/nexus-ostd/Dockerfile" => {
-            "fdf74ae4f564db845ac66f6c600ca623126082cea956bf4d6f7ea90ca2ea3b02"
+            "e34a04b60781fda89688343feae03b388da0888b53a3c1e925e9b8f324f62a5c"
         }
         "experiments/ostd-virtio-cser-spike/Dockerfile" => {
-            "60d2e36b17735e555f8bf848e1070618fa08bbf466d89f1ba062c9ca3aebf140"
+            "65d4f1517e342ca620afe57feace001cb5f12aff620522f501cfcb2cb4eab6cb"
         }
         _ => return Err(format!("unknown production backend Dockerfile: {relative}").into()),
     };
-    // Freeze the complete normalized instruction vector as well. The final
-    // audit trusts the pinned base image's cmp/find/awk/sort toolchain, so an
-    // earlier RUN or ENV must not be able to replace or redirect those tools.
-    let expected_instruction_sha256 = match relative {
+    let expected_raw_sha256 = match relative {
         "kernel/nexus-ostd/Dockerfile" => {
-            "a7063f9993ab6100424ce090bb9648ed085e62e2d428966276af02a612ab4048"
+            "874b7cb859ba9648bf44bb33d116a8994abcc331aebb26913ddf3797651cebe2"
         }
         "experiments/ostd-virtio-cser-spike/Dockerfile" => {
-            "863db4df637354424a0643a3a927df32762ca39df8f2cd09952b9214d2d91449"
+            "ff5f4c0129632991a4da032b7255af1ff763de6ced6b44dc25f084fa78651411"
         }
         _ => return Err(format!("unknown production backend Dockerfile: {relative}").into()),
     };
     let logical = continued_shell_lines(dockerfile)?;
-    let instruction_sha256 = sha256(logical.join("\n").as_bytes());
-    if instruction_sha256 != expected_instruction_sha256 {
-        return Err(format!(
-            "{relative} normalized Docker instruction vector drifted: expected {expected_instruction_sha256}, found {instruction_sha256}"
-        )
-        .into());
-    }
     for (index, line) in logical.iter().enumerate() {
         let opcode = line
             .split_ascii_whitespace()
@@ -2065,12 +2218,12 @@ fn validate_backend_docker_source_set(
             return Err(format!("{relative} uses unaudited Docker instruction {uppercase}").into());
         }
         if uppercase == "RUN"
-            && index + 1 != logical.len()
             && (line.contains("/kernel/nexus-ostd/src/cser")
                 || line.contains("/kernel/nexus-ostd/cser-production-sources.txt"))
+            && index + 3 != logical.len()
         {
             return Err(format!(
-                "{relative} may mutate the cold CSER tree only through the exact final audit"
+                "{relative} may inspect the cold CSER tree only in the isolated verifier stage"
             )
             .into());
         }
@@ -2079,19 +2232,74 @@ fn validate_backend_docker_source_set(
         .iter()
         .filter(|line| line.starts_with("FROM "))
         .collect::<Vec<_>>()
-        != ["FROM ${OSDK_IMAGE}"]
-    {
-        return Err(format!("{relative} must retain one exact unnamed final stage").into());
-    }
-    let final_instruction = logical
-        .last()
-        .ok_or_else(|| format!("{relative} has no Docker instructions"))?;
-    let final_audit_sha256 = sha256(final_instruction.as_bytes());
-    if !final_instruction.starts_with("RUN --mount=type=bind,")
-        || final_audit_sha256 != expected_audit_sha256
+        != [
+            "FROM ${OSDK_IMAGE} AS build",
+            "FROM ${OSDK_IMAGE} AS cser-verifier",
+            "FROM build AS final",
+        ]
     {
         return Err(format!(
-            "{relative} must end with the exact read-only CSER byte and inventory audit: expected {expected_audit_sha256}, found {final_audit_sha256}"
+            "{relative} must retain the exact build, fresh verifier, and marker-only final stages"
+        )
+        .into());
+    }
+    let tail = logical
+        .get(logical.len().saturating_sub(4)..)
+        .ok_or_else(|| format!("{relative} has no complete verifier/final stage tail"))?;
+    let expected_verifier_from = "FROM ${OSDK_IMAGE} AS cser-verifier";
+    let expected_final_from = "FROM build AS final";
+    let expected_final_copy = "COPY --from=cser-verifier /verified /nexus-cser-verified";
+    if tail[0] != expected_verifier_from
+        || tail[2] != expected_final_from
+        || tail[3] != expected_final_copy
+    {
+        return Err(format!(
+            "{relative} must end with one fresh verifier RUN and the sole final proof-marker COPY"
+        )
+        .into());
+    }
+    let verifier = &tail[1];
+    let expected_context_mount = match relative {
+        "kernel/nexus-ostd/Dockerfile" => {
+            "--mount=type=bind,source=kernel/nexus-ostd,target=/expected-kernel,readonly"
+        }
+        "experiments/ostd-virtio-cser-spike/Dockerfile" => {
+            "--mount=type=bind,from=nexus-root,source=kernel/nexus-ostd,target=/expected-kernel,readonly"
+        }
+        _ => unreachable!("relative checked above"),
+    };
+    for required in [
+        "RUN --network=none",
+        "--mount=type=bind,from=build,source=/,target=/candidate-root,readonly",
+        expected_context_mount,
+        "test ! -e /candidate-root/nexus-cser-verified",
+        "test ! -L /candidate-root/nexus-cser-verified",
+        "/usr/bin/cmp /tmp/nexus-cser-expected /tmp/nexus-cser-candidate",
+        "chmod 0444 /verified",
+    ] {
+        if verifier.matches(required).count() != 1 {
+            return Err(format!(
+                "{relative} isolated verifier lacks one canonical proof step: {required}"
+            )
+            .into());
+        }
+    }
+    if verifier.matches("nexus.cser.image-source-proof.v1").count() != 2 {
+        return Err(format!(
+            "{relative} verifier must bind the proof schema into both aggregate input and marker"
+        )
+        .into());
+    }
+    if verifier.matches("test ! -L /verified").count() != 2 {
+        return Err(format!(
+            "{relative} verifier must reject a pre-existing and a substituted proof-marker symlink"
+        )
+        .into());
+    }
+    let verifier_sha256 = sha256(verifier.as_bytes());
+    if verifier_sha256 != expected_verifier_sha256 {
+        return Err(format!(
+            "{relative} isolated verifier drifted: expected {expected_verifier_sha256}, found {verifier_sha256}"
         )
         .into());
     }
@@ -2129,6 +2337,13 @@ fn validate_backend_docker_source_set(
         )
         .into());
     }
+    let raw_sha256 = sha256(dockerfile.as_bytes());
+    if raw_sha256 != expected_raw_sha256 {
+        return Err(format!(
+            "{relative} raw authority source drifted: expected {expected_raw_sha256}, found {raw_sha256}"
+        )
+        .into());
+    }
     Ok(())
 }
 
@@ -2160,7 +2375,7 @@ fn validate_portal_abi_image_binding(kernel: &str, kernel_dockerfile: &str) -> R
     let container_lines = continued_shell_lines(container)?;
     let docker_runs = container_lines
         .iter()
-        .filter(|line| line.starts_with("docker run --rm "))
+        .filter(|line| line.starts_with(r#"command "$docker_bin" run --rm "#))
         .collect::<Vec<_>>();
     let portal_mount = r#"-v "$repo_root/crates/nexus-portal-abi:/crates/nexus-portal-abi:ro,z""#;
     if docker_runs.len() != 1 {
@@ -2181,7 +2396,47 @@ fn validate_portal_abi_image_binding(kernel: &str, kernel_dockerfile: &str) -> R
     Ok(())
 }
 
+const QEMU_CAPTURE_HELPER_SHA256: &str =
+    "b05544fb66e5d124fb141696accb1933742de561469f1c9e4a12eef3c6c5e7b7";
+const QEMU_CAPTURE_HELPERS: [&str; 2] = [
+    "kernel/nexus-ostd/scripts/qemu-stream-capture.sh",
+    "experiments/ostd-virtio-cser-spike/scripts/qemu-stream-capture.sh",
+];
+
+fn validate_qemu_capture_helper_bytes(relative: &str, source: &[u8]) -> Result<()> {
+    let found = sha256(source);
+    if found != QEMU_CAPTURE_HELPER_SHA256 {
+        return Err(format!(
+            "{relative} raw helper source drifted: expected {QEMU_CAPTURE_HELPER_SHA256}, found {found}"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn validate_qemu_capture_helpers(root: &Path) -> Result<()> {
+    let mut canonical = None;
+    for relative in QEMU_CAPTURE_HELPERS {
+        require_plain_regular_file_below(
+            root,
+            Path::new(relative),
+            "QEMU capture authority helper",
+        )?;
+        let source = fs::read(root.join(relative))?;
+        validate_qemu_capture_helper_bytes(relative, &source)?;
+        if let Some(expected) = &canonical {
+            if expected != &source {
+                return Err("QEMU capture authority helpers must remain byte-identical".into());
+            }
+        } else {
+            canonical = Some(source);
+        }
+    }
+    Ok(())
+}
+
 fn validate_backend_source_binding(root: &Path) -> Result<()> {
+    validate_qemu_capture_helpers(root)?;
     let production_files = cser_production_source_files(root)?;
     for (relative, source_root) in [
         ("kernel/nexus-ostd/x", "$root/src/cser"),
@@ -3735,8 +3990,8 @@ mod tests {
         ] {
             let dockerfile = fs::read_to_string(root.join(relative)).expect("read Dockerfile");
             validate_backend_docker_source_set(relative, &dockerfile, &production_files)
-                .expect("exact single-stage cold CSER image");
-            let insertion = "# The final filesystem mutation proves";
+                .expect("exact isolated-verifier cold CSER image");
+            let insertion = "# Audit the immutable build-stage snapshot";
 
             for (name, instruction) in [
                 (
@@ -3767,6 +4022,10 @@ mod tests {
                     "audit tool shadow",
                     "RUN ln -sf /bin/true /usr/local/bin/cmp",
                 ),
+                (
+                    "reserved marker symlink",
+                    "RUN ln -s /kernel/nexus-ostd/src/cser /nexus-cser-verified",
+                ),
                 ("audit path redirect", "ENV PATH=/tmp/attacker:/usr/bin"),
                 ("second final stage", "FROM ${OSDK_IMAGE}"),
             ] {
@@ -3795,7 +4054,7 @@ mod tests {
                     "RUN <<EOF\n",
                     "COPY hidden.rs /kernel/nexus-ostd/src/cser/hidden.rs\n",
                     "EOF\n",
-                    "# The final filesystem mutation proves"
+                    "# Audit the immutable build-stage snapshot"
                 ),
                 1,
             );
@@ -3804,13 +4063,39 @@ mod tests {
                 .expect_err("Docker and shell heredocs are outside the audited grammar");
 
             let weakened_audit = dockerfile.replacen(
-                "cmp /tmp/nexus-cser-expected /tmp/nexus-cser-actual;",
-                "test -f /tmp/nexus-cser-actual;",
+                "/usr/bin/cmp /tmp/nexus-cser-expected /tmp/nexus-cser-candidate;",
+                "test -f /tmp/nexus-cser-candidate;",
                 1,
             );
             assert_ne!(weakened_audit, dockerfile);
             validate_backend_docker_source_set(relative, &weakened_audit, &production_files)
                 .expect_err("the final exact inventory comparison may not be weakened");
+
+            let writable_candidate = dockerfile.replacen(
+                "target=/candidate-root,readonly",
+                "target=/candidate-root",
+                1,
+            );
+            assert_ne!(writable_candidate, dockerfile);
+            validate_backend_docker_source_set(
+                relative,
+                &writable_candidate,
+                &production_files,
+            )
+            .expect_err("the verifier must inspect an immutable build-stage snapshot");
+
+            let redirected_marker = dockerfile.replacen(
+                "COPY --from=cser-verifier /verified /nexus-cser-verified",
+                "COPY --from=cser-verifier /verified /kernel/nexus-ostd/src/cser/verified",
+                1,
+            );
+            assert_ne!(redirected_marker, dockerfile);
+            validate_backend_docker_source_set(
+                relative,
+                &redirected_marker,
+                &production_files,
+            )
+            .expect_err("the proof marker must remain at the reserved direct-root path");
 
             let post_audit_write = format!(
                 "{dockerfile}\nRUN cp /tmp/hidden.rs /kernel/nexus-ostd/src/cser/hidden.rs\n"
@@ -3946,17 +4231,42 @@ mod tests {
         let source_path = root.join("effect_registry.rs");
 
         let safe = concat!(
+            "extern crate alloc as __cser_alloc;\n",
+            "extern crate core as __cser_core;\n",
             "pub fn safe(value: bool) {\n",
-            "    assert!(matches!(value, true | false));\n",
-            "    assert!(!value || 1 != 2);\n",
+            "    __cser_core::assert!(__cser_core::matches!(value, true | false));\n",
+            "    __cser_core::assert!(!value || 1 != 2);\n",
             "}\n",
         );
         fs::write(&source_path, safe).expect("write safe source fixture");
         let mut safe_closure = BTreeSet::new();
         collect_external_module_closure(root, Path::new("effect_registry.rs"), &mut safe_closure)
             .expect("audited non-source macros remain permitted");
+        let safe_inline = format!(
+            "{safe}\nmod child {{\n    extern crate alloc as __cser_alloc;\n    extern crate core as __cser_core;\n    #[derive(__cser_core::marker::Copy, __cser_core::clone::Clone)]\n    struct Local;\n}}\n"
+        );
+        fs::write(&source_path, &safe_inline).expect("write safe inline-module fixture");
+        let mut safe_inline_closure = BTreeSet::new();
+        collect_external_module_closure(
+            root,
+            Path::new("effect_registry.rs"),
+            &mut safe_inline_closure,
+        )
+        .expect("each inline module retains its own exact sysroot aliases");
 
         for (name, mutation) in [
+            (
+                "inline module missing local sysroot aliases",
+                format!("{safe}\nmod child {{ pub fn local() {{}} }}\n"),
+            ),
+            (
+                "crate-self core alias",
+                format!("{safe}\nextern crate self as core;\n"),
+            ),
+            (
+                "unqualified derive macro",
+                format!("{safe}\n#[derive(Clone)]\nstruct Hidden;\n"),
+            ),
             (
                 "inline external module",
                 format!("{safe}\nmod outer {{ mod hidden; }}\n"),
@@ -3972,7 +4282,7 @@ mod tests {
             (
                 "nested include expression",
                 format!(
-                    "{safe}\npub fn hidden() -> bool {{ assert!(include!(\"hidden.rs\")); true }}\n"
+                    "{safe}\npub fn hidden() -> bool {{ __cser_core::assert!(include!(\"hidden.rs\")); true }}\n"
                 ),
             ),
             (
@@ -3990,25 +4300,57 @@ mod tests {
             (
                 "nested dynamic macro",
                 format!(
-                    "{safe}\npub fn hidden() -> bool {{ assert!(make_hidden_source!()); true }}\n"
+                    "{safe}\npub fn hidden() -> bool {{ __cser_core::assert!(make_hidden_source!()); true }}\n"
                 ),
             ),
             (
                 "external module hidden in allowed macro tokens",
                 format!(
-                    "{safe}\npub fn hidden() {{ assert!({{ #[path = \"hidden.rs\"] mod hidden; true }}); }}\n"
+                    "{safe}\npub fn hidden() {{ __cser_core::assert!({{ #[path = \"hidden.rs\"] mod hidden; true }}); }}\n"
                 ),
             ),
             (
                 "attribute hidden in allowed macro tokens",
                 format!(
-                    "{safe}\npub fn hidden() {{ assert!({{ #[allow(unused)] let hidden = true; hidden }}); }}\n"
+                    "{safe}\npub fn hidden() {{ __cser_core::assert!({{ #[allow(unused)] let hidden = true; hidden }}); }}\n"
+                ),
+            ),
+            (
+                "inner attribute hidden in allowed macro tokens",
+                format!(
+                    "{safe}\npub fn hidden() {{ __cser_core::assert!({{ #![loader(\"hidden.rs\")] true }}); }}\n"
+                ),
+            ),
+            (
+                "macro alias binding hidden in allowed macro tokens",
+                format!(
+                    "{safe}\npub fn hidden() {{ __cser_core::assert!({{ use core::include as assert_eq; assert_eq!(\"hidden.rs\"); true }}); }}\n"
                 ),
             ),
             (
                 "allowed macro name imported as include alias",
                 format!(
                     "{safe}\nuse core::include as assert;\npub fn hidden() {{ assert!(\"hidden.rs\"); }}\n"
+                ),
+            ),
+            (
+                "audited alloc macro path shadowed by local module",
+                format!(
+                    "{safe}\nmod __cser_alloc {{ pub use core::assert as vec; }}\npub fn hidden() {{ __cser_alloc::vec!(true); }}\n"
+                ),
+            ),
+            (
+                "unqualified builtin macro",
+                format!("{safe}\npub fn hidden() {{ assert!(true); }}\n"),
+            ),
+            (
+                "unqualified alloc macro",
+                format!("{safe}\npub fn hidden() {{ alloc::vec!(true); }}\n"),
+            ),
+            (
+                "audited alloc macro terminal name imported from another macro",
+                format!(
+                    "{safe}\nmod helper {{ pub use core::assert as format; }}\nuse helper::format;\n"
                 ),
             ),
             (
@@ -4279,6 +4621,21 @@ mod tests {
     }
 
     #[test]
+    fn qemu_capture_authority_helper_is_raw_frozen_and_shared() {
+        let root = repository_root();
+        validate_qemu_capture_helpers(&root).expect("exact shared QEMU capture helper");
+        let kernel = fs::read(root.join(QEMU_CAPTURE_HELPERS[0]))
+            .expect("read kernel QEMU capture helper");
+        let spike = fs::read(root.join(QEMU_CAPTURE_HELPERS[1]))
+            .expect("read spike QEMU capture helper");
+        assert_eq!(kernel, spike);
+        let mut mutation = kernel;
+        mutation.extend_from_slice(b"\nfunction /usr/bin/docker { return 0; }\n");
+        validate_qemu_capture_helper_bytes(QEMU_CAPTURE_HELPERS[0], &mutation)
+            .expect_err("a helper-side slash-named Docker function must fail raw provenance");
+    }
+
+    #[test]
     fn production_build_surfaces_keep_cache_evidence_and_source_identity_separate() {
         let root = repository_root();
         let frontdoor = fs::read_to_string(root.join("x")).expect("read root workflow");
@@ -4409,6 +4766,28 @@ mod tests {
             let source = fs::read_to_string(root.join(relative)).expect("read backend workflow");
             validate_backend_source_pair(relative, &source, source_root, &production_files)
                 .expect("manifest-driven source binding");
+
+            let unprivileged_interpreter =
+                source.replacen("#!/usr/bin/bash -p", "#!/usr/bin/bash", 1);
+            assert_ne!(unprivileged_interpreter, source);
+            validate_backend_source_pair(
+                relative,
+                &unprivileged_interpreter,
+                source_root,
+                &production_files,
+            )
+            .expect_err("the backend shell must ignore exported functions and startup hooks");
+
+            let path_resolved_interpreter =
+                source.replacen("#!/usr/bin/bash", "#!/usr/bin/env bash", 1);
+            assert_ne!(path_resolved_interpreter, source);
+            validate_backend_source_pair(
+                relative,
+                &path_resolved_interpreter,
+                source_root,
+                &production_files,
+            )
+            .expect_err("the production backend interpreter may not be PATH-resolved");
 
             let manifest_symlink_bypass =
                 source.replacen(" || -L $production_source_manifest", "", 1);
@@ -4574,6 +4953,57 @@ mod tests {
                 &production_files,
             )
             .expect_err("source mounts after the image are container command arguments");
+
+            for (name, insertion) in [
+                (
+                    "late Docker function shadow",
+                    "docker() { return 0; }\nrunner_base=",
+                ),
+                (
+                    "late command function shadow",
+                    "command() { return 0; }\nrunner_base=",
+                ),
+                (
+                    "late slash-named Docker function shadow",
+                    "function /usr/bin/docker { return 0; }\nrunner_base=",
+                ),
+                (
+                    "late PATH shadow",
+                    "PATH=/tmp/nexus-attacker:$PATH\nrunner_base=",
+                ),
+            ] {
+                let mutation = source.replacen("runner_base=", insertion, 1);
+                assert_ne!(mutation, source, "{name} fixture must mutate");
+                validate_backend_source_pair(relative, &mutation, source_root, &production_files)
+                    .expect_err("late command provenance changes must be script-vector bound");
+            }
+
+            let mutable_docker_path = source.replacen("readonly docker_bin\n", "", 1);
+            assert_ne!(mutable_docker_path, source);
+            validate_backend_source_pair(
+                relative,
+                &mutable_docker_path,
+                source_root,
+                &production_files,
+            )
+            .expect_err("the absolute Docker command path must be immutable");
+
+            let mutable_path = source.replacen("readonly PATH\n", "", 1);
+            assert_ne!(mutable_path, source);
+            validate_backend_source_pair(relative, &mutable_path, source_root, &production_files)
+                .expect_err("the host command search path must be immutable");
+
+            let unbound_helper =
+                source.replacen(r#"source "$capture_helper""#, "source /tmp/attacker", 1);
+            assert_ne!(unbound_helper, source);
+            validate_backend_source_pair(relative, &unbound_helper, source_root, &production_files)
+                .expect_err("the backend may source only the raw-frozen helper");
+
+            let bare_docker =
+                source.replacen(r#"command "$docker_bin" run --rm"#, "docker run --rm", 1);
+            assert_ne!(bare_docker, source);
+            validate_backend_source_pair(relative, &bare_docker, source_root, &production_files)
+                .expect_err("container execution may not use a PATH-resolved Docker command");
         }
 
         let production_registry =

@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: MPL-2.0
 
+extern crate alloc as __cser_alloc;
+extern crate core as __cser_core;
+
 use super::{
     AppliedFaultDisposition, ArmedFaultEvent, BearerStamp, EnteredTaskLease, FaultDescriptor,
     FaultDisposition, FaultDispositionPlan, FaultEvent, FaultObservation, FaultPhase,
@@ -30,7 +33,7 @@ impl InfrastructureState {
             || task.0.identity.vm.map(VmAuthorityKey::generation) != Some(descriptor.vm_generation)
             || descriptor.service_domain != task.0.domain.domain
             || descriptor.service_binding_epoch != task.0.domain.binding_epoch
-            || !matches!(
+            || !__cser_core::matches!(
                 task.0.identity.role,
                 TaskWorkRole::ServiceRequest | TaskWorkRole::ReplacementRecovery
             )
@@ -49,7 +52,7 @@ impl InfrastructureState {
             };
         }
         if scope.faults.iter().any(|record| {
-            matches!(record.phase, FaultPhase::Reserved)
+            __cser_core::matches!(record.phase, FaultPhase::Reserved)
                 && record.stamp.identity.task == descriptor.task
         }) {
             return Err(InfrastructureError::IdentityConflict);
@@ -375,7 +378,10 @@ impl InfrastructureState {
                 FaultPhase::Observed { projection, .. } => Some(projection),
                 FaultPhase::Reserved => None,
             },
-            consumed: matches!(record.phase, FaultPhase::Observed { consumed: true, .. }),
+            consumed: __cser_core::matches!(
+                record.phase,
+                FaultPhase::Observed { consumed: true, .. }
+            ),
         })
     }
 }

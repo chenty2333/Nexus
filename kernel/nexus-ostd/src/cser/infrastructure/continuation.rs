@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: MPL-2.0
 
+extern crate alloc as __cser_alloc;
+extern crate core as __cser_core;
+
 use super::{
     BearerStamp, ContinuationAckReceipt, ContinuationAdoption, ContinuationDescriptor,
     ContinuationLease, ContinuationPhase, ContinuationPublicationAckReceipt,
@@ -454,7 +457,7 @@ impl InfrastructureState {
             }
             if record.phase != ContinuationPhase::Pending {
                 return Err(
-                    if matches!(
+                    if __cser_core::matches!(
                         record.phase,
                         ContinuationPhase::Claimed { .. }
                             | ContinuationPhase::Publishing { .. }
@@ -990,13 +993,13 @@ impl InfrastructureState {
         }
         let previous_phase = record.phase;
         let publication_ack = record.publication_ack;
-        if matches!(
+        if __cser_core::matches!(
             previous_phase,
             ContinuationPhase::Resumed { .. } | ContinuationPhase::Cancelled
         ) {
             return Err(InfrastructureError::InvalidState);
         }
-        let claim_generation = if matches!(
+        let claim_generation = if __cser_core::matches!(
             previous_phase,
             ContinuationPhase::Claimed { .. } | ContinuationPhase::Publishing { .. }
         ) {
@@ -1007,7 +1010,7 @@ impl InfrastructureState {
         } else {
             record.claim_generation
         };
-        let ack_generation = if matches!(
+        let ack_generation = if __cser_core::matches!(
             previous_phase,
             ContinuationPhase::Acknowledged { .. } | ContinuationPhase::Resuming { .. }
         ) {
@@ -1018,14 +1021,15 @@ impl InfrastructureState {
         } else {
             record.ack_generation
         };
-        let resume_generation = if matches!(previous_phase, ContinuationPhase::Resuming { .. }) {
-            record
-                .resume_generation
-                .checked_add(1)
-                .ok_or(InfrastructureError::CounterOverflow)?
-        } else {
-            record.resume_generation
-        };
+        let resume_generation =
+            if __cser_core::matches!(previous_phase, ContinuationPhase::Resuming { .. }) {
+                record
+                    .resume_generation
+                    .checked_add(1)
+                    .ok_or(InfrastructureError::CounterOverflow)?
+            } else {
+                record.resume_generation
+            };
         let bearer_generation = record
             .stamp
             .bearer_generation

@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: MPL-2.0
 
+extern crate alloc as __cser_alloc;
+extern crate core as __cser_core;
+
 use super::{
     BearerStamp, EnteredTaskLease, InfrastructureError, InfrastructureEventKind,
     InfrastructureKind, InfrastructureState, LinearResult, ParentStamp, ReplyAckReceipt,
@@ -59,7 +62,7 @@ impl InfrastructureState {
                 };
             }
             if scope.replies.iter().any(|record| {
-                !matches!(
+                !__cser_core::matches!(
                     record.phase,
                     ReplyPhase::Completed { .. } | ReplyPhase::Cancelled { .. }
                 ) && (record.stamp.identity.payload_slot == descriptor.payload_slot
@@ -446,7 +449,7 @@ impl InfrastructureState {
             return Err(InfrastructureError::StaleBinding);
         }
         let phase = record.phase;
-        if matches!(
+        if __cser_core::matches!(
             phase,
             ReplyPhase::Completed { .. } | ReplyPhase::Cancelled { .. }
         ) {
@@ -457,7 +460,7 @@ impl InfrastructureState {
             .bearer_generation
             .checked_add(1)
             .ok_or(InfrastructureError::CounterOverflow)?;
-        let claim_generation = if matches!(
+        let claim_generation = if __cser_core::matches!(
             phase,
             ReplyPhase::Claimed { .. } | ReplyPhase::Publishing { .. }
         ) {
@@ -468,7 +471,7 @@ impl InfrastructureState {
         } else {
             record.claim_generation
         };
-        let apply_generation = if matches!(phase, ReplyPhase::Publishing { .. }) {
+        let apply_generation = if __cser_core::matches!(phase, ReplyPhase::Publishing { .. }) {
             record
                 .apply_generation
                 .checked_add(1)
@@ -476,7 +479,7 @@ impl InfrastructureState {
         } else {
             record.apply_generation
         };
-        let ack_generation = if matches!(phase, ReplyPhase::Acknowledged { .. }) {
+        let ack_generation = if __cser_core::matches!(phase, ReplyPhase::Acknowledged { .. }) {
             record
                 .ack_generation
                 .checked_add(1)

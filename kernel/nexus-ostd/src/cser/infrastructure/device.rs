@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: MPL-2.0
 
+extern crate alloc as __cser_alloc;
+extern crate core as __cser_core;
+
 use super::{
     BearerStamp, DeviceAdoption, DeviceApplyIntent, DeviceHardwareReceipt,
     DeviceMaterializationPlan, DevicePhase, DevicePreparationRecoveryProjection,
@@ -578,7 +581,7 @@ impl InfrastructureState {
         {
             return Err(InfrastructureError::StaleBinding);
         }
-        if matches!(
+        if __cser_core::matches!(
             record.phase,
             DevicePhase::Released { .. } | DevicePhase::Cancelled { .. }
         ) {
@@ -592,11 +595,11 @@ impl InfrastructureState {
             .ok_or(InfrastructureError::CounterOverflow)?;
         let (nonces, next_nonce) = preview_nonces(
             scope,
-            usize::from(matches!(phase, DevicePhase::Applying { .. })),
+            usize::from(__cser_core::matches!(phase, DevicePhase::Applying { .. })),
         )?;
         let next_revision = preview_revision(scope)?;
         let index_slot = record.stamp.nonce;
-        let apply_generation = if matches!(phase, DevicePhase::Applying { .. }) {
+        let apply_generation = if __cser_core::matches!(phase, DevicePhase::Applying { .. }) {
             record
                 .apply_generation
                 .checked_add(1)
@@ -699,7 +702,7 @@ fn finish_device(
         .get(stamp.identity.preparation_id)
         .ok_or(InfrastructureError::UnknownObligation)?
         .phase;
-    let preparation_credits_live = matches!(
+    let preparation_credits_live = __cser_core::matches!(
         current,
         DevicePhase::Reserved | DevicePhase::Applying { .. } | DevicePhase::PreparedRetained { .. }
     );
@@ -749,7 +752,7 @@ fn finish_device(
         .unwrap()
         .live_children = next_workload_children;
     scope.events.push(
-        if matches!(terminal, DevicePhase::Released { .. }) {
+        if __cser_core::matches!(terminal, DevicePhase::Released { .. }) {
             InfrastructureEventKind::DeviceReleased
         } else {
             InfrastructureEventKind::DeviceCancelled
@@ -761,7 +764,7 @@ fn finish_device(
 }
 
 pub(super) fn device_phase_live(phase: DevicePhase) -> bool {
-    !matches!(
+    !__cser_core::matches!(
         phase,
         DevicePhase::Released { .. } | DevicePhase::Cancelled { .. }
     )

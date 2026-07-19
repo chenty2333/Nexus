@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use alloc::vec::Vec;
+extern crate alloc as __cser_alloc;
+extern crate core as __cser_core;
+
+use __cser_alloc::vec::Vec;
 
 #[cfg(test)]
 use super::ClosureRecord;
@@ -74,7 +77,7 @@ impl InfrastructureState {
     }
 
     pub(in super::super) fn rewrite_private_registry_instance(&mut self, registry_instance: u64) {
-        debug_assert_ne!(registry_instance, 0);
+        __cser_core::debug_assert_ne!(registry_instance, 0);
         self.registry_instance = registry_instance;
         for (_, scope) in &mut self.scopes {
             scope.root.registry_instance = registry_instance;
@@ -234,8 +237,8 @@ impl InfrastructureState {
     }
 
     pub(in super::super) fn install_exact_scope(&mut self, plan: InfrastructureScopeInstallPlan) {
-        debug_assert_eq!(self.mode, LedgerMode::Authoritative);
-        debug_assert!(plan.slot < self.scopes.len());
+        __cser_core::debug_assert_eq!(self.mode, LedgerMode::Authoritative);
+        __cser_core::debug_assert!(plan.slot < self.scopes.len());
         self.scopes[plan.slot].1 = plan.replacement;
     }
 
@@ -257,13 +260,13 @@ impl InfrastructureState {
         scope: ScopeKey,
         root_effect: EffectKey,
     ) {
-        assert_eq!(self.mode, LedgerMode::NonAuthoritativeCandidate);
+        __cser_core::assert_eq!(self.mode, LedgerMode::NonAuthoritativeCandidate);
         self.scope_mut(scope).unwrap().root.root_effect = root_effect;
     }
 
     #[cfg(test)]
     pub(in super::super) fn corrupt_candidate_sequence_for_test(&mut self, scope: ScopeKey) {
-        assert_eq!(self.mode, LedgerMode::NonAuthoritativeCandidate);
+        __cser_core::assert_eq!(self.mode, LedgerMode::NonAuthoritativeCandidate);
         self.scope_mut(scope).unwrap().next_nonce = 0;
     }
 
@@ -272,7 +275,7 @@ impl InfrastructureState {
         &mut self,
         scope: ScopeKey,
     ) {
-        assert_eq!(self.mode, LedgerMode::Authoritative);
+        __cser_core::assert_eq!(self.mode, LedgerMode::Authoritative);
         let record = self.scope_mut(scope).unwrap();
         record.revision = record.revision.checked_add(1).unwrap();
     }

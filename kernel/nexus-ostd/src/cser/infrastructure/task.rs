@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: MPL-2.0
 
+extern crate alloc as __cser_alloc;
+extern crate core as __cser_core;
+
 use super::{
     ArmedFaultEvent, BearerStamp, EnteredTaskLease, FaultEvent, FaultPhase, InfrastructureError,
     InfrastructureEventKind, InfrastructureKind, InfrastructureState, LinearResult, ParentStamp,
@@ -35,7 +38,7 @@ impl InfrastructureState {
             };
         }
         if scope.tasks.iter().any(|record| {
-            matches!(record.phase, TaskPhase::Admitted | TaskPhase::Entered)
+            __cser_core::matches!(record.phase, TaskPhase::Admitted | TaskPhase::Entered)
                 && record.stamp.identity.task == descriptor.task
         }) {
             return Err(InfrastructureError::IdentityConflict);
@@ -109,7 +112,7 @@ impl InfrastructureState {
             let registry_instance = self.registry_instance;
             let scope = self.scope_mut(stamp.root.scope)?;
             validate_task_stamp(scope, registry_instance, &stamp)?;
-            if matches!(
+            if __cser_core::matches!(
                 stamp.identity.role,
                 TaskWorkRole::ServiceRequest | TaskWorkRole::ReplacementRecovery
             ) {
@@ -145,7 +148,7 @@ impl InfrastructureState {
             let scope = self.scope_mut(stamp.root.scope)?;
             validate_task_stamp(scope, registry_instance, &stamp)?;
             validate_fault_bearer(scope, registry_instance, &fault_stamp)?;
-            if !matches!(
+            if !__cser_core::matches!(
                 stamp.identity.role,
                 TaskWorkRole::ServiceRequest | TaskWorkRole::ReplacementRecovery
             ) || fault_stamp.parent != ParentStamp::Task(stamp.identity)
@@ -204,13 +207,13 @@ impl InfrastructureState {
         let scope = self.scope_mut(stamp.root.scope)?;
         validate_task_stamp(scope, registry_instance, stamp)?;
         let phase = scope.tasks.get(stamp.identity.work_id).unwrap().phase;
-        if matches!(
+        if __cser_core::matches!(
             phase,
             TaskPhase::Isolated | TaskPhase::Reaped | TaskPhase::Rejected
         ) {
             return Ok(());
         }
-        if !matches!(phase, TaskPhase::Admitted | TaskPhase::Entered) {
+        if !__cser_core::matches!(phase, TaskPhase::Admitted | TaskPhase::Entered) {
             return Err(InfrastructureError::InvalidState);
         }
         finish_task_record(scope, stamp, TaskPhase::Isolated)
@@ -301,7 +304,7 @@ impl InfrastructureState {
             return Err(InfrastructureError::StaleBinding);
         }
         let phase = record.phase;
-        if !matches!(phase, TaskPhase::Admitted | TaskPhase::Entered) {
+        if !__cser_core::matches!(phase, TaskPhase::Admitted | TaskPhase::Entered) {
             return Err(InfrastructureError::InvalidState);
         }
         let bearer_generation = record

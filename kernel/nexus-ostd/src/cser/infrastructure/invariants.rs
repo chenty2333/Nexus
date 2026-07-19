@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use alloc::vec::Vec;
+extern crate alloc as __cser_alloc;
+extern crate core as __cser_core;
+
+use __cser_alloc::vec::Vec;
 
 use super::{
     BearerStamp, ContinuationPhase, ContinuationRecord, DeadlineExhaustedDisposition,
@@ -173,7 +176,7 @@ pub(super) fn check_scope_invariants(
             ));
         }
         check_fault_phase(scope, record)?;
-        if matches!(record.phase, FaultPhase::Reserved) {
+        if __cser_core::matches!(record.phase, FaultPhase::Reserved) {
             increment_invariant(&mut expected_live.faults)?;
             account_live_task_child(&mut workload_children, &mut task_children, &record.stamp)?;
         }
@@ -237,7 +240,7 @@ pub(super) fn check_scope_invariants(
             .validate()
             .map_err(|_| InfrastructureError::Invariant("invalid device coordinates"))?;
         validate_primary_stamp(scope, &record.stamp)?;
-        if !matches!(record.stamp.parent, ParentStamp::Effect(_)) {
+        if !__cser_core::matches!(record.stamp.parent, ParentStamp::Effect(_)) {
             return Err(InfrastructureError::Invariant("invalid device parent"));
         }
         if device_phase_live(record.phase) {
@@ -1057,25 +1060,25 @@ fn reverse_index_for_reply(record: &ReplyStateRecord) -> ReverseIndexRecord {
 }
 
 fn task_phase_live(phase: TaskPhase) -> bool {
-    matches!(phase, TaskPhase::Admitted | TaskPhase::Entered)
+    __cser_core::matches!(phase, TaskPhase::Admitted | TaskPhase::Entered)
 }
 
 fn continuation_phase_live(phase: ContinuationPhase) -> bool {
-    !matches!(
+    !__cser_core::matches!(
         phase,
         ContinuationPhase::Resumed { .. } | ContinuationPhase::Cancelled
     )
 }
 
 fn deadline_phase_live(phase: DeadlinePhase) -> bool {
-    !matches!(
+    !__cser_core::matches!(
         phase,
         DeadlinePhase::Cancelled | DeadlinePhase::Resolved { .. }
     )
 }
 
 fn reply_phase_live(phase: ReplyPhase) -> bool {
-    !matches!(
+    !__cser_core::matches!(
         phase,
         ReplyPhase::Completed { .. } | ReplyPhase::Cancelled { .. }
     )
@@ -1125,7 +1128,7 @@ fn check_fault_phase(
             || receipt_generation == 0
             || receipt_generation != record.receipt_generation
             || consumed != (consume_generation != 0)
-            || !matches!(parent_phase, TaskPhase::Isolated | TaskPhase::Reaped)
+            || !__cser_core::matches!(parent_phase, TaskPhase::Isolated | TaskPhase::Reaped)
             || !disposition_valid
         {
             return Err(InfrastructureError::Invariant(
@@ -1252,7 +1255,7 @@ fn check_deadline_phase(record: &DeadlineRecord) -> Result<(), InfrastructureErr
                 && match reconciliation {
                     None => terminal_evidence_digest.is_none(),
                     Some(receipt) => {
-                        matches!(
+                        __cser_core::matches!(
                             receipt.disposition,
                             DeadlineExhaustedDisposition::AbortWork
                                 | DeadlineExhaustedDisposition::Quarantine
@@ -1289,7 +1292,7 @@ fn check_service_phase(
             "live service request has stale destination binding",
         ));
     }
-    let live_bound = matches!(
+    let live_bound = __cser_core::matches!(
         record.phase,
         ServiceRequestPhase::ReservedBound
             | ServiceRequestPhase::Publishing { .. }
@@ -1682,7 +1685,7 @@ fn terminal_claimant_dominates(
                 && task.stamp.nonce == historical.task_nonce
                 && task.stamp.bearer_generation >= historical.task_bearer_generation
                 && task.stamp.parent == ParentStamp::Request(task.stamp.workload.request)
-                && matches!(
+                && __cser_core::matches!(
                     task.phase,
                     TaskPhase::Entered | TaskPhase::Isolated | TaskPhase::Reaped
                 )
@@ -1711,7 +1714,7 @@ fn terminal_response_exists(
                         >= service.stamp.workload.bearer_generation
                     && continuation.stamp.domain.domain == service.stamp.domain.domain
                     && continuation.stamp.domain.binding_epoch >= service.stamp.domain.binding_epoch
-                    && matches!(
+                    && __cser_core::matches!(
                         (continuation.stamp.parent, service.stamp.parent),
                         (ParentStamp::Task(current), ParentStamp::Task(historical))
                             if current == historical
@@ -1738,7 +1741,7 @@ fn check_service_continuation_owners(
         };
         let Some(bound) = request.bound_continuation else {
             if service_request_phase_live(request.phase)
-                && !matches!(request.phase, ServiceRequestPhase::ReservedUnbound)
+                && !__cser_core::matches!(request.phase, ServiceRequestPhase::ReservedUnbound)
             {
                 return Err(InfrastructureError::Invariant(
                     "live bound service request lacks continuation owner",
