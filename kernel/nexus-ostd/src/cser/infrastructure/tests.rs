@@ -18,7 +18,8 @@ use super::{
     FaultAccess, FaultDisposition, FaultObservation, FaultPhase, FaultSlotDescriptor,
     InfrastructureClosureProgress, InfrastructureClosureReceipt, InfrastructureError,
     InfrastructureKind, InfrastructureLimits, InfrastructureState, LinearFailure, PortalHandle,
-    ReplyAbortAuthority, ReplyDescriptor, ReplyPublicationReceipt, ReservedFaultTask, ResourceKey,
+    ReplyAbortAuthority, ReplyAckReceipt, ReplyAdoption, ReplyClaim, ReplyDescriptor,
+    ReplyPublicationIntent, ReplyPublicationReceipt, ReplyRecord, ReservedFaultTask, ResourceKey,
     ReverseIndexRecord, ReverseParent, ScopeKey, ServiceArmAuthority, ServiceArmPlan,
     ServiceArmReceipt, ServiceBoundKey, ServiceCancellationPoint, ServiceChildBindingReceipt,
     ServiceChildReceipt, ServiceClaimantSnapshot, ServiceEnqueueAuthority, ServiceEnqueuePlan,
@@ -47,6 +48,8 @@ const COMPACT_VM: u64 = 0xd600;
 const COMPACT_CONTINUATION: u64 = 0xd700;
 const COMPACT_SERVICE_REQUEST: u64 = 0xd800;
 const COMPACT_RESPONSE_SLOT: u64 = 0xd900;
+const COMPACT_REPLY: u64 = 0xda00;
+const COMPACT_REPLY_EFFECT: u64 = 0xda10;
 
 fn compact_task_state(
     registry_instance: u64,
@@ -75,6 +78,84 @@ fn compact_task_state(
         .unwrap();
     let entered = state.claim_task_entry(task).unwrap();
     (state, workload, entered)
+}
+
+fn compact_reply_descriptor() -> ReplyDescriptor {
+    ReplyDescriptor {
+        reply_id: COMPACT_REPLY,
+        generation: 1,
+        guest_task: TaskKey::new(COMPACT_TASK, 1),
+        guest_vm_generation: 1,
+        descriptor_digest: 0xda20,
+        result_digest: 0xda21,
+        byte_count: 8,
+        destination_digest: 0xda22,
+        source_domain: GUEST,
+        source_binding_epoch: 1,
+        payload_slot: 3,
+        payload_generation: 1,
+        flight_cookie: 0xda23,
+    }
+}
+
+fn compact_reply_proof(registry_instance: u64) -> ValidatedCommitProof {
+    ValidatedCommitProof::new(super::super::CommitReceipt {
+        registry_instance_id: registry_instance,
+        effect: EffectKey::new(COMPACT_REPLY_EFFECT, 1),
+        scope: SCOPE,
+        authority_epoch: 1,
+        binding_epoch: 1,
+        sequence: 7,
+        result: 0,
+        domain_revision: 1,
+        descriptor_digest: 0xda24,
+    })
+}
+
+fn compact_reply_publication_receipt() -> ReplyPublicationReceipt {
+    let descriptor = compact_reply_descriptor();
+    ReplyPublicationReceipt {
+        payload_slot: descriptor.payload_slot,
+        payload_generation: descriptor.payload_generation,
+        flight_cookie: descriptor.flight_cookie,
+        descriptor_digest: descriptor.descriptor_digest,
+        result_digest: descriptor.result_digest,
+        byte_count: descriptor.byte_count,
+        destination_digest: descriptor.destination_digest,
+        backend_effect: EffectKey::new(COMPACT_REPLY_EFFECT, 1),
+        backend_commit_sequence: 7,
+        external_apply_digest: 0xda25,
+    }
+}
+
+fn compact_reply_state(
+    registry_instance: u64,
+) -> (
+    InfrastructureState,
+    WorkloadContext,
+    EnteredTaskLease,
+    ReplyRecord,
+) {
+    let (mut state, workload, entered) = compact_task_state(registry_instance);
+    let reply = state
+        .prepare_reply(
+            &entered,
+            compact_reply_descriptor(),
+            compact_reply_proof(registry_instance),
+        )
+        .unwrap();
+    (state, workload, entered, reply)
+}
+
+fn reply_bearer_generation(state: &InfrastructureState) -> u64 {
+    state
+        .scope(SCOPE)
+        .unwrap()
+        .replies
+        .get(COMPACT_REPLY)
+        .unwrap()
+        .stamp
+        .bearer_generation
 }
 
 fn compact_continuation_state(
@@ -5173,6 +5254,699 @@ fn terminal_reserved_bound_service_cannot_start_queue_publication_and_can_cancel
     state.check_invariants().unwrap();
 }
 
+fn assert_reply_record_mutation_rejected(
+    registry_instance: u64,
+    mutate: impl FnOnce(&mut super::ReplyStateRecord),
+    expected_error: InfrastructureError,
+) {
+    let (mut state, _, _, reply) = compact_reply_state(registry_instance);
+    mutate(
+        state
+            .scope_mut(SCOPE)
+            .unwrap()
+            .replies
+            .get_mut(COMPACT_REPLY)
+            .unwrap(),
+    );
+    let presented = service_key_coordinates(&reply.0);
+    let before = state.private_full_clone();
+    let failure = state.claim_reply(reply).unwrap_err();
+    __cser_core::assert_eq!(failure.error(), expected_error);
+    __cser_core::assert_eq!(state, before);
+    __cser_core::assert_eq!(service_key_coordinates(&failure.into_input().0), presented);
+}
+
+fn advance_reply_parent_after_fence(state: &mut InfrastructureState) -> WorkloadContext {
+    *state
+        .scope_mut(SCOPE)
+        .unwrap()
+        .binding_epoch_mut(GUEST)
+        .unwrap() = 2;
+    let workload = state
+        .adopt_workload_after_fence(
+            WorkloadRootPresentation::new(SCOPE, 1, ROOT),
+            WorkloadRequestPresentation::new(GUEST, 2, COMPACT_REQUEST, 1),
+        )
+        .unwrap();
+    __cser_core::assert!(__cser_core::matches!(
+        state
+            .adopt_task_after_fence(&workload, COMPACT_WORK, 1)
+            .unwrap(),
+        TaskAdoption::Entered(_)
+    ));
+    workload
+}
+
+#[test]
+fn reply_compact_authority_layout_and_successor_generations_are_bounded() {
+    __cser_core::assert!(__cser_core::mem::size_of::<ReplyRecord>() <= 64);
+    __cser_core::assert!(__cser_core::mem::size_of::<ReplyClaim>() <= 64);
+    __cser_core::assert!(__cser_core::mem::size_of::<ReplyPublicationIntent>() <= 64);
+    __cser_core::assert!(__cser_core::mem::size_of::<ReplyAckReceipt>() <= 64);
+    __cser_core::assert!(__cser_core::mem::size_of::<ReplyAbortAuthority>() <= 96);
+    __cser_core::assert!(
+        __cser_core::mem::size_of::<LinearFailure<ReplyPublicationIntent>>() <= 120
+    );
+
+    let (mut state, _, _, reply) = compact_reply_state(0xfe36);
+    __cser_core::assert_eq!(reply.0.bearer_generation, 1);
+    let claim = state.claim_reply(reply).unwrap();
+    __cser_core::assert_eq!(claim.0.bearer_generation, 2);
+    let intent = state.begin_reply_publication(claim).unwrap();
+    __cser_core::assert_eq!(intent.0.bearer_generation, 3);
+    let ack = state
+        .acknowledge_reply_publication(intent, compact_reply_publication_receipt())
+        .unwrap();
+    __cser_core::assert_eq!(ack.0.bearer_generation, 4);
+    let completion = state.complete_reply_wake(ack).unwrap();
+    __cser_core::assert_eq!(completion.reply_id, COMPACT_REPLY);
+    __cser_core::assert_eq!(reply_bearer_generation(&state), 5);
+    state.check_invariants().unwrap();
+
+    let (mut state, _, _, reply) = compact_reply_state(0xfe37);
+    state
+        .cancel_reply(ReplyAbortAuthority::Prepared(reply), 0xfe38)
+        .unwrap();
+    __cser_core::assert_eq!(reply_bearer_generation(&state), 2);
+    state.check_invariants().unwrap();
+
+    let (mut state, _, _, reply) = compact_reply_state(0xfe39);
+    let claim = state.claim_reply(reply).unwrap();
+    state
+        .cancel_reply(ReplyAbortAuthority::Claimed(claim), 0xfe3a)
+        .unwrap();
+    __cser_core::assert_eq!(reply_bearer_generation(&state), 3);
+    state.check_invariants().unwrap();
+
+    // A commit may legitimately describe the initial domain revision. It is
+    // not a sentinel and must not be rejected by the compact Reply boundary.
+    let (mut state, _, entered) = compact_task_state(0xfe3b);
+    let mut proof = compact_reply_proof(0xfe3b);
+    proof.receipt.domain_revision = 0;
+    let reply = state
+        .prepare_reply(&entered, compact_reply_descriptor(), proof)
+        .unwrap();
+    state
+        .cancel_reply(ReplyAbortAuthority::Prepared(reply), 0xfe3c)
+        .unwrap();
+    state.check_invariants().unwrap();
+}
+
+#[test]
+fn reply_compact_key_rejects_foreign_candidate_and_stale_coordinates_atomically() {
+    let (mut owner, _, _, reply) = compact_reply_state(0xfe80);
+    let (mut foreign, _, _, _) = compact_reply_state(0xfe81);
+    let presented = service_key_coordinates(&reply.0);
+    let before_owner = owner.private_full_clone();
+    let before_foreign = foreign.private_full_clone();
+    let failure = foreign.claim_reply(reply).unwrap_err();
+    __cser_core::assert_eq!(failure.error(), InfrastructureError::ForeignRegistry);
+    __cser_core::assert_eq!(owner, before_owner);
+    __cser_core::assert_eq!(foreign, before_foreign);
+    let reply = failure.into_input();
+    __cser_core::assert_eq!(service_key_coordinates(&reply.0), presented);
+    owner.claim_reply(reply).unwrap();
+
+    let (mut owner, _, _, reply) = compact_reply_state(0xfe82);
+    let mut candidate = owner.try_scope_candidate(SCOPE).unwrap();
+    let before_owner = owner.private_full_clone();
+    let before_candidate = candidate.private_full_clone();
+    let failure = candidate.claim_reply(reply).unwrap_err();
+    __cser_core::assert_eq!(
+        failure.error(),
+        InfrastructureError::CandidateHasNoAuthority
+    );
+    __cser_core::assert_eq!(owner, before_owner);
+    __cser_core::assert_eq!(candidate, before_candidate);
+    owner.claim_reply(failure.into_input()).unwrap();
+
+    type Mutate = fn(&mut BearerKey<bearer_state::ReplyPrepared>);
+    let mutations: [(Mutate, InfrastructureError); 6] = [
+        (
+            |key| key.authority.scope = ScopeKey::new(SCOPE.id() + 1, SCOPE.generation()),
+            InfrastructureError::NotEnabled,
+        ),
+        (
+            |key| key.authority.authority_epoch += 1,
+            InfrastructureError::StaleAuthority,
+        ),
+        (|key| key.slot += 1, InfrastructureError::UnknownObligation),
+        (
+            |key| key.object_generation += 1,
+            InfrastructureError::StaleGeneration,
+        ),
+        (
+            |key| key.bearer_generation += 1,
+            InfrastructureError::StaleGeneration,
+        ),
+        (|key| key.nonce += 1, InfrastructureError::StaleGeneration),
+    ];
+    for (offset, (mutate, expected)) in mutations.into_iter().enumerate() {
+        let (mut state, _, _, mut reply) = compact_reply_state(0xfe90 + offset as u64);
+        mutate(&mut reply.0);
+        let presented = service_key_coordinates(&reply.0);
+        let before = state.private_full_clone();
+        let failure = state.claim_reply(reply).unwrap_err();
+        __cser_core::assert_eq!(failure.error(), expected);
+        __cser_core::assert_eq!(state, before);
+        __cser_core::assert_eq!(service_key_coordinates(&failure.into_input().0), presented);
+    }
+}
+
+#[test]
+fn reply_transition_revalidates_record_backend_payload_and_exact_reverse_index() {
+    assert_reply_record_mutation_rejected(
+        0xfe9c,
+        |record| record.stamp.root.registry_instance ^= 1,
+        InfrastructureError::ForeignRegistry,
+    );
+    assert_reply_record_mutation_rejected(
+        0xfe9d,
+        |record| record.stamp.root.scope = ScopeKey::new(SCOPE.id() + 1, SCOPE.generation()),
+        InfrastructureError::ForeignScope,
+    );
+    assert_reply_record_mutation_rejected(
+        0xfe9e,
+        |record| record.stamp.root.authority_epoch += 1,
+        InfrastructureError::StaleAuthority,
+    );
+    assert_reply_record_mutation_rejected(
+        0xfe9f,
+        |record| record.stamp.domain.binding_epoch += 1,
+        InfrastructureError::StaleBinding,
+    );
+    assert_reply_record_mutation_rejected(
+        0xfea0,
+        |record| record.stamp.root.root_effect = EffectKey::new(ROOT.id() + 1, 1),
+        InfrastructureError::ForeignRootEffect,
+    );
+    assert_reply_record_mutation_rejected(
+        0xfea1,
+        |record| record.stamp.workload.request.id += 1,
+        InfrastructureError::UnknownWorkload,
+    );
+    assert_reply_record_mutation_rejected(
+        0xfea2,
+        |record| {
+            record.stamp.parent = super::ParentStamp::Task(TaskWorkDescriptor {
+                work_id: COMPACT_WORK + 1,
+                ..match record.stamp.parent {
+                    super::ParentStamp::Task(parent) => parent,
+                    _ => __cser_core::unreachable!(),
+                }
+            })
+        },
+        InfrastructureError::UnknownObligation,
+    );
+    assert_reply_record_mutation_rejected(
+        0xfea3,
+        |record| record.stamp.identity.guest_vm_generation += 1,
+        InfrastructureError::ForeignParent,
+    );
+    assert_reply_record_mutation_rejected(
+        0xfea4,
+        |record| record.stamp.identity.source_binding_epoch += 1,
+        InfrastructureError::StaleBinding,
+    );
+    assert_reply_record_mutation_rejected(
+        0xfeab,
+        |record| record.stamp.identity.source_domain = SERVICE,
+        InfrastructureError::Invariant("reply reverse index mismatch"),
+    );
+    assert_reply_record_mutation_rejected(
+        0xfeac,
+        |record| record.backend_commit.registry_instance_id ^= 1,
+        InfrastructureError::InvalidReceipt,
+    );
+    assert_reply_record_mutation_rejected(
+        0xfead,
+        |record| record.backend_commit.scope = ScopeKey::new(SCOPE.id() + 1, 1),
+        InfrastructureError::InvalidReceipt,
+    );
+    assert_reply_record_mutation_rejected(
+        0xfeae,
+        |record| record.backend_commit.authority_epoch += 1,
+        InfrastructureError::InvalidReceipt,
+    );
+    assert_reply_record_mutation_rejected(
+        0xfeaf,
+        |record| record.backend_commit.effect = EffectKey::new(COMPACT_REPLY_EFFECT, 0),
+        InfrastructureError::InvalidReceipt,
+    );
+    assert_reply_record_mutation_rejected(
+        0xfea5,
+        |record| record.backend_commit.sequence = 0,
+        InfrastructureError::InvalidReceipt,
+    );
+    assert_reply_record_mutation_rejected(
+        0xfea6,
+        |record| record.backend_commit.binding_epoch = 0,
+        InfrastructureError::InvalidReceipt,
+    );
+    assert_reply_record_mutation_rejected(
+        0xfea7,
+        |record| record.stamp.identity.payload_slot += 1,
+        InfrastructureError::Invariant("reply reverse index mismatch"),
+    );
+    assert_reply_record_mutation_rejected(
+        0xfea8,
+        |record| record.stamp.identity.result_digest = 0,
+        InfrastructureError::InvalidIdentity,
+    );
+
+    let (mut role_state, workload, _, reply) = compact_reply_state(0xfebf);
+    let supervisor_task = TaskWorkDescriptor {
+        work_id: COMPACT_WORK + 1,
+        generation: 1,
+        task: TaskKey::new(COMPACT_TASK + 1, 1),
+        role: TaskWorkRole::SupervisorControl,
+        vm: Some(VmAuthorityKey::new(COMPACT_VM + 1, 1).unwrap()),
+    };
+    let supervisor = role_state.admit_task(&workload, supervisor_task).unwrap();
+    role_state.claim_task_entry(supervisor).unwrap();
+    let reply_nonce = reply.0.nonce;
+    let record = role_state
+        .scope_mut(SCOPE)
+        .unwrap()
+        .replies
+        .get_mut(COMPACT_REPLY)
+        .unwrap();
+    record.stamp.parent = super::ParentStamp::Task(supervisor_task);
+    record.stamp.identity.guest_task = supervisor_task.task;
+    let index = role_state
+        .scope_mut(SCOPE)
+        .unwrap()
+        .reverse_indexes
+        .get_mut(reply_nonce)
+        .unwrap();
+    index.parent = ReverseParent::Task(supervisor_task);
+    index.task = Some(supervisor_task.task);
+    let before = role_state.private_full_clone();
+    let failure = role_state.claim_reply(reply).unwrap_err();
+    __cser_core::assert_eq!(failure.error(), InfrastructureError::ForeignParent);
+    __cser_core::assert_eq!(role_state, before);
+
+    let (mut missing, _, _, reply) = compact_reply_state(0xfea9);
+    let index_slot = reply.0.nonce;
+    missing
+        .scope_mut(SCOPE)
+        .unwrap()
+        .reverse_indexes
+        .remove(index_slot)
+        .unwrap();
+    let before = missing.private_full_clone();
+    let failure = missing.claim_reply(reply).unwrap_err();
+    __cser_core::assert_eq!(
+        failure.error(),
+        InfrastructureError::Invariant("missing reply reverse index")
+    );
+    __cser_core::assert_eq!(missing, before);
+
+    let (mut mismatch, _, _, reply) = compact_reply_state(0xfeaa);
+    mismatch
+        .scope_mut(SCOPE)
+        .unwrap()
+        .reverse_indexes
+        .get_mut(reply.0.nonce)
+        .unwrap()
+        .actor_generation = Some(2);
+    let before = mismatch.private_full_clone();
+    let failure = mismatch.claim_reply(reply).unwrap_err();
+    __cser_core::assert_eq!(
+        failure.error(),
+        InfrastructureError::Invariant("reply reverse index mismatch")
+    );
+    __cser_core::assert_eq!(mismatch, before);
+}
+
+#[test]
+fn reply_phase_typestate_and_receipt_substitution_return_exact_authority() {
+    let (mut state, _, _, reply) = compact_reply_state(0xfeb0);
+    let forged = ReplyClaim(BearerKey {
+        authority: AuthorityKey {
+            registry_instance: reply.0.authority.registry_instance,
+            scope: reply.0.authority.scope,
+            authority_epoch: reply.0.authority.authority_epoch,
+        },
+        slot: reply.0.slot,
+        object_generation: reply.0.object_generation,
+        bearer_generation: reply.0.bearer_generation,
+        nonce: reply.0.nonce,
+        state: __cser_core::marker::PhantomData,
+    });
+    let presented = service_key_coordinates(&forged.0);
+    let before = state.private_full_clone();
+    let failure = state.begin_reply_publication(forged).unwrap_err();
+    __cser_core::assert_eq!(failure.error(), InfrastructureError::StaleClaim);
+    __cser_core::assert_eq!(state, before);
+    __cser_core::assert_eq!(service_key_coordinates(&failure.into_input().0), presented);
+
+    let (mut state, _, _, reply) = compact_reply_state(0xfeb1);
+    let claim = state.claim_reply(reply).unwrap();
+    let phase = state
+        .scope(SCOPE)
+        .unwrap()
+        .replies
+        .get(COMPACT_REPLY)
+        .unwrap()
+        .phase;
+    let (claim_generation, claim_nonce) = match phase {
+        super::ReplyPhase::Claimed {
+            claim_generation,
+            claim_nonce,
+        } => (claim_generation, claim_nonce),
+        _ => __cser_core::unreachable!(),
+    };
+    state
+        .scope_mut(SCOPE)
+        .unwrap()
+        .replies
+        .get_mut(COMPACT_REPLY)
+        .unwrap()
+        .phase = super::ReplyPhase::Claimed {
+        claim_generation: claim_generation + 1,
+        claim_nonce,
+    };
+    let presented = service_key_coordinates(&claim.0);
+    let before = state.private_full_clone();
+    let failure = state.begin_reply_publication(claim).unwrap_err();
+    __cser_core::assert_eq!(
+        failure.error(),
+        InfrastructureError::Invariant("reply claim mismatch")
+    );
+    __cser_core::assert_eq!(state, before);
+    let claim = failure.into_input();
+    __cser_core::assert_eq!(service_key_coordinates(&claim.0), presented);
+    state
+        .scope_mut(SCOPE)
+        .unwrap()
+        .replies
+        .get_mut(COMPACT_REPLY)
+        .unwrap()
+        .phase = super::ReplyPhase::Claimed {
+        claim_generation,
+        claim_nonce: 0,
+    };
+    let before = state.private_full_clone();
+    let failure = state.begin_reply_publication(claim).unwrap_err();
+    __cser_core::assert_eq!(
+        failure.error(),
+        InfrastructureError::Invariant("reply claim mismatch")
+    );
+    __cser_core::assert_eq!(state, before);
+    __cser_core::assert_eq!(service_key_coordinates(&failure.into_input().0), presented);
+
+    type MutateReceipt = fn(&mut ReplyPublicationReceipt);
+    let mutations: [MutateReceipt; 10] = [
+        |receipt| receipt.payload_slot += 1,
+        |receipt| receipt.payload_generation += 1,
+        |receipt| receipt.flight_cookie += 1,
+        |receipt| receipt.descriptor_digest += 1,
+        |receipt| receipt.result_digest += 1,
+        |receipt| receipt.byte_count += 1,
+        |receipt| receipt.destination_digest += 1,
+        |receipt| receipt.backend_effect = EffectKey::new(COMPACT_REPLY_EFFECT + 1, 1),
+        |receipt| receipt.backend_commit_sequence += 1,
+        |receipt| receipt.external_apply_digest = 0,
+    ];
+    for (offset, mutate) in mutations.into_iter().enumerate() {
+        let (mut state, _, _, reply) = compact_reply_state(0xfec0 + offset as u64);
+        let claim = state.claim_reply(reply).unwrap();
+        let intent = state.begin_reply_publication(claim).unwrap();
+        let presented = service_key_coordinates(&intent.0);
+        let mut receipt = compact_reply_publication_receipt();
+        mutate(&mut receipt);
+        let before = state.private_full_clone();
+        let failure = state
+            .acknowledge_reply_publication(intent, receipt)
+            .unwrap_err();
+        __cser_core::assert_eq!(failure.error(), InfrastructureError::InvalidReceipt);
+        __cser_core::assert_eq!(state, before);
+        __cser_core::assert_eq!(service_key_coordinates(&failure.into_input().0), presented);
+    }
+}
+
+#[test]
+fn reply_overflow_collision_and_terminal_preflight_are_failure_atomic() {
+    let (mut state, _, _, reply) = compact_reply_state(0xfed0);
+    let presented = service_key_coordinates(&reply.0);
+    state.scope_mut(SCOPE).unwrap().revision = u64::MAX;
+    let before = state.private_full_clone();
+    let failure = state.claim_reply(reply).unwrap_err();
+    __cser_core::assert_eq!(failure.error(), InfrastructureError::CounterOverflow);
+    __cser_core::assert_eq!(state, before);
+    __cser_core::assert_eq!(service_key_coordinates(&failure.into_input().0), presented);
+
+    let (mut state, _, entered) = compact_task_state(0xfed1);
+    let occupied_nonce = state
+        .scope(SCOPE)
+        .unwrap()
+        .reverse_indexes
+        .iter()
+        .next()
+        .unwrap()
+        .slot;
+    state.scope_mut(SCOPE).unwrap().next_nonce = occupied_nonce;
+    let proof = compact_reply_proof(0xfed1);
+    let expected = proof.receipt.clone();
+    let before = state.private_full_clone();
+    let failure = state
+        .prepare_reply(&entered, compact_reply_descriptor(), proof)
+        .unwrap_err();
+    __cser_core::assert_eq!(failure.error(), InfrastructureError::IdentityConflict);
+    __cser_core::assert_eq!(failure.into_input().receipt, expected);
+    __cser_core::assert_eq!(state, before);
+
+    let (mut state, _, _, reply) = compact_reply_state(0xfed2);
+    state.scope_mut(SCOPE).unwrap().live.replies = 0;
+    let presented = service_key_coordinates(&reply.0);
+    let before = state.private_full_clone();
+    let failure = state
+        .cancel_reply(ReplyAbortAuthority::Prepared(reply), 0xfed3)
+        .unwrap_err();
+    __cser_core::assert_eq!(
+        failure.error(),
+        InfrastructureError::Invariant("live counter underflow")
+    );
+    __cser_core::assert_eq!(state, before);
+    let returned = match failure.into_input() {
+        ReplyAbortAuthority::Prepared(reply) => reply,
+        ReplyAbortAuthority::Claimed(_) => __cser_core::unreachable!(),
+    };
+    __cser_core::assert_eq!(service_key_coordinates(&returned.0), presented);
+}
+
+#[test]
+fn reply_adoption_fences_every_live_phase_and_preflights_reverse_index() {
+    let (mut state, _, _, stale) = compact_reply_state(0xfee0);
+    let workload = advance_reply_parent_after_fence(&mut state);
+    let before = state.private_full_clone();
+    __cser_core::assert_eq!(
+        state
+            .adopt_reply_after_fence(&workload, COMPACT_REPLY, 2, 2)
+            .unwrap_err(),
+        InfrastructureError::StaleGeneration
+    );
+    __cser_core::assert_eq!(state, before);
+
+    let mut zero_bearer = state.private_full_clone();
+    zero_bearer
+        .scope_mut(SCOPE)
+        .unwrap()
+        .replies
+        .get_mut(COMPACT_REPLY)
+        .unwrap()
+        .stamp
+        .bearer_generation = 0;
+    let before = zero_bearer.private_full_clone();
+    __cser_core::assert_eq!(
+        zero_bearer
+            .adopt_reply_after_fence(&workload, COMPACT_REPLY, 1, 2)
+            .unwrap_err(),
+        InfrastructureError::InvalidIdentity
+    );
+    __cser_core::assert_eq!(zero_bearer, before);
+
+    let mut wrong_nonce = state.private_full_clone();
+    wrong_nonce
+        .scope_mut(SCOPE)
+        .unwrap()
+        .replies
+        .get_mut(COMPACT_REPLY)
+        .unwrap()
+        .stamp
+        .workload
+        .nonce += 1;
+    let before = wrong_nonce.private_full_clone();
+    __cser_core::assert_eq!(
+        wrong_nonce
+            .adopt_reply_after_fence(&workload, COMPACT_REPLY, 1, 2)
+            .unwrap_err(),
+        InfrastructureError::ForeignWorkload
+    );
+    __cser_core::assert_eq!(wrong_nonce, before);
+
+    let mut future_workload = state.private_full_clone();
+    future_workload
+        .scope_mut(SCOPE)
+        .unwrap()
+        .replies
+        .get_mut(COMPACT_REPLY)
+        .unwrap()
+        .stamp
+        .workload
+        .bearer_generation = workload.workload.bearer_generation + 1;
+    let before = future_workload.private_full_clone();
+    __cser_core::assert_eq!(
+        future_workload
+            .adopt_reply_after_fence(&workload, COMPACT_REPLY, 1, 2)
+            .unwrap_err(),
+        InfrastructureError::StaleGeneration
+    );
+    __cser_core::assert_eq!(future_workload, before);
+    let mut missing = state.private_full_clone();
+    let index_slot = missing
+        .scope(SCOPE)
+        .unwrap()
+        .replies
+        .get(COMPACT_REPLY)
+        .unwrap()
+        .stamp
+        .nonce;
+    missing
+        .scope_mut(SCOPE)
+        .unwrap()
+        .reverse_indexes
+        .remove(index_slot)
+        .unwrap();
+    let before = missing.private_full_clone();
+    __cser_core::assert_eq!(
+        missing
+            .adopt_reply_after_fence(&workload, COMPACT_REPLY, 1, 2)
+            .unwrap_err(),
+        InfrastructureError::Invariant("missing reply reverse index")
+    );
+    __cser_core::assert_eq!(missing, before);
+
+    let mut mismatch = state.private_full_clone();
+    mismatch
+        .scope_mut(SCOPE)
+        .unwrap()
+        .reverse_indexes
+        .get_mut(index_slot)
+        .unwrap()
+        .source_binding_epoch = Some(2);
+    let before = mismatch.private_full_clone();
+    __cser_core::assert_eq!(
+        mismatch
+            .adopt_reply_after_fence(&workload, COMPACT_REPLY, 1, 2)
+            .unwrap_err(),
+        InfrastructureError::Invariant("reply reverse index mismatch")
+    );
+    __cser_core::assert_eq!(mismatch, before);
+
+    let mut overflow = state.private_full_clone();
+    overflow
+        .scope_mut(SCOPE)
+        .unwrap()
+        .replies
+        .get_mut(COMPACT_REPLY)
+        .unwrap()
+        .stamp
+        .bearer_generation = u64::MAX;
+    let before = overflow.private_full_clone();
+    __cser_core::assert_eq!(
+        overflow
+            .adopt_reply_after_fence(&workload, COMPACT_REPLY, 1, 2)
+            .unwrap_err(),
+        InfrastructureError::CounterOverflow
+    );
+    __cser_core::assert_eq!(overflow, before);
+
+    let current = match state
+        .adopt_reply_after_fence(&workload, COMPACT_REPLY, 1, 2)
+        .unwrap()
+    {
+        ReplyAdoption::Prepared(reply) => reply,
+        _ => __cser_core::panic!("prepared reply adopted into wrong phase"),
+    };
+    __cser_core::assert_eq!(reply_bearer_generation(&state), 2);
+    let before = state.private_full_clone();
+    let failure = state.claim_reply(stale).unwrap_err();
+    __cser_core::assert_eq!(failure.error(), InfrastructureError::StaleGeneration);
+    __cser_core::assert_eq!(state, before);
+    state.claim_reply(current).unwrap();
+    state.check_invariants().unwrap();
+
+    let (mut state, _, _, reply) = compact_reply_state(0xfee1);
+    let stale = state.claim_reply(reply).unwrap();
+    let workload = advance_reply_parent_after_fence(&mut state);
+    let current = match state
+        .adopt_reply_after_fence(&workload, COMPACT_REPLY, 1, 2)
+        .unwrap()
+    {
+        ReplyAdoption::Claimed(claim) => claim,
+        _ => __cser_core::panic!("claimed reply adopted into wrong phase"),
+    };
+    let before = state.private_full_clone();
+    let failure = state.begin_reply_publication(stale).unwrap_err();
+    __cser_core::assert_eq!(failure.error(), InfrastructureError::StaleGeneration);
+    __cser_core::assert_eq!(state, before);
+    state.begin_reply_publication(current).unwrap();
+    state.check_invariants().unwrap();
+
+    let (mut state, _, _, reply) = compact_reply_state(0xfee2);
+    let claim = state.claim_reply(reply).unwrap();
+    let stale = state.begin_reply_publication(claim).unwrap();
+    let workload = advance_reply_parent_after_fence(&mut state);
+    let current = match state
+        .adopt_reply_after_fence(&workload, COMPACT_REPLY, 1, 2)
+        .unwrap()
+    {
+        ReplyAdoption::ReplayPublication(intent) => intent,
+        _ => __cser_core::panic!("publishing reply adopted into wrong phase"),
+    };
+    let before = state.private_full_clone();
+    let failure = state
+        .acknowledge_reply_publication(stale, compact_reply_publication_receipt())
+        .unwrap_err();
+    __cser_core::assert_eq!(failure.error(), InfrastructureError::StaleGeneration);
+    __cser_core::assert_eq!(state, before);
+    state
+        .acknowledge_reply_publication(current, compact_reply_publication_receipt())
+        .unwrap();
+    state.check_invariants().unwrap();
+
+    let (mut state, _, _, reply) = compact_reply_state(0xfee3);
+    let claim = state.claim_reply(reply).unwrap();
+    let intent = state.begin_reply_publication(claim).unwrap();
+    let publication = compact_reply_publication_receipt();
+    let stale = state
+        .acknowledge_reply_publication(intent, publication)
+        .unwrap();
+    let workload = advance_reply_parent_after_fence(&mut state);
+    let current = match state
+        .adopt_reply_after_fence(&workload, COMPACT_REPLY, 1, 2)
+        .unwrap()
+    {
+        ReplyAdoption::Acknowledged(ack) => ack,
+        _ => __cser_core::panic!("acknowledged reply adopted into wrong phase"),
+    };
+    __cser_core::assert_eq!(
+        state
+            .query_reply(&workload, COMPACT_REPLY, 1)
+            .unwrap()
+            .publication_receipt,
+        Some(publication)
+    );
+    let before = state.private_full_clone();
+    let failure = state.complete_reply_wake(stale).unwrap_err();
+    __cser_core::assert_eq!(failure.error(), InfrastructureError::StaleGeneration);
+    __cser_core::assert_eq!(state, before);
+    state.complete_reply_wake(current).unwrap();
+    state.check_invariants().unwrap();
+}
+
 #[test]
 fn normal_task_exit_retains_continuation_and_reply_until_both_drain() {
     const REGISTRY: u64 = 0xfe40;
@@ -5241,13 +6015,13 @@ fn normal_task_exit_retains_continuation_and_reply_until_both_drain() {
     __cser_core::assert_eq!(retained.live_children, 1);
     __cser_core::assert_eq!(retained.anchor, TaskAnchorRecoveryState::TerminalRetained);
 
-    let reply_stamp = reply.0;
+    let reply_coordinates = service_key_coordinates(&reply.0);
     let before = state.private_full_clone();
     let failure = state.claim_reply(reply).unwrap_err();
     __cser_core::assert_eq!(failure.error(), InfrastructureError::InvalidState);
     __cser_core::assert_eq!(state, before);
     let reply = failure.into_input();
-    __cser_core::assert_eq!(reply.0, reply_stamp);
+    __cser_core::assert_eq!(service_key_coordinates(&reply.0), reply_coordinates);
     state
         .cancel_reply(ReplyAbortAuthority::Prepared(reply), 0xfe49)
         .unwrap();
@@ -5327,22 +6101,14 @@ fn terminal_claimed_continuation_and_reply_can_only_cancel_before_publication() 
     __cser_core::assert_eq!(service_key_coordinates(&claim.0), claim_coordinates);
     state.cancel_claimed_continuation(claim).unwrap();
 
-    let reply_claim_coordinates = (
-        reply_claim.reply,
-        reply_claim.claim_generation,
-        reply_claim.claim_nonce,
-    );
+    let reply_claim_coordinates = service_key_coordinates(&reply_claim.0);
     let before = state.private_full_clone();
     let failure = state.begin_reply_publication(reply_claim).unwrap_err();
     __cser_core::assert_eq!(failure.error(), InfrastructureError::InvalidState);
     __cser_core::assert_eq!(state, before);
     let reply_claim = failure.into_input();
     __cser_core::assert_eq!(
-        (
-            reply_claim.reply,
-            reply_claim.claim_generation,
-            reply_claim.claim_nonce,
-        ),
+        service_key_coordinates(&reply_claim.0),
         reply_claim_coordinates
     );
     state

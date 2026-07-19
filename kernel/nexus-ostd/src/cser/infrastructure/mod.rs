@@ -388,6 +388,14 @@ mod bearer_state {
     pub(super) enum DelayedReserved {}
     #[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
     pub(super) enum DelayedPublishing {}
+    #[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
+    pub(super) enum ReplyPrepared {}
+    #[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
+    pub(super) enum ReplyClaimed {}
+    #[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
+    pub(super) enum ReplyPublishing {}
+    #[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
+    pub(super) enum ReplyAcknowledged {}
 
     impl Sealed for ContinuationPending {}
     impl Sealed for ContinuationClaimed {}
@@ -414,6 +422,10 @@ mod bearer_state {
     impl Sealed for DeadlineQuarantined {}
     impl Sealed for DelayedReserved {}
     impl Sealed for DelayedPublishing {}
+    impl Sealed for ReplyPrepared {}
+    impl Sealed for ReplyClaimed {}
+    impl Sealed for ReplyPublishing {}
+    impl Sealed for ReplyAcknowledged {}
 }
 
 /// Opaque, state-typed authority for one fixed infrastructure slot.
@@ -2272,14 +2284,10 @@ impl ReplyDescriptor {
 }
 
 #[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
-pub(crate) struct ReplyRecord(BearerStamp<ReplyDescriptor>);
+pub(crate) struct ReplyRecord(BearerKey<bearer_state::ReplyPrepared>);
 
 #[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
-pub(crate) struct ReplyClaim {
-    reply: BearerStamp<ReplyDescriptor>,
-    claim_generation: u64,
-    claim_nonce: u64,
-}
+pub(crate) struct ReplyClaim(BearerKey<bearer_state::ReplyClaimed>);
 
 #[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(crate) enum ReplyAbortAuthority {
@@ -2288,13 +2296,7 @@ pub(crate) enum ReplyAbortAuthority {
 }
 
 #[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
-pub(crate) struct ReplyPublicationIntent {
-    reply: BearerStamp<ReplyDescriptor>,
-    claim_generation: u64,
-    claim_nonce: u64,
-    apply_generation: u64,
-    apply_nonce: u64,
-}
+pub(crate) struct ReplyPublicationIntent(BearerKey<bearer_state::ReplyPublishing>);
 
 #[derive(
     __cser_core::clone::Clone,
@@ -2318,14 +2320,34 @@ pub(crate) struct ReplyPublicationReceipt {
 
 /// Receipt which alone gates the guest wake following reply publication.
 #[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
-pub(crate) struct ReplyAckReceipt {
-    reply: BearerStamp<ReplyDescriptor>,
-    backend_effect: EffectKey,
-    backend_commit_sequence: u64,
-    publication_receipt: ReplyPublicationReceipt,
-    ack_generation: u64,
-    ack_nonce: u64,
-}
+pub(crate) struct ReplyAckReceipt(BearerKey<bearer_state::ReplyAcknowledged>);
+
+const _: () = {
+    __cser_core::assert!(
+        __cser_core::mem::size_of::<BearerKey<bearer_state::ReplyPrepared>>() <= 64
+    );
+    __cser_core::assert!(
+        __cser_core::mem::size_of::<BearerKey<bearer_state::ReplyClaimed>>() <= 64
+    );
+    __cser_core::assert!(
+        __cser_core::mem::size_of::<BearerKey<bearer_state::ReplyPublishing>>() <= 64
+    );
+    __cser_core::assert!(
+        __cser_core::mem::size_of::<BearerKey<bearer_state::ReplyAcknowledged>>() <= 64
+    );
+    __cser_core::assert!(__cser_core::mem::size_of::<ReplyRecord>() <= 64);
+    __cser_core::assert!(__cser_core::mem::size_of::<ReplyClaim>() <= 64);
+    __cser_core::assert!(__cser_core::mem::size_of::<ReplyPublicationIntent>() <= 64);
+    __cser_core::assert!(__cser_core::mem::size_of::<ReplyAckReceipt>() <= 64);
+    __cser_core::assert!(__cser_core::mem::size_of::<ReplyAbortAuthority>() <= 96);
+    __cser_core::assert!(__cser_core::mem::size_of::<LinearFailure<ReplyRecord>>() <= 120);
+    __cser_core::assert!(__cser_core::mem::size_of::<LinearFailure<ReplyClaim>>() <= 120);
+    __cser_core::assert!(
+        __cser_core::mem::size_of::<LinearFailure<ReplyPublicationIntent>>() <= 120
+    );
+    __cser_core::assert!(__cser_core::mem::size_of::<LinearFailure<ReplyAckReceipt>>() <= 120);
+    __cser_core::assert!(__cser_core::mem::size_of::<LinearFailure<ReplyAbortAuthority>>() <= 120);
+};
 
 #[derive(
     __cser_core::clone::Clone,
@@ -3703,6 +3725,7 @@ fn rewrite_scope_stamps(scope: &mut ScopeInfrastructure, registry_instance: u64)
     }
     for record in scope.replies.iter_mut() {
         record.stamp.root.registry_instance = registry_instance;
+        record.backend_commit.registry_instance_id = registry_instance;
     }
 }
 
