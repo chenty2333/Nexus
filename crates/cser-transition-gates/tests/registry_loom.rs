@@ -127,9 +127,18 @@ fn production_device_batch_vs_revoke_linearization() {
                 let fixture = Arc::new(Mutex::new(fixture));
                 let commit_fixture = fixture.clone();
                 let revoke_fixture = fixture.clone();
-                let commit = thread::spawn(move || commit_fixture.lock().unwrap().commit());
-                let revoke =
-                    thread::spawn(move || revoke_fixture.lock().unwrap().revoke_to_completion());
+                // Both modeled actors run the full Registry oracle. Give the
+                // inner Loom coroutines the same bounded stack as the outer
+                // fixture thread; the default coroutine stack is too small for
+                // the exhaustive post-revoke invariant recomputation.
+                let commit = thread::Builder::new()
+                    .stack_size(8 * 1024 * 1024)
+                    .spawn(move || commit_fixture.lock().unwrap().commit())
+                    .unwrap();
+                let revoke = thread::Builder::new()
+                    .stack_size(8 * 1024 * 1024)
+                    .spawn(move || revoke_fixture.lock().unwrap().revoke_to_completion())
+                    .unwrap();
                 let commit = commit.join().unwrap();
                 revoke.join().unwrap().unwrap();
 
