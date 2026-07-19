@@ -2,30 +2,32 @@
 
 use super::service::{validate_bound_service_request, validate_live_service_child_binding};
 use super::{
-    BearerStamp, BoundServiceRequest, DelayedCommandDescriptor, DelayedCommandIntent,
-    DelayedCommandPhase, DelayedCommandReceipt, DelayedCommandRecoveryProjection,
-    DelayedCommandRecoveryState, DelayedCommandRejectionReason, DelayedCommandRejectionReceipt,
-    DelayedCommandStateRecord, DelayedCommandTicket, EnteredTaskLease, InfrastructureError,
-    InfrastructureEventKind, InfrastructureKind, InfrastructureState, LinearResult, ParentStamp,
-    ReverseIndexRecord, ReverseParent, ScopeInfrastructure, ScopeKey, WorkloadContext, checked_add,
-    checked_sub, context_from_stamp, linear_apply, preview_bearer_stamp, preview_nonce,
-    preview_revision, preview_task_child_add, preview_task_child_sub, preview_workload_child_add,
-    preview_workload_child_sub, require_vacancy, validate_active_admission, validate_context,
-    validate_stamp_common, validate_task_stamp,
+    ArmedFaultTask, BearerStamp, BoundServiceRequest, DelayedCommandDescriptor,
+    DelayedCommandIntent, DelayedCommandPhase, DelayedCommandReceipt,
+    DelayedCommandRecoveryProjection, DelayedCommandRecoveryState, DelayedCommandRejectionReason,
+    DelayedCommandRejectionReceipt, DelayedCommandStateRecord, DelayedCommandTicket,
+    InfrastructureError, InfrastructureEventKind, InfrastructureKind, InfrastructureState,
+    LinearResult, ParentStamp, ReverseIndexRecord, ReverseParent, ScopeInfrastructure, ScopeKey,
+    WorkloadContext, checked_add, checked_sub, context_from_stamp, install_task_child_count,
+    linear_apply, preview_bearer_stamp, preview_nonce, preview_revision, preview_task_child_add,
+    preview_task_child_sub, preview_workload_child_add, preview_workload_child_sub,
+    require_vacancy, validate_active_admission, validate_context, validate_task_child_stamp,
+    validate_task_key,
 };
 
 impl InfrastructureState {
     pub(in super::super) fn reserve_delayed_command(
         &mut self,
-        task: &EnteredTaskLease,
+        task: &ArmedFaultTask,
         bound: &BoundServiceRequest,
         descriptor: DelayedCommandDescriptor,
     ) -> Result<DelayedCommandTicket, InfrastructureError> {
         self.require_authoritative()?;
         descriptor.validate()?;
         let registry_instance = self.registry_instance;
-        let scope = self.scope_mut(task.0.root.scope)?;
-        validate_task_stamp(scope, registry_instance, &task.0)?;
+        let scope = self.scope_mut(task.0.authority.scope)?;
+        let task_record = validate_task_key(scope, registry_instance, &task.0)?;
+        let task_stamp = task_record.stamp;
         let bound_record = validate_bound_service_request(scope, registry_instance, bound)?;
         let bound_stamp = bound_record.stamp;
         let binding_receipt =
@@ -33,9 +35,10 @@ impl InfrastructureState {
         validate_active_admission(scope)?;
         if descriptor.request_id != bound_stamp.identity.request_id
             || descriptor.request_generation != bound_stamp.identity.generation
-            || descriptor.sender != task.0.identity.task
+            || descriptor.sender != task_stamp.identity.task
             || descriptor.sender != binding_receipt.claimant.task.task
-            || task.0.identity != binding_receipt.claimant.task
+            || task_stamp.identity != binding_receipt.claimant.task
+            || task_record.service_fault.is_none()
             || descriptor.target.scope() != stamp_scope(&bound_stamp)
             || descriptor.target.effect() != binding_receipt.child.child_effect
             || descriptor.target.domain() != descriptor.destination_domain
@@ -48,7 +51,7 @@ impl InfrastructureState {
         }
         if let Some(existing) = scope.delayed_commands.get(descriptor.command_id) {
             return if existing.stamp.identity == descriptor
-                && existing.stamp.parent == ParentStamp::Task(task.0.identity)
+                && existing.stamp.parent == ParentStamp::Task(task_stamp.identity)
             {
                 Err(InfrastructureError::ExactReplay)
             } else if existing.stamp.identity.generation > descriptor.generation {
@@ -69,12 +72,12 @@ impl InfrastructureState {
             descriptor.command_id,
             InfrastructureKind::DelayedCommand,
         )?;
-        let context = context_from_stamp(scope, task.0.workload)?;
+        let context = context_from_stamp(scope, task_stamp.workload)?;
         let (stamp, next_nonce) = preview_bearer_stamp(
             scope,
             &context,
             descriptor,
-            ParentStamp::Task(task.0.identity),
+            ParentStamp::Task(task_stamp.identity),
         )?;
         require_vacancy(
             &scope.reverse_indexes,
@@ -84,12 +87,12 @@ impl InfrastructureState {
         let next_revision = preview_revision(scope)?;
         let next_live = checked_add(scope.live.delayed_commands, 1)?;
         let next_workload_children = preview_workload_child_add(scope, stamp.workload.request)?;
-        let next_task_children = preview_task_child_add(scope, task.0.identity)?;
+        let next_task_children = preview_task_child_add(scope, task_stamp.identity)?;
         let index = ReverseIndexRecord {
             slot: stamp.nonce,
             kind: InfrastructureKind::DelayedCommand,
             root_effect: stamp.root.root_effect,
-            parent: ReverseParent::Task(task.0.identity),
+            parent: ReverseParent::Task(task_stamp.identity),
             task: Some(descriptor.sender),
             domain: stamp.domain.domain,
             binding_epoch: stamp.domain.binding_epoch,
@@ -121,7 +124,7 @@ impl InfrastructureState {
             .live_children = next_workload_children;
         scope
             .tasks
-            .get_mut(task.0.identity.work_id)
+            .get_mut(task_stamp.identity.work_id)
             .unwrap()
             .live_children = next_task_children;
         scope.events.push(
@@ -333,7 +336,7 @@ fn validate_delayed_command_bearer(
     registry_instance: u64,
     stamp: &BearerStamp<DelayedCommandDescriptor>,
 ) -> Result<(), InfrastructureError> {
-    validate_stamp_common(scope, registry_instance, stamp)?;
+    validate_task_child_stamp(scope, registry_instance, stamp)?;
     let record = scope
         .delayed_commands
         .get(stamp.identity.command_id)
@@ -369,11 +372,10 @@ fn finish_delayed_command(
         .get_mut(stamp.workload.request.id)
         .unwrap()
         .live_children = next_workload_children;
-    scope
-        .tasks
-        .get_mut(parent_task.work_id)
-        .unwrap()
-        .live_children = next_task_children;
+    install_task_child_count(
+        scope.tasks.get_mut(parent_task.work_id).unwrap(),
+        next_task_children,
+    );
     Ok(())
 }
 

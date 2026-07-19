@@ -25,7 +25,7 @@ mod task;
 
 use self::{
     continuation::validate_continuation_publication_ack, delayed::delayed_command_phase_live,
-    device::device_phase_live, fault::validate_fault_bearer, invariants::check_scope_invariants,
+    device::device_phase_live, invariants::check_scope_invariants,
     service::service_request_phase_live,
 };
 
@@ -292,6 +292,20 @@ mod bearer_state {
     #[derive(Debug, Eq, PartialEq)]
     pub(super) enum ServiceChildBound {}
     #[derive(Debug, Eq, PartialEq)]
+    pub(super) enum TaskAdmitted {}
+    #[derive(Debug, Eq, PartialEq)]
+    pub(super) enum TaskEntered {}
+    #[derive(Debug, Eq, PartialEq)]
+    pub(super) enum TaskFaultReserved {}
+    #[derive(Debug, Eq, PartialEq)]
+    pub(super) enum TaskFaultArmed {}
+    #[derive(Debug, Eq, PartialEq)]
+    pub(super) enum FaultCrashReceiptClaimed {}
+    #[derive(Debug, Eq, PartialEq)]
+    pub(super) enum FaultIsolateReceiptClaimed {}
+    #[derive(Debug, Eq, PartialEq)]
+    pub(super) enum FaultCrashCauseClaimed {}
+    #[derive(Debug, Eq, PartialEq)]
     pub(super) enum DeadlineArmed {}
     #[derive(Debug, Eq, PartialEq)]
     pub(super) enum DeadlineFired {}
@@ -312,6 +326,13 @@ mod bearer_state {
     impl Sealed for ServiceArmPublishing {}
     impl Sealed for ServiceArmed {}
     impl Sealed for ServiceChildBound {}
+    impl Sealed for TaskAdmitted {}
+    impl Sealed for TaskEntered {}
+    impl Sealed for TaskFaultReserved {}
+    impl Sealed for TaskFaultArmed {}
+    impl Sealed for FaultCrashReceiptClaimed {}
+    impl Sealed for FaultIsolateReceiptClaimed {}
+    impl Sealed for FaultCrashCauseClaimed {}
     impl Sealed for DeadlineArmed {}
     impl Sealed for DeadlineFired {}
     impl Sealed for DeadlineExhausted {}
@@ -454,12 +475,21 @@ impl TaskWorkDescriptor {
 /// A root-specific runnable/work admission. It must not be described as the
 /// lifetime authority for a process task which existed before the root.
 #[derive(Debug, Eq, PartialEq)]
-pub(crate) struct TaskLease(BearerStamp<TaskWorkDescriptor>);
+pub(crate) struct TaskLease(BearerKey<bearer_state::TaskAdmitted>);
 
 /// Successor returned exactly once by the entry claim. An admitted lease can
 /// no longer be reused to run or reap the work item.
 #[derive(Debug, Eq, PartialEq)]
-pub(crate) struct EnteredTaskLease(BearerStamp<TaskWorkDescriptor>);
+pub(crate) struct EnteredTaskLease(BearerKey<bearer_state::TaskEntered>);
+
+/// The admitted service task and its reserved fault slot are one linear
+/// authority. There is deliberately no independently usable fault bearer.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct ReservedFaultTask(BearerKey<bearer_state::TaskFaultReserved>);
+
+/// The entered service task and armed fault slot are one linear authority.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct ArmedFaultTask(BearerKey<bearer_state::TaskFaultArmed>);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TaskRecoveryState {
@@ -475,12 +505,22 @@ pub(crate) struct TaskRecoveryProjection {
     pub(crate) descriptor: TaskWorkDescriptor,
     pub(crate) state: TaskRecoveryState,
     pub(crate) live_children: u32,
+    pub(crate) anchor: TaskAnchorRecoveryState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TaskAnchorRecoveryState {
+    Live,
+    TerminalRetained,
+    TerminalDrained,
 }
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum TaskAdoption {
     Admitted(TaskLease),
     Entered(EnteredTaskLease),
+    FaultReserved(ReservedFaultTask),
+    FaultArmed(ArmedFaultTask),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -881,39 +921,28 @@ pub(crate) enum FaultAccess {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct FaultDescriptor {
+pub(crate) struct FaultSlotDescriptor {
     pub(crate) fault_id: u64,
     pub(crate) generation: u64,
     pub(crate) task: TaskKey,
     pub(crate) vm_generation: u64,
-    pub(crate) instruction_pointer: u64,
-    pub(crate) address: u64,
-    pub(crate) access: FaultAccess,
-    pub(crate) architecture_error: u64,
     pub(crate) service_domain: DomainKey,
-    pub(crate) service_binding_epoch: u64,
+    pub(crate) admission_binding_epoch: u64,
 }
 
-impl FaultDescriptor {
+impl FaultSlotDescriptor {
     fn validate(self) -> Result<(), InfrastructureError> {
         if self.fault_id == 0
             || self.generation == 0
             || self.task.generation() == 0
             || self.vm_generation == 0
-            || self.instruction_pointer == 0
-            || self.service_binding_epoch == 0
+            || self.admission_binding_epoch == 0
         {
             return Err(InfrastructureError::InvalidIdentity);
         }
         Ok(())
     }
 }
-
-#[derive(Debug, Eq, PartialEq)]
-pub(crate) struct FaultEvent(BearerStamp<FaultDescriptor>);
-
-#[derive(Debug, Eq, PartialEq)]
-pub(crate) struct ArmedFaultEvent(BearerStamp<FaultDescriptor>);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FaultDisposition {
@@ -946,46 +975,119 @@ pub(crate) struct ServiceFaultProjection {
 }
 
 #[derive(Debug, Eq, PartialEq)]
-pub(crate) struct ServiceFaultReceipt {
-    fault: BearerStamp<FaultDescriptor>,
-    projection: ServiceFaultProjection,
-    receipt_generation: u64,
-    receipt_nonce: u64,
+pub(crate) struct CrashServiceReceipt(BearerKey<bearer_state::FaultCrashReceiptClaimed>);
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct IsolateTaskReceipt(BearerKey<bearer_state::FaultIsolateReceiptClaimed>);
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct ServiceCrashCause(BearerKey<bearer_state::FaultCrashCauseClaimed>);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FaultClaimProjection {
+    Crash(ServiceFaultProjection),
+    Isolate(ServiceFaultProjection),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InstalledFaultObservation {
+    Crash(InstalledFaultProjection),
+    Isolate(InstalledFaultProjection),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct InstalledFaultProjection {
+    pub(crate) projection: ServiceFaultProjection,
+    pub(crate) commitment: FaultPlanCommitment,
 }
 
 #[derive(Debug, Eq, PartialEq)]
-pub(crate) struct ServiceCrashCause {
-    projection: ServiceFaultProjection,
-    consume_generation: u64,
-    consume_nonce: u64,
+pub(crate) enum FaultReceiptClaimOutcome {
+    Crash(CrashServiceReceipt),
+    Isolate(IsolateTaskReceipt),
+    AlreadyClaimed(FaultClaimProjection),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct FaultRecoveryProjection {
-    pub(crate) descriptor: FaultDescriptor,
+    pub(crate) descriptor: FaultSlotDescriptor,
     pub(crate) receipt: Option<ServiceFaultProjection>,
     pub(crate) consumed: bool,
+    pub(crate) awaiting_claim: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ServiceTaskExitReceipt {
+    pub(crate) fault_id: u64,
+    pub(crate) generation: u64,
+    pub(crate) task: TaskKey,
+    pub(crate) evidence_digest: u64,
 }
 
 #[derive(Debug, Eq, PartialEq)]
-pub(super) struct FaultDispositionPlan {
-    event: BearerStamp<FaultDescriptor>,
-    task: BearerStamp<TaskWorkDescriptor>,
-    projection: ServiceFaultProjection,
+pub(crate) struct FaultDispositionIntent {
+    pub(super) armed: ArmedFaultTask,
+    pub(super) commitment: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FaultPlanCommitment(pub(super) [u8; 32]);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FaultDispositionPlan {
+    pub(super) scope: ScopeKey,
+    task: TaskWorkDescriptor,
+    fault: FaultSlotDescriptor,
+    task_nonce: u64,
+    task_bearer_generation: u64,
+    fault_nonce: u64,
+    fault_bearer_generation: u64,
+    pub(super) observation: FaultObservation,
+    pub(super) projection: ServiceFaultProjection,
     base_revision: u64,
     next_binding_epoch: u64,
-    receipt_generation: u64,
-    receipt_nonce: u64,
-    next_nonce: u64,
+    pub(super) business: FaultBusinessPlan,
+    pub(super) commitment: FaultPlanCommitment,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct FaultBusinessPlan {
+    pub(super) scope_revision: u64,
+    pub(super) domain_revision: u64,
+    pub(super) supervisor: Option<TaskKey>,
+    pub(super) fallback_running: bool,
+    pub(super) cohort_digest: [u8; 32],
+    pub(super) cohort_count: u64,
+}
+
+impl FaultBusinessPlan {
+    pub(super) const INFRASTRUCTURE_ONLY: Self = Self {
+        scope_revision: 0,
+        domain_revision: 0,
+        supervisor: None,
+        fallback_running: false,
+        cohort_digest: [0; 32],
+        cohort_count: 0,
+    };
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct AppliedFaultDisposition {
-    event: BearerStamp<FaultDescriptor>,
     projection: ServiceFaultProjection,
-    receipt_generation: u64,
-    receipt_nonce: u64,
+    commitment: FaultPlanCommitment,
 }
+
+const _: () = {
+    assert!(core::mem::size_of::<TaskLease>() <= 64);
+    assert!(core::mem::size_of::<EnteredTaskLease>() <= 64);
+    assert!(core::mem::size_of::<ReservedFaultTask>() <= 64);
+    assert!(core::mem::size_of::<ArmedFaultTask>() <= 64);
+    assert!(core::mem::size_of::<FaultDispositionIntent>() <= 96);
+    assert!(core::mem::size_of::<LinearFailure<TaskLease>>() <= 120);
+    assert!(core::mem::size_of::<LinearFailure<EnteredTaskLease>>() <= 120);
+    assert!(core::mem::size_of::<LinearFailure<ReservedFaultTask>>() <= 120);
+    assert!(core::mem::size_of::<LinearFailure<ArmedFaultTask>>() <= 120);
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ContinuationDescriptor {
@@ -1754,10 +1856,28 @@ enum TaskPhase {
     Reaped,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TaskAnchorPhase {
+    Live,
+    TerminalRetained,
+    TerminalDrained,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TaskFaultLink {
+    fault_id: u64,
+    fault_object_generation: u64,
+    fault_bearer_generation: u64,
+    fault_nonce: u64,
+    terminal_install_digest: Option<[u8; 32]>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct TaskRecord {
     stamp: BearerStamp<TaskWorkDescriptor>,
     phase: TaskPhase,
+    anchor: TaskAnchorPhase,
+    service_fault: Option<TaskFaultLink>,
     live_children: u32,
     closure_sequence: Option<u64>,
 }
@@ -1845,20 +1965,35 @@ struct DelayedCommandStateRecord {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FaultPhase {
     Reserved,
-    Observed {
-        projection: ServiceFaultProjection,
-        receipt_generation: u64,
-        receipt_nonce: u64,
-        consumed: bool,
-        consume_generation: u64,
+    Armed,
+    Exited {
+        receipt: ServiceTaskExitReceipt,
     },
+    InstalledAwaitingClaim {
+        projection: ServiceFaultProjection,
+        observation: FaultObservation,
+        commitment: FaultPlanCommitment,
+    },
+    Claimed {
+        projection: ServiceFaultProjection,
+        observation: FaultObservation,
+        commitment: FaultPlanCommitment,
+        cause_claimed: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FaultTaskOwner {
+    task: TaskWorkDescriptor,
+    task_object_nonce: u64,
+    task_bearer_generation: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct FaultStateRecord {
-    stamp: BearerStamp<FaultDescriptor>,
+    stamp: BearerStamp<FaultSlotDescriptor>,
+    owner: FaultTaskOwner,
     phase: FaultPhase,
-    receipt_generation: u64,
     closure_sequence: Option<u64>,
 }
 
@@ -2647,6 +2782,54 @@ fn validate_context(
     Ok(())
 }
 
+/// Validates an observation context for a terminal record whose service-domain
+/// binding may already have advanced.  The presented workload authority stays
+/// exact; only the enclosing domain epoch may dominate the recorded epoch.
+fn validate_recovery_context(
+    scope: &ScopeInfrastructure,
+    registry_instance: u64,
+    context: &WorkloadContext,
+) -> Result<(), InfrastructureError> {
+    if context.root.registry_instance != registry_instance
+        || scope.root.registry_instance != registry_instance
+    {
+        return Err(InfrastructureError::ForeignRegistry);
+    }
+    if context.root.scope != scope.root.scope {
+        return Err(InfrastructureError::ForeignScope);
+    }
+    if context.root.root_effect != scope.root.root_effect {
+        return Err(InfrastructureError::ForeignRootEffect);
+    }
+    if context.root.authority_epoch != scope.root.authority_epoch {
+        return Err(InfrastructureError::StaleAuthority);
+    }
+    let record = scope
+        .workloads
+        .get(context.workload.request.id)
+        .ok_or(InfrastructureError::UnknownWorkload)?;
+    if record.request != context.workload.request
+        || record.root_effect != context.root.root_effect
+        || record.parent != context.parent
+        || record.domain != context.domain.domain
+        || record.nonce != context.workload.nonce
+    {
+        return Err(InfrastructureError::ForeignWorkload);
+    }
+    if record.bearer_generation != context.workload.bearer_generation {
+        return Err(InfrastructureError::StaleGeneration);
+    }
+    if record.current_binding_epoch != context.domain.binding_epoch
+        || scope.binding_epoch(context.domain.domain)? < context.domain.binding_epoch
+    {
+        return Err(InfrastructureError::StaleBinding);
+    }
+    if record.phase != WorkloadPhase::Open {
+        return Err(InfrastructureError::InvalidState);
+    }
+    Ok(())
+}
+
 fn context_from_stamp(
     scope: &ScopeInfrastructure,
     workload: WorkloadStamp,
@@ -2772,6 +2955,100 @@ fn validate_stamp_common<I: Copy + Eq>(
     Ok(())
 }
 
+/// Validates a retained child against the monotonic coordinates that may have
+/// advanced after its owning task became terminal.
+///
+/// The child's own request, nonce, root effect, domain, and recorded epochs
+/// remain exact historical coordinates.  Only the authoritative domain epoch
+/// and workload bearer may dominate those coordinates.  Callers must also
+/// prove that the parent task is a retained terminal anchor before using this
+/// relaxation.
+fn validate_stamp_common_historical<I: Copy + Eq>(
+    scope: &ScopeInfrastructure,
+    registry_instance: u64,
+    stamp: &BearerStamp<I>,
+) -> Result<(), InfrastructureError> {
+    if stamp.root.registry_instance != registry_instance
+        || scope.root.registry_instance != registry_instance
+    {
+        return Err(InfrastructureError::ForeignRegistry);
+    }
+    if stamp.root.scope != scope.root.scope {
+        return Err(InfrastructureError::ForeignScope);
+    }
+    if stamp.root.root_effect != scope.root.root_effect {
+        return Err(InfrastructureError::ForeignRootEffect);
+    }
+    if stamp.root.authority_epoch != scope.root.authority_epoch {
+        return Err(InfrastructureError::StaleAuthority);
+    }
+    if scope.binding_epoch(stamp.domain.domain)? < stamp.domain.binding_epoch {
+        return Err(InfrastructureError::StaleBinding);
+    }
+    let workload = scope
+        .workloads
+        .get(stamp.workload.request.id)
+        .ok_or(InfrastructureError::UnknownWorkload)?;
+    if workload.request != stamp.workload.request
+        || workload.nonce != stamp.workload.nonce
+        || workload.bearer_generation < stamp.workload.bearer_generation
+        || workload.domain != stamp.domain.domain
+        || workload.current_binding_epoch < stamp.domain.binding_epoch
+    {
+        return Err(InfrastructureError::ForeignWorkload);
+    }
+    Ok(())
+}
+
+/// Validates a task-owned child and reports whether its parent is a retained
+/// terminal anchor.  Live parents require exact current coordinates; terminal
+/// parents permit only monotonic domination of the child's historic binding
+/// and workload bearer.  This function never authorizes allocation of a new
+/// child: all creation paths separately require an `EnteredTaskLease` or
+/// `ArmedFaultTask` and a live task phase.
+fn validate_task_child_stamp<I: Copy + Eq>(
+    scope: &ScopeInfrastructure,
+    registry_instance: u64,
+    stamp: &BearerStamp<I>,
+) -> Result<bool, InfrastructureError> {
+    let parent = match stamp.parent {
+        ParentStamp::Task(parent) => parent,
+        _ => return Err(InfrastructureError::ForeignParent),
+    };
+    let task = scope
+        .tasks
+        .get(parent.work_id)
+        .ok_or(InfrastructureError::UnknownObligation)?;
+    let live = task.phase == TaskPhase::Entered && task.anchor == TaskAnchorPhase::Live;
+    let terminal = matches!(
+        task.phase,
+        TaskPhase::Rejected | TaskPhase::Isolated | TaskPhase::Reaped
+    ) && task.anchor != TaskAnchorPhase::Live;
+    if !live && !terminal {
+        return Err(InfrastructureError::ForeignParent);
+    }
+    if terminal {
+        validate_stamp_common_historical(scope, registry_instance, stamp)?;
+    } else {
+        validate_stamp_common(scope, registry_instance, stamp)?;
+    }
+    if task.stamp.identity != parent
+        || task.stamp.root != stamp.root
+        || task.stamp.domain.domain != stamp.domain.domain
+        || task.stamp.domain.binding_epoch < stamp.domain.binding_epoch
+        || task.stamp.workload.request != stamp.workload.request
+        || task.stamp.workload.nonce != stamp.workload.nonce
+        || task.stamp.workload.bearer_generation < stamp.workload.bearer_generation
+        || task.stamp.parent != ParentStamp::Request(stamp.workload.request)
+    {
+        return Err(InfrastructureError::ForeignParent);
+    }
+    if live && (task.stamp.domain != stamp.domain || task.stamp.workload != stamp.workload) {
+        return Err(InfrastructureError::ForeignParent);
+    }
+    Ok(terminal)
+}
+
 fn validate_task_stamp(
     scope: &ScopeInfrastructure,
     registry_instance: u64,
@@ -2793,12 +3070,75 @@ fn validate_task_stamp(
     Ok(())
 }
 
-fn validate_task_bearer(
-    scope: &ScopeInfrastructure,
+fn mint_task_key<State: bearer_state::Sealed>(record: &TaskRecord) -> BearerKey<State> {
+    BearerKey {
+        authority: AuthorityKey {
+            registry_instance: record.stamp.root.registry_instance,
+            scope: record.stamp.root.scope,
+            authority_epoch: record.stamp.root.authority_epoch,
+        },
+        slot: record.stamp.identity.work_id,
+        object_generation: record.stamp.identity.generation,
+        bearer_generation: record.stamp.bearer_generation,
+        nonce: record.stamp.nonce,
+        state: PhantomData,
+    }
+}
+
+fn validate_task_key<'a, State: bearer_state::Sealed>(
+    scope: &'a ScopeInfrastructure,
+    registry_instance: u64,
+    key: &BearerKey<State>,
+) -> Result<&'a TaskRecord, InfrastructureError> {
+    if key.authority.registry_instance != registry_instance
+        || scope.root.registry_instance != registry_instance
+    {
+        return Err(InfrastructureError::ForeignRegistry);
+    }
+    if key.authority.scope != scope.root.scope {
+        return Err(InfrastructureError::ForeignScope);
+    }
+    if key.authority.authority_epoch != scope.root.authority_epoch {
+        return Err(InfrastructureError::StaleAuthority);
+    }
+    let record = scope
+        .tasks
+        .get(key.slot)
+        .ok_or(InfrastructureError::UnknownObligation)?;
+    if record.stamp.identity.work_id != key.slot {
+        return Err(InfrastructureError::IdentityConflict);
+    }
+    if record.stamp.identity.generation != key.object_generation
+        || record.stamp.bearer_generation != key.bearer_generation
+        || record.stamp.nonce != key.nonce
+    {
+        return Err(InfrastructureError::StaleGeneration);
+    }
+    validate_task_stamp(scope, registry_instance, &record.stamp)?;
+    Ok(record)
+}
+
+fn validate_task_bearer<'a>(
+    scope: &'a ScopeInfrastructure,
     registry_instance: u64,
     lease: &TaskLease,
-) -> Result<(), InfrastructureError> {
-    validate_task_stamp(scope, registry_instance, &lease.0)
+) -> Result<&'a TaskRecord, InfrastructureError> {
+    validate_task_key(scope, registry_instance, &lease.0)
+}
+
+fn next_task_bearer_generation(record: &TaskRecord) -> Result<u64, InfrastructureError> {
+    record
+        .stamp
+        .bearer_generation
+        .checked_add(1)
+        .ok_or(InfrastructureError::CounterOverflow)
+}
+
+fn install_task_child_count(record: &mut TaskRecord, live_children: u32) {
+    record.live_children = live_children;
+    if live_children == 0 && record.anchor == TaskAnchorPhase::TerminalRetained {
+        record.anchor = TaskAnchorPhase::TerminalDrained;
+    }
 }
 
 fn validate_continuation_bearer(
@@ -2806,7 +3146,7 @@ fn validate_continuation_bearer(
     registry_instance: u64,
     stamp: &BearerStamp<ContinuationDescriptor>,
 ) -> Result<(), InfrastructureError> {
-    validate_stamp_common(scope, registry_instance, stamp)?;
+    let terminal_parent = validate_task_child_stamp(scope, registry_instance, stamp)?;
     let record = scope
         .continuations
         .get(stamp.identity.continuation_id)
@@ -2814,7 +3154,7 @@ fn validate_continuation_bearer(
     if record.stamp != *stamp {
         return Err(InfrastructureError::StaleGeneration);
     }
-    validate_continuation_source(scope, stamp)?;
+    validate_continuation_source(scope, stamp, terminal_parent)?;
     validate_continuation_publication_ack(record)?;
     Ok(())
 }
@@ -2882,8 +3222,12 @@ fn next_continuation_bearer_generation(
 fn validate_continuation_source(
     scope: &ScopeInfrastructure,
     stamp: &BearerStamp<ContinuationDescriptor>,
+    terminal_parent: bool,
 ) -> Result<(), InfrastructureError> {
-    if scope.binding_epoch(stamp.identity.source_domain)? != stamp.identity.source_binding_epoch {
+    let source_binding_epoch = scope.binding_epoch(stamp.identity.source_domain)?;
+    if (!terminal_parent && source_binding_epoch != stamp.identity.source_binding_epoch)
+        || (terminal_parent && source_binding_epoch < stamp.identity.source_binding_epoch)
+    {
         return Err(InfrastructureError::StaleBinding);
     }
     let parent = match stamp.parent {
@@ -2896,9 +3240,19 @@ fn validate_continuation_source(
         .ok_or(InfrastructureError::UnknownObligation)?;
     if task.stamp.identity != parent
         || task.stamp.root != stamp.root
-        || task.stamp.domain != stamp.domain
-        || task.stamp.workload != stamp.workload
-        || task.phase != TaskPhase::Entered
+        || task.stamp.domain.domain != stamp.domain.domain
+        || task.stamp.domain.binding_epoch < stamp.domain.binding_epoch
+        || task.stamp.workload.request != stamp.workload.request
+        || task.stamp.workload.nonce != stamp.workload.nonce
+        || task.stamp.workload.bearer_generation < stamp.workload.bearer_generation
+        || (!terminal_parent
+            && (task.stamp.domain != stamp.domain || task.stamp.workload != stamp.workload))
+        || (!terminal_parent && task.phase != TaskPhase::Entered)
+        || (terminal_parent
+            && (!matches!(
+                task.phase,
+                TaskPhase::Rejected | TaskPhase::Isolated | TaskPhase::Reaped
+            ) || task.anchor == TaskAnchorPhase::Live))
         || parent.vm.map(VmAuthorityKey::generation) != Some(stamp.identity.vm_generation)
     {
         return Err(InfrastructureError::ForeignParent);
@@ -2912,7 +3266,7 @@ fn validate_deadline_record(
     record: &DeadlineRecord,
 ) -> Result<(), InfrastructureError> {
     let stamp = &record.stamp;
-    validate_stamp_common(scope, registry_instance, stamp)?;
+    let terminal_parent = validate_task_child_stamp(scope, registry_instance, stamp)?;
     let parent = match stamp.parent {
         ParentStamp::Task(parent) => parent,
         _ => return Err(InfrastructureError::ForeignParent),
@@ -2921,13 +3275,20 @@ fn validate_deadline_record(
         .tasks
         .get(parent.work_id)
         .ok_or(InfrastructureError::UnknownObligation)?;
-    validate_task_stamp(scope, registry_instance, &task.stamp)?;
-    if task.phase != TaskPhase::Entered
+    let parent_phase_valid = (task.phase == TaskPhase::Entered
+        && task.anchor == TaskAnchorPhase::Live)
+        || (matches!(task.phase, TaskPhase::Isolated | TaskPhase::Reaped)
+            && task.anchor != TaskAnchorPhase::Live);
+    if !parent_phase_valid
         || task.stamp.identity != parent
         || task.stamp.root != stamp.root
-        || task.stamp.domain != stamp.domain
-        || task.stamp.workload != stamp.workload
+        || task.stamp.domain.domain != stamp.domain.domain
+        || task.stamp.domain.binding_epoch < stamp.domain.binding_epoch
+        || task.stamp.workload.request != stamp.workload.request
+        || task.stamp.workload.nonce != stamp.workload.nonce
+        || task.stamp.workload.bearer_generation < stamp.workload.bearer_generation
         || task.stamp.parent != ParentStamp::Request(stamp.workload.request)
+        || terminal_parent != (task.anchor != TaskAnchorPhase::Live)
     {
         return Err(InfrastructureError::ForeignParent);
     }

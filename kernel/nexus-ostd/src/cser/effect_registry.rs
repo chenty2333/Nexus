@@ -23,11 +23,22 @@ use cser_transition_gates::handoff::{
     HandoffAdmissionGate, HandoffGateError, OwnershipDecision, OwnershipDecisionReceipt,
     PrepareIntent,
 };
+use sha2::{Digest, Sha256};
 
 #[path = "infrastructure/mod.rs"]
 mod infrastructure;
 
 static NEXT_REGISTRY_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
+
+fn fault_cohort_digest(cohort: Option<&BTreeSet<EffectKey>>) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"nexus.cser.fault-business-cohort.v1\0");
+    for effect in cohort.into_iter().flatten() {
+        hasher.update(effect.id().to_le_bytes());
+        hasher.update(effect.generation().to_le_bytes());
+    }
+    hasher.finalize().into()
+}
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct ScopeKey {
@@ -1951,6 +1962,17 @@ struct DomainRecoveryState {
     unadopted: BTreeSet<EffectKey>,
     snapshot: Option<DomainRecoverySnapshot>,
     ready: Option<TaskKey>,
+    fault: Option<DomainFaultRecoveryAnchor>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DomainFaultRecoveryAnchor {
+    fault_id: u64,
+    generation: u64,
+    task: TaskKey,
+    vm_generation: u64,
+    evidence_digest: u64,
+    plan_commitment: [u8; 32],
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2328,6 +2350,22 @@ pub(crate) enum RegistryError {
     Invariant(&'static str),
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct FaultRegistryFailure {
+    error: RegistryError,
+    input: infrastructure::ArmedFaultTask,
+}
+
+impl FaultRegistryFailure {
+    pub(crate) const fn error(&self) -> &RegistryError {
+        &self.error
+    }
+
+    pub(crate) fn into_input(self) -> infrastructure::ArmedFaultTask {
+        self.input
+    }
+}
+
 impl From<infrastructure::InfrastructureError> for RegistryError {
     fn from(error: infrastructure::InfrastructureError) -> Self {
         Self::Infrastructure(error)
@@ -2689,6 +2727,216 @@ impl EffectRegistry {
             base_infrastructure,
             replacement,
         })
+    }
+
+    /// Prepares the one task-owned fault plan which may later enter the
+    /// specialized business/infrastructure install below.  No Registry state
+    /// changes here and every failure returns the exact armed task authority.
+    pub(crate) fn prepare_service_fault_disposition(
+        &self,
+        armed: infrastructure::ArmedFaultTask,
+        observation: infrastructure::FaultObservation,
+        disposition: infrastructure::FaultDisposition,
+    ) -> Result<
+        (
+            infrastructure::FaultDispositionIntent,
+            infrastructure::FaultDispositionPlan,
+        ),
+        FaultRegistryFailure,
+    > {
+        let (scope_key, descriptor) = match self.infrastructure.describe_armed_fault(&armed) {
+            Ok(description) => description,
+            Err(error) => {
+                return Err(FaultRegistryFailure {
+                    error: error.into(),
+                    input: armed,
+                });
+            }
+        };
+        let scope = match self.scopes.get(&scope_key) {
+            Some(scope) => scope,
+            None => {
+                return Err(FaultRegistryFailure {
+                    error: RegistryError::UnknownScope,
+                    input: armed,
+                });
+            }
+        };
+        if scope.phase != ScopePhase::Active {
+            return Err(FaultRegistryFailure {
+                error: RegistryError::ScopeNotActive,
+                input: armed,
+            });
+        }
+        let binding = match scope.domains.get(&descriptor.service_domain) {
+            Some(binding) => binding,
+            None => {
+                return Err(FaultRegistryFailure {
+                    error: RegistryError::UnknownDomain,
+                    input: armed,
+                });
+            }
+        };
+        if binding.binding_epoch != descriptor.admission_binding_epoch {
+            return Err(FaultRegistryFailure {
+                error: RegistryError::StaleBinding,
+                input: armed,
+            });
+        }
+        if disposition == infrastructure::FaultDisposition::CrashService
+            && (binding.supervisor != Some(descriptor.task) || binding.fallback_running)
+        {
+            return Err(FaultRegistryFailure {
+                error: RegistryError::NoSupervisor,
+                input: armed,
+            });
+        }
+        let cohort = self
+            .production
+            .by_domain
+            .get(&(scope_key, descriptor.service_domain));
+        let cohort_count = match u64::try_from(cohort.map_or(0, BTreeSet::len)) {
+            Ok(count) => count,
+            Err(_) => {
+                return Err(FaultRegistryFailure {
+                    error: RegistryError::CounterOverflow,
+                    input: armed,
+                });
+            }
+        };
+        let business = infrastructure::FaultBusinessPlan {
+            scope_revision: scope.revision,
+            domain_revision: binding.revision,
+            supervisor: binding.supervisor,
+            fallback_running: binding.fallback_running,
+            cohort_digest: fault_cohort_digest(cohort),
+            cohort_count,
+        };
+        self.infrastructure
+            .prepare_fault_disposition_with_business(armed, observation, disposition, business)
+            .map_err(|failure| {
+                let (error, input) = failure.into_parts();
+                FaultRegistryFailure {
+                    error: error.into(),
+                    input,
+                }
+            })
+    }
+
+    /// Specialized exact-scope transaction for a task-owned fault.  The
+    /// candidate receives only a copyable plan, never bearer authority.  The
+    /// final live install is two prevalidated existing-slot replacements and
+    /// is therefore allocation-free and infallible.
+    pub(crate) fn install_service_fault_disposition(
+        &mut self,
+        intent: infrastructure::FaultDispositionIntent,
+        plan: infrastructure::FaultDispositionPlan,
+    ) -> Result<infrastructure::InstalledFaultObservation, FaultRegistryFailure> {
+        let prepared = (|| -> Result<_, RegistryError> {
+            self.infrastructure
+                .validate_fault_disposition_intent(&intent, plan)?;
+            let live_scope = self
+                .scopes
+                .get(&plan.scope)
+                .ok_or(RegistryError::UnknownScope)?;
+            let live_binding = live_scope
+                .domains
+                .get(&plan.projection.service_domain)
+                .ok_or(RegistryError::UnknownDomain)?;
+            let cohort = self
+                .production
+                .by_domain
+                .get(&(plan.scope, plan.projection.service_domain));
+            let cohort_count = u64::try_from(cohort.map_or(0, BTreeSet::len))
+                .map_err(|_| RegistryError::CounterOverflow)?;
+            let current_business = infrastructure::FaultBusinessPlan {
+                scope_revision: live_scope.revision,
+                domain_revision: live_binding.revision,
+                supervisor: live_binding.supervisor,
+                fallback_running: live_binding.fallback_running,
+                cohort_digest: fault_cohort_digest(cohort),
+                cohort_count,
+            };
+            if current_business != plan.business || live_scope.phase != ScopePhase::Active {
+                return Err(RegistryError::CombinedCandidateStale);
+            }
+
+            let mut candidate = self.combined_scope_candidate(plan.scope)?;
+            if plan.projection.disposition == infrastructure::FaultDisposition::CrashService {
+                let scope = candidate
+                    .replacement
+                    .scopes
+                    .get_mut(&plan.scope)
+                    .ok_or(RegistryError::UnknownScope)?;
+                let next_scope_revision = scope
+                    .revision
+                    .checked_add(1)
+                    .ok_or(RegistryError::CounterOverflow)?;
+                let binding = scope
+                    .domains
+                    .get_mut(&plan.projection.service_domain)
+                    .ok_or(RegistryError::UnknownDomain)?;
+                let next_domain_revision = binding
+                    .revision
+                    .checked_add(1)
+                    .ok_or(RegistryError::CounterOverflow)?;
+                if binding.supervisor != Some(plan.projection.task)
+                    || binding.fallback_running
+                    || next_domain_revision != plan.projection.crash_generation
+                {
+                    return Err(RegistryError::NoSupervisor);
+                }
+                let cohort = candidate
+                    .replacement
+                    .production
+                    .by_domain
+                    .get(&(plan.scope, plan.projection.service_domain))
+                    .cloned()
+                    .unwrap_or_default();
+                scope.revision = next_scope_revision;
+                binding.binding_epoch = binding
+                    .binding_epoch
+                    .checked_add(1)
+                    .ok_or(RegistryError::CounterOverflow)?;
+                binding.supervisor = None;
+                binding.fallback_running = true;
+                binding.revision = next_domain_revision;
+                binding.recovery = Some(DomainRecoveryState {
+                    crash_revision: next_domain_revision,
+                    cohort: cohort.clone(),
+                    unadopted: cohort,
+                    snapshot: None,
+                    ready: None,
+                    fault: Some(DomainFaultRecoveryAnchor {
+                        fault_id: plan.projection.fault_id,
+                        generation: plan.projection.generation,
+                        task: plan.projection.task,
+                        vm_generation: plan.projection.vm_generation,
+                        evidence_digest: plan.projection.evidence_digest,
+                        plan_commitment: plan.commitment.0,
+                    }),
+                });
+                scope.invalidate_recovery_readiness();
+            }
+            let applied = candidate
+                .replacement
+                .infrastructure
+                .apply_fault_disposition_in_candidate(plan)
+                .map_err(RegistryError::Infrastructure)?;
+            let install = self.prepare_combined_scope_install(candidate)?;
+            Ok((install, applied))
+        })();
+
+        match prepared {
+            Ok((install, applied)) => {
+                self.install_combined_scope(install);
+                Ok(applied.into_installed())
+            }
+            Err(error) => Err(FaultRegistryFailure {
+                error,
+                input: intent.armed,
+            }),
+        }
     }
 
     /// First usable outer transaction skeleton.  It supports scope-record
@@ -6538,6 +6786,7 @@ impl EffectRegistry {
             unadopted: cohort.clone(),
             snapshot: None,
             ready: None,
+            fault: None,
         });
         scope.invalidate_recovery_readiness();
         Ok(DomainCrashReceipt {
@@ -11887,6 +12136,275 @@ fn combined_scope_candidate_self_test() {
     success.check_invariants().unwrap();
 }
 
+#[cfg(test)]
+fn task_owned_fault_outer_transaction_self_test() {
+    const SCOPE: ScopeKey = ScopeKey::new(0xfa01, 1);
+    const SERVICE: DomainKey = DomainKey::new(0xfa);
+    const ROOT_OWNER: TaskKey = TaskKey::new(0xfa10, 1);
+    const SERVICE_OWNER: TaskKey = TaskKey::new(0xfa11, 1);
+    const CREDIT: CreditClass = CreditClass::new(0xfa20);
+    const WORK_ID: u64 = 0xfa30;
+    const FAULT_ID: u64 = 0xfa40;
+
+    fn fixture(
+        instance_bias: u64,
+    ) -> (
+        EffectRegistry,
+        infrastructure::WorkloadContext,
+        infrastructure::ArmedFaultTask,
+        EffectKey,
+    ) {
+        let mut registry = EffectRegistry::new();
+        registry
+            .create_scope(ScopeConfig {
+                key: SCOPE,
+                authority_epoch: 1,
+                binding_epoch: 1,
+                supervisor: ROOT_OWNER,
+                credits: alloc::vec![CreditLimit::new(CREDIT, 2)],
+            })
+            .unwrap();
+        registry
+            .add_domain(
+                SCOPE,
+                DomainConfig {
+                    key: SERVICE,
+                    binding_epoch: 1,
+                    supervisor: SERVICE_OWNER,
+                },
+            )
+            .unwrap();
+        let root = registry
+            .register(RegisterRequest {
+                scope: SCOPE,
+                task: ROOT_OWNER,
+                operation: OperationClass::new(0xfa21),
+                descriptor: SyscallDescriptor::new(0xfa21, [0; 6]),
+                resources: alloc::vec![ResourceKey::new(0xfa, 1, 1)],
+                credits: alloc::vec![CreditCharge::new(CREDIT, 1)],
+                publication: PublicationMode::None,
+            })
+            .unwrap()
+            .identity
+            .effect();
+        let service_effect = registry
+            .register_derived(DerivedRegisterRequest {
+                request: RegisterRequest {
+                    scope: SCOPE,
+                    task: SERVICE_OWNER,
+                    operation: OperationClass::new(0xfa22),
+                    descriptor: SyscallDescriptor::new(0xfa22, [0; 6]),
+                    resources: alloc::vec![ResourceKey::new(0xfa, 2, 1)],
+                    credits: alloc::vec![CreditCharge::new(CREDIT, 1)],
+                    publication: PublicationMode::None,
+                },
+                domain: SERVICE,
+                parent: Some(root),
+            })
+            .unwrap()
+            .identity
+            .effect();
+        registry
+            .enable_infrastructure_for_scope(
+                SCOPE,
+                root,
+                infrastructure::InfrastructureLimits::new(4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 8)
+                    .unwrap(),
+            )
+            .unwrap();
+        let workload = registry
+            .infrastructure
+            .open_workload(
+                infrastructure::WorkloadRootPresentation::new(SCOPE, 1, root),
+                infrastructure::WorkloadRequestPresentation::new(
+                    SERVICE,
+                    1,
+                    0xfa50 + instance_bias,
+                    1,
+                ),
+            )
+            .unwrap();
+        let task = registry
+            .infrastructure
+            .admit_task(
+                &workload,
+                infrastructure::TaskWorkDescriptor {
+                    work_id: WORK_ID + instance_bias,
+                    generation: 1,
+                    task: SERVICE_OWNER,
+                    role: infrastructure::TaskWorkRole::ServiceRequest,
+                    vm: Some(
+                        infrastructure::VmAuthorityKey::new(0xfa60 + instance_bias, 1).unwrap(),
+                    ),
+                },
+            )
+            .unwrap();
+        let reserved = registry
+            .infrastructure
+            .reserve_fault_event(
+                task,
+                infrastructure::FaultSlotDescriptor {
+                    fault_id: FAULT_ID + instance_bias,
+                    generation: 1,
+                    task: SERVICE_OWNER,
+                    vm_generation: 1,
+                    service_domain: SERVICE,
+                    admission_binding_epoch: 1,
+                },
+            )
+            .unwrap();
+        let armed = registry
+            .infrastructure
+            .claim_service_task_entry(reserved)
+            .unwrap();
+        registry.check_invariants().unwrap();
+        (registry, workload, armed, service_effect)
+    }
+
+    let (mut stale, _, stale_armed, _) = fixture(0x200);
+    let stale_observation = infrastructure::FaultObservation {
+        task: SERVICE_OWNER,
+        vm_generation: 1,
+        instruction_pointer: 0xfc70,
+        address: 0xfc80,
+        access: infrastructure::FaultAccess::Write,
+        architecture_error: 0xfc90,
+        evidence_digest: 0xfca0,
+    };
+    let (stale_intent, stale_plan) = stale
+        .prepare_service_fault_disposition(
+            stale_armed,
+            stale_observation,
+            infrastructure::FaultDisposition::CrashService,
+        )
+        .unwrap();
+    stale.scopes.get_mut(&SCOPE).unwrap().revision += 1;
+    let stale_before = stale.clone();
+    let stale_failure = stale
+        .install_service_fault_disposition(stale_intent, stale_plan)
+        .unwrap_err();
+    assert_eq!(
+        stale_failure.error(),
+        &RegistryError::CombinedCandidateStale
+    );
+    assert_eq!(stale, stale_before);
+    let returned_armed = stale_failure.into_input();
+    assert!(
+        stale
+            .prepare_service_fault_disposition(
+                returned_armed,
+                stale_observation,
+                infrastructure::FaultDisposition::CrashService,
+            )
+            .is_ok()
+    );
+
+    let (mut crash, crash_workload, crash_armed, service_effect) = fixture(0);
+    let effects_before = crash.effects.clone();
+    let (intent, plan) = crash
+        .prepare_service_fault_disposition(
+            crash_armed,
+            infrastructure::FaultObservation {
+                task: SERVICE_OWNER,
+                vm_generation: 1,
+                instruction_pointer: 0xfa70,
+                address: 0xfa80,
+                access: infrastructure::FaultAccess::Read,
+                architecture_error: 0xfa90,
+                evidence_digest: 0xfaa0,
+            },
+            infrastructure::FaultDisposition::CrashService,
+        )
+        .unwrap();
+    let installed = crash
+        .install_service_fault_disposition(intent, plan)
+        .unwrap();
+    assert_eq!(crash.effects, effects_before);
+    let binding = &crash.scopes[&SCOPE].domains[&SERVICE];
+    assert_eq!(binding.binding_epoch, 2);
+    assert_eq!(binding.supervisor, None);
+    assert!(binding.fallback_running);
+    let recovery = binding.recovery.as_ref().unwrap();
+    assert_eq!(recovery.cohort, BTreeSet::from([service_effect]));
+    assert_eq!(recovery.unadopted, recovery.cohort);
+    assert!(recovery.fault.is_some());
+    assert!(
+        crash
+            .infrastructure
+            .query_fault(&crash_workload, FAULT_ID, 1)
+            .unwrap()
+            .awaiting_claim
+    );
+    let mut substituted_installed = installed;
+    match &mut substituted_installed {
+        infrastructure::InstalledFaultObservation::Crash(projection)
+        | infrastructure::InstalledFaultObservation::Isolate(projection) => {
+            projection.commitment.0[0] ^= 1;
+        }
+    }
+    let awaiting_before = crash.infrastructure.private_full_clone();
+    assert_eq!(
+        crash
+            .infrastructure
+            .claim_fault_receipt(&crash_workload, substituted_installed),
+        Err(infrastructure::InfrastructureError::InvalidReceipt)
+    );
+    assert_eq!(crash.infrastructure, awaiting_before);
+    let receipt = match crash
+        .infrastructure
+        .claim_fault_receipt(&crash_workload, installed)
+        .unwrap()
+    {
+        infrastructure::FaultReceiptClaimOutcome::Crash(receipt) => receipt,
+        _ => panic!("crash install minted the wrong typed receipt"),
+    };
+    let claimed_before_duplicate = crash.infrastructure.private_full_clone();
+    assert!(matches!(
+        crash
+            .infrastructure
+            .claim_fault_receipt(&crash_workload, installed)
+            .unwrap(),
+        infrastructure::FaultReceiptClaimOutcome::AlreadyClaimed(
+            infrastructure::FaultClaimProjection::Crash(_)
+        )
+    ));
+    assert_eq!(crash.infrastructure, claimed_before_duplicate);
+    let _cause = crash.infrastructure.consume_service_fault(receipt).unwrap();
+    crash.check_invariants().unwrap();
+
+    let (mut isolate, isolate_workload, isolate_armed, _) = fixture(0x100);
+    let business_before = isolate.scopes[&SCOPE].clone();
+    let effects_before = isolate.effects.clone();
+    let (intent, plan) = isolate
+        .prepare_service_fault_disposition(
+            isolate_armed,
+            infrastructure::FaultObservation {
+                task: SERVICE_OWNER,
+                vm_generation: 1,
+                instruction_pointer: 0xfb70,
+                address: 0xfb80,
+                access: infrastructure::FaultAccess::Execute,
+                architecture_error: 0xfb90,
+                evidence_digest: 0xfba0,
+            },
+            infrastructure::FaultDisposition::IsolateTask,
+        )
+        .unwrap();
+    let installed = isolate
+        .install_service_fault_disposition(intent, plan)
+        .unwrap();
+    assert_eq!(isolate.scopes[&SCOPE], business_before);
+    assert_eq!(isolate.effects, effects_before);
+    assert!(matches!(
+        isolate
+            .infrastructure
+            .claim_fault_receipt(&isolate_workload, installed)
+            .unwrap(),
+        infrastructure::FaultReceiptClaimOutcome::Isolate(_)
+    ));
+    isolate.check_invariants().unwrap();
+}
+
 /// Pins the first registry-native production identity chain independently of
 /// the later runtime wiring.  These are real registry records with one shared
 /// credit ledger, distinct service bindings, and immutable effect ancestry;
@@ -11894,6 +12412,8 @@ fn combined_scope_candidate_self_test() {
 pub(crate) fn production_identity_registry_self_test() {
     #[cfg(test)]
     combined_scope_candidate_self_test();
+    #[cfg(test)]
+    task_owned_fault_outer_transaction_self_test();
     publication_ack_and_revoke_complete_self_test();
 
     const PERSONALITY_CREDIT: CreditClass = CreditClass::new(0x201);

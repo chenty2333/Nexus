@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use super::{
-    ArmedFaultEvent, BearerStamp, EnteredTaskLease, FaultEvent, FaultPhase, InfrastructureError,
-    InfrastructureEventKind, InfrastructureKind, InfrastructureState, LinearResult, ParentStamp,
-    ReverseIndexRecord, ReverseParent, ScopeInfrastructure, TaskAdoption, TaskLease, TaskPhase,
-    TaskRecord, TaskRecoveryProjection, TaskRecoveryState, TaskWorkDescriptor, TaskWorkRole,
-    WorkloadContext, checked_add, checked_sub, first_task_child_kind, linear_apply,
-    preview_bearer_stamp, preview_revision, preview_workload_child_add, preview_workload_child_sub,
-    require_vacancy, validate_active_admission, validate_context, validate_fault_bearer,
-    validate_task_stamp,
+    ArmedFaultTask, EnteredTaskLease, FaultPhase, InfrastructureError, InfrastructureEventKind,
+    InfrastructureKind, InfrastructureState, LinearResult, ParentStamp, ReservedFaultTask,
+    ReverseIndexRecord, ReverseParent, ScopeInfrastructure, TaskAdoption, TaskAnchorPhase,
+    TaskAnchorRecoveryState, TaskLease, TaskPhase, TaskRecoveryProjection, TaskRecoveryState,
+    TaskWorkDescriptor, TaskWorkRole, WorkloadContext, bearer_state, checked_add, checked_sub,
+    linear_apply, mint_task_key, next_task_bearer_generation, preview_bearer_stamp,
+    preview_revision, preview_workload_child_add, preview_workload_child_sub, require_vacancy,
+    validate_active_admission, validate_context, validate_recovery_context, validate_task_key,
 };
 
 impl InfrastructureState {
@@ -70,9 +70,11 @@ impl InfrastructureState {
             retry_generation: descriptor.generation,
         };
         scope.tasks.install(
-            TaskRecord {
+            super::TaskRecord {
                 stamp,
                 phase: TaskPhase::Admitted,
+                anchor: TaskAnchorPhase::Live,
+                service_fault: None,
                 live_children: 0,
                 closure_sequence: None,
             },
@@ -94,9 +96,9 @@ impl InfrastructureState {
             descriptor.work_id,
             descriptor.generation,
         );
-        Ok(TaskLease(
-            scope.tasks.get(descriptor.work_id).unwrap().stamp,
-        ))
+        Ok(TaskLease(mint_task_key::<bearer_state::TaskAdmitted>(
+            scope.tasks.get(descriptor.work_id).unwrap(),
+        )))
     }
 
     pub(in super::super) fn claim_task_entry(
@@ -105,70 +107,98 @@ impl InfrastructureState {
     ) -> LinearResult<TaskLease, EnteredTaskLease> {
         linear_apply(lease, |lease| {
             self.require_authoritative()?;
-            let stamp = lease.0;
             let registry_instance = self.registry_instance;
-            let scope = self.scope_mut(stamp.root.scope)?;
-            validate_task_stamp(scope, registry_instance, &stamp)?;
+            let scope = self.scope_mut(lease.0.authority.scope)?;
+            let record = validate_task_key(scope, registry_instance, &lease.0)?;
             if matches!(
-                stamp.identity.role,
+                record.stamp.identity.role,
                 TaskWorkRole::ServiceRequest | TaskWorkRole::ReplacementRecovery
-            ) {
+            ) || record.phase != TaskPhase::Admitted
+                || record.anchor != TaskAnchorPhase::Live
+                || record.service_fault.is_some()
+            {
                 return Err(InfrastructureError::InvalidState);
             }
-            match scope.tasks.get(stamp.identity.work_id).unwrap().phase {
-                TaskPhase::Admitted => {}
-                TaskPhase::Entered => return Err(InfrastructureError::ExactReplay),
-                _ => return Err(InfrastructureError::InvalidState),
-            }
+            let work_id = record.stamp.identity.work_id;
+            let next_bearer_generation = next_task_bearer_generation(record)?;
             let next_revision = preview_revision(scope)?;
-            scope.tasks.get_mut(stamp.identity.work_id).unwrap().phase = TaskPhase::Entered;
+            let record = scope.tasks.get_mut(work_id).unwrap();
+            record.phase = TaskPhase::Entered;
+            record.stamp.bearer_generation = next_bearer_generation;
             scope.revision = next_revision;
             scope.events.push(
                 InfrastructureEventKind::TaskEntered,
-                stamp.identity.work_id,
-                stamp.identity.generation,
+                work_id,
+                record.stamp.identity.generation,
             );
-            Ok(EnteredTaskLease(stamp))
+            Ok(EnteredTaskLease(
+                mint_task_key::<bearer_state::TaskEntered>(record),
+            ))
         })
     }
 
     pub(in super::super) fn claim_service_task_entry(
         &mut self,
-        lease: TaskLease,
-        fault: FaultEvent,
-    ) -> LinearResult<(TaskLease, FaultEvent), (EnteredTaskLease, ArmedFaultEvent)> {
-        linear_apply((lease, fault), |(lease, fault)| {
+        reserved: ReservedFaultTask,
+    ) -> LinearResult<ReservedFaultTask, ArmedFaultTask> {
+        linear_apply(reserved, |reserved| {
             self.require_authoritative()?;
-            let stamp = lease.0;
-            let fault_stamp = fault.0;
             let registry_instance = self.registry_instance;
-            let scope = self.scope_mut(stamp.root.scope)?;
-            validate_task_stamp(scope, registry_instance, &stamp)?;
-            validate_fault_bearer(scope, registry_instance, &fault_stamp)?;
-            if !matches!(
-                stamp.identity.role,
-                TaskWorkRole::ServiceRequest | TaskWorkRole::ReplacementRecovery
-            ) || fault_stamp.parent != ParentStamp::Task(stamp.identity)
-                || fault_stamp.identity.task != stamp.identity.task
-                || scope.tasks.get(stamp.identity.work_id).unwrap().phase != TaskPhase::Admitted
-                || scope
-                    .faults
-                    .get(fault_stamp.identity.fault_id)
-                    .unwrap()
-                    .phase
-                    != FaultPhase::Reserved
+            let scope = self.scope_mut(reserved.0.authority.scope)?;
+            let task = validate_task_key(scope, registry_instance, &reserved.0)?;
+            let task_stamp = task.stamp;
+            let link = task
+                .service_fault
+                .ok_or(InfrastructureError::InvalidState)?;
+            if task.phase != TaskPhase::Admitted
+                || task.anchor != TaskAnchorPhase::Live
+                || !matches!(
+                    task_stamp.identity.role,
+                    TaskWorkRole::ServiceRequest | TaskWorkRole::ReplacementRecovery
+                )
             {
                 return Err(InfrastructureError::InvalidState);
             }
+            let fault = scope
+                .faults
+                .get(link.fault_id)
+                .ok_or(InfrastructureError::UnknownObligation)?;
+            if fault.phase != FaultPhase::Reserved
+                || fault.stamp.identity.generation != link.fault_object_generation
+                || fault.stamp.bearer_generation != link.fault_bearer_generation
+                || fault.stamp.nonce != link.fault_nonce
+                || fault.owner.task != task_stamp.identity
+                || fault.owner.task_object_nonce != task_stamp.nonce
+                || fault.owner.task_bearer_generation != task_stamp.bearer_generation
+            {
+                return Err(InfrastructureError::StaleClaim);
+            }
+            let next_task_generation = next_task_bearer_generation(task)?;
+            let next_fault_generation = fault
+                .stamp
+                .bearer_generation
+                .checked_add(1)
+                .ok_or(InfrastructureError::CounterOverflow)?;
             let next_revision = preview_revision(scope)?;
-            scope.tasks.get_mut(stamp.identity.work_id).unwrap().phase = TaskPhase::Entered;
+
+            let fault = scope.faults.get_mut(link.fault_id).unwrap();
+            fault.phase = FaultPhase::Armed;
+            fault.stamp.bearer_generation = next_fault_generation;
+            fault.owner.task_bearer_generation = next_task_generation;
+            let task = scope.tasks.get_mut(task_stamp.identity.work_id).unwrap();
+            task.phase = TaskPhase::Entered;
+            task.stamp.bearer_generation = next_task_generation;
+            let task_link = task.service_fault.as_mut().unwrap();
+            task_link.fault_bearer_generation = next_fault_generation;
             scope.revision = next_revision;
             scope.events.push(
                 InfrastructureEventKind::TaskEntered,
-                stamp.identity.work_id,
-                stamp.identity.generation,
+                task_stamp.identity.work_id,
+                task_stamp.identity.generation,
             );
-            Ok((EnteredTaskLease(stamp), ArmedFaultEvent(fault_stamp)))
+            Ok(ArmedFaultTask(
+                mint_task_key::<bearer_state::TaskFaultArmed>(task),
+            ))
         })
     }
 
@@ -177,7 +207,7 @@ impl InfrastructureState {
         lease: TaskLease,
     ) -> LinearResult<TaskLease, ()> {
         linear_apply(lease, |lease| {
-            self.finish_task_stamp(&lease.0, TaskPhase::Admitted, TaskPhase::Rejected)
+            self.finish_task_key(&lease.0, TaskPhase::Admitted, TaskPhase::Rejected)
         })
     }
 
@@ -185,35 +215,18 @@ impl InfrastructureState {
         &mut self,
         lease: TaskLease,
     ) -> LinearResult<TaskLease, ()> {
-        linear_apply(lease, |lease| self.isolate_task_stamp(&lease.0))
+        linear_apply(lease, |lease| {
+            self.finish_task_key(&lease.0, TaskPhase::Admitted, TaskPhase::Isolated)
+        })
     }
 
     pub(in super::super) fn isolate_entered_task(
         &mut self,
         lease: EnteredTaskLease,
     ) -> LinearResult<EnteredTaskLease, ()> {
-        linear_apply(lease, |lease| self.isolate_task_stamp(&lease.0))
-    }
-
-    fn isolate_task_stamp(
-        &mut self,
-        stamp: &BearerStamp<TaskWorkDescriptor>,
-    ) -> Result<(), InfrastructureError> {
-        self.require_authoritative()?;
-        let registry_instance = self.registry_instance;
-        let scope = self.scope_mut(stamp.root.scope)?;
-        validate_task_stamp(scope, registry_instance, stamp)?;
-        let phase = scope.tasks.get(stamp.identity.work_id).unwrap().phase;
-        if matches!(
-            phase,
-            TaskPhase::Isolated | TaskPhase::Reaped | TaskPhase::Rejected
-        ) {
-            return Ok(());
-        }
-        if !matches!(phase, TaskPhase::Admitted | TaskPhase::Entered) {
-            return Err(InfrastructureError::InvalidState);
-        }
-        finish_task_record(scope, stamp, TaskPhase::Isolated)
+        linear_apply(lease, |lease| {
+            self.finish_task_key(&lease.0, TaskPhase::Entered, TaskPhase::Isolated)
+        })
     }
 
     pub(in super::super) fn reap_task(
@@ -221,28 +234,27 @@ impl InfrastructureState {
         lease: EnteredTaskLease,
     ) -> LinearResult<EnteredTaskLease, ()> {
         linear_apply(lease, |lease| {
-            self.finish_task_stamp(&lease.0, TaskPhase::Entered, TaskPhase::Reaped)
+            self.finish_task_key(&lease.0, TaskPhase::Entered, TaskPhase::Reaped)
         })
     }
 
-    fn finish_task_stamp(
+    fn finish_task_key<State: bearer_state::Sealed>(
         &mut self,
-        stamp: &BearerStamp<TaskWorkDescriptor>,
+        key: &super::BearerKey<State>,
         required: TaskPhase,
         terminal: TaskPhase,
     ) -> Result<(), InfrastructureError> {
         self.require_authoritative()?;
         let registry_instance = self.registry_instance;
-        let scope = self.scope_mut(stamp.root.scope)?;
-        validate_task_stamp(scope, registry_instance, stamp)?;
-        let phase = scope.tasks.get(stamp.identity.work_id).unwrap().phase;
-        if phase == terminal {
-            return Ok(());
-        }
-        if phase != required {
+        let scope = self.scope_mut(key.authority.scope)?;
+        let record = validate_task_key(scope, registry_instance, key)?;
+        if record.phase != required
+            || record.anchor != TaskAnchorPhase::Live
+            || record.service_fault.is_some()
+        {
             return Err(InfrastructureError::InvalidState);
         }
-        finish_task_record(scope, stamp, terminal)
+        finish_task_record(scope, record.stamp, terminal)
     }
 
     pub(in super::super) fn query_task(
@@ -253,7 +265,6 @@ impl InfrastructureState {
     ) -> Result<TaskRecoveryProjection, InfrastructureError> {
         self.require_authoritative()?;
         let scope = self.scope(context.root.scope)?;
-        validate_context(scope, self.registry_instance, context)?;
         let record = scope
             .tasks
             .get(work_id)
@@ -263,6 +274,11 @@ impl InfrastructureState {
         }
         if record.stamp.workload.request != context.workload.request {
             return Err(InfrastructureError::ForeignWorkload);
+        }
+        if record.anchor == TaskAnchorPhase::Live {
+            validate_context(scope, self.registry_instance, context)?;
+        } else {
+            validate_recovery_context(scope, self.registry_instance, context)?;
         }
         Ok(TaskRecoveryProjection {
             descriptor: record.stamp.identity,
@@ -274,6 +290,11 @@ impl InfrastructureState {
                 TaskPhase::Reaped => TaskRecoveryState::Reaped,
             },
             live_children: record.live_children,
+            anchor: match record.anchor {
+                TaskAnchorPhase::Live => TaskAnchorRecoveryState::Live,
+                TaskAnchorPhase::TerminalRetained => TaskAnchorRecoveryState::TerminalRetained,
+                TaskAnchorPhase::TerminalDrained => TaskAnchorRecoveryState::TerminalDrained,
+            },
         })
     }
 
@@ -300,36 +321,112 @@ impl InfrastructureState {
         {
             return Err(InfrastructureError::StaleBinding);
         }
-        let phase = record.phase;
-        if !matches!(phase, TaskPhase::Admitted | TaskPhase::Entered) {
+        if record.anchor != TaskAnchorPhase::Live
+            || !matches!(record.phase, TaskPhase::Admitted | TaskPhase::Entered)
+        {
             return Err(InfrastructureError::InvalidState);
         }
-        let bearer_generation = record
-            .stamp
-            .bearer_generation
-            .checked_add(1)
-            .ok_or(InfrastructureError::CounterOverflow)?;
-        let next_revision = preview_revision(scope)?;
-        let index_slot = record.stamp.nonce;
-        let mut stamp = record.stamp;
-        stamp.domain = context.domain;
-        stamp.workload = context.workload;
-        stamp.bearer_generation = bearer_generation;
-        scope.tasks.get_mut(work_id).unwrap().stamp = stamp;
-        let index = scope
+
+        // Complete every lookup and arithmetic check before the first write.
+        let phase = record.phase;
+        let task_stamp = record.stamp;
+        let task_generation = next_task_bearer_generation(record)?;
+        let task_index_slot = task_stamp.nonce;
+        let task_index = scope
             .reverse_indexes
-            .get_mut(index_slot)
+            .get(task_index_slot)
             .ok_or(InfrastructureError::Invariant("missing task reverse index"))?;
-        index.binding_epoch = context.domain.binding_epoch;
+        if task_index.kind != InfrastructureKind::Task {
+            return Err(InfrastructureError::Invariant("invalid task reverse index"));
+        }
+        let composite = if let Some(link) = record.service_fault {
+            let fault = scope
+                .faults
+                .get(link.fault_id)
+                .ok_or(InfrastructureError::UnknownObligation)?;
+            if fault.stamp.identity.generation != link.fault_object_generation
+                || fault.stamp.bearer_generation != link.fault_bearer_generation
+                || fault.stamp.nonce != link.fault_nonce
+                || fault.owner.task != task_stamp.identity
+                || fault.owner.task_object_nonce != task_stamp.nonce
+                || fault.owner.task_bearer_generation != task_stamp.bearer_generation
+                || !matches!(
+                    (phase, fault.phase),
+                    (TaskPhase::Admitted, FaultPhase::Reserved)
+                        | (TaskPhase::Entered, FaultPhase::Armed)
+                )
+            {
+                return Err(InfrastructureError::StaleClaim);
+            }
+            let fault_generation = fault
+                .stamp
+                .bearer_generation
+                .checked_add(1)
+                .ok_or(InfrastructureError::CounterOverflow)?;
+            let fault_index = scope.reverse_indexes.get(fault.stamp.nonce).ok_or(
+                InfrastructureError::Invariant("missing fault reverse index"),
+            )?;
+            if fault_index.kind != InfrastructureKind::Fault {
+                return Err(InfrastructureError::Invariant(
+                    "invalid fault reverse index",
+                ));
+            }
+            Some((link, fault_generation))
+        } else {
+            None
+        };
+        let next_revision = preview_revision(scope)?;
+
+        let mut installed_task_stamp = task_stamp;
+        installed_task_stamp.domain = context.domain;
+        installed_task_stamp.workload = context.workload;
+        installed_task_stamp.bearer_generation = task_generation;
+        if let Some((link, fault_generation)) = composite {
+            let fault = scope.faults.get_mut(link.fault_id).unwrap();
+            fault.stamp.domain = context.domain;
+            fault.stamp.workload = context.workload;
+            fault.stamp.bearer_generation = fault_generation;
+            fault.owner.task_bearer_generation = task_generation;
+            scope
+                .reverse_indexes
+                .get_mut(link.fault_nonce)
+                .unwrap()
+                .binding_epoch = context.domain.binding_epoch;
+            let task = scope.tasks.get_mut(work_id).unwrap();
+            task.stamp = installed_task_stamp;
+            task.service_fault.as_mut().unwrap().fault_bearer_generation = fault_generation;
+        } else {
+            scope.tasks.get_mut(work_id).unwrap().stamp = installed_task_stamp;
+        }
+        scope
+            .reverse_indexes
+            .get_mut(task_index_slot)
+            .unwrap()
+            .binding_epoch = context.domain.binding_epoch;
         scope.revision = next_revision;
         scope.events.push(
             InfrastructureEventKind::AuthorityAdvanced,
             work_id,
             generation,
         );
-        Ok(match phase {
-            TaskPhase::Admitted => TaskAdoption::Admitted(TaskLease(stamp)),
-            TaskPhase::Entered => TaskAdoption::Entered(EnteredTaskLease(stamp)),
+        let task = scope.tasks.get(work_id).unwrap();
+        Ok(match (phase, composite.is_some()) {
+            (TaskPhase::Admitted, false) => {
+                TaskAdoption::Admitted(TaskLease(mint_task_key::<bearer_state::TaskAdmitted>(task)))
+            }
+            (TaskPhase::Entered, false) => TaskAdoption::Entered(EnteredTaskLease(
+                mint_task_key::<bearer_state::TaskEntered>(task),
+            )),
+            (TaskPhase::Admitted, true) => {
+                TaskAdoption::FaultReserved(ReservedFaultTask(mint_task_key::<
+                    bearer_state::TaskFaultReserved,
+                >(task)))
+            }
+            (TaskPhase::Entered, true) => {
+                TaskAdoption::FaultArmed(ArmedFaultTask(mint_task_key::<
+                    bearer_state::TaskFaultArmed,
+                >(task)))
+            }
             _ => return Err(InfrastructureError::Invariant("invalid task adoption")),
         })
     }
@@ -337,20 +434,22 @@ impl InfrastructureState {
 
 fn finish_task_record(
     scope: &mut ScopeInfrastructure,
-    stamp: &BearerStamp<TaskWorkDescriptor>,
+    stamp: super::BearerStamp<TaskWorkDescriptor>,
     terminal: TaskPhase,
 ) -> Result<(), InfrastructureError> {
     let record = scope.tasks.get(stamp.identity.work_id).unwrap();
-    if record.live_children != 0 {
-        return Err(InfrastructureError::ClosureBlocked {
-            kind: first_task_child_kind(scope, stamp.identity)?,
-            live: record.live_children,
-        });
-    }
+    let next_bearer_generation = next_task_bearer_generation(record)?;
     let next_revision = preview_revision(scope)?;
     let next_tasks = checked_sub(scope.live.tasks, 1)?;
     let next_children = preview_workload_child_sub(scope, stamp.workload.request)?;
-    scope.tasks.get_mut(stamp.identity.work_id).unwrap().phase = terminal;
+    let record = scope.tasks.get_mut(stamp.identity.work_id).unwrap();
+    record.phase = terminal;
+    record.anchor = if record.live_children == 0 {
+        TaskAnchorPhase::TerminalDrained
+    } else {
+        TaskAnchorPhase::TerminalRetained
+    };
+    record.stamp.bearer_generation = next_bearer_generation;
     scope.live.tasks = next_tasks;
     scope
         .workloads

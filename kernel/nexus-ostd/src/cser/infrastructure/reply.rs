@@ -7,10 +7,11 @@ use super::{
     ReplyPublicationIntent, ReplyPublicationReceipt, ReplyRecord, ReplyRecoveryProjection,
     ReplyRecoveryState, ReplyStateRecord, ReverseIndexRecord, ReverseParent, ScopeInfrastructure,
     TaskPhase, ValidatedCommitProof, VmAuthorityKey, WorkloadContext, checked_add, checked_sub,
-    context_from_stamp, linear_apply, preview_bearer_stamp, preview_nonce, preview_nonces,
-    preview_revision, preview_task_child_add, preview_task_child_sub, preview_workload_child_add,
-    preview_workload_child_sub, require_vacancy, validate_active_admission, validate_context,
-    validate_stamp_common, validate_task_stamp,
+    context_from_stamp, install_task_child_count, linear_apply, preview_bearer_stamp,
+    preview_nonce, preview_nonces, preview_revision, preview_task_child_add,
+    preview_task_child_sub, preview_workload_child_add, preview_workload_child_sub,
+    require_vacancy, validate_active_admission, validate_context, validate_task_child_stamp,
+    validate_task_key,
 };
 
 impl InfrastructureState {
@@ -24,12 +25,14 @@ impl InfrastructureState {
             self.require_authoritative()?;
             descriptor.validate()?;
             let registry_instance = self.registry_instance;
-            let scope = self.scope_mut(task.0.root.scope)?;
-            validate_task_stamp(scope, registry_instance, &task.0)?;
+            let scope = self.scope_mut(task.0.authority.scope)?;
+            let task_record = validate_task_key(scope, registry_instance, &task.0)?;
+            let task_stamp = task_record.stamp;
             validate_active_admission(scope)?;
-            if scope.tasks.get(task.0.identity.work_id).unwrap().phase != TaskPhase::Entered
-                || descriptor.guest_task != task.0.identity.task
-                || task.0.identity.vm.map(VmAuthorityKey::generation)
+            if task_record.phase != TaskPhase::Entered
+                || task_record.stamp.identity.role != super::TaskWorkRole::GuestSyscallWork
+                || descriptor.guest_task != task_stamp.identity.task
+                || task_stamp.identity.vm.map(VmAuthorityKey::generation)
                     != Some(descriptor.guest_vm_generation)
             {
                 return Err(InfrastructureError::ForeignParent);
@@ -39,8 +42,8 @@ impl InfrastructureState {
             }
             let commit = &proof.receipt;
             if commit.registry_instance_id != registry_instance
-                || commit.scope != task.0.root.scope
-                || commit.authority_epoch != task.0.root.authority_epoch
+                || commit.scope != task_stamp.root.scope
+                || commit.authority_epoch != task_stamp.root.authority_epoch
                 || commit.sequence == 0
                 || commit.effect.generation() == 0
             {
@@ -49,7 +52,7 @@ impl InfrastructureState {
             if let Some(existing) = scope.replies.get(descriptor.reply_id) {
                 return if existing.stamp.identity == descriptor
                     && existing.backend_commit == *commit
-                    && existing.stamp.parent == ParentStamp::Task(task.0.identity)
+                    && existing.stamp.parent == ParentStamp::Task(task_stamp.identity)
                 {
                     Err(InfrastructureError::ExactReplay)
                 } else if existing.stamp.identity.generation > descriptor.generation {
@@ -72,12 +75,12 @@ impl InfrastructureState {
                 descriptor.reply_id,
                 InfrastructureKind::Reply,
             )?;
-            let context = context_from_stamp(scope, task.0.workload)?;
+            let context = context_from_stamp(scope, task_stamp.workload)?;
             let (stamp, next_nonce) = preview_bearer_stamp(
                 scope,
                 &context,
                 descriptor,
-                ParentStamp::Task(task.0.identity),
+                ParentStamp::Task(task_stamp.identity),
             )?;
             require_vacancy(
                 &scope.reverse_indexes,
@@ -87,12 +90,12 @@ impl InfrastructureState {
             let next_revision = preview_revision(scope)?;
             let next_live = checked_add(scope.live.replies, 1)?;
             let next_workload_children = preview_workload_child_add(scope, stamp.workload.request)?;
-            let next_task_children = preview_task_child_add(scope, task.0.identity)?;
+            let next_task_children = preview_task_child_add(scope, task_stamp.identity)?;
             let index = ReverseIndexRecord {
                 slot: stamp.nonce,
                 kind: InfrastructureKind::Reply,
                 root_effect: stamp.root.root_effect,
-                parent: ReverseParent::Task(task.0.identity),
+                parent: ReverseParent::Task(task_stamp.identity),
                 task: Some(descriptor.guest_task),
                 domain: stamp.domain.domain,
                 binding_epoch: stamp.domain.binding_epoch,
@@ -127,7 +130,7 @@ impl InfrastructureState {
                 .live_children = next_workload_children;
             scope
                 .tasks
-                .get_mut(task.0.identity.work_id)
+                .get_mut(task_stamp.identity.work_id)
                 .unwrap()
                 .live_children = next_task_children;
             scope.events.push(
@@ -589,7 +592,7 @@ fn validate_reply_bearer(
     registry_instance: u64,
     stamp: &BearerStamp<ReplyDescriptor>,
 ) -> Result<(), InfrastructureError> {
-    validate_stamp_common(scope, registry_instance, stamp)?;
+    let terminal_parent = validate_task_child_stamp(scope, registry_instance, stamp)?;
     let record = scope
         .replies
         .get(stamp.identity.reply_id)
@@ -597,7 +600,10 @@ fn validate_reply_bearer(
     if record.stamp != *stamp {
         return Err(InfrastructureError::StaleGeneration);
     }
-    if scope.binding_epoch(stamp.identity.source_domain)? != stamp.identity.source_binding_epoch {
+    let source_binding_epoch = scope.binding_epoch(stamp.identity.source_domain)?;
+    if (!terminal_parent && source_binding_epoch != stamp.identity.source_binding_epoch)
+        || (terminal_parent && source_binding_epoch < stamp.identity.source_binding_epoch)
+    {
         return Err(InfrastructureError::StaleBinding);
     }
     let parent = match stamp.parent {
@@ -635,10 +641,9 @@ fn finish_reply(
         .get_mut(stamp.workload.request.id)
         .unwrap()
         .live_children = next_workload_children;
-    scope
-        .tasks
-        .get_mut(parent_task.work_id)
-        .unwrap()
-        .live_children = next_task_children;
+    install_task_child_count(
+        scope.tasks.get_mut(parent_task.work_id).unwrap(),
+        next_task_children,
+    );
     Ok(())
 }

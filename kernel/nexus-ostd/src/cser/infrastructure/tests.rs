@@ -1,25 +1,28 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use super::{
-    AuthorityKey, BearerKey, BoundServiceRequest, ContinuationAckReceipt, ContinuationAdoption,
-    ContinuationDescriptor, ContinuationLease, ContinuationPublicationAckReceipt,
-    ContinuationPublicationAuthority, ContinuationPublicationReceipt, ContinuationResumeAuthority,
-    ContinuationResumePlan, ContinuationResumeReceipt, DeadlineAdoption, DeadlineClockBasis,
-    DeadlineDescriptor, DeadlineExhaustedDisposition, DeadlineExpiryAuthority,
-    DeadlineExpiryReceipt, DeadlineLease, DeadlinePurpose, DeadlineQuarantineReleaseReceipt,
-    DeadlineQuarantineTicket, DeadlineReconciliationOutcome, DeadlineReconciliationReceipt,
-    DeadlineRecoveryState, DeadlineSupervisorRetry, DeviceReservationCoordinates, DomainKey,
-    EffectKey, EnqueuedServiceRequest, EnteredTaskLease, FaultAccess, FaultDescriptor,
-    FaultDisposition, FaultObservation, FaultPhase, InfrastructureError, InfrastructureLimits,
-    InfrastructureState, LinearFailure, ResourceKey, ScopeKey, ServiceArmAuthority, ServiceArmPlan,
-    ServiceArmReceipt, ServiceBoundKey, ServiceCancellationPoint, ServiceChildBindingReceipt,
-    ServiceChildReceipt, ServiceClaimantSnapshot, ServiceEnqueueAuthority, ServiceEnqueuePlan,
-    ServiceEnqueueReceipt, ServiceLineageCommitment, ServiceRequestCausalIdentity,
-    ServiceRequestDescriptor, ServiceRequestPhase, ServiceRequestRecoveryState,
-    ServiceRequestTicket, TaskAdoption, TaskKey, TaskPhase, TaskWorkDescriptor, TaskWorkRole,
-    UnarmedServiceRequest, UnboundServiceRequest, ValidatedAbortProof, ValidatedServiceChildProof,
-    VmAuthorityKey, WakeClaim, WorkloadContext, WorkloadRequestPresentation,
-    WorkloadRootPresentation, bearer_state,
+    ArmedFaultTask, AuthorityKey, BearerKey, BoundServiceRequest, ContinuationAckReceipt,
+    ContinuationAdoption, ContinuationDescriptor, ContinuationLease,
+    ContinuationPublicationAckReceipt, ContinuationPublicationAuthority,
+    ContinuationPublicationReceipt, ContinuationResumeAuthority, ContinuationResumePlan,
+    ContinuationResumeReceipt, DeadlineAdoption, DeadlineClockBasis, DeadlineDescriptor,
+    DeadlineExhaustedDisposition, DeadlineExpiryAuthority, DeadlineExpiryReceipt, DeadlineLease,
+    DeadlinePurpose, DeadlineQuarantineReleaseReceipt, DeadlineQuarantineTicket,
+    DeadlineReconciliationOutcome, DeadlineReconciliationReceipt, DeadlineRecoveryState,
+    DeadlineSupervisorRetry, DelayedCommandDescriptor, DelayedCommandRejectionReason,
+    DelayedCommandRejectionReceipt, DeviceReservationCoordinates, DomainKey, EffectKey,
+    EnqueuedServiceRequest, EnteredTaskLease, FaultAccess, FaultDisposition, FaultObservation,
+    FaultPhase, FaultSlotDescriptor, InfrastructureError, InfrastructureKind, InfrastructureLimits,
+    InfrastructureState, LinearFailure, PortalHandle, ReplyDescriptor, ResourceKey, ScopeKey,
+    ServiceArmAuthority, ServiceArmPlan, ServiceArmReceipt, ServiceBoundKey,
+    ServiceCancellationPoint, ServiceChildBindingReceipt, ServiceChildReceipt,
+    ServiceClaimantSnapshot, ServiceEnqueueAuthority, ServiceEnqueuePlan, ServiceEnqueueReceipt,
+    ServiceLineageCommitment, ServiceRequestCausalIdentity, ServiceRequestDescriptor,
+    ServiceRequestPhase, ServiceRequestRecoveryState, ServiceRequestTicket, TaskAdoption,
+    TaskAnchorRecoveryState, TaskKey, TaskPhase, TaskWorkDescriptor, TaskWorkRole,
+    UnarmedServiceRequest, UnboundServiceRequest, ValidatedAbortProof, ValidatedCommitProof,
+    ValidatedServiceChildProof, VmAuthorityKey, WakeClaim, WorkloadContext,
+    WorkloadRequestPresentation, WorkloadRootPresentation, bearer_state,
 };
 
 const SCOPE: ScopeKey = ScopeKey::new(0x9100, 1);
@@ -222,7 +225,9 @@ fn compact_bound_service_state_with_sibling_response(
             super::ParentStamp::Task(parent) => parent,
             _ => unreachable!(),
         };
-        EnteredTaskLease(scope.tasks.get(parent.work_id).unwrap().stamp)
+        EnteredTaskLease(super::mint_task_key::<bearer_state::TaskEntered>(
+            scope.tasks.get(parent.work_id).unwrap(),
+        ))
     };
     let sibling = ContinuationDescriptor {
         continuation_id: COMPACT_CONTINUATION + 1,
@@ -232,7 +237,7 @@ fn compact_bound_service_state_with_sibling_response(
     (state, service, sibling)
 }
 
-fn add_service_claimant(state: &mut InfrastructureState, identity_base: u64) -> EnteredTaskLease {
+fn add_service_claimant(state: &mut InfrastructureState, identity_base: u64) -> ArmedFaultTask {
     let workload = state
         .open_workload(
             WorkloadRootPresentation::new(SCOPE, 1, ROOT),
@@ -246,12 +251,25 @@ fn add_service_claimant(state: &mut InfrastructureState, identity_base: u64) -> 
                 work_id: identity_base + 1,
                 generation: 1,
                 task: TaskKey::new(identity_base + 2, 1),
-                role: TaskWorkRole::GuestSyscallWork,
+                role: TaskWorkRole::ServiceRequest,
                 vm: Some(VmAuthorityKey::new(identity_base + 3, 1).unwrap()),
             },
         )
         .unwrap();
-    state.claim_task_entry(task).unwrap()
+    let reserved = state
+        .reserve_fault_event(
+            task,
+            FaultSlotDescriptor {
+                fault_id: identity_base + 8,
+                generation: 1,
+                task: TaskKey::new(identity_base + 2, 1),
+                vm_generation: 1,
+                service_domain: SERVICE,
+                admission_binding_epoch: 1,
+            },
+        )
+        .unwrap();
+    state.claim_service_task_entry(reserved).unwrap()
 }
 
 fn compact_child_bound_service_state(
@@ -1407,25 +1425,7 @@ fn service_external_receipts_are_exact_and_claim_child_is_one_transition() {
         .acknowledge_service_arm(arm_authority, service_arm_receipt(arm_plan, 0xd0a6))
         .unwrap();
 
-    let service_workload = state
-        .open_workload(
-            WorkloadRootPresentation::new(SCOPE, 1, ROOT),
-            WorkloadRequestPresentation::new(SERVICE, 1, 0xd0b0, 1),
-        )
-        .unwrap();
-    let claimant = state
-        .admit_task(
-            &service_workload,
-            TaskWorkDescriptor {
-                work_id: 0xd0b1,
-                generation: 1,
-                task: TaskKey::new(0xd0b2, 1),
-                role: TaskWorkRole::GuestSyscallWork,
-                vm: Some(VmAuthorityKey::new(0xd0b3, 1).unwrap()),
-            },
-        )
-        .unwrap();
-    let claimant = state.claim_task_entry(claimant).unwrap();
+    let claimant = add_service_claimant(&mut state, 0xd0b0);
     let enqueued_coordinates = service_bound_key_coordinates(&enqueued.0);
     let before_invalid_child = state.private_full_clone();
     let failure = state
@@ -1493,7 +1493,7 @@ fn service_claim_and_completion_preview_failures_are_atomic() {
         .scope_mut(SCOPE)
         .unwrap()
         .tasks
-        .get_mut(claimant.0.identity.work_id)
+        .get_mut(claimant.0.slot)
         .unwrap()
         .live_children = u32::MAX;
     let presented = service_bound_key_coordinates(&enqueued.0);
@@ -2547,12 +2547,25 @@ fn service_completion_returns_fresh_compact_continuation_authority() {
                 work_id: 0xe400,
                 generation: 1,
                 task: TaskKey::new(0xe500, 1),
-                role: TaskWorkRole::GuestSyscallWork,
+                role: TaskWorkRole::ServiceRequest,
                 vm: Some(VmAuthorityKey::new(0xe600, 1).unwrap()),
             },
         )
         .unwrap();
-    let claimant = state.claim_task_entry(claimant).unwrap();
+    let claimant = state
+        .reserve_fault_event(
+            claimant,
+            FaultSlotDescriptor {
+                fault_id: 0xe408,
+                generation: 1,
+                task: TaskKey::new(0xe500, 1),
+                vm_generation: 1,
+                service_domain: SERVICE,
+                admission_binding_epoch: 1,
+            },
+        )
+        .unwrap();
+    let claimant = state.claim_service_task_entry(claimant).unwrap();
     let alternate_claimant = state
         .admit_task(
             &service_workload,
@@ -2606,7 +2619,14 @@ fn service_completion_returns_fresh_compact_continuation_authority() {
     let binding_receipt = binding_receipt.unwrap();
     assert_eq!(binding_receipt.service_bearer_generation, 7);
     assert_eq!(binding_receipt.claim_generation, 1);
-    assert_eq!(binding_receipt.claimant.task, claimant.0.identity);
+    let claimant_stamp = state
+        .scope(SCOPE)
+        .unwrap()
+        .tasks
+        .get(claimant.0.slot)
+        .unwrap()
+        .stamp;
+    assert_eq!(binding_receipt.claimant.task, claimant_stamp.identity);
     assert_eq!(
         binding_receipt.claimant.task_bearer_generation,
         claimant.0.bearer_generation
@@ -2664,20 +2684,27 @@ fn service_completion_returns_fresh_compact_continuation_authority() {
     }
 
     let mut substituted_claimant = state.private_full_clone();
+    let alternate_stamp = state
+        .scope(SCOPE)
+        .unwrap()
+        .tasks
+        .get(alternate_claimant.0.slot)
+        .unwrap()
+        .stamp;
     let alternate_snapshot = ServiceClaimantSnapshot {
-        registry_instance: alternate_claimant.0.root.registry_instance,
-        scope: alternate_claimant.0.root.scope,
-        authority_epoch: alternate_claimant.0.root.authority_epoch,
-        root_effect: alternate_claimant.0.root.root_effect,
-        workload_request_id: alternate_claimant.0.workload.request.id,
-        workload_request_generation: alternate_claimant.0.workload.request.generation,
-        workload_nonce: alternate_claimant.0.workload.nonce,
-        workload_bearer_generation: alternate_claimant.0.workload.bearer_generation,
-        domain: alternate_claimant.0.domain.domain,
-        binding_epoch: alternate_claimant.0.domain.binding_epoch,
-        task: alternate_claimant.0.identity,
-        task_nonce: alternate_claimant.0.nonce,
-        task_bearer_generation: alternate_claimant.0.bearer_generation,
+        registry_instance: alternate_stamp.root.registry_instance,
+        scope: alternate_stamp.root.scope,
+        authority_epoch: alternate_stamp.root.authority_epoch,
+        root_effect: alternate_stamp.root.root_effect,
+        workload_request_id: alternate_stamp.workload.request.id,
+        workload_request_generation: alternate_stamp.workload.request.generation,
+        workload_nonce: alternate_stamp.workload.nonce,
+        workload_bearer_generation: alternate_stamp.workload.bearer_generation,
+        domain: alternate_stamp.domain.domain,
+        binding_epoch: alternate_stamp.domain.binding_epoch,
+        task: alternate_stamp.identity,
+        task_nonce: alternate_stamp.nonce,
+        task_bearer_generation: alternate_stamp.bearer_generation,
     };
     {
         let scope = substituted_claimant.scope_mut(SCOPE).unwrap();
@@ -2754,7 +2781,9 @@ fn service_completion_returns_fresh_compact_continuation_authority() {
     );
 
     let before_early_reap = state.private_full_clone();
-    let failure = state.reap_task(claimant).unwrap_err();
+    let failure = state
+        .finish_service_task_without_fault(claimant, 0xe8f0)
+        .unwrap_err();
     assert!(matches!(
         failure.error(),
         InfrastructureError::ClosureBlocked { live: 1, .. }
@@ -2964,12 +2993,14 @@ fn service_completion_returns_fresh_compact_continuation_authority() {
         .adopt_task_after_fence(&adopted_service_workload, 0xe400, 1)
         .unwrap();
     state.check_invariants().unwrap();
-    let mut entered_claimant = None;
-    if let TaskAdoption::Entered(entered) = adopted_claimant {
-        entered_claimant = Some(entered);
+    let mut armed_claimant = None;
+    if let TaskAdoption::FaultArmed(armed) = adopted_claimant {
+        armed_claimant = Some(armed);
     }
-    assert!(entered_claimant.is_some());
-    state.reap_task(entered_claimant.unwrap()).unwrap();
+    assert!(armed_claimant.is_some());
+    state
+        .finish_service_task_without_fault(armed_claimant.unwrap(), 0xeaf0)
+        .unwrap();
     state.check_invariants().unwrap();
 
     state.claim_continuation(outcome.response, 0xea).unwrap();
@@ -3692,6 +3723,477 @@ fn publication_state() -> InfrastructureState {
     state
 }
 
+fn armed_fault_state(
+    registry_instance: u64,
+) -> (
+    InfrastructureState,
+    WorkloadContext,
+    ArmedFaultTask,
+    FaultObservation,
+) {
+    let mut state = InfrastructureState::new(registry_instance);
+    state
+        .enable(SCOPE, 1, ROOT, limits(), &[(SERVICE, 1)])
+        .unwrap();
+    let workload = state
+        .open_workload(
+            WorkloadRootPresentation::new(SCOPE, 1, ROOT),
+            WorkloadRequestPresentation::new(SERVICE, 1, 0xfc10, 1),
+        )
+        .unwrap();
+    let task_key = TaskKey::new(0xfc20, 1);
+    let task = state
+        .admit_task(
+            &workload,
+            TaskWorkDescriptor {
+                work_id: 0xfc30,
+                generation: 1,
+                task: task_key,
+                role: TaskWorkRole::ServiceRequest,
+                vm: Some(VmAuthorityKey::new(0xfc40, 1).unwrap()),
+            },
+        )
+        .unwrap();
+    assert_eq!(task.0.bearer_generation, 1);
+    let reserved = state
+        .reserve_fault_event(
+            task,
+            FaultSlotDescriptor {
+                fault_id: 0xfc50,
+                generation: 1,
+                task: task_key,
+                vm_generation: 1,
+                service_domain: SERVICE,
+                admission_binding_epoch: 1,
+            },
+        )
+        .unwrap();
+    assert_eq!(reserved.0.bearer_generation, 2);
+    let armed = state.claim_service_task_entry(reserved).unwrap();
+    assert_eq!(armed.0.bearer_generation, 3);
+    assert_eq!(
+        state
+            .scope(SCOPE)
+            .unwrap()
+            .faults
+            .get(0xfc50)
+            .unwrap()
+            .stamp
+            .bearer_generation,
+        2
+    );
+    let observation = FaultObservation {
+        task: task_key,
+        vm_generation: 1,
+        instruction_pointer: 0xfc60,
+        address: 0xfc70,
+        access: FaultAccess::Write,
+        architecture_error: 0xfc80,
+        evidence_digest: 0xfc90,
+    };
+    state.check_invariants().unwrap();
+    (state, workload, armed, observation)
+}
+
+fn current_armed_fault(state: &InfrastructureState) -> ArmedFaultTask {
+    ArmedFaultTask(super::mint_task_key::<bearer_state::TaskFaultArmed>(
+        state.scope(SCOPE).unwrap().tasks.get(0xfc30).unwrap(),
+    ))
+}
+
+#[test]
+fn task_fault_compact_key_coordinates_are_all_fenced() {
+    type Mutate = fn(&mut BearerKey<bearer_state::TaskFaultArmed>);
+    let mutations: [Mutate; 7] = [
+        |key| key.authority.registry_instance ^= 1,
+        |key| key.authority.scope = ScopeKey::new(SCOPE.id() + 1, SCOPE.generation()),
+        |key| key.authority.authority_epoch += 1,
+        |key| key.slot += 1,
+        |key| key.object_generation += 1,
+        |key| key.bearer_generation += 1,
+        |key| key.nonce += 1,
+    ];
+    for mutate in mutations {
+        let (state, _, _, observation) = armed_fault_state(0xfc00);
+        let mut forged = current_armed_fault(&state);
+        mutate(&mut forged.0);
+        let presented = service_key_coordinates(&forged.0);
+        let before = state.private_full_clone();
+        let failure = state
+            .prepare_fault_disposition(forged, observation, FaultDisposition::CrashService)
+            .unwrap_err();
+        assert!(matches!(
+            failure.error(),
+            InfrastructureError::ForeignRegistry
+                | InfrastructureError::ForeignScope
+                | InfrastructureError::StaleAuthority
+                | InfrastructureError::NotEnabled
+                | InfrastructureError::UnknownObligation
+                | InfrastructureError::IdentityConflict
+                | InfrastructureError::StaleGeneration
+        ));
+        assert_eq!(state, before);
+        let returned = failure.into_input();
+        assert_eq!(service_key_coordinates(&returned.0), presented);
+    }
+}
+
+#[test]
+fn fault_plan_commitment_is_frozen_and_every_field_is_bound() {
+    let (state, _, armed, observation) = armed_fault_state(0xfc00);
+    let (_, plan) = state
+        .prepare_fault_disposition(armed, observation, FaultDisposition::CrashService)
+        .unwrap();
+    assert_eq!(
+        plan.commitment.0,
+        [
+            0xb0, 0x04, 0x5b, 0x95, 0xd1, 0x41, 0x52, 0x88, 0x7b, 0x87, 0x6b, 0x6f, 0x87, 0x17,
+            0xa6, 0x7f, 0x44, 0xd4, 0x8e, 0x17, 0xf5, 0x5d, 0xa8, 0x0a, 0x77, 0x57, 0xd6, 0x91,
+            0x74, 0xaf, 0x5b, 0xd9,
+        ]
+    );
+
+    type Mutate = fn(&mut super::FaultDispositionPlan);
+    let mutations: &[Mutate] = &[
+        |plan| plan.scope = ScopeKey::new(plan.scope.id() + 1, plan.scope.generation()),
+        |plan| plan.task.work_id += 1,
+        |plan| plan.task.generation += 1,
+        |plan| plan.task.task = TaskKey::new(plan.task.task.id() + 1, plan.task.task.generation()),
+        |plan| plan.task.role = TaskWorkRole::ReplacementRecovery,
+        |plan| plan.task.vm = Some(VmAuthorityKey::new(0xfd00, 1).unwrap()),
+        |plan| plan.fault.fault_id += 1,
+        |plan| plan.fault.generation += 1,
+        |plan| plan.fault.task = TaskKey::new(plan.fault.task.id() + 1, 1),
+        |plan| plan.fault.vm_generation += 1,
+        |plan| plan.fault.service_domain = DomainKey::new(SERVICE.value() + 1),
+        |plan| plan.fault.admission_binding_epoch += 1,
+        |plan| plan.task_nonce += 1,
+        |plan| plan.task_bearer_generation += 1,
+        |plan| plan.fault_nonce += 1,
+        |plan| plan.fault_bearer_generation += 1,
+        |plan| plan.observation.task = TaskKey::new(plan.observation.task.id() + 1, 1),
+        |plan| plan.observation.vm_generation += 1,
+        |plan| plan.observation.instruction_pointer += 1,
+        |plan| plan.observation.address += 1,
+        |plan| plan.observation.access = FaultAccess::Execute,
+        |plan| plan.observation.architecture_error += 1,
+        |plan| plan.observation.evidence_digest += 1,
+        |plan| plan.projection.disposition = FaultDisposition::IsolateTask,
+        |plan| plan.projection.crash_generation += 1,
+        |plan| plan.base_revision += 1,
+        |plan| plan.next_binding_epoch += 1,
+        |plan| plan.business.scope_revision += 1,
+        |plan| plan.business.domain_revision += 1,
+        |plan| plan.business.supervisor = Some(TaskKey::new(0xfd10, 1)),
+        |plan| plan.business.fallback_running = !plan.business.fallback_running,
+        |plan| plan.business.cohort_digest[0] ^= 1,
+        |plan| plan.business.cohort_count += 1,
+        |plan| plan.commitment.0[0] ^= 1,
+    ];
+    for mutate in mutations {
+        let (mut state, _, armed, observation) = armed_fault_state(0xfc00);
+        let (intent, mut plan) = state
+            .prepare_fault_disposition(armed, observation, FaultDisposition::CrashService)
+            .unwrap();
+        mutate(&mut plan);
+        let before = state.private_full_clone();
+        let failure = state.install_fault_disposition(intent, plan).unwrap_err();
+        assert!(matches!(
+            failure.error(),
+            InfrastructureError::InvalidReceipt
+                | InfrastructureError::StaleClaim
+                | InfrastructureError::UnknownDomain
+                | InfrastructureError::StaleBinding
+        ));
+        assert_eq!(state, before);
+        assert_eq!(
+            service_key_coordinates(&failure.into_input().0),
+            service_key_coordinates(&current_armed_fault(&state).0)
+        );
+    }
+}
+
+#[test]
+fn reserved_fault_adoption_is_composite_and_preflight_failure_is_atomic() {
+    let mut state = InfrastructureState::new(0xfd00);
+    state
+        .enable(SCOPE, 1, ROOT, limits(), &[(SERVICE, 1)])
+        .unwrap();
+    let workload = state
+        .open_workload(
+            WorkloadRootPresentation::new(SCOPE, 1, ROOT),
+            WorkloadRequestPresentation::new(SERVICE, 1, 0xfd01, 1),
+        )
+        .unwrap();
+    let task_key = TaskKey::new(0xfd02, 1);
+    let task = state
+        .admit_task(
+            &workload,
+            TaskWorkDescriptor {
+                work_id: 0xfd03,
+                generation: 1,
+                task: task_key,
+                role: TaskWorkRole::ServiceRequest,
+                vm: Some(VmAuthorityKey::new(0xfd04, 1).unwrap()),
+            },
+        )
+        .unwrap();
+    let stale_reserved = state
+        .reserve_fault_event(
+            task,
+            FaultSlotDescriptor {
+                fault_id: 0xfd05,
+                generation: 1,
+                task: task_key,
+                vm_generation: 1,
+                service_domain: SERVICE,
+                admission_binding_epoch: 1,
+            },
+        )
+        .unwrap();
+    *state
+        .scope_mut(SCOPE)
+        .unwrap()
+        .binding_epoch_mut(SERVICE)
+        .unwrap() = 2;
+    let workload = state
+        .adopt_workload_after_fence(
+            WorkloadRootPresentation::new(SCOPE, 1, ROOT),
+            WorkloadRequestPresentation::new(SERVICE, 2, 0xfd01, 1),
+        )
+        .unwrap();
+
+    let mut corrupt = state.private_full_clone();
+    let fault_nonce = corrupt
+        .scope(SCOPE)
+        .unwrap()
+        .faults
+        .get(0xfd05)
+        .unwrap()
+        .stamp
+        .nonce;
+    corrupt
+        .scope_mut(SCOPE)
+        .unwrap()
+        .reverse_indexes
+        .get_mut(fault_nonce)
+        .unwrap()
+        .kind = InfrastructureKind::Deadline;
+    let before = corrupt.private_full_clone();
+    assert_eq!(
+        corrupt.adopt_task_after_fence(&workload, 0xfd03, 1),
+        Err(InfrastructureError::Invariant(
+            "invalid fault reverse index"
+        ))
+    );
+    assert_eq!(corrupt, before);
+
+    let adopted = state.adopt_task_after_fence(&workload, 0xfd03, 1).unwrap();
+    let reserved = match adopted {
+        TaskAdoption::FaultReserved(reserved) => reserved,
+        _ => panic!("reserved task/fault composite adopted into the wrong state"),
+    };
+    let stale_failure = state.claim_service_task_entry(stale_reserved).unwrap_err();
+    assert_eq!(stale_failure.error(), InfrastructureError::StaleGeneration);
+    let armed = state.claim_service_task_entry(reserved).unwrap();
+    assert_eq!(armed.0.bearer_generation, 4);
+    state.check_invariants().unwrap();
+}
+
+#[test]
+fn terminal_fault_retains_deadline_then_drains_historical_task_anchor() {
+    let (mut state, workload, armed, observation) = armed_fault_state(0xfd20);
+    let deadline = state
+        .arm_service_deadline(
+            &armed,
+            DeadlineDescriptor {
+                series_id: 0xfd30,
+                generation: 1,
+                purpose: DeadlinePurpose::Recovery,
+                clock: DeadlineClockBasis::ObservedCallbackTick,
+                deadline_tick: 10,
+                attempt: 1,
+                max_attempts: 1,
+                backoff_ticks: 1,
+            },
+        )
+        .unwrap();
+    let (intent, plan) = state
+        .prepare_fault_disposition(armed, observation, FaultDisposition::CrashService)
+        .unwrap();
+    state.install_fault_disposition(intent, plan).unwrap();
+    let retained = state.query_task(&workload, 0xfc30, 1).unwrap();
+    assert_eq!(retained.live_children, 1);
+    assert_eq!(retained.anchor, TaskAnchorRecoveryState::TerminalRetained);
+
+    // Even a synchronously forged marker with the current compact coordinates
+    // cannot turn a terminal historical anchor back into admission authority.
+    let forged = current_armed_fault(&state);
+    let before = state.private_full_clone();
+    assert!(matches!(
+        state.arm_service_deadline(
+            &forged,
+            DeadlineDescriptor {
+                series_id: 0xfd31,
+                generation: 1,
+                purpose: DeadlinePurpose::Recovery,
+                clock: DeadlineClockBasis::ObservedCallbackTick,
+                deadline_tick: 20,
+                attempt: 1,
+                max_attempts: 1,
+                backoff_ticks: 1,
+            },
+        ),
+        Err(InfrastructureError::InvalidState | InfrastructureError::StaleBinding)
+    ));
+    assert_eq!(state, before);
+
+    state.cancel_deadline(deadline).unwrap();
+    let drained = state.query_task(&workload, 0xfc30, 1).unwrap();
+    assert_eq!(drained.live_children, 0);
+    assert_eq!(drained.anchor, TaskAnchorRecoveryState::TerminalDrained);
+    state.check_invariants().unwrap();
+}
+
+#[test]
+fn terminal_fault_preserves_service_and_delayed_children_until_each_drains() {
+    const CLAIMANT: u64 = 0xfe00;
+    let (mut state, bound) = compact_child_bound_service_state(0xfe10, CLAIMANT);
+    let claimant_task = TaskKey::new(CLAIMANT + 2, 1);
+    let context = super::workload_bearer(state.scope(SCOPE).unwrap(), CLAIMANT).unwrap();
+    let armed = ArmedFaultTask(super::mint_task_key::<bearer_state::TaskFaultArmed>(
+        state.scope(SCOPE).unwrap().tasks.get(CLAIMANT + 1).unwrap(),
+    ));
+    let target_effect = EffectKey::new(CLAIMANT + 4, 1);
+    let delayed_descriptor = DelayedCommandDescriptor {
+        command_id: 0xfe20,
+        generation: 1,
+        request_id: COMPACT_SERVICE_REQUEST,
+        request_generation: 1,
+        destination_domain: SERVICE,
+        destination_binding_epoch: 1,
+        sender: claimant_task,
+        target: PortalHandle {
+            scope: SCOPE,
+            effect: target_effect,
+            domain: SERVICE,
+            authority_epoch: 1,
+            binding_epoch: 1,
+            nonce: 0xfe21,
+        },
+        command_digest: 0xfe22,
+        actor_slot: 7,
+        actor_generation: 1,
+    };
+    let delayed = state
+        .reserve_delayed_command(&armed, &bound, delayed_descriptor)
+        .unwrap();
+    let (intent, plan) = state
+        .prepare_fault_disposition(
+            armed,
+            FaultObservation {
+                task: claimant_task,
+                vm_generation: 1,
+                instruction_pointer: 0xfe30,
+                address: 0xfe31,
+                access: FaultAccess::Read,
+                architecture_error: 0xfe32,
+                evidence_digest: 0xfe33,
+            },
+            FaultDisposition::CrashService,
+        )
+        .unwrap();
+    state.install_fault_disposition(intent, plan).unwrap();
+    let retained = state.query_task(&context, CLAIMANT + 1, 1).unwrap();
+    assert_eq!(retained.live_children, 2);
+    assert_eq!(retained.anchor, TaskAnchorRecoveryState::TerminalRetained);
+
+    state
+        .reject_delayed_command(
+            delayed,
+            DelayedCommandRejectionReceipt {
+                reason: DelayedCommandRejectionReason::RequestAborted,
+                target_effect,
+                evidence_digest: 0xfe34,
+            },
+        )
+        .unwrap();
+    let retained = state.query_task(&context, CLAIMANT + 1, 1).unwrap();
+    assert_eq!(retained.live_children, 1);
+    assert_eq!(retained.anchor, TaskAnchorRecoveryState::TerminalRetained);
+
+    let _outcome = state.complete_service_request(bound, 0xfe35).unwrap();
+    let drained = state.query_task(&context, CLAIMANT + 1, 1).unwrap();
+    assert_eq!(drained.live_children, 0);
+    assert_eq!(drained.anchor, TaskAnchorRecoveryState::TerminalDrained);
+    state.check_invariants().unwrap();
+}
+
+#[test]
+fn normal_task_exit_retains_continuation_and_reply_until_both_drain() {
+    const REGISTRY: u64 = 0xfe40;
+    let (mut state, workload, entered) = compact_task_state(REGISTRY);
+    let continuation = state
+        .create_continuation(
+            &entered,
+            ContinuationDescriptor {
+                continuation_id: 0xfe41,
+                generation: 1,
+                vm_generation: 1,
+                source_domain: GUEST,
+                source_binding_epoch: 1,
+            },
+        )
+        .unwrap();
+    let reply = state
+        .prepare_reply(
+            &entered,
+            ReplyDescriptor {
+                reply_id: 0xfe42,
+                generation: 1,
+                guest_task: TaskKey::new(COMPACT_TASK, 1),
+                guest_vm_generation: 1,
+                descriptor_digest: 0xfe43,
+                result_digest: 0xfe44,
+                byte_count: 8,
+                destination_digest: 0xfe45,
+                source_domain: GUEST,
+                source_binding_epoch: 1,
+                payload_slot: 3,
+                payload_generation: 1,
+                flight_cookie: 0xfe46,
+            },
+            ValidatedCommitProof::new(super::super::CommitReceipt {
+                registry_instance_id: REGISTRY,
+                effect: EffectKey::new(0xfe47, 1),
+                scope: SCOPE,
+                authority_epoch: 1,
+                binding_epoch: 1,
+                sequence: 1,
+                result: 0,
+                domain_revision: 1,
+                descriptor_digest: 0xfe48,
+            }),
+        )
+        .unwrap();
+
+    state.reap_task(entered).unwrap();
+    let retained = state.query_task(&workload, COMPACT_WORK, 1).unwrap();
+    assert_eq!(retained.live_children, 2);
+    assert_eq!(retained.anchor, TaskAnchorRecoveryState::TerminalRetained);
+
+    state.cancel_continuation(continuation).unwrap();
+    let retained = state.query_task(&workload, COMPACT_WORK, 1).unwrap();
+    assert_eq!(retained.live_children, 1);
+    assert_eq!(retained.anchor, TaskAnchorRecoveryState::TerminalRetained);
+
+    state.cancel_prepared_reply(reply, 0xfe49).unwrap();
+    let drained = state.query_task(&workload, COMPACT_WORK, 1).unwrap();
+    assert_eq!(drained.live_children, 0);
+    assert_eq!(drained.anchor, TaskAnchorRecoveryState::TerminalDrained);
+    state.check_invariants().unwrap();
+}
+
 fn applied_fault_state(disposition: FaultDisposition) -> InfrastructureState {
     let mut state = InfrastructureState::new(0x9020);
     state
@@ -3716,32 +4218,23 @@ fn applied_fault_state(disposition: FaultDisposition) -> InfrastructureState {
             },
         )
         .unwrap();
-    let fault = state
+    let reserved = state
         .reserve_fault_event(
-            &task,
-            FaultDescriptor {
+            task,
+            FaultSlotDescriptor {
                 fault_id: 0xb700,
                 generation: 1,
                 task: task_key,
                 vm_generation: 1,
-                instruction_pointer: 0xb800,
-                address: 0xb900,
-                access: FaultAccess::Read,
-                architecture_error: 0xba,
                 service_domain: SERVICE,
-                service_binding_epoch: 1,
+                admission_binding_epoch: 1,
             },
         )
         .unwrap();
-    let (entered, armed) = state.claim_service_task_entry(task, fault).unwrap();
-    let (next_binding_epoch, crash_generation) = match disposition {
-        FaultDisposition::CrashService => (2, 1),
-        FaultDisposition::IsolateTask => (1, 0),
-    };
-    let plan = state
+    let armed = state.claim_service_task_entry(reserved).unwrap();
+    let (intent, plan) = state
         .prepare_fault_disposition(
             armed,
-            entered,
             FaultObservation {
                 task: task_key,
                 vm_generation: 1,
@@ -3752,20 +4245,9 @@ fn applied_fault_state(disposition: FaultDisposition) -> InfrastructureState {
                 evidence_digest: 0xbb,
             },
             disposition,
-            next_binding_epoch,
-            crash_generation,
         )
         .unwrap();
-    let base = state.root_binding(SCOPE).unwrap();
-    let mut candidate = state.try_private_candidate().unwrap();
-    candidate
-        .apply_fault_disposition_in_candidate(plan)
-        .unwrap();
-    candidate.check_invariants().unwrap();
-    let install = state
-        .prepare_exact_scope_install(SCOPE, base, &mut candidate)
-        .unwrap();
-    state.install_exact_scope(install);
+    state.install_fault_disposition(intent, plan).unwrap();
     state.check_invariants().unwrap();
     state
 }
@@ -3825,7 +4307,7 @@ fn observed_fault_requires_atomic_task_and_domain_disposition() {
         .iter_mut()
         .next()
         .unwrap();
-    if let FaultPhase::Observed {
+    if let FaultPhase::InstalledAwaitingClaim {
         ref mut projection, ..
     } = fault.phase
     {
@@ -3841,7 +4323,7 @@ fn observed_fault_requires_atomic_task_and_domain_disposition() {
         .iter_mut()
         .next()
         .unwrap();
-    if let FaultPhase::Observed {
+    if let FaultPhase::InstalledAwaitingClaim {
         ref mut projection, ..
     } = fault.phase
     {
@@ -3870,28 +4352,23 @@ fn observed_fault_requires_atomic_task_and_domain_disposition() {
             },
         )
         .unwrap();
-    let fault = later_crash
+    let reserved = later_crash
         .reserve_fault_event(
-            &task,
-            FaultDescriptor {
+            task,
+            FaultSlotDescriptor {
                 fault_id: 0xc700,
                 generation: 1,
                 task: task_key,
                 vm_generation: 1,
-                instruction_pointer: 0xc800,
-                address: 0xc900,
-                access: FaultAccess::Read,
-                architecture_error: 0xca,
                 service_domain: SERVICE,
-                service_binding_epoch: 1,
+                admission_binding_epoch: 1,
             },
         )
         .unwrap();
-    let (entered, armed) = later_crash.claim_service_task_entry(task, fault).unwrap();
-    let plan = later_crash
+    let armed = later_crash.claim_service_task_entry(reserved).unwrap();
+    let (intent, plan) = later_crash
         .prepare_fault_disposition(
             armed,
-            entered,
             FaultObservation {
                 task: task_key,
                 vm_generation: 1,
@@ -3902,20 +4379,9 @@ fn observed_fault_requires_atomic_task_and_domain_disposition() {
                 evidence_digest: 0xcb,
             },
             FaultDisposition::CrashService,
-            2,
-            1,
         )
         .unwrap();
-    let base = later_crash.root_binding(SCOPE).unwrap();
-    let mut candidate = later_crash.try_private_candidate().unwrap();
-    candidate
-        .apply_fault_disposition_in_candidate(plan)
-        .unwrap();
-    candidate.check_invariants().unwrap();
-    let install = later_crash
-        .prepare_exact_scope_install(SCOPE, base, &mut candidate)
-        .unwrap();
-    later_crash.install_exact_scope(install);
+    later_crash.install_fault_disposition(intent, plan).unwrap();
     later_crash.check_invariants().unwrap();
 
     let mut fabricated_crash = isolate.private_full_clone();
@@ -3926,7 +4392,7 @@ fn observed_fault_requires_atomic_task_and_domain_disposition() {
         .iter_mut()
         .next()
         .unwrap();
-    if let FaultPhase::Observed {
+    if let FaultPhase::InstalledAwaitingClaim {
         ref mut projection, ..
     } = fault.phase
     {
