@@ -1498,10 +1498,17 @@ pub(super) fn runtime_causal_bootstrap_self_test() {
         let crash = registry
             .crash_causal_service_task(selector, armed, observation)
             .unwrap();
+        let crash_observation = crash.observation();
         crash.close(&mut registry).unwrap();
         let snapshot = registry
             .domain_recovery_snapshot(SCOPE, TARGET_DOMAIN, REPLACEMENT, 1)
             .unwrap();
+        __cser_core::assert_eq!(
+            crash_observation.previous_binding_epoch(),
+            snapshot.binding_epoch.checked_sub(1).unwrap()
+        );
+        __cser_core::assert_eq!(crash_observation.binding_epoch(), snapshot.binding_epoch);
+        __cser_core::assert_eq!(crash_observation.cohort(), snapshot.cohort_identity());
         registry.check_invariants().unwrap();
         (registry, root_session, snapshot)
     }

@@ -16,7 +16,9 @@ use super::runtime_causal::{
     CausalWorkloadError,
 };
 use super::runtime_task::CausalVmIdentity;
-use super::{DomainKey, EffectRegistry, RegistryError, TaskKey, infrastructure};
+use super::{
+    DomainCohortIdentity, DomainKey, EffectRegistry, RegistryError, TaskKey, infrastructure,
+};
 
 #[derive(
     __cser_core::clone::Clone,
@@ -412,7 +414,37 @@ pub(crate) struct CausalServiceCrashCommit {
     identity: CausalDomainWorkloadIdentity,
     selector: CausalServiceTaskSelector,
     installed: infrastructure::InstalledFaultObservation,
+    observation: CausalServiceCrashObservation,
     claim: CausalCrashClaim,
+}
+
+/// Registry-derived crash transition returned with the retained commit owner.
+/// The cohort is never reconstructed by an adapter from a mutable effect map.
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
+pub(crate) struct CausalServiceCrashObservation {
+    previous_binding_epoch: u64,
+    binding_epoch: u64,
+    cohort: DomainCohortIdentity,
+}
+
+impl CausalServiceCrashObservation {
+    pub(crate) const fn previous_binding_epoch(self) -> u64 {
+        self.previous_binding_epoch
+    }
+
+    pub(crate) const fn binding_epoch(self) -> u64 {
+        self.binding_epoch
+    }
+
+    pub(crate) const fn cohort(self) -> DomainCohortIdentity {
+        self.cohort
+    }
 }
 
 #[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
@@ -463,6 +495,10 @@ impl CausalServiceCrashCommit {
             CausalCrashClaim::Consumed { .. } => CausalServiceCrashStage::Consumed,
             CausalCrashClaim::AlreadyClaimed { .. } => CausalServiceCrashStage::AlreadyClaimed,
         }
+    }
+
+    pub(crate) const fn observation(&self) -> CausalServiceCrashObservation {
+        self.observation
     }
 
     /// Retries only the post-install claim/consume suffix.  Any failure stays
@@ -543,6 +579,7 @@ impl CausalServiceCrashCommit {
             identity,
             selector,
             installed,
+            observation,
             claim,
         } = self;
         match registry.close_causal_domain_workload(session) {
@@ -554,6 +591,7 @@ impl CausalServiceCrashCommit {
                     identity,
                     selector,
                     installed,
+                    observation,
                     claim,
                 },
             }),
@@ -1127,6 +1165,15 @@ impl EffectRegistry {
         if let Err(error) = validate_observation(selector, observation) {
             return Err(CausalServiceTaskFailure { error, task });
         }
+        let binding_epoch = match selector.binding_epoch.checked_add(1) {
+            Some(binding_epoch) => binding_epoch,
+            None => {
+                return Err(CausalServiceTaskFailure {
+                    error: CausalServiceTaskError::Registry(RegistryError::CounterOverflow),
+                    task,
+                });
+            }
+        };
         let CausalArmedServiceTask {
             session,
             identity,
@@ -1153,6 +1200,14 @@ impl EffectRegistry {
                 });
             }
         };
+        let crash_observation = CausalServiceCrashObservation {
+            previous_binding_epoch: selector.binding_epoch,
+            binding_epoch,
+            cohort: DomainCohortIdentity::new(
+                plan.business.cohort_count,
+                plan.business.cohort_digest,
+            ),
+        };
         let installed = match self.install_service_fault_disposition(intent, plan) {
             Ok(installed) => installed,
             Err(failure) => {
@@ -1174,6 +1229,7 @@ impl EffectRegistry {
             identity,
             selector,
             installed,
+            observation: crash_observation,
             claim,
         })
     }

@@ -2651,6 +2651,44 @@ fn advance_device_preparation_scope(scope: &mut ScopeRecord) -> Result<(), Regis
     Ok(())
 }
 
+/// Registry-canonical identity of one ordered domain recovery cohort.
+///
+/// Both the crash transition and every recovery snapshot carry this exact
+/// value. Adapters must not hash the effect list with a second algorithm.
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
+pub(crate) struct DomainCohortIdentity {
+    len: u64,
+    digest: [u8; 32],
+}
+
+impl DomainCohortIdentity {
+    const fn new(len: u64, digest: [u8; 32]) -> Self {
+        Self { len, digest }
+    }
+
+    pub(crate) const fn len(self) -> u64 {
+        self.len
+    }
+
+    pub(crate) const fn digest(self) -> [u8; 32] {
+        self.digest
+    }
+}
+
+fn domain_cohort_identity(
+    cohort: Option<&BTreeSet<EffectKey>>,
+) -> Result<DomainCohortIdentity, RegistryError> {
+    let len = u64::try_from(cohort.map_or(0, BTreeSet::len))
+        .map_err(|_| RegistryError::CounterOverflow)?;
+    Ok(DomainCohortIdentity::new(len, fault_cohort_digest(cohort)))
+}
+
 #[derive(
     __cser_core::clone::Clone,
     __cser_core::fmt::Debug,
@@ -2701,6 +2739,7 @@ pub(crate) struct DomainRecoverySnapshot {
     crash_revision: u64,
     pub(crate) root_revision: u64,
     pub(crate) domain_revision: u64,
+    cohort_identity: DomainCohortIdentity,
     pub(crate) effects: Vec<RecoveryEffectSummary>,
     digest: [u8; 32],
 }
@@ -2716,6 +2755,10 @@ impl DomainRecoverySnapshot {
 
     pub(crate) const fn digest(&self) -> [u8; 32] {
         self.digest
+    }
+
+    pub(crate) const fn cohort_identity(&self) -> DomainCohortIdentity {
+        self.cohort_identity
     }
 }
 
@@ -2733,6 +2776,8 @@ fn domain_recovery_snapshot_digest(snapshot: &DomainRecoverySnapshot) -> [u8; 32
     hasher.update(snapshot.crash_revision.to_le_bytes());
     hasher.update(snapshot.root_revision.to_le_bytes());
     hasher.update(snapshot.domain_revision.to_le_bytes());
+    hasher.update(snapshot.cohort_identity.len.to_le_bytes());
+    hasher.update(snapshot.cohort_identity.digest);
     hasher.update((snapshot.effects.len() as u128).to_le_bytes());
     for effect in &snapshot.effects {
         hasher.update(effect.effect.id().to_le_bytes());
@@ -2960,6 +3005,7 @@ pub(crate) struct DomainCrashReceipt {
     pub(crate) previous_binding_epoch: u64,
     pub(crate) binding_epoch: u64,
     pub(crate) cohort: BTreeSet<EffectKey>,
+    pub(crate) cohort_identity: DomainCohortIdentity,
 }
 
 #[derive(
@@ -4593,8 +4639,8 @@ impl EffectRegistry {
             .production
             .by_domain
             .get(&(scope_key, descriptor.service_domain));
-        let cohort_count = match u64::try_from(cohort.map_or(0, BTreeSet::len)) {
-            Ok(count) => count,
+        let cohort_identity = match domain_cohort_identity(cohort) {
+            Ok(identity) => identity,
             Err(_) => {
                 return Err(FaultRegistryFailure {
                     error: RegistryError::CounterOverflow,
@@ -4607,8 +4653,8 @@ impl EffectRegistry {
             domain_revision: binding.revision,
             supervisor: binding.supervisor,
             fallback_running: binding.fallback_running,
-            cohort_digest: fault_cohort_digest(cohort),
-            cohort_count,
+            cohort_digest: cohort_identity.digest,
+            cohort_count: cohort_identity.len,
         };
         self.infrastructure
             .prepare_fault_disposition_with_business(armed, observation, disposition, business)
@@ -4648,15 +4694,14 @@ impl EffectRegistry {
                 .production
                 .by_domain
                 .get(&(plan.scope, plan.projection.service_domain));
-            let cohort_count = u64::try_from(cohort.map_or(0, BTreeSet::len))
-                .map_err(|_| RegistryError::CounterOverflow)?;
+            let cohort_identity = domain_cohort_identity(cohort)?;
             let current_business = infrastructure::FaultBusinessPlan {
                 scope_revision: live_scope.revision,
                 domain_revision: live_binding.revision,
                 supervisor: live_binding.supervisor,
                 fallback_running: live_binding.fallback_running,
-                cohort_digest: fault_cohort_digest(cohort),
-                cohort_count,
+                cohort_digest: cohort_identity.digest,
+                cohort_count: cohort_identity.len,
             };
             if current_business != plan.business || live_scope.phase != ScopePhase::Active {
                 return Err(RegistryError::CombinedCandidateStale);
@@ -8923,6 +8968,7 @@ impl EffectRegistry {
             .get(&(scope_key, domain))
             .cloned()
             .unwrap_or_default();
+        let cohort_identity = domain_cohort_identity(Some(&cohort))?;
         let scope = self
             .scopes
             .get(&scope_key)
@@ -8977,6 +9023,7 @@ impl EffectRegistry {
             previous_binding_epoch,
             binding_epoch,
             cohort,
+            cohort_identity,
         })
     }
 
@@ -9031,6 +9078,7 @@ impl EffectRegistry {
         if attempt <= recovery.highest_attempt {
             return Err(RegistryError::StaleRecoveryAttempt);
         }
+        let cohort_identity = domain_cohort_identity(Some(&recovery.cohort))?;
         let mut effects = Vec::with_capacity(recovery.cohort.len());
         for effect in &recovery.cohort {
             let record = self
@@ -9062,6 +9110,7 @@ impl EffectRegistry {
             crash_revision: recovery.crash_revision,
             root_revision: scope.revision,
             domain_revision: binding.revision,
+            cohort_identity,
             effects,
             digest: [0; 32],
         };
@@ -10865,6 +10914,8 @@ impl EffectRegistry {
                             || snapshot.crash_revision != recovery.crash_revision
                             || snapshot.root_revision > scope.revision
                             || snapshot.domain_revision > binding.revision
+                            || snapshot.cohort_identity
+                                != domain_cohort_identity(Some(&recovery.cohort))?
                             || snapshot.digest != domain_recovery_snapshot_digest(snapshot))
                     {
                         return Err(RegistryError::Invariant(
