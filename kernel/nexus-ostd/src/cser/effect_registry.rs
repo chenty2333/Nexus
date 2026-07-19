@@ -3318,16 +3318,18 @@ impl EffectRegistry {
         coordinates: infrastructure::DeviceReservationCoordinates,
     ) -> Result<infrastructure::DevicePreparationTicket, RegistryError> {
         let scope_key = context.scope();
-        let parent = self
-            .effects
-            .get(&parent_effect)
-            .ok_or(RegistryError::UnknownEffect)?;
         let scope = self
             .scopes
             .get(&scope_key)
             .ok_or(RegistryError::UnknownScope)?;
-        if scope.phase != ScopePhase::Active
-            || parent.identity.scope != scope_key
+        if scope.phase != ScopePhase::Active {
+            return Err(RegistryError::ScopeNotActive);
+        }
+        let parent = self
+            .effects
+            .get(&parent_effect)
+            .ok_or(RegistryError::UnknownEffect)?;
+        if parent.identity.scope != scope_key
             || parent.identity.authority_epoch != scope.authority_epoch
             || parent.phase.is_terminal()
         {
@@ -3426,6 +3428,21 @@ impl EffectRegistry {
     > {
         let scope_key = ticket.scope();
         let charges = ticket.coordinates().credit_charges();
+        let scope = match self.scopes.get(&scope_key) {
+            Some(scope) => scope,
+            None => {
+                return Err(DevicePreparationRegistryFailure {
+                    error: RegistryError::UnknownScope,
+                    input: ticket,
+                });
+            }
+        };
+        if scope.phase != ScopePhase::Active {
+            return Err(DevicePreparationRegistryFailure {
+                error: RegistryError::ScopeNotActive,
+                input: ticket,
+            });
+        }
         let mut candidate = match self.combined_scope_candidate(scope_key) {
             Ok(candidate) => candidate,
             Err(error) => {
@@ -13819,6 +13836,70 @@ fn device_preparation_outer_credit_self_test() {
         unrelated_infrastructure
     );
     cancelled.check_invariants().unwrap();
+
+    // Revocation wins admission. A Closing scope reports the lifecycle error
+    // before reinterpreting its old parent authority as an invalid handle.
+    let (mut reserve_closing, workload, root, coordinates) = fixture(0xdb31);
+    reserve_closing.revoke_begin(SCOPE).unwrap();
+    reserve_closing
+        .infrastructure
+        .set_closing_lifecycle_for_test(SCOPE);
+    reserve_closing.check_invariants().unwrap();
+    let closing_before = reserve_closing.clone();
+    __cser_core::assert_eq!(
+        reserve_closing.reserve_device_preparation(&workload, root, coordinates),
+        Err(RegistryError::ScopeNotActive)
+    );
+    __cser_core::assert_eq!(reserve_closing, closing_before);
+
+    // A preparation which lost the revoke race remains a linear Reserved
+    // owner. Closing may cancel and drain it, but cannot begin new hardware
+    // exposure; the rejected begin returns the exact ticket without mutation.
+    let (mut revoke_first, workload, root, coordinates) = fixture(0xdb32);
+    let ticket = revoke_first
+        .reserve_device_preparation(&workload, root, coordinates)
+        .unwrap();
+    revoke_first.revoke_begin(SCOPE).unwrap();
+    revoke_first
+        .infrastructure
+        .set_closing_lifecycle_for_test(SCOPE);
+    revoke_first.check_invariants().unwrap();
+    let closing_before = revoke_first.clone();
+    let failure = revoke_first
+        .begin_device_hardware_apply(ticket)
+        .unwrap_err();
+    __cser_core::assert_eq!(failure.error(), &RegistryError::ScopeNotActive);
+    __cser_core::assert_eq!(revoke_first, closing_before);
+    let ticket = failure.into_input();
+    __cser_core::assert_eq!(ticket.coordinates(), coordinates);
+    let projection = revoke_first
+        .query_device_preparation(
+            &workload,
+            coordinates.preparation_id,
+            coordinates.generation,
+        )
+        .unwrap();
+    __cser_core::assert_eq!(
+        projection.state,
+        infrastructure::DevicePreparationRecoveryState::Reserved
+    );
+    let held = revoke_first.scope_projection(SCOPE).unwrap().credits;
+    __cser_core::assert_eq!((held.free, held.held, held.retained), (0, 7, 0));
+    revoke_first.cancel_device_preparation(ticket).unwrap();
+    let projection = revoke_first
+        .query_device_preparation(
+            &workload,
+            coordinates.preparation_id,
+            coordinates.generation,
+        )
+        .unwrap();
+    __cser_core::assert_eq!(
+        projection.state,
+        infrastructure::DevicePreparationRecoveryState::Cancelled
+    );
+    let released = revoke_first.scope_projection(SCOPE).unwrap().credits;
+    __cser_core::assert_eq!((released.free, released.held, released.retained), (7, 0, 0));
+    revoke_first.check_invariants().unwrap();
 
     // A staged successor never escapes a rejected combined install. Converting
     // it back to the sole input bearer still validates the unchanged live
