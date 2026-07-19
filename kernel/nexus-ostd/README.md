@@ -468,15 +468,29 @@ owners; timeout does not advance device generation, ResetAck advances it, and
 only IOTLB Ack releases ownership.
 
 The production Registry now has the two private primitives required by the
-kernel supervisor backend, but this checkpoint does not yet wire that backend
-into the filesystem lifecycle. A domain recovery snapshot binds the Registry
-instance, scope, domain, replacement, crash generation, binding, explicit
-manager attempt, and a domain-separated digest. Exact pre-rebind abort clears
-only that attempt's snapshot and Ready proof; it retains the crash cohort and
-unadopted set, records one fixed-size replay receipt, and rejects foreign,
-stale, or conflicting attempts without mutation. Recovery peeking remains a
-pure `unadopted.first()` query, so there is no service-owned mutable selector to
-survive the abort.
+kernel supervisor backend. Current main also compiles an activation-gated OSTD
+adapter around the provider-neutral `SupervisorManager`: a fixed-size FIFO and
+per-task retained slots, monotonic `Jiffies` wakeups, unpublished
+`TaskOptions::build`, state installation before `Task::run`, and the private
+Registry crash/snapshot/Ready/rebind/adopt/abort/isolate bridge. A domain
+recovery snapshot binds the Registry instance, scope, domain, replacement,
+crash generation, binding, explicit manager attempt, and a domain-separated
+digest. Exact pre-rebind abort clears only that attempt's snapshot and Ready
+proof; it retains the crash cohort and unadopted set, records one fixed-size
+replay receipt, and rejects foreign, stale, or conflicting attempts without
+mutation. Recovery peeking remains a pure `unadopted.first()` query, so there
+is no service-owned mutable selector to survive the abort.
+
+The adapter installs the pinned OSTD once-only post-task-exit hook. A service
+wrapper only retains its pending `ExitReason`; it cannot start manager Backoff
+while its task is still running. After OSTD publishes exact reaping, the hook
+queues `Exit` and, when pre-Ready stop cleanup requires it, `Reaped`. A
+successful Ready transition marks the slot `Active`, while the already-reaped
+resource phase remains stronger if exit races with manager event consumption.
+Queue-full lifecycle facts remain in the preallocated slot and are replayed by
+observed tick with `Ready < Exit < Reaped` tie-breaking. The audited lock order
+is task slot before event queue or Registry; event dequeue releases the queue
+lock before acquiring the slot or entering the manager.
 
 The last-resort domain isolation primitive installs a fixed-size quarantine
 marker in the existing binding record, clears supervisor/fallback/Ready
@@ -487,8 +501,16 @@ and the domain projection exposes the marker. Portal, crash, snapshot, Ready,
 rebind, recover, and adopt entry points reject the marker before considering a
 weaker stale-handle or no-supervisor path. This tranche intentionally provides
 no operator clear/retry operation: a quarantined domain can only be retired
-with its enclosing scope. These host-side Registry tests are not evidence of a
-real OSTD supervisor task, timer, task-reap event, repeated crash, or timeout.
+with its enclosing scope.
+
+This is supervisor adapter foundation, not supervisor completion evidence.
+`activation_report()` remains fail-closed because isolated service-fault
+containment, an exact binding for the initial active service task, and a
+Nexus-owned manager worker/system-cell are absent. Nothing in the filesystem
+runtime constructs the adapter, and cooperative stop is not arbitrary task
+kill. Consequently the compiled hook, queue, timer ingress, and backend do not
+establish a real filesystem service crash/replacement run, repeated-crash or
+timeout behavior, SMP refinement, or an operator-visible supervisor service.
 
 Phase 2 stops at deterministic block preparation. It aborts that prepared
 effect without a device commit and keeps queue-slot, pinned-page, and DMA credit

@@ -10,6 +10,7 @@ RUN rustup target add --toolchain nightly-2026-04-03 x86_64-unknown-none \
 COPY crates/cser-transition-gates /crates/cser-transition-gates
 COPY crates/nexus-ostd-virtio /crates/nexus-ostd-virtio
 COPY crates/nexus-portal-abi /crates/nexus-portal-abi
+COPY crates/nexus-supervisor /crates/nexus-supervisor
 
 ARG OSTD_CRATE_SHA256=aa160b3c09e0471f85f76a069e327b3df0bc60d5191b2ce3a64cc15cd62038e1
 ARG OSTD_CRATE_URL=https://static.crates.io/crates/ostd/ostd-0.18.0.crate
@@ -65,6 +66,7 @@ RUN cargo test --manifest-path /opt/nexus-virtio/virtio-drivers-0.13.0/Cargo.tom
 COPY kernel/nexus-ostd/src/cser/device_flight.rs \
     kernel/nexus-ostd/src/cser/effect_registry.rs \
     kernel/nexus-ostd/src/cser/portal_v2.rs \
+    kernel/nexus-ostd/src/cser/supervisor_runtime.rs \
     /kernel/nexus-ostd/src/cser/
 COPY kernel/nexus-ostd/src/cser/effect_registry/root_lanes.rs \
     /kernel/nexus-ostd/src/cser/effect_registry/root_lanes.rs

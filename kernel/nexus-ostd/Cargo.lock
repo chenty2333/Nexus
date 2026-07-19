@@ -377,6 +377,7 @@ dependencies = [
  "linux-raw-sys",
  "nexus-ostd-virtio",
  "nexus-portal-abi",
+ "nexus-supervisor",
  "object",
  "ostd",
  "sha2",
@@ -402,6 +403,10 @@ dependencies = [
  "bitflags 2.13.0",
  "zerocopy",
 ]
+
+[[package]]
+name = "nexus-supervisor"
+version = "0.1.0"
 
 [[package]]
 name = "num-traits"

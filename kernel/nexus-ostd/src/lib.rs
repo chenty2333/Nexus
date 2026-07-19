@@ -12,6 +12,15 @@ mod composition;
 mod effect;
 #[path = "cser/effect_registry.rs"]
 mod effect_registry;
+// This adapter is deliberately activation-gated until OSTD exposes isolated
+// service-fault containment and Nexus supplies initial-active binding plus a
+// live manager worker. The pinned patch does provide exact post-exit/reap
+// observation; keeping the full adapter compiled binds that hook, the real
+// Registry backend, unpublished task construction, and Jiffies deadline driver
+// without claiming supervisor completion.
+#[allow(dead_code)]
+#[path = "cser/supervisor_runtime.rs"]
+mod supervisor_runtime;
 // The adapter is compiled into the kernel now, while its user/kernel transport
 // and persistent session owner land in later portal-v2 tranches.
 #[allow(dead_code)]
@@ -63,7 +72,6 @@ mod stage7b_evaluation;
 use alloc::{boxed::Box, sync::Arc};
 
 use effect::{EffectTimer, EffectToken, EffectWaiter};
-#[cfg(feature = "virtio-cser-facade")]
 use effect_registry::TaskKey;
 #[cfg(not(feature = "virtio-cser-facade"))]
 use iommu_probe::{DmaQuiesceError, DmaQuiescer, Ostd018FailClosed};
@@ -79,7 +87,7 @@ use ostd::{
     task::{
         Task, TaskOptions, disable_preempt, inject_first_task_entry_handler,
         inject_first_task_pre_irq_handler, inject_post_schedule_handler,
-        scheduler as ostd_scheduler,
+        inject_post_task_exit_handler, scheduler as ostd_scheduler,
     },
     user::{ReturnReason, UserMode},
 };
@@ -99,6 +107,7 @@ pub struct TaskData {
     pub(crate) vm_space: Option<Arc<VmSpace>>,
     #[cfg(feature = "virtio-cser-facade")]
     pub(crate) cser_task: Option<TaskKey>,
+    supervisor_exit: Option<supervisor_runtime::OstdSupervisorTaskExitBinding>,
     dynamic_vm_space: Option<Arc<SpinLock<Arc<VmSpace>>>>,
 }
 
@@ -109,6 +118,7 @@ impl TaskData {
             vm_space,
             #[cfg(feature = "virtio-cser-facade")]
             cser_task: None,
+            supervisor_exit: None,
             dynamic_vm_space: None,
         }
     }
@@ -123,6 +133,24 @@ impl TaskData {
             id: task.id(),
             vm_space,
             cser_task: Some(task),
+            supervisor_exit: None,
+            dynamic_vm_space: None,
+        }
+    }
+
+    /// Binds a manager-selected service incarnation to OSTD's exact post-exit
+    /// observation before the unpublished task can reach the scheduler.
+    pub(crate) fn new_supervised(
+        task: TaskKey,
+        supervisor_exit: supervisor_runtime::OstdSupervisorTaskExitBinding,
+        vm_space: Option<Arc<VmSpace>>,
+    ) -> Self {
+        Self {
+            id: task.id(),
+            vm_space,
+            #[cfg(feature = "virtio-cser-facade")]
+            cser_task: { Some(task) },
+            supervisor_exit: Some(supervisor_exit),
             dynamic_vm_space: None,
         }
     }
@@ -135,6 +163,7 @@ impl TaskData {
             vm_space: None,
             #[cfg(feature = "virtio-cser-facade")]
             cser_task: None,
+            supervisor_exit: None,
             dynamic_vm_space: Some(vm_space),
         }
     }
@@ -160,6 +189,7 @@ fn kernel_main_standard() {
     linux_futex::init_expire_debugcon();
     ostd_scheduler::inject_scheduler(scheduler);
     inject_post_schedule_handler(activate_current_task_vm);
+    inject_post_task_exit_handler(supervisor_runtime::observe_post_task_exit);
     inject_first_task_pre_irq_handler(admit_current_task_pre_irq);
     inject_first_task_entry_handler(record_current_task_post_irq_entry);
 

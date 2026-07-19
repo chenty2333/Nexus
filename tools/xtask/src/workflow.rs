@@ -80,7 +80,13 @@ const DEPENDENCY_CACHE_INPUTS: [(&str, &str); 10] = [
 const PRODUCTION_REGISTRY_TEST: &str = "crates/cser-transition-gates/tests/production_registry.rs";
 const CSER_PRODUCTION_SOURCE_MANIFEST: &str = "kernel/nexus-ostd/cser-production-sources.txt";
 const CSER_SOURCE_ROOT: &str = "kernel/nexus-ostd/src/cser";
-const CSER_PRODUCTION_ROOTS: [&str; 3] = ["device_flight.rs", "effect_registry.rs", "portal_v2.rs"];
+const OSTD_SUPERVISOR_RUNTIME_SOURCE: &str = "kernel/nexus-ostd/src/cser/supervisor_runtime.rs";
+const CSER_PRODUCTION_ROOTS: [&str; 4] = [
+    "device_flight.rs",
+    "effect_registry.rs",
+    "portal_v2.rs",
+    "supervisor_runtime.rs",
+];
 const PINNED_DOCKER_SYNTAX: &str = "# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e";
 const PORTAL_ABI_IMAGE_INPUTS: [&str; 15] = [
     "Cargo.toml",
@@ -1898,6 +1904,195 @@ fn cser_production_source_files(root: &Path) -> Result<Vec<String>> {
     Ok(entries)
 }
 
+fn require_source_order(label: &str, source: &str, fragments: &[&str]) -> Result<()> {
+    let mut cursor = 0;
+    for fragment in fragments {
+        let Some(offset) = source[cursor..].find(fragment) else {
+            return Err(format!("{label} is missing ordered source fragment: {fragment}").into());
+        };
+        cursor += offset + fragment.len();
+    }
+    Ok(())
+}
+
+fn source_function<'a>(source: &'a str, start: &str, next: &str) -> Result<&'a str> {
+    let start = source
+        .find(start)
+        .ok_or_else(|| format!("supervisor runtime is missing function start: {start}"))?;
+    let tail = &source[start..];
+    let end = tail
+        .find(next)
+        .ok_or_else(|| format!("supervisor runtime is missing function boundary: {next}"))?;
+    Ok(&tail[..end])
+}
+
+fn validate_ostd_supervisor_runtime_source(runtime: &str, kernel: &str) -> Result<()> {
+    require_source_order(
+        "supervisor activation completeness",
+        source_function(
+            runtime,
+            "pub(crate) const fn is_complete",
+            "/// Current exact",
+        )?,
+        &[
+            "self.exact_task_exit_hook",
+            "self.exact_task_reap_hook",
+            "self.isolated_task_fault_hook",
+            "self.initial_active_task_binding",
+            "self.nexus_owned_manager_worker",
+        ],
+    )?;
+    for capability in [
+        "exact_task_exit_hook: true",
+        "exact_task_reap_hook: true",
+        "isolated_task_fault_hook: false",
+        "initial_active_task_binding: false",
+        "nexus_owned_manager_worker: false",
+    ] {
+        if !source_function(
+            runtime,
+            "pub(crate) const fn activation_report",
+            "/// Opaque proof",
+        )?
+        .contains(capability)
+        {
+            return Err(format!(
+                "supervisor activation report lost exact capability: {capability}"
+            )
+            .into());
+        }
+    }
+    require_source_order(
+        "supervisor permit gate",
+        source_function(
+            runtime,
+            "fn permit_for_report",
+            "/// Returns an activation permit",
+        )?,
+        &["if report.is_complete()", "OstdSupervisorActivationPermit"],
+    )?;
+
+    let enqueue = source_function(runtime, "    fn enqueue_signal_locked", "    fn emit_ready")?;
+    if !enqueue.contains("self.events.disable_irq().lock()") {
+        return Err("supervisor preallocated enqueue lost its events lock".into());
+    }
+    let emit = source_function(runtime, "    fn emit_ready", "    fn record_pending_exit")?;
+    require_source_order(
+        "supervisor event ingress lock order",
+        emit,
+        &[
+            "self.replacement.disable_irq().lock()",
+            "self.enqueue_signal_locked(",
+        ],
+    )?;
+    let exact_reap = source_function(
+        runtime,
+        "    fn observe_exact_reap",
+        "    fn mark_ready_accepted",
+    )?;
+    require_source_order(
+        "supervisor exact-reap ingress lock order",
+        exact_reap,
+        &[
+            "self.replacement.disable_irq().lock()",
+            "self.enqueue_signal_locked(",
+        ],
+    )?;
+    if exact_reap.matches("self.enqueue_signal_locked(").count() != 4 {
+        return Err(
+            "supervisor exact-reap ingress must retain four phase-scoped enqueue sites".into(),
+        );
+    }
+    require_source_order(
+        "supervisor exact-reap resource publication",
+        exact_reap,
+        &[
+            "match slot.phase",
+            "slot.phase = ReplacementSlotPhase::Reaped",
+        ],
+    )?;
+    let wrapper_return =
+        source_function(runtime, "    fn report_return", "/// Replacement program")?;
+    if !wrapper_return.contains("record_pending_exit(")
+        || wrapper_return.contains("enqueue_signal_locked")
+        || wrapper_return.contains("OstdSupervisorEvent::Exit")
+    {
+        return Err(
+            "service wrapper return must only retain an ExitReason until exact OSTD reap".into(),
+        );
+    }
+    let flush = source_function(runtime, "    fn flush_oldest_retained", "    fn pop_event")?;
+    require_source_order(
+        "supervisor retained-event lock order",
+        flush,
+        &[
+            "self.replacement.disable_irq().lock()",
+            "self.events.disable_irq().lock()",
+        ],
+    )?;
+    let pop = source_function(runtime, "    fn pop_event", "trait ExactTaskReapSink")?;
+    require_source_order(
+        "supervisor queue release before slot lock",
+        pop,
+        &[
+            "let envelope = {",
+            "self.events.disable_irq().lock()",
+            "events.pop()?",
+            "};",
+            "self.replacement.disable_irq().lock()",
+        ],
+    )?;
+
+    for (label, start, next) in [
+        (
+            "authority isolation slot-to-Registry lock order",
+            "    fn isolate_authority",
+            "    fn select_replacement",
+        ),
+        (
+            "replacement selection slot-to-Registry lock order",
+            "    fn select_replacement",
+            "    fn construct_replacement",
+        ),
+        (
+            "recovery abort slot-to-Registry lock order",
+            "    fn abort_recovery_attempt",
+            "    fn ready",
+        ),
+    ] {
+        require_source_order(
+            label,
+            source_function(runtime, start, next)?,
+            &["self.shared.replacement.disable_irq().lock()", ".registry"],
+        )?;
+    }
+
+    require_source_order(
+        "patched OSTD exact-reap binding",
+        kernel,
+        &[
+            "supervisor_exit: Option<supervisor_runtime::OstdSupervisorTaskExitBinding>",
+            "fn new_supervised(",
+            "inject_post_task_exit_handler(supervisor_runtime::observe_post_task_exit)",
+        ],
+    )?;
+    let observer = source_function(
+        runtime,
+        "pub(crate) fn observe_post_task_exit",
+        "/// Why a critical event",
+    )?;
+    require_source_order(
+        "patched OSTD exact-reap observer",
+        observer,
+        &[
+            "task.is_reaped()",
+            "data.supervisor_exit",
+            "binding.observe_exact_reap()",
+        ],
+    )?;
+    Ok(())
+}
+
 fn parse_sha256_image_inputs(command: &str) -> Result<Vec<String>> {
     const PREFIX: &str = "image_key=$(sha256sum ";
     const SUFFIX: &str = " | cut -d ' ' -f1 | sha256sum | cut -c1-16)";
@@ -2485,10 +2680,10 @@ fn validate_backend_docker_source_set_semantics(
 fn expected_backend_docker_sha256(relative: &str) -> Result<&'static str> {
     match relative {
         "kernel/nexus-ostd/Dockerfile" => {
-            Ok("b1a1d5a446f6851878a1ba264d794e00532b64eff9900fa09fdee3fc4b1ba6a8")
+            Ok("364e7e18db887513f1f854437aea00c5e96a0bad2670f955f740150349b78893")
         }
         "experiments/ostd-virtio-cser-spike/Dockerfile" => {
-            Ok("37dd524243d44fdc247fe74b3eba4f31a362a7d248f30dbfde64b910dce8751b")
+            Ok("3ecbe03b2eef393e6672cfc18bf98e5f45d4fc65c8eda2726a46d018ccc075d2")
         }
         _ => Err(format!("unknown production backend Dockerfile: {relative}").into()),
     }
@@ -2597,6 +2792,10 @@ fn validate_qemu_capture_helpers(root: &Path) -> Result<()> {
 fn validate_backend_source_binding(root: &Path) -> Result<()> {
     validate_qemu_capture_helpers(root)?;
     let production_files = cser_production_source_files(root)?;
+    validate_ostd_supervisor_runtime_source(
+        &fs::read_to_string(root.join(OSTD_SUPERVISOR_RUNTIME_SOURCE))?,
+        &fs::read_to_string(root.join("kernel/nexus-ostd/src/lib.rs"))?,
+    )?;
     for (relative, source_root) in [
         ("kernel/nexus-ostd/x", "$root/src/cser"),
         (
@@ -4400,6 +4599,59 @@ mod tests {
                 BackendValidationError::RawAuthorityDrift { .. }
             ));
         }
+    }
+
+    #[test]
+    fn ostd_supervisor_source_gate_binds_capabilities_hooks_and_lock_order() {
+        let root = repository_root();
+        let runtime = fs::read_to_string(root.join(OSTD_SUPERVISOR_RUNTIME_SOURCE))
+            .expect("read OSTD supervisor runtime");
+        let kernel = fs::read_to_string(root.join("kernel/nexus-ostd/src/lib.rs"))
+            .expect("read OSTD kernel root");
+        validate_ostd_supervisor_runtime_source(&runtime, &kernel)
+            .expect("canonical supervisor adapter source is bound");
+
+        for capability in [
+            "            && self.exact_task_exit_hook\n",
+            "            && self.exact_task_reap_hook\n",
+            "            && self.isolated_task_fault_hook\n",
+            "            && self.initial_active_task_binding\n",
+            "            && self.nexus_owned_manager_worker\n",
+        ] {
+            let mutation = runtime.replacen(capability, "", 1);
+            assert_ne!(mutation, runtime, "capability mutation must apply");
+            validate_ostd_supervisor_runtime_source(&mutation, &kernel)
+                .expect_err("no mandatory capability may disappear from permit completeness");
+        }
+
+        let early_exit = runtime.replacen(
+            "        let observed_tick = Jiffies::elapsed().as_u64();\n        match slot.phase {",
+            "        let observed_tick = Jiffies::elapsed().as_u64();\n        self.enqueue_signal_locked(&mut slot, observed_tick, OstdSupervisorEvent::Reaped { service, binding_epoch });\n        match slot.phase {",
+            1,
+        );
+        assert_ne!(early_exit, runtime, "exact-reap mutation must apply");
+        validate_ostd_supervisor_runtime_source(&early_exit, &kernel)
+            .expect_err("exact-reap ingress may not gain an early unscoped event");
+
+        // The gate binds the audited slot-to-events edge before a runtime
+        // oracle can exercise the race.
+        let missing_slot_lock = runtime.replacen(
+            "        let mut slot = self.replacement.disable_irq().lock();\n",
+            "        let mut slot = self.replacement.lock();\n",
+            1,
+        );
+        assert_ne!(missing_slot_lock, runtime, "slot-lock mutation must apply");
+        validate_ostd_supervisor_runtime_source(&missing_slot_lock, &kernel)
+            .expect_err("event ingress must retain the IRQ-safe slot-first lock edge");
+
+        let missing_hook = kernel.replacen(
+            "    inject_post_task_exit_handler(supervisor_runtime::observe_post_task_exit);\n",
+            "",
+            1,
+        );
+        assert_ne!(missing_hook, kernel, "post-exit hook mutation must apply");
+        validate_ostd_supervisor_runtime_source(&runtime, &missing_hook)
+            .expect_err("kernel root must install the exact post-task-exit hook");
     }
 
     #[test]
