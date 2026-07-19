@@ -83,7 +83,7 @@ pub enum ExitReason {
     ProtocolViolation,
 }
 
-/// Why a replacement task is being stopped before activation.
+/// Why a replacement task is being cooperatively stopped.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StopReason {
     /// The replacement failed before reporting ready.
@@ -92,6 +92,8 @@ pub enum StopReason {
     ReadyTimeout,
     /// A pre-rebind recovery attempt was rejected.
     RecoveryRejected,
+    /// A rebound replacement was fenced after incomplete recovery.
+    PartialRecoveryFailed,
 }
 
 /// Bounded restart and recovery policy.
@@ -100,8 +102,8 @@ pub struct SupervisorPolicy {
     /// Maximum recovery attempts over the manager lifetime.
     ///
     /// An attempt is consumed when backoff expires and replacement selection is
-    /// invoked. Selection, spawn, and snapshot failures therefore consume an
-    /// attempt even when no replacement task reaches Ready.
+    /// invoked. Selection, construction, snapshot, and publication failures
+    /// therefore consume an attempt even when no replacement task reaches Ready.
     pub max_recovery_attempts: u32,
     /// Delay before the first replacement start.
     pub initial_backoff_ticks: u64,
@@ -109,6 +111,8 @@ pub struct SupervisorPolicy {
     pub max_backoff_ticks: u64,
     /// Maximum ticks from replacement start to a ready notification.
     pub replacement_timeout_ticks: u64,
+    /// Maximum ticks allowed for cooperative cancellation and exact reaping.
+    pub stop_timeout_ticks: u64,
     /// Maximum effects adopted during one recovery activation.
     pub max_adoptions_per_recovery: u32,
 }
@@ -120,6 +124,7 @@ impl SupervisorPolicy {
             && self.initial_backoff_ticks != 0
             && self.max_backoff_ticks >= self.initial_backoff_ticks
             && self.replacement_timeout_ticks != 0
+            && self.stop_timeout_ticks != 0
             && self.max_adoptions_per_recovery != 0
     }
 }
@@ -217,12 +222,14 @@ pub enum BackendStage {
     Crash,
     /// Select a fresh replacement identity.
     SelectReplacement,
-    /// Construct and enqueue a replacement task.
-    Spawn,
+    /// Construct a replacement task without publishing it to a scheduler.
+    ConstructReplacement,
     /// Capture the exact Registry recovery cohort.
     Snapshot,
-    /// Stop a not-yet-active replacement.
-    StopReplacement,
+    /// Publish a fully described replacement to the scheduler.
+    PublishReplacement,
+    /// Request cooperative cancellation of a published replacement.
+    RequestStopReplacement,
     /// Abandon a snapshot/Ready attempt while retaining its frozen cohort.
     AbortRecoveryAttempt,
     /// Validate the replacement's ready proof against its snapshot.
@@ -246,6 +253,8 @@ pub enum SupervisorPhase {
     Backoff,
     /// A replacement exists and must report Ready before its deadline.
     AwaitingReady,
+    /// Cooperative cancellation was requested and exact task reaping is pending.
+    Stopping,
     /// Authority is isolated after the attempt budget or a nonrecoverable
     /// invariant failed.
     Quarantined,
@@ -255,6 +264,29 @@ pub enum SupervisorPhase {
     /// it must drive a mutating manager method so the mandatory backend
     /// isolation primitive can complete.
     AuthorityUnresolved,
+}
+
+/// Stable terminal disposition retained for health and operator projections.
+///
+/// Backend-specific error payloads never enter this type. The manager reports
+/// those payloads to the immediate caller while retaining only the stable
+/// operation stage here.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TerminalFailure {
+    /// The configured lifetime recovery-attempt budget was consumed.
+    RecoveryAttemptsExhausted,
+    /// A cooperative stop did not produce an exact reaped event in time.
+    StopTimeout,
+    /// A tick, attempt, or adoption counter could not advance safely.
+    CounterOverflow,
+    /// The backend returned an identity, epoch, or cohort outside the contract.
+    InvalidBackendObservation,
+    /// The exact recovery cohort exceeded the configured adoption bound.
+    RecoveryLimitExceeded,
+    /// A backend operation failed at the retained stable stage.
+    BackendFailure(BackendStage),
+    /// The manager observed its private transition sentinel unexpectedly.
+    InternalInvariant,
 }
 
 /// Read-only manager health projection.
@@ -267,14 +299,25 @@ pub struct SupervisorHealth {
     /// Last exact Registry binding epoch, or `None` after an invalid observation.
     ///
     /// In `Quarantined`, this is diagnostic history and does not name an active
-    /// supervisor: backend authority isolation has already completed.
+    /// supervisor: backend authority isolation has already completed. In
+    /// `Stopping` after a rebound service is fenced, this is the new Registry
+    /// recovery epoch; the exact reaped event still presents the launch epoch
+    /// retained in that task's event record.
     pub binding_epoch: Option<u64>,
     /// Recovery attempts consumed so far.
     pub recovery_attempts: u32,
-    /// Deadline or backoff wake tick, when the phase has one.
+    /// Ready deadline, stop deadline, or backoff wake tick, when the phase has one.
     pub deadline_tick: Option<u64>,
     /// Last observed exit reason, if recovery has begun.
     pub last_exit: Option<ExitReason>,
+    /// Stable terminal disposition, present only after quarantine.
+    pub terminal_failure: Option<TerminalFailure>,
+    /// Published task whose exact reaping was not observed before quarantine.
+    ///
+    /// Registry authority is already isolated even when this field is present.
+    /// The task remains visible so an operator or retained worker can finish
+    /// cooperative cleanup without guessing an identity.
+    pub retained_task: Option<ServiceIdentity>,
 }
 
 /// Progress made by a manager poll.
@@ -291,15 +334,34 @@ pub enum PollProgress {
         /// Inclusive Ready deadline.
         deadline_tick: u64,
     },
-    /// A replacement missed its Ready deadline and another attempt was scheduled.
-    ReplacementTimedOut {
-        /// Replacement that was stopped.
+    /// Cooperative cancellation was requested for a published replacement.
+    ReplacementStopRequested {
+        /// Replacement which must produce an exact reaped event.
         replacement: ServiceIdentity,
-        /// Tick at which the next attempt may start.
-        retry_tick: u64,
+        /// Why cancellation was requested.
+        reason: StopReason,
+        /// Inclusive deadline for the exact reaped event.
+        deadline_tick: u64,
     },
     /// The bounded recovery-attempt budget is exhausted.
     Quarantined,
+}
+
+/// Progress produced by an exact replacement-reaped event.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StopCompletion {
+    /// Cleanup completed and a bounded retry was scheduled.
+    RetryScheduled {
+        /// Exact replacement which was reaped.
+        replacement: ServiceIdentity,
+        /// Tick at which the next recovery attempt may start.
+        retry_tick: u64,
+    },
+    /// Cleanup completed, but the lifetime attempt budget was exhausted.
+    Quarantined {
+        /// Exact replacement which was reaped before quarantine.
+        replacement: ServiceIdentity,
+    },
 }
 
 /// Successful replacement activation and adoption summary.
@@ -333,6 +395,10 @@ pub enum SupervisorError<E> {
     ConflictingEventReplay,
     /// The exact replacement reported Ready after its inclusive deadline.
     ReadyDeadlineExpired,
+    /// A Ready or exit event targeted a replacement already being stopped.
+    ReplacementStopping,
+    /// An exact reaped event arrived after its inclusive stop deadline.
+    StopDeadlineExpired,
     /// Time moved backwards relative to a prior manager call.
     TimeWentBackwards,
     /// A tick, attempt, or adoption counter would overflow.

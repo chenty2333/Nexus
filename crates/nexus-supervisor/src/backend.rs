@@ -16,7 +16,9 @@ use crate::{
 /// [`Self::isolate_authority`] is the exception in shape only: it has no error
 /// return because a backend must provide an always-available Registry
 /// control-plane revocation primitive before it can implement this trait.
-/// A successful [`Self::abort_recovery_attempt`] must remove every snapshot and
+/// [`Self::discard_unpublished_replacement`] is infallible because an adapter
+/// must be able to drop a task which has never been published. A successful
+/// [`Self::abort_recovery_attempt`] must remove every snapshot and
 /// Ready-side effect for that attempt while retaining the exact crash-frozen
 /// cohort. A successful [`Self::crash_active`] on a rebound replacement must
 /// fence every earlier adoption and supersede the prior recovery attempt with
@@ -59,13 +61,23 @@ pub trait SupervisorBackend {
         attempt: u32,
     ) -> Result<ServiceIdentity, Self::Error>;
 
-    /// Constructs and schedules the replacement task without granting it
-    /// backend authority.
+    /// Constructs a replacement task without publishing it to a scheduler.
     ///
     /// The launch parameters are calculated by the manager. The backend must
     /// pass them through exactly rather than recomputing the binding or Ready
     /// deadline from its own Registry observation, clock, or policy copy.
-    fn spawn_replacement(&mut self, launch: ReplacementLaunch) -> Result<(), Self::Error>;
+    ///
+    /// On success, exactly one unpublished replacement is retained under the
+    /// launch identity. On error, no replacement exists. An unpublished task
+    /// cannot run, emit lifecycle events, or hold Registry authority.
+    fn construct_replacement(&mut self, launch: ReplacementLaunch) -> Result<(), Self::Error>;
+
+    /// Discards one replacement which was successfully constructed but never published.
+    ///
+    /// This operation must be bounded, idempotent, non-allocating, and unable
+    /// to fail. It releases task-local construction resources but does not
+    /// alter the crash-frozen Registry cohort.
+    fn discard_unpublished_replacement(&mut self, replacement: ServiceIdentity);
 
     /// Captures the exact crash-frozen cohort for the replacement handshake.
     ///
@@ -77,14 +89,30 @@ pub trait SupervisorBackend {
         replacement: ServiceIdentity,
     ) -> Result<RecoverySnapshot<Self::Snapshot>, Self::Error>;
 
-    /// Stops and reaps a replacement which never became active.
-    fn stop_replacement(
+    /// Publishes a fully described replacement to the scheduler.
+    ///
+    /// The manager installs its `AwaitingReady` state, exact snapshot, binding
+    /// epoch, and deadline before invoking this method. The backend may enqueue
+    /// an immediate Ready or exit observation, but must never re-enter the
+    /// manager. On error, the replacement remains unpublished and can be
+    /// discarded with [`Self::discard_unpublished_replacement`].
+    fn publish_replacement(&mut self, replacement: ServiceIdentity) -> Result<(), Self::Error>;
+
+    /// Requests cooperative cancellation of a published replacement.
+    ///
+    /// Success means a cancellation request is durably visible to the task; it
+    /// does not mean the task has exited. The manager waits for a separate exact
+    /// reaped event and retains the task on timeout. The operation is idempotent
+    /// for the same replacement and stop reason. Error must leave the request
+    /// unmodified.
+    fn request_stop_replacement(
         &mut self,
         replacement: ServiceIdentity,
         reason: StopReason,
     ) -> Result<(), Self::Error>;
 
-    /// Abandons one pre-rebind snapshot/Ready attempt after its task is stopped.
+    /// Abandons one pre-rebind snapshot/Ready attempt after its task is either
+    /// discarded unpublished or observed exactly reaped.
     ///
     /// Success clears all snapshot, Ready, selector, and attempt-local state for
     /// `replacement`, but preserves the crash-frozen cohort so a later attempt
