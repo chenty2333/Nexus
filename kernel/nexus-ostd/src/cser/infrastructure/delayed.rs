@@ -3,20 +3,35 @@
 extern crate alloc as __cser_alloc;
 extern crate core as __cser_core;
 
-use super::service::{validate_bound_service_request, validate_live_service_child_binding};
+use super::service::{
+    validate_bound_service_request, validate_live_service_child_binding,
+    validate_service_child_binding_for_drain,
+};
 use super::{
-    ArmedFaultTask, BearerStamp, BoundServiceRequest, DelayedCommandDescriptor,
-    DelayedCommandIntent, DelayedCommandPhase, DelayedCommandReceipt,
-    DelayedCommandRecoveryProjection, DelayedCommandRecoveryState, DelayedCommandRejectionReason,
-    DelayedCommandRejectionReceipt, DelayedCommandStateRecord, DelayedCommandTicket,
-    InfrastructureError, InfrastructureEventKind, InfrastructureKind, InfrastructureState,
-    LinearResult, ParentStamp, ReverseIndexRecord, ReverseParent, ScopeInfrastructure, ScopeKey,
-    WorkloadContext, checked_add, checked_sub, context_from_stamp, install_task_child_count,
+    ArmedFaultTask, BearerKey, BoundServiceRequest, DelayedCommandDescriptor, DelayedCommandIntent,
+    DelayedCommandPhase, DelayedCommandReceipt, DelayedCommandRecoveryProjection,
+    DelayedCommandRecoveryState, DelayedCommandRejectionReason, DelayedCommandRejectionReceipt,
+    DelayedCommandStateRecord, DelayedCommandTicket, InfrastructureError, InfrastructureEventKind,
+    InfrastructureKind, InfrastructureState, LinearResult, ParentStamp, RequestKey,
+    ReverseIndexRecord, ReverseParent, ScopeInfrastructure, TaskWorkDescriptor, WorkloadContext,
+    bearer_state, checked_add, checked_sub, context_from_stamp, install_task_child_count,
     linear_apply, preview_bearer_stamp, preview_nonce, preview_revision, preview_task_child_add,
     preview_task_child_sub, preview_workload_child_add, preview_workload_child_sub,
     require_vacancy, validate_active_admission, validate_context, validate_task_child_stamp,
     validate_task_key,
 };
+
+struct PreparedDelayedFinish {
+    command_id: u64,
+    bearer_generation: u64,
+    workload_request: RequestKey,
+    parent_task: TaskWorkDescriptor,
+    next_revision: u64,
+    next_live: u32,
+    next_workload_children: u32,
+    next_task_children: u32,
+    terminal: DelayedCommandPhase,
+}
 
 impl InfrastructureState {
     pub(in super::super) fn reserve_delayed_command(
@@ -42,7 +57,7 @@ impl InfrastructureState {
             || descriptor.sender != binding_receipt.claimant.task.task
             || task_stamp.identity != binding_receipt.claimant.task
             || task_record.service_fault.is_none()
-            || descriptor.target.scope() != stamp_scope(&bound_stamp)
+            || descriptor.target.scope() != bound_stamp.root.scope
             || descriptor.target.effect() != binding_receipt.child.child_effect
             || descriptor.target.domain() != descriptor.destination_domain
             || descriptor.target.authority_epoch() != bound_stamp.root.authority_epoch
@@ -82,6 +97,9 @@ impl InfrastructureState {
             descriptor,
             ParentStamp::Task(task_stamp.identity),
         )?;
+        if scope.reverse_indexes.get(stamp.nonce).is_some() {
+            return Err(InfrastructureError::IdentityConflict);
+        }
         require_vacancy(
             &scope.reverse_indexes,
             stamp.nonce,
@@ -106,18 +124,22 @@ impl InfrastructureState {
             actor_generation: Some(descriptor.actor_generation),
             retry_generation: descriptor.generation,
         };
-        scope.delayed_commands.install(
-            DelayedCommandStateRecord {
-                stamp,
-                apply_generation: 0,
-                phase: DelayedCommandPhase::Reserved,
-                closure_sequence: None,
-            },
-            InfrastructureKind::DelayedCommand,
-        )?;
+        scope
+            .delayed_commands
+            .install(
+                DelayedCommandStateRecord {
+                    stamp,
+                    apply_generation: 0,
+                    phase: DelayedCommandPhase::Reserved,
+                    closure_sequence: None,
+                },
+                InfrastructureKind::DelayedCommand,
+            )
+            .unwrap();
         scope
             .reverse_indexes
-            .install(index, InfrastructureKind::DelayedCommand)?;
+            .install(index, InfrastructureKind::DelayedCommand)
+            .unwrap();
         scope.next_nonce = next_nonce;
         scope.revision = next_revision;
         scope.live.delayed_commands = next_live;
@@ -136,7 +158,11 @@ impl InfrastructureState {
             descriptor.command_id,
             descriptor.generation,
         );
-        Ok(DelayedCommandTicket(stamp))
+        Ok(DelayedCommandTicket(mint_delayed_command_key::<
+            bearer_state::DelayedReserved,
+        >(
+            scope.delayed_commands.get(descriptor.command_id).unwrap(),
+        )))
     }
 
     pub(in super::super) fn begin_delayed_command_delivery(
@@ -145,20 +171,22 @@ impl InfrastructureState {
     ) -> LinearResult<DelayedCommandTicket, DelayedCommandIntent> {
         linear_apply(ticket, |ticket| {
             self.require_authoritative()?;
-            let stamp = ticket.0;
             let registry_instance = self.registry_instance;
-            let scope = self.scope_mut(stamp.root.scope)?;
-            validate_delayed_command_bearer(scope, registry_instance, &stamp)?;
-            let record = scope
-                .delayed_commands
-                .get(stamp.identity.command_id)
-                .unwrap();
-            if validate_task_child_stamp(scope, registry_instance, &record.stamp)? {
+            if ticket.0.authority.registry_instance != registry_instance {
+                return Err(InfrastructureError::ForeignRegistry);
+            }
+            let scope = self.scope_mut(ticket.0.authority.scope)?;
+            let (record, terminal_parent) =
+                validate_delayed_command_key(scope, registry_instance, &ticket.0)?;
+            if terminal_parent {
                 return Err(InfrastructureError::InvalidState);
             }
-            if scope.binding_epoch(stamp.identity.destination_domain)?
-                != stamp.identity.destination_binding_epoch
-                || record.phase != DelayedCommandPhase::Reserved
+            if record.phase != DelayedCommandPhase::Reserved {
+                return Err(InfrastructureError::InvalidState);
+            }
+            let descriptor = record.stamp.identity;
+            if scope.binding_epoch(descriptor.destination_domain)?
+                != descriptor.destination_binding_epoch
             {
                 return Err(InfrastructureError::StaleBinding);
             }
@@ -166,13 +194,15 @@ impl InfrastructureState {
                 .apply_generation
                 .checked_add(1)
                 .ok_or(InfrastructureError::CounterOverflow)?;
+            let bearer_generation = next_delayed_command_bearer_generation(record)?;
             let (apply_nonce, next_nonce) = preview_nonce(scope)?;
             let next_revision = preview_revision(scope)?;
             let record = scope
                 .delayed_commands
-                .get_mut(stamp.identity.command_id)
+                .get_mut(descriptor.command_id)
                 .unwrap();
             record.apply_generation = apply_generation;
+            record.stamp.bearer_generation = bearer_generation;
             record.phase = DelayedCommandPhase::Publishing {
                 apply_generation,
                 apply_nonce,
@@ -181,14 +211,14 @@ impl InfrastructureState {
             scope.revision = next_revision;
             scope.events.push(
                 InfrastructureEventKind::DelayedCommandPublishing,
-                stamp.identity.command_id,
-                stamp.identity.generation,
+                descriptor.command_id,
+                descriptor.generation,
             );
-            Ok(DelayedCommandIntent {
-                command: stamp,
-                apply_generation,
-                apply_nonce,
-            })
+            Ok(DelayedCommandIntent(mint_delayed_command_key::<
+                bearer_state::DelayedPublishing,
+            >(
+                scope.delayed_commands.get(descriptor.command_id).unwrap(),
+            )))
         })
     }
 
@@ -199,31 +229,30 @@ impl InfrastructureState {
     ) -> LinearResult<DelayedCommandIntent, DelayedCommandReceipt> {
         linear_apply(intent, |intent| {
             self.require_authoritative()?;
-            let stamp = intent.command;
             let registry_instance = self.registry_instance;
-            let scope = self.scope_mut(stamp.root.scope)?;
-            validate_delayed_command_bearer(scope, registry_instance, &stamp)?;
-            if receipt.actor_slot != stamp.identity.actor_slot
-                || receipt.actor_generation != stamp.identity.actor_generation
-                || receipt.command_digest != stamp.identity.command_digest
+            if intent.0.authority.registry_instance != registry_instance {
+                return Err(InfrastructureError::ForeignRegistry);
+            }
+            let scope = self.scope_mut(intent.0.authority.scope)?;
+            let (record, _) = validate_delayed_command_key(scope, registry_instance, &intent.0)?;
+            if !__cser_core::matches!(record.phase, DelayedCommandPhase::Publishing { .. }) {
+                return Err(InfrastructureError::InvalidState);
+            }
+            let descriptor = record.stamp.identity;
+            if receipt.actor_slot != descriptor.actor_slot
+                || receipt.actor_generation != descriptor.actor_generation
+                || receipt.command_digest != descriptor.command_digest
                 || receipt.transport_receipt_digest == 0
-                || scope
-                    .delayed_commands
-                    .get(stamp.identity.command_id)
-                    .unwrap()
-                    .phase
-                    != (DelayedCommandPhase::Publishing {
-                        apply_generation: intent.apply_generation,
-                        apply_nonce: intent.apply_nonce,
-                    })
             {
                 return Err(InfrastructureError::InvalidReceipt);
             }
-            finish_delayed_command(scope, stamp, DelayedCommandPhase::Issued { receipt })?;
+            let prepared =
+                prepare_delayed_finish(scope, record, DelayedCommandPhase::Issued { receipt })?;
+            apply_delayed_finish(scope, prepared);
             scope.events.push(
                 InfrastructureEventKind::DelayedCommandIssued,
-                stamp.identity.command_id,
-                stamp.identity.generation,
+                descriptor.command_id,
+                descriptor.generation,
             );
             Ok(receipt)
         })
@@ -235,7 +264,7 @@ impl InfrastructureState {
         receipt: DelayedCommandRejectionReceipt,
     ) -> LinearResult<DelayedCommandTicket, DelayedCommandRejectionReceipt> {
         linear_apply(ticket, |ticket| {
-            self.reject_delayed_command_stamp(ticket.0, receipt, false)?;
+            self.reject_delayed_command_key(&ticket.0, receipt, false)?;
             Ok(receipt)
         })
     }
@@ -246,44 +275,48 @@ impl InfrastructureState {
         receipt: DelayedCommandRejectionReceipt,
     ) -> LinearResult<DelayedCommandIntent, DelayedCommandRejectionReceipt> {
         linear_apply(intent, |intent| {
-            self.reject_delayed_command_stamp(intent.command, receipt, true)?;
+            self.reject_delayed_command_key(&intent.0, receipt, true)?;
             Ok(receipt)
         })
     }
 
-    fn reject_delayed_command_stamp(
+    fn reject_delayed_command_key<State: bearer_state::Sealed>(
         &mut self,
-        stamp: BearerStamp<DelayedCommandDescriptor>,
+        key: &BearerKey<State>,
         receipt: DelayedCommandRejectionReceipt,
         publishing: bool,
     ) -> Result<(), InfrastructureError> {
         self.require_authoritative()?;
         let registry_instance = self.registry_instance;
-        let scope = self.scope_mut(stamp.root.scope)?;
-        validate_delayed_command_bearer(scope, registry_instance, &stamp)?;
-        if receipt.target_effect != stamp.identity.target.effect()
+        if key.authority.registry_instance != registry_instance {
+            return Err(InfrastructureError::ForeignRegistry);
+        }
+        let scope = self.scope_mut(key.authority.scope)?;
+        let (record, _) = validate_delayed_command_key(scope, registry_instance, key)?;
+        let phase_matches = if publishing {
+            __cser_core::matches!(record.phase, DelayedCommandPhase::Publishing { .. })
+        } else {
+            record.phase == DelayedCommandPhase::Reserved
+        };
+        if !phase_matches {
+            return Err(InfrastructureError::InvalidState);
+        }
+        let descriptor = record.stamp.identity;
+        if receipt.target_effect != descriptor.target.effect()
             || receipt.evidence_digest == 0
             || __cser_core::matches!(receipt.reason, DelayedCommandRejectionReason::StaleTarget)
-                && scope.binding_epoch(stamp.identity.destination_domain)?
-                    == stamp.identity.destination_binding_epoch
+                && scope.binding_epoch(descriptor.destination_domain)?
+                    == descriptor.destination_binding_epoch
         {
             return Err(InfrastructureError::InvalidReceipt);
         }
-        let phase = scope
-            .delayed_commands
-            .get(stamp.identity.command_id)
-            .unwrap()
-            .phase;
-        if publishing != __cser_core::matches!(phase, DelayedCommandPhase::Publishing { .. })
-            || (!publishing && phase != DelayedCommandPhase::Reserved)
-        {
-            return Err(InfrastructureError::InvalidState);
-        }
-        finish_delayed_command(scope, stamp, DelayedCommandPhase::Rejected { receipt })?;
+        let prepared =
+            prepare_delayed_finish(scope, record, DelayedCommandPhase::Rejected { receipt })?;
+        apply_delayed_finish(scope, prepared);
         scope.events.push(
             InfrastructureEventKind::DelayedCommandRejected,
-            stamp.identity.command_id,
-            stamp.identity.generation,
+            descriptor.command_id,
+            descriptor.generation,
         );
         Ok(())
     }
@@ -329,31 +362,159 @@ impl InfrastructureState {
     }
 }
 
-fn stamp_scope<I>(stamp: &BearerStamp<I>) -> ScopeKey {
-    stamp.root.scope
+pub(super) fn mint_delayed_command_key<State: bearer_state::Sealed>(
+    record: &DelayedCommandStateRecord,
+) -> BearerKey<State> {
+    BearerKey {
+        authority: super::AuthorityKey {
+            registry_instance: record.stamp.root.registry_instance,
+            scope: record.stamp.root.scope,
+            authority_epoch: record.stamp.root.authority_epoch,
+        },
+        slot: record.stamp.identity.command_id,
+        object_generation: record.stamp.identity.generation,
+        bearer_generation: record.stamp.bearer_generation,
+        nonce: record.stamp.nonce,
+        state: __cser_core::marker::PhantomData,
+    }
 }
 
-fn validate_delayed_command_bearer(
-    scope: &ScopeInfrastructure,
+fn validate_delayed_command_key<'a, State: bearer_state::Sealed>(
+    scope: &'a ScopeInfrastructure,
     registry_instance: u64,
-    stamp: &BearerStamp<DelayedCommandDescriptor>,
-) -> Result<(), InfrastructureError> {
-    validate_task_child_stamp(scope, registry_instance, stamp)?;
+    key: &BearerKey<State>,
+) -> Result<(&'a DelayedCommandStateRecord, bool), InfrastructureError> {
+    if key.authority.registry_instance != registry_instance
+        || scope.root.registry_instance != registry_instance
+    {
+        return Err(InfrastructureError::ForeignRegistry);
+    }
+    if key.authority.scope != scope.root.scope {
+        return Err(InfrastructureError::ForeignScope);
+    }
+    if key.authority.authority_epoch != scope.root.authority_epoch {
+        return Err(InfrastructureError::StaleAuthority);
+    }
     let record = scope
         .delayed_commands
-        .get(stamp.identity.command_id)
+        .get(key.slot)
         .ok_or(InfrastructureError::UnknownObligation)?;
-    if record.stamp != *stamp {
+    if record.stamp.identity.command_id != key.slot {
+        return Err(InfrastructureError::IdentityConflict);
+    }
+    if record.stamp.identity.generation != key.object_generation
+        || record.stamp.bearer_generation != key.bearer_generation
+        || record.stamp.nonce != key.nonce
+    {
         return Err(InfrastructureError::StaleGeneration);
     }
-    Ok(())
+    let terminal_parent = validate_delayed_command_record(scope, registry_instance, record)?;
+    Ok((record, terminal_parent))
 }
 
-fn finish_delayed_command(
-    scope: &mut ScopeInfrastructure,
-    stamp: BearerStamp<DelayedCommandDescriptor>,
+fn validate_delayed_command_record(
+    scope: &ScopeInfrastructure,
+    registry_instance: u64,
+    record: &DelayedCommandStateRecord,
+) -> Result<bool, InfrastructureError> {
+    let stamp = &record.stamp;
+    stamp.identity.validate()?;
+    let terminal_parent = validate_task_child_stamp(scope, registry_instance, stamp)?;
+    let parent_task = match stamp.parent {
+        ParentStamp::Task(parent) => parent,
+        _ => return Err(InfrastructureError::ForeignParent),
+    };
+    let descriptor = stamp.identity;
+    let service = scope
+        .service_requests
+        .get(descriptor.request_id)
+        .ok_or(InfrastructureError::UnknownObligation)?;
+    let binding = validate_service_child_binding_for_drain(scope, registry_instance, service)?;
+    if service.stamp.identity.request_id != descriptor.request_id
+        || service.stamp.identity.generation != descriptor.request_generation
+        || service.stamp.root != stamp.root
+        || descriptor.sender != parent_task.task
+        || binding.claimant.task != parent_task
+        || descriptor.sender != binding.claimant.task.task
+        || descriptor.destination_domain != stamp.domain.domain
+        || descriptor.destination_binding_epoch != stamp.domain.binding_epoch
+        || descriptor.destination_domain != binding.claimant.domain
+        || descriptor.destination_binding_epoch != binding.claimant.binding_epoch
+        || descriptor.target.scope() != stamp.root.scope
+        || descriptor.target.authority_epoch() != stamp.root.authority_epoch
+        || descriptor.target.domain() != descriptor.destination_domain
+        || descriptor.target.binding_epoch() != descriptor.destination_binding_epoch
+        || descriptor.target.effect() != binding.child.child_effect
+    {
+        return Err(InfrastructureError::InvalidState);
+    }
+    let expected_index = ReverseIndexRecord {
+        slot: stamp.nonce,
+        kind: InfrastructureKind::DelayedCommand,
+        root_effect: stamp.root.root_effect,
+        parent: ReverseParent::Task(parent_task),
+        task: Some(descriptor.sender),
+        domain: stamp.domain.domain,
+        binding_epoch: stamp.domain.binding_epoch,
+        source_domain: Some(descriptor.destination_domain),
+        source_binding_epoch: Some(descriptor.destination_binding_epoch),
+        resource: None,
+        actor_slot: Some(descriptor.actor_slot),
+        actor_generation: Some(descriptor.actor_generation),
+        retry_generation: descriptor.generation,
+    };
+    match scope.reverse_indexes.get(stamp.nonce) {
+        None => {
+            return Err(InfrastructureError::Invariant(
+                "missing delayed command reverse index",
+            ));
+        }
+        Some(index) if *index != expected_index => {
+            return Err(InfrastructureError::Invariant(
+                "delayed command reverse index mismatch",
+            ));
+        }
+        Some(_) => {}
+    }
+    match record.phase {
+        DelayedCommandPhase::Reserved if record.apply_generation != 0 => {
+            return Err(InfrastructureError::Invariant(
+                "reserved delayed command has apply generation",
+            ));
+        }
+        DelayedCommandPhase::Publishing {
+            apply_generation,
+            apply_nonce,
+        } if apply_generation == 0
+            || apply_generation != record.apply_generation
+            || apply_nonce == 0 =>
+        {
+            return Err(InfrastructureError::Invariant(
+                "invalid delayed command publication phase",
+            ));
+        }
+        _ => {}
+    }
+    Ok(terminal_parent)
+}
+
+fn next_delayed_command_bearer_generation(
+    record: &DelayedCommandStateRecord,
+) -> Result<u64, InfrastructureError> {
+    record
+        .stamp
+        .bearer_generation
+        .checked_add(1)
+        .ok_or(InfrastructureError::CounterOverflow)
+}
+
+fn prepare_delayed_finish(
+    scope: &ScopeInfrastructure,
+    record: &DelayedCommandStateRecord,
     terminal: DelayedCommandPhase,
-) -> Result<(), InfrastructureError> {
+) -> Result<PreparedDelayedFinish, InfrastructureError> {
+    let stamp = record.stamp;
+    let bearer_generation = next_delayed_command_bearer_generation(record)?;
     let next_revision = preview_revision(scope)?;
     let next_live = checked_sub(scope.live.delayed_commands, 1)?;
     let next_workload_children = preview_workload_child_sub(scope, stamp.workload.request)?;
@@ -362,23 +523,45 @@ fn finish_delayed_command(
         _ => return Err(InfrastructureError::ForeignParent),
     };
     let next_task_children = preview_task_child_sub(scope, parent_task)?;
-    scope
-        .delayed_commands
-        .get_mut(stamp.identity.command_id)
-        .unwrap()
-        .phase = terminal;
+    Ok(PreparedDelayedFinish {
+        command_id: stamp.identity.command_id,
+        bearer_generation,
+        workload_request: stamp.workload.request,
+        parent_task,
+        next_revision,
+        next_live,
+        next_workload_children,
+        next_task_children,
+        terminal,
+    })
+}
+
+fn apply_delayed_finish(scope: &mut ScopeInfrastructure, prepared: PreparedDelayedFinish) {
+    let PreparedDelayedFinish {
+        command_id,
+        bearer_generation,
+        workload_request,
+        parent_task,
+        next_revision,
+        next_live,
+        next_workload_children,
+        next_task_children,
+        terminal,
+    } = prepared;
+    let record = scope.delayed_commands.get_mut(command_id).unwrap();
+    record.stamp.bearer_generation = bearer_generation;
+    record.phase = terminal;
     scope.revision = next_revision;
     scope.live.delayed_commands = next_live;
     scope
         .workloads
-        .get_mut(stamp.workload.request.id)
+        .get_mut(workload_request.id)
         .unwrap()
         .live_children = next_workload_children;
     install_task_child_count(
         scope.tasks.get_mut(parent_task.work_id).unwrap(),
         next_task_children,
     );
-    Ok(())
 }
 
 pub(super) fn delayed_command_phase_live(phase: DelayedCommandPhase) -> bool {

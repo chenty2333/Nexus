@@ -384,6 +384,10 @@ mod bearer_state {
     pub(super) enum DeadlineExhausted {}
     #[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
     pub(super) enum DeadlineQuarantined {}
+    #[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
+    pub(super) enum DelayedReserved {}
+    #[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
+    pub(super) enum DelayedPublishing {}
 
     impl Sealed for ContinuationPending {}
     impl Sealed for ContinuationClaimed {}
@@ -408,6 +412,8 @@ mod bearer_state {
     impl Sealed for DeadlineFired {}
     impl Sealed for DeadlineExhausted {}
     impl Sealed for DeadlineQuarantined {}
+    impl Sealed for DelayedReserved {}
+    impl Sealed for DelayedPublishing {}
 }
 
 /// Opaque, state-typed authority for one fixed infrastructure slot.
@@ -1087,6 +1093,7 @@ impl DelayedCommandDescriptor {
             || self.destination_binding_epoch == 0
             || self.sender.generation() == 0
             || self.target.effect().generation() == 0
+            || self.target.nonce == 0
             || self.command_digest == 0
             || self.actor_generation == 0
         {
@@ -1096,15 +1103,19 @@ impl DelayedCommandDescriptor {
     }
 }
 
+/// Opaque authority for a delayed command reserved at its exact child portal.
+///
+/// This bearer can advance or reject that recorded command; it deliberately
+/// cannot retarget it during supervisor adoption. Retargeting requires a new
+/// independently validated child/portal proof and is outside this tranche.
 #[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
-pub(crate) struct DelayedCommandTicket(BearerStamp<DelayedCommandDescriptor>);
+pub(crate) struct DelayedCommandTicket(BearerKey<bearer_state::DelayedReserved>);
 
+/// One-shot authority for acknowledging the Registry's current publication
+/// record. Apply generation and nonce stay in the authoritative record rather
+/// than being duplicated in this compact input.
 #[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
-pub(crate) struct DelayedCommandIntent {
-    command: BearerStamp<DelayedCommandDescriptor>,
-    apply_generation: u64,
-    apply_nonce: u64,
-}
+pub(crate) struct DelayedCommandIntent(BearerKey<bearer_state::DelayedPublishing>);
 
 #[derive(
     __cser_core::clone::Clone,
@@ -1173,6 +1184,16 @@ pub(crate) struct DelayedCommandRecoveryProjection {
     pub(crate) receipt: Option<DelayedCommandReceipt>,
     pub(crate) rejection: Option<DelayedCommandRejectionReceipt>,
 }
+
+const _: () = {
+    __cser_core::assert!(
+        __cser_core::mem::size_of::<BearerKey<bearer_state::DelayedReserved>>() <= 64
+    );
+    __cser_core::assert!(__cser_core::mem::size_of::<DelayedCommandTicket>() <= 96);
+    __cser_core::assert!(__cser_core::mem::size_of::<DelayedCommandIntent>() <= 96);
+    __cser_core::assert!(__cser_core::mem::size_of::<LinearFailure<DelayedCommandTicket>>() <= 120);
+    __cser_core::assert!(__cser_core::mem::size_of::<LinearFailure<DelayedCommandIntent>>() <= 120);
+};
 
 #[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
 pub(super) struct ValidatedAbortProof {

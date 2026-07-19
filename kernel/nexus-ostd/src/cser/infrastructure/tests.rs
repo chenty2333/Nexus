@@ -12,13 +12,14 @@ use super::{
     DeadlineExhaustedDisposition, DeadlineExpiryAuthority, DeadlineExpiryReceipt, DeadlineLease,
     DeadlinePurpose, DeadlineQuarantineReleaseReceipt, DeadlineQuarantineTicket,
     DeadlineReconciliationOutcome, DeadlineReconciliationReceipt, DeadlineRecoveryState,
-    DeadlineSupervisorRetry, DelayedCommandDescriptor, DelayedCommandRejectionReason,
-    DelayedCommandRejectionReceipt, DeviceReservationCoordinates, DomainKey, EffectKey,
-    EnqueuedServiceRequest, EnteredTaskLease, FaultAccess, FaultDisposition, FaultObservation,
-    FaultPhase, FaultSlotDescriptor, InfrastructureError, InfrastructureKind, InfrastructureLimits,
-    InfrastructureState, LinearFailure, PortalHandle, ReplyAbortAuthority, ReplyDescriptor,
-    ReplyPublicationReceipt, ReservedFaultTask, ResourceKey, ReverseIndexRecord, ReverseParent,
-    ScopeKey, ServiceArmAuthority, ServiceArmPlan, ServiceArmReceipt, ServiceBoundKey,
+    DeadlineSupervisorRetry, DelayedCommandDescriptor, DelayedCommandIntent, DelayedCommandReceipt,
+    DelayedCommandRejectionReason, DelayedCommandRejectionReceipt, DelayedCommandTicket,
+    DeviceReservationCoordinates, DomainKey, EffectKey, EnqueuedServiceRequest, EnteredTaskLease,
+    FaultAccess, FaultDisposition, FaultObservation, FaultPhase, FaultSlotDescriptor,
+    InfrastructureError, InfrastructureKind, InfrastructureLimits, InfrastructureState,
+    LinearFailure, PortalHandle, ReplyAbortAuthority, ReplyDescriptor, ReplyPublicationReceipt,
+    ReservedFaultTask, ResourceKey, ReverseIndexRecord, ReverseParent, ScopeKey,
+    ServiceArmAuthority, ServiceArmPlan, ServiceArmReceipt, ServiceBoundKey,
     ServiceCancellationPoint, ServiceChildBindingReceipt, ServiceChildReceipt,
     ServiceClaimantSnapshot, ServiceEnqueueAuthority, ServiceEnqueuePlan, ServiceEnqueueReceipt,
     ServiceLineageCommitment, ServiceRequestCausalIdentity, ServiceRequestDescriptor,
@@ -122,6 +123,12 @@ fn service_key_coordinates<State: bearer_state::Sealed>(
         key.bearer_generation,
         key.nonce,
     )
+}
+
+fn delayed_key_coordinates<State: bearer_state::Sealed>(
+    key: &BearerKey<State>,
+) -> (u64, ScopeKey, u64, u64, u64, u64, u64) {
+    service_key_coordinates(key)
 }
 
 fn service_bound_key_coordinates<State: bearer_state::Sealed>(
@@ -307,6 +314,133 @@ fn compact_child_bound_service_state(
         )
         .unwrap();
     (state, bound)
+}
+
+const COMPACT_DELAYED_CLAIMANT: u64 = 0xee00;
+const COMPACT_DELAYED_COMMAND: u64 = 0xee20;
+
+fn compact_delayed_descriptor() -> DelayedCommandDescriptor {
+    DelayedCommandDescriptor {
+        command_id: COMPACT_DELAYED_COMMAND,
+        generation: 1,
+        request_id: COMPACT_SERVICE_REQUEST,
+        request_generation: 1,
+        destination_domain: SERVICE,
+        destination_binding_epoch: 1,
+        sender: TaskKey::new(COMPACT_DELAYED_CLAIMANT + 2, 1),
+        target: PortalHandle {
+            scope: SCOPE,
+            effect: EffectKey::new(COMPACT_DELAYED_CLAIMANT + 4, 1),
+            domain: SERVICE,
+            authority_epoch: 1,
+            binding_epoch: 1,
+            nonce: COMPACT_DELAYED_COMMAND + 1,
+        },
+        command_digest: COMPACT_DELAYED_COMMAND + 2,
+        actor_slot: 7,
+        actor_generation: 1,
+    }
+}
+
+fn compact_delayed_state(
+    registry_instance: u64,
+) -> (
+    InfrastructureState,
+    DelayedCommandTicket,
+    DelayedCommandDescriptor,
+) {
+    let (mut state, bound) =
+        compact_child_bound_service_state(registry_instance, COMPACT_DELAYED_CLAIMANT);
+    let armed = ArmedFaultTask(super::mint_task_key::<bearer_state::TaskFaultArmed>(
+        state
+            .scope(SCOPE)
+            .unwrap()
+            .tasks
+            .get(COMPACT_DELAYED_CLAIMANT + 1)
+            .unwrap(),
+    ));
+    let descriptor = compact_delayed_descriptor();
+    let ticket = state
+        .reserve_delayed_command(&armed, &bound, descriptor)
+        .unwrap();
+    (state, ticket, descriptor)
+}
+
+fn current_delayed_ticket(state: &InfrastructureState) -> DelayedCommandTicket {
+    DelayedCommandTicket(super::delayed::mint_delayed_command_key::<
+        bearer_state::DelayedReserved,
+    >(
+        state
+            .scope(SCOPE)
+            .unwrap()
+            .delayed_commands
+            .get(COMPACT_DELAYED_COMMAND)
+            .unwrap(),
+    ))
+}
+
+fn delayed_receipt(
+    descriptor: DelayedCommandDescriptor,
+    transport_receipt_digest: u64,
+) -> DelayedCommandReceipt {
+    DelayedCommandReceipt {
+        actor_slot: descriptor.actor_slot,
+        actor_generation: descriptor.actor_generation,
+        command_digest: descriptor.command_digest,
+        transport_receipt_digest,
+    }
+}
+
+fn delayed_rejection(
+    descriptor: DelayedCommandDescriptor,
+    reason: DelayedCommandRejectionReason,
+    evidence_digest: u64,
+) -> DelayedCommandRejectionReceipt {
+    DelayedCommandRejectionReceipt {
+        reason,
+        target_effect: descriptor.target.effect(),
+        evidence_digest,
+    }
+}
+
+fn assert_delayed_record_mutation_rejected(
+    registry_instance: u64,
+    mutate: impl FnOnce(&mut super::DelayedCommandStateRecord),
+    expected_error: InfrastructureError,
+) {
+    let (mut state, ticket, _) = compact_delayed_state(registry_instance);
+    let presented = delayed_key_coordinates(&ticket.0);
+    mutate(
+        state
+            .scope_mut(SCOPE)
+            .unwrap()
+            .delayed_commands
+            .get_mut(COMPACT_DELAYED_COMMAND)
+            .unwrap(),
+    );
+    let before = state.private_full_clone();
+    let failure = state.begin_delayed_command_delivery(ticket).unwrap_err();
+    __cser_core::assert_eq!(failure.error(), expected_error);
+    __cser_core::assert_eq!(state, before);
+    __cser_core::assert_eq!(delayed_key_coordinates(&failure.into_input().0), presented);
+}
+
+fn assert_delayed_ack_mutation_rejected(
+    registry_instance: u64,
+    mutate: impl FnOnce(&mut DelayedCommandReceipt),
+) {
+    let (mut state, ticket, descriptor) = compact_delayed_state(registry_instance);
+    let intent = state.begin_delayed_command_delivery(ticket).unwrap();
+    let presented = delayed_key_coordinates(&intent.0);
+    let mut receipt = delayed_receipt(descriptor, registry_instance + 0x100);
+    mutate(&mut receipt);
+    let before = state.private_full_clone();
+    let failure = state
+        .acknowledge_delayed_command(intent, receipt)
+        .unwrap_err();
+    __cser_core::assert_eq!(failure.error(), InfrastructureError::InvalidReceipt);
+    __cser_core::assert_eq!(state, before);
+    __cser_core::assert_eq!(delayed_key_coordinates(&failure.into_input().0), presented);
 }
 
 fn substitute_queue_response(
@@ -4538,6 +4672,398 @@ fn terminal_deadline_may_drain_armed_fire_but_cannot_rearm_or_supervisor_retry()
 }
 
 #[test]
+fn delayed_compact_authority_is_bounded_and_every_transition_fences_its_input() {
+    __cser_core::assert!(
+        __cser_core::mem::size_of::<BearerKey<bearer_state::DelayedReserved>>() <= 64
+    );
+    __cser_core::assert!(__cser_core::mem::size_of::<DelayedCommandTicket>() <= 96);
+    __cser_core::assert!(__cser_core::mem::size_of::<DelayedCommandIntent>() <= 96);
+    __cser_core::assert!(__cser_core::mem::size_of::<LinearFailure<DelayedCommandTicket>>() <= 120);
+    __cser_core::assert!(__cser_core::mem::size_of::<LinearFailure<DelayedCommandIntent>>() <= 120);
+
+    let (mut state, ticket, descriptor) = compact_delayed_state(0xee40);
+    let stale = current_delayed_ticket(&state);
+    let reserved = delayed_key_coordinates(&ticket.0);
+    let intent = state.begin_delayed_command_delivery(ticket).unwrap();
+    let publishing = delayed_key_coordinates(&intent.0);
+    __cser_core::assert_eq!(publishing.0, reserved.0);
+    __cser_core::assert_eq!(publishing.1, reserved.1);
+    __cser_core::assert_eq!(publishing.2, reserved.2);
+    __cser_core::assert_eq!(publishing.3, reserved.3);
+    __cser_core::assert_eq!(publishing.4, reserved.4);
+    __cser_core::assert_eq!(publishing.5, reserved.5 + 1);
+    __cser_core::assert_eq!(publishing.6, reserved.6);
+
+    let before_stale = state.private_full_clone();
+    let failure = state
+        .reject_delayed_command(
+            stale,
+            delayed_rejection(
+                descriptor,
+                DelayedCommandRejectionReason::RequestAborted,
+                0xee41,
+            ),
+        )
+        .unwrap_err();
+    __cser_core::assert_eq!(failure.error(), InfrastructureError::StaleGeneration);
+    __cser_core::assert_eq!(state, before_stale);
+    __cser_core::assert_eq!(delayed_key_coordinates(&failure.into_input().0), reserved);
+
+    state
+        .acknowledge_delayed_command(intent, delayed_receipt(descriptor, 0xee42))
+        .unwrap();
+    let record = state
+        .scope(SCOPE)
+        .unwrap()
+        .delayed_commands
+        .get(COMPACT_DELAYED_COMMAND)
+        .unwrap();
+    __cser_core::assert_eq!(record.stamp.bearer_generation, publishing.5 + 1);
+    __cser_core::assert!(__cser_core::matches!(
+        record.phase,
+        super::DelayedCommandPhase::Issued { .. }
+    ));
+    state.check_invariants().unwrap();
+
+    let (mut state, ticket, descriptor) = compact_delayed_state(0xee43);
+    let reserved = delayed_key_coordinates(&ticket.0);
+    state
+        .reject_delayed_command(
+            ticket,
+            delayed_rejection(
+                descriptor,
+                DelayedCommandRejectionReason::RequestAborted,
+                0xee44,
+            ),
+        )
+        .unwrap();
+    let record = state
+        .scope(SCOPE)
+        .unwrap()
+        .delayed_commands
+        .get(COMPACT_DELAYED_COMMAND)
+        .unwrap();
+    __cser_core::assert_eq!(record.stamp.bearer_generation, reserved.5 + 1);
+    __cser_core::assert!(__cser_core::matches!(
+        record.phase,
+        super::DelayedCommandPhase::Rejected { .. }
+    ));
+    state.check_invariants().unwrap();
+
+    let (mut state, ticket, descriptor) = compact_delayed_state(0xee45);
+    let intent = state.begin_delayed_command_delivery(ticket).unwrap();
+    let publishing = delayed_key_coordinates(&intent.0);
+    state
+        .reject_delayed_command_intent(
+            intent,
+            delayed_rejection(
+                descriptor,
+                DelayedCommandRejectionReason::ClosureDrain,
+                0xee46,
+            ),
+        )
+        .unwrap();
+    let record = state
+        .scope(SCOPE)
+        .unwrap()
+        .delayed_commands
+        .get(COMPACT_DELAYED_COMMAND)
+        .unwrap();
+    __cser_core::assert_eq!(record.stamp.bearer_generation, publishing.5 + 1);
+    __cser_core::assert!(__cser_core::matches!(
+        record.phase,
+        super::DelayedCommandPhase::Rejected { .. }
+    ));
+    state.check_invariants().unwrap();
+}
+
+#[test]
+fn delayed_compact_key_rejects_foreign_and_stale_coordinates_atomically() {
+    let (mut owner, ticket, _) = compact_delayed_state(0xee50);
+    let (mut foreign, _, _) = compact_delayed_state(0xee51);
+    let presented = delayed_key_coordinates(&ticket.0);
+    let before_owner = owner.private_full_clone();
+    let before_foreign = foreign.private_full_clone();
+    let failure = foreign.begin_delayed_command_delivery(ticket).unwrap_err();
+    __cser_core::assert_eq!(failure.error(), InfrastructureError::ForeignRegistry);
+    __cser_core::assert_eq!(owner, before_owner);
+    __cser_core::assert_eq!(foreign, before_foreign);
+    let ticket = failure.into_input();
+    __cser_core::assert_eq!(delayed_key_coordinates(&ticket.0), presented);
+    owner.begin_delayed_command_delivery(ticket).unwrap();
+
+    let (mut owner, ticket, _) = compact_delayed_state(0xee52);
+    let mut candidate = owner.try_scope_candidate(SCOPE).unwrap();
+    let before_owner = owner.private_full_clone();
+    let before_candidate = candidate.private_full_clone();
+    let failure = candidate
+        .begin_delayed_command_delivery(ticket)
+        .unwrap_err();
+    __cser_core::assert_eq!(
+        failure.error(),
+        InfrastructureError::CandidateHasNoAuthority
+    );
+    __cser_core::assert_eq!(owner, before_owner);
+    __cser_core::assert_eq!(candidate, before_candidate);
+    owner
+        .begin_delayed_command_delivery(failure.into_input())
+        .unwrap();
+
+    type Mutate = fn(&mut BearerKey<bearer_state::DelayedReserved>);
+    let mutations: [(Mutate, InfrastructureError); 5] = [
+        (
+            |key| key.authority.scope = ScopeKey::new(SCOPE.id() + 1, SCOPE.generation()),
+            InfrastructureError::NotEnabled,
+        ),
+        (
+            |key| key.authority.authority_epoch += 1,
+            InfrastructureError::StaleAuthority,
+        ),
+        (
+            |key| key.object_generation += 1,
+            InfrastructureError::StaleGeneration,
+        ),
+        (
+            |key| key.bearer_generation += 1,
+            InfrastructureError::StaleGeneration,
+        ),
+        (|key| key.nonce += 1, InfrastructureError::StaleGeneration),
+    ];
+    for (index, (mutate, expected)) in mutations.into_iter().enumerate() {
+        let (mut state, mut ticket, _) = compact_delayed_state(0xee60 + index as u64);
+        mutate(&mut ticket.0);
+        let presented = delayed_key_coordinates(&ticket.0);
+        let before = state.private_full_clone();
+        let failure = state.begin_delayed_command_delivery(ticket).unwrap_err();
+        __cser_core::assert_eq!(failure.error(), expected);
+        __cser_core::assert_eq!(state, before);
+        __cser_core::assert_eq!(delayed_key_coordinates(&failure.into_input().0), presented);
+    }
+}
+
+#[test]
+fn delayed_transition_revalidates_lineage_descriptor_and_exact_reverse_index() {
+    assert_delayed_record_mutation_rejected(
+        0xee70,
+        |record| record.stamp.identity.actor_slot += 1,
+        InfrastructureError::Invariant("delayed command reverse index mismatch"),
+    );
+    assert_delayed_record_mutation_rejected(
+        0xee71,
+        |record| {
+            record.stamp.identity.target.effect = EffectKey::new(COMPACT_DELAYED_CLAIMANT + 5, 1);
+        },
+        InfrastructureError::InvalidState,
+    );
+    assert_delayed_record_mutation_rejected(
+        0xee72,
+        |record| record.stamp.identity.destination_domain = GUEST,
+        InfrastructureError::InvalidState,
+    );
+    assert_delayed_record_mutation_rejected(
+        0xee73,
+        |record| record.stamp.identity.sender = TaskKey::new(COMPACT_DELAYED_CLAIMANT + 3, 1),
+        InfrastructureError::InvalidState,
+    );
+    assert_delayed_record_mutation_rejected(
+        0xee74,
+        |record| record.stamp.identity.request_generation += 1,
+        InfrastructureError::InvalidState,
+    );
+    assert_delayed_record_mutation_rejected(
+        0xee75,
+        |record| record.stamp.identity.target.nonce = 0,
+        InfrastructureError::InvalidIdentity,
+    );
+
+    let (mut missing, ticket, _) = compact_delayed_state(0xee76);
+    let nonce = ticket.0.nonce;
+    missing
+        .scope_mut(SCOPE)
+        .unwrap()
+        .reverse_indexes
+        .remove(nonce)
+        .unwrap();
+    let before_missing = missing.private_full_clone();
+    let failure = missing.begin_delayed_command_delivery(ticket).unwrap_err();
+    __cser_core::assert_eq!(
+        failure.error(),
+        InfrastructureError::Invariant("missing delayed command reverse index")
+    );
+    __cser_core::assert_eq!(missing, before_missing);
+
+    let (mut mismatch, ticket, _) = compact_delayed_state(0xee77);
+    mismatch
+        .scope_mut(SCOPE)
+        .unwrap()
+        .reverse_indexes
+        .get_mut(ticket.0.nonce)
+        .unwrap()
+        .actor_generation = Some(2);
+    let before_mismatch = mismatch.private_full_clone();
+    let failure = mismatch.begin_delayed_command_delivery(ticket).unwrap_err();
+    __cser_core::assert_eq!(
+        failure.error(),
+        InfrastructureError::Invariant("delayed command reverse index mismatch")
+    );
+    __cser_core::assert_eq!(mismatch, before_mismatch);
+}
+
+#[test]
+fn delayed_receipt_and_publication_phase_substitution_return_the_intent_unchanged() {
+    assert_delayed_ack_mutation_rejected(0xee80, |receipt| receipt.actor_slot += 1);
+    assert_delayed_ack_mutation_rejected(0xee81, |receipt| receipt.actor_generation += 1);
+    assert_delayed_ack_mutation_rejected(0xee82, |receipt| receipt.command_digest += 1);
+    assert_delayed_ack_mutation_rejected(0xee83, |receipt| {
+        receipt.transport_receipt_digest = 0;
+    });
+
+    let (mut state, ticket, descriptor) = compact_delayed_state(0xee84);
+    let intent = state.begin_delayed_command_delivery(ticket).unwrap();
+    let presented = delayed_key_coordinates(&intent.0);
+    let phase = state
+        .scope(SCOPE)
+        .unwrap()
+        .delayed_commands
+        .get(COMPACT_DELAYED_COMMAND)
+        .unwrap()
+        .phase;
+    let (apply_generation, apply_nonce) = match phase {
+        super::DelayedCommandPhase::Publishing {
+            apply_generation,
+            apply_nonce,
+        } => (apply_generation, apply_nonce),
+        _ => __cser_core::unreachable!(),
+    };
+    state
+        .scope_mut(SCOPE)
+        .unwrap()
+        .delayed_commands
+        .get_mut(COMPACT_DELAYED_COMMAND)
+        .unwrap()
+        .phase = super::DelayedCommandPhase::Publishing {
+        apply_generation: apply_generation + 1,
+        apply_nonce,
+    };
+    let before = state.private_full_clone();
+    let failure = state
+        .acknowledge_delayed_command(intent, delayed_receipt(descriptor, 0xee85))
+        .unwrap_err();
+    __cser_core::assert_eq!(
+        failure.error(),
+        InfrastructureError::Invariant("invalid delayed command publication phase")
+    );
+    __cser_core::assert_eq!(state, before);
+    let intent = failure.into_input();
+    __cser_core::assert_eq!(delayed_key_coordinates(&intent.0), presented);
+
+    state
+        .scope_mut(SCOPE)
+        .unwrap()
+        .delayed_commands
+        .get_mut(COMPACT_DELAYED_COMMAND)
+        .unwrap()
+        .phase = super::DelayedCommandPhase::Publishing {
+        apply_generation,
+        apply_nonce: 0,
+    };
+    let before = state.private_full_clone();
+    let failure = state
+        .acknowledge_delayed_command(intent, delayed_receipt(descriptor, 0xee86))
+        .unwrap_err();
+    __cser_core::assert_eq!(
+        failure.error(),
+        InfrastructureError::Invariant("invalid delayed command publication phase")
+    );
+    __cser_core::assert_eq!(state, before);
+    __cser_core::assert_eq!(delayed_key_coordinates(&failure.into_input().0), presented);
+}
+
+#[test]
+fn delayed_rejection_validates_target_and_is_failure_atomic() {
+    let (mut state, ticket, descriptor) = compact_delayed_state(0xee90);
+    let presented = delayed_key_coordinates(&ticket.0);
+    let mut rejection = delayed_rejection(
+        descriptor,
+        DelayedCommandRejectionReason::RequestAborted,
+        0xee91,
+    );
+    rejection.target_effect = EffectKey::new(COMPACT_DELAYED_CLAIMANT + 5, 1);
+    let before = state.private_full_clone();
+    let failure = state.reject_delayed_command(ticket, rejection).unwrap_err();
+    __cser_core::assert_eq!(failure.error(), InfrastructureError::InvalidReceipt);
+    __cser_core::assert_eq!(state, before);
+    let ticket = failure.into_input();
+    __cser_core::assert_eq!(delayed_key_coordinates(&ticket.0), presented);
+
+    state.scope_mut(SCOPE).unwrap().revision = u64::MAX;
+    let before_overflow = state.private_full_clone();
+    let failure = state.begin_delayed_command_delivery(ticket).unwrap_err();
+    __cser_core::assert_eq!(failure.error(), InfrastructureError::CounterOverflow);
+    __cser_core::assert_eq!(state, before_overflow);
+    __cser_core::assert_eq!(delayed_key_coordinates(&failure.into_input().0), presented);
+
+    let (mut state, bound) = compact_child_bound_service_state(0xee92, COMPACT_DELAYED_CLAIMANT);
+    let armed = ArmedFaultTask(super::mint_task_key::<bearer_state::TaskFaultArmed>(
+        state
+            .scope(SCOPE)
+            .unwrap()
+            .tasks
+            .get(COMPACT_DELAYED_CLAIMANT + 1)
+            .unwrap(),
+    ));
+    let occupied_nonce = state
+        .scope(SCOPE)
+        .unwrap()
+        .service_requests
+        .get(COMPACT_SERVICE_REQUEST)
+        .unwrap()
+        .stamp
+        .nonce;
+    state.scope_mut(SCOPE).unwrap().next_nonce = occupied_nonce;
+    let before_collision = state.private_full_clone();
+    __cser_core::assert_eq!(
+        state
+            .reserve_delayed_command(&armed, &bound, compact_delayed_descriptor())
+            .unwrap_err(),
+        InfrastructureError::IdentityConflict
+    );
+    __cser_core::assert_eq!(state, before_collision);
+}
+
+#[test]
+fn authoritative_scope_install_fences_old_delayed_bearer_and_keeps_current_authority_live() {
+    let (mut state, stale, descriptor) = compact_delayed_state(0xeea0);
+    let stale_coordinates = delayed_key_coordinates(&stale.0);
+    let base = state.root_binding(SCOPE).unwrap();
+    let mut successor = state.private_full_clone();
+    let current = successor
+        .begin_delayed_command_delivery(current_delayed_ticket(&successor))
+        .unwrap();
+    let current_coordinates = delayed_key_coordinates(&current.0);
+    let mut candidate = successor.try_scope_candidate(SCOPE).unwrap();
+    let plan = state
+        .prepare_exact_scope_install(SCOPE, base, &mut candidate)
+        .unwrap();
+    state.install_exact_scope(plan);
+    state.check_invariants().unwrap();
+
+    let before_stale = state.private_full_clone();
+    let failure = state.begin_delayed_command_delivery(stale).unwrap_err();
+    __cser_core::assert_eq!(failure.error(), InfrastructureError::StaleGeneration);
+    __cser_core::assert_eq!(state, before_stale);
+    __cser_core::assert_eq!(
+        delayed_key_coordinates(&failure.into_input().0),
+        stale_coordinates
+    );
+    __cser_core::assert_eq!(current_coordinates.5, stale_coordinates.5 + 1);
+    state
+        .acknowledge_delayed_command(current, delayed_receipt(descriptor, 0xeea1))
+        .unwrap();
+    state.check_invariants().unwrap();
+}
+
+#[test]
 fn terminal_fault_preserves_service_and_delayed_children_until_each_drains() {
     const CLAIMANT: u64 = 0xfe00;
     let (mut state, bound) = compact_child_bound_service_state(0xfe10, CLAIMANT);
@@ -4590,13 +5116,13 @@ fn terminal_fault_preserves_service_and_delayed_children_until_each_drains() {
     __cser_core::assert_eq!(retained.live_children, 2);
     __cser_core::assert_eq!(retained.anchor, TaskAnchorRecoveryState::TerminalRetained);
 
-    let delayed_stamp = delayed.0;
+    let delayed_coordinates = delayed_key_coordinates(&delayed.0);
     let before = state.private_full_clone();
     let failure = state.begin_delayed_command_delivery(delayed).unwrap_err();
     __cser_core::assert_eq!(failure.error(), InfrastructureError::InvalidState);
     __cser_core::assert_eq!(state, before);
     let delayed = failure.into_input();
-    __cser_core::assert_eq!(delayed.0, delayed_stamp);
+    __cser_core::assert_eq!(delayed_key_coordinates(&delayed.0), delayed_coordinates);
     state
         .reject_delayed_command(
             delayed,
