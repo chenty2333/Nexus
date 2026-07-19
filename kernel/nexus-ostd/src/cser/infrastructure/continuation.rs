@@ -8,7 +8,8 @@ use super::{
     ContinuationRecoveryState, ContinuationResumeAuthority, ContinuationResumeIntent,
     ContinuationResumePlan, ContinuationResumeReceipt, DomainStamp, EnteredTaskLease,
     InfrastructureError, InfrastructureEventKind, InfrastructureKind, InfrastructureState,
-    LinearResult, ParentStamp, ReverseIndexRecord, ReverseParent, ScopeInfrastructure, TaskPhase,
+    LinearResult, ParentStamp, RequestKey, ReverseIndexRecord, ReverseParent, ScopeInfrastructure,
+    ServiceRequestDescriptor, ServiceRequestPhase, ServiceRequestStateRecord, TaskPhase,
     VmAuthorityKey, WakeClaim, WorkloadContext, bearer_state, checked_add, checked_sub,
     context_from_stamp, linear_apply, mint_continuation_key, next_continuation_bearer_generation,
     preview_bearer_stamp, preview_nonce, preview_nonces, preview_revision, preview_task_child_add,
@@ -23,6 +24,302 @@ enum PreparedContinuationAdoption {
     ReplayPublication(ContinuationPublicationPlan),
     Acknowledged,
     ReplayResume(ContinuationResumePlan),
+}
+
+/// Fully checked allocation-free apply plan for a continuation whose only
+/// initial authority is a live service request.
+///
+/// The plan records exact fixed-slot positions and every accounting input.
+/// `apply_service_owned_continuation` revalidates all of them before its first
+/// mutation, so a failed bind leaves both the service request and all
+/// continuation ledgers byte-for-byte unchanged.
+pub(super) struct PreparedServiceOwnedContinuation {
+    service_slot: usize,
+    continuation_slot: usize,
+    reverse_slot: usize,
+    workload_slot: usize,
+    task_slot: usize,
+    expected_service: BearerStamp<ServiceRequestDescriptor>,
+    expected_workload_children: u32,
+    expected_task_children: u32,
+    expected_live_continuations: u32,
+    base_nonce: u64,
+    next_nonce: u64,
+    base_revision: u64,
+    next_revision: u64,
+    continuation: ContinuationRecord,
+    reverse_index: ReverseIndexRecord,
+    next_workload_children: u32,
+    next_task_children: u32,
+    next_live_continuations: u32,
+}
+
+pub(super) fn prepare_service_owned_continuation(
+    scope: &ScopeInfrastructure,
+    registry_instance: u64,
+    service: &ServiceRequestStateRecord,
+    descriptor: ContinuationDescriptor,
+) -> Result<PreparedServiceOwnedContinuation, InfrastructureError> {
+    descriptor.validate()?;
+    validate_active_admission(scope)?;
+    if service.phase != ServiceRequestPhase::ReservedUnbound
+        || service.bound_continuation.is_some()
+        || service.response_identity.is_some()
+        || service.response_commitment.is_some()
+        || service.child_binding_commitment.is_some()
+        || service.bound_commitment.is_some()
+        || service.bind_bearer_generation != 0
+    {
+        return Err(InfrastructureError::InvalidState);
+    }
+    if scope.binding_epoch(descriptor.source_domain)? != descriptor.source_binding_epoch {
+        return Err(InfrastructureError::StaleBinding);
+    }
+    let parent_task = match service.stamp.parent {
+        ParentStamp::Task(parent) => parent,
+        _ => return Err(InfrastructureError::ForeignParent),
+    };
+    let task = scope
+        .tasks
+        .get(parent_task.work_id)
+        .ok_or(InfrastructureError::UnknownObligation)?;
+    validate_task_stamp(scope, registry_instance, &task.stamp)?;
+    if task.phase != TaskPhase::Entered
+        || task.stamp.identity != parent_task
+        || task.stamp.root != service.stamp.root
+        || task.stamp.domain != service.stamp.domain
+        || task.stamp.workload != service.stamp.workload
+        || parent_task.vm.map(VmAuthorityKey::generation) != Some(descriptor.vm_generation)
+    {
+        return Err(InfrastructureError::ForeignParent);
+    }
+    if let Some(existing) = scope.continuations.get(descriptor.continuation_id) {
+        return if existing.stamp.identity == descriptor
+            && existing.stamp.parent == service.stamp.parent
+        {
+            Err(InfrastructureError::ExactReplay)
+        } else if existing.stamp.identity.generation > descriptor.generation {
+            Err(InfrastructureError::StaleGeneration)
+        } else {
+            Err(InfrastructureError::IdentityConflict)
+        };
+    }
+    require_vacancy(
+        &scope.continuations,
+        descriptor.continuation_id,
+        InfrastructureKind::Continuation,
+    )?;
+    let context = context_from_stamp(scope, service.stamp.workload)?;
+    let (stamp, next_nonce) =
+        preview_bearer_stamp(scope, &context, descriptor, service.stamp.parent)?;
+    require_vacancy(
+        &scope.reverse_indexes,
+        stamp.nonce,
+        InfrastructureKind::Continuation,
+    )?;
+    let service_slot = scope
+        .service_requests
+        .slots
+        .iter()
+        .position(|slot| {
+            slot.as_ref()
+                .is_some_and(|record| record.stamp == service.stamp)
+        })
+        .ok_or(InfrastructureError::UnknownObligation)?;
+    let continuation_slot = scope
+        .continuations
+        .slots
+        .iter()
+        .position(Option::is_none)
+        .ok_or(InfrastructureError::QuotaExceeded(
+            InfrastructureKind::Continuation,
+        ))?;
+    let reverse_slot = scope
+        .reverse_indexes
+        .slots
+        .iter()
+        .position(Option::is_none)
+        .ok_or(InfrastructureError::QuotaExceeded(
+            InfrastructureKind::Continuation,
+        ))?;
+    let workload_slot = scope
+        .workloads
+        .slots
+        .iter()
+        .position(|slot| {
+            slot.as_ref()
+                .is_some_and(|record| record.request == stamp.workload.request)
+        })
+        .ok_or(InfrastructureError::UnknownWorkload)?;
+    let task_slot = scope
+        .tasks
+        .slots
+        .iter()
+        .position(|slot| {
+            slot.as_ref()
+                .is_some_and(|record| record.stamp.identity == parent_task)
+        })
+        .ok_or(InfrastructureError::UnknownObligation)?;
+    let workload = scope
+        .workloads
+        .slots
+        .get(workload_slot)
+        .and_then(Option::as_ref)
+        .ok_or(InfrastructureError::UnknownWorkload)?;
+    let next_workload_children = preview_workload_child_add(scope, stamp.workload.request)?;
+    let next_task_children = preview_task_child_add(scope, parent_task)?;
+    let next_live_continuations = checked_add(scope.live.continuations, 1)?;
+    let next_revision = preview_revision(scope)?;
+    let owner = RequestKey {
+        id: service.stamp.identity.request_id,
+        generation: service.stamp.identity.generation,
+    };
+    let reverse_index = ReverseIndexRecord {
+        slot: stamp.nonce,
+        kind: InfrastructureKind::Continuation,
+        root_effect: stamp.root.root_effect,
+        parent: ReverseParent::Task(parent_task),
+        task: Some(parent_task.task),
+        domain: stamp.domain.domain,
+        binding_epoch: stamp.domain.binding_epoch,
+        source_domain: Some(descriptor.source_domain),
+        source_binding_epoch: Some(descriptor.source_binding_epoch),
+        resource: None,
+        actor_slot: None,
+        retry_generation: descriptor.generation,
+    };
+    Ok(PreparedServiceOwnedContinuation {
+        service_slot,
+        continuation_slot,
+        reverse_slot,
+        workload_slot,
+        task_slot,
+        expected_service: service.stamp,
+        expected_workload_children: workload.live_children,
+        expected_task_children: task.live_children,
+        expected_live_continuations: scope.live.continuations,
+        base_nonce: scope.next_nonce,
+        next_nonce,
+        base_revision: scope.revision,
+        next_revision,
+        continuation: ContinuationRecord {
+            stamp,
+            origin_source: DomainStamp {
+                domain: descriptor.source_domain,
+                binding_epoch: descriptor.source_binding_epoch,
+            },
+            claim_generation: 0,
+            apply_generation: 0,
+            ack_generation: 0,
+            resume_generation: 0,
+            publication_ack: None,
+            service_owner: Some(owner),
+            phase: ContinuationPhase::Pending,
+            closure_sequence: None,
+        },
+        reverse_index,
+        next_workload_children,
+        next_task_children,
+        next_live_continuations,
+    })
+}
+
+pub(super) fn apply_service_owned_continuation<O>(
+    scope: &mut ScopeInfrastructure,
+    prepared: PreparedServiceOwnedContinuation,
+    apply_service: impl FnOnce(&mut ServiceRequestStateRecord, BearerStamp<ContinuationDescriptor>) -> O,
+) -> Result<O, InfrastructureError> {
+    let PreparedServiceOwnedContinuation {
+        service_slot,
+        continuation_slot,
+        reverse_slot,
+        workload_slot,
+        task_slot,
+        expected_service,
+        expected_workload_children,
+        expected_task_children,
+        expected_live_continuations,
+        base_nonce,
+        next_nonce,
+        base_revision,
+        next_revision,
+        continuation,
+        reverse_index,
+        next_workload_children,
+        next_task_children,
+        next_live_continuations,
+    } = prepared;
+    if scope.next_nonce != base_nonce
+        || scope.revision != base_revision
+        || scope.live.continuations != expected_live_continuations
+    {
+        return Err(InfrastructureError::StaleClaim);
+    }
+    let service = scope
+        .service_requests
+        .slots
+        .get_mut(service_slot)
+        .and_then(Option::as_mut)
+        .ok_or(InfrastructureError::UnknownObligation)?;
+    let continuation_target = scope.continuations.slots.get_mut(continuation_slot).ok_or(
+        InfrastructureError::Invariant("prepared continuation slot disappeared"),
+    )?;
+    let reverse_target =
+        scope
+            .reverse_indexes
+            .slots
+            .get_mut(reverse_slot)
+            .ok_or(InfrastructureError::Invariant(
+                "prepared continuation reverse slot disappeared",
+            ))?;
+    let workload = scope
+        .workloads
+        .slots
+        .get_mut(workload_slot)
+        .and_then(Option::as_mut)
+        .ok_or(InfrastructureError::UnknownWorkload)?;
+    let task = scope
+        .tasks
+        .slots
+        .get_mut(task_slot)
+        .and_then(Option::as_mut)
+        .ok_or(InfrastructureError::UnknownObligation)?;
+    if service.stamp != expected_service
+        || service.phase != ServiceRequestPhase::ReservedUnbound
+        || service.bound_continuation.is_some()
+        || service.response_identity.is_some()
+        || service.response_commitment.is_some()
+        || service.child_binding_commitment.is_some()
+        || service.bound_commitment.is_some()
+        || service.bind_bearer_generation != 0
+        || continuation_target.is_some()
+        || reverse_target.is_some()
+        || workload.request != continuation.stamp.workload.request
+        || workload.live_children != expected_workload_children
+        || task.stamp.identity
+            != match continuation.stamp.parent {
+                ParentStamp::Task(parent) => parent,
+                _ => return Err(InfrastructureError::ForeignParent),
+            }
+        || task.live_children != expected_task_children
+    {
+        return Err(InfrastructureError::StaleClaim);
+    }
+    let continuation_stamp = continuation.stamp;
+    *continuation_target = Some(continuation);
+    *reverse_target = Some(reverse_index);
+    workload.live_children = next_workload_children;
+    task.live_children = next_task_children;
+    scope.live.continuations = next_live_continuations;
+    scope.next_nonce = next_nonce;
+    scope.revision = next_revision;
+    let output = apply_service(service, continuation_stamp);
+    scope.events.push(
+        InfrastructureEventKind::ContinuationCreated,
+        continuation_stamp.identity.continuation_id,
+        continuation_stamp.identity.generation,
+    );
+    Ok(output)
 }
 
 impl InfrastructureState {
@@ -646,6 +943,9 @@ impl InfrastructureState {
             .get(continuation_id)
             .ok_or(InfrastructureError::UnknownObligation)?;
         validate_continuation_publication_ack(record)?;
+        // A service-owned continuation cannot advance independently of its
+        // service request. A future fenced path must adopt both records in one
+        // atomic transition so their causal history cannot diverge.
         if record.service_owner.is_some() {
             return Err(InfrastructureError::InvalidState);
         }

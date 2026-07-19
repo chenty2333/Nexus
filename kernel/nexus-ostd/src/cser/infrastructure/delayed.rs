@@ -1,16 +1,16 @@
 // SPDX-License-Identifier: MPL-2.0
 
+use super::service::{validate_bound_service_request, validate_live_service_child_binding};
 use super::{
     BearerStamp, BoundServiceRequest, DelayedCommandDescriptor, DelayedCommandIntent,
     DelayedCommandPhase, DelayedCommandReceipt, DelayedCommandRecoveryProjection,
     DelayedCommandRecoveryState, DelayedCommandRejectionReason, DelayedCommandRejectionReceipt,
     DelayedCommandStateRecord, DelayedCommandTicket, EnteredTaskLease, InfrastructureError,
     InfrastructureEventKind, InfrastructureKind, InfrastructureState, LinearResult, ParentStamp,
-    ReverseIndexRecord, ReverseParent, ScopeInfrastructure, ScopeKey, ServiceRequestPhase,
-    WorkloadContext, checked_add, checked_sub, context_from_stamp, linear_apply,
-    preview_bearer_stamp, preview_nonce, preview_revision, preview_task_child_add,
-    preview_task_child_sub, preview_workload_child_add, preview_workload_child_sub,
-    require_vacancy, validate_active_admission, validate_context, validate_service_request_bearer,
+    ReverseIndexRecord, ReverseParent, ScopeInfrastructure, ScopeKey, WorkloadContext, checked_add,
+    checked_sub, context_from_stamp, linear_apply, preview_bearer_stamp, preview_nonce,
+    preview_revision, preview_task_child_add, preview_task_child_sub, preview_workload_child_add,
+    preview_workload_child_sub, require_vacancy, validate_active_admission, validate_context,
     validate_stamp_common, validate_task_stamp,
 };
 
@@ -26,31 +26,23 @@ impl InfrastructureState {
         let registry_instance = self.registry_instance;
         let scope = self.scope_mut(task.0.root.scope)?;
         validate_task_stamp(scope, registry_instance, &task.0)?;
-        validate_service_request_bearer(scope, registry_instance, &bound.request)?;
+        let bound_record = validate_bound_service_request(scope, registry_instance, bound)?;
+        let bound_stamp = bound_record.stamp;
+        let binding_receipt =
+            validate_live_service_child_binding(scope, registry_instance, bound_record)?;
         validate_active_admission(scope)?;
-        if descriptor.request_id != bound.request.identity.request_id
-            || descriptor.request_generation != bound.request.identity.generation
+        if descriptor.request_id != bound_stamp.identity.request_id
+            || descriptor.request_generation != bound_stamp.identity.generation
             || descriptor.sender != task.0.identity.task
-            || descriptor.sender != bound.claimant.task
-            || task.0.identity != bound.claimant
-            || descriptor.target.scope() != stamp_scope(&bound.request)
-            || descriptor.target.effect() != bound.child_receipt.child_effect
+            || descriptor.sender != binding_receipt.claimant.task.task
+            || task.0.identity != binding_receipt.claimant.task
+            || descriptor.target.scope() != stamp_scope(&bound_stamp)
+            || descriptor.target.effect() != binding_receipt.child.child_effect
             || descriptor.target.domain() != descriptor.destination_domain
-            || descriptor.target.authority_epoch() != bound.request.root.authority_epoch
+            || descriptor.target.authority_epoch() != bound_stamp.root.authority_epoch
             || descriptor.target.binding_epoch() != descriptor.destination_binding_epoch
             || scope.binding_epoch(descriptor.destination_domain)?
                 != descriptor.destination_binding_epoch
-            || scope
-                .service_requests
-                .get(bound.request.identity.request_id)
-                .unwrap()
-                .phase
-                != (ServiceRequestPhase::ChildBound {
-                    queue_receipt: bound.queue_receipt,
-                    arm_receipt: bound.arm_receipt,
-                    child_receipt: bound.child_receipt,
-                    claimant: bound.claimant,
-                })
         {
             return Err(InfrastructureError::InvalidState);
         }

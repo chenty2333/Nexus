@@ -8,3 +8,4 @@ publish = false
 [dev-dependencies]
 loom = "=0.7.2"
 nexus-portal-abi = { path = "../nexus-portal-abi" }
+sha2 = { version = "=0.10.9", default-features = false, features = ["force-soft"] }

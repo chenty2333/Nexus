@@ -24,12 +24,9 @@ mod service;
 mod task;
 
 use self::{
-    continuation::validate_continuation_publication_ack,
-    delayed::delayed_command_phase_live,
-    device::device_phase_live,
-    fault::validate_fault_bearer,
-    invariants::check_scope_invariants,
-    service::{service_request_phase_live, validate_service_request_bearer},
+    continuation::validate_continuation_publication_ack, delayed::delayed_command_phase_live,
+    device::device_phase_live, fault::validate_fault_bearer, invariants::check_scope_invariants,
+    service::service_request_phase_live,
 };
 
 use super::{
@@ -281,6 +278,20 @@ mod bearer_state {
     #[derive(Debug, Eq, PartialEq)]
     pub(super) enum ContinuationResuming {}
     #[derive(Debug, Eq, PartialEq)]
+    pub(super) enum ServiceReservedUnbound {}
+    #[derive(Debug, Eq, PartialEq)]
+    pub(super) enum ServiceReservedBound {}
+    #[derive(Debug, Eq, PartialEq)]
+    pub(super) enum ServiceEnqueuePublishing {}
+    #[derive(Debug, Eq, PartialEq)]
+    pub(super) enum ServiceQueueWritten {}
+    #[derive(Debug, Eq, PartialEq)]
+    pub(super) enum ServiceArmPublishing {}
+    #[derive(Debug, Eq, PartialEq)]
+    pub(super) enum ServiceArmed {}
+    #[derive(Debug, Eq, PartialEq)]
+    pub(super) enum ServiceChildBound {}
+    #[derive(Debug, Eq, PartialEq)]
     pub(super) enum DeadlineArmed {}
     #[derive(Debug, Eq, PartialEq)]
     pub(super) enum DeadlineFired {}
@@ -294,6 +305,13 @@ mod bearer_state {
     impl Sealed for ContinuationPublishing {}
     impl Sealed for ContinuationAcknowledged {}
     impl Sealed for ContinuationResuming {}
+    impl Sealed for ServiceReservedUnbound {}
+    impl Sealed for ServiceReservedBound {}
+    impl Sealed for ServiceEnqueuePublishing {}
+    impl Sealed for ServiceQueueWritten {}
+    impl Sealed for ServiceArmPublishing {}
+    impl Sealed for ServiceArmed {}
+    impl Sealed for ServiceChildBound {}
     impl Sealed for DeadlineArmed {}
     impl Sealed for DeadlineFired {}
     impl Sealed for DeadlineExhausted {}
@@ -498,19 +516,56 @@ impl ServiceRequestDescriptor {
     }
 }
 
+/// Compact authority for a reserved service request which owns no response
+/// continuation.
 #[derive(Debug, Eq, PartialEq)]
-pub(crate) struct ServiceRequestTicket(BearerStamp<ServiceRequestDescriptor>);
+pub(crate) struct UnboundServiceRequest(BearerKey<bearer_state::ServiceReservedUnbound>);
 
+/// Compact authority for a reserved request and its Registry-owned response
+/// continuation. The continuation has no independently minted bearer while
+/// this authority is live.
 #[derive(Debug, Eq, PartialEq)]
-pub(crate) struct ServiceEnqueueIntent {
-    request: BearerStamp<ServiceRequestDescriptor>,
-    bound_continuation: BearerStamp<ContinuationDescriptor>,
-    apply_generation: u64,
-    apply_nonce: u64,
+pub(crate) struct ServiceRequestTicket(ServiceBoundKey<bearer_state::ServiceReservedBound>);
+
+/// Copyable, descriptive causal identity for an external service action.
+///
+/// This is a complete snapshot of the Registry-owned request coordinates. It
+/// carries no bearer state and therefore cannot authorize a transition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ServiceRequestCausalIdentity {
+    pub(crate) registry_instance: u64,
+    pub(crate) scope: ScopeKey,
+    pub(crate) authority_epoch: u64,
+    pub(crate) root_effect: EffectKey,
+    pub(crate) workload_request_id: u64,
+    pub(crate) workload_request_generation: u64,
+    pub(crate) workload_nonce: u64,
+    pub(crate) workload_bearer_generation: u64,
+    pub(crate) admission_domain: DomainKey,
+    pub(crate) admission_binding_epoch: u64,
+    pub(crate) parent_task: TaskWorkDescriptor,
+    pub(crate) request_nonce: u64,
+    pub(crate) descriptor: ServiceRequestDescriptor,
+    pub(crate) response: ContinuationDescriptor,
+}
+
+/// One-shot authority for acknowledging an externally applied queue write.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct ServiceEnqueueAuthority(ServiceBoundKey<bearer_state::ServiceEnqueuePublishing>);
+
+/// Copyable instructions for the external queue write. Copying this plan does
+/// not copy authority; acknowledgement consumes [`ServiceEnqueueAuthority`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ServiceEnqueuePlan {
+    pub(crate) causal: ServiceRequestCausalIdentity,
+    pub(crate) bearer_generation: u64,
+    pub(crate) apply_generation: u64,
+    pub(crate) apply_nonce: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ServiceEnqueueReceipt {
+    pub(crate) plan: ServiceEnqueuePlan,
     pub(crate) queue: ResourceKey,
     pub(crate) queue_generation: u64,
     pub(crate) payload_slot: u32,
@@ -519,46 +574,35 @@ pub(crate) struct ServiceEnqueueReceipt {
 }
 
 #[derive(Debug, Eq, PartialEq)]
-pub(crate) struct UnarmedServiceRequest {
-    request: BearerStamp<ServiceRequestDescriptor>,
-    receipt: ServiceEnqueueReceipt,
-}
+pub(crate) struct UnarmedServiceRequest(ServiceBoundKey<bearer_state::ServiceQueueWritten>);
 
+/// One-shot authority for acknowledging external response-slot arming.
 #[derive(Debug, Eq, PartialEq)]
-pub(crate) struct ServiceArmIntent {
-    request: BearerStamp<ServiceRequestDescriptor>,
-    queue_receipt: ServiceEnqueueReceipt,
-    bound_continuation: BearerStamp<ContinuationDescriptor>,
-    arm_generation: u64,
-    arm_nonce: u64,
+pub(crate) struct ServiceArmAuthority(ServiceBoundKey<bearer_state::ServiceArmPublishing>);
+
+/// Copyable instructions for response-slot arming. The plan is descriptive;
+/// acknowledgement consumes the separate compact authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ServiceArmPlan {
+    pub(crate) causal: ServiceRequestCausalIdentity,
+    pub(crate) queue_receipt: ServiceEnqueueReceipt,
+    pub(crate) bearer_generation: u64,
+    pub(crate) arm_generation: u64,
+    pub(crate) arm_nonce: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ServiceArmReceipt {
+    pub(crate) plan: ServiceArmPlan,
     pub(crate) response_slot_id: u64,
     pub(crate) response_slot_generation: u64,
     pub(crate) bound_continuation_id: u64,
     pub(crate) bound_continuation_generation: u64,
-    pub(crate) arm_generation: u64,
     pub(crate) transport_receipt_digest: u64,
 }
 
 #[derive(Debug, Eq, PartialEq)]
-pub(crate) struct EnqueuedServiceRequest {
-    request: BearerStamp<ServiceRequestDescriptor>,
-    queue_receipt: ServiceEnqueueReceipt,
-    arm_receipt: ServiceArmReceipt,
-}
-
-#[derive(Debug, Eq, PartialEq)]
-pub(crate) struct ServiceClaim {
-    request: BearerStamp<ServiceRequestDescriptor>,
-    queue_receipt: ServiceEnqueueReceipt,
-    arm_receipt: ServiceArmReceipt,
-    claim_generation: u64,
-    claim_nonce: u64,
-    claimant: TaskWorkDescriptor,
-}
+pub(crate) struct EnqueuedServiceRequest(ServiceBoundKey<bearer_state::ServiceArmed>);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ServiceChildReceipt {
@@ -566,6 +610,42 @@ pub(crate) struct ServiceChildReceipt {
     pub(crate) registration_digest: u64,
 }
 
+/// Claim-time coordinates of the task which registered a service child.
+///
+/// This snapshot is descriptive evidence only. In particular, it cannot be
+/// converted into an [`EnteredTaskLease`] or used as task authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ServiceClaimantSnapshot {
+    pub(crate) registry_instance: u64,
+    pub(crate) scope: ScopeKey,
+    pub(crate) authority_epoch: u64,
+    pub(crate) root_effect: EffectKey,
+    pub(crate) workload_request_id: u64,
+    pub(crate) workload_request_generation: u64,
+    pub(crate) workload_nonce: u64,
+    pub(crate) workload_bearer_generation: u64,
+    pub(crate) domain: DomainKey,
+    pub(crate) binding_epoch: u64,
+    pub(crate) task: TaskWorkDescriptor,
+    pub(crate) task_nonce: u64,
+    pub(crate) task_bearer_generation: u64,
+}
+
+/// Immutable evidence for the atomic claim-and-child-binding transition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ServiceChildBindingReceipt {
+    pub(crate) request_id: u64,
+    pub(crate) generation: u64,
+    pub(crate) service_bearer_generation: u64,
+    pub(crate) claim_generation: u64,
+    pub(crate) claim_nonce: u64,
+    pub(crate) claimant: ServiceClaimantSnapshot,
+    pub(crate) child: ServiceChildReceipt,
+}
+
+/// Temporary proof supplied by the already validated outer Registry
+/// transaction. It is not a production source mapping and does not expose an
+/// intermediate claimed service authority.
 #[derive(Debug, Eq, PartialEq)]
 pub(super) struct ValidatedServiceChildProof {
     receipt: ServiceChildReceipt,
@@ -577,26 +657,73 @@ impl ValidatedServiceChildProof {
     }
 }
 
+/// Canonical SHA-256 commitment to one service response lineage.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ServiceLineageCommitment([u8; 32]);
+
+/// Compact authority for every service state after response binding.
+///
+/// The commitment evolves with the state: exact bind-time response, issued
+/// enqueue plan, acknowledged enqueue receipt, issued arm plan, acknowledged
+/// queue/arm receipts, then those receipts plus the complete child binding.
+/// This detects an active transition presented with a self-consistently
+/// substituted Registry record while the independently held opaque authority
+/// remains unchanged. It does not claim protection against an attacker able to
+/// rewrite both arbitrary kernel memory and the caller-held authority/evidence
+/// and recompute every SHA-256 value. The state remains sealed and the key
+/// remains non-`Clone`/non-`Copy`.
 #[derive(Debug, Eq, PartialEq)]
-pub(crate) struct BoundServiceRequest {
-    request: BearerStamp<ServiceRequestDescriptor>,
-    queue_receipt: ServiceEnqueueReceipt,
-    arm_receipt: ServiceArmReceipt,
-    child_receipt: ServiceChildReceipt,
-    claimant: TaskWorkDescriptor,
+struct ServiceBoundKey<State: bearer_state::Sealed> {
+    authority: AuthorityKey,
+    slot: u64,
+    object_generation: u64,
+    bearer_generation: u64,
+    nonce: u64,
+    lineage_commitment: ServiceLineageCommitment,
+    state: PhantomData<fn() -> State>,
 }
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct BoundServiceRequest(ServiceBoundKey<bearer_state::ServiceChildBound>);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ServiceCompletionReceipt {
     pub(crate) request_id: u64,
     pub(crate) generation: u64,
+    pub(crate) bearer_generation: u64,
+    /// Echoes the final live `ServiceChildBound` lineage commitment.
+    pub(crate) lineage_commitment: ServiceLineageCommitment,
+    pub(crate) binding_receipt: ServiceChildBindingReceipt,
     pub(crate) child_effect: EffectKey,
+    pub(crate) response: ContinuationDescriptor,
     pub(crate) result_digest: u64,
 }
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct ServiceCompletionOutcome {
     pub(crate) receipt: ServiceCompletionReceipt,
+    pub(crate) response: ContinuationLease,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ServiceCancellationPoint {
+    ReservedUnbound,
+    ReservedBound,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ServiceCancellationReceipt {
+    pub(crate) request_id: u64,
+    pub(crate) generation: u64,
+    pub(crate) bearer_generation: u64,
+    pub(crate) evidence_digest: u64,
+    pub(crate) point: ServiceCancellationPoint,
+    pub(crate) response: Option<ContinuationDescriptor>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct BoundServiceCancellationOutcome {
+    pub(crate) receipt: ServiceCancellationReceipt,
     pub(crate) response: ContinuationLease,
 }
 
@@ -608,7 +735,6 @@ pub(crate) enum ServiceRequestRecoveryState {
     QueueWrittenUnarmed,
     ArmUncertain,
     Armed,
-    Claimed,
     ChildBound,
     Completed,
     Cancelled,
@@ -620,19 +746,40 @@ pub(crate) struct ServiceRequestRecoveryProjection {
     pub(crate) state: ServiceRequestRecoveryState,
     pub(crate) enqueue_receipt: Option<ServiceEnqueueReceipt>,
     pub(crate) arm_receipt: Option<ServiceArmReceipt>,
-    pub(crate) child_receipt: Option<ServiceChildReceipt>,
+    pub(crate) child_binding_receipt: Option<ServiceChildBindingReceipt>,
     pub(crate) completion_receipt: Option<ServiceCompletionReceipt>,
+    pub(crate) cancellation_receipt: Option<ServiceCancellationReceipt>,
+    pub(crate) bearer_generation: u64,
 }
 
-#[derive(Debug, Eq, PartialEq)]
-pub(crate) enum ServiceRequestAdoption {
-    Reserved(ServiceRequestTicket),
-    ReplayEnqueue(ServiceEnqueueIntent),
-    QueueWrittenUnarmed(UnarmedServiceRequest),
-    ReplayArm(ServiceArmIntent),
-    Enqueued(EnqueuedServiceRequest),
-    Claimed(ServiceClaim),
-}
+const _: () = {
+    assert!(core::mem::size_of::<ServiceBoundKey<bearer_state::ServiceReservedBound>>() <= 96);
+    assert!(core::mem::size_of::<ServiceBoundKey<bearer_state::ServiceEnqueuePublishing>>() <= 96);
+    assert!(core::mem::size_of::<ServiceBoundKey<bearer_state::ServiceQueueWritten>>() <= 96);
+    assert!(core::mem::size_of::<ServiceBoundKey<bearer_state::ServiceArmPublishing>>() <= 96);
+    assert!(core::mem::size_of::<ServiceBoundKey<bearer_state::ServiceArmed>>() <= 96);
+    assert!(core::mem::size_of::<ServiceBoundKey<bearer_state::ServiceChildBound>>() <= 96);
+    assert!(core::mem::size_of::<UnboundServiceRequest>() <= 96);
+    assert!(core::mem::size_of::<ServiceRequestTicket>() <= 96);
+    assert!(core::mem::size_of::<ServiceEnqueueAuthority>() <= 96);
+    assert!(core::mem::size_of::<UnarmedServiceRequest>() <= 96);
+    assert!(core::mem::size_of::<ServiceArmAuthority>() <= 96);
+    assert!(core::mem::size_of::<EnqueuedServiceRequest>() <= 96);
+    assert!(core::mem::size_of::<BoundServiceRequest>() <= 96);
+    assert!(core::mem::size_of::<LinearFailure<UnboundServiceRequest>>() <= 120);
+    assert!(core::mem::size_of::<LinearFailure<ServiceRequestTicket>>() <= 120);
+    assert!(core::mem::size_of::<LinearFailure<ServiceEnqueueAuthority>>() <= 120);
+    assert!(core::mem::size_of::<LinearFailure<UnarmedServiceRequest>>() <= 120);
+    assert!(core::mem::size_of::<LinearFailure<ServiceArmAuthority>>() <= 120);
+    assert!(core::mem::size_of::<LinearFailure<EnqueuedServiceRequest>>() <= 120);
+    assert!(core::mem::size_of::<LinearFailure<BoundServiceRequest>>() <= 120);
+    assert!(core::mem::size_of::<ServiceEnqueuePlan>() <= 512);
+    assert!(core::mem::size_of::<ServiceEnqueueReceipt>() <= 640);
+    assert!(core::mem::size_of::<ServiceArmPlan>() <= 1_280);
+    assert!(core::mem::size_of::<ServiceArmReceipt>() <= 1_408);
+    assert!(core::mem::size_of::<ServiceChildBindingReceipt>() <= 384);
+    assert!(core::mem::size_of::<ServiceCompletionReceipt>() <= 512);
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct DelayedCommandDescriptor {
@@ -1467,9 +1614,9 @@ pub(crate) enum InfrastructureEventKind {
     TaskIsolated,
     TaskReaped,
     ServiceRequestReserved,
+    ServiceRequestBound,
     ServiceRequestPublishing,
     ServiceRequestEnqueued,
-    ServiceRequestClaimed,
     ServiceRequestChildBound,
     ServiceRequestCompleted,
     ServiceRequestCancelled,
@@ -1635,24 +1782,18 @@ enum ServiceRequestPhase {
         queue_receipt: ServiceEnqueueReceipt,
         arm_receipt: ServiceArmReceipt,
     },
-    Claimed {
-        queue_receipt: ServiceEnqueueReceipt,
-        arm_receipt: ServiceArmReceipt,
-        claim_generation: u64,
-        claim_nonce: u64,
-        claimant: TaskWorkDescriptor,
-    },
     ChildBound {
         queue_receipt: ServiceEnqueueReceipt,
         arm_receipt: ServiceArmReceipt,
-        child_receipt: ServiceChildReceipt,
-        claimant: TaskWorkDescriptor,
+        binding_receipt: ServiceChildBindingReceipt,
     },
     Completed {
+        queue_receipt: ServiceEnqueueReceipt,
+        arm_receipt: ServiceArmReceipt,
         receipt: ServiceCompletionReceipt,
     },
     Cancelled {
-        evidence_digest: u64,
+        receipt: ServiceCancellationReceipt,
     },
 }
 
@@ -1660,9 +1801,20 @@ enum ServiceRequestPhase {
 struct ServiceRequestStateRecord {
     stamp: BearerStamp<ServiceRequestDescriptor>,
     bound_continuation: Option<BearerStamp<ContinuationDescriptor>>,
+    response_identity: Option<ContinuationDescriptor>,
+    response_commitment: Option<ServiceLineageCommitment>,
+    child_binding_commitment: Option<ServiceChildBindingReceipt>,
+    bound_commitment: Option<ServiceLineageCommitment>,
+    bind_bearer_generation: u64,
     apply_generation: u64,
+    apply_bearer_generation: u64,
+    apply_nonce_high_water: u64,
     arm_generation: u64,
+    arm_bearer_generation: u64,
+    arm_nonce_high_water: u64,
     claim_generation: u64,
+    claim_bearer_generation: u64,
+    claim_nonce_high_water: u64,
     phase: ServiceRequestPhase,
     closure_sequence: Option<u64>,
 }
@@ -2952,6 +3104,17 @@ fn first_task_child_kind(
         .iter()
         .any(|record| record.stamp.parent == parent && service_request_phase_live(record.phase))
     {
+        return Ok(InfrastructureKind::ServiceRequest);
+    }
+    if scope.service_requests.iter().any(|record| {
+        matches!(
+            record.phase,
+            ServiceRequestPhase::ChildBound {
+                binding_receipt,
+                ..
+            } if binding_receipt.claimant.task == task
+        )
+    }) {
         return Ok(InfrastructureKind::ServiceRequest);
     }
     if scope

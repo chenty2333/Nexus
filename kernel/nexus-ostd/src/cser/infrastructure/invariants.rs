@@ -8,7 +8,8 @@ use super::{
     DeviceRecord, DeviceReservationCoordinates, FaultDisposition, FaultPhase, FaultStateRecord,
     FixedSlots, InfrastructureError, InfrastructureKind, InfrastructureLiveCounts, ParentStamp,
     ReplyPhase, ReplyStateRecord, RequestKey, ResourceUsage, ReverseIndexRecord, ReverseParent,
-    ScopeInfrastructure, ServiceArmReceipt, ServiceEnqueueReceipt, ServiceRequestDescriptor,
+    ScopeInfrastructure, ServiceArmReceipt, ServiceCancellationPoint, ServiceChildBindingReceipt,
+    ServiceClaimantSnapshot, ServiceEnqueueReceipt, ServiceRequestCausalIdentity,
     ServiceRequestPhase, ServiceRequestStateRecord, SlotIdentity, TaskPhase, TaskRecord,
     TaskWorkDescriptor, VmAuthorityKey, WorkloadPhase, delayed_command_phase_live,
     device_phase_live, service_request_phase_live, validate_continuation_publication_ack,
@@ -131,6 +132,12 @@ pub(super) fn check_scope_invariants(
         if service_request_phase_live(record.phase) {
             increment_invariant(&mut expected_live.service_requests)?;
             account_live_task_child(&mut workload_children, &mut task_children, &record.stamp)?;
+        }
+        if let ServiceRequestPhase::ChildBound {
+            binding_receipt, ..
+        } = record.phase
+        {
+            increment_task_child(&mut task_children, binding_receipt.claimant.task)?;
         }
         push_expected_index(&mut expected_indexes, reverse_index_for_service(record))?;
     }
@@ -620,6 +627,24 @@ fn check_monotonic_sequences(scope: &ScopeInfrastructure) -> Result<(), Infrastr
         if let Some(bound) = record.bound_continuation.as_ref() {
             observe_stamp_nonces(&mut max_nonce, bound)?;
         }
+        for (high_water, zero_error) in [
+            (
+                record.apply_nonce_high_water,
+                "zero service apply nonce high-water",
+            ),
+            (
+                record.arm_nonce_high_water,
+                "zero service arm nonce high-water",
+            ),
+            (
+                record.claim_nonce_high_water,
+                "zero service claim nonce high-water",
+            ),
+        ] {
+            if high_water != 0 {
+                observe_sequence(&mut max_nonce, high_water, zero_error)?;
+            }
+        }
         match record.phase {
             ServiceRequestPhase::Publishing { apply_nonce, .. } => {
                 observe_sequence(&mut max_nonce, apply_nonce, "zero service apply nonce")?;
@@ -627,8 +652,14 @@ fn check_monotonic_sequences(scope: &ScopeInfrastructure) -> Result<(), Infrastr
             ServiceRequestPhase::Arming { arm_nonce, .. } => {
                 observe_sequence(&mut max_nonce, arm_nonce, "zero service arm nonce")?;
             }
-            ServiceRequestPhase::Claimed { claim_nonce, .. } => {
-                observe_sequence(&mut max_nonce, claim_nonce, "zero service claim nonce")?;
+            ServiceRequestPhase::ChildBound {
+                binding_receipt, ..
+            } => {
+                observe_sequence(
+                    &mut max_nonce,
+                    binding_receipt.claim_nonce,
+                    "zero service claim nonce",
+                )?;
             }
             _ => {}
         }
@@ -1258,101 +1289,303 @@ fn check_service_phase(
             "live service request has stale destination binding",
         ));
     }
-    match record.phase {
-        ServiceRequestPhase::ReservedUnbound if record.bound_continuation.is_some() => {
-            return Err(InfrastructureError::Invariant(
-                "unbound service phase retains response continuation",
-            ));
-        }
+    let live_bound = matches!(
+        record.phase,
         ServiceRequestPhase::ReservedBound
-        | ServiceRequestPhase::Publishing { .. }
-        | ServiceRequestPhase::QueueWrittenUnarmed { .. }
-        | ServiceRequestPhase::Arming { .. }
-        | ServiceRequestPhase::Armed { .. }
-        | ServiceRequestPhase::Claimed { .. }
-        | ServiceRequestPhase::ChildBound { .. }
-        | ServiceRequestPhase::Completed { .. }
-            if record.bound_continuation.is_none() =>
-        {
-            return Err(InfrastructureError::Invariant(
-                "bound service phase lacks response continuation",
-            ));
-        }
-        // Cancellation is valid from both ReservedUnbound and ReservedBound;
-        // its retained historical pointer therefore remains optional.
-        ServiceRequestPhase::Cancelled { .. } | ServiceRequestPhase::ReservedUnbound => {}
-        _ => {}
+            | ServiceRequestPhase::Publishing { .. }
+            | ServiceRequestPhase::QueueWrittenUnarmed { .. }
+            | ServiceRequestPhase::Arming { .. }
+            | ServiceRequestPhase::Armed { .. }
+            | ServiceRequestPhase::ChildBound { .. }
+    );
+    if live_bound != record.bound_continuation.is_some() {
+        return Err(InfrastructureError::Invariant(
+            "service continuation ownership link mismatches phase",
+        ));
     }
+    if !service_request_phase_live(record.phase) && record.bound_continuation.is_some() {
+        return Err(InfrastructureError::Invariant(
+            "terminal service request retains continuation ownership link",
+        ));
+    }
+    let response_commitment = record
+        .response_identity
+        .map(super::service::service_response_commitment);
+    let response_anchor_valid = record.response_commitment == response_commitment;
+    let live_response = record
+        .bound_continuation
+        .map(|continuation| continuation.identity)
+        .filter(|identity| {
+            record.response_identity == Some(*identity)
+                && record.response_commitment
+                    == Some(super::service::service_response_commitment(*identity))
+        });
+    let base_bind_chain = service_bearer_after(1, 1, record.bind_bearer_generation);
+    let apply_chain = base_bind_chain
+        && service_bearer_after(
+            record.bind_bearer_generation,
+            1,
+            record.apply_bearer_generation,
+        );
+    let arm_chain = apply_chain
+        && service_bearer_after(
+            record.apply_bearer_generation,
+            2,
+            record.arm_bearer_generation,
+        );
+    let claim_chain = arm_chain
+        && service_bearer_after(
+            record.arm_bearer_generation,
+            2,
+            record.claim_bearer_generation,
+        );
     let valid_generations = match record.phase {
-        ServiceRequestPhase::ReservedUnbound | ServiceRequestPhase::ReservedBound => true,
+        ServiceRequestPhase::ReservedUnbound => {
+            record.stamp.bearer_generation == 1
+                && record.bind_bearer_generation == 0
+                && record.response_identity.is_none()
+                && record.response_commitment.is_none()
+                && record.child_binding_commitment.is_none()
+                && record.bound_commitment.is_none()
+                && empty_service_action_history(record)
+        }
+        ServiceRequestPhase::ReservedBound => {
+            base_bind_chain
+                && record.stamp.bearer_generation == record.bind_bearer_generation
+                && live_response.is_some()
+                && response_anchor_valid
+                && record.child_binding_commitment.is_none()
+                && record.bound_commitment.is_none()
+                && empty_service_action_history(record)
+                && record
+                    .bound_continuation
+                    .is_some_and(|continuation| continuation.bearer_generation != 0)
+        }
         ServiceRequestPhase::Publishing {
-            apply_generation, ..
-        } => apply_generation != 0 && apply_generation == record.apply_generation,
+            apply_generation,
+            apply_nonce,
+        } => {
+            apply_chain
+                && record.apply_bearer_generation == record.stamp.bearer_generation
+                && live_response.is_some()
+                && response_anchor_valid
+                && record.child_binding_commitment.is_none()
+                && record.bound_commitment.is_none()
+                && apply_generation != 0
+                && apply_generation == record.apply_generation
+                && apply_nonce != 0
+                && apply_nonce == record.apply_nonce_high_water
+                && record.arm_generation == 0
+                && record.arm_bearer_generation == 0
+                && record.arm_nonce_high_water == 0
+                && record.claim_generation == 0
+                && record.claim_bearer_generation == 0
+                && record.claim_nonce_high_water == 0
+        }
         ServiceRequestPhase::QueueWrittenUnarmed { queue_receipt } => {
-            valid_service_queue_receipt(descriptor, queue_receipt)
+            apply_chain
+                && service_bearer_after(
+                    record.apply_bearer_generation,
+                    1,
+                    record.stamp.bearer_generation,
+                )
+                && response_anchor_valid
+                && record.child_binding_commitment.is_none()
+                && record.bound_commitment.is_none()
+                && live_response.is_some_and(|response| {
+                    valid_service_queue_receipt(record, response, queue_receipt)
+                })
+                && record.arm_generation == 0
+                && record.arm_bearer_generation == 0
+                && record.arm_nonce_high_water == 0
+                && record.claim_generation == 0
+                && record.claim_bearer_generation == 0
+                && record.claim_nonce_high_water == 0
         }
         ServiceRequestPhase::Arming {
             queue_receipt,
             arm_generation,
-            ..
+            arm_nonce,
         } => {
-            valid_service_queue_receipt(descriptor, queue_receipt)
+            arm_chain
+                && record.arm_bearer_generation == record.stamp.bearer_generation
+                && response_anchor_valid
+                && record.child_binding_commitment.is_none()
+                && record.bound_commitment.is_none()
+                && live_response.is_some_and(|response| {
+                    valid_service_queue_receipt(record, response, queue_receipt)
+                })
                 && arm_generation != 0
                 && arm_generation == record.arm_generation
+                && arm_nonce != 0
+                && arm_nonce == record.arm_nonce_high_water
+                && record.claim_generation == 0
+                && record.claim_bearer_generation == 0
+                && record.claim_nonce_high_water == 0
         }
         ServiceRequestPhase::Armed {
             queue_receipt,
             arm_receipt,
-        }
-        | ServiceRequestPhase::Claimed {
-            queue_receipt,
-            arm_receipt,
-            ..
-        }
-        | ServiceRequestPhase::ChildBound {
-            queue_receipt,
-            arm_receipt,
-            ..
         } => {
-            valid_service_queue_receipt(descriptor, queue_receipt)
-                && valid_service_arm_receipt(record, arm_receipt)
+            arm_chain
+                && service_bearer_after(
+                    record.arm_bearer_generation,
+                    1,
+                    record.stamp.bearer_generation,
+                )
+                && response_anchor_valid
+                && record.child_binding_commitment.is_none()
+                && record.bound_commitment.is_none()
+                && live_response.is_some_and(|response| {
+                    valid_service_queue_receipt(record, response, queue_receipt)
+                        && valid_service_arm_receipt(record, response, queue_receipt, arm_receipt)
+                })
+                && record.claim_generation == 0
+                && record.claim_bearer_generation == 0
+                && record.claim_nonce_high_water == 0
         }
-        ServiceRequestPhase::Completed { receipt } => {
+        ServiceRequestPhase::ChildBound {
+            queue_receipt,
+            arm_receipt,
+            binding_receipt,
+        } => {
+            claim_chain
+                && record.stamp.bearer_generation == record.claim_bearer_generation
+                && response_anchor_valid
+                && record.child_binding_commitment == Some(binding_receipt)
+                && record.response_identity.is_some_and(|response| {
+                    record.bound_commitment
+                        == Some(super::service::service_child_bound_commitment(
+                            queue_receipt,
+                            arm_receipt,
+                            response,
+                            binding_receipt,
+                        ))
+                })
+                && live_response.is_some_and(|response| {
+                    valid_service_queue_receipt(record, response, queue_receipt)
+                        && valid_service_arm_receipt(record, response, queue_receipt, arm_receipt)
+                })
+                && valid_service_child_binding(record, binding_receipt)
+                && super::service::validate_live_service_child_binding(
+                    scope,
+                    scope.root.registry_instance,
+                    record,
+                )
+                .is_ok()
+        }
+        ServiceRequestPhase::Completed {
+            queue_receipt,
+            arm_receipt,
+            receipt,
+        } => {
+            let binding_receipt = receipt.binding_receipt;
+            claim_chain
+                && service_bearer_after(
+                    record.claim_bearer_generation,
+                    1,
+                    record.stamp.bearer_generation,
+                )
+                && record.response_identity == Some(receipt.response)
+                && response_anchor_valid
+                && record.child_binding_commitment == Some(binding_receipt)
+                && record.bound_commitment
+                    == Some(super::service::service_child_bound_commitment(
+                        queue_receipt,
+                        arm_receipt,
+                        receipt.response,
+                        binding_receipt,
+                    ))
+                && receipt.lineage_commitment
+                    == super::service::service_child_bound_commitment(
+                        queue_receipt,
+                        arm_receipt,
+                        receipt.response,
+                        binding_receipt,
+                    )
+                && receipt.binding_receipt == binding_receipt
+                && valid_service_queue_receipt(record, receipt.response, queue_receipt)
+                && valid_service_arm_receipt(record, receipt.response, queue_receipt, arm_receipt)
+                && valid_service_child_binding(record, binding_receipt)
+                && receipt.request_id == descriptor.request_id
+                && receipt.generation == descriptor.generation
+                && receipt.bearer_generation == record.stamp.bearer_generation
+                && receipt.child_effect == binding_receipt.child.child_effect
+                && receipt.response.validate().is_ok()
+                && receipt.result_digest != 0
+                && terminal_response_exists(scope, record, receipt.response)
+                && terminal_claimant_dominates(scope, binding_receipt.claimant)
+        }
+        ServiceRequestPhase::Cancelled { receipt } => {
             receipt.request_id == descriptor.request_id
                 && receipt.generation == descriptor.generation
-                && receipt.result_digest != 0
+                && receipt.bearer_generation == record.stamp.bearer_generation
+                && receipt.evidence_digest != 0
+                && record.child_binding_commitment.is_none()
+                && record.bound_commitment.is_none()
+                && empty_service_action_history(record)
+                && match (receipt.point, receipt.response) {
+                    (ServiceCancellationPoint::ReservedUnbound, None) => {
+                        record.response_identity.is_none()
+                            && record.response_commitment.is_none()
+                            && record.bind_bearer_generation == 0
+                            && service_bearer_after(1, 1, record.stamp.bearer_generation)
+                    }
+                    (ServiceCancellationPoint::ReservedBound, Some(response)) => {
+                        base_bind_chain
+                            && record.response_identity == Some(response)
+                            && record.response_commitment
+                                == Some(super::service::service_response_commitment(response))
+                            && service_bearer_after(
+                                record.bind_bearer_generation,
+                                1,
+                                record.stamp.bearer_generation,
+                            )
+                            && response.validate().is_ok()
+                            && terminal_response_exists(scope, record, response)
+                    }
+                    _ => false,
+                }
         }
-        ServiceRequestPhase::Cancelled { evidence_digest } => evidence_digest != 0,
     };
     if !valid_generations {
         return Err(InfrastructureError::Invariant(
             "service request phase or receipt mismatch",
         ));
     }
-    if let ServiceRequestPhase::Claimed {
-        claim_generation,
-        claimant,
-        ..
-    } = record.phase
-    {
-        if claim_generation == 0 || claim_generation != record.claim_generation {
-            return Err(InfrastructureError::Invariant(
-                "service request claim generation mismatch",
-            ));
-        }
-        validate_current_claimant(scope, descriptor, claimant)?;
-    }
-    if let ServiceRequestPhase::ChildBound { claimant, .. } = record.phase {
-        validate_current_claimant(scope, descriptor, claimant)?;
-    }
     Ok(())
 }
 
+fn service_bearer_after(base: u64, transitions: u64, actual: u64) -> bool {
+    base.checked_add(transitions) == Some(actual)
+}
+
+fn empty_service_action_history(record: &ServiceRequestStateRecord) -> bool {
+    record.apply_generation == 0
+        && record.apply_bearer_generation == 0
+        && record.apply_nonce_high_water == 0
+        && record.arm_generation == 0
+        && record.arm_bearer_generation == 0
+        && record.arm_nonce_high_water == 0
+        && record.claim_generation == 0
+        && record.claim_bearer_generation == 0
+        && record.claim_nonce_high_water == 0
+}
+
 fn valid_service_queue_receipt(
-    descriptor: ServiceRequestDescriptor,
+    record: &ServiceRequestStateRecord,
+    response: super::ContinuationDescriptor,
     receipt: ServiceEnqueueReceipt,
 ) -> bool {
-    receipt.queue == descriptor.queue
+    let descriptor = record.stamp.identity;
+    record.apply_bearer_generation != 0
+        && record.apply_generation != 0
+        && record.apply_nonce_high_water != 0
+        && valid_service_causal_identity(record, response, receipt.plan.causal)
+        && receipt.plan.bearer_generation == record.apply_bearer_generation
+        && receipt.plan.apply_generation == record.apply_generation
+        && receipt.plan.apply_nonce == record.apply_nonce_high_water
+        && receipt.queue == descriptor.queue
         && receipt.queue_generation == descriptor.queue_generation
         && receipt.payload_slot == descriptor.payload_slot
         && receipt.payload_generation == descriptor.payload_generation
@@ -1361,42 +1594,138 @@ fn valid_service_queue_receipt(
 
 fn valid_service_arm_receipt(
     record: &ServiceRequestStateRecord,
+    response: super::ContinuationDescriptor,
+    queue_receipt: ServiceEnqueueReceipt,
     receipt: ServiceArmReceipt,
 ) -> bool {
     let descriptor = record.stamp.identity;
-    record.bound_continuation.is_some_and(|continuation| {
-        receipt.response_slot_id == descriptor.response_slot_id
-            && receipt.response_slot_generation == descriptor.response_slot_generation
-            && receipt.bound_continuation_id == continuation.identity.continuation_id
-            && receipt.bound_continuation_generation == continuation.identity.generation
-            && receipt.arm_generation != 0
-            && receipt.arm_generation == record.arm_generation
-            && receipt.transport_receipt_digest != 0
-    })
+    record.arm_bearer_generation != 0
+        && record.arm_generation != 0
+        && record.arm_nonce_high_water != 0
+        && valid_service_causal_identity(record, response, receipt.plan.causal)
+        && receipt.plan.queue_receipt == queue_receipt
+        && receipt.plan.bearer_generation == record.arm_bearer_generation
+        && receipt.plan.arm_generation == record.arm_generation
+        && receipt.plan.arm_nonce == record.arm_nonce_high_water
+        && receipt.response_slot_id == descriptor.response_slot_id
+        && receipt.response_slot_generation == descriptor.response_slot_generation
+        && receipt.bound_continuation_id == response.continuation_id
+        && receipt.bound_continuation_generation == response.generation
+        && receipt.transport_receipt_digest != 0
 }
 
-fn validate_current_claimant(
+fn valid_service_causal_identity(
+    record: &ServiceRequestStateRecord,
+    response: super::ContinuationDescriptor,
+    causal: ServiceRequestCausalIdentity,
+) -> bool {
+    let parent_task = match record.stamp.parent {
+        ParentStamp::Task(parent) => parent,
+        _ => return false,
+    };
+    causal.registry_instance == record.stamp.root.registry_instance
+        && causal.scope == record.stamp.root.scope
+        && causal.authority_epoch == record.stamp.root.authority_epoch
+        && causal.root_effect == record.stamp.root.root_effect
+        && causal.workload_request_id == record.stamp.workload.request.id
+        && causal.workload_request_generation == record.stamp.workload.request.generation
+        && causal.workload_nonce == record.stamp.workload.nonce
+        && causal.workload_bearer_generation == record.stamp.workload.bearer_generation
+        && causal.admission_domain == record.stamp.domain.domain
+        && causal.admission_binding_epoch == record.stamp.domain.binding_epoch
+        && causal.parent_task == parent_task
+        && causal.request_nonce == record.stamp.nonce
+        && causal.descriptor == record.stamp.identity
+        && causal.response == response
+}
+
+fn valid_service_child_binding(
+    record: &ServiceRequestStateRecord,
+    receipt: ServiceChildBindingReceipt,
+) -> bool {
+    let claimant = receipt.claimant;
+    super::service::valid_service_child_binding_commitment(record, receipt)
+        && claimant.registry_instance == record.stamp.root.registry_instance
+        && claimant.scope == record.stamp.root.scope
+        && claimant.authority_epoch == record.stamp.root.authority_epoch
+        && claimant.root_effect == record.stamp.root.root_effect
+        && claimant.workload_request_id != 0
+        && claimant.workload_request_generation != 0
+        && claimant.workload_nonce != 0
+        && claimant.workload_bearer_generation != 0
+        && claimant.domain == record.stamp.identity.destination_domain
+        && claimant.binding_epoch == record.stamp.identity.destination_binding_epoch
+        && claimant.task.validate().is_ok()
+        && claimant.task_nonce != 0
+        && claimant.task_bearer_generation != 0
+}
+
+fn terminal_claimant_dominates(
     scope: &ScopeInfrastructure,
-    descriptor: ServiceRequestDescriptor,
-    claimant: TaskWorkDescriptor,
-) -> Result<(), InfrastructureError> {
-    let task = scope
+    historical: ServiceClaimantSnapshot,
+) -> bool {
+    scope
         .tasks
-        .get(claimant.work_id)
-        .ok_or(InfrastructureError::Invariant(
-            "service claimant lacks task record",
-        ))?;
-    if task.stamp.identity != claimant
-        || task.phase != TaskPhase::Entered
-        || task.stamp.domain.domain != descriptor.destination_domain
-        || task.stamp.domain.binding_epoch != descriptor.destination_binding_epoch
-        || claimant.vm.is_none()
-    {
-        return Err(InfrastructureError::Invariant(
-            "service claimant authority mismatch",
-        ));
-    }
-    Ok(())
+        .get(historical.task.work_id)
+        .is_some_and(|task| {
+            task.stamp.root.registry_instance == historical.registry_instance
+                && task.stamp.root.scope == historical.scope
+                && task.stamp.root.root_effect == historical.root_effect
+                && task.stamp.root.authority_epoch >= historical.authority_epoch
+                && task.stamp.workload.request.id == historical.workload_request_id
+                && task.stamp.workload.request.generation == historical.workload_request_generation
+                && task.stamp.workload.nonce == historical.workload_nonce
+                && task.stamp.workload.bearer_generation >= historical.workload_bearer_generation
+                && task.stamp.domain.domain == historical.domain
+                && task.stamp.domain.binding_epoch >= historical.binding_epoch
+                && task.stamp.identity == historical.task
+                && task.stamp.nonce == historical.task_nonce
+                && task.stamp.bearer_generation >= historical.task_bearer_generation
+                && task.stamp.parent == ParentStamp::Request(task.stamp.workload.request)
+                && matches!(
+                    task.phase,
+                    TaskPhase::Entered | TaskPhase::Isolated | TaskPhase::Reaped
+                )
+        })
+}
+
+fn terminal_response_exists(
+    scope: &ScopeInfrastructure,
+    service: &ServiceRequestStateRecord,
+    response: super::ContinuationDescriptor,
+) -> bool {
+    service.response_identity == Some(response)
+        && scope
+            .continuations
+            .get(response.continuation_id)
+            .is_some_and(|continuation| {
+                continuation.service_owner.is_none()
+                    && continuation.stamp.root.registry_instance
+                        == service.stamp.root.registry_instance
+                    && continuation.stamp.root.scope == service.stamp.root.scope
+                    && continuation.stamp.root.root_effect == service.stamp.root.root_effect
+                    && continuation.stamp.root.authority_epoch >= service.stamp.root.authority_epoch
+                    && continuation.stamp.workload.request == service.stamp.workload.request
+                    && continuation.stamp.workload.nonce == service.stamp.workload.nonce
+                    && continuation.stamp.workload.bearer_generation
+                        >= service.stamp.workload.bearer_generation
+                    && continuation.stamp.domain.domain == service.stamp.domain.domain
+                    && continuation.stamp.domain.binding_epoch >= service.stamp.domain.binding_epoch
+                    && matches!(
+                        (continuation.stamp.parent, service.stamp.parent),
+                        (ParentStamp::Task(current), ParentStamp::Task(historical))
+                            if current == historical
+                    )
+                    && continuation.stamp.identity.continuation_id == response.continuation_id
+                    && continuation.stamp.identity.generation == response.generation
+                    && continuation.stamp.identity.vm_generation == response.vm_generation
+                    && response.source_domain == continuation.origin_source.domain
+                    && response.source_binding_epoch == continuation.origin_source.binding_epoch
+                    && continuation.stamp.identity.source_domain
+                        == continuation.origin_source.domain
+                    && continuation.stamp.identity.source_binding_epoch
+                        >= continuation.origin_source.binding_epoch
+            })
 }
 
 fn check_service_continuation_owners(
@@ -1408,6 +1737,13 @@ fn check_service_continuation_owners(
             generation: request.stamp.identity.generation,
         };
         let Some(bound) = request.bound_continuation else {
+            if service_request_phase_live(request.phase)
+                && !matches!(request.phase, ServiceRequestPhase::ReservedUnbound)
+            {
+                return Err(InfrastructureError::Invariant(
+                    "live bound service request lacks continuation owner",
+                ));
+            }
             continue;
         };
         let continuation = scope
@@ -1416,39 +1752,24 @@ fn check_service_continuation_owners(
             .ok_or(InfrastructureError::Invariant(
                 "service request bound continuation is missing",
             ))?;
-        if service_request_phase_live(request.phase) {
-            let current_source = scope
-                .binding_epoch(continuation.stamp.identity.source_domain)
-                .map_err(|_| {
-                    InfrastructureError::Invariant(
-                        "service continuation references unknown source domain",
-                    )
-                })?;
-            if continuation.stamp != bound
-                || continuation.stamp.workload != request.stamp.workload
-                || continuation.stamp.parent != request.stamp.parent
-                || continuation.service_owner != Some(owner)
-                || continuation.phase != ContinuationPhase::Pending
-                || continuation.stamp.identity.source_binding_epoch != current_source
-            {
-                return Err(InfrastructureError::Invariant(
-                    "live service continuation owner mismatch",
-                ));
-            }
-        } else {
-            if bound.workload != request.stamp.workload
-                || bound.parent != request.stamp.parent
-                || !historical_continuation_matches(bound, continuation.stamp)
-            {
-                return Err(InfrastructureError::Invariant(
-                    "terminal service continuation history mismatch",
-                ));
-            }
-            if continuation.service_owner == Some(owner) {
-                return Err(InfrastructureError::Invariant(
-                    "terminal service request retains continuation owner",
-                ));
-            }
+        let current_source = scope
+            .binding_epoch(continuation.stamp.identity.source_domain)
+            .map_err(|_| {
+                InfrastructureError::Invariant(
+                    "service continuation references unknown source domain",
+                )
+            })?;
+        if !service_request_phase_live(request.phase)
+            || continuation.stamp != bound
+            || continuation.stamp.workload != request.stamp.workload
+            || continuation.stamp.parent != request.stamp.parent
+            || continuation.service_owner != Some(owner)
+            || continuation.phase != ContinuationPhase::Pending
+            || continuation.stamp.identity.source_binding_epoch != current_source
+        {
+            return Err(InfrastructureError::Invariant(
+                "live service continuation owner mismatch",
+            ));
         }
         if scope
             .service_requests
@@ -1489,24 +1810,4 @@ fn check_service_continuation_owners(
         }
     }
     Ok(())
-}
-
-fn historical_continuation_matches(
-    historical: BearerStamp<super::ContinuationDescriptor>,
-    current: BearerStamp<super::ContinuationDescriptor>,
-) -> bool {
-    historical.root == current.root
-        && historical.workload.request == current.workload.request
-        && historical.workload.nonce == current.workload.nonce
-        && historical.workload.bearer_generation <= current.workload.bearer_generation
-        && historical.domain.domain == current.domain.domain
-        && historical.domain.binding_epoch <= current.domain.binding_epoch
-        && historical.parent == current.parent
-        && historical.nonce == current.nonce
-        && historical.bearer_generation <= current.bearer_generation
-        && historical.identity.continuation_id == current.identity.continuation_id
-        && historical.identity.generation == current.identity.generation
-        && historical.identity.vm_generation == current.identity.vm_generation
-        && historical.identity.source_domain == current.identity.source_domain
-        && historical.identity.source_binding_epoch <= current.identity.source_binding_epoch
 }

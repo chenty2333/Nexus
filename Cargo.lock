@@ -96,6 +96,7 @@ version = "0.1.0"
 dependencies = [
  "loom",
  "nexus-portal-abi",
+ "sha2",
 ]
 
 [[package]]
