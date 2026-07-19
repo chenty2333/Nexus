@@ -3,6 +3,8 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+mod task_fault_source;
+
 const INPUT: &str = "kernel/nexus-ostd/artifacts/stage7b-evaluation.log";
 const RUNTIME_METADATA: &str = "kernel/nexus-ostd/artifacts/stage7b-runtime-metadata.env";
 const EVALUATOR_SOURCE: &str = "kernel/nexus-ostd/src/evaluation/stage7b.rs";
@@ -655,13 +657,14 @@ fn validate_fault_registry_source_text(source: &str) -> Result<(), String> {
         );
     }
 
-    let registry_constructors = source.matches("EffectRegistry::new()").count();
-    if registry_constructors != 12 {
+    let registry_constructors =
+        task_fault_source::validate_and_count_registry_constructors(source)?;
+    let textual_registry_constructors = source.matches("EffectRegistry::new()").count();
+    if registry_constructors != 14 || textual_registry_constructors != 14 {
         return Err(format!(
-            "Stage 7B Registry source constructor population drifted; hidden sidecars are forbidden (expected 12, observed {registry_constructors})"
+            "Stage 7B Registry source constructor population drifted; hidden sidecars are forbidden (expected 14, observed semantic={registry_constructors} textual={textual_registry_constructors})"
         ));
     }
-
     let publication_start = source
         .find("fn publication_ack_and_revoke_complete_self_test() {")
         .ok_or_else(|| "Registry lacks combined publication/revoke self-test".to_owned())?;
@@ -717,7 +720,7 @@ fn validate_fault_registry_source_text(source: &str) -> Result<(), String> {
         .find("#[cfg(test)]\nfn combined_scope_candidate_self_test() {")
         .ok_or_else(|| "Registry lacks combined-scope candidate self-test".to_owned())?;
     let combined_end = source[combined_start..]
-        .find("pub(crate) fn production_identity_registry_self_test() {")
+        .find("#[cfg(test)]\nfn task_owned_fault_outer_transaction_self_test() {")
         .map(|offset| combined_start + offset)
         .ok_or_else(|| "combined-scope candidate self-test boundary is unterminated".to_owned())?;
     let combined = &source[combined_start..combined_end];
@@ -4582,6 +4585,8 @@ mod tests {
             "mutation must preserve the implementation self-test call count"
         );
         assert!(validate_fault_registry_source_text(&moved_to_fault_helper).is_err());
+
+        task_fault_source::exercise_negative_mutations(&source);
     }
 
     #[test]
