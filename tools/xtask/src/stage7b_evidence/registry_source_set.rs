@@ -277,6 +277,11 @@ const CHECKED_ITEM_OWNERSHIP: &[CheckedItemOwner] = &[
     ),
     owned(
         CheckedItemKind::Function,
+        "device_preparation_outer_materialization_self_test",
+        RegistryUnit::Authority,
+    ),
+    owned(
+        CheckedItemKind::Function,
         "production_identity_registry_self_test",
         RegistryUnit::Authority,
     ),
@@ -300,6 +305,21 @@ struct AllowedRegistryHolder {
 }
 
 const ALLOWED_REGISTRY_HOLDERS: &[AllowedRegistryHolder] = &[
+    // The device materialization transaction is a private, synchronous,
+    // allocation-bearing fallback. `base` is immutable stale-candidate
+    // evidence and `candidate` is installed at most once; neither field is
+    // exposed as caller authority. The O(N) shape remains an explicit
+    // non-claim until a preallocated per-scope transaction replaces it.
+    AllowedRegistryHolder {
+        owner: RegistryUnit::Authority,
+        item: "DeviceCohortMaterializationPlan",
+        field: "base",
+    },
+    AllowedRegistryHolder {
+        owner: RegistryUnit::Authority,
+        item: "DeviceCohortMaterializationPlan",
+        field: "candidate",
+    },
     AllowedRegistryHolder {
         owner: RegistryUnit::Authority,
         item: "DeviceDerivedCohortPlan",

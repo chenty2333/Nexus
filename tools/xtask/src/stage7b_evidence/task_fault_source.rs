@@ -5,6 +5,7 @@ use syn::visit::Visit;
 const TASK_TEST: &str = "task_owned_fault_outer_transaction_self_test";
 const ORDINARY_TEST: &str = "ordinary_domain_crash_rejects_a_forged_fault_origin";
 const DEVICE_TEST: &str = "device_preparation_outer_credit_self_test";
+const DEVICE_MATERIALIZATION_TEST: &str = "device_preparation_outer_materialization_self_test";
 const PRODUCTION_TEST: &str = "production_identity_registry_self_test";
 
 #[derive(Default)]
@@ -277,10 +278,22 @@ fn validate_task_fault_self_tests(syntax: &syn::File) -> Result<(), String> {
         PRODUCTION_TEST,
         "production-identity Registry self-test",
     )?;
+    let device =
+        exact_top_level_function(syntax, DEVICE_TEST, "device-preparation credit self-test")?;
+    let materialization = exact_top_level_function(
+        syntax,
+        DEVICE_MATERIALIZATION_TEST,
+        "device-preparation materialization self-test",
+    )?;
     validate_zero_argument_private_test_function(task, "task-owned fault self-test")?;
     validate_zero_argument_private_test_function(
         ordinary,
         "ordinary domain-crash origin self-test",
+    )?;
+    validate_zero_argument_private_test_function(device, "device-preparation credit self-test")?;
+    validate_zero_argument_private_test_function(
+        materialization,
+        "device-preparation materialization self-test",
     )?;
 
     let nested = task
@@ -422,6 +435,10 @@ fn validate_task_fault_self_tests(syntax: &syn::File) -> Result<(), String> {
         (TASK_TEST, "task-owned fault self-test"),
         (ORDINARY_TEST, "ordinary domain-crash origin self-test"),
         (DEVICE_TEST, "device-preparation credit self-test"),
+        (
+            DEVICE_MATERIALIZATION_TEST,
+            "device-preparation materialization self-test",
+        ),
     ] {
         if direct_cfg_test_call_count(production, name) != 1
             || production_audit.function_calls(name) != 1

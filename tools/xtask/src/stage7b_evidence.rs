@@ -13,7 +13,7 @@ const FAULT_REGISTRY_SOURCE: &str = registry_source_set::RegistryUnit::Authority
 const KERNEL_SOURCE_DIRECTORY: &str = "kernel/nexus-ostd/src";
 const OUTPUT_DIRECTORY: &str = "target/verification/stage7b";
 const FAULT_OUTPUT: &str = "fault-matrix.jsonl";
-const EXPECTED_REGISTRY_CONSTRUCTORS: usize = 15;
+const EXPECTED_REGISTRY_CONSTRUCTORS: usize = 16;
 const SCALE_OUTPUT: &str = "scale.jsonl";
 const PERFORMANCE_OUTPUT: &str = "performance.json";
 const ORACLE_OUTPUT: &str = "oracle.log";
@@ -1522,6 +1522,13 @@ fn validate_production_device_batch_source_text(source: &str) -> Result<(), Stri
         .find("    fn rewrite_registry_instance(")
         .map(|offset| projection_clone_start + offset)
         .ok_or_else(|| "Registry diagnostic projection boundary is unterminated".to_owned())?;
+    let materialization_clone_start = registry_impl
+        .find("    fn prepare_device_cohort_materialization(")
+        .ok_or_else(|| "device materialization lacks its private prepare phase".to_owned())?;
+    let materialization_clone_end = registry_impl[materialization_clone_start..]
+        .find("    fn apply_device_cohort_materialization(")
+        .map(|offset| materialization_clone_start + offset)
+        .ok_or_else(|| "device materialization prepare boundary is unterminated".to_owned())?;
     let exact_registry_declaration =
         format!("{CSER_CORE_DERIVE_DEBUG_EQ_PARTIAL_EQ}\npub(crate) struct EffectRegistry {{");
     if source.matches(&exact_registry_declaration).count() != 1
@@ -1533,7 +1540,7 @@ fn validate_production_device_batch_source_text(source: &str) -> Result<(), Stri
         || registry_impl.contains("pub(super) fn clone(&self) -> Self")
         || source.contains("impl Clone for EffectRegistry")
         || registry_impl.contains("authority_copy")
-        || registry_impl.matches("self.clone()").count() != 3
+        || registry_impl.matches("self.clone()").count() != 5
         || registry_impl[candidate_clone_start..candidate_clone_end]
             .matches("self.clone()")
             .count()
@@ -1543,9 +1550,13 @@ fn validate_production_device_batch_source_text(source: &str) -> Result<(), Stri
             .count()
             != 1
         || cohort_prepare.matches("self.clone()").count() != 1
+        || registry_impl[materialization_clone_start..materialization_clone_end]
+            .matches("self.clone()")
+            .count()
+            != 2
     {
         return Err(
-            "EffectRegistry inherent cloning must remain private and confined to the exact legacy candidate, diagnostic projection, and device-cohort preparation sites"
+            "EffectRegistry inherent cloning must remain private and confined to the exact legacy candidate, diagnostic projection, device-cohort registration, and materialization preparation sites"
                 .into(),
         );
     }
@@ -2148,8 +2159,7 @@ fn validate_production_device_batch_source_text(source: &str) -> Result<(), Stri
         .find("    pub(crate) fn revoke_work_projection(")
         .map(|offset| revoke_finish_apply_start + offset)
         .ok_or_else(|| "revoke completion apply boundary is unterminated".to_owned())?;
-    let revoke_finish_prepare =
-        &source[revoke_finish_prepare_start..revoke_finish_apply_start];
+    let revoke_finish_prepare = &source[revoke_finish_prepare_start..revoke_finish_apply_start];
     let revoke_finish_apply = &source[revoke_finish_apply_start..revoke_finish_end];
     for required in [
         "self.validate_revoke_selection(selection)?;",
@@ -3807,6 +3817,23 @@ mod tests {
             error.contains("device-preparation credit self-test")
                 && error.contains("must be called exactly once"),
             "unbound device-preparation self-test failed through the wrong gate: {error}"
+        );
+    }
+
+    #[test]
+    fn registry_source_set_rejects_unbound_device_materialization_self_test() {
+        let source = checked_registry_source();
+        let mutated = source.replacen(
+            "    device_preparation_outer_materialization_self_test();",
+            "    device_preparation_outer_materialization_self_test_disabled();",
+            1,
+        );
+        assert_ne!(mutated, source);
+        let error = validate_fault_registry_source_text(&mutated).unwrap_err();
+        assert!(
+            error.contains("device-preparation materialization self-test")
+                && error.contains("must be called exactly once"),
+            "unbound device-materialization self-test failed through the wrong gate: {error}"
         );
     }
 

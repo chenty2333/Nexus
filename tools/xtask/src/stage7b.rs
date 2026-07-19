@@ -2057,7 +2057,7 @@ fn validate_scale_instrumentation_source(source: &str) -> Result<(), String> {
     let remove_indexes = source_region(
         source,
         "    fn remove_reverse_indexes(",
-        "\n}\n\nfn validate_generation(",
+        "    fn insert_resource_indexes(",
         "EffectRegistry::remove_reverse_indexes",
     )?;
     let access = source_region(
