@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
+use super::fault::validate_exact_task_fault_pair;
 use super::{
     ArmedFaultTask, EnteredTaskLease, FaultPhase, InfrastructureError, InfrastructureEventKind,
     InfrastructureKind, InfrastructureState, LinearResult, ParentStamp, ReservedFaultTask,
@@ -8,7 +9,8 @@ use super::{
     TaskWorkDescriptor, TaskWorkRole, WorkloadContext, bearer_state, checked_add, checked_sub,
     linear_apply, mint_task_key, next_task_bearer_generation, preview_bearer_stamp,
     preview_revision, preview_workload_child_add, preview_workload_child_sub, require_vacancy,
-    validate_active_admission, validate_context, validate_recovery_context, validate_task_key,
+    reverse_index_for_fault, reverse_index_for_task, validate_active_admission, validate_context,
+    validate_recovery_context, validate_task_key,
 };
 
 impl InfrastructureState {
@@ -335,27 +337,17 @@ impl InfrastructureState {
         let task_index = scope
             .reverse_indexes
             .get(task_index_slot)
-            .ok_or(InfrastructureError::Invariant("missing task reverse index"))?;
-        if task_index.kind != InfrastructureKind::Task {
+            .ok_or(InfrastructureError::Invariant("invalid task reverse index"))?;
+        if *task_index != reverse_index_for_task(record) {
             return Err(InfrastructureError::Invariant("invalid task reverse index"));
         }
         let composite = if let Some(link) = record.service_fault {
-            let fault = scope
-                .faults
-                .get(link.fault_id)
-                .ok_or(InfrastructureError::UnknownObligation)?;
-            if fault.stamp.identity.generation != link.fault_object_generation
-                || fault.stamp.bearer_generation != link.fault_bearer_generation
-                || fault.stamp.nonce != link.fault_nonce
-                || fault.owner.task != task_stamp.identity
-                || fault.owner.task_object_nonce != task_stamp.nonce
-                || fault.owner.task_bearer_generation != task_stamp.bearer_generation
-                || !matches!(
-                    (phase, fault.phase),
-                    (TaskPhase::Admitted, FaultPhase::Reserved)
-                        | (TaskPhase::Entered, FaultPhase::Armed)
-                )
-            {
+            let (_, fault) = validate_exact_task_fault_pair(scope, record)?;
+            if !matches!(
+                (phase, fault.phase),
+                (TaskPhase::Admitted, FaultPhase::Reserved)
+                    | (TaskPhase::Entered, FaultPhase::Armed)
+            ) {
                 return Err(InfrastructureError::StaleClaim);
             }
             let fault_generation = fault
@@ -364,9 +356,9 @@ impl InfrastructureState {
                 .checked_add(1)
                 .ok_or(InfrastructureError::CounterOverflow)?;
             let fault_index = scope.reverse_indexes.get(fault.stamp.nonce).ok_or(
-                InfrastructureError::Invariant("missing fault reverse index"),
+                InfrastructureError::Invariant("invalid fault reverse index"),
             )?;
-            if fault_index.kind != InfrastructureKind::Fault {
+            if *fault_index != reverse_index_for_fault(fault) {
                 return Err(InfrastructureError::Invariant(
                     "invalid fault reverse index",
                 ));

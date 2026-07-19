@@ -15,7 +15,7 @@ use super::{
     next_continuation_bearer_generation, preview_bearer_stamp, preview_nonce, preview_nonces,
     preview_revision, preview_task_child_add, preview_task_child_sub, preview_workload_child_add,
     preview_workload_child_sub, require_vacancy, validate_active_admission, validate_context,
-    validate_continuation_key, validate_task_key, validate_task_stamp,
+    validate_continuation_key, validate_task_child_stamp, validate_task_key, validate_task_stamp,
 };
 
 enum PreparedContinuationAdoption {
@@ -452,6 +452,9 @@ impl InfrastructureState {
             let registry_instance = self.registry_instance;
             let scope = self.scope_mut(lease.0.authority.scope)?;
             let record = validate_continuation_key(scope, registry_instance, &lease.0)?;
+            if validate_task_child_stamp(scope, registry_instance, &record.stamp)? {
+                return Err(InfrastructureError::InvalidState);
+            }
             if record.service_owner.is_some() {
                 return Err(InfrastructureError::InvalidState);
             }
@@ -513,6 +516,9 @@ impl InfrastructureState {
             let registry_instance = self.registry_instance;
             let scope = self.scope_mut(claim.0.authority.scope)?;
             let record = validate_continuation_key(scope, registry_instance, &claim.0)?;
+            if validate_task_child_stamp(scope, registry_instance, &record.stamp)? {
+                return Err(InfrastructureError::InvalidState);
+            }
             if record.service_owner.is_some() {
                 return Err(InfrastructureError::InvalidState);
             }
@@ -861,6 +867,24 @@ impl InfrastructureState {
             let scope = self.scope_mut(lease.0.authority.scope)?;
             let record = validate_continuation_key(scope, registry_instance, &lease.0)?;
             if record.service_owner.is_some() || record.phase != ContinuationPhase::Pending {
+                return Err(InfrastructureError::InvalidState);
+            }
+            finish_continuation_cancel(scope, record.stamp)
+        })
+    }
+
+    pub(in super::super) fn cancel_claimed_continuation(
+        &mut self,
+        claim: WakeClaim,
+    ) -> LinearResult<WakeClaim, ()> {
+        linear_apply(claim, |claim| {
+            self.require_authoritative()?;
+            let registry_instance = self.registry_instance;
+            let scope = self.scope_mut(claim.0.authority.scope)?;
+            let record = validate_continuation_key(scope, registry_instance, &claim.0)?;
+            if record.service_owner.is_some()
+                || !matches!(record.phase, ContinuationPhase::Claimed { .. })
+            {
                 return Err(InfrastructureError::InvalidState);
             }
             finish_continuation_cancel(scope, record.stamp)

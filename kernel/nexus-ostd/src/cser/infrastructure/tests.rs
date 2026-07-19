@@ -13,7 +13,8 @@ use super::{
     DelayedCommandRejectionReceipt, DeviceReservationCoordinates, DomainKey, EffectKey,
     EnqueuedServiceRequest, EnteredTaskLease, FaultAccess, FaultDisposition, FaultObservation,
     FaultPhase, FaultSlotDescriptor, InfrastructureError, InfrastructureKind, InfrastructureLimits,
-    InfrastructureState, LinearFailure, PortalHandle, ReplyDescriptor, ResourceKey, ScopeKey,
+    InfrastructureState, LinearFailure, PortalHandle, ReplyAbortAuthority, ReplyDescriptor,
+    ReplyPublicationReceipt, ResourceKey, ReverseIndexRecord, ReverseParent, ScopeKey,
     ServiceArmAuthority, ServiceArmPlan, ServiceArmReceipt, ServiceBoundKey,
     ServiceCancellationPoint, ServiceChildBindingReceipt, ServiceChildReceipt,
     ServiceClaimantSnapshot, ServiceEnqueueAuthority, ServiceEnqueuePlan, ServiceEnqueueReceipt,
@@ -563,6 +564,33 @@ fn deadline_coordinates(state: &InfrastructureState) -> (u64, u64, u64) {
         record.stamp.bearer_generation,
         record.stamp.nonce,
     )
+}
+
+fn deadline_expiry_coordinates(
+    expiry: &DeadlineExpiryReceipt,
+) -> (bool, u64, ScopeKey, u64, u64, u64, u64, u64) {
+    match &expiry.0 {
+        DeadlineExpiryAuthority::Fired(key) => (
+            false,
+            key.authority.registry_instance,
+            key.authority.scope,
+            key.authority.authority_epoch,
+            key.slot,
+            key.object_generation,
+            key.bearer_generation,
+            key.nonce,
+        ),
+        DeadlineExpiryAuthority::Exhausted(key) => (
+            true,
+            key.authority.registry_instance,
+            key.authority.scope,
+            key.authority.authority_epoch,
+            key.slot,
+            key.object_generation,
+            key.bearer_generation,
+            key.nonce,
+        ),
+    }
 }
 
 fn assert_deadline_key_rejected_without_mutation(
@@ -3671,6 +3699,15 @@ fn assert_invariant_read_only(state: InfrastructureState) {
     assert_eq!(state, before);
 }
 
+fn assert_invariant_message_read_only(state: InfrastructureState, message: &'static str) {
+    let before = state.private_full_clone();
+    assert_eq!(
+        state.check_invariants(),
+        Err(InfrastructureError::Invariant(message))
+    );
+    assert_eq!(state, before);
+}
+
 fn publication_state() -> InfrastructureState {
     let mut state = InfrastructureState::new(0x9010);
     state
@@ -3847,9 +3884,9 @@ fn fault_plan_commitment_is_frozen_and_every_field_is_bound() {
     assert_eq!(
         plan.commitment.0,
         [
-            0xb0, 0x04, 0x5b, 0x95, 0xd1, 0x41, 0x52, 0x88, 0x7b, 0x87, 0x6b, 0x6f, 0x87, 0x17,
-            0xa6, 0x7f, 0x44, 0xd4, 0x8e, 0x17, 0xf5, 0x5d, 0xa8, 0x0a, 0x77, 0x57, 0xd6, 0x91,
-            0x74, 0xaf, 0x5b, 0xd9,
+            0x1c, 0xde, 0xeb, 0xe8, 0x8c, 0x92, 0xd3, 0x78, 0x71, 0x54, 0x50, 0x11, 0xd5, 0xd1,
+            0xe2, 0x5f, 0x1f, 0xdc, 0xd9, 0x95, 0x27, 0x5e, 0x79, 0x9f, 0x0b, 0x7b, 0x99, 0x88,
+            0xe3, 0x37, 0xa5, 0x85,
         ]
     );
 
@@ -3878,8 +3915,20 @@ fn fault_plan_commitment_is_frozen_and_every_field_is_bound() {
         |plan| plan.observation.access = FaultAccess::Execute,
         |plan| plan.observation.architecture_error += 1,
         |plan| plan.observation.evidence_digest += 1,
+        |plan| plan.projection.fault_id += 1,
+        |plan| plan.projection.generation += 1,
+        |plan| {
+            plan.projection.task = TaskKey::new(
+                plan.projection.task.id() + 1,
+                plan.projection.task.generation(),
+            )
+        },
+        |plan| plan.projection.vm_generation += 1,
         |plan| plan.projection.disposition = FaultDisposition::IsolateTask,
+        |plan| plan.projection.service_domain = DomainKey::new(SERVICE.value() + 1),
+        |plan| plan.projection.closed_binding_epoch += 1,
         |plan| plan.projection.crash_generation += 1,
+        |plan| plan.projection.evidence_digest += 1,
         |plan| plan.base_revision += 1,
         |plan| plan.next_binding_epoch += 1,
         |plan| plan.business.scope_revision += 1,
@@ -3905,6 +3954,42 @@ fn fault_plan_commitment_is_frozen_and_every_field_is_bound() {
                 | InfrastructureError::UnknownDomain
                 | InfrastructureError::StaleBinding
         ));
+        assert_eq!(state, before);
+        assert_eq!(
+            service_key_coordinates(&failure.into_input().0),
+            service_key_coordinates(&current_armed_fault(&state).0)
+        );
+    }
+}
+
+#[test]
+fn fault_install_rejects_noncanonical_projection_with_matching_commitment() {
+    type Mutate = fn(&mut super::FaultDispositionPlan);
+    let mutations: &[Mutate] = &[
+        |plan| plan.projection.fault_id += 1,
+        |plan| plan.projection.generation += 1,
+        |plan| {
+            plan.projection.task = TaskKey::new(
+                plan.projection.task.id() + 1,
+                plan.projection.task.generation(),
+            )
+        },
+        |plan| plan.projection.vm_generation += 1,
+        |plan| plan.projection.service_domain = DomainKey::new(SERVICE.value() + 1),
+        |plan| plan.projection.closed_binding_epoch += 1,
+        |plan| plan.projection.evidence_digest += 1,
+    ];
+    for mutate in mutations {
+        let (mut state, _, armed, observation) = armed_fault_state(0xfc10);
+        let (mut intent, mut plan) = state
+            .prepare_fault_disposition(armed, observation, FaultDisposition::CrashService)
+            .unwrap();
+        mutate(&mut plan);
+        plan.commitment = super::fault::fault_plan_commitment(state.scope(SCOPE).unwrap(), plan);
+        intent.commitment = plan.commitment.0;
+        let before = state.private_full_clone();
+        let failure = state.install_fault_disposition(intent, plan).unwrap_err();
+        assert_eq!(failure.error(), InfrastructureError::InvalidReceipt);
         assert_eq!(state, before);
         assert_eq!(
             service_key_coordinates(&failure.into_input().0),
@@ -4000,6 +4085,128 @@ fn reserved_fault_adoption_is_composite_and_preflight_failure_is_atomic() {
     state.check_invariants().unwrap();
 }
 
+fn fault_adoption_preflight_state(
+    registry_instance: u64,
+    armed: bool,
+) -> (InfrastructureState, WorkloadContext) {
+    let mut state = InfrastructureState::new(registry_instance);
+    state
+        .enable(SCOPE, 1, ROOT, limits(), &[(SERVICE, 1)])
+        .unwrap();
+    let workload = state
+        .open_workload(
+            WorkloadRootPresentation::new(SCOPE, 1, ROOT),
+            WorkloadRequestPresentation::new(SERVICE, 1, 0xfd81, 1),
+        )
+        .unwrap();
+    let task_key = TaskKey::new(0xfd82, 1);
+    let task = state
+        .admit_task(
+            &workload,
+            TaskWorkDescriptor {
+                work_id: 0xfd83,
+                generation: 1,
+                task: task_key,
+                role: TaskWorkRole::ServiceRequest,
+                vm: Some(VmAuthorityKey::new(0xfd84, 1).unwrap()),
+            },
+        )
+        .unwrap();
+    let reserved = state
+        .reserve_fault_event(
+            task,
+            FaultSlotDescriptor {
+                fault_id: 0xfd85,
+                generation: 1,
+                task: task_key,
+                vm_generation: 1,
+                service_domain: SERVICE,
+                admission_binding_epoch: 1,
+            },
+        )
+        .unwrap();
+    if armed {
+        let _armed = state.claim_service_task_entry(reserved).unwrap();
+    }
+    *state
+        .scope_mut(SCOPE)
+        .unwrap()
+        .binding_epoch_mut(SERVICE)
+        .unwrap() = 2;
+    let workload = state
+        .adopt_workload_after_fence(
+            WorkloadRootPresentation::new(SCOPE, 1, ROOT),
+            WorkloadRequestPresentation::new(SERVICE, 2, 0xfd81, 1),
+        )
+        .unwrap();
+    (state, workload)
+}
+
+#[test]
+fn fault_adoption_validates_every_task_and_fault_reverse_coordinate() {
+    type Mutate = fn(&mut ReverseIndexRecord);
+    let mutations: &[Mutate] = &[
+        |index| index.slot += 1,
+        |index| index.kind = InfrastructureKind::Deadline,
+        |index| index.root_effect = EffectKey::new(ROOT.id() + 1, ROOT.generation()),
+        |index| index.parent = ReverseParent::RootEffect(ROOT),
+        |index| index.task = Some(TaskKey::new(0xfda0, 1)),
+        |index| index.domain = GUEST,
+        |index| index.binding_epoch += 1,
+        |index| index.source_domain = Some(SERVICE),
+        |index| index.source_binding_epoch = Some(1),
+        |index| index.resource = Some(ResourceKey::new(0xfd, 1, 1)),
+        |index| index.actor_slot = Some(1),
+        |index| index.retry_generation += 1,
+    ];
+    let mut registry_instance = 0xfd90;
+    for armed in [false, true] {
+        for fault_row in [false, true] {
+            for mutate in mutations {
+                registry_instance += 1;
+                let (mut state, workload) =
+                    fault_adoption_preflight_state(registry_instance, armed);
+                let slot = {
+                    let scope = state.scope(SCOPE).unwrap();
+                    if fault_row {
+                        scope.faults.get(0xfd85).unwrap().stamp.nonce
+                    } else {
+                        scope.tasks.get(0xfd83).unwrap().stamp.nonce
+                    }
+                };
+                mutate(
+                    state
+                        .scope_mut(SCOPE)
+                        .unwrap()
+                        .reverse_indexes
+                        .get_mut(slot)
+                        .unwrap(),
+                );
+                let before = state.private_full_clone();
+                assert_eq!(
+                    state.adopt_task_after_fence(&workload, 0xfd83, 1),
+                    Err(InfrastructureError::Invariant(if fault_row {
+                        "invalid fault reverse index"
+                    } else {
+                        "invalid task reverse index"
+                    }))
+                );
+                assert_eq!(state, before);
+            }
+        }
+    }
+
+    for (instance, armed) in [(0xfde0, false), (0xfde1, true)] {
+        let (mut state, workload) = fault_adoption_preflight_state(instance, armed);
+        let adoption = state.adopt_task_after_fence(&workload, 0xfd83, 1).unwrap();
+        assert!(matches!(
+            (armed, adoption),
+            (false, TaskAdoption::FaultReserved(_)) | (true, TaskAdoption::FaultArmed(_))
+        ));
+        state.check_invariants().unwrap();
+    }
+}
+
 #[test]
 fn terminal_fault_retains_deadline_then_drains_historical_task_anchor() {
     let (mut state, workload, armed, observation) = armed_fault_state(0xfd20);
@@ -4049,6 +4256,107 @@ fn terminal_fault_retains_deadline_then_drains_historical_task_anchor() {
     assert_eq!(state, before);
 
     state.cancel_deadline(deadline).unwrap();
+    let drained = state.query_task(&workload, 0xfc30, 1).unwrap();
+    assert_eq!(drained.live_children, 0);
+    assert_eq!(drained.anchor, TaskAnchorRecoveryState::TerminalDrained);
+    state.check_invariants().unwrap();
+}
+
+#[test]
+fn terminal_deadline_may_drain_armed_fire_but_cannot_rearm_or_supervisor_retry() {
+    let (mut state, workload, armed, observation) = armed_fault_state(0xfd40);
+    let fired_deadline = state
+        .arm_service_deadline(
+            &armed,
+            DeadlineDescriptor {
+                series_id: 0xfd41,
+                generation: 1,
+                purpose: DeadlinePurpose::Recovery,
+                clock: DeadlineClockBasis::ObservedCallbackTick,
+                deadline_tick: 10,
+                attempt: 1,
+                max_attempts: 2,
+                backoff_ticks: 1,
+            },
+        )
+        .unwrap();
+    let exhausted_deadline = state
+        .arm_service_deadline(
+            &armed,
+            DeadlineDescriptor {
+                series_id: 0xfd42,
+                generation: 1,
+                purpose: DeadlinePurpose::Recovery,
+                clock: DeadlineClockBasis::ObservedCallbackTick,
+                deadline_tick: 10,
+                attempt: 1,
+                max_attempts: 1,
+                backoff_ticks: 1,
+            },
+        )
+        .unwrap();
+    let (intent, plan) = state
+        .prepare_fault_disposition(armed, observation, FaultDisposition::CrashService)
+        .unwrap();
+    state.install_fault_disposition(intent, plan).unwrap();
+
+    let fired = state
+        .fire_deadline(fired_deadline, DeadlineClockBasis::ObservedCallbackTick, 10)
+        .unwrap();
+    let fired_coordinates = deadline_expiry_coordinates(&fired);
+    let before = state.private_full_clone();
+    let failure = state.rearm_deadline(fired, 2, 11).unwrap_err();
+    assert_eq!(failure.error(), InfrastructureError::InvalidState);
+    assert_eq!(state, before);
+    let fired = failure.into_input();
+    assert_eq!(deadline_expiry_coordinates(&fired), fired_coordinates);
+    state.resolve_fired_deadline(fired).unwrap();
+
+    let exhausted = state
+        .fire_deadline(
+            exhausted_deadline,
+            DeadlineClockBasis::ObservedCallbackTick,
+            10,
+        )
+        .unwrap();
+    let exhausted_coordinates = deadline_expiry_coordinates(&exhausted);
+    let before = state.private_full_clone();
+    let failure = state
+        .reconcile_exhausted_deadline(
+            exhausted,
+            DeadlineReconciliationReceipt {
+                disposition: DeadlineExhaustedDisposition::RetryBySupervisor,
+                evidence_digest: 0xfd43,
+            },
+            Some(DeadlineSupervisorRetry {
+                generation: 2,
+                deadline_tick: 11,
+                max_attempts: 1,
+                backoff_ticks: 1,
+            }),
+        )
+        .unwrap_err();
+    assert_eq!(failure.error(), InfrastructureError::InvalidState);
+    assert_eq!(state, before);
+    let exhausted = failure.into_input();
+    assert_eq!(
+        deadline_expiry_coordinates(&exhausted),
+        exhausted_coordinates
+    );
+    assert!(matches!(
+        state
+            .reconcile_exhausted_deadline(
+                exhausted,
+                DeadlineReconciliationReceipt {
+                    disposition: DeadlineExhaustedDisposition::AbortWork,
+                    evidence_digest: 0xfd44,
+                },
+                None,
+            )
+            .unwrap(),
+        DeadlineReconciliationOutcome::Aborted
+    ));
+
     let drained = state.query_task(&workload, 0xfc30, 1).unwrap();
     assert_eq!(drained.live_children, 0);
     assert_eq!(drained.anchor, TaskAnchorRecoveryState::TerminalDrained);
@@ -4108,6 +4416,13 @@ fn terminal_fault_preserves_service_and_delayed_children_until_each_drains() {
     assert_eq!(retained.live_children, 2);
     assert_eq!(retained.anchor, TaskAnchorRecoveryState::TerminalRetained);
 
+    let delayed_stamp = delayed.0;
+    let before = state.private_full_clone();
+    let failure = state.begin_delayed_command_delivery(delayed).unwrap_err();
+    assert_eq!(failure.error(), InfrastructureError::InvalidState);
+    assert_eq!(state, before);
+    let delayed = failure.into_input();
+    assert_eq!(delayed.0, delayed_stamp);
     state
         .reject_delayed_command(
             delayed,
@@ -4126,6 +4441,34 @@ fn terminal_fault_preserves_service_and_delayed_children_until_each_drains() {
     let drained = state.query_task(&context, CLAIMANT + 1, 1).unwrap();
     assert_eq!(drained.live_children, 0);
     assert_eq!(drained.anchor, TaskAnchorRecoveryState::TerminalDrained);
+    state.check_invariants().unwrap();
+}
+
+#[test]
+fn terminal_reserved_bound_service_cannot_start_queue_publication_and_can_cancel() {
+    let (mut state, ticket) = compact_bound_service_state(0xfe30);
+    let parent = {
+        let scope = state.scope(SCOPE).unwrap();
+        let service = scope.service_requests.get(COMPACT_SERVICE_REQUEST).unwrap();
+        let parent = match service.stamp.parent {
+            super::ParentStamp::Task(parent) => parent,
+            _ => unreachable!(),
+        };
+        EnteredTaskLease(super::mint_task_key::<bearer_state::TaskEntered>(
+            scope.tasks.get(parent.work_id).unwrap(),
+        ))
+    };
+    state.reap_task(parent).unwrap();
+    let coordinates = service_bound_key_coordinates(&ticket.0);
+    let before = state.private_full_clone();
+    let failure = state.begin_service_enqueue(ticket).unwrap_err();
+    assert_eq!(failure.error(), InfrastructureError::InvalidState);
+    assert_eq!(state, before);
+    let ticket = failure.into_input();
+    assert_eq!(service_bound_key_coordinates(&ticket.0), coordinates);
+    state
+        .cancel_bound_service_request(ticket, ValidatedAbortProof::new(0xfe31))
+        .unwrap();
     state.check_invariants().unwrap();
 }
 
@@ -4182,12 +4525,247 @@ fn normal_task_exit_retains_continuation_and_reply_until_both_drain() {
     assert_eq!(retained.live_children, 2);
     assert_eq!(retained.anchor, TaskAnchorRecoveryState::TerminalRetained);
 
+    let continuation_coordinates = service_key_coordinates(&continuation.0);
+    let before = state.private_full_clone();
+    let failure = state.claim_continuation(continuation, 0xfe4a).unwrap_err();
+    assert_eq!(failure.error(), InfrastructureError::InvalidState);
+    assert_eq!(state, before);
+    let continuation = failure.into_input();
+    assert_eq!(
+        service_key_coordinates(&continuation.0),
+        continuation_coordinates
+    );
     state.cancel_continuation(continuation).unwrap();
     let retained = state.query_task(&workload, COMPACT_WORK, 1).unwrap();
     assert_eq!(retained.live_children, 1);
     assert_eq!(retained.anchor, TaskAnchorRecoveryState::TerminalRetained);
 
-    state.cancel_prepared_reply(reply, 0xfe49).unwrap();
+    let reply_stamp = reply.0;
+    let before = state.private_full_clone();
+    let failure = state.claim_reply(reply).unwrap_err();
+    assert_eq!(failure.error(), InfrastructureError::InvalidState);
+    assert_eq!(state, before);
+    let reply = failure.into_input();
+    assert_eq!(reply.0, reply_stamp);
+    state
+        .cancel_reply(ReplyAbortAuthority::Prepared(reply), 0xfe49)
+        .unwrap();
+    let drained = state.query_task(&workload, COMPACT_WORK, 1).unwrap();
+    assert_eq!(drained.live_children, 0);
+    assert_eq!(drained.anchor, TaskAnchorRecoveryState::TerminalDrained);
+    state.check_invariants().unwrap();
+}
+
+#[test]
+fn terminal_claimed_continuation_and_reply_can_only_cancel_before_publication() {
+    const REGISTRY: u64 = 0xfe60;
+    let (mut state, workload, entered) = compact_task_state(REGISTRY);
+    let continuation = state
+        .create_continuation(
+            &entered,
+            ContinuationDescriptor {
+                continuation_id: 0xfe61,
+                generation: 1,
+                vm_generation: 1,
+                source_domain: GUEST,
+                source_binding_epoch: 1,
+            },
+        )
+        .unwrap();
+    let claim = state.claim_continuation(continuation, 0xfe62).unwrap();
+    let reply = state
+        .prepare_reply(
+            &entered,
+            ReplyDescriptor {
+                reply_id: 0xfe63,
+                generation: 1,
+                guest_task: TaskKey::new(COMPACT_TASK, 1),
+                guest_vm_generation: 1,
+                descriptor_digest: 0xfe64,
+                result_digest: 0xfe65,
+                byte_count: 8,
+                destination_digest: 0xfe66,
+                source_domain: GUEST,
+                source_binding_epoch: 1,
+                payload_slot: 3,
+                payload_generation: 1,
+                flight_cookie: 0xfe67,
+            },
+            ValidatedCommitProof::new(super::super::CommitReceipt {
+                registry_instance_id: REGISTRY,
+                effect: EffectKey::new(0xfe68, 1),
+                scope: SCOPE,
+                authority_epoch: 1,
+                binding_epoch: 1,
+                sequence: 1,
+                result: 0,
+                domain_revision: 1,
+                descriptor_digest: 0xfe69,
+            }),
+        )
+        .unwrap();
+    let reply_claim = state.claim_reply(reply).unwrap();
+    state.reap_task(entered).unwrap();
+
+    let claim_coordinates = service_key_coordinates(&claim.0);
+    let before = state.private_full_clone();
+    let failure = state
+        .begin_continuation_publication(
+            claim,
+            ContinuationPublicationReceipt {
+                vm_generation: 1,
+                source_domain: GUEST,
+                source_binding_epoch: 1,
+                outcome_digest: 0xfe62,
+            },
+        )
+        .unwrap_err();
+    assert_eq!(failure.error(), InfrastructureError::InvalidState);
+    assert_eq!(state, before);
+    let claim = failure.into_input();
+    assert_eq!(service_key_coordinates(&claim.0), claim_coordinates);
+    state.cancel_claimed_continuation(claim).unwrap();
+
+    let reply_claim_coordinates = (
+        reply_claim.reply,
+        reply_claim.claim_generation,
+        reply_claim.claim_nonce,
+    );
+    let before = state.private_full_clone();
+    let failure = state.begin_reply_publication(reply_claim).unwrap_err();
+    assert_eq!(failure.error(), InfrastructureError::InvalidState);
+    assert_eq!(state, before);
+    let reply_claim = failure.into_input();
+    assert_eq!(
+        (
+            reply_claim.reply,
+            reply_claim.claim_generation,
+            reply_claim.claim_nonce,
+        ),
+        reply_claim_coordinates
+    );
+    state
+        .cancel_reply(ReplyAbortAuthority::Claimed(reply_claim), 0xfe6a)
+        .unwrap();
+
+    let drained = state.query_task(&workload, COMPACT_WORK, 1).unwrap();
+    assert_eq!(drained.live_children, 0);
+    assert_eq!(drained.anchor, TaskAnchorRecoveryState::TerminalDrained);
+    state.check_invariants().unwrap();
+}
+
+#[test]
+fn terminal_publication_uncertainty_can_reconcile_and_committed_work_can_drain() {
+    const REGISTRY: u64 = 0xfe70;
+    let (mut state, workload, entered) = compact_task_state(REGISTRY);
+    let continuation = state
+        .create_continuation(
+            &entered,
+            ContinuationDescriptor {
+                continuation_id: 0xfe71,
+                generation: 1,
+                vm_generation: 1,
+                source_domain: GUEST,
+                source_binding_epoch: 1,
+            },
+        )
+        .unwrap();
+    let claim = state.claim_continuation(continuation, 0xfe72).unwrap();
+    let publication = state
+        .begin_continuation_publication(
+            claim,
+            ContinuationPublicationReceipt {
+                vm_generation: 1,
+                source_domain: GUEST,
+                source_binding_epoch: 1,
+                outcome_digest: 0xfe72,
+            },
+        )
+        .unwrap();
+    let continuation_plan = publication.plan();
+    let continuation_authority = publication.into_authority();
+
+    let backend_effect = EffectKey::new(0xfe73, 1);
+    let reply = state
+        .prepare_reply(
+            &entered,
+            ReplyDescriptor {
+                reply_id: 0xfe74,
+                generation: 1,
+                guest_task: TaskKey::new(COMPACT_TASK, 1),
+                guest_vm_generation: 1,
+                descriptor_digest: 0xfe75,
+                result_digest: 0xfe76,
+                byte_count: 8,
+                destination_digest: 0xfe77,
+                source_domain: GUEST,
+                source_binding_epoch: 1,
+                payload_slot: 3,
+                payload_generation: 1,
+                flight_cookie: 0xfe78,
+            },
+            ValidatedCommitProof::new(super::super::CommitReceipt {
+                registry_instance_id: REGISTRY,
+                effect: backend_effect,
+                scope: SCOPE,
+                authority_epoch: 1,
+                binding_epoch: 1,
+                sequence: 7,
+                result: 0,
+                domain_revision: 1,
+                descriptor_digest: 0xfe79,
+            }),
+        )
+        .unwrap();
+    let reply_claim = state.claim_reply(reply).unwrap();
+    let reply_publication = state.begin_reply_publication(reply_claim).unwrap();
+    state.reap_task(entered).unwrap();
+
+    let acknowledgement = ContinuationPublicationAckReceipt {
+        continuation_id: continuation_plan.descriptor.continuation_id,
+        generation: continuation_plan.descriptor.generation,
+        claim_generation: continuation_plan.claim_generation,
+        claim_nonce: continuation_plan.claim_nonce,
+        apply_generation: continuation_plan.apply_generation,
+        apply_nonce: continuation_plan.apply_nonce,
+        publication_sequence: continuation_plan.publication_sequence,
+        vm_generation: continuation_plan.descriptor.vm_generation,
+        source_domain: continuation_plan.descriptor.source_domain,
+        source_binding_epoch: continuation_plan.descriptor.source_binding_epoch,
+        outcome_digest: continuation_plan.receipt.outcome_digest,
+        external_receipt_digest: 0xfe7a,
+    };
+    let ack = state
+        .acknowledge_continuation_publication(continuation_authority, acknowledgement)
+        .unwrap();
+    let resume = state.begin_continuation_resume(ack).unwrap();
+    let resume_plan = resume.plan();
+    state
+        .complete_continuation_resume(
+            resume.into_authority(),
+            continuation_resume_receipt(resume_plan, 0xfe7b),
+        )
+        .unwrap();
+
+    let reply_ack = state
+        .acknowledge_reply_publication(
+            reply_publication,
+            ReplyPublicationReceipt {
+                payload_slot: 3,
+                payload_generation: 1,
+                flight_cookie: 0xfe78,
+                descriptor_digest: 0xfe75,
+                result_digest: 0xfe76,
+                byte_count: 8,
+                destination_digest: 0xfe77,
+                backend_effect,
+                backend_commit_sequence: 7,
+                external_apply_digest: 0xfe7c,
+            },
+        )
+        .unwrap();
+    state.complete_reply_wake(reply_ack).unwrap();
+
     let drained = state.query_task(&workload, COMPACT_WORK, 1).unwrap();
     assert_eq!(drained.live_children, 0);
     assert_eq!(drained.anchor, TaskAnchorRecoveryState::TerminalDrained);
@@ -4399,6 +4977,145 @@ fn observed_fault_requires_atomic_task_and_domain_disposition() {
         projection.crash_generation = 1;
     }
     assert_invariant_read_only(fabricated_crash);
+}
+
+#[test]
+fn task_fault_invariants_bind_both_directions_disposition_and_exact_exit_digest() {
+    let installed = applied_fault_state(FaultDisposition::CrashService);
+    type MutatePair = fn(&mut InfrastructureState);
+    let pair_mutations: &[MutatePair] = &[
+        |state| {
+            state
+                .scope_mut(SCOPE)
+                .unwrap()
+                .tasks
+                .get_mut(0xb400)
+                .unwrap()
+                .service_fault
+                .as_mut()
+                .unwrap()
+                .fault_object_generation += 1
+        },
+        |state| {
+            state
+                .scope_mut(SCOPE)
+                .unwrap()
+                .tasks
+                .get_mut(0xb400)
+                .unwrap()
+                .service_fault
+                .as_mut()
+                .unwrap()
+                .fault_bearer_generation += 1
+        },
+        |state| {
+            state
+                .scope_mut(SCOPE)
+                .unwrap()
+                .tasks
+                .get_mut(0xb400)
+                .unwrap()
+                .service_fault
+                .as_mut()
+                .unwrap()
+                .fault_nonce += 1
+        },
+        |state| {
+            state
+                .scope_mut(SCOPE)
+                .unwrap()
+                .faults
+                .get_mut(0xb700)
+                .unwrap()
+                .owner
+                .task_object_nonce += 1
+        },
+        |state| {
+            state
+                .scope_mut(SCOPE)
+                .unwrap()
+                .faults
+                .get_mut(0xb700)
+                .unwrap()
+                .owner
+                .task_bearer_generation += 1
+        },
+    ];
+    for mutate in pair_mutations {
+        let mut corrupt = installed.private_full_clone();
+        mutate(&mut corrupt);
+        assert_invariant_message_read_only(corrupt, "task-fault pair mismatch");
+    }
+
+    let mut isolate = applied_fault_state(FaultDisposition::IsolateTask);
+    let context = super::workload_bearer(isolate.scope(SCOPE).unwrap(), 0xb300).unwrap();
+    let selector = isolate
+        .query_fault(&context, 0xb700, 1)
+        .unwrap()
+        .selector
+        .unwrap();
+    assert!(matches!(
+        isolate.claim_fault_receipt(&context, selector).unwrap(),
+        super::FaultReceiptClaimOutcome::Isolate(_)
+    ));
+    if let FaultPhase::Claimed {
+        ref mut cause_claimed,
+        ..
+    } = isolate
+        .scope_mut(SCOPE)
+        .unwrap()
+        .faults
+        .get_mut(0xb700)
+        .unwrap()
+        .phase
+    {
+        *cause_claimed = true;
+    } else {
+        panic!("claimed isolate fault changed phase")
+    }
+    assert_invariant_message_read_only(isolate, "fault phase projection mismatch");
+
+    let (mut exited, _, armed, _) = armed_fault_state(0xfef0);
+    exited
+        .finish_service_task_without_fault(armed, 0xfef1)
+        .unwrap();
+    let mut bad_digest = exited.private_full_clone();
+    bad_digest
+        .scope_mut(SCOPE)
+        .unwrap()
+        .tasks
+        .get_mut(0xfc30)
+        .unwrap()
+        .service_fault
+        .as_mut()
+        .unwrap()
+        .terminal_install_digest
+        .as_mut()
+        .unwrap()[0] ^= 1;
+    assert_invariant_message_read_only(bad_digest, "fault phase projection mismatch");
+
+    type MutateExit = fn(&mut super::ServiceTaskExitReceipt);
+    let exit_mutations: &[MutateExit] = &[
+        |receipt| receipt.fault_id += 1,
+        |receipt| receipt.generation += 1,
+        |receipt| receipt.task = TaskKey::new(receipt.task.id() + 1, receipt.task.generation()),
+        |receipt| receipt.evidence_digest += 1,
+    ];
+    for mutate in exit_mutations {
+        let mut corrupt = exited.private_full_clone();
+        let fault = corrupt
+            .scope_mut(SCOPE)
+            .unwrap()
+            .faults
+            .get_mut(0xfc50)
+            .unwrap();
+        if let FaultPhase::Exited { ref mut receipt } = fault.phase {
+            mutate(receipt);
+        } else {
+            panic!("service exit changed fault phase")
+        }
+        assert_invariant_message_read_only(corrupt, "fault phase projection mismatch");
+    }
 }
 
 #[test]

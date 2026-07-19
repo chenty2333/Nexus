@@ -2,6 +2,7 @@
 
 use alloc::vec::Vec;
 
+use super::fault::{exit_receipt_digest, validate_exact_task_fault_pair};
 use super::{
     BearerStamp, ContinuationPhase, ContinuationRecord, DeadlineExhaustedDisposition,
     DeadlinePhase, DeadlineRecord, DelayedCommandPhase, DelayedCommandStateRecord, DevicePhase,
@@ -11,8 +12,9 @@ use super::{
     ScopeInfrastructure, ServiceArmReceipt, ServiceCancellationPoint, ServiceChildBindingReceipt,
     ServiceClaimantSnapshot, ServiceEnqueueReceipt, ServiceRequestCausalIdentity,
     ServiceRequestPhase, ServiceRequestStateRecord, SlotIdentity, TaskAnchorPhase, TaskPhase,
-    TaskRecord, TaskWorkDescriptor, VmAuthorityKey, WorkloadPhase, delayed_command_phase_live,
-    device_phase_live, service_request_phase_live, validate_continuation_publication_ack,
+    TaskWorkDescriptor, VmAuthorityKey, WorkloadPhase, delayed_command_phase_live,
+    device_phase_live, reverse_index_for_fault, reverse_index_for_task, service_request_phase_live,
+    validate_continuation_publication_ack,
 };
 
 pub(super) fn check_scope_invariants(
@@ -909,23 +911,6 @@ fn observe_sequence(
     Ok(())
 }
 
-fn reverse_index_for_task(record: &TaskRecord) -> ReverseIndexRecord {
-    ReverseIndexRecord {
-        slot: record.stamp.nonce,
-        kind: InfrastructureKind::Task,
-        root_effect: record.stamp.root.root_effect,
-        parent: ReverseParent::Request(record.stamp.workload.request),
-        task: Some(record.stamp.identity.task),
-        domain: record.stamp.domain.domain,
-        binding_epoch: record.stamp.domain.binding_epoch,
-        source_domain: None,
-        source_binding_epoch: None,
-        resource: None,
-        actor_slot: None,
-        retry_generation: record.stamp.identity.generation,
-    }
-}
-
 fn reverse_index_for_service(record: &ServiceRequestStateRecord) -> ReverseIndexRecord {
     let descriptor = record.stamp.identity;
     ReverseIndexRecord {
@@ -959,24 +944,6 @@ fn reverse_index_for_delayed(record: &DelayedCommandStateRecord) -> ReverseIndex
         resource: None,
         actor_slot: Some(descriptor.actor_slot),
         retry_generation: descriptor.actor_generation,
-    }
-}
-
-fn reverse_index_for_fault(record: &FaultStateRecord) -> ReverseIndexRecord {
-    let descriptor = record.stamp.identity;
-    ReverseIndexRecord {
-        slot: record.stamp.nonce,
-        kind: InfrastructureKind::Fault,
-        root_effect: record.stamp.root.root_effect,
-        parent: ReverseParent::Task(task_parent(&record.stamp).unwrap()),
-        task: Some(descriptor.task),
-        domain: record.stamp.domain.domain,
-        binding_epoch: record.stamp.domain.binding_epoch,
-        source_domain: None,
-        source_binding_epoch: None,
-        resource: None,
-        actor_slot: None,
-        retry_generation: descriptor.vm_generation,
     }
 }
 
@@ -1095,22 +1062,9 @@ fn check_fault_phase(
         .ok_or(InfrastructureError::Invariant(
             "fault lacks exact parent task",
         ))?;
-    let link = parent_record
-        .service_fault
-        .ok_or(InfrastructureError::Invariant(
-            "fault lacks reciprocal task link",
-        ))?;
-    if record.owner.task != parent
-        || record.owner.task_object_nonce != parent_record.stamp.nonce
-        || record.owner.task_bearer_generation != parent_record.stamp.bearer_generation
-        || link.fault_id != record.stamp.identity.fault_id
-        || link.fault_object_generation != record.stamp.identity.generation
-        || link.fault_bearer_generation != record.stamp.bearer_generation
-        || link.fault_nonce != record.stamp.nonce
-    {
-        return Err(InfrastructureError::Invariant(
-            "fault reciprocal authority mismatch",
-        ));
+    let (link, exact_fault) = validate_exact_task_fault_pair(scope, parent_record)?;
+    if exact_fault.stamp.identity != record.stamp.identity {
+        return Err(InfrastructureError::Invariant("task-fault pair mismatch"));
     }
     let expected_pair = match record.phase {
         FaultPhase::Reserved => {
@@ -1131,19 +1085,25 @@ fn check_fault_phase(
                 && parent_record.phase == TaskPhase::Reaped
                 && parent_record.anchor == TaskAnchorPhase::TerminalDrained
                 && parent_record.live_children == 0
-                && link.terminal_install_digest.is_some()
+                && link.terminal_install_digest == Some(exit_receipt_digest(receipt))
         }
-        FaultPhase::InstalledAwaitingClaim {
-            projection,
-            observation,
-            commitment,
-        }
-        | FaultPhase::Claimed {
-            projection,
-            observation,
-            commitment,
-            ..
-        } => {
+        phase @ (FaultPhase::InstalledAwaitingClaim { .. } | FaultPhase::Claimed { .. }) => {
+            let (projection, observation, commitment, cause_claimed) = match phase {
+                FaultPhase::InstalledAwaitingClaim {
+                    projection,
+                    observation,
+                    commitment,
+                } => (projection, observation, commitment, false),
+                FaultPhase::Claimed {
+                    projection,
+                    observation,
+                    commitment,
+                    cause_claimed,
+                } => (projection, observation, commitment, cause_claimed),
+                FaultPhase::Reserved | FaultPhase::Armed | FaultPhase::Exited { .. } => {
+                    unreachable!()
+                }
+            };
             let current_domain_epoch = scope
                 .binding_epoch(projection.service_domain)
                 .map_err(|_| InfrastructureError::Invariant("fault references unknown domain"))?;
@@ -1171,6 +1131,7 @@ fn check_fault_phase(
                 && parent_record.phase == TaskPhase::Isolated
                 && parent_record.anchor != TaskAnchorPhase::Live
                 && link.terminal_install_digest == Some(commitment.0)
+                && (!cause_claimed || projection.disposition == FaultDisposition::CrashService)
                 && disposition_valid
         }
     };
@@ -1185,9 +1146,14 @@ fn check_fault_phase(
 fn check_continuation_phase(record: &ContinuationRecord) -> Result<(), InfrastructureError> {
     validate_continuation_publication_ack(record)?;
     let valid = match record.phase {
-        ContinuationPhase::Pending | ContinuationPhase::Cancelled => {
+        ContinuationPhase::Pending => {
             record.claim_generation == 0
                 && record.apply_generation == 0
+                && record.ack_generation == 0
+                && record.resume_generation == 0
+        }
+        ContinuationPhase::Cancelled => {
+            record.apply_generation == 0
                 && record.ack_generation == 0
                 && record.resume_generation == 0
         }

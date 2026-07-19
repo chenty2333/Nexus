@@ -211,6 +211,9 @@ impl InfrastructureState {
             if record.phase != ServiceRequestPhase::ReservedBound {
                 return Err(InfrastructureError::InvalidState);
             }
+            if validate_task_child_stamp(scope, registry_instance, &record.stamp)? {
+                return Err(InfrastructureError::InvalidState);
+            }
             let response = validate_service_owned_continuation(scope, registry_instance, record)?;
             let apply_generation = record
                 .apply_generation

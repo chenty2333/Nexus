@@ -2,16 +2,16 @@
 
 use super::{
     BearerStamp, EnteredTaskLease, InfrastructureError, InfrastructureEventKind,
-    InfrastructureKind, InfrastructureState, LinearResult, ParentStamp, ReplyAckReceipt,
-    ReplyAdoption, ReplyClaim, ReplyCompletionReceipt, ReplyDescriptor, ReplyPhase,
-    ReplyPublicationIntent, ReplyPublicationReceipt, ReplyRecord, ReplyRecoveryProjection,
-    ReplyRecoveryState, ReplyStateRecord, ReverseIndexRecord, ReverseParent, ScopeInfrastructure,
-    TaskPhase, ValidatedCommitProof, VmAuthorityKey, WorkloadContext, checked_add, checked_sub,
-    context_from_stamp, install_task_child_count, linear_apply, preview_bearer_stamp,
-    preview_nonce, preview_nonces, preview_revision, preview_task_child_add,
-    preview_task_child_sub, preview_workload_child_add, preview_workload_child_sub,
-    require_vacancy, validate_active_admission, validate_context, validate_task_child_stamp,
-    validate_task_key,
+    InfrastructureKind, InfrastructureState, LinearResult, ParentStamp, ReplyAbortAuthority,
+    ReplyAckReceipt, ReplyAdoption, ReplyClaim, ReplyCompletionReceipt, ReplyDescriptor,
+    ReplyPhase, ReplyPublicationIntent, ReplyPublicationReceipt, ReplyRecord,
+    ReplyRecoveryProjection, ReplyRecoveryState, ReplyStateRecord, ReverseIndexRecord,
+    ReverseParent, ScopeInfrastructure, TaskPhase, ValidatedCommitProof, VmAuthorityKey,
+    WorkloadContext, checked_add, checked_sub, context_from_stamp, install_task_child_count,
+    linear_apply, preview_bearer_stamp, preview_nonce, preview_nonces, preview_revision,
+    preview_task_child_add, preview_task_child_sub, preview_workload_child_add,
+    preview_workload_child_sub, require_vacancy, validate_active_admission, validate_context,
+    validate_task_child_stamp, validate_task_key,
 };
 
 impl InfrastructureState {
@@ -153,6 +153,9 @@ impl InfrastructureState {
             let scope = self.scope_mut(stamp.root.scope)?;
             validate_reply_bearer(scope, registry_instance, &stamp)?;
             let record = scope.replies.get(stamp.identity.reply_id).unwrap();
+            if validate_task_child_stamp(scope, registry_instance, &record.stamp)? {
+                return Err(InfrastructureError::InvalidState);
+            }
             if record.phase != ReplyPhase::Prepared {
                 return Err(InfrastructureError::InvalidState);
             }
@@ -194,6 +197,9 @@ impl InfrastructureState {
             let scope = self.scope_mut(stamp.root.scope)?;
             validate_reply_bearer(scope, registry_instance, &stamp)?;
             let record = scope.replies.get(stamp.identity.reply_id).unwrap();
+            if validate_task_child_stamp(scope, registry_instance, &record.stamp)? {
+                return Err(InfrastructureError::InvalidState);
+            }
             if record.phase
                 != (ReplyPhase::Claimed {
                     claim_generation: claim.claim_generation,
@@ -342,21 +348,30 @@ impl InfrastructureState {
         })
     }
 
-    pub(in super::super) fn cancel_prepared_reply(
+    pub(in super::super) fn cancel_reply(
         &mut self,
-        reply: ReplyRecord,
+        authority: ReplyAbortAuthority,
         evidence_digest: u64,
-    ) -> LinearResult<ReplyRecord, ()> {
-        linear_apply(reply, |reply| {
+    ) -> LinearResult<ReplyAbortAuthority, ()> {
+        linear_apply(authority, |authority| {
             self.require_authoritative()?;
             if evidence_digest == 0 {
                 return Err(InfrastructureError::InvalidReceipt);
             }
-            let stamp = reply.0;
+            let (stamp, expected_phase) = match &authority {
+                ReplyAbortAuthority::Prepared(reply) => (reply.0, ReplyPhase::Prepared),
+                ReplyAbortAuthority::Claimed(claim) => (
+                    claim.reply,
+                    ReplyPhase::Claimed {
+                        claim_generation: claim.claim_generation,
+                        claim_nonce: claim.claim_nonce,
+                    },
+                ),
+            };
             let registry_instance = self.registry_instance;
             let scope = self.scope_mut(stamp.root.scope)?;
             validate_reply_bearer(scope, registry_instance, &stamp)?;
-            if scope.replies.get(stamp.identity.reply_id).unwrap().phase != ReplyPhase::Prepared {
+            if scope.replies.get(stamp.identity.reply_id).unwrap().phase != expected_phase {
                 return Err(InfrastructureError::InvalidState);
             }
             finish_reply(scope, stamp, ReplyPhase::Cancelled { evidence_digest })

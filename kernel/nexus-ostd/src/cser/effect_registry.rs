@@ -8124,6 +8124,46 @@ impl EffectRegistry {
         self.by_resource.get(&resource).cloned().unwrap_or_default()
     }
 
+    // Keep this cross-ledger oracle out of the already-large invariant frame.
+    // Loom's modeled coroutine stack is intentionally small.
+    #[inline(never)]
+    fn check_domain_fault_recovery_anchor(
+        &self,
+        scope: ScopeKey,
+        domain: DomainKey,
+        binding: &DomainBindingRecord,
+        recovery: &DomainRecoveryState,
+    ) -> Result<(), RegistryError> {
+        let Some(anchor) = recovery.fault else {
+            return Ok(());
+        };
+        let projection = self
+            .infrastructure
+            .domain_fault_recovery_projection(scope, anchor.fault_id, anchor.generation)
+            .map_err(|_| RegistryError::Invariant("domain fault recovery anchor mismatch"))?
+            .ok_or(RegistryError::Invariant(
+                "domain fault recovery anchor mismatch",
+            ))?;
+        if projection.fault_id != anchor.fault_id
+            || projection.generation != anchor.generation
+            || projection.task != anchor.task
+            || projection.vm_generation != anchor.vm_generation
+            || projection.service_domain != domain
+            || projection
+                .closed_binding_epoch
+                .checked_add(1)
+                .is_none_or(|epoch| epoch != binding.binding_epoch)
+            || projection.crash_generation != recovery.crash_revision
+            || projection.evidence_digest != anchor.evidence_digest
+            || projection.plan_commitment != anchor.plan_commitment
+        {
+            return Err(RegistryError::Invariant(
+                "domain fault recovery anchor mismatch",
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn check_invariants(&self) -> Result<(), RegistryError> {
         if self.instance_id == 0 {
             return Err(RegistryError::Invariant("invalid Registry instance"));
@@ -8235,6 +8275,7 @@ impl EffectRegistry {
                     {
                         return Err(RegistryError::Invariant("stale domain ready proof"));
                     }
+                    self.check_domain_fault_recovery_anchor(*key, *domain, binding, recovery)?;
                 } else if binding.fallback_running && *domain != DomainKey::LEGACY {
                     return Err(RegistryError::Invariant(
                         "fallback domain lacks recovery state",
@@ -12316,7 +12357,7 @@ fn task_owned_fault_outer_transaction_self_test() {
             infrastructure::FaultDisposition::CrashService,
         )
         .unwrap();
-    let installed = crash
+    let _lost_install_return = crash
         .install_service_fault_disposition(intent, plan)
         .unwrap();
     assert_eq!(crash.effects, effects_before);
@@ -12328,25 +12369,101 @@ fn task_owned_fault_outer_transaction_self_test() {
     assert_eq!(recovery.cohort, BTreeSet::from([service_effect]));
     assert_eq!(recovery.unadopted, recovery.cohort);
     assert!(recovery.fault.is_some());
-    assert!(
-        crash
-            .infrastructure
-            .query_fault(&crash_workload, FAULT_ID, 1)
-            .unwrap()
-            .awaiting_claim
-    );
-    let mut substituted_installed = installed;
-    match &mut substituted_installed {
-        infrastructure::InstalledFaultObservation::Crash(projection)
-        | infrastructure::InstalledFaultObservation::Isolate(projection) => {
-            projection.commitment.0[0] ^= 1;
-        }
+    type MutateAnchor = fn(&mut DomainFaultRecoveryAnchor);
+    let anchor_mutations: &[MutateAnchor] = &[
+        |anchor| anchor.fault_id += 1,
+        |anchor| anchor.generation += 1,
+        |anchor| anchor.task = TaskKey::new(anchor.task.id() + 1, anchor.task.generation()),
+        |anchor| anchor.vm_generation += 1,
+        |anchor| anchor.evidence_digest += 1,
+        |anchor| anchor.plan_commitment[0] ^= 1,
+    ];
+    for mutate in anchor_mutations {
+        let mut corrupt = crash.clone();
+        mutate(
+            corrupt
+                .scopes
+                .get_mut(&SCOPE)
+                .unwrap()
+                .domains
+                .get_mut(&SERVICE)
+                .unwrap()
+                .recovery
+                .as_mut()
+                .unwrap()
+                .fault
+                .as_mut()
+                .unwrap(),
+        );
+        let before = corrupt.clone();
+        assert_eq!(
+            corrupt.check_invariants(),
+            Err(RegistryError::Invariant(
+                "domain fault recovery anchor mismatch"
+            ))
+        );
+        assert_eq!(corrupt, before);
     }
+    let recovery_projection = crash
+        .infrastructure
+        .query_fault(&crash_workload, FAULT_ID, 1)
+        .unwrap();
+    assert!(recovery_projection.awaiting_claim);
+    let installed = recovery_projection
+        .selector
+        .expect("awaiting fault exposes a descriptive recovery selector");
+
+    type MutateSelector = fn(&mut infrastructure::InstalledFaultProjection);
+    let selector_mutations: &[MutateSelector] = &[
+        |installed| installed.projection.fault_id += 1,
+        |installed| installed.projection.generation += 1,
+        |installed| {
+            installed.projection.task = TaskKey::new(
+                installed.projection.task.id() + 1,
+                installed.projection.task.generation(),
+            )
+        },
+        |installed| installed.projection.vm_generation += 1,
+        |installed| {
+            installed.projection.disposition = infrastructure::FaultDisposition::IsolateTask
+        },
+        |installed| {
+            installed.projection.service_domain =
+                DomainKey::new(installed.projection.service_domain.value() + 1)
+        },
+        |installed| installed.projection.closed_binding_epoch += 1,
+        |installed| installed.projection.crash_generation += 1,
+        |installed| installed.projection.evidence_digest += 1,
+        |installed| installed.commitment.0[0] ^= 1,
+    ];
+    for mutate in selector_mutations {
+        let mut substituted = installed;
+        let projection = match &mut substituted {
+            infrastructure::InstalledFaultObservation::Crash(projection)
+            | infrastructure::InstalledFaultObservation::Isolate(projection) => projection,
+        };
+        mutate(projection);
+        let awaiting_before = crash.infrastructure.private_full_clone();
+        assert!(
+            crash
+                .infrastructure
+                .claim_fault_receipt(&crash_workload, substituted)
+                .is_err()
+        );
+        assert_eq!(crash.infrastructure, awaiting_before);
+    }
+    let projection = match installed {
+        infrastructure::InstalledFaultObservation::Crash(projection) => projection,
+        infrastructure::InstalledFaultObservation::Isolate(_) => {
+            panic!("crash recovery selector has isolate variant")
+        }
+    };
     let awaiting_before = crash.infrastructure.private_full_clone();
     assert_eq!(
-        crash
-            .infrastructure
-            .claim_fault_receipt(&crash_workload, substituted_installed),
+        crash.infrastructure.claim_fault_receipt(
+            &crash_workload,
+            infrastructure::InstalledFaultObservation::Isolate(projection),
+        ),
         Err(infrastructure::InfrastructureError::InvalidReceipt)
     );
     assert_eq!(crash.infrastructure, awaiting_before);

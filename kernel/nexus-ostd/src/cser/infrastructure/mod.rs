@@ -1012,8 +1012,26 @@ pub(crate) enum FaultReceiptClaimOutcome {
 pub(crate) struct FaultRecoveryProjection {
     pub(crate) descriptor: FaultSlotDescriptor,
     pub(crate) receipt: Option<ServiceFaultProjection>,
+    /// Descriptive, copyable selector for recovering the first receipt claim
+    /// after the install return value was lost.  This carries no bearer
+    /// authority; the ledger still decides whether the claim is first or a
+    /// duplicate.
+    pub(crate) selector: Option<InstalledFaultObservation>,
     pub(crate) consumed: bool,
     pub(crate) awaiting_claim: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DomainFaultRecoveryProjection {
+    pub(crate) fault_id: u64,
+    pub(crate) generation: u64,
+    pub(crate) task: TaskKey,
+    pub(crate) vm_generation: u64,
+    pub(crate) service_domain: DomainKey,
+    pub(crate) closed_binding_epoch: u64,
+    pub(crate) crash_generation: u64,
+    pub(crate) evidence_digest: u64,
+    pub(crate) plan_commitment: [u8; 32],
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1591,6 +1609,12 @@ pub(crate) struct ReplyClaim {
     reply: BearerStamp<ReplyDescriptor>,
     claim_generation: u64,
     claim_nonce: u64,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum ReplyAbortAuthority {
+    Prepared(ReplyRecord),
+    Claimed(ReplyClaim),
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -2235,6 +2259,50 @@ struct ReverseIndexRecord {
     resource: Option<ResourceKey>,
     actor_slot: Option<u32>,
     retry_generation: u64,
+}
+
+fn reverse_index_for_task(record: &TaskRecord) -> ReverseIndexRecord {
+    ReverseIndexRecord {
+        slot: record.stamp.nonce,
+        kind: InfrastructureKind::Task,
+        root_effect: record.stamp.root.root_effect,
+        parent: reverse_parent_from_stamp(record.stamp.parent),
+        task: Some(record.stamp.identity.task),
+        domain: record.stamp.domain.domain,
+        binding_epoch: record.stamp.domain.binding_epoch,
+        source_domain: None,
+        source_binding_epoch: None,
+        resource: None,
+        actor_slot: None,
+        retry_generation: record.stamp.identity.generation,
+    }
+}
+
+fn reverse_index_for_fault(record: &FaultStateRecord) -> ReverseIndexRecord {
+    let descriptor = record.stamp.identity;
+    ReverseIndexRecord {
+        slot: record.stamp.nonce,
+        kind: InfrastructureKind::Fault,
+        root_effect: record.stamp.root.root_effect,
+        parent: reverse_parent_from_stamp(record.stamp.parent),
+        task: Some(descriptor.task),
+        domain: record.stamp.domain.domain,
+        binding_epoch: record.stamp.domain.binding_epoch,
+        source_domain: None,
+        source_binding_epoch: None,
+        resource: None,
+        actor_slot: None,
+        retry_generation: descriptor.vm_generation,
+    }
+}
+
+const fn reverse_parent_from_stamp(parent: ParentStamp) -> ReverseParent {
+    match parent {
+        ParentStamp::RootEffect(effect) => ReverseParent::RootEffect(effect),
+        ParentStamp::Request(request) => ReverseParent::Request(request),
+        ParentStamp::Task(task) => ReverseParent::Task(task),
+        ParentStamp::Effect(effect) => ReverseParent::Effect(effect),
+    }
 }
 
 impl SlotIdentity for ReverseIndexRecord {
@@ -3412,7 +3480,8 @@ fn first_live_child_kind(
         return Ok(InfrastructureKind::DelayedCommand);
     }
     if scope.faults.iter().any(|record| {
-        record.stamp.workload.request == request && matches!(record.phase, FaultPhase::Reserved)
+        record.stamp.workload.request == request
+            && matches!(record.phase, FaultPhase::Reserved | FaultPhase::Armed)
     }) {
         return Ok(InfrastructureKind::Fault);
     }
@@ -3485,11 +3554,10 @@ fn first_task_child_kind(
     {
         return Ok(InfrastructureKind::DelayedCommand);
     }
-    if scope
-        .faults
-        .iter()
-        .any(|record| record.stamp.parent == parent && matches!(record.phase, FaultPhase::Reserved))
-    {
+    if scope.faults.iter().any(|record| {
+        record.stamp.parent == parent
+            && matches!(record.phase, FaultPhase::Reserved | FaultPhase::Armed)
+    }) {
         return Ok(InfrastructureKind::Fault);
     }
     if scope.continuations.iter().any(|record| {

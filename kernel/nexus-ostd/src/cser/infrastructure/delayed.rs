@@ -145,21 +145,19 @@ impl InfrastructureState {
             let registry_instance = self.registry_instance;
             let scope = self.scope_mut(stamp.root.scope)?;
             validate_delayed_command_bearer(scope, registry_instance, &stamp)?;
-            if scope.binding_epoch(stamp.identity.destination_domain)?
-                != stamp.identity.destination_binding_epoch
-                || scope
-                    .delayed_commands
-                    .get(stamp.identity.command_id)
-                    .unwrap()
-                    .phase
-                    != DelayedCommandPhase::Reserved
-            {
-                return Err(InfrastructureError::StaleBinding);
-            }
             let record = scope
                 .delayed_commands
                 .get(stamp.identity.command_id)
                 .unwrap();
+            if validate_task_child_stamp(scope, registry_instance, &record.stamp)? {
+                return Err(InfrastructureError::InvalidState);
+            }
+            if scope.binding_epoch(stamp.identity.destination_domain)?
+                != stamp.identity.destination_binding_epoch
+                || record.phase != DelayedCommandPhase::Reserved
+            {
+                return Err(InfrastructureError::StaleBinding);
+            }
             let apply_generation = record
                 .apply_generation
                 .checked_add(1)

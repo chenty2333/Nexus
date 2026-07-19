@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use super::{
-    ArmedFaultTask, BearerKey, CrashServiceReceipt, FaultAccess, FaultBusinessPlan,
-    FaultClaimProjection, FaultDisposition, FaultDispositionIntent, FaultDispositionPlan,
-    FaultPhase, FaultPlanCommitment, FaultReceiptClaimOutcome, FaultRecoveryProjection,
-    FaultSlotDescriptor, FaultStateRecord, FaultTaskOwner, InfrastructureError,
-    InfrastructureEventKind, InfrastructureKind, InfrastructureState, InstalledFaultObservation,
-    InstalledFaultProjection, IsolateTaskReceipt, LedgerMode, LinearFailure, LinearResult,
-    ParentStamp, ReservedFaultTask, ReverseIndexRecord, ReverseParent, ScopeInfrastructure,
-    ServiceCrashCause, ServiceFaultProjection, TaskAnchorPhase, TaskFaultLink, TaskLease,
-    TaskPhase, TaskWorkRole, VmAuthorityKey, WorkloadContext, bearer_state, checked_add,
+    ArmedFaultTask, BearerKey, CrashServiceReceipt, DomainFaultRecoveryProjection, FaultAccess,
+    FaultBusinessPlan, FaultClaimProjection, FaultDisposition, FaultDispositionIntent,
+    FaultDispositionPlan, FaultPhase, FaultPlanCommitment, FaultReceiptClaimOutcome,
+    FaultRecoveryProjection, FaultSlotDescriptor, FaultStateRecord, FaultTaskOwner,
+    InfrastructureError, InfrastructureEventKind, InfrastructureKind, InfrastructureState,
+    InstalledFaultObservation, InstalledFaultProjection, IsolateTaskReceipt, LedgerMode,
+    LinearFailure, LinearResult, ParentStamp, ReservedFaultTask, ReverseIndexRecord, ReverseParent,
+    ScopeInfrastructure, ServiceCrashCause, ServiceFaultProjection, TaskAnchorPhase, TaskFaultLink,
+    TaskLease, TaskPhase, TaskWorkRole, VmAuthorityKey, WorkloadContext, bearer_state, checked_add,
     checked_sub, context_from_stamp, linear_apply, mint_task_key, next_task_bearer_generation,
     preview_bearer_stamp, preview_revision, preview_workload_child_add, preview_workload_child_sub,
     require_vacancy, validate_active_admission, validate_recovery_context, validate_task_key,
@@ -25,22 +25,10 @@ impl InfrastructureState {
         self.require_authoritative()?;
         let scope = self.scope(armed.0.authority.scope)?;
         let task = validate_task_key(scope, self.registry_instance, &armed.0)?;
-        let link = task
-            .service_fault
-            .ok_or(InfrastructureError::InvalidState)?;
-        let fault = scope
-            .faults
-            .get(link.fault_id)
-            .ok_or(InfrastructureError::UnknownObligation)?;
+        let (_, fault) = validate_exact_task_fault_pair(scope, task)?;
         if task.phase != TaskPhase::Entered
             || task.anchor != TaskAnchorPhase::Live
             || fault.phase != FaultPhase::Armed
-            || fault.owner.task != task.stamp.identity
-            || fault.owner.task_object_nonce != task.stamp.nonce
-            || fault.owner.task_bearer_generation != task.stamp.bearer_generation
-            || link.fault_object_generation != fault.stamp.identity.generation
-            || link.fault_bearer_generation != fault.stamp.bearer_generation
-            || link.fault_nonce != fault.stamp.nonce
         {
             return Err(InfrastructureError::StaleClaim);
         }
@@ -225,21 +213,10 @@ impl InfrastructureState {
             let scope = self.scope_mut(armed.0.authority.scope)?;
             let task = validate_task_key(scope, registry_instance, &armed.0)?;
             let task_stamp = task.stamp;
-            let link = task
-                .service_fault
-                .ok_or(InfrastructureError::InvalidState)?;
-            let fault = scope
-                .faults
-                .get(link.fault_id)
-                .ok_or(InfrastructureError::UnknownObligation)?;
+            let (link, fault) = validate_exact_task_fault_pair(scope, task)?;
             if task.phase != TaskPhase::Entered
                 || task.anchor != TaskAnchorPhase::Live
                 || fault.phase != FaultPhase::Armed
-                || fault.owner.task != task_stamp.identity
-                || fault.owner.task_object_nonce != task_stamp.nonce
-                || fault.owner.task_bearer_generation != task_stamp.bearer_generation
-                || link.fault_bearer_generation != fault.stamp.bearer_generation
-                || link.fault_nonce != fault.stamp.nonce
             {
                 return Err(InfrastructureError::StaleClaim);
             }
@@ -310,22 +287,10 @@ impl InfrastructureState {
         let scope = self.scope(armed.0.authority.scope)?;
         let task = validate_task_key(scope, self.registry_instance, &armed.0)?;
         let task_stamp = task.stamp;
-        let link = task
-            .service_fault
-            .ok_or(InfrastructureError::InvalidState)?;
-        let fault = scope
-            .faults
-            .get(link.fault_id)
-            .ok_or(InfrastructureError::UnknownObligation)?;
+        let (_, fault) = validate_exact_task_fault_pair(scope, task)?;
         if task.phase != TaskPhase::Entered
             || task.anchor != TaskAnchorPhase::Live
             || fault.phase != FaultPhase::Armed
-            || fault.stamp.identity.generation != link.fault_object_generation
-            || fault.stamp.bearer_generation != link.fault_bearer_generation
-            || fault.stamp.nonce != link.fault_nonce
-            || fault.owner.task != task_stamp.identity
-            || fault.owner.task_object_nonce != task_stamp.nonce
-            || fault.owner.task_bearer_generation != task_stamp.bearer_generation
             || observation.task != fault.stamp.identity.task
             || observation.vm_generation != fault.stamp.identity.vm_generation
         {
@@ -419,6 +384,7 @@ impl InfrastructureState {
             return Err(InfrastructureError::CandidateHasNoAuthority);
         }
         let scope = self.scope_mut(plan.scope)?;
+        validate_fault_plan_canonical(scope, plan)?;
         if plan.commitment != fault_plan_commitment(scope, plan)
             || plan.base_revision != scope.revision
         {
@@ -428,13 +394,7 @@ impl InfrastructureState {
             .tasks
             .get(plan.task.work_id)
             .ok_or(InfrastructureError::UnknownObligation)?;
-        let fault = scope
-            .faults
-            .get(plan.fault.fault_id)
-            .ok_or(InfrastructureError::UnknownObligation)?;
-        let link = task
-            .service_fault
-            .ok_or(InfrastructureError::InvalidState)?;
+        let (_, fault) = validate_exact_task_fault_pair(scope, task)?;
         if plan.task_nonce != task.stamp.nonce
             || plan.task_bearer_generation != task.stamp.bearer_generation
             || plan.fault != fault.stamp.identity
@@ -443,13 +403,6 @@ impl InfrastructureState {
             || task.phase != TaskPhase::Entered
             || task.anchor != TaskAnchorPhase::Live
             || fault.phase != FaultPhase::Armed
-            || fault.owner.task != task.stamp.identity
-            || fault.owner.task_object_nonce != task.stamp.nonce
-            || fault.owner.task_bearer_generation != task.stamp.bearer_generation
-            || link.fault_id != fault.stamp.identity.fault_id
-            || link.fault_object_generation != fault.stamp.identity.generation
-            || link.fault_bearer_generation != fault.stamp.bearer_generation
-            || link.fault_nonce != fault.stamp.nonce
         {
             return Err(InfrastructureError::StaleClaim);
         }
@@ -538,13 +491,8 @@ impl InfrastructureState {
             let scope = self.scope_mut(armed.0.authority.scope)?;
             let task = validate_task_key(scope, registry_instance, &armed.0)?;
             let task_stamp = task.stamp;
-            let link = task
-                .service_fault
-                .ok_or(InfrastructureError::InvalidState)?;
-            let fault = scope
-                .faults
-                .get(link.fault_id)
-                .ok_or(InfrastructureError::UnknownObligation)?;
+            let (link, fault) = validate_exact_task_fault_pair(scope, task)?;
+            validate_fault_plan_canonical(scope, plan)?;
             if plan.commitment != fault_plan_commitment(scope, plan)
                 || plan.base_revision != scope.revision
                 || plan.task != task_stamp.identity
@@ -556,12 +504,6 @@ impl InfrastructureState {
                 || task.phase != TaskPhase::Entered
                 || task.anchor != TaskAnchorPhase::Live
                 || fault.phase != FaultPhase::Armed
-                || fault.owner.task != task_stamp.identity
-                || fault.owner.task_object_nonce != task_stamp.nonce
-                || fault.owner.task_bearer_generation != task_stamp.bearer_generation
-                || link.fault_object_generation != fault.stamp.identity.generation
-                || link.fault_bearer_generation != fault.stamp.bearer_generation
-                || link.fault_nonce != fault.stamp.nonce
             {
                 return Err(InfrastructureError::StaleClaim);
             }
@@ -657,10 +599,7 @@ impl InfrastructureState {
         installed: InstalledFaultObservation,
     ) -> Result<FaultReceiptClaimOutcome, InfrastructureError> {
         self.require_authoritative()?;
-        let projection = match installed {
-            InstalledFaultObservation::Crash(installed)
-            | InstalledFaultObservation::Isolate(installed) => installed,
-        };
+        let projection = validate_installed_fault_variant(installed)?;
         let registry_instance = self.registry_instance;
         let scope = self.scope_mut(context.root.scope)?;
         validate_recovery_context(scope, registry_instance, context)?;
@@ -690,10 +629,9 @@ impl InfrastructureState {
                     .tasks
                     .get(owner_work_id)
                     .ok_or(InfrastructureError::UnknownObligation)?;
-                if owner.service_fault.is_none_or(|link| {
-                    link.fault_bearer_generation != record.stamp.bearer_generation
-                }) {
-                    return Err(InfrastructureError::StaleClaim);
+                let (_, linked_fault) = validate_exact_task_fault_pair(scope, owner)?;
+                if linked_fault.stamp.identity != record.stamp.identity {
+                    return Err(InfrastructureError::Invariant("task-fault pair mismatch"));
                 }
                 let record = scope
                     .faults
@@ -782,11 +720,9 @@ impl InfrastructureState {
                 .tasks
                 .get(owner_work_id)
                 .ok_or(InfrastructureError::UnknownObligation)?;
-            if owner
-                .service_fault
-                .is_none_or(|link| link.fault_bearer_generation != record.stamp.bearer_generation)
-            {
-                return Err(InfrastructureError::StaleClaim);
+            let (_, linked_fault) = validate_exact_task_fault_pair(scope, owner)?;
+            if linked_fault.stamp.identity != record.stamp.identity {
+                return Err(InfrastructureError::Invariant("task-fault pair mismatch"));
             }
             let record = scope.faults.get_mut(projection.fault_id).unwrap();
             record.stamp.bearer_generation = next_generation;
@@ -830,14 +766,26 @@ impl InfrastructureState {
         if record.stamp.workload.request != context.workload.request {
             return Err(InfrastructureError::ForeignWorkload);
         }
-        let receipt = match record.phase {
-            FaultPhase::InstalledAwaitingClaim { projection, .. }
-            | FaultPhase::Claimed { projection, .. } => Some(projection),
-            FaultPhase::Reserved | FaultPhase::Armed | FaultPhase::Exited { .. } => None,
+        let (receipt, selector) = match record.phase {
+            FaultPhase::InstalledAwaitingClaim {
+                projection,
+                commitment,
+                ..
+            }
+            | FaultPhase::Claimed {
+                projection,
+                commitment,
+                ..
+            } => (
+                Some(projection),
+                Some(installed_fault_observation(projection, commitment)),
+            ),
+            FaultPhase::Reserved | FaultPhase::Armed | FaultPhase::Exited { .. } => (None, None),
         };
         Ok(FaultRecoveryProjection {
             descriptor: record.stamp.identity,
             receipt,
+            selector,
             consumed: matches!(
                 record.phase,
                 FaultPhase::Claimed {
@@ -847,6 +795,52 @@ impl InfrastructureState {
             ),
             awaiting_claim: matches!(record.phase, FaultPhase::InstalledAwaitingClaim { .. }),
         })
+    }
+
+    pub(in super::super) fn domain_fault_recovery_projection(
+        &self,
+        scope_key: super::ScopeKey,
+        fault_id: u64,
+        generation: u64,
+    ) -> Result<Option<DomainFaultRecoveryProjection>, InfrastructureError> {
+        let scope = self.scope(scope_key)?;
+        let record = scope
+            .faults
+            .get(fault_id)
+            .ok_or(InfrastructureError::UnknownObligation)?;
+        if record.stamp.identity.generation != generation {
+            return Err(InfrastructureError::StaleGeneration);
+        }
+        let (projection, commitment) = match record.phase {
+            FaultPhase::InstalledAwaitingClaim {
+                projection,
+                commitment,
+                ..
+            }
+            | FaultPhase::Claimed {
+                projection,
+                commitment,
+                ..
+            } if projection.disposition == FaultDisposition::CrashService => {
+                (projection, commitment)
+            }
+            FaultPhase::Reserved
+            | FaultPhase::Armed
+            | FaultPhase::Exited { .. }
+            | FaultPhase::InstalledAwaitingClaim { .. }
+            | FaultPhase::Claimed { .. } => return Ok(None),
+        };
+        Ok(Some(DomainFaultRecoveryProjection {
+            fault_id: projection.fault_id,
+            generation: projection.generation,
+            task: projection.task,
+            vm_generation: projection.vm_generation,
+            service_domain: projection.service_domain,
+            closed_binding_epoch: projection.closed_binding_epoch,
+            crash_generation: projection.crash_generation,
+            evidence_digest: projection.evidence_digest,
+            plan_commitment: commitment.0,
+        }))
     }
 }
 
@@ -910,7 +904,7 @@ fn validate_fault_key<'a, State: bearer_state::Sealed>(
     Ok(record)
 }
 
-fn fault_plan_commitment(
+pub(super) fn fault_plan_commitment(
     scope: &ScopeInfrastructure,
     plan: FaultDispositionPlan,
 ) -> FaultPlanCommitment {
@@ -953,8 +947,19 @@ fn fault_plan_commitment(
     hash_word(&mut hasher, access_tag(plan.observation.access));
     hash_word(&mut hasher, plan.observation.architecture_error);
     hash_word(&mut hasher, plan.observation.evidence_digest);
+    hash_word(&mut hasher, plan.projection.fault_id);
+    hash_word(&mut hasher, plan.projection.generation);
+    hash_word(&mut hasher, plan.projection.task.id());
+    hash_word(&mut hasher, plan.projection.task.generation());
+    hash_word(&mut hasher, plan.projection.vm_generation);
     hash_word(&mut hasher, disposition_tag(plan.projection.disposition));
+    hash_word(
+        &mut hasher,
+        u64::from(plan.projection.service_domain.value()),
+    );
+    hash_word(&mut hasher, plan.projection.closed_binding_epoch);
     hash_word(&mut hasher, plan.projection.crash_generation);
+    hash_word(&mut hasher, plan.projection.evidence_digest);
     hash_word(&mut hasher, plan.base_revision);
     hash_word(&mut hasher, plan.next_binding_epoch);
     hash_word(&mut hasher, plan.business.scope_revision);
@@ -973,11 +978,128 @@ fn fault_plan_commitment(
     FaultPlanCommitment(hasher.finalize().into())
 }
 
+pub(super) fn validate_exact_task_fault_pair<'a>(
+    scope: &'a ScopeInfrastructure,
+    task: &'a super::TaskRecord,
+) -> Result<(&'a TaskFaultLink, &'a FaultStateRecord), InfrastructureError> {
+    let link = task
+        .service_fault
+        .as_ref()
+        .ok_or(InfrastructureError::Invariant("task-fault pair missing"))?;
+    let fault = scope
+        .faults
+        .get(link.fault_id)
+        .ok_or(InfrastructureError::Invariant("task-fault pair missing"))?;
+    let descriptor = fault.stamp.identity;
+    if fault.stamp.parent != ParentStamp::Task(task.stamp.identity)
+        || fault.stamp.root != task.stamp.root
+        || fault.stamp.domain != task.stamp.domain
+        || fault.stamp.workload != task.stamp.workload
+        || descriptor.task != task.stamp.identity.task
+        || task.stamp.identity.vm.map(VmAuthorityKey::generation) != Some(descriptor.vm_generation)
+        || descriptor.service_domain != fault.stamp.domain.domain
+        || fault.owner.task != task.stamp.identity
+        || fault.owner.task_object_nonce != task.stamp.nonce
+        || fault.owner.task_bearer_generation != task.stamp.bearer_generation
+        || link.fault_id != descriptor.fault_id
+        || link.fault_object_generation != descriptor.generation
+        || link.fault_bearer_generation != fault.stamp.bearer_generation
+        || link.fault_nonce != fault.stamp.nonce
+    {
+        return Err(InfrastructureError::Invariant("task-fault pair mismatch"));
+    }
+    Ok((link, fault))
+}
+
+fn validate_fault_plan_canonical(
+    scope: &ScopeInfrastructure,
+    plan: FaultDispositionPlan,
+) -> Result<(), InfrastructureError> {
+    let expected_next_binding = match plan.projection.disposition {
+        FaultDisposition::CrashService => plan
+            .fault
+            .admission_binding_epoch
+            .checked_add(1)
+            .ok_or(InfrastructureError::CounterOverflow)?,
+        FaultDisposition::IsolateTask => plan.fault.admission_binding_epoch,
+    };
+    let expected_crash_generation = match plan.projection.disposition {
+        FaultDisposition::CrashService => {
+            if plan.business == FaultBusinessPlan::INFRASTRUCTURE_ONLY {
+                scope
+                    .revision
+                    .checked_add(1)
+                    .ok_or(InfrastructureError::CounterOverflow)?
+            } else {
+                plan.business
+                    .domain_revision
+                    .checked_add(1)
+                    .ok_or(InfrastructureError::CounterOverflow)?
+            }
+        }
+        FaultDisposition::IsolateTask => 0,
+    };
+    if plan.scope != scope.root.scope
+        || plan.task.task != plan.fault.task
+        || plan.task.vm.map(VmAuthorityKey::generation) != Some(plan.fault.vm_generation)
+        || plan.observation.task != plan.fault.task
+        || plan.observation.vm_generation != plan.fault.vm_generation
+        || plan.observation.instruction_pointer == 0
+        || plan.observation.evidence_digest == 0
+        || plan.projection.fault_id != plan.fault.fault_id
+        || plan.projection.generation != plan.fault.generation
+        || plan.projection.task != plan.fault.task
+        || plan.projection.vm_generation != plan.fault.vm_generation
+        || plan.projection.service_domain != plan.fault.service_domain
+        || plan.projection.closed_binding_epoch != plan.fault.admission_binding_epoch
+        || plan.projection.crash_generation != expected_crash_generation
+        || plan.projection.evidence_digest != plan.observation.evidence_digest
+        || plan.next_binding_epoch != expected_next_binding
+    {
+        return Err(InfrastructureError::InvalidReceipt);
+    }
+    Ok(())
+}
+
+fn installed_fault_observation(
+    projection: ServiceFaultProjection,
+    commitment: FaultPlanCommitment,
+) -> InstalledFaultObservation {
+    let installed = InstalledFaultProjection {
+        projection,
+        commitment,
+    };
+    match projection.disposition {
+        FaultDisposition::CrashService => InstalledFaultObservation::Crash(installed),
+        FaultDisposition::IsolateTask => InstalledFaultObservation::Isolate(installed),
+    }
+}
+
+fn validate_installed_fault_variant(
+    installed: InstalledFaultObservation,
+) -> Result<InstalledFaultProjection, InfrastructureError> {
+    match installed {
+        InstalledFaultObservation::Crash(installed)
+            if installed.projection.disposition == FaultDisposition::CrashService =>
+        {
+            Ok(installed)
+        }
+        InstalledFaultObservation::Isolate(installed)
+            if installed.projection.disposition == FaultDisposition::IsolateTask =>
+        {
+            Ok(installed)
+        }
+        InstalledFaultObservation::Crash(_) | InstalledFaultObservation::Isolate(_) => {
+            Err(InfrastructureError::InvalidReceipt)
+        }
+    }
+}
+
 fn hash_word(hasher: &mut Sha256, value: u64) {
     hasher.update(value.to_le_bytes());
 }
 
-fn exit_receipt_digest(receipt: super::ServiceTaskExitReceipt) -> [u8; 32] {
+pub(super) fn exit_receipt_digest(receipt: super::ServiceTaskExitReceipt) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(b"nexus.cser.task-fault-exit.v1\0");
     hash_word(&mut hasher, receipt.fault_id);

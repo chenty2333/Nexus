@@ -13,7 +13,7 @@ use super::{
     next_deadline_bearer_generation, preview_bearer_stamp, preview_nonce, preview_nonces,
     preview_revision, preview_task_child_add, preview_task_child_sub, preview_workload_child_add,
     preview_workload_child_sub, require_vacancy, validate_active_admission, validate_context,
-    validate_deadline_key, validate_task_key, validate_task_stamp,
+    validate_deadline_key, validate_task_child_stamp, validate_task_key, validate_task_stamp,
 };
 
 enum PreparedDeadlineAdoption {
@@ -239,6 +239,9 @@ impl InfrastructureState {
             if exhausted {
                 return Err(InfrastructureError::ClosureRetained);
             }
+            if validate_task_child_stamp(scope, registry_instance, &record.stamp)? {
+                return Err(InfrastructureError::InvalidState);
+            }
             let observed_tick = match record.phase {
                 DeadlinePhase::Fired {
                     expiry_nonce,
@@ -396,6 +399,9 @@ impl InfrastructureState {
                     Ok(DeadlineReconciliationOutcome::Aborted)
                 }
                 DeadlineExhaustedDisposition::RetryBySupervisor => {
+                    if validate_task_child_stamp(scope, registry_instance, &record.stamp)? {
+                        return Err(InfrastructureError::InvalidState);
+                    }
                     let retry = supervisor_retry.ok_or(InfrastructureError::InvalidReceipt)?;
                     let minimum_tick = observed_tick
                         .checked_add(retry.backoff_ticks)
