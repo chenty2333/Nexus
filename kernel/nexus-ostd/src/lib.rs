@@ -42,6 +42,8 @@ mod linux_dynamic;
 mod linux_epoll;
 #[path = "personality/linux_fs.rs"]
 mod linux_fs;
+#[path = "personality/linux_fs_input.rs"]
+mod linux_fs_input;
 #[path = "personality/linux_futex.rs"]
 mod linux_futex;
 #[path = "personality/linux_futex_core.rs"]
@@ -521,7 +523,16 @@ fn run_fallback_probe(scheduler: &'static CserScheduler, old_binding: scheduler:
     // lifetime, publication, and scope closure.
     linux_epoll::run_linux_epoll_slice();
     linux_dynamic::run_linux_dynamic_slice();
-    let fs_receipt = linux_fs::run_linux_fs_slice();
+    let fs_receipt = match linux_fs::run_linux_fs_slice() {
+        Ok(receipt) => receipt,
+        Err(isolation) => {
+            println!(
+                "LINUX_FS_TERMINAL Isolated error={:?} retained_owner=true closure_receipt=false supervisor_handoff=pending demo_policy=poweroff_failure",
+                isolation,
+            );
+            poweroff(ExitCode::Failure)
+        }
+    };
     #[cfg(all(
         feature = "virtio-cser-facade",
         not(feature = "virtio-cser-precommit-fault")

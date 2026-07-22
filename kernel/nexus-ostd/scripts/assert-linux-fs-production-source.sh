@@ -42,16 +42,17 @@ line_of() {
     printf '%s\n' "$line"
 }
 
+fd_validation=$(line_of 'state.fds.get(&3) != Some(&FdKind::Executable)')
 capture=$(line_of 'let registered = state.capture(descriptor, vec![PROCESS_RESOURCE]);')
-fd_resolution=$(line_of 'assert_eq!(state.fds.get(&3), Some(&FdKind::Executable));')
+fd_invariant=$(line_of 'assert_eq!(state.fds.get(&3), Some(&FdKind::Executable));')
 begin=$(line_of 'let prepared = state.begin_first_executable_read(&registered, descriptor);')
 payload=$(line_of 'let bytes = RUNTIME_FS_ELF[start..end].to_vec();')
 finish=$(line_of 'let receipt = state.finish_first_executable_read(prepared, descriptor, &bytes);')
 personality_commit=$(line_of 'let commit = state.commit(&registered, result);')
 
-((capture < fd_resolution && fd_resolution < begin && begin < payload &&
+((fd_validation < capture && capture < fd_invariant && fd_invariant < begin && begin < payload &&
     payload < finish && finish < personality_commit)) ||
-    fail 'capture/resolve/prepare/read/finish/personality-commit order changed'
+    fail 'validate/capture/invariant/prepare/read/finish/personality-commit order changed'
 
 if grep -Fq '.commit(BLOCK_V1' "$legacy_finish"; then
     fail 'deterministic Phase-2 BlockRequest acquired a device CommitReceipt'
@@ -74,4 +75,4 @@ grep -Fq 'crash_injection=registry_domain real_user_service_crash=false' "$sourc
 grep -Fq 'device_commit=false avail_idx_release=false' "$source_file" ||
     fail 'block-preparation non-claim is missing'
 
-echo 'runtime filesystem production source assertions: PASS capture_before_resolution=true capture_before_payload=true shared_registry=true registry_domain_crash=true real_user_service_crash=false block_preparation_only=true device_commit=false device_credits_held=0 fresh_registry_negative_only=true'
+echo 'runtime filesystem production source assertions: PASS input_validation_before_capture=true capture_before_payload=true shared_registry=true registry_domain_crash=true real_user_service_crash=false block_preparation_only=true device_commit=false device_credits_held=0 fresh_registry_negative_only=true'

@@ -21,6 +21,9 @@ use core::fmt;
 #[cfg(feature = "virtio-cser-facade")]
 use core::{hint::spin_loop, num::NonZeroU64};
 
+#[cfg(feature = "virtio-cser-facade")]
+use linux_raw_sys::errno::EIO;
+use linux_raw_sys::errno::{E2BIG, EBADF, EFAULT, EINVAL, ENAMETOOLONG, ENOENT, ENOSYS};
 use linux_raw_sys::general::{
     __NR_close, __NR_exit, __NR_newfstatat, __NR_openat, __NR_pread64, __NR_pwrite64,
     __NR_readlinkat, __NR_statx, __NR_write, AT_FDCWD,
@@ -44,6 +47,10 @@ use ostd::{
     task::{Task, disable_preempt},
 };
 
+use crate::linux_fs_input::{
+    FsGuestAccessError, FsGuestCopyDirection, MAX_RUNTIME_FS_C_STRING, MAX_RUNTIME_FS_GUEST_COPY,
+    find_c_string_end, unmapped_guest_range, validate_guest_copy, validate_guest_range,
+};
 use crate::{
     TaskData,
     effect::{EffectToken, EffectWaiter, EffectWaker},
@@ -2422,6 +2429,7 @@ fn reserved_block_descriptor(
 }
 
 enum PublicationAuthority {
+    RejectedInput,
     #[cfg(not(feature = "virtio-cser-facade"))]
     Generic(PublicationTicket),
     #[cfg(feature = "virtio-cser-facade")]
@@ -2432,7 +2440,44 @@ enum PublicationAuthority {
         flight_cookie: u64,
     },
     #[cfg(feature = "virtio-cser-facade")]
-    Retained { flight_cookie: u64 },
+    Retained {
+        flight_cookie: u64,
+    },
+}
+
+impl FsGuestAccessError {
+    const fn linux_errno(self) -> i64 {
+        let errno = match self {
+            Self::LengthExceedsLimit { .. } => E2BIG,
+            Self::MissingNul { .. } => ENAMETOOLONG,
+            Self::AddressOverflow { .. }
+            | Self::InvalidRange { .. }
+            | Self::Unmapped { .. }
+            | Self::Partial { .. } => EFAULT,
+        };
+        -(errno as i64)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FsDispatchInputError {
+    GuestAccess(FsGuestAccessError),
+    BadFileDescriptor { fd: i32 },
+    InvalidArgument { argument: &'static str },
+    NotFound,
+    UnsupportedSyscall { number: usize },
+}
+
+impl FsDispatchInputError {
+    const fn linux_errno(self) -> i64 {
+        match self {
+            Self::GuestAccess(error) => error.linux_errno(),
+            Self::BadFileDescriptor { .. } => -(EBADF as i64),
+            Self::InvalidArgument { .. } => -(EINVAL as i64),
+            Self::NotFound => -(ENOENT as i64),
+            Self::UnsupportedSyscall { .. } => -(ENOSYS as i64),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2440,6 +2485,7 @@ enum PublicationResult {
     Complete,
     #[cfg(feature = "virtio-cser-facade")]
     Retained,
+    GuestAccess(FsGuestAccessError),
 }
 
 struct DispatchOutcome {
@@ -2447,6 +2493,24 @@ struct DispatchOutcome {
     authority: PublicationAuthority,
     publication: Publication,
     exit: bool,
+}
+
+impl DispatchOutcome {
+    fn rejected(descriptor: SyscallDescriptor, error: FsDispatchInputError) -> Self {
+        let result = error.linux_errno();
+        println!(
+            "LINUX_FS_INPUT Rejected syscall={} error={:?} errno={} mutation=false authority=none",
+            descriptor.number(),
+            error,
+            -result,
+        );
+        Self {
+            result,
+            authority: PublicationAuthority::RejectedInput,
+            publication: Publication::None,
+            exit: false,
+        }
+    }
 }
 
 #[cfg(feature = "virtio-cser-facade")]
@@ -2465,6 +2529,58 @@ enum FsServicePhase {
     Executed,
     ReplyReady,
     Done,
+    Isolated,
+}
+
+#[cfg(feature = "virtio-cser-facade")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum FsServiceProtocolError {
+    ScenarioIsolated {
+        portal: &'static str,
+    },
+    UnexpectedSender {
+        portal: &'static str,
+        expected: TaskKey,
+        observed: TaskKey,
+    },
+    UnexpectedPhase {
+        portal: &'static str,
+        expected: &'static str,
+        observed: FsServicePhase,
+    },
+    MissingField {
+        portal: &'static str,
+        field: &'static str,
+    },
+    CapturedFlightMismatch {
+        portal: &'static str,
+        cookie: u64,
+    },
+    Registry {
+        portal: &'static str,
+        error: RegistryError,
+    },
+}
+
+#[cfg(feature = "virtio-cser-facade")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum FsServiceTerminationReason {
+    GuestReportedFailure { code: usize },
+    UnknownPortal { opcode: usize },
+    PortalRejected(FsServiceProtocolError),
+    MissingException,
+    UnexpectedException(CpuException),
+    UnexpectedPageFault { address: usize },
+}
+
+#[cfg(feature = "virtio-cser-facade")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FsServiceTerminationReceipt {
+    task: TaskKey,
+    phase_before_isolation: FsServicePhase,
+    filesystem_effect: Option<EffectKey>,
+    flight_cookie: Option<u64>,
+    reason: FsServiceTerminationReason,
 }
 
 #[cfg(feature = "virtio-cser-facade")]
@@ -2491,6 +2607,7 @@ struct FsServiceProjection {
     response_taken: bool,
     stale_replay_observed: bool,
     service_done: bool,
+    termination_present: bool,
 }
 
 #[cfg(feature = "virtio-cser-facade")]
@@ -2508,6 +2625,7 @@ struct FsServiceProtocol {
     response_taken: bool,
     stale_replay_observed: bool,
     service_done: bool,
+    termination: Option<FsServiceTerminationReceipt>,
 }
 
 #[cfg(feature = "virtio-cser-facade")]
@@ -2527,6 +2645,7 @@ impl FsServiceProtocol {
             response_taken: false,
             stale_replay_observed: false,
             service_done: false,
+            termination: None,
         }
     }
 
@@ -2549,7 +2668,72 @@ impl FsServiceProtocol {
             response_taken: self.response_taken,
             stale_replay_observed: self.stale_replay_observed,
             service_done: self.service_done,
+            termination_present: self.termination.is_some(),
         }
+    }
+
+    fn require_sender(
+        portal: &'static str,
+        observed: TaskKey,
+        expected: TaskKey,
+    ) -> Result<(), FsServiceProtocolError> {
+        if observed != expected {
+            return Err(FsServiceProtocolError::UnexpectedSender {
+                portal,
+                expected,
+                observed,
+            });
+        }
+        Ok(())
+    }
+
+    fn require_phase(
+        &self,
+        portal: &'static str,
+        expected: &'static str,
+        accepted: impl FnOnce(FsServicePhase) -> bool,
+    ) -> Result<(), FsServiceProtocolError> {
+        if !accepted(self.phase) {
+            return Err(FsServiceProtocolError::UnexpectedPhase {
+                portal,
+                expected,
+                observed: self.phase,
+            });
+        }
+        Ok(())
+    }
+
+    fn isolate(
+        &mut self,
+        task: TaskKey,
+        reason: FsServiceTerminationReason,
+    ) -> (FsServiceTerminationReceipt, Option<EffectWaker>) {
+        if let Some(receipt) = self.termination.as_ref() {
+            return (receipt.clone(), None);
+        }
+        let receipt = FsServiceTerminationReceipt {
+            task,
+            phase_before_isolation: self.phase,
+            filesystem_effect: self
+                .filesystem
+                .as_ref()
+                .map(|registered| registered.identity.effect()),
+            flight_cookie: self.cookie.map(NonZeroU64::get),
+            reason,
+        };
+        let response_waker = self.response_waker.take();
+        if response_waker.is_some() {
+            self.outcome = Some(DispatchOutcome {
+                result: -(EIO as i64),
+                authority: PublicationAuthority::RejectedInput,
+                publication: Publication::None,
+                exit: true,
+            });
+            self.reply_wakeups = 1;
+        }
+        self.phase = FsServicePhase::Isolated;
+        self.termination = Some(receipt.clone());
+        (receipt, response_waker)
     }
 
     fn enqueue_unannounced(
@@ -2570,17 +2754,27 @@ impl FsServiceProtocol {
         self.phase = FsServicePhase::Queued;
     }
 
-    fn take_outcome(&mut self) -> DispatchOutcome {
-        assert!(matches!(
-            self.phase,
-            FsServicePhase::ReplyReady | FsServicePhase::Done
-        ));
-        assert_eq!(self.reply_wakeups, 1);
-        assert!(!self.response_taken);
+    fn take_outcome(&mut self) -> Result<DispatchOutcome, FsServiceProtocolError> {
+        self.require_phase("take_outcome", "ReplyReady, Done, or Isolated", |phase| {
+            matches!(
+                phase,
+                FsServicePhase::ReplyReady | FsServicePhase::Done | FsServicePhase::Isolated
+            )
+        })?;
+        if self.reply_wakeups != 1 || self.response_taken {
+            return Err(FsServiceProtocolError::UnexpectedPhase {
+                portal: "take_outcome",
+                expected: "one unconsumed reply wakeup",
+                observed: self.phase,
+            });
+        }
         self.response_taken = true;
         self.outcome
             .take()
-            .expect("fsd-v2 installed one filesystem response")
+            .ok_or(FsServiceProtocolError::MissingField {
+                portal: "take_outcome",
+                field: "outcome",
+            })
     }
 
     fn assert_complete(&self) {
@@ -2595,6 +2789,7 @@ impl FsServiceProtocol {
         assert!(self.response_taken);
         assert!(self.stale_replay_observed);
         assert!(self.service_done);
+        assert!(self.termination.is_none());
     }
 }
 
@@ -2617,10 +2812,89 @@ struct FsScenario {
     production: SpinLock<ProductionReadRuntime>,
     #[cfg(feature = "virtio-cser-facade")]
     service: SpinLock<FsServiceProtocol>,
+    isolation_reason: SpinLock<Option<RuntimeFsSliceIsolationReason>>,
     done: SpinLock<Option<EffectWaker>>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RuntimeFsSliceIsolationReason {
+    GuestPublication(FsGuestAccessError),
+    #[cfg(feature = "virtio-cser-facade")]
+    RetainedPublication,
+    #[cfg(feature = "virtio-cser-facade")]
+    Service(FsServiceTerminationReceipt),
+}
+
+/// Owns the exact scenario state after a typed local isolation. This is not a
+/// closure receipt and does not claim that a replacement service has adopted
+/// any live Registry or hardware authority. A future supervisor must consume
+/// this owner before it can retry, abort, or replace the isolated service.
+pub(crate) struct RuntimeFsSliceIsolation {
+    reason: RuntimeFsSliceIsolationReason,
+    _retained_owner: Arc<FsScenario>,
+}
+
+impl RuntimeFsSliceIsolation {
+    fn new(reason: RuntimeFsSliceIsolationReason, retained_owner: Arc<FsScenario>) -> Self {
+        Self {
+            reason,
+            _retained_owner: retained_owner,
+        }
+    }
+}
+
+impl fmt::Debug for RuntimeFsSliceIsolation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RuntimeFsSliceIsolation")
+            .field("reason", &self.reason)
+            .field("retained_owner", &true)
+            .field("closure_receipt", &false)
+            .finish()
+    }
+}
+
 impl FsScenario {
+    fn record_isolation(&self, reason: RuntimeFsSliceIsolationReason) {
+        let mut isolated = self.isolation_reason.lock();
+        if isolated.is_none() {
+            *isolated = Some(reason);
+        }
+    }
+
+    fn isolation_reason(&self) -> Option<RuntimeFsSliceIsolationReason> {
+        self.isolation_reason.lock().clone()
+    }
+
+    fn wake_slice_done(&self) {
+        if let Some(waker) = self.done.lock().take() {
+            waker.wake_up();
+        }
+    }
+
+    #[cfg(feature = "virtio-cser-facade")]
+    fn isolate_fsd(
+        &self,
+        task: TaskKey,
+        reason: FsServiceTerminationReason,
+    ) -> FsServiceTerminationReceipt {
+        let (receipt, response_waker) = self.service.lock().isolate(task, reason);
+        println!(
+            "LINUX_FS_SERVICE Isolated task={} task_generation={} phase_before={:?} filesystem_effect={:?} flight_cookie={:?} reason={:?} retained_owner=true closure_receipt=false replacement_complete=false",
+            receipt.task.id(),
+            receipt.task.generation(),
+            receipt.phase_before_isolation,
+            receipt.filesystem_effect,
+            receipt.flight_cookie,
+            receipt.reason,
+        );
+        self.record_isolation(RuntimeFsSliceIsolationReason::Service(receipt.clone()));
+        if let Some(waker) = response_waker {
+            waker.wake_up();
+        }
+        receipt
+    }
+
     #[cfg(feature = "virtio-cser-facade")]
     fn require_same_boot_causal_session(
         &self,
@@ -2890,14 +3164,38 @@ impl FsScenario {
     }
 
     #[cfg(feature = "virtio-cser-facade")]
-    fn fsd_next_operation(&self, sender: TaskKey) -> usize {
-        assert_eq!(sender, FILESYSTEM_V1);
+    fn fsd_next_operation(&self, sender: TaskKey) -> Result<usize, FsServiceProtocolError> {
+        FsServiceProtocol::require_sender("next", sender, FILESYSTEM_V1)?;
+        if self.isolation_reason().is_some() {
+            return Err(FsServiceProtocolError::ScenarioIsolated { portal: "next" });
+        }
         let (descriptor, cookie) = {
             let service = self.service.lock();
             if service.phase != FsServicePhase::Queued {
-                return FSD_OP_WAIT;
+                return if matches!(
+                    service.phase,
+                    FsServicePhase::Idle | FsServicePhase::QueuedUnannounced
+                ) {
+                    Ok(FSD_OP_WAIT)
+                } else {
+                    Err(FsServiceProtocolError::UnexpectedPhase {
+                        portal: "next",
+                        expected: "Idle, QueuedUnannounced, or Queued",
+                        observed: service.phase,
+                    })
+                };
             }
-            (service.descriptor.unwrap(), service.cookie.unwrap())
+            let descriptor = service
+                .descriptor
+                .ok_or(FsServiceProtocolError::MissingField {
+                    portal: "next",
+                    field: "descriptor",
+                })?;
+            let cookie = service.cookie.ok_or(FsServiceProtocolError::MissingField {
+                portal: "next",
+                field: "cookie",
+            })?;
+            (descriptor, cookie)
         };
         let filesystem = {
             let mut runtime = self.production.lock();
@@ -2907,7 +3205,12 @@ impl FsScenario {
                     syscall,
                     ..
                 } if *captured_cookie == cookie => syscall.clone(),
-                _ => panic!("fsd-v1 observed a request without its captured syscall flight"),
+                _ => {
+                    return Err(FsServiceProtocolError::CapturedFlightMismatch {
+                        portal: "next",
+                        cookie: cookie.get(),
+                    });
+                }
             };
             let filesystem = runtime
                 .registry
@@ -2924,77 +3227,146 @@ impl FsScenario {
                     domain: FILESYSTEM_DOMAIN,
                     parent: Some(syscall.identity.effect()),
                 })
-                .expect("fsd-v1 registers the filesystem descendant");
+                .map_err(|error| FsServiceProtocolError::Registry {
+                    portal: "next/register",
+                    error,
+                })?;
             runtime.registered_effects = 2;
-            assert_eq!(
-                runtime
-                    .registry
-                    .domain_projection(SCOPE, BLOCK_DOMAIN)
-                    .unwrap()
-                    .live_effects,
-                0,
-            );
-            runtime.registry.check_invariants().unwrap();
             filesystem
         };
         let effect = filesystem.identity.effect();
         {
             let mut service = self.service.lock();
-            assert_eq!(service.phase, FsServicePhase::Queued);
             service.filesystem = Some(filesystem);
+            service.require_phase("next/install", "Queued", |phase| {
+                phase == FsServicePhase::Queued
+            })?;
             service.phase = FsServicePhase::Registered;
+        }
+        {
+            let runtime = self.production.lock();
+            let block = runtime
+                .registry
+                .domain_projection(SCOPE, BLOCK_DOMAIN)
+                .map_err(|error| FsServiceProtocolError::Registry {
+                    portal: "next/block_projection",
+                    error,
+                })?;
+            if block.live_effects != 0 {
+                return Err(FsServiceProtocolError::Registry {
+                    portal: "next/block_projection",
+                    error: RegistryError::Invariant(
+                        "filesystem registration unexpectedly admitted a block effect",
+                    ),
+                });
+            }
+            runtime.registry.check_invariants().map_err(|error| {
+                FsServiceProtocolError::Registry {
+                    portal: "next/invariants",
+                    error,
+                }
+            })?;
         }
         println!(
             "LINUX_FS_SERVICE Register runner=fsd-v1 task={} effect={} binding=1 parent=syscall device_cohort=0 guest_reply=false",
             sender.id(),
             effect.id(),
         );
-        FSD_OP_REQUEST
+        Ok(FSD_OP_REQUEST)
     }
 
     #[cfg(feature = "virtio-cser-facade")]
-    fn fsd_prepare_active(&self, sender: TaskKey) {
-        assert_eq!(sender, FILESYSTEM_V1);
-        let filesystem = {
-            let service = self.service.lock();
-            assert_eq!(service.phase, FsServicePhase::Registered);
-            service.filesystem.as_ref().unwrap().clone()
-        };
+    fn fsd_prepare_active(&self, sender: TaskKey) -> Result<(), FsServiceProtocolError> {
+        FsServiceProtocol::require_sender("prepare", sender, FILESYSTEM_V1)?;
+        let filesystem =
+            {
+                let service = self.service.lock();
+                service.require_phase("prepare", "Registered", |phase| {
+                    phase == FsServicePhase::Registered
+                })?;
+                service.filesystem.as_ref().cloned().ok_or(
+                    FsServiceProtocolError::MissingField {
+                        portal: "prepare",
+                        field: "filesystem",
+                    },
+                )?
+            };
         {
             let mut runtime = self.production.lock();
-            runtime.registry.prepare(sender, filesystem.handle).unwrap();
+            runtime
+                .registry
+                .prepare(sender, filesystem.handle)
+                .map_err(|error| FsServiceProtocolError::Registry {
+                    portal: "prepare",
+                    error,
+                })?;
+        }
+        self.service.lock().phase = FsServicePhase::Prepared;
+        {
+            let runtime = self.production.lock();
             let view = runtime
                 .registry
                 .effect_view(filesystem.identity.effect())
-                .unwrap();
-            assert_eq!(view.phase, EffectPhase::Prepared);
-            assert_eq!(
-                runtime
-                    .registry
-                    .domain_projection(SCOPE, BLOCK_DOMAIN)
-                    .unwrap()
-                    .live_effects,
-                0,
-            );
-            assert!(matches!(runtime.flight, FsDeviceFlight::Captured { .. }));
-            runtime.registry.check_invariants().unwrap();
+                .map_err(|error| FsServiceProtocolError::Registry {
+                    portal: "prepare/effect_view",
+                    error,
+                })?;
+            if view.phase != EffectPhase::Prepared
+                || !matches!(runtime.flight, FsDeviceFlight::Captured { .. })
+            {
+                return Err(FsServiceProtocolError::Registry {
+                    portal: "prepare/postcondition",
+                    error: RegistryError::Invariant(
+                        "filesystem prepare did not preserve the captured flight",
+                    ),
+                });
+            }
+            let block = runtime
+                .registry
+                .domain_projection(SCOPE, BLOCK_DOMAIN)
+                .map_err(|error| FsServiceProtocolError::Registry {
+                    portal: "prepare/block_projection",
+                    error,
+                })?;
+            if block.live_effects != 0 {
+                return Err(FsServiceProtocolError::Registry {
+                    portal: "prepare/block_projection",
+                    error: RegistryError::Invariant(
+                        "filesystem prepare unexpectedly admitted a block effect",
+                    ),
+                });
+            }
+            runtime.registry.check_invariants().map_err(|error| {
+                FsServiceProtocolError::Registry {
+                    portal: "prepare/invariants",
+                    error,
+                }
+            })?;
         }
-        self.service.lock().phase = FsServicePhase::Prepared;
         println!(
             "LINUX_FS_SERVICE Prepare runner=fsd-v1 task={} effect={} phase=Prepared device_prepared=false device_committed=false guest_reply=false",
             sender.id(),
             filesystem.identity.effect().id(),
         );
+        Ok(())
     }
 
     #[cfg(feature = "virtio-cser-facade")]
-    fn fsd_queue_old_prepare(&self, sender: TaskKey) {
-        assert_eq!(sender, FILESYSTEM_V1);
+    fn fsd_queue_old_prepare(&self, sender: TaskKey) -> Result<(), FsServiceProtocolError> {
+        FsServiceProtocol::require_sender("queue_old_prepare", sender, FILESYSTEM_V1)?;
         let handle = {
             let mut service = self.service.lock();
-            assert_eq!(service.phase, FsServicePhase::Prepared);
-            assert!(service.delayed_prepare.is_none());
-            let handle = service.filesystem.as_ref().unwrap().handle;
+            service.require_phase("queue_old_prepare", "Prepared", |phase| {
+                phase == FsServicePhase::Prepared && service.delayed_prepare.is_none()
+            })?;
+            let handle = service
+                .filesystem
+                .as_ref()
+                .map(|effect| effect.handle)
+                .ok_or(FsServiceProtocolError::MissingField {
+                    portal: "queue_old_prepare",
+                    field: "filesystem",
+                })?;
             service.delayed_prepare = Some(DelayedPrepareCommand { sender, handle });
             handle
         };
@@ -3005,78 +3377,126 @@ impl FsScenario {
             handle.effect().id(),
             handle.binding_epoch(),
         );
+        Ok(())
     }
 
     #[cfg(feature = "virtio-cser-facade")]
-    fn crash_fsd_v1(&self, sender: TaskKey) {
-        assert_eq!(sender, FILESYSTEM_V1);
+    fn crash_fsd_v1(&self, sender: TaskKey) -> Result<(), FsServiceProtocolError> {
+        FsServiceProtocol::require_sender("crash", sender, FILESYSTEM_V1)?;
         let filesystem = {
             let service = self.service.lock();
-            assert_eq!(service.phase, FsServicePhase::Prepared);
-            assert_eq!(
-                service.delayed_prepare,
-                Some(DelayedPrepareCommand {
+            service.require_phase("crash", "Prepared", |phase| {
+                phase == FsServicePhase::Prepared
+                    && service.outcome.is_none()
+                    && service.reply_wakeups == 0
+            })?;
+            let filesystem = service.filesystem.as_ref().cloned().ok_or(
+                FsServiceProtocolError::MissingField {
+                    portal: "crash",
+                    field: "filesystem",
+                },
+            )?;
+            if service.delayed_prepare
+                != Some(DelayedPrepareCommand {
                     sender,
-                    handle: service.filesystem.as_ref().unwrap().handle,
+                    handle: filesystem.handle,
                 })
-            );
-            assert!(service.outcome.is_none());
-            assert_eq!(service.reply_wakeups, 0);
-            service.filesystem.as_ref().unwrap().clone()
+            {
+                return Err(FsServiceProtocolError::MissingField {
+                    portal: "crash",
+                    field: "exact delayed_prepare",
+                });
+            }
+            filesystem
         };
-        let crash = {
+        let (crash, personality_before, block_before) = {
             let mut runtime = self.production.lock();
-            assert_eq!(
-                runtime
-                    .registry
-                    .effect_view(filesystem.identity.effect())
-                    .unwrap()
-                    .phase,
-                EffectPhase::Prepared,
-            );
-            assert_eq!(
-                runtime
-                    .registry
-                    .domain_projection(SCOPE, BLOCK_DOMAIN)
-                    .unwrap()
-                    .live_effects,
-                0,
-            );
-            assert!(matches!(runtime.flight, FsDeviceFlight::Captured { .. }));
+            let view = runtime
+                .registry
+                .effect_view(filesystem.identity.effect())
+                .map_err(|error| FsServiceProtocolError::Registry {
+                    portal: "crash/effect_view",
+                    error,
+                })?;
+            let block = runtime
+                .registry
+                .domain_projection(SCOPE, BLOCK_DOMAIN)
+                .map_err(|error| FsServiceProtocolError::Registry {
+                    portal: "crash/block_projection",
+                    error,
+                })?;
+            if view.phase != EffectPhase::Prepared
+                || block.live_effects != 0
+                || !matches!(runtime.flight, FsDeviceFlight::Captured { .. })
+            {
+                return Err(FsServiceProtocolError::Registry {
+                    portal: "crash/precondition",
+                    error: RegistryError::Invariant(
+                        "filesystem crash precondition does not retain one prepared effect",
+                    ),
+                });
+            }
             let personality_before = runtime
                 .registry
                 .domain_projection(SCOPE, PERSONALITY_DOMAIN)
-                .unwrap();
+                .map_err(|error| FsServiceProtocolError::Registry {
+                    portal: "crash/personality_projection",
+                    error,
+                })?;
             let block_before = runtime
                 .registry
                 .domain_projection(SCOPE, BLOCK_DOMAIN)
-                .unwrap();
+                .map_err(|error| FsServiceProtocolError::Registry {
+                    portal: "crash/block_projection",
+                    error,
+                })?;
             let crash = runtime
                 .registry
                 .crash_domain(SCOPE, FILESYSTEM_DOMAIN, sender)
-                .unwrap();
-            assert_eq!(crash.previous_binding_epoch, 1);
-            assert_eq!(crash.binding_epoch, 2);
-            assert_eq!(crash.cohort.len(), 1);
-            assert!(crash.cohort.contains(&filesystem.identity.effect()));
-            assert_eq!(
-                runtime
-                    .registry
-                    .domain_projection(SCOPE, PERSONALITY_DOMAIN)
-                    .unwrap(),
-                personality_before,
-            );
-            assert_eq!(
-                runtime
-                    .registry
-                    .domain_projection(SCOPE, BLOCK_DOMAIN)
-                    .unwrap(),
-                block_before,
-            );
-            runtime.registry.check_invariants().unwrap();
-            crash
+                .map_err(|error| FsServiceProtocolError::Registry {
+                    portal: "crash",
+                    error,
+                })?;
+            (crash, personality_before, block_before)
         };
         self.service.lock().phase = FsServicePhase::Crashed;
+        {
+            let runtime = self.production.lock();
+            let personality_after = runtime
+                .registry
+                .domain_projection(SCOPE, PERSONALITY_DOMAIN)
+                .map_err(|error| FsServiceProtocolError::Registry {
+                    portal: "crash/personality_projection_after",
+                    error,
+                })?;
+            let block_after = runtime
+                .registry
+                .domain_projection(SCOPE, BLOCK_DOMAIN)
+                .map_err(|error| FsServiceProtocolError::Registry {
+                    portal: "crash/block_projection_after",
+                    error,
+                })?;
+            if crash.previous_binding_epoch != 1
+                || crash.binding_epoch != 2
+                || crash.cohort.len() != 1
+                || !crash.cohort.contains(&filesystem.identity.effect())
+                || personality_after != personality_before
+                || block_after != block_before
+            {
+                return Err(FsServiceProtocolError::Registry {
+                    portal: "crash/postcondition",
+                    error: RegistryError::Invariant(
+                        "filesystem crash changed its peer domains or exact cohort",
+                    ),
+                });
+            }
+            runtime.registry.check_invariants().map_err(|error| {
+                FsServiceProtocolError::Registry {
+                    portal: "crash/invariants",
+                    error,
+                }
+            })?;
+        }
         println!(
             "LINUX_FS_SERVICE Crash runner=fsd-v1 task={} old_binding={} new_binding={} cohort=1 filesystem_effect={} phase=Prepared device_cohort=0 device_committed=false guest_reply=false peer_domains_unchanged=true real_user_page_fault=true",
             sender.id(),
@@ -3084,32 +3504,55 @@ impl FsScenario {
             crash.binding_epoch,
             filesystem.identity.effect().id(),
         );
+        Ok(())
     }
 
     #[cfg(feature = "virtio-cser-facade")]
-    fn fsd_recovery_snapshot(&self, sender: TaskKey) {
-        assert_eq!(sender, FILESYSTEM_V2);
+    fn fsd_recovery_snapshot(&self, sender: TaskKey) -> Result<(), FsServiceProtocolError> {
+        FsServiceProtocol::require_sender("recovery_snapshot", sender, FILESYSTEM_V2)?;
         let filesystem_effect = {
             let service = self.service.lock();
-            assert_eq!(service.phase, FsServicePhase::Crashed);
-            service.filesystem.as_ref().unwrap().identity.effect()
+            service.require_phase("recovery_snapshot", "Crashed", |phase| {
+                phase == FsServicePhase::Crashed
+            })?;
+            service
+                .filesystem
+                .as_ref()
+                .map(|effect| effect.identity.effect())
+                .ok_or(FsServiceProtocolError::MissingField {
+                    portal: "recovery_snapshot",
+                    field: "filesystem",
+                })?
         };
         let snapshot = {
             let mut runtime = self.production.lock();
             let snapshot = runtime
                 .registry
                 .domain_recovery_snapshot(SCOPE, FILESYSTEM_DOMAIN, sender, 1)
-                .unwrap();
-            assert_eq!(snapshot.effects.len(), 1);
-            assert_eq!(snapshot.effects[0].effect, filesystem_effect);
-            assert_eq!(snapshot.effects[0].phase, EffectPhase::Prepared);
-            assert_eq!(snapshot.effects[0].binding_epoch, 1);
+                .map_err(|error| FsServiceProtocolError::Registry {
+                    portal: "recovery_snapshot",
+                    error,
+                })?;
+            if snapshot.effects.len() != 1
+                || snapshot.effects[0].effect != filesystem_effect
+                || snapshot.effects[0].phase != EffectPhase::Prepared
+                || snapshot.effects[0].binding_epoch != 1
+            {
+                return Err(FsServiceProtocolError::Registry {
+                    portal: "recovery_snapshot/postcondition",
+                    error: RegistryError::Invariant(
+                        "recovery snapshot did not preserve the prepared filesystem effect",
+                    ),
+                });
+            }
             snapshot
         };
         let binding = snapshot.binding_epoch;
         {
             let mut service = self.service.lock();
-            assert_eq!(service.phase, FsServicePhase::Crashed);
+            service.require_phase("recovery_snapshot/install", "Crashed", |phase| {
+                phase == FsServicePhase::Crashed
+            })?;
             service.snapshot = Some(snapshot);
             service.phase = FsServicePhase::Snapshotted;
         }
@@ -3118,96 +3561,167 @@ impl FsScenario {
             sender.id(),
             binding,
         );
+        Ok(())
     }
 
     #[cfg(feature = "virtio-cser-facade")]
-    fn fsd_recovery_ready(&self, sender: TaskKey) {
-        assert_eq!(sender, FILESYSTEM_V2);
+    fn fsd_recovery_ready(&self, sender: TaskKey) -> Result<(), FsServiceProtocolError> {
+        FsServiceProtocol::require_sender("recovery_ready", sender, FILESYSTEM_V2)?;
         let snapshot = {
             let service = self.service.lock();
-            assert_eq!(service.phase, FsServicePhase::Snapshotted);
-            service.snapshot.as_ref().unwrap().clone()
+            service.require_phase("recovery_ready", "Snapshotted", |phase| {
+                phase == FsServicePhase::Snapshotted
+            })?;
+            service
+                .snapshot
+                .as_ref()
+                .cloned()
+                .ok_or(FsServiceProtocolError::MissingField {
+                    portal: "recovery_ready",
+                    field: "snapshot",
+                })?
         };
         self.production
             .lock()
             .registry
             .domain_ready(SCOPE, FILESYSTEM_DOMAIN, sender, &snapshot)
-            .unwrap();
+            .map_err(|error| FsServiceProtocolError::Registry {
+                portal: "recovery_ready",
+                error,
+            })?;
         self.service.lock().phase = FsServicePhase::Ready;
         println!(
             "LINUX_FS_SERVICE Ready replacement={} binding={} snapshot_fresh=true",
             sender.id(),
             snapshot.binding_epoch,
         );
+        Ok(())
     }
 
     #[cfg(feature = "virtio-cser-facade")]
-    fn fsd_recovery_rebind(&self, sender: TaskKey) {
-        assert_eq!(sender, FILESYSTEM_V2);
+    fn fsd_recovery_rebind(&self, sender: TaskKey) -> Result<(), FsServiceProtocolError> {
+        FsServiceProtocol::require_sender("recovery_rebind", sender, FILESYSTEM_V2)?;
         {
             let service = self.service.lock();
-            assert_eq!(service.phase, FsServicePhase::Ready);
+            service.require_phase("recovery_rebind", "Ready", |phase| {
+                phase == FsServicePhase::Ready
+            })?;
         }
         let receipt = self
             .production
             .lock()
             .registry
             .rebind_domain(SCOPE, FILESYSTEM_DOMAIN, sender)
-            .unwrap();
-        assert_eq!(receipt.binding_epoch, 2);
+            .map_err(|error| FsServiceProtocolError::Registry {
+                portal: "recovery_rebind",
+                error,
+            })?;
         self.service.lock().phase = FsServicePhase::Rebound;
+        if receipt.binding_epoch != 2 {
+            return Err(FsServiceProtocolError::Registry {
+                portal: "recovery_rebind/postcondition",
+                error: RegistryError::Invariant("replacement binding epoch is not two"),
+            });
+        }
         println!(
             "LINUX_FS_SERVICE Rebind replacement={} binding={} personality_binding=1 block_binding=1 peer_domains_unchanged=true",
             sender.id(),
             receipt.binding_epoch,
         );
+        Ok(())
     }
 
     #[cfg(feature = "virtio-cser-facade")]
-    fn fsd_adopt_next(&self, sender: TaskKey) -> bool {
-        assert_eq!(sender, FILESYSTEM_V2);
+    fn fsd_adopt_next(&self, sender: TaskKey) -> Result<bool, FsServiceProtocolError> {
+        FsServiceProtocol::require_sender("adopt_next", sender, FILESYSTEM_V2)?;
         let (phase, old_handle) = {
             let service = self.service.lock();
-            (service.phase, service.filesystem.as_ref().unwrap().handle)
+            service.require_phase("adopt_next", "Rebound or Adopted", |phase| {
+                matches!(phase, FsServicePhase::Rebound | FsServicePhase::Adopted)
+            })?;
+            let old_handle = service
+                .filesystem
+                .as_ref()
+                .map(|effect| effect.handle)
+                .ok_or(FsServiceProtocolError::MissingField {
+                    portal: "adopt_next",
+                    field: "filesystem",
+                })?;
+            (service.phase, old_handle)
         };
-        assert!(matches!(
-            phase,
-            FsServicePhase::Rebound | FsServicePhase::Adopted
-        ));
         let Some(item) = self
             .production
             .lock()
             .registry
             .recover_next_domain(SCOPE, FILESYSTEM_DOMAIN, sender)
-            .unwrap()
+            .map_err(|error| FsServiceProtocolError::Registry {
+                portal: "adopt_next/recover",
+                error,
+            })?
         else {
-            assert_eq!(phase, FsServicePhase::Adopted);
-            return false;
+            return if phase == FsServicePhase::Adopted {
+                Ok(false)
+            } else {
+                Err(FsServiceProtocolError::UnexpectedPhase {
+                    portal: "adopt_next/recover",
+                    expected: "one exact recovery item while Rebound",
+                    observed: phase,
+                })
+            };
         };
-        assert_eq!(phase, FsServicePhase::Rebound);
-        assert_eq!(item.handle, old_handle);
-        assert_eq!(item.phase, EffectPhase::Prepared);
+        if phase != FsServicePhase::Rebound
+            || item.handle != old_handle
+            || item.phase != EffectPhase::Prepared
+        {
+            return Err(FsServiceProtocolError::Registry {
+                portal: "adopt_next/recover",
+                error: RegistryError::Invariant(
+                    "recovery iterator did not return the exact prepared old handle",
+                ),
+            });
+        }
         let fresh = {
             let mut runtime = self.production.lock();
             let fresh = runtime
                 .registry
                 .adopt_domain(SCOPE, FILESYSTEM_DOMAIN, sender, old_handle)
-                .unwrap();
-            assert_eq!(
-                runtime
-                    .registry
-                    .domain_recovery_remaining(SCOPE, FILESYSTEM_DOMAIN)
-                    .unwrap(),
-                0,
-            );
-            runtime.registry.check_invariants().unwrap();
+                .map_err(|error| FsServiceProtocolError::Registry {
+                    portal: "adopt_next/adopt",
+                    error,
+                })?;
             fresh
         };
         {
             let mut service = self.service.lock();
-            assert_eq!(service.phase, FsServicePhase::Rebound);
             service.adopted_handle = Some(fresh);
+            service.require_phase("adopt_next/install", "Rebound", |phase| {
+                phase == FsServicePhase::Rebound
+            })?;
             service.phase = FsServicePhase::Adopted;
+        }
+        {
+            let runtime = self.production.lock();
+            let remaining = runtime
+                .registry
+                .domain_recovery_remaining(SCOPE, FILESYSTEM_DOMAIN)
+                .map_err(|error| FsServiceProtocolError::Registry {
+                    portal: "adopt_next/remaining",
+                    error,
+                })?;
+            if remaining != 0 {
+                return Err(FsServiceProtocolError::Registry {
+                    portal: "adopt_next/remaining",
+                    error: RegistryError::Invariant(
+                        "single-member filesystem recovery cohort remains after adoption",
+                    ),
+                });
+            }
+            runtime.registry.check_invariants().map_err(|error| {
+                FsServiceProtocolError::Registry {
+                    portal: "adopt_next/invariants",
+                    error,
+                }
+            })?;
         }
         println!(
             "LINUX_FS_SERVICE Adopt replacement={} effect={} old_binding={} new_binding={} phase=Prepared identity_preserved=true explicit=true",
@@ -3216,50 +3730,101 @@ impl FsScenario {
             old_handle.binding_epoch(),
             fresh.binding_epoch(),
         );
-        true
+        Ok(true)
     }
 
     #[cfg(feature = "virtio-cser-facade")]
-    fn fsd_deliver_old_prepare(&self, delivery_sender: TaskKey) {
-        assert_eq!(delivery_sender, FILESYSTEM_V2);
+    fn fsd_deliver_old_prepare(
+        &self,
+        delivery_sender: TaskKey,
+    ) -> Result<(), FsServiceProtocolError> {
+        FsServiceProtocol::require_sender("replay_old", delivery_sender, FILESYSTEM_V2)?;
         let (before_service, command, adopted_handle) = {
             let service = self.service.lock();
-            assert_eq!(service.phase, FsServicePhase::Adopted);
-            assert!(!service.stale_replay_observed);
+            service.require_phase("replay_old", "Adopted before stale replay", |phase| {
+                phase == FsServicePhase::Adopted && !service.stale_replay_observed
+            })?;
             (
                 service.projection(),
                 service
                     .delayed_prepare
-                    .expect("fsd-v1 queued one typed delayed Prepare"),
-                service.adopted_handle.unwrap(),
+                    .ok_or(FsServiceProtocolError::MissingField {
+                        portal: "replay_old",
+                        field: "delayed_prepare",
+                    })?,
+                service
+                    .adopted_handle
+                    .ok_or(FsServiceProtocolError::MissingField {
+                        portal: "replay_old",
+                        field: "adopted_handle",
+                    })?,
             )
         };
-        assert_eq!(command.sender, FILESYSTEM_V1);
+        if command.sender != FILESYSTEM_V1 {
+            return Err(FsServiceProtocolError::UnexpectedSender {
+                portal: "replay_old/queued_command",
+                expected: FILESYSTEM_V1,
+                observed: command.sender,
+            });
+        }
         let (before_registry, after_old_handle, after_old_sender) = {
             let mut runtime = self.production.lock();
             let before = runtime.registry.failure_atomic_projection();
-            assert_eq!(
-                runtime.registry.prepare(command.sender, command.handle),
-                Err(RegistryError::StaleBinding),
-            );
+            if runtime.registry.prepare(command.sender, command.handle)
+                != Err(RegistryError::StaleBinding)
+            {
+                return Err(FsServiceProtocolError::Registry {
+                    portal: "replay_old/old_handle",
+                    error: RegistryError::Invariant(
+                        "old filesystem handle was not rejected as StaleBinding",
+                    ),
+                });
+            }
             let after_old_handle = runtime.registry.failure_atomic_projection();
-            assert_eq!(after_old_handle, before);
-            assert_eq!(
-                runtime.registry.prepare(command.sender, adopted_handle),
-                Err(RegistryError::NoSupervisor),
-            );
+            if after_old_handle != before {
+                return Err(FsServiceProtocolError::Registry {
+                    portal: "replay_old/old_handle",
+                    error: RegistryError::Invariant(
+                        "stale old-handle rejection changed the Registry projection",
+                    ),
+                });
+            }
+            if runtime.registry.prepare(command.sender, adopted_handle)
+                != Err(RegistryError::NoSupervisor)
+            {
+                return Err(FsServiceProtocolError::Registry {
+                    portal: "replay_old/old_sender",
+                    error: RegistryError::Invariant(
+                        "old filesystem sender was not rejected as NoSupervisor",
+                    ),
+                });
+            }
             let after_old_sender = runtime.registry.failure_atomic_projection();
             (before, after_old_handle, after_old_sender)
         };
         let after_service = self.service.lock().projection();
-        assert_eq!(after_old_handle, before_registry);
-        assert_eq!(after_old_sender, before_registry);
-        assert_eq!(after_service, before_service);
+        if after_old_handle != before_registry
+            || after_old_sender != before_registry
+            || after_service != before_service
+        {
+            return Err(FsServiceProtocolError::Registry {
+                portal: "replay_old/projection",
+                error: RegistryError::Invariant(
+                    "stale replay rejection changed Registry or service state",
+                ),
+            });
+        }
         let before_fingerprint = fnv1a(before_registry.as_bytes());
         let after_fingerprint = fnv1a(after_old_sender.as_bytes());
         {
             let mut service = self.service.lock();
-            assert_eq!(service.delayed_prepare.take(), Some(command));
+            if service.delayed_prepare != Some(command) {
+                return Err(FsServiceProtocolError::MissingField {
+                    portal: "replay_old/consume",
+                    field: "exact delayed_prepare",
+                });
+            }
+            service.delayed_prepare = None;
             service.stale_replay_observed = true;
         }
         println!(
@@ -3272,19 +3837,39 @@ impl FsScenario {
             before_fingerprint,
             after_fingerprint,
         );
+        Ok(())
     }
 
     #[cfg(feature = "virtio-cser-facade")]
-    fn fsd_execute_recovered(&self) {
+    fn fsd_execute_recovered(&self) -> Result<(), FsServiceProtocolError> {
         let (descriptor, cookie, filesystem, adopted_handle) = {
             let service = self.service.lock();
-            assert_eq!(service.phase, FsServicePhase::Adopted);
-            assert!(service.stale_replay_observed);
+            service.require_phase("commit", "Adopted after stale replay", |phase| {
+                phase == FsServicePhase::Adopted && service.stale_replay_observed
+            })?;
             (
-                service.descriptor.unwrap(),
-                service.cookie.unwrap(),
-                service.filesystem.as_ref().unwrap().clone(),
-                service.adopted_handle.unwrap(),
+                service
+                    .descriptor
+                    .ok_or(FsServiceProtocolError::MissingField {
+                        portal: "commit",
+                        field: "descriptor",
+                    })?,
+                service.cookie.ok_or(FsServiceProtocolError::MissingField {
+                    portal: "commit",
+                    field: "cookie",
+                })?,
+                service.filesystem.as_ref().cloned().ok_or(
+                    FsServiceProtocolError::MissingField {
+                        portal: "commit",
+                        field: "filesystem",
+                    },
+                )?,
+                service
+                    .adopted_handle
+                    .ok_or(FsServiceProtocolError::MissingField {
+                        portal: "commit",
+                        field: "adopted_handle",
+                    })?,
             )
         };
         let outcome = self.execute_recovered_first_pread_same_boot(
@@ -3294,25 +3879,34 @@ impl FsScenario {
             adopted_handle,
         );
         let mut service = self.service.lock();
-        assert_eq!(service.phase, FsServicePhase::Adopted);
-        assert!(service.outcome.is_none());
+        service.require_phase("commit/install", "Adopted without outcome", |phase| {
+            phase == FsServicePhase::Adopted && service.outcome.is_none()
+        })?;
         service.outcome = Some(outcome);
         service.phase = FsServicePhase::Executed;
+        Ok(())
     }
 
     #[cfg(feature = "virtio-cser-facade")]
-    fn fsd_publish_response(&self) {
+    fn fsd_publish_response(&self) -> Result<(), FsServiceProtocolError> {
         let waker = {
             let mut service = self.service.lock();
-            assert_eq!(service.phase, FsServicePhase::Executed);
-            assert!(service.outcome.is_some());
-            assert_eq!(service.reply_wakeups, 0);
+            service.require_phase("publish", "Executed with one pending outcome", |phase| {
+                phase == FsServicePhase::Executed
+                    && service.outcome.is_some()
+                    && service.reply_wakeups == 0
+            })?;
+            let waker =
+                service
+                    .response_waker
+                    .take()
+                    .ok_or(FsServiceProtocolError::MissingField {
+                        portal: "publish",
+                        field: "response_waker",
+                    })?;
             service.phase = FsServicePhase::ReplyReady;
             service.reply_wakeups = 1;
-            service
-                .response_waker
-                .take()
-                .expect("one blocked runtime-fs guest continuation")
+            waker
         };
         println!(
             "LINUX_FS_SERVICE DispatchOutcomeInstalled replacement={} guest={} reply_wakeups=1 exactly_once=true all_locks_released=true",
@@ -3320,16 +3914,20 @@ impl FsScenario {
             GUEST.id(),
         );
         waker.wake_up();
+        Ok(())
     }
 
     #[cfg(feature = "virtio-cser-facade")]
-    fn fsd_service_done(&self) {
+    fn fsd_service_done(&self) -> Result<(), FsServiceProtocolError> {
         let mut service = self.service.lock();
-        assert_eq!(service.phase, FsServicePhase::ReplyReady);
-        assert_eq!(service.reply_wakeups, 1);
-        assert!(service.response_waker.is_none());
+        service.require_phase("done", "ReplyReady after one wakeup", |phase| {
+            phase == FsServicePhase::ReplyReady
+                && service.reply_wakeups == 1
+                && service.response_waker.is_none()
+        })?;
         service.phase = FsServicePhase::Done;
         service.service_done = true;
+        Ok(())
     }
 
     // The single polling actor restores each linear successor to the runtime
@@ -3341,10 +3939,39 @@ impl FsScenario {
         &self,
         descriptor: SyscallDescriptor,
     ) -> Result<NonZeroU64, DispatchOutcome> {
-        assert_eq!(descriptor.number(), __NR_pread64 as usize);
-        assert_eq!(descriptor.argument(0), 3);
-        assert_eq!(descriptor.argument(2), 4);
-        assert_eq!(descriptor.argument(3), 0);
+        if descriptor.number() != __NR_pread64 as usize {
+            return Err(DispatchOutcome::rejected(
+                descriptor,
+                FsDispatchInputError::UnsupportedSyscall {
+                    number: descriptor.number(),
+                },
+            ));
+        }
+        if descriptor.argument(0) != 3 {
+            return Err(DispatchOutcome::rejected(
+                descriptor,
+                FsDispatchInputError::BadFileDescriptor {
+                    fd: descriptor.argument(0) as i32,
+                },
+            ));
+        }
+        if descriptor.argument(2) != 4 || descriptor.argument(3) != 0 {
+            return Err(DispatchOutcome::rejected(
+                descriptor,
+                FsDispatchInputError::InvalidArgument {
+                    argument: "first executable pread count/offset",
+                },
+            ));
+        }
+        {
+            let state = self.state.lock();
+            if state.production_read_observed || state.fds.get(&3) != Some(&FdKind::Executable) {
+                return Err(DispatchOutcome::rejected(
+                    descriptor,
+                    FsDispatchInputError::BadFileDescriptor { fd: 3 },
+                ));
+            }
+        }
 
         // Capture precedes all personality lookup. The captured syscall and
         // the physical root/device pair are installed together in the only
@@ -3510,8 +4137,6 @@ impl FsScenario {
 
         {
             let mut state = self.state.lock();
-            assert!(!state.production_read_observed);
-            assert_eq!(state.fds.get(&3), Some(&FdKind::Executable));
             state.production_read_observed = true;
         }
 
@@ -3552,7 +4177,21 @@ impl FsScenario {
         // single-CPU log order as an admission guarantee.
         self.service.lock().arm_queued();
         waiter.wait();
-        self.service.lock().take_outcome()
+        match self.service.lock().take_outcome() {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                println!(
+                    "LINUX_FS_SERVICE GuestResumeRejected error={:?} errno={} mutation=false",
+                    error, EIO,
+                );
+                DispatchOutcome {
+                    result: -(EIO as i64),
+                    authority: PublicationAuthority::RejectedInput,
+                    publication: Publication::None,
+                    exit: true,
+                }
+            }
+        }
     }
 
     #[cfg(feature = "virtio-cser-facade")]
@@ -5759,9 +6398,26 @@ impl FsScenario {
         state: &mut FsState,
         descriptor: SyscallDescriptor,
     ) -> DispatchOutcome {
+        if descriptor.argument(0) != 3 || state.fds.get(&3) != Some(&FdKind::Executable) {
+            return DispatchOutcome::rejected(
+                descriptor,
+                FsDispatchInputError::BadFileDescriptor {
+                    fd: descriptor.argument(0) as i32,
+                },
+            );
+        }
+        if descriptor.argument(2) != 4 || descriptor.argument(3) != 0 {
+            return DispatchOutcome::rejected(
+                descriptor,
+                FsDispatchInputError::InvalidArgument {
+                    argument: "first executable pread count/offset",
+                },
+            );
+        }
+
         // Capture the personality authority directly from the immutable guest
-        // descriptor. No fd resolution, inode lookup, or payload read has
-        // occurred before this registration.
+        // descriptor after bounded descriptor/fd validation but before payload
+        // read or mutation.
         let registered = state.capture(descriptor, vec![PROCESS_RESOURCE]);
         assert_eq!(descriptor.argument(0) as i32, 3);
         assert_eq!(state.fds.get(&3), Some(&FdKind::Executable));
@@ -5785,7 +6441,7 @@ impl FsScenario {
         let commit = state.commit(&registered, result);
         let commit_sequence = commit.sequence();
         println!(
-            "LINUX_FS_PRODUCTION_IDENTITY Capture root_scope=95 authority_epoch=141 cohort_source=normal_pread64_path registry=workload_owned syscall_effect={} syscall_domain=personality filesystem_effect={} filesystem_domain=filesystem block_effect={} block_domain=block immutable_ancestry=syscall->filesystem->block distinct_effects=true capture_before_fd_resolution=true capture_before_payload_read=true",
+            "LINUX_FS_PRODUCTION_IDENTITY Capture root_scope=95 authority_epoch=141 cohort_source=normal_pread64_path registry=workload_owned syscall_effect={} syscall_domain=personality filesystem_effect={} filesystem_domain=filesystem block_effect={} block_domain=block immutable_ancestry=syscall->filesystem->block distinct_effects=true capture_after_input_validation=true capture_before_payload_read=true",
             receipt.syscall_effect, receipt.filesystem_effect, receipt.block_effect,
         );
         println!(
@@ -5842,7 +6498,14 @@ impl FsScenario {
 
     fn dispatch(&self, descriptor: SyscallDescriptor) -> DispatchOutcome {
         let mut state = self.state.lock();
-        assert!(!state.exited);
+        if state.exited {
+            return DispatchOutcome::rejected(
+                descriptor,
+                FsDispatchInputError::InvalidArgument {
+                    argument: "syscall after exit",
+                },
+            );
+        }
 
         if descriptor.number() == __NR_pread64 as usize && !state.production_read_observed {
             #[cfg(feature = "virtio-cser-facade")]
@@ -5856,12 +6519,34 @@ impl FsScenario {
 
         let (resources, result, publication, exit, action) = match descriptor.number() {
             number if number == __NR_openat as usize => {
-                assert_eq!(descriptor.argument(0) as i32, AT_FDCWD);
-                let path = read_c_string(&self.vm_space, descriptor.argument(1), 64);
+                if descriptor.argument(0) as i32 != AT_FDCWD {
+                    return DispatchOutcome::rejected(
+                        descriptor,
+                        FsDispatchInputError::BadFileDescriptor {
+                            fd: descriptor.argument(0) as i32,
+                        },
+                    );
+                }
+                let path = match read_c_string(&self.vm_space, descriptor.argument(1), 64) {
+                    Ok(path) => path,
+                    Err(error) => {
+                        return DispatchOutcome::rejected(
+                            descriptor,
+                            FsDispatchInputError::GuestAccess(error),
+                        );
+                    }
+                };
                 let flags = descriptor.argument(2);
                 let fd = state.next_fd;
                 if path.as_slice() == EXECUTABLE_PATH {
-                    assert_eq!(flags, 0);
+                    if flags != 0 {
+                        return DispatchOutcome::rejected(
+                            descriptor,
+                            FsDispatchInputError::InvalidArgument {
+                                argument: "executable open flags",
+                            },
+                        );
+                    }
                     (
                         vec![PROCESS_RESOURCE, EXEC_INODE_RESOURCE],
                         i64::from(fd),
@@ -5870,8 +6555,14 @@ impl FsScenario {
                         FsAction::Open(fd, FdKind::Executable),
                     )
                 } else if path.as_slice() == TMP_PATH {
-                    assert_eq!(flags, O_TMP_FLAGS);
-                    assert_eq!(descriptor.argument(3), 0o644);
+                    if flags != O_TMP_FLAGS || descriptor.argument(3) != 0o644 {
+                        return DispatchOutcome::rejected(
+                            descriptor,
+                            FsDispatchInputError::InvalidArgument {
+                                argument: "temporary open flags/mode",
+                            },
+                        );
+                    }
                     (
                         vec![PROCESS_RESOURCE, TMP_INODE_RESOURCE],
                         i64::from(fd),
@@ -5880,7 +6571,14 @@ impl FsScenario {
                         FsAction::OpenTmp(fd),
                     )
                 } else if path.as_slice() == PROC_SELF_PATH {
-                    assert_eq!(flags, AT_DIRECTORY);
+                    if flags != AT_DIRECTORY {
+                        return DispatchOutcome::rejected(
+                            descriptor,
+                            FsDispatchInputError::InvalidArgument {
+                                argument: "proc directory open flags",
+                            },
+                        );
+                    }
                     (
                         vec![PROCESS_RESOURCE, PROC_INODE_RESOURCE],
                         i64::from(fd),
@@ -5889,29 +6587,42 @@ impl FsScenario {
                         FsAction::Open(fd, FdKind::ProcSelf),
                     )
                 } else {
-                    panic!("unsupported runtime-fs openat path")
+                    return DispatchOutcome::rejected(descriptor, FsDispatchInputError::NotFound);
                 }
             }
             number if number == __NR_pread64 as usize => {
                 let fd = descriptor.argument(0) as i32;
                 let count = descriptor.argument(2);
                 let offset = descriptor.argument(3);
-                let kind = *state.fds.get(&fd).expect("bounded pread fd");
+                if count > MAX_RUNTIME_FS_GUEST_COPY {
+                    return DispatchOutcome::rejected(
+                        descriptor,
+                        FsDispatchInputError::GuestAccess(FsGuestAccessError::LengthExceedsLimit {
+                            requested: count,
+                            limit: MAX_RUNTIME_FS_GUEST_COPY,
+                        }),
+                    );
+                }
+                let Some(kind) = state.fds.get(&fd).copied() else {
+                    return DispatchOutcome::rejected(
+                        descriptor,
+                        FsDispatchInputError::BadFileDescriptor { fd },
+                    );
+                };
                 let source = match kind {
-                    FdKind::Executable => RUNTIME_FS_ELF,
                     FdKind::Temporary => state.temporary.as_slice(),
-                    _ => panic!("unsupported pread fd kind"),
+                    _ => {
+                        return DispatchOutcome::rejected(
+                            descriptor,
+                            FsDispatchInputError::BadFileDescriptor { fd },
+                        );
+                    }
                 };
                 let start = offset.min(source.len());
                 let end = start.saturating_add(count).min(source.len());
                 let bytes = source[start..end].to_vec();
-                let resource = match kind {
-                    FdKind::Executable => EXEC_INODE_RESOURCE,
-                    FdKind::Temporary => TMP_INODE_RESOURCE,
-                    _ => unreachable!(),
-                };
                 (
-                    vec![PROCESS_RESOURCE, resource],
+                    vec![PROCESS_RESOURCE, TMP_INODE_RESOURCE],
                     bytes.len() as i64,
                     Publication::GuestBytes {
                         address: descriptor.argument(1),
@@ -5923,10 +6634,32 @@ impl FsScenario {
             }
             number if number == __NR_statx as usize => {
                 let fd = descriptor.argument(0) as i32;
-                assert_eq!(state.fds.get(&fd), Some(&FdKind::Executable));
-                assert!(read_c_string(&self.vm_space, descriptor.argument(1), 2).is_empty());
-                assert_eq!(descriptor.argument(2), AT_EMPTY_PATH);
-                assert_eq!(descriptor.argument(3), STATX_MASK as usize);
+                if state.fds.get(&fd) != Some(&FdKind::Executable) {
+                    return DispatchOutcome::rejected(
+                        descriptor,
+                        FsDispatchInputError::BadFileDescriptor { fd },
+                    );
+                }
+                let path = match read_c_string(&self.vm_space, descriptor.argument(1), 2) {
+                    Ok(path) => path,
+                    Err(error) => {
+                        return DispatchOutcome::rejected(
+                            descriptor,
+                            FsDispatchInputError::GuestAccess(error),
+                        );
+                    }
+                };
+                if !path.is_empty()
+                    || descriptor.argument(2) != AT_EMPTY_PATH
+                    || descriptor.argument(3) != STATX_MASK as usize
+                {
+                    return DispatchOutcome::rejected(
+                        descriptor,
+                        FsDispatchInputError::InvalidArgument {
+                            argument: "statx empty-path flags/mask",
+                        },
+                    );
+                }
                 let mut bytes = vec![0; STATX_BYTES];
                 bytes[0..4].copy_from_slice(&STATX_MASK.to_le_bytes());
                 bytes[28..30].copy_from_slice(&REGULAR_MODE.to_le_bytes());
@@ -5944,9 +6677,29 @@ impl FsScenario {
             }
             number if number == __NR_newfstatat as usize => {
                 let fd = descriptor.argument(0) as i32;
-                assert_eq!(state.fds.get(&fd), Some(&FdKind::Executable));
-                assert!(read_c_string(&self.vm_space, descriptor.argument(1), 2).is_empty());
-                assert_eq!(descriptor.argument(3), AT_EMPTY_PATH);
+                if state.fds.get(&fd) != Some(&FdKind::Executable) {
+                    return DispatchOutcome::rejected(
+                        descriptor,
+                        FsDispatchInputError::BadFileDescriptor { fd },
+                    );
+                }
+                let path = match read_c_string(&self.vm_space, descriptor.argument(1), 2) {
+                    Ok(path) => path,
+                    Err(error) => {
+                        return DispatchOutcome::rejected(
+                            descriptor,
+                            FsDispatchInputError::GuestAccess(error),
+                        );
+                    }
+                };
+                if !path.is_empty() || descriptor.argument(3) != AT_EMPTY_PATH {
+                    return DispatchOutcome::rejected(
+                        descriptor,
+                        FsDispatchInputError::InvalidArgument {
+                            argument: "newfstatat empty-path flags",
+                        },
+                    );
+                }
                 let mut bytes = vec![0; STAT_BYTES];
                 bytes[24..28].copy_from_slice(&(u32::from(REGULAR_MODE)).to_le_bytes());
                 bytes[48..56].copy_from_slice(&(RUNTIME_FS_ELF.len() as i64).to_le_bytes());
@@ -5963,14 +6716,36 @@ impl FsScenario {
             }
             number if number == __NR_pwrite64 as usize => {
                 let fd = descriptor.argument(0) as i32;
-                assert_eq!(state.fds.get(&fd), Some(&FdKind::Temporary));
-                let bytes = read_guest_bytes(
+                if state.fds.get(&fd) != Some(&FdKind::Temporary) {
+                    return DispatchOutcome::rejected(
+                        descriptor,
+                        FsDispatchInputError::BadFileDescriptor { fd },
+                    );
+                }
+                let bytes = match read_guest_bytes(
                     &self.vm_space,
                     descriptor.argument(1),
                     descriptor.argument(2),
-                );
-                assert_eq!(bytes.as_slice(), b"xy");
-                assert_eq!(descriptor.argument(3), 2);
+                ) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        return DispatchOutcome::rejected(
+                            descriptor,
+                            FsDispatchInputError::GuestAccess(error),
+                        );
+                    }
+                };
+                if bytes.as_slice() != b"xy"
+                    || descriptor.argument(3) != 2
+                    || descriptor.argument(3).checked_add(bytes.len()).is_none()
+                {
+                    return DispatchOutcome::rejected(
+                        descriptor,
+                        FsDispatchInputError::InvalidArgument {
+                            argument: "temporary pwrite payload/offset",
+                        },
+                    );
+                }
                 (
                     vec![PROCESS_RESOURCE, TMP_INODE_RESOURCE],
                     bytes.len() as i64,
@@ -5984,12 +6759,31 @@ impl FsScenario {
             }
             number if number == __NR_readlinkat as usize => {
                 let fd = descriptor.argument(0) as i32;
-                assert_eq!(state.fds.get(&fd), Some(&FdKind::ProcSelf));
-                assert_eq!(
-                    read_c_string(&self.vm_space, descriptor.argument(1), 8).as_slice(),
-                    PROC_EXE_NAME
-                );
-                assert!(descriptor.argument(3) >= EXECUTABLE_PATH.len());
+                if state.fds.get(&fd) != Some(&FdKind::ProcSelf) {
+                    return DispatchOutcome::rejected(
+                        descriptor,
+                        FsDispatchInputError::BadFileDescriptor { fd },
+                    );
+                }
+                let path = match read_c_string(&self.vm_space, descriptor.argument(1), 8) {
+                    Ok(path) => path,
+                    Err(error) => {
+                        return DispatchOutcome::rejected(
+                            descriptor,
+                            FsDispatchInputError::GuestAccess(error),
+                        );
+                    }
+                };
+                if path.as_slice() != PROC_EXE_NAME
+                    || descriptor.argument(3) < EXECUTABLE_PATH.len()
+                {
+                    return DispatchOutcome::rejected(
+                        descriptor,
+                        FsDispatchInputError::InvalidArgument {
+                            argument: "readlinkat path/output length",
+                        },
+                    );
+                }
                 (
                     vec![PROCESS_RESOURCE, PROC_INODE_RESOURCE],
                     EXECUTABLE_PATH.len() as i64,
@@ -6003,8 +6797,18 @@ impl FsScenario {
             }
             number if number == __NR_close as usize => {
                 let fd = descriptor.argument(0) as i32;
-                let kind = *state.fds.get(&fd).expect("bounded close fd");
-                assert_ne!(kind, FdKind::Stdout);
+                let Some(kind) = state.fds.get(&fd).copied() else {
+                    return DispatchOutcome::rejected(
+                        descriptor,
+                        FsDispatchInputError::BadFileDescriptor { fd },
+                    );
+                };
+                if kind == FdKind::Stdout {
+                    return DispatchOutcome::rejected(
+                        descriptor,
+                        FsDispatchInputError::BadFileDescriptor { fd },
+                    );
+                }
                 (
                     vec![PROCESS_RESOURCE],
                     0,
@@ -6014,14 +6818,35 @@ impl FsScenario {
                 )
             }
             number if number == __NR_write as usize => {
-                assert_eq!(descriptor.argument(0), 1);
-                let bytes = read_guest_bytes(
+                if descriptor.argument(0) != 1 {
+                    return DispatchOutcome::rejected(
+                        descriptor,
+                        FsDispatchInputError::BadFileDescriptor {
+                            fd: descriptor.argument(0) as i32,
+                        },
+                    );
+                }
+                let bytes = match read_guest_bytes(
                     &self.vm_space,
                     descriptor.argument(1),
                     descriptor.argument(2),
-                );
-                assert_eq!(bytes.as_slice(), EXPECTED_STDOUT);
-                assert_eq!(state.stdout_publications, 0);
+                ) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        return DispatchOutcome::rejected(
+                            descriptor,
+                            FsDispatchInputError::GuestAccess(error),
+                        );
+                    }
+                };
+                if bytes.as_slice() != EXPECTED_STDOUT || state.stdout_publications != 0 {
+                    return DispatchOutcome::rejected(
+                        descriptor,
+                        FsDispatchInputError::InvalidArgument {
+                            argument: "stdout payload/exactly-once",
+                        },
+                    );
+                }
                 (
                     vec![PROCESS_RESOURCE],
                     bytes.len() as i64,
@@ -6031,7 +6856,14 @@ impl FsScenario {
                 )
             }
             number if number == __NR_exit as usize => {
-                assert_eq!(descriptor.argument(0), 0);
+                if descriptor.argument(0) != 0 {
+                    return DispatchOutcome::rejected(
+                        descriptor,
+                        FsDispatchInputError::InvalidArgument {
+                            argument: "exit status",
+                        },
+                    );
+                }
                 (
                     vec![PROCESS_RESOURCE],
                     0,
@@ -6040,7 +6872,12 @@ impl FsScenario {
                     FsAction::Exit,
                 )
             }
-            other => panic!("unsupported retained runtime-fs syscall {other}"),
+            other => {
+                return DispatchOutcome::rejected(
+                    descriptor,
+                    FsDispatchInputError::UnsupportedSyscall { number: other },
+                );
+            }
         };
 
         #[cfg(not(feature = "virtio-cser-facade"))]
@@ -6067,12 +6904,19 @@ impl FsScenario {
 
         match action {
             FsAction::Open(fd, kind) => {
-                state.allocate_fd_after_commit(fd, kind);
                 let (path, label) = match kind {
                     FdKind::Executable => ("/bin/linux-runtime-fs-smoke", "executable"),
                     FdKind::ProcSelf => ("/proc/self", "proc_directory"),
-                    _ => unreachable!(),
+                    _ => {
+                        return DispatchOutcome::rejected(
+                            descriptor,
+                            FsDispatchInputError::InvalidArgument {
+                                argument: "open action kind",
+                            },
+                        );
+                    }
                 };
+                state.allocate_fd_after_commit(fd, kind);
                 println!(
                     "LINUX_FS Open {} fd={} path={} kind={}",
                     log_identity, fd, path, label,
@@ -6086,14 +6930,20 @@ impl FsScenario {
                     log_identity, fd,
                 );
             }
-            FsAction::Pread(kind, offset) => match kind {
-                FdKind::Executable => panic!("first executable pread bypassed production capture"),
-                FdKind::Temporary => println!(
+            FsAction::Pread(kind, offset) => {
+                if kind != FdKind::Temporary {
+                    return DispatchOutcome::rejected(
+                        descriptor,
+                        FsDispatchInputError::BadFileDescriptor {
+                            fd: descriptor.argument(0) as i32,
+                        },
+                    );
+                }
+                println!(
                     "LINUX_FS Pread {} fd=4 offset={} bytes={} payload=00007879",
                     log_identity, offset, result,
-                ),
-                _ => unreachable!(),
-            },
+                );
+            }
             FsAction::Statx => println!(
                 "LINUX_FS Statx {} mask=0x17ff mode=regular size={} empty_path=true",
                 log_identity,
@@ -6105,7 +6955,14 @@ impl FsScenario {
                 RUNTIME_FS_ELF.len(),
             ),
             FsAction::Pwrite { offset, bytes } => {
-                let end = offset.checked_add(bytes.len()).unwrap();
+                let Some(end) = offset.checked_add(bytes.len()) else {
+                    return DispatchOutcome::rejected(
+                        descriptor,
+                        FsDispatchInputError::InvalidArgument {
+                            argument: "temporary pwrite range",
+                        },
+                    );
+                };
                 if state.temporary.len() < end {
                     state.temporary.resize(end, 0);
                 }
@@ -6128,7 +6985,12 @@ impl FsScenario {
                 EXECUTABLE_PATH.len(),
             ),
             FsAction::Close(fd, kind) => {
-                assert_eq!(state.fds.remove(&fd), Some(kind));
+                if state.fds.remove(&fd) != Some(kind) {
+                    return DispatchOutcome::rejected(
+                        descriptor,
+                        FsDispatchInputError::BadFileDescriptor { fd },
+                    );
+                }
                 println!(
                     "LINUX_FS Close {} fd={} remaining_runtime_fds={}",
                     log_identity,
@@ -6175,9 +7037,9 @@ impl FsScenario {
         }
     }
 
-    fn apply_publication(&self, publication: &Publication) {
+    fn apply_publication(&self, publication: &Publication) -> Result<(), FsGuestAccessError> {
         match publication {
-            Publication::None => {}
+            Publication::None => Ok(()),
             Publication::GuestBytes { address, bytes } => {
                 write_guest_bytes(&self.vm_space, *address, bytes)
             }
@@ -6186,16 +7048,30 @@ impl FsScenario {
                 address,
                 bytes,
                 len,
-            } => write_guest_bytes(&self.vm_space, *address, &bytes[..*len]),
-            Publication::Stdout => println!("LINUX_FS stdout=runtime fs ok"),
+            } => {
+                let payload = bytes
+                    .get(..*len)
+                    .ok_or(FsGuestAccessError::LengthExceedsLimit {
+                        requested: *len,
+                        limit: bytes.len(),
+                    })?;
+                write_guest_bytes(&self.vm_space, *address, payload)
+            }
+            Publication::Stdout => {
+                println!("LINUX_FS stdout=runtime fs ok");
+                Ok(())
+            }
         }
     }
 
     fn publish(&self, outcome: &DispatchOutcome) -> PublicationResult {
         match &outcome.authority {
+            PublicationAuthority::RejectedInput => PublicationResult::Complete,
             #[cfg(not(feature = "virtio-cser-facade"))]
             PublicationAuthority::Generic(ticket) => {
-                self.apply_publication(&outcome.publication);
+                if let Err(error) = self.apply_publication(&outcome.publication) {
+                    return PublicationResult::GuestAccess(error);
+                }
                 let mut state = self.state.lock();
                 state.effects.acknowledge_publication(ticket).unwrap();
                 state.effects.check_invariants().unwrap();
@@ -6203,8 +7079,10 @@ impl FsScenario {
             }
             #[cfg(feature = "virtio-cser-facade")]
             PublicationAuthority::CompatibilityPayload => {
-                self.apply_publication(&outcome.publication);
-                PublicationResult::Complete
+                match self.apply_publication(&outcome.publication) {
+                    Ok(()) => PublicationResult::Complete,
+                    Err(error) => PublicationResult::GuestAccess(error),
+                }
             }
             #[cfg(feature = "virtio-cser-facade")]
             PublicationAuthority::Production {
@@ -6378,6 +7256,14 @@ impl FsScenario {
     }
 
     fn finish(&self) {
+        if let Some(reason) = self.isolation_reason() {
+            println!(
+                "LINUX_FS_SLICE Isolated reason={:?} retained_owner=true closure_receipt=false supervisor_handoff=pending",
+                reason,
+            );
+            self.wake_slice_done();
+            return;
+        }
         let state = self.state.lock();
         #[cfg(not(feature = "virtio-cser-facade"))]
         let mut state = state;
@@ -6473,11 +7359,7 @@ impl FsScenario {
                 production_effects, preparation_identity_observed,
             );
         }
-        self.done
-            .lock()
-            .take()
-            .expect("one runtime-fs completion waker")
-            .wake_up();
+        self.wake_slice_done();
     }
 }
 
@@ -6553,6 +7435,17 @@ fn current_fsd_task(expected: TaskKey, vm_space: &Arc<VmSpace>) -> TaskKey {
 }
 
 #[cfg(feature = "virtio-cser-facade")]
+fn terminate_fsd(
+    scenario: &FsScenario,
+    sender: TaskKey,
+    reason: FsServiceTerminationReason,
+    done: &EffectWaker,
+) {
+    scenario.isolate_fsd(sender, reason);
+    done.wake_up();
+}
+
+#[cfg(feature = "virtio-cser-facade")]
 fn run_fsd_v1(scenario: Arc<FsScenario>, vm_space: Arc<VmSpace>, done: EffectWaker) {
     let sender = current_fsd_task(FILESYSTEM_V1, &vm_space);
     vm_space.activate();
@@ -6564,33 +7457,108 @@ fn run_fsd_v1(scenario: Arc<FsScenario>, vm_space: Arc<VmSpace>, done: EffectWak
         match user_mode.execute(|| false) {
             ReturnReason::UserSyscall => match user_mode.context().rax() {
                 FSD_NEXT => {
-                    let operation = scenario.fsd_next_operation(sender);
+                    let operation = match scenario.fsd_next_operation(sender) {
+                        Ok(operation) => operation,
+                        Err(error) => {
+                            terminate_fsd(
+                                &scenario,
+                                sender,
+                                FsServiceTerminationReason::PortalRejected(error),
+                                &done,
+                            );
+                            return;
+                        }
+                    };
                     user_mode.context_mut().set_rax(operation);
                     if operation == FSD_OP_WAIT {
                         Task::yield_now();
                     }
                 }
                 FSD_PREPARE => {
-                    scenario.fsd_prepare_active(sender);
+                    if let Err(error) = scenario.fsd_prepare_active(sender) {
+                        terminate_fsd(
+                            &scenario,
+                            sender,
+                            FsServiceTerminationReason::PortalRejected(error),
+                            &done,
+                        );
+                        return;
+                    }
                     user_mode.context_mut().set_rax(0);
                 }
                 FSD_QUEUE_OLD_PREPARE => {
-                    scenario.fsd_queue_old_prepare(sender);
+                    if let Err(error) = scenario.fsd_queue_old_prepare(sender) {
+                        terminate_fsd(
+                            &scenario,
+                            sender,
+                            FsServiceTerminationReason::PortalRejected(error),
+                            &done,
+                        );
+                        return;
+                    }
                     user_mode.context_mut().set_rax(0);
                 }
-                FSD_FAIL => panic!(
-                    "runtime-fs fsd-v1 protocol failure code={}",
-                    user_mode.context().rdi(),
-                ),
-                opcode => panic!("runtime-fs fsd-v1 unknown portal {opcode:#x}"),
+                FSD_FAIL => {
+                    terminate_fsd(
+                        &scenario,
+                        sender,
+                        FsServiceTerminationReason::GuestReportedFailure {
+                            code: user_mode.context().rdi(),
+                        },
+                        &done,
+                    );
+                    return;
+                }
+                opcode => {
+                    terminate_fsd(
+                        &scenario,
+                        sender,
+                        FsServiceTerminationReason::UnknownPortal { opcode },
+                        &done,
+                    );
+                    return;
+                }
             },
             ReturnReason::UserException => {
-                let info = match user_mode.context_mut().take_exception() {
-                    Some(CpuException::PageFault(info)) => info,
-                    other => panic!("runtime-fs fsd-v1 unexpected exception {other:?}"),
+                let Some(exception) = user_mode.context_mut().take_exception() else {
+                    terminate_fsd(
+                        &scenario,
+                        sender,
+                        FsServiceTerminationReason::MissingException,
+                        &done,
+                    );
+                    return;
                 };
-                assert_eq!(info.addr, EXPECTED_FSD_FAULT);
-                scenario.crash_fsd_v1(sender);
+                let info = match exception {
+                    CpuException::PageFault(info) if info.addr == EXPECTED_FSD_FAULT => info,
+                    CpuException::PageFault(info) => {
+                        terminate_fsd(
+                            &scenario,
+                            sender,
+                            FsServiceTerminationReason::UnexpectedPageFault { address: info.addr },
+                            &done,
+                        );
+                        return;
+                    }
+                    other => {
+                        terminate_fsd(
+                            &scenario,
+                            sender,
+                            FsServiceTerminationReason::UnexpectedException(other),
+                            &done,
+                        );
+                        return;
+                    }
+                };
+                if let Err(error) = scenario.crash_fsd_v1(sender) {
+                    terminate_fsd(
+                        &scenario,
+                        sender,
+                        FsServiceTerminationReason::PortalRejected(error),
+                        &done,
+                    );
+                    return;
+                }
                 println!(
                     "FSD_V1 EXIT task={} task_generation={} reason=real_user_page_fault addr={:#x} filesystem_prepared=true device_committed=false guest_reply=false",
                     sender.id(),
@@ -6617,36 +7585,103 @@ fn run_fsd_v2(scenario: Arc<FsScenario>, vm_space: Arc<VmSpace>, done: EffectWak
         match user_mode.execute(|| false) {
             ReturnReason::UserSyscall => match user_mode.context().rax() {
                 FSD_RECOVERY_SNAPSHOT => {
-                    scenario.fsd_recovery_snapshot(sender);
+                    if let Err(error) = scenario.fsd_recovery_snapshot(sender) {
+                        terminate_fsd(
+                            &scenario,
+                            sender,
+                            FsServiceTerminationReason::PortalRejected(error),
+                            &done,
+                        );
+                        return;
+                    }
                     user_mode.context_mut().set_rax(0);
                 }
                 FSD_READY => {
-                    scenario.fsd_recovery_ready(sender);
+                    if let Err(error) = scenario.fsd_recovery_ready(sender) {
+                        terminate_fsd(
+                            &scenario,
+                            sender,
+                            FsServiceTerminationReason::PortalRejected(error),
+                            &done,
+                        );
+                        return;
+                    }
                     user_mode.context_mut().set_rax(0);
                 }
                 FSD_REBIND => {
-                    scenario.fsd_recovery_rebind(sender);
+                    if let Err(error) = scenario.fsd_recovery_rebind(sender) {
+                        terminate_fsd(
+                            &scenario,
+                            sender,
+                            FsServiceTerminationReason::PortalRejected(error),
+                            &done,
+                        );
+                        return;
+                    }
                     user_mode.context_mut().set_rax(0);
                 }
                 FSD_ADOPT_NEXT => {
-                    let adopted = scenario.fsd_adopt_next(sender);
+                    let adopted = match scenario.fsd_adopt_next(sender) {
+                        Ok(adopted) => adopted,
+                        Err(error) => {
+                            terminate_fsd(
+                                &scenario,
+                                sender,
+                                FsServiceTerminationReason::PortalRejected(error),
+                                &done,
+                            );
+                            return;
+                        }
+                    };
                     user_mode.context_mut().set_rax(0);
                     user_mode.context_mut().set_rdi(usize::from(adopted));
                 }
                 FSD_REPLAY_OLD => {
-                    scenario.fsd_deliver_old_prepare(sender);
+                    if let Err(error) = scenario.fsd_deliver_old_prepare(sender) {
+                        terminate_fsd(
+                            &scenario,
+                            sender,
+                            FsServiceTerminationReason::PortalRejected(error),
+                            &done,
+                        );
+                        return;
+                    }
                     user_mode.context_mut().set_rax(FSD_RESULT_STALE_BINDING);
                 }
                 FSD_COMMIT => {
-                    scenario.fsd_execute_recovered();
+                    if let Err(error) = scenario.fsd_execute_recovered() {
+                        terminate_fsd(
+                            &scenario,
+                            sender,
+                            FsServiceTerminationReason::PortalRejected(error),
+                            &done,
+                        );
+                        return;
+                    }
                     user_mode.context_mut().set_rax(0);
                 }
                 FSD_PUBLISH => {
-                    scenario.fsd_publish_response();
+                    if let Err(error) = scenario.fsd_publish_response() {
+                        terminate_fsd(
+                            &scenario,
+                            sender,
+                            FsServiceTerminationReason::PortalRejected(error),
+                            &done,
+                        );
+                        return;
+                    }
                     user_mode.context_mut().set_rax(0);
                 }
                 FSD_DONE => {
-                    scenario.fsd_service_done();
+                    if let Err(error) = scenario.fsd_service_done() {
+                        terminate_fsd(
+                            &scenario,
+                            sender,
+                            FsServiceTerminationReason::PortalRejected(error),
+                            &done,
+                        );
+                        return;
+                    }
                     println!(
                         "FSD_V2 EXIT task={} task_generation={} reason=bounded_service_done recovered_filesystem=true reply_wakeups=1",
                         sender.id(),
@@ -6655,22 +7690,44 @@ fn run_fsd_v2(scenario: Arc<FsScenario>, vm_space: Arc<VmSpace>, done: EffectWak
                     done.wake_up();
                     return;
                 }
-                FSD_FAIL => panic!(
-                    "runtime-fs fsd-v2 protocol failure code={}",
-                    user_mode.context().rdi(),
-                ),
-                opcode => panic!("runtime-fs fsd-v2 unknown portal {opcode:#x}"),
+                FSD_FAIL => {
+                    terminate_fsd(
+                        &scenario,
+                        sender,
+                        FsServiceTerminationReason::GuestReportedFailure {
+                            code: user_mode.context().rdi(),
+                        },
+                        &done,
+                    );
+                    return;
+                }
+                opcode => {
+                    terminate_fsd(
+                        &scenario,
+                        sender,
+                        FsServiceTerminationReason::UnknownPortal { opcode },
+                        &done,
+                    );
+                    return;
+                }
             },
-            ReturnReason::UserException => panic!(
-                "runtime-fs fsd-v2 unexpectedly faulted: {:?}",
-                user_mode.context_mut().take_exception(),
-            ),
+            ReturnReason::UserException => {
+                let reason = match user_mode.context_mut().take_exception() {
+                    Some(CpuException::PageFault(info)) => {
+                        FsServiceTerminationReason::UnexpectedPageFault { address: info.addr }
+                    }
+                    Some(other) => FsServiceTerminationReason::UnexpectedException(other),
+                    None => FsServiceTerminationReason::MissingException,
+                };
+                terminate_fsd(&scenario, sender, reason, &done);
+                return;
+            }
             ReturnReason::KernelEvent => Task::yield_now(),
         }
     }
 }
 
-pub(crate) fn run_linux_fs_slice() -> RuntimeFsSliceReceipt {
+pub(crate) fn run_linux_fs_slice() -> Result<RuntimeFsSliceReceipt, RuntimeFsSliceIsolation> {
     #[cfg(not(feature = "virtio-cser-facade"))]
     lifecycle_companion::run_filesystem_lifecycle_companion();
     #[cfg(not(feature = "virtio-cser-facade"))]
@@ -6700,6 +7757,7 @@ pub(crate) fn run_linux_fs_slice() -> RuntimeFsSliceReceipt {
         production: SpinLock::new(production),
         #[cfg(feature = "virtio-cser-facade")]
         service: SpinLock::new(FsServiceProtocol::new()),
+        isolation_reason: SpinLock::new(None),
         done: SpinLock::new(Some(done_waker)),
     });
     #[cfg(feature = "virtio-cser-facade")]
@@ -6796,7 +7854,26 @@ pub(crate) fn run_linux_fs_slice() -> RuntimeFsSliceReceipt {
     #[cfg(feature = "virtio-cser-facade")]
     {
         v1_waiter.wait();
-        assert_eq!(scenario.service.lock().phase, FsServicePhase::Crashed);
+        if let Some(reason) = scenario.isolation_reason() {
+            return Err(RuntimeFsSliceIsolation::new(reason, scenario));
+        }
+        let phase = scenario.service.lock().phase;
+        if phase != FsServicePhase::Crashed {
+            let receipt = scenario.isolate_fsd(
+                FILESYSTEM_V1,
+                FsServiceTerminationReason::PortalRejected(
+                    FsServiceProtocolError::UnexpectedPhase {
+                        portal: "run_slice/after_v1",
+                        expected: "Crashed",
+                        observed: phase,
+                    },
+                ),
+            );
+            return Err(RuntimeFsSliceIsolation::new(
+                RuntimeFsSliceIsolationReason::Service(receipt),
+                scenario,
+            ));
+        }
         let v2_vm = Arc::new(create_vm_space(FSD_V2_PROGRAM));
         assert!(!Arc::ptr_eq(&v1_vm, &v2_vm));
         let (v2_waiter, v2_waker) = EffectWaiter::new_pair(EffectToken {
@@ -6829,8 +7906,14 @@ pub(crate) fn run_linux_fs_slice() -> RuntimeFsSliceReceipt {
         );
         v2_task.run();
         v2_waiter.wait();
+        if let Some(reason) = scenario.isolation_reason() {
+            return Err(RuntimeFsSliceIsolation::new(reason, scenario));
+        }
     }
     done_waiter.wait();
+    if let Some(reason) = scenario.isolation_reason() {
+        return Err(RuntimeFsSliceIsolation::new(reason, scenario));
+    }
     #[cfg(not(feature = "virtio-cser-facade"))]
     scenario.state.lock().assert_final();
     #[cfg(all(
@@ -6905,7 +7988,7 @@ pub(crate) fn run_linux_fs_slice() -> RuntimeFsSliceReceipt {
     let publication_acks = terminalizations;
     #[cfg(feature = "virtio-cser-facade")]
     let publication_acks = 1;
-    RuntimeFsSliceReceipt {
+    Ok(RuntimeFsSliceReceipt {
         scope: SCOPE,
         closed_authority_epoch: AUTHORITY_EPOCH,
         final_authority_epoch: AUTHORITY_EPOCH + 1,
@@ -6919,7 +8002,7 @@ pub(crate) fn run_linux_fs_slice() -> RuntimeFsSliceReceipt {
         quiescent: true,
         source_sha256: EXPECTED_SOURCE_SHA256,
         elf_sha256: EXPECTED_ELF_SHA256,
-    }
+    })
 }
 
 fn run_guest(scenario: Arc<FsScenario>, vm_space: Arc<VmSpace>, entry: usize, stack: usize) {
@@ -6937,11 +8020,30 @@ fn run_guest(scenario: Arc<FsScenario>, vm_space: Arc<VmSpace>, entry: usize, st
                 let outcome = scenario.dispatch(descriptor);
                 user_mode.context_mut().set_rax(outcome.result as usize);
                 let publication = scenario.publish(&outcome);
-                assert_eq!(
-                    publication,
-                    PublicationResult::Complete,
-                    "runtime-fs retained publication authority before guest resume"
-                );
+                match publication {
+                    PublicationResult::Complete => {}
+                    PublicationResult::GuestAccess(error) => {
+                        scenario.record_isolation(RuntimeFsSliceIsolationReason::GuestPublication(
+                            error,
+                        ));
+                        println!(
+                            "LINUX_FS_GUEST Isolated stage=publication error={:?} retained_owner=true closure_receipt=false",
+                            error,
+                        );
+                        scenario.wake_slice_done();
+                        return;
+                    }
+                    #[cfg(feature = "virtio-cser-facade")]
+                    PublicationResult::Retained => {
+                        scenario
+                            .record_isolation(RuntimeFsSliceIsolationReason::RetainedPublication);
+                        println!(
+                            "LINUX_FS_GUEST Isolated stage=publication retained_owner=true closure_receipt=false"
+                        );
+                        scenario.wake_slice_done();
+                        return;
+                    }
+                }
                 if outcome.exit {
                     scenario.finish();
                     return;
@@ -6975,38 +8077,66 @@ fn syscall_descriptor(context: &UserContext) -> SyscallDescriptor {
     )
 }
 
-fn read_guest_bytes(vm_space: &VmSpace, address: usize, length: usize) -> Vec<u8> {
+fn read_guest_bytes(
+    vm_space: &VmSpace,
+    address: usize,
+    length: usize,
+) -> Result<Vec<u8>, FsGuestAccessError> {
+    validate_guest_range(address, length, MAX_RUNTIME_FS_GUEST_COPY)?;
+    if length == 0 {
+        return Ok(Vec::new());
+    }
     let mut output = vec![0; length];
-    let mut source = vm_space.reader(address, length).expect("guest read range");
+    let mut source =
+        vm_space
+            .reader(address, length)
+            .map_err(|_| FsGuestAccessError::InvalidRange {
+                direction: FsGuestCopyDirection::Read,
+                address,
+                length,
+            })?;
     let mut destination = VmWriter::from(output.as_mut_slice());
     let copied = source
         .read_fallible(&mut destination)
-        .expect("copy bytes from runtime-fs guest");
-    assert_eq!(copied, length);
-    output
+        .map_err(|_| unmapped_guest_range(FsGuestCopyDirection::Read, address, length))?;
+    validate_guest_copy(FsGuestCopyDirection::Read, length, copied)?;
+    Ok(output)
 }
 
-fn write_guest_bytes(vm_space: &VmSpace, address: usize, bytes: &[u8]) {
+fn write_guest_bytes(
+    vm_space: &VmSpace,
+    address: usize,
+    bytes: &[u8],
+) -> Result<(), FsGuestAccessError> {
+    validate_guest_range(address, bytes.len(), MAX_RUNTIME_FS_GUEST_COPY)?;
     if bytes.is_empty() {
-        return;
+        return Ok(());
     }
-    let mut destination = vm_space
-        .writer(address, bytes.len())
-        .expect("guest write range");
+    let mut destination =
+        vm_space
+            .writer(address, bytes.len())
+            .map_err(|_| FsGuestAccessError::InvalidRange {
+                direction: FsGuestCopyDirection::Write,
+                address,
+                length: bytes.len(),
+            })?;
     let mut source = VmReader::from(bytes);
     let copied = destination
         .write_fallible(&mut source)
-        .expect("copy bytes to runtime-fs guest");
-    assert_eq!(copied, bytes.len());
+        .map_err(|_| unmapped_guest_range(FsGuestCopyDirection::Write, address, bytes.len()))?;
+    validate_guest_copy(FsGuestCopyDirection::Write, bytes.len(), copied)?;
+    Ok(())
 }
 
-fn read_c_string(vm_space: &VmSpace, address: usize, max: usize) -> Vec<u8> {
-    let bytes = read_guest_bytes(vm_space, address, max);
-    let end = bytes
-        .iter()
-        .position(|byte| *byte == 0)
-        .expect("bounded runtime-fs string is NUL terminated");
-    bytes[..end].to_vec()
+fn read_c_string(
+    vm_space: &VmSpace,
+    address: usize,
+    max: usize,
+) -> Result<Vec<u8>, FsGuestAccessError> {
+    validate_guest_range(address, max, MAX_RUNTIME_FS_C_STRING)?;
+    let bytes = read_guest_bytes(vm_space, address, max)?;
+    let end = find_c_string_end(&bytes, max)?;
+    Ok(bytes[..end].to_vec())
 }
 
 #[cfg(not(feature = "virtio-cser-facade"))]

@@ -119,7 +119,7 @@ extract_between "$commit_gate" \
     '            #[cfg(not(feature = "virtio-cser-precommit-fault"))]' "$fault"
 extract_between "$source_file" 'fn close_precommit_flight(' \
     'fn drive_postcommit_flight(' "$precommit_close"
-extract_until_first_after "$lib_file" '    let fs_receipt = linux_fs::run_linux_fs_slice();' \
+extract_until_first_after "$lib_file" '    let fs_receipt = match linux_fs::run_linux_fs_slice() {' \
     '    #[cfg(not(feature = "virtio-cser-facade"))]' "$feature_root"
 extract_between "$facade_file" 'impl PreparedRequest {' \
     'impl Drop for PreparedRequest {' "$prepared_impl"
