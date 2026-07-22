@@ -44,11 +44,16 @@ use crate::{
     effect_registry::{
         DomainIsolationOutcome, DomainKey, DomainRecoveryAbortReason, DomainRecoverySnapshot,
         EffectKey, EffectRegistry, PortalHandle, RecoveryItem, RegistryError, ScopeKey, TaskKey,
+        runtime_service_task::{
+            CausalArmedServiceTask, CausalCompletedServiceTask, CausalServiceCrashCommit,
+            CausalServiceIsolateCommit,
+        },
     },
 };
 
 const MIN_EVENT_CAPACITY: usize = 4;
 const MIN_MANAGER_DRIVE_BUDGET: u32 = 1;
+const MAX_RETAINED_SERVICE_TASK_OWNERS: usize = 4;
 
 /// Exact capabilities supplied by this adapter and the pinned OSTD substrate.
 #[derive(
@@ -324,6 +329,777 @@ struct ServiceTaskSelector {
     binding_epoch: u64,
 }
 
+/// Architecture-neutral access classification copied from raw user-fault
+/// evidence. It deliberately carries no task, VM, domain, or binding
+/// coordinate; the causal bearer supplies those authority coordinates later.
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
+pub(crate) enum OstdUserFaultAccess {
+    Read,
+    Write,
+    Execute,
+}
+
+/// Raw, typed evidence observed at the OSTD user/kernel boundary.
+///
+/// This is evidence only, never authority. In particular, constructors cannot
+/// accept a `TaskKey`, VM generation, service domain, or binding epoch. A later
+/// Registry transition must combine this value with the unique armed bearer.
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
+pub(crate) enum OstdUserFaultEvidence {
+    PageFault {
+        instruction_pointer: u64,
+        address: u64,
+        access: OstdUserFaultAccess,
+        architecture_error: u64,
+        evidence_digest: u64,
+    },
+    CpuException {
+        instruction_pointer: u64,
+        architecture_vector: u16,
+        architecture_error: Option<u64>,
+        evidence_digest: u64,
+    },
+}
+
+impl OstdUserFaultEvidence {
+    pub(crate) const fn page_fault(
+        instruction_pointer: u64,
+        address: u64,
+        access: OstdUserFaultAccess,
+        architecture_error: u64,
+        evidence_digest: u64,
+    ) -> Result<Self, OstdSupervisorOutcomeEvidenceError> {
+        if evidence_digest == 0 {
+            return Err(OstdSupervisorOutcomeEvidenceError::InvalidEvidenceDigest);
+        }
+        Ok(Self::PageFault {
+            instruction_pointer,
+            address,
+            access,
+            architecture_error,
+            evidence_digest,
+        })
+    }
+
+    pub(crate) const fn cpu_exception(
+        instruction_pointer: u64,
+        architecture_vector: u16,
+        architecture_error: Option<u64>,
+        evidence_digest: u64,
+    ) -> Result<Self, OstdSupervisorOutcomeEvidenceError> {
+        if evidence_digest == 0 {
+            return Err(OstdSupervisorOutcomeEvidenceError::InvalidEvidenceDigest);
+        }
+        Ok(Self::CpuException {
+            instruction_pointer,
+            architecture_vector,
+            architecture_error,
+            evidence_digest,
+        })
+    }
+
+    pub(crate) const fn evidence_digest(self) -> u64 {
+        match self {
+            Self::PageFault {
+                evidence_digest, ..
+            }
+            | Self::CpuException {
+                evidence_digest, ..
+            } => evidence_digest,
+        }
+    }
+}
+
+/// A non-fault service return classification.
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
+pub(crate) enum OstdServiceExitReason {
+    UnexpectedUserSyscall,
+    UnexpectedKernelEvent,
+    UnexpectedProgramReturn,
+    CooperativeStop,
+}
+
+/// Typed reason plus digest of the complete raw service-exit observation.
+/// Authority-bearing coordinates are intentionally unrepresentable here.
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
+pub(crate) struct OstdServiceExitEvidence {
+    reason: OstdServiceExitReason,
+    evidence_digest: u64,
+}
+
+impl OstdServiceExitEvidence {
+    pub(crate) const fn new(
+        reason: OstdServiceExitReason,
+        evidence_digest: u64,
+    ) -> Result<Self, OstdSupervisorOutcomeEvidenceError> {
+        if evidence_digest == 0 {
+            return Err(OstdSupervisorOutcomeEvidenceError::InvalidEvidenceDigest);
+        }
+        Ok(Self {
+            reason,
+            evidence_digest,
+        })
+    }
+
+    pub(crate) const fn reason(self) -> OstdServiceExitReason {
+        self.reason
+    }
+
+    pub(crate) const fn evidence_digest(self) -> u64 {
+        self.evidence_digest
+    }
+}
+
+/// Typed terminal result returned by a bounded service entry.
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
+pub(crate) enum OstdSupervisorServiceOutcome {
+    UserFault(OstdUserFaultEvidence),
+    ServiceExit(OstdServiceExitEvidence),
+}
+
+/// A user exception cannot be classified as a service fault unless the caller
+/// presents the raw exception evidence it took from `UserContext`.
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
+pub(crate) enum OstdSupervisorOutcomeEvidenceError {
+    InvalidEvidenceDigest,
+    MissingUserFaultEvidence,
+    UnexpectedUserFaultEvidence,
+}
+
+impl OstdSupervisorServiceOutcome {
+    /// Classifies only an OSTD user-mode return. Kernel faults never pass
+    /// through this API and remain fail-stop.
+    pub(crate) fn from_user_mode_return(
+        reason: ReturnReason,
+        cooperative_stop_requested: bool,
+        exit_evidence_digest: u64,
+        fault: Option<OstdUserFaultEvidence>,
+    ) -> Result<Self, OstdSupervisorOutcomeEvidenceError> {
+        match (reason, fault) {
+            (ReturnReason::UserException, Some(fault)) => Ok(Self::UserFault(fault)),
+            (ReturnReason::UserException, None) => {
+                Err(OstdSupervisorOutcomeEvidenceError::MissingUserFaultEvidence)
+            }
+            (ReturnReason::UserSyscall | ReturnReason::KernelEvent, Some(_)) => {
+                Err(OstdSupervisorOutcomeEvidenceError::UnexpectedUserFaultEvidence)
+            }
+            (ReturnReason::UserSyscall, None) => {
+                Ok(Self::ServiceExit(OstdServiceExitEvidence::new(
+                    OstdServiceExitReason::UnexpectedUserSyscall,
+                    exit_evidence_digest,
+                )?))
+            }
+            (ReturnReason::KernelEvent, None) if cooperative_stop_requested => {
+                Ok(Self::ServiceExit(OstdServiceExitEvidence::new(
+                    OstdServiceExitReason::CooperativeStop,
+                    exit_evidence_digest,
+                )?))
+            }
+            (ReturnReason::KernelEvent, None) => {
+                Ok(Self::ServiceExit(OstdServiceExitEvidence::new(
+                    OstdServiceExitReason::UnexpectedKernelEvent,
+                    exit_evidence_digest,
+                )?))
+            }
+        }
+    }
+}
+
+/// Portable terminal bearer installed after a successful causal Registry
+/// transition. Each variant remains non-Clone and owns the exact child session
+/// until its own close operation succeeds.
+#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]
+pub(crate) enum CausalServiceTaskCommitBearer {
+    Completed(CausalCompletedServiceTask),
+    Crashed(CausalServiceCrashCommit),
+    Isolated(CausalServiceIsolateCommit),
+}
+
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
+pub(crate) enum CausalServiceTaskOwnerPhase {
+    Empty,
+    Armed,
+    ArmedWithExit,
+    Reaped,
+    Committed,
+    Retained,
+}
+
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
+pub(crate) enum CausalServiceTaskRetentionReason {
+    CommitSuffixPending,
+    ClosureRetryRequired,
+    ManagerDeliveryBlocked,
+}
+
+enum CausalServiceTaskOwnerState<Armed, Committed> {
+    Empty,
+    Armed {
+        bearer: Armed,
+    },
+    ArmedWithExit {
+        bearer: Armed,
+        outcome: OstdSupervisorServiceOutcome,
+    },
+    Reaped {
+        bearer: Option<Armed>,
+        outcome: OstdSupervisorServiceOutcome,
+        reservation: Option<u64>,
+    },
+    Committed {
+        bearer: Committed,
+        outcome: OstdSupervisorServiceOutcome,
+    },
+    Retained {
+        bearer: Committed,
+        outcome: OstdSupervisorServiceOutcome,
+        reason: CausalServiceTaskRetentionReason,
+    },
+}
+
+impl<Armed, Committed> CausalServiceTaskOwnerState<Armed, Committed> {
+    const fn phase(&self) -> CausalServiceTaskOwnerPhase {
+        match self {
+            Self::Empty => CausalServiceTaskOwnerPhase::Empty,
+            Self::Armed { .. } => CausalServiceTaskOwnerPhase::Armed,
+            Self::ArmedWithExit { .. } => CausalServiceTaskOwnerPhase::ArmedWithExit,
+            Self::Reaped { .. } => CausalServiceTaskOwnerPhase::Reaped,
+            Self::Committed { .. } => CausalServiceTaskOwnerPhase::Committed,
+            Self::Retained { .. } => CausalServiceTaskOwnerPhase::Retained,
+        }
+    }
+}
+
+/// Single linear owner shared by TaskData, the replacement slot, and the
+/// bounded retained-owner table. Cloning the `Arc` clones only access to this
+/// lock; the bearer itself exists in exactly one state cell or one in-progress
+/// transition.
+pub(crate) struct CausalServiceTaskOwner<
+    Armed = CausalArmedServiceTask,
+    Committed = CausalServiceTaskCommitBearer,
+> {
+    state: SpinLock<CausalServiceTaskOwnerState<Armed, Committed>>,
+    next_reservation: AtomicU64,
+}
+
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
+pub(crate) enum CausalServiceTaskOwnerError {
+    AlreadyOwned,
+    MissingExitEvidence,
+    ConflictingExitEvidence,
+    WrongPhase {
+        expected: CausalServiceTaskOwnerPhase,
+        actual: CausalServiceTaskOwnerPhase,
+    },
+    TransitionReserved,
+    ReservationExhausted,
+    StaleReservation,
+}
+
+pub(crate) struct CausalServiceTaskOwnerInstallFailure<Armed> {
+    error: CausalServiceTaskOwnerError,
+    bearer: Armed,
+}
+
+impl<Armed> CausalServiceTaskOwnerInstallFailure<Armed> {
+    pub(crate) const fn error(&self) -> CausalServiceTaskOwnerError {
+        self.error
+    }
+
+    pub(crate) fn into_bearer(self) -> Armed {
+        self.bearer
+    }
+}
+
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
+pub(crate) enum CausalServiceTaskOwnerObservation {
+    Unwired,
+    Recorded,
+    AlreadyObserved,
+}
+
+pub(crate) enum CausalServiceTaskTransitionOutcome<Armed, Committed, Error> {
+    Committed(Committed),
+    Restored { error: Error, bearer: Armed },
+}
+
+pub(crate) enum CausalServiceTaskOwnerTransitionFailure<Armed, Committed, Error> {
+    Owner(CausalServiceTaskOwnerError),
+    Transition(Error),
+    Finalize {
+        error: CausalServiceTaskOwnerError,
+        outcome: CausalServiceTaskTransitionOutcome<Armed, Committed, Error>,
+    },
+}
+
+impl<Armed, Committed> CausalServiceTaskOwner<Armed, Committed> {
+    pub(crate) const fn new_empty() -> Self {
+        Self {
+            state: SpinLock::new(CausalServiceTaskOwnerState::Empty),
+            next_reservation: AtomicU64::new(1),
+        }
+    }
+
+    pub(crate) fn phase(&self) -> CausalServiceTaskOwnerPhase {
+        self.state.disable_irq().lock().phase()
+    }
+
+    /// Installs the exact armed bearer. A failed install returns the same input
+    /// value and leaves the existing owner state untouched.
+    pub(crate) fn install_armed(
+        &self,
+        bearer: Armed,
+    ) -> Result<(), CausalServiceTaskOwnerInstallFailure<Armed>> {
+        let mut state = self.state.disable_irq().lock();
+        if !__cser_core::matches!(*state, CausalServiceTaskOwnerState::Empty) {
+            return Err(CausalServiceTaskOwnerInstallFailure {
+                error: CausalServiceTaskOwnerError::AlreadyOwned,
+                bearer,
+            });
+        }
+        *state = CausalServiceTaskOwnerState::Armed { bearer };
+        Ok(())
+    }
+
+    pub(crate) fn observe_exit(
+        &self,
+        outcome: OstdSupervisorServiceOutcome,
+    ) -> Result<CausalServiceTaskOwnerObservation, CausalServiceTaskOwnerError> {
+        let mut state = self.state.disable_irq().lock();
+        let previous = __cser_core::mem::replace(&mut *state, CausalServiceTaskOwnerState::Empty);
+        match previous {
+            CausalServiceTaskOwnerState::Empty => {
+                *state = CausalServiceTaskOwnerState::Empty;
+                Ok(CausalServiceTaskOwnerObservation::Unwired)
+            }
+            CausalServiceTaskOwnerState::Armed { bearer } => {
+                *state = CausalServiceTaskOwnerState::ArmedWithExit { bearer, outcome };
+                Ok(CausalServiceTaskOwnerObservation::Recorded)
+            }
+            CausalServiceTaskOwnerState::ArmedWithExit {
+                bearer,
+                outcome: current,
+            } if current == outcome => {
+                *state = CausalServiceTaskOwnerState::ArmedWithExit {
+                    bearer,
+                    outcome: current,
+                };
+                Ok(CausalServiceTaskOwnerObservation::AlreadyObserved)
+            }
+            other @ CausalServiceTaskOwnerState::ArmedWithExit { .. } => {
+                *state = other;
+                Err(CausalServiceTaskOwnerError::ConflictingExitEvidence)
+            }
+            other => {
+                let actual = other.phase();
+                *state = other;
+                Err(CausalServiceTaskOwnerError::WrongPhase {
+                    expected: CausalServiceTaskOwnerPhase::Armed,
+                    actual,
+                })
+            }
+        }
+    }
+
+    pub(crate) fn observe_reaped(
+        &self,
+    ) -> Result<CausalServiceTaskOwnerObservation, CausalServiceTaskOwnerError> {
+        let mut state = self.state.disable_irq().lock();
+        let previous = __cser_core::mem::replace(&mut *state, CausalServiceTaskOwnerState::Empty);
+        match previous {
+            CausalServiceTaskOwnerState::Empty => {
+                *state = CausalServiceTaskOwnerState::Empty;
+                Ok(CausalServiceTaskOwnerObservation::Unwired)
+            }
+            CausalServiceTaskOwnerState::ArmedWithExit { bearer, outcome } => {
+                *state = CausalServiceTaskOwnerState::Reaped {
+                    bearer: Some(bearer),
+                    outcome,
+                    reservation: None,
+                };
+                Ok(CausalServiceTaskOwnerObservation::Recorded)
+            }
+            other @ CausalServiceTaskOwnerState::Reaped { .. } => {
+                *state = other;
+                Ok(CausalServiceTaskOwnerObservation::AlreadyObserved)
+            }
+            other => {
+                let actual = other.phase();
+                *state = other;
+                Err(if actual == CausalServiceTaskOwnerPhase::Armed {
+                    CausalServiceTaskOwnerError::MissingExitEvidence
+                } else {
+                    CausalServiceTaskOwnerError::WrongPhase {
+                        expected: CausalServiceTaskOwnerPhase::ArmedWithExit,
+                        actual,
+                    }
+                })
+            }
+        }
+    }
+
+    /// Runs a consuming Registry transition without holding the owner lock.
+    /// An ordinary transition error restores the exact armed bearer to Reaped.
+    /// Even an impossible finalization mismatch returns whichever linear value
+    /// the transition produced instead of dropping it.
+    pub(crate) fn resolve_reaped_with<Error, Transition>(
+        &self,
+        transition: Transition,
+    ) -> Result<(), CausalServiceTaskOwnerTransitionFailure<Armed, Committed, Error>>
+    where
+        Transition:
+            FnOnce(Armed, OstdSupervisorServiceOutcome) -> Result<Committed, (Error, Armed)>,
+    {
+        let reservation = self
+            .next_reservation
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |next| {
+                next.checked_add(1)
+            })
+            .map_err(|_| {
+                CausalServiceTaskOwnerTransitionFailure::Owner(
+                    CausalServiceTaskOwnerError::ReservationExhausted,
+                )
+            })?;
+        let (bearer, outcome) = {
+            let mut state = self.state.disable_irq().lock();
+            match &mut *state {
+                CausalServiceTaskOwnerState::Reaped {
+                    bearer,
+                    outcome,
+                    reservation: active,
+                } => {
+                    if active.is_some() {
+                        return Err(CausalServiceTaskOwnerTransitionFailure::Owner(
+                            CausalServiceTaskOwnerError::TransitionReserved,
+                        ));
+                    }
+                    let Some(bearer) = bearer.take() else {
+                        return Err(CausalServiceTaskOwnerTransitionFailure::Owner(
+                            CausalServiceTaskOwnerError::TransitionReserved,
+                        ));
+                    };
+                    *active = Some(reservation);
+                    (bearer, *outcome)
+                }
+                other => {
+                    return Err(CausalServiceTaskOwnerTransitionFailure::Owner(
+                        CausalServiceTaskOwnerError::WrongPhase {
+                            expected: CausalServiceTaskOwnerPhase::Reaped,
+                            actual: other.phase(),
+                        },
+                    ));
+                }
+            }
+        };
+
+        let outcome_value = match transition(bearer, outcome) {
+            Ok(committed) => CausalServiceTaskTransitionOutcome::Committed(committed),
+            Err((error, bearer)) => CausalServiceTaskTransitionOutcome::Restored { error, bearer },
+        };
+        let mut state = self.state.disable_irq().lock();
+        let valid = __cser_core::matches!(
+            &*state,
+            CausalServiceTaskOwnerState::Reaped {
+                bearer: None,
+                reservation: Some(active),
+                ..
+            } if *active == reservation
+        );
+        if !valid {
+            return Err(CausalServiceTaskOwnerTransitionFailure::Finalize {
+                error: CausalServiceTaskOwnerError::StaleReservation,
+                outcome: outcome_value,
+            });
+        }
+        match outcome_value {
+            CausalServiceTaskTransitionOutcome::Committed(bearer) => {
+                *state = CausalServiceTaskOwnerState::Committed { bearer, outcome };
+                Ok(())
+            }
+            CausalServiceTaskTransitionOutcome::Restored { error, bearer } => {
+                *state = CausalServiceTaskOwnerState::Reaped {
+                    bearer: Some(bearer),
+                    outcome,
+                    reservation: None,
+                };
+                Err(CausalServiceTaskOwnerTransitionFailure::Transition(error))
+            }
+        }
+    }
+
+    pub(crate) fn retain_committed(
+        &self,
+        reason: CausalServiceTaskRetentionReason,
+    ) -> Result<(), CausalServiceTaskOwnerError> {
+        let mut state = self.state.disable_irq().lock();
+        let previous = __cser_core::mem::replace(&mut *state, CausalServiceTaskOwnerState::Empty);
+        match previous {
+            CausalServiceTaskOwnerState::Committed { bearer, outcome } => {
+                *state = CausalServiceTaskOwnerState::Retained {
+                    bearer,
+                    outcome,
+                    reason,
+                };
+                Ok(())
+            }
+            other => {
+                let actual = other.phase();
+                *state = other;
+                Err(CausalServiceTaskOwnerError::WrongPhase {
+                    expected: CausalServiceTaskOwnerPhase::Committed,
+                    actual,
+                })
+            }
+        }
+    }
+}
+
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
+pub(crate) struct CausalRetainedOwnerKey {
+    index: usize,
+    generation: u64,
+}
+
+enum CausalRetainedOwnerEntry {
+    Vacant,
+    Reserved {
+        generation: u64,
+    },
+    Published {
+        generation: u64,
+        owner: Arc<CausalServiceTaskOwner>,
+    },
+    Retained {
+        generation: u64,
+        owner: Arc<CausalServiceTaskOwner>,
+    },
+}
+
+struct CausalRetainedOwnerTableState {
+    entries: [CausalRetainedOwnerEntry; MAX_RETAINED_SERVICE_TASK_OWNERS],
+    next_generation: Option<u64>,
+}
+
+struct CausalRetainedOwnerTable {
+    state: SpinLock<CausalRetainedOwnerTableState>,
+}
+
+#[derive(
+    __cser_core::clone::Clone,
+    __cser_core::marker::Copy,
+    __cser_core::fmt::Debug,
+    __cser_core::cmp::Eq,
+    __cser_core::cmp::PartialEq,
+)]
+pub(crate) enum CausalRetainedOwnerReservationError {
+    CapacityExhausted,
+    GenerationExhausted,
+    StaleReservation,
+    AlreadyPublished,
+    OwnerNotRetained,
+}
+
+struct CausalRetainedOwnerReservation {
+    table: Arc<CausalRetainedOwnerTable>,
+    key: CausalRetainedOwnerKey,
+    release_on_drop: bool,
+}
+
+impl CausalRetainedOwnerTable {
+    fn new() -> Self {
+        Self {
+            state: SpinLock::new(CausalRetainedOwnerTableState {
+                entries: __cser_core::array::from_fn(|_| CausalRetainedOwnerEntry::Vacant),
+                next_generation: Some(1),
+            }),
+        }
+    }
+
+    fn reserve(
+        self: &Arc<Self>,
+    ) -> Result<CausalRetainedOwnerReservation, CausalRetainedOwnerReservationError> {
+        let mut state = self.state.disable_irq().lock();
+        let generation = state
+            .next_generation
+            .ok_or(CausalRetainedOwnerReservationError::GenerationExhausted)?;
+        let Some(index) = state
+            .entries
+            .iter()
+            .position(|entry| __cser_core::matches!(entry, CausalRetainedOwnerEntry::Vacant))
+        else {
+            return Err(CausalRetainedOwnerReservationError::CapacityExhausted);
+        };
+        state.next_generation = generation.checked_add(1);
+        state.entries[index] = CausalRetainedOwnerEntry::Reserved { generation };
+        Ok(CausalRetainedOwnerReservation {
+            table: Arc::clone(self),
+            key: CausalRetainedOwnerKey { index, generation },
+            release_on_drop: true,
+        })
+    }
+
+    fn release(&self, key: CausalRetainedOwnerKey) {
+        let mut state = self.state.disable_irq().lock();
+        let Some(entry) = state.entries.get_mut(key.index) else {
+            return;
+        };
+        let matches = match entry {
+            CausalRetainedOwnerEntry::Reserved { generation }
+            | CausalRetainedOwnerEntry::Published { generation, .. } => {
+                *generation == key.generation
+            }
+            CausalRetainedOwnerEntry::Vacant | CausalRetainedOwnerEntry::Retained { .. } => false,
+        };
+        if matches {
+            *entry = CausalRetainedOwnerEntry::Vacant;
+        }
+    }
+
+    #[cfg(test)]
+    fn occupied(&self) -> usize {
+        self.state
+            .disable_irq()
+            .lock()
+            .entries
+            .iter()
+            .filter(|entry| !__cser_core::matches!(entry, CausalRetainedOwnerEntry::Vacant))
+            .count()
+    }
+}
+
+impl CausalRetainedOwnerReservation {
+    fn publish(
+        &mut self,
+        owner: &Arc<CausalServiceTaskOwner>,
+    ) -> Result<(), CausalRetainedOwnerReservationError> {
+        let mut state = self.table.state.disable_irq().lock();
+        let Some(entry) = state.entries.get_mut(self.key.index) else {
+            return Err(CausalRetainedOwnerReservationError::StaleReservation);
+        };
+        match entry {
+            CausalRetainedOwnerEntry::Reserved { generation }
+                if *generation == self.key.generation =>
+            {
+                *entry = CausalRetainedOwnerEntry::Published {
+                    generation: self.key.generation,
+                    owner: Arc::clone(owner),
+                };
+                Ok(())
+            }
+            CausalRetainedOwnerEntry::Published {
+                generation,
+                owner: current,
+            } if *generation == self.key.generation && Arc::ptr_eq(current, owner) => {
+                Err(CausalRetainedOwnerReservationError::AlreadyPublished)
+            }
+            _ => Err(CausalRetainedOwnerReservationError::StaleReservation),
+        }
+    }
+
+    #[allow(dead_code)]
+    fn retain(mut self) -> Result<CausalRetainedOwnerKey, CausalRetainedOwnerReservationError> {
+        {
+            let mut state = self.table.state.disable_irq().lock();
+            let Some(entry) = state.entries.get_mut(self.key.index) else {
+                return Err(CausalRetainedOwnerReservationError::StaleReservation);
+            };
+            match entry {
+                CausalRetainedOwnerEntry::Published { generation, owner }
+                    if *generation == self.key.generation
+                        && owner.phase() == CausalServiceTaskOwnerPhase::Retained =>
+                {
+                    *entry = CausalRetainedOwnerEntry::Retained {
+                        generation: self.key.generation,
+                        owner: Arc::clone(owner),
+                    };
+                }
+                CausalRetainedOwnerEntry::Published { generation, .. }
+                    if *generation == self.key.generation =>
+                {
+                    return Err(CausalRetainedOwnerReservationError::OwnerNotRetained);
+                }
+                _ => return Err(CausalRetainedOwnerReservationError::StaleReservation),
+            }
+        }
+        self.release_on_drop = false;
+        Ok(self.key)
+    }
+}
+
+impl Drop for CausalRetainedOwnerReservation {
+    fn drop(&mut self) {
+        if self.release_on_drop {
+            self.table.release(self.key);
+        }
+    }
+}
+
 impl ServiceTaskSelector {
     const fn new(service: ServiceIdentity, binding_epoch: u64) -> Self {
         Self {
@@ -364,6 +1140,8 @@ struct ReplacementSlot {
     launch: Option<ReplacementLaunch>,
     attempt: Option<u32>,
     task: Option<Arc<Task>>,
+    causal_owner: Option<Arc<CausalServiceTaskOwner>>,
+    causal_owner_reservation: Option<CausalRetainedOwnerReservation>,
     pending_exit_reason: Option<ExitReason>,
     ready: SignalState,
     exit: SignalState,
@@ -379,6 +1157,8 @@ impl ReplacementSlot {
             launch: None,
             attempt: None,
             task: None,
+            causal_owner: None,
+            causal_owner_reservation: None,
             pending_exit_reason: None,
             ready: SignalState::Empty,
             exit: SignalState::Empty,
@@ -393,6 +1173,8 @@ impl ReplacementSlot {
         self.launch = None;
         self.attempt = None;
         self.task = None;
+        self.causal_owner = None;
+        self.causal_owner_reservation = None;
         self.pending_exit_reason = None;
         self.ready = SignalState::Empty;
         self.exit = SignalState::Empty;
@@ -443,6 +1225,7 @@ fn oldest_retained(slot: &ReplacementSlot) -> Option<(u64, SignalKind, OstdSuper
 struct OstdSupervisorShared<const N: usize> {
     events: SpinLock<BoundedEventQueue<N>>,
     replacement: SpinLock<ReplacementSlot>,
+    retained_owners: Arc<CausalRetainedOwnerTable>,
     stop_requested: AtomicBool,
     tick_pending: AtomicBool,
     timer_installed: AtomicBool,
@@ -452,10 +1235,11 @@ struct OstdSupervisorShared<const N: usize> {
 }
 
 impl<const N: usize> OstdSupervisorShared<N> {
-    const fn new() -> Self {
+    fn new() -> Self {
         Self {
             events: SpinLock::new(BoundedEventQueue::new()),
             replacement: SpinLock::new(ReplacementSlot::new()),
+            retained_owners: Arc::new(CausalRetainedOwnerTable::new()),
             stop_requested: AtomicBool::new(false),
             tick_pending: AtomicBool::new(false),
             timer_installed: AtomicBool::new(false),
@@ -473,6 +1257,8 @@ impl<const N: usize> OstdSupervisorShared<N> {
     fn reserve_initial_active(
         &self,
         selector: ServiceTaskSelector,
+        causal_owner: Arc<CausalServiceTaskOwner>,
+        causal_owner_reservation: CausalRetainedOwnerReservation,
     ) -> Result<(), OstdSupervisorSlotError> {
         let mut slot = self.replacement.disable_irq().lock();
         if slot.phase != ReplacementSlotPhase::Vacant {
@@ -480,6 +1266,8 @@ impl<const N: usize> OstdSupervisorShared<N> {
         }
         slot.phase = ReplacementSlotPhase::Constructing;
         slot.selector = Some(selector);
+        slot.causal_owner = Some(causal_owner);
+        slot.causal_owner_reservation = Some(causal_owner_reservation);
         Ok(())
     }
 
@@ -492,6 +1280,8 @@ impl<const N: usize> OstdSupervisorShared<N> {
         if slot.phase != ReplacementSlotPhase::Constructing
             || slot.selector != Some(selector)
             || slot.task.is_some()
+            || slot.causal_owner.is_none()
+            || slot.causal_owner_reservation.is_none()
         {
             return Err(OstdSupervisorSlotError::WrongPhase);
         }
@@ -528,9 +1318,21 @@ impl<const N: usize> OstdSupervisorShared<N> {
         if slot.phase != ReplacementSlotPhase::InstalledActive
             || slot.selector != Some(selector)
             || slot.task.is_none()
+            || slot.causal_owner.is_none()
+            || slot.causal_owner_reservation.is_none()
         {
             return Err(OstdSupervisorSlotError::WrongPhase);
         }
+        let owner = slot
+            .causal_owner
+            .as_ref()
+            .cloned()
+            .ok_or(OstdSupervisorSlotError::WrongPhase)?;
+        slot.causal_owner_reservation
+            .as_mut()
+            .ok_or(OstdSupervisorSlotError::WrongPhase)?
+            .publish(&owner)
+            .map_err(OstdSupervisorSlotError::RetainedOwnerReservation)?;
         slot.phase = ReplacementSlotPhase::Active;
         Ok(())
     }
@@ -765,6 +1567,7 @@ impl<const N: usize> OstdSupervisorShared<N> {
 
 trait ExactTaskReapSink: Send + Sync {
     fn observe_exact_reap(&self, service: ServiceIdentity, binding_epoch: u64);
+    fn reject_exact_lifecycle(&self);
 }
 
 impl<const N: usize> ExactTaskReapSink for OstdSupervisorShared<N> {
@@ -772,6 +1575,10 @@ impl<const N: usize> ExactTaskReapSink for OstdSupervisorShared<N> {
         if self.observe_exact_reap(service, binding_epoch).is_err() {
             self.latch_lifecycle_ingress_rejection();
         }
+    }
+
+    fn reject_exact_lifecycle(&self) {
+        self.latch_lifecycle_ingress_rejection();
     }
 }
 
@@ -833,6 +1640,12 @@ impl OstdSupervisorTaskExitBinding {
             sink.observe_exact_reap(self.service, self.binding_epoch);
         }
     }
+
+    fn latch_lifecycle_rejection(&self) {
+        if let Some(sink) = self.sink.upgrade() {
+            sink.reject_exact_lifecycle();
+        }
+    }
 }
 
 /// OSTD's patched switch tail calls this exactly once after terminal task
@@ -844,6 +1657,12 @@ pub(crate) fn observe_post_task_exit(task: &Task) {
     let Some(data) = task.data().downcast_ref::<TaskData>() else {
         return;
     };
+    if let Some(owner) = data.supervisor_causal_owner.as_ref()
+        && owner.observe_reaped().is_err()
+        && let Some(binding) = data.supervisor_exit.as_ref()
+    {
+        binding.latch_lifecycle_rejection();
+    }
     if let Some(binding) = data.supervisor_exit.as_ref() {
         binding.observe_exact_reap();
     }
@@ -902,22 +1721,33 @@ pub(crate) enum OstdSupervisorSignalError {
 pub(crate) struct OstdSupervisorServiceContext<const N: usize> {
     shared: Arc<OstdSupervisorShared<N>>,
     selector: ServiceTaskSelector,
+    causal_owner: Arc<CausalServiceTaskOwner>,
     ready_deadline_tick: Option<u64>,
 }
 
 impl<const N: usize> OstdSupervisorServiceContext<N> {
-    fn initial(shared: Arc<OstdSupervisorShared<N>>, selector: ServiceTaskSelector) -> Self {
+    fn initial(
+        shared: Arc<OstdSupervisorShared<N>>,
+        selector: ServiceTaskSelector,
+        causal_owner: Arc<CausalServiceTaskOwner>,
+    ) -> Self {
         Self {
             shared,
             selector,
+            causal_owner,
             ready_deadline_tick: None,
         }
     }
 
-    fn replacement(shared: Arc<OstdSupervisorShared<N>>, launch: ReplacementLaunch) -> Self {
+    fn replacement(
+        shared: Arc<OstdSupervisorShared<N>>,
+        launch: ReplacementLaunch,
+        causal_owner: Arc<CausalServiceTaskOwner>,
+    ) -> Self {
         Self {
             shared,
             selector: ServiceTaskSelector::from_launch(launch),
+            causal_owner,
             ready_deadline_tick: Some(launch.ready_deadline_tick()),
         }
     }
@@ -951,16 +1781,29 @@ impl<const N: usize> OstdSupervisorServiceContext<N> {
         // switch-out. Otherwise Backoff could select the next generation while
         // this task still occupies the exact slot. The task wrapper owns only
         // this pending reason; the later hook owns event publication.
+        if self.causal_owner.observe_exit(outcome).is_err() {
+            self.shared.latch_lifecycle_ingress_rejection();
+        }
         let reason = match outcome {
-            OstdSupervisorServiceOutcome::Fault => ExitReason::Fault,
-            OstdSupervisorServiceOutcome::UnexpectedReturn => ExitReason::UnexpectedReturn,
+            OstdSupervisorServiceOutcome::UserFault(_) => ExitReason::Fault,
+            OstdSupervisorServiceOutcome::ServiceExit(OstdServiceExitEvidence {
+                reason:
+                    OstdServiceExitReason::UnexpectedUserSyscall
+                    | OstdServiceExitReason::UnexpectedKernelEvent
+                    | OstdServiceExitReason::UnexpectedProgramReturn,
+                ..
+            }) => ExitReason::UnexpectedReturn,
             // In StopRequested the exact-reap path ignores the retained exit
             // reason. A spontaneous cooperative return is instead a protocol
             // violation and therefore starts ordinary recovery.
-            OstdSupervisorServiceOutcome::CooperativeStop if self.stop_requested() => {
-                ExitReason::UnexpectedReturn
-            }
-            OstdSupervisorServiceOutcome::CooperativeStop => ExitReason::ProtocolViolation,
+            OstdSupervisorServiceOutcome::ServiceExit(OstdServiceExitEvidence {
+                reason: OstdServiceExitReason::CooperativeStop,
+                ..
+            }) if self.stop_requested() => ExitReason::UnexpectedReturn,
+            OstdSupervisorServiceOutcome::ServiceExit(OstdServiceExitEvidence {
+                reason: OstdServiceExitReason::CooperativeStop,
+                ..
+            }) => ExitReason::ProtocolViolation,
         };
         if self
             .shared
@@ -968,35 +1811,6 @@ impl<const N: usize> OstdSupervisorServiceContext<N> {
             .is_err()
         {
             self.shared.latch_lifecycle_ingress_rejection();
-        }
-    }
-}
-
-/// Typed terminal result returned by a bounded service entry.
-#[derive(
-    __cser_core::clone::Clone,
-    __cser_core::marker::Copy,
-    __cser_core::fmt::Debug,
-    __cser_core::cmp::Eq,
-    __cser_core::cmp::PartialEq,
-)]
-pub(crate) enum OstdSupervisorServiceOutcome {
-    Fault,
-    UnexpectedReturn,
-    CooperativeStop,
-}
-
-impl OstdSupervisorServiceOutcome {
-    /// Classifies only an OSTD user-mode return. Kernel faults never pass
-    /// through this API and remain fail-stop.
-    pub(crate) const fn from_user_mode_return(
-        reason: ReturnReason,
-        cooperative_stop_requested: bool,
-    ) -> Self {
-        match reason {
-            ReturnReason::UserException => Self::Fault,
-            ReturnReason::KernelEvent if cooperative_stop_requested => Self::CooperativeStop,
-            ReturnReason::UserSyscall | ReturnReason::KernelEvent => Self::UnexpectedReturn,
         }
     }
 }
@@ -1083,6 +1897,7 @@ pub(crate) enum OstdSupervisorSlotError {
     WrongIdentity,
     WrongPhase,
     RecoveryCleanupPending,
+    RetainedOwnerReservation(CausalRetainedOwnerReservationError),
 }
 
 /// Typed OSTD/Registry backend failure.
@@ -1300,6 +2115,16 @@ impl<const N: usize> SupervisorBackend for OstdRegistrySupervisorBackend<N> {
     }
 
     fn construct_replacement(&mut self, launch: ReplacementLaunch) -> Result<(), Self::Error> {
+        // Capacity is reserved before any task publication and before a causal
+        // bearer can be installed. The current backend deliberately creates
+        // only an Empty owner; recovery admission wires the armed bearer in a
+        // later tranche.
+        let causal_owner = Arc::new(CausalServiceTaskOwner::new_empty());
+        let causal_owner_reservation = self.shared.retained_owners.reserve().map_err(|error| {
+            OstdSupervisorBackendError::Slot(OstdSupervisorSlotError::RetainedOwnerReservation(
+                error,
+            ))
+        })?;
         {
             let mut slot = self.shared.replacement.disable_irq().lock();
             if slot.phase != ReplacementSlotPhase::Selected {
@@ -1320,10 +2145,14 @@ impl<const N: usize> SupervisorBackend for OstdRegistrySupervisorBackend<N> {
             slot.phase = ReplacementSlotPhase::Constructing;
             slot.selector = Some(ServiceTaskSelector::from_launch(launch));
             slot.launch = Some(launch);
+            slot.causal_owner = Some(Arc::clone(&causal_owner));
+            slot.causal_owner_reservation = Some(causal_owner_reservation);
         }
 
         let shared = Arc::downgrade(&self.shared);
         let program = Arc::clone(&self.program);
+        let task_causal_owner = Arc::clone(&causal_owner);
+        let context_causal_owner = Arc::clone(&causal_owner);
         let replacement = service_task(launch.replacement());
         // Install the manager-selected identity before scheduler publication.
         // The patched OSTD switch tail can therefore report exact reaping
@@ -1332,12 +2161,14 @@ impl<const N: usize> SupervisorBackend for OstdRegistrySupervisorBackend<N> {
             &self.shared,
             ServiceTaskSelector::from_launch(launch),
         );
-        let task_data = TaskData::new_supervised(replacement, exit_binding, None);
+        let task_data =
+            TaskData::new_supervised(replacement, exit_binding, task_causal_owner, None);
         let built = TaskOptions::new(move || {
             let Some(shared) = shared.upgrade() else {
                 return;
             };
-            let context = OstdSupervisorServiceContext::replacement(shared, launch);
+            let context =
+                OstdSupervisorServiceContext::replacement(shared, launch, context_causal_owner);
             let outcome = program.run(&context);
             context.report_return(outcome);
         })
@@ -1355,7 +2186,14 @@ impl<const N: usize> SupervisorBackend for OstdRegistrySupervisorBackend<N> {
         };
 
         let mut slot = self.shared.replacement.disable_irq().lock();
-        if slot.phase != ReplacementSlotPhase::Constructing || slot.launch != Some(launch) {
+        if slot.phase != ReplacementSlotPhase::Constructing
+            || slot.launch != Some(launch)
+            || slot
+                .causal_owner
+                .as_ref()
+                .is_none_or(|owner| !Arc::ptr_eq(owner, &causal_owner))
+            || slot.causal_owner_reservation.is_none()
+        {
             return Err(OstdSupervisorBackendError::Slot(
                 OstdSupervisorSlotError::WrongPhase,
             ));
@@ -1419,6 +2257,24 @@ impl<const N: usize> SupervisorBackend for OstdRegistrySupervisorBackend<N> {
                 .ok_or(OstdSupervisorBackendError::Slot(
                     OstdSupervisorSlotError::WrongPhase,
                 ))?;
+            let owner =
+                slot.causal_owner
+                    .as_ref()
+                    .cloned()
+                    .ok_or(OstdSupervisorBackendError::Slot(
+                        OstdSupervisorSlotError::WrongPhase,
+                    ))?;
+            slot.causal_owner_reservation
+                .as_mut()
+                .ok_or(OstdSupervisorBackendError::Slot(
+                    OstdSupervisorSlotError::WrongPhase,
+                ))?
+                .publish(&owner)
+                .map_err(|error| {
+                    OstdSupervisorBackendError::Slot(
+                        OstdSupervisorSlotError::RetainedOwnerReservation(error),
+                    )
+                })?;
             // Publish state precedes Task::run. An immediately scheduled Ready
             // or return event therefore sees the complete selector slot.
             slot.phase = ReplacementSlotPhase::Published;
@@ -2002,19 +2858,36 @@ fn start_supervisor_runtime<const N: usize>(
 
     let shared = Arc::new(OstdSupervisorShared::new());
     let selector = ServiceTaskSelector::new(config.active, config.binding_epoch);
+    let initial_causal_owner = Arc::new(CausalServiceTaskOwner::new_empty());
+    let initial_owner_reservation = shared.retained_owners.reserve().map_err(|error| {
+        OstdSupervisorRuntimeBuildError::InitialSlot(
+            OstdSupervisorSlotError::RetainedOwnerReservation(error),
+        )
+    })?;
     shared
-        .reserve_initial_active(selector)
+        .reserve_initial_active(
+            selector,
+            Arc::clone(&initial_causal_owner),
+            initial_owner_reservation,
+        )
         .map_err(OstdSupervisorRuntimeBuildError::InitialSlot)?;
 
     let weak_shared = Arc::downgrade(&shared);
     let initial_program = Arc::clone(&authority.program);
+    let initial_context_owner = Arc::clone(&initial_causal_owner);
     let initial_exit = OstdSupervisorTaskExitBinding::new(&shared, selector);
-    let initial_data = TaskData::new_supervised(service_task(config.active), initial_exit, None);
+    let initial_data = TaskData::new_supervised(
+        service_task(config.active),
+        initial_exit,
+        Arc::clone(&initial_causal_owner),
+        None,
+    );
     let initial_task = match TaskOptions::new(move || {
         let Some(shared) = weak_shared.upgrade() else {
             return;
         };
-        let context = OstdSupervisorServiceContext::initial(shared, selector);
+        let context =
+            OstdSupervisorServiceContext::initial(shared, selector, initial_context_owner);
         let outcome = initial_program.run(&context);
         context.report_return(outcome);
     })
@@ -2213,13 +3086,18 @@ mod tests {
     use ostd::user::ReturnReason;
 
     use super::{
-        BoundedEventQueue, EventQueuePushError, OstdSupervisorActivationReport,
-        OstdSupervisorBackendError, OstdSupervisorEvent, OstdSupervisorEventEnvelope,
+        BoundedEventQueue, CausalRetainedOwnerReservationError, CausalRetainedOwnerTable,
+        CausalServiceTaskOwner, CausalServiceTaskOwnerPhase,
+        CausalServiceTaskOwnerTransitionFailure, CausalServiceTaskRetentionReason,
+        EventQueuePushError, OstdServiceExitEvidence, OstdServiceExitReason,
+        OstdSupervisorActivationReport, OstdSupervisorBackendError, OstdSupervisorEvent,
+        OstdSupervisorEventEnvelope, OstdSupervisorOutcomeEvidenceError,
         OstdSupervisorRetentionReason, OstdSupervisorServiceOutcome, OstdSupervisorShared,
         OstdSupervisorSignalError, OstdSupervisorWorkerPhase, OstdSupervisorWorkerShared,
-        OstdSupervisorWorkerTerminal, ReplacementSlot, ReplacementSlotPhase, ServiceTaskSelector,
-        SignalKind, SignalState, activation_report, cohort_identity_from_effects, oldest_retained,
-        permit_for_report, replacement_identity, request_activation,
+        OstdSupervisorWorkerTerminal, OstdUserFaultAccess, OstdUserFaultEvidence, ReplacementSlot,
+        ReplacementSlotPhase, ServiceTaskSelector, SignalKind, SignalState, activation_report,
+        cohort_identity_from_effects, oldest_retained, permit_for_report, replacement_identity,
+        request_activation,
     };
     use crate::effect_registry::EffectKey;
 
@@ -2295,18 +3173,142 @@ mod tests {
 
     #[test]
     fn user_mode_boundary_classifies_only_user_exception_as_fault() {
+        let fault = OstdUserFaultEvidence::page_fault(
+            0x1000,
+            0x2000,
+            OstdUserFaultAccess::Write,
+            0x7,
+            0xfeed,
+        )
+        .unwrap();
         __cser_core::assert_eq!(
-            OstdSupervisorServiceOutcome::from_user_mode_return(ReturnReason::UserException, false,),
-            OstdSupervisorServiceOutcome::Fault
+            OstdSupervisorServiceOutcome::from_user_mode_return(
+                ReturnReason::UserException,
+                false,
+                0xbeef,
+                Some(fault),
+            ),
+            Ok(OstdSupervisorServiceOutcome::UserFault(fault))
         );
         __cser_core::assert_eq!(
-            OstdSupervisorServiceOutcome::from_user_mode_return(ReturnReason::UserSyscall, false),
-            OstdSupervisorServiceOutcome::UnexpectedReturn
+            OstdSupervisorServiceOutcome::from_user_mode_return(
+                ReturnReason::UserException,
+                false,
+                0xbeef,
+                None,
+            ),
+            Err(OstdSupervisorOutcomeEvidenceError::MissingUserFaultEvidence)
         );
         __cser_core::assert_eq!(
-            OstdSupervisorServiceOutcome::from_user_mode_return(ReturnReason::KernelEvent, true),
-            OstdSupervisorServiceOutcome::CooperativeStop
+            OstdSupervisorServiceOutcome::from_user_mode_return(
+                ReturnReason::UserSyscall,
+                false,
+                0xbeef,
+                None,
+            ),
+            Ok(OstdSupervisorServiceOutcome::ServiceExit(
+                OstdServiceExitEvidence::new(OstdServiceExitReason::UnexpectedUserSyscall, 0xbeef,)
+                    .unwrap(),
+            ))
         );
+        __cser_core::assert_eq!(
+            OstdSupervisorServiceOutcome::from_user_mode_return(
+                ReturnReason::KernelEvent,
+                true,
+                0xcafe,
+                None,
+            ),
+            Ok(OstdSupervisorServiceOutcome::ServiceExit(
+                OstdServiceExitEvidence::new(OstdServiceExitReason::CooperativeStop, 0xcafe)
+                    .unwrap(),
+            ))
+        );
+        __cser_core::assert_eq!(
+            OstdSupervisorServiceOutcome::from_user_mode_return(
+                ReturnReason::KernelEvent,
+                false,
+                0,
+                None,
+            ),
+            Err(OstdSupervisorOutcomeEvidenceError::InvalidEvidenceDigest)
+        );
+    }
+
+    #[test]
+    fn causal_owner_restores_the_exact_armed_bearer_on_consuming_failure() {
+        let owner = CausalServiceTaskOwner::<u64, u64>::new_empty();
+        __cser_core::assert_eq!(owner.phase(), CausalServiceTaskOwnerPhase::Empty);
+        __cser_core::assert!(owner.install_armed(41).is_ok());
+        let install_failure = owner.install_armed(99).unwrap_err();
+        __cser_core::assert_eq!(install_failure.into_bearer(), 99);
+
+        let exit = OstdSupervisorServiceOutcome::ServiceExit(
+            OstdServiceExitEvidence::new(OstdServiceExitReason::UnexpectedProgramReturn, 0x1234)
+                .unwrap(),
+        );
+        __cser_core::assert!(owner.observe_exit(exit).is_ok());
+        __cser_core::assert!(owner.observe_reaped().is_ok());
+        __cser_core::assert_eq!(owner.phase(), CausalServiceTaskOwnerPhase::Reaped);
+
+        let failed = owner.resolve_reaped_with(|bearer, observed| {
+            __cser_core::assert_eq!(bearer, 41);
+            __cser_core::assert_eq!(observed, exit);
+            Err((7_u8, bearer))
+        });
+        __cser_core::assert!(__cser_core::matches!(
+            failed,
+            Err(CausalServiceTaskOwnerTransitionFailure::Transition(7))
+        ));
+        __cser_core::assert_eq!(owner.phase(), CausalServiceTaskOwnerPhase::Reaped);
+
+        let committed = owner.resolve_reaped_with::<u8, _>(|bearer, observed| {
+            __cser_core::assert_eq!(bearer, 41);
+            __cser_core::assert_eq!(observed, exit);
+            Ok(bearer + 1)
+        });
+        __cser_core::assert!(committed.is_ok());
+        __cser_core::assert_eq!(owner.phase(), CausalServiceTaskOwnerPhase::Committed);
+        __cser_core::assert_eq!(
+            owner.retain_committed(CausalServiceTaskRetentionReason::ClosureRetryRequired),
+            Ok(())
+        );
+        __cser_core::assert_eq!(owner.phase(), CausalServiceTaskOwnerPhase::Retained);
+    }
+
+    #[test]
+    fn retained_owner_capacity_is_reserved_before_publication() {
+        let table = Arc::new(CausalRetainedOwnerTable::new());
+        let first = table.reserve().unwrap();
+        let second = table.reserve().unwrap();
+        let third = table.reserve().unwrap();
+        let fourth = table.reserve().unwrap();
+        __cser_core::assert_eq!(table.occupied(), 4);
+        __cser_core::assert!(__cser_core::matches!(
+            table.reserve(),
+            Err(CausalRetainedOwnerReservationError::CapacityExhausted)
+        ));
+
+        drop(first);
+        __cser_core::assert_eq!(table.occupied(), 3);
+        let replacement = table.reserve().unwrap();
+        __cser_core::assert_eq!(table.occupied(), 4);
+        drop((second, third, fourth, replacement));
+        __cser_core::assert_eq!(table.occupied(), 0);
+    }
+
+    #[test]
+    fn publication_table_holds_only_an_arc_to_the_unique_owner() {
+        let table = Arc::new(CausalRetainedOwnerTable::new());
+        let owner = Arc::new(CausalServiceTaskOwner::new_empty());
+        let mut reservation = table.reserve().unwrap();
+        __cser_core::assert_eq!(reservation.publish(&owner), Ok(()));
+        __cser_core::assert_eq!(
+            reservation.publish(&owner),
+            Err(CausalRetainedOwnerReservationError::AlreadyPublished)
+        );
+        __cser_core::assert_eq!(owner.phase(), CausalServiceTaskOwnerPhase::Empty);
+        drop(reservation);
+        __cser_core::assert_eq!(table.occupied(), 0);
     }
 
     #[test]

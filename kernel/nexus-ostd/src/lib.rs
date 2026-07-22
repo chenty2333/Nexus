@@ -110,6 +110,7 @@ pub struct TaskData {
     #[cfg(feature = "virtio-cser-facade")]
     pub(crate) cser_task: Option<TaskKey>,
     supervisor_exit: Option<supervisor_runtime::OstdSupervisorTaskExitBinding>,
+    supervisor_causal_owner: Option<Arc<supervisor_runtime::CausalServiceTaskOwner>>,
     supervisor_worker_exit: Option<supervisor_runtime::OstdSupervisorWorkerExitBinding>,
     dynamic_vm_space: Option<Arc<SpinLock<Arc<VmSpace>>>>,
 }
@@ -122,6 +123,7 @@ impl TaskData {
             #[cfg(feature = "virtio-cser-facade")]
             cser_task: None,
             supervisor_exit: None,
+            supervisor_causal_owner: None,
             supervisor_worker_exit: None,
             dynamic_vm_space: None,
         }
@@ -138,6 +140,7 @@ impl TaskData {
             vm_space,
             cser_task: Some(task),
             supervisor_exit: None,
+            supervisor_causal_owner: None,
             supervisor_worker_exit: None,
             dynamic_vm_space: None,
         }
@@ -148,6 +151,7 @@ impl TaskData {
     pub(crate) fn new_supervised(
         task: TaskKey,
         supervisor_exit: supervisor_runtime::OstdSupervisorTaskExitBinding,
+        supervisor_causal_owner: Arc<supervisor_runtime::CausalServiceTaskOwner>,
         vm_space: Option<Arc<VmSpace>>,
     ) -> Self {
         Self {
@@ -156,6 +160,7 @@ impl TaskData {
             #[cfg(feature = "virtio-cser-facade")]
             cser_task: { Some(task) },
             supervisor_exit: Some(supervisor_exit),
+            supervisor_causal_owner: Some(supervisor_causal_owner),
             supervisor_worker_exit: None,
             dynamic_vm_space: None,
         }
@@ -173,6 +178,7 @@ impl TaskData {
             #[cfg(feature = "virtio-cser-facade")]
             cser_task: None,
             supervisor_exit: None,
+            supervisor_causal_owner: None,
             supervisor_worker_exit: Some(supervisor_worker_exit),
             dynamic_vm_space: None,
         }
@@ -187,6 +193,7 @@ impl TaskData {
             #[cfg(feature = "virtio-cser-facade")]
             cser_task: None,
             supervisor_exit: None,
+            supervisor_causal_owner: None,
             supervisor_worker_exit: None,
             dynamic_vm_space: Some(vm_space),
         }
