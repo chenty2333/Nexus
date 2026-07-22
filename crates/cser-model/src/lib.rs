@@ -19,6 +19,7 @@ mod model;
 pub mod pager;
 pub mod personality;
 pub mod production_identity;
+pub mod production_identity_postcommit;
 pub mod runtime_fs;
 pub mod runtime_net;
 
