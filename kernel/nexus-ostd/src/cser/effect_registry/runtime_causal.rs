@@ -1513,20 +1513,22 @@ pub(super) fn runtime_causal_bootstrap_self_test() {
         (registry, root_session, snapshot)
     }
 
-    macro_rules! assert_recovery_activation_failure {
-        ($registry:expr, $parent:expr, $request:expr, $error:expr) => {{
-            let request = $request;
-            let expected = __cser_alloc::format!("{request:?}");
-            let before = $registry.failure_atomic_projection();
-            let failure = $registry
-                .activate_causal_recovery_domain_workload($parent, request)
-                .unwrap_err();
-            __cser_core::assert_eq!(failure.error(), &$error);
-            let request = failure.into_input();
-            __cser_core::assert_eq!(__cser_alloc::format!("{request:?}"), expected);
-            __cser_core::assert_eq!($registry.failure_atomic_projection(), before);
-            request
-        }};
+    fn assert_recovery_activation_failure(
+        registry: &mut EffectRegistry,
+        parent: &CausalWorkloadSession,
+        request: CausalRecoveryWorkloadRequest,
+        error: CausalWorkloadError,
+    ) -> CausalRecoveryWorkloadRequest {
+        let expected = __cser_alloc::format!("{request:?}");
+        let before = registry.failure_atomic_projection();
+        let failure = registry
+            .activate_causal_recovery_domain_workload(parent, request)
+            .unwrap_err();
+        __cser_core::assert_eq!(failure.error(), &error);
+        let request = failure.into_input();
+        __cser_core::assert_eq!(__cser_alloc::format!("{request:?}"), expected);
+        __cser_core::assert_eq!(registry.failure_atomic_projection(), before);
+        request
     }
 
     fn advance_target_epoch_for_test(registry: &mut EffectRegistry) {
@@ -1907,11 +1909,11 @@ pub(super) fn runtime_causal_bootstrap_self_test() {
         let child = recovery
             .activate_causal_recovery_domain_workload(&root_session, request)
             .unwrap();
-        let _ = assert_recovery_activation_failure!(
-            recovery,
+        let _ = assert_recovery_activation_failure(
+            &mut recovery,
             &root_session,
             duplicate_request,
-            CausalWorkloadError::StaleScope
+            CausalWorkloadError::StaleScope,
         );
         __cser_core::assert_eq!(
             child.provenance(),
@@ -1989,88 +1991,88 @@ pub(super) fn runtime_causal_bootstrap_self_test() {
             .prepare_causal_recovery_domain_workload(&root_session, fence, 0xcd10, 1)
             .unwrap();
         request.fence.parent.request_id = request.fence.parent.request_id.checked_add(1).unwrap();
-        let _ = assert_recovery_activation_failure!(
-            substituted,
+        let _ = assert_recovery_activation_failure(
+            &mut substituted,
             &root_session,
             request,
-            CausalWorkloadError::ParentMismatch
+            CausalWorkloadError::ParentMismatch,
         );
 
         let mut request = substituted
             .prepare_causal_recovery_domain_workload(&root_session, fence, 0xcd11, 1)
             .unwrap();
         request.fence.domain = DOMAIN;
-        let _ = assert_recovery_activation_failure!(
-            substituted,
+        let _ = assert_recovery_activation_failure(
+            &mut substituted,
             &root_session,
             request,
-            CausalWorkloadError::StaleDomain
+            CausalWorkloadError::StaleDomain,
         );
 
         let mut request = substituted
             .prepare_causal_recovery_domain_workload(&root_session, fence, 0xcd12, 1)
             .unwrap();
         request.fence.replacement = TaskKey::new(0xcdfe, 1);
-        let _ = assert_recovery_activation_failure!(
-            substituted,
+        let _ = assert_recovery_activation_failure(
+            &mut substituted,
             &root_session,
             request,
-            CausalWorkloadError::RecoverySnapshotMismatch
+            CausalWorkloadError::RecoverySnapshotMismatch,
         );
 
         let mut request = substituted
             .prepare_causal_recovery_domain_workload(&root_session, fence, 0xcd13, 1)
             .unwrap();
         request.fence.attempt = 2;
-        let _ = assert_recovery_activation_failure!(
-            substituted,
+        let _ = assert_recovery_activation_failure(
+            &mut substituted,
             &root_session,
             request,
-            CausalWorkloadError::RecoverySnapshotMismatch
+            CausalWorkloadError::RecoverySnapshotMismatch,
         );
 
         let mut request = substituted
             .prepare_causal_recovery_domain_workload(&root_session, fence, 0xcd14, 1)
             .unwrap();
         request.fence.snapshot_digest[0] ^= 1;
-        let _ = assert_recovery_activation_failure!(
-            substituted,
+        let _ = assert_recovery_activation_failure(
+            &mut substituted,
             &root_session,
             request,
-            CausalWorkloadError::RecoverySnapshotMismatch
+            CausalWorkloadError::RecoverySnapshotMismatch,
         );
 
         let mut request = substituted
             .prepare_causal_recovery_domain_workload(&root_session, fence, 0xcd15, 1)
             .unwrap();
         request.fence.binding_epoch = request.fence.binding_epoch.checked_add(1).unwrap();
-        let _ = assert_recovery_activation_failure!(
-            substituted,
+        let _ = assert_recovery_activation_failure(
+            &mut substituted,
             &root_session,
             request,
-            CausalWorkloadError::StaleDomain
+            CausalWorkloadError::StaleDomain,
         );
 
         let mut request = substituted
             .prepare_causal_recovery_domain_workload(&root_session, fence, 0xcd16, 1)
             .unwrap();
         request.fence.root_revision = request.fence.root_revision.checked_add(1).unwrap();
-        let _ = assert_recovery_activation_failure!(
-            substituted,
+        let _ = assert_recovery_activation_failure(
+            &mut substituted,
             &root_session,
             request,
-            CausalWorkloadError::StaleScope
+            CausalWorkloadError::StaleScope,
         );
 
         let mut request = substituted
             .prepare_causal_recovery_domain_workload(&root_session, fence, 0xcd17, 1)
             .unwrap();
         request.fence.domain_revision = request.fence.domain_revision.checked_add(1).unwrap();
-        let _ = assert_recovery_activation_failure!(
-            substituted,
+        let _ = assert_recovery_activation_failure(
+            &mut substituted,
             &root_session,
             request,
-            CausalWorkloadError::StaleDomain
+            CausalWorkloadError::StaleDomain,
         );
 
         let mut request = substituted
@@ -2081,22 +2083,22 @@ pub(super) fn runtime_causal_bootstrap_self_test() {
             .infrastructure_scope_revision
             .checked_add(1)
             .unwrap();
-        let _ = assert_recovery_activation_failure!(
-            substituted,
+        let _ = assert_recovery_activation_failure(
+            &mut substituted,
             &root_session,
             request,
-            CausalWorkloadError::StaleScope
+            CausalWorkloadError::StaleScope,
         );
 
         let mut request = substituted
             .prepare_causal_recovery_domain_workload(&root_session, fence, 0xcd19, 1)
             .unwrap();
         request.fence.registry_instance = request.fence.registry_instance.checked_add(1).unwrap();
-        let _ = assert_recovery_activation_failure!(
-            substituted,
+        let _ = assert_recovery_activation_failure(
+            &mut substituted,
             &root_session,
             request,
-            CausalWorkloadError::ForeignRegistry
+            CausalWorkloadError::ForeignRegistry,
         );
         substituted.check_invariants().unwrap();
     }
@@ -2112,11 +2114,11 @@ pub(super) fn runtime_causal_bootstrap_self_test() {
             .prepare_causal_recovery_domain_workload(&owner_root, owner_fence, 0xce10, 1)
             .unwrap();
         let (mut target, target_root, _) = recovery_fixture(0xce20);
-        let _ = assert_recovery_activation_failure!(
-            target,
+        let _ = assert_recovery_activation_failure(
+            &mut target,
             &target_root,
             foreign_request,
-            CausalWorkloadError::ForeignRegistry
+            CausalWorkloadError::ForeignRegistry,
         );
         target.check_invariants().unwrap();
         owner.check_invariants().unwrap();
@@ -2146,11 +2148,11 @@ pub(super) fn runtime_causal_bootstrap_self_test() {
         stale
             .domain_recovery_snapshot(SCOPE, TARGET_DOMAIN, TaskKey::new(0xcf11, 1), 2)
             .unwrap();
-        let _ = assert_recovery_activation_failure!(
-            stale,
+        let _ = assert_recovery_activation_failure(
+            &mut stale,
             &root_session,
             request,
-            CausalWorkloadError::RecoverySnapshotMismatch
+            CausalWorkloadError::RecoverySnapshotMismatch,
         );
     }
 
@@ -2165,11 +2167,11 @@ pub(super) fn runtime_causal_bootstrap_self_test() {
         let scope = changed_root.scopes.get_mut(&SCOPE).unwrap();
         scope.revision = scope.revision.checked_add(1).unwrap();
         scope.invalidate_recovery_readiness();
-        let _ = assert_recovery_activation_failure!(
-            changed_root,
+        let _ = assert_recovery_activation_failure(
+            &mut changed_root,
             &root_session,
             request,
-            CausalWorkloadError::StaleScope
+            CausalWorkloadError::StaleScope,
         );
         changed_root.check_invariants().unwrap();
     }
@@ -2191,11 +2193,11 @@ pub(super) fn runtime_causal_bootstrap_self_test() {
             .unwrap();
         binding.revision = binding.revision.checked_add(1).unwrap();
         binding.recovery.as_mut().unwrap().ready = None;
-        let _ = assert_recovery_activation_failure!(
-            changed_domain,
+        let _ = assert_recovery_activation_failure(
+            &mut changed_domain,
             &root_session,
             request,
-            CausalWorkloadError::StaleDomain
+            CausalWorkloadError::StaleDomain,
         );
         changed_domain.check_invariants().unwrap();
     }
@@ -2212,11 +2214,11 @@ pub(super) fn runtime_causal_bootstrap_self_test() {
             .infrastructure
             .open_child_workload(&root_session.context, DomainKey::LEGACY, 0xd211, 1)
             .unwrap();
-        let _ = assert_recovery_activation_failure!(
-            changed_infrastructure,
+        let _ = assert_recovery_activation_failure(
+            &mut changed_infrastructure,
             &root_session,
             request,
-            CausalWorkloadError::StaleScope
+            CausalWorkloadError::StaleScope,
         );
         changed_infrastructure.check_invariants().unwrap();
     }
@@ -2235,11 +2237,11 @@ pub(super) fn runtime_causal_bootstrap_self_test() {
         rebound
             .rebind_domain(SCOPE, TARGET_DOMAIN, REPLACEMENT)
             .unwrap();
-        let _ = assert_recovery_activation_failure!(
-            rebound,
+        let _ = assert_recovery_activation_failure(
+            &mut rebound,
             &root_session,
             request,
-            CausalWorkloadError::RecoveryUnavailable
+            CausalWorkloadError::RecoveryUnavailable,
         );
         rebound.check_invariants().unwrap();
     }
@@ -2252,7 +2254,7 @@ pub(super) fn runtime_causal_bootstrap_self_test() {
         let request = quarantined
             .prepare_causal_recovery_domain_workload(&root_session, fence, 0xd410, 1)
             .unwrap();
-        __cser_core::assert!(matches!(
+        __cser_core::assert!(__cser_core::matches!(
             quarantined.isolate_domain_authority(
                 SCOPE,
                 TARGET_DOMAIN,
@@ -2261,11 +2263,11 @@ pub(super) fn runtime_causal_bootstrap_self_test() {
             ),
             super::DomainIsolationOutcome::Isolated(_)
         ));
-        let _ = assert_recovery_activation_failure!(
-            quarantined,
+        let _ = assert_recovery_activation_failure(
+            &mut quarantined,
             &root_session,
             request,
-            CausalWorkloadError::RecoveryUnavailable
+            CausalWorkloadError::RecoveryUnavailable,
         );
         quarantined.check_invariants().unwrap();
     }

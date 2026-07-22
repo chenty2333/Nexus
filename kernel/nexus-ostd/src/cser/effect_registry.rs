@@ -10889,14 +10889,15 @@ impl EffectRegistry {
                             .ok_or(RegistryError::Invariant("unknown domain recovery effect"))?;
                         if record.identity.scope != *key
                             || record.identity.domain != *domain
-                            || record.phase.is_terminal()
                             || record.identity.binding_epoch > binding.binding_epoch
                         {
                             return Err(RegistryError::Invariant("invalid domain recovery cohort"));
                         }
                     }
                     for effect in &recovery.unadopted {
-                        if self.effects[effect].identity.binding_epoch >= binding.binding_epoch {
+                        if self.effects[effect].phase.is_terminal()
+                            || self.effects[effect].identity.binding_epoch >= binding.binding_epoch
+                        {
                             return Err(RegistryError::Invariant(
                                 "invalid unadopted domain effect",
                             ));
@@ -12503,7 +12504,6 @@ impl EffectRegistry {
             .and_then(|binding| binding.recovery.as_mut())
         {
             recovery.unadopted.remove(&effect);
-            recovery.cohort.remove(&effect);
         }
         scope.revision = next_scope_revision;
         scope.pending_publications = next_pending_publications;
@@ -16911,6 +16911,43 @@ fn supervisor_domain_recovery_primitives_self_test() {
         }
         registry.check_invariants().unwrap();
         (registry, root, child)
+    }
+
+    // Kernel completion may terminalize an old-binding effect after the
+    // recovery snapshot was issued. The member leaves the unadopted work set,
+    // but remains in the immutable crash cohort so the stored snapshot keeps
+    // the exact identity of what was observed at the crash boundary.
+    {
+        let (mut completed, root, _) = fixture(false);
+        let commit = match completed
+            .commit(SERVICE_V1, root.handle, CommitMetadata::new(1, 1))
+            .unwrap()
+        {
+            CommitOutcome::Applied(receipt) => receipt,
+            CommitOutcome::AlreadyCommitted(_) => __cser_core::unreachable!(),
+        };
+        completed.crash_domain(SCOPE, DOMAIN, SERVICE_V1).unwrap();
+        let snapshot = completed
+            .domain_recovery_snapshot(SCOPE, DOMAIN, SERVICE_V2, 1)
+            .unwrap();
+        let cohort_identity = snapshot.cohort_identity();
+
+        completed.stage_kernel_completion(&commit).unwrap();
+        completed.check_invariants().unwrap();
+        let recovery = completed.scopes[&SCOPE].domains[&DOMAIN]
+            .recovery
+            .as_ref()
+            .unwrap();
+        __cser_core::assert_eq!(recovery.cohort, BTreeSet::from([root.identity.effect()]));
+        __cser_core::assert!(recovery.unadopted.is_empty());
+        __cser_core::assert_eq!(
+            domain_cohort_identity(Some(&recovery.cohort)).unwrap(),
+            cohort_identity
+        );
+        __cser_core::assert_eq!(
+            completed.domain_recovery_snapshot(SCOPE, DOMAIN, SERVICE_V2, 1),
+            Ok(snapshot)
+        );
     }
 
     let (mut registry, _, _) = fixture(false);
