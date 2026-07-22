@@ -313,6 +313,7 @@ clean_cache() {
         "$root/target/.rustc_info.json" \
         "$root/target/cargo" \
         "$root/target/debug" \
+        "$root/target/doc" \
         "$root/target/docker" \
         "$root/target/release-api-test" \
         "$root/target/review" \

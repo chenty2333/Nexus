@@ -579,6 +579,7 @@ fn validate_clean_contract(frontdoor: &str) -> Result<()> {
         "$root/target/cargo",
         "$root/target/docker",
         "$root/target/debug",
+        "$root/target/doc",
         "$root/tools/xtask/target",
         "$root/crates/nexus-ostd-virtio/target",
         "$root/kernel/nexus-ostd/target",
