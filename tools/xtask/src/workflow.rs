@@ -18,7 +18,7 @@ const TLA2TOOLS_LICENSE_SHA256: &str =
 const TLA2TOOLS_SHA256SUMS: &str =
     "33de7da9ce1b7fffb9d1c184021178dbb051747be48504e65c584c423721a32e  tla2tools-227f61b.jar\n";
 const ROOT_FRONTDOOR_SHA256: &str =
-    "1041b0fd0686b413183e1ede7934496d31f46db085e0a649bcdb48d100dbf728";
+    "3658175921a292362559a693c2dc29e2e3d538ca94e236bcc72c2f9e017dfd1e";
 const TLA2TOOLS_LICENSE_PATHSPEC_EXCLUSION: &str =
     ":(exclude)third_party/tlaplus/1.8.0-227f61b/LICENSE.upstream";
 const TRANSITION_GATE_MANIFEST: &str = "crates/cser-transition-gates/Cargo.toml";
@@ -110,6 +110,15 @@ const PORTAL_ABI_IMAGE_INPUTS: [&str; 15] = [
     "src/response/lifecycle.rs",
     "src/response/negotiation.rs",
     "src/response/query.rs",
+];
+const SUPERVISOR_IMAGE_INPUTS: [&str; 7] = [
+    "Cargo.toml",
+    "README.md",
+    "src/backend.rs",
+    "src/lib.rs",
+    "src/manager.rs",
+    "src/tests.rs",
+    "src/types.rs",
 ];
 const VIRTIO_AUTHORITY_LOCK: &str = "kernel/nexus-ostd/osdk-runner-base/Cargo.lock";
 const VIRTIO_PRODUCTION_LOCKS: [&str; 5] = [
@@ -312,6 +321,7 @@ fn validate_full_verify_order(frontdoor: &str) -> Result<()> {
         "run_xtask verify",
         "run_system",
         "run_same_boot_acceptance",
+        "run_xtask research production-identity-postcommit-crash",
         "eval-stage7b",
         "run_xtask stage7b-evidence",
         "run_xtask complete",
@@ -328,6 +338,7 @@ fn validate_full_verify_order(frontdoor: &str) -> Result<()> {
         "run_xtask verify",
         "run_system",
         "run_same_boot_acceptance",
+        "run_xtask research production-identity-postcommit-crash",
         "eval-stage7b",
         "run_xtask stage7b-evidence",
         "run_xtask complete",
@@ -384,13 +395,17 @@ fn validate_same_boot_acceptance_route(frontdoor: &str) -> Result<()> {
     let positive =
         "run_backend \"$kernel_backend\" test-same-boot \"Nexus same-boot production filesystem\"";
     let precommit = "run_backend \"$kernel_backend\" test-same-boot-precommit \"Nexus same-boot precommit revocation\"";
+    let postcommit = "run_backend \"$kernel_backend\" test-same-boot-postcommit-crash \"Nexus same-boot postcommit service crash\"";
     let (_, after_positive) = body
         .split_once(positive)
         .ok_or("root same-boot acceptance lacks the positive production gate")?;
-    if !after_positive.contains(precommit) {
-        return Err("root same-boot acceptance lacks ordered precommit revocation gate".into());
+    let (_, after_precommit) = after_positive
+        .split_once(precommit)
+        .ok_or("root same-boot acceptance lacks ordered precommit revocation gate")?;
+    if !after_precommit.contains(postcommit) {
+        return Err("root same-boot acceptance lacks ordered postcommit crash gate".into());
     }
-    if body.matches("run_backend ").count() != 2 {
+    if body.matches("run_backend ").count() != 3 {
         return Err("root same-boot acceptance has an unexpected backend population".into());
     }
     Ok(())
@@ -399,9 +414,12 @@ fn validate_same_boot_acceptance_route(frontdoor: &str) -> Result<()> {
 fn validate_production_identity_route(frontdoor: &str) -> Result<()> {
     for required in [
         "research production-identity",
+        "research production-identity-postcommit-crash",
         "doctor|build|test|run|fmt|check|quick|model|spec|system|research|verify|verify-bundle|clean",
-        "research requires exactly one target: production-identity",
+        "research requires exactly one target: production-identity, production-identity-postcommit-crash, or handoff-admission",
         "production-identity) run_xtask research production-identity",
+        "production-identity-postcommit-crash)",
+        "run_xtask research production-identity-postcommit-crash",
         "unknown research target: $1",
     ] {
         if !frontdoor.contains(required) {
@@ -2025,7 +2043,7 @@ fn validate_ostd_supervisor_runtime_source(runtime: &str, kernel: &str) -> Resul
         ],
     )?;
     let wrapper_return =
-        source_function(runtime, "    fn report_return", "/// Typed terminal result")?;
+        source_function(runtime, "    fn report_return", "/// Replacement program")?;
     if !wrapper_return.contains("record_pending_exit(")
         || wrapper_return.contains("enqueue_signal_locked")
         || wrapper_return.contains("OstdSupervisorEvent::Exit")
@@ -2036,15 +2054,19 @@ fn validate_ostd_supervisor_runtime_source(runtime: &str, kernel: &str) -> Resul
     }
     let user_fault_boundary = source_function(
         runtime,
-        "    pub(crate) const fn from_user_mode_return",
+        "    pub(crate) fn from_user_mode_return",
         "/// Replacement program",
     )?;
     require_source_order(
         "isolated user-mode fault boundary",
         user_fault_boundary,
         &[
-            "ReturnReason::UserException => Self::Fault",
-            "ReturnReason::UserSyscall | ReturnReason::KernelEvent => Self::UnexpectedReturn",
+            "(ReturnReason::UserException, Some(fault)) => Ok(Self::UserFault(fault))",
+            "OstdSupervisorOutcomeEvidenceError::MissingUserFaultEvidence",
+            "OstdSupervisorOutcomeEvidenceError::UnexpectedUserFaultEvidence",
+            "OstdServiceExitReason::UnexpectedUserSyscall",
+            "OstdServiceExitReason::CooperativeStop",
+            "OstdServiceExitReason::UnexpectedKernelEvent",
         ],
     )?;
     if user_fault_boundary.contains("panic") || user_fault_boundary.contains("KernelFault") {
@@ -2133,7 +2155,9 @@ fn validate_ostd_supervisor_runtime_source(runtime: &str, kernel: &str) -> Resul
         "initial-active and manager-worker install before publication",
         startup,
         &[
-            "reserve_initial_active(selector)",
+            "let initial_causal_owner = Arc::new(CausalServiceTaskOwner::new_empty())",
+            "shared.retained_owners.reserve()",
+            ".reserve_initial_active(",
             "TaskData::new_supervised(",
             ".build()",
             "install_initial_active_task(",
@@ -2475,7 +2499,7 @@ fn validate_backend_source_pair_semantics(
         .into());
     }
     let expected_helper_sources = if relative == "kernel/nexus-ostd/x" {
-        4
+        5
     } else {
         1
     };
@@ -2568,7 +2592,7 @@ fn validate_backend_source_pair_semantics(
 fn expected_backend_source_sha256(relative: &str) -> Result<&'static str> {
     match relative {
         "kernel/nexus-ostd/x" => {
-            Ok("783ac422934fda763daa0bff52d1282a1d21de0000b9d4c0aec6242976adfbcb")
+            Ok("33ce92e82f3e36670dd4b16933993021e1ec3bc3db1ce2cf2d9f96f8752bf322")
         }
         "experiments/ostd-virtio-cser-spike/x" => {
             Ok("e51d863a8134cfd8b25ff33438441c73a93f6548ea0202fad54a6c4270153ee9")
@@ -2805,7 +2829,7 @@ fn validate_backend_docker_source_set_semantics(
 fn expected_backend_docker_sha256(relative: &str) -> Result<&'static str> {
     match relative {
         "kernel/nexus-ostd/Dockerfile" => {
-            Ok("ca213ec54cfbb086886c9e0d1ea26a37e4a41318b621264d4f106f85af287182")
+            Ok("441f84f7e674117702f2d69ce267571db807e2fb1510ec09efd905381726c539")
         }
         "experiments/ostd-virtio-cser-spike/Dockerfile" => {
             Ok("d13b7c6629849de19957ad0536033706e2ebef9e54d761a4a0357beae332b1dc")
@@ -2850,6 +2874,20 @@ fn validate_portal_abi_image_binding(kernel: &str, kernel_dockerfile: &str) -> R
             .into());
         }
     }
+    for relative in SUPERVISOR_IMAGE_INPUTS {
+        let input = format!("$repo_root/crates/nexus-supervisor/{relative}");
+        if image_inputs
+            .iter()
+            .filter(|candidate| candidate.as_str() == input)
+            .count()
+            != 1
+        {
+            return Err(format!(
+                "kernel/nexus-ostd/x must hash supervisor input exactly once: {relative}"
+            )
+            .into());
+        }
+    }
     let container = function_body(kernel, "container() {")?;
     let container_lines = continued_shell_lines(container)?;
     let docker_runs = container_lines
@@ -2857,12 +2895,17 @@ fn validate_portal_abi_image_binding(kernel: &str, kernel_dockerfile: &str) -> R
         .filter(|line| line.starts_with(r#"command "$docker_bin" run --rm "#))
         .collect::<Vec<_>>();
     let portal_mount = r#"-v "$repo_root/crates/nexus-portal-abi:/crates/nexus-portal-abi:ro,z""#;
+    let supervisor_mount =
+        r#"-v "$repo_root/crates/nexus-supervisor:/crates/nexus-supervisor:ro,z""#;
     if docker_runs.len() != 1 {
         return Err("kernel/nexus-ostd/x must have one canonical container command".into());
     }
     validate_single_shell_command(docker_runs[0])?;
     if docker_runs[0].matches(portal_mount).count() != 1 {
         return Err("kernel/nexus-ostd/x must live-mount the portal ABI exactly once".into());
+    }
+    if docker_runs[0].matches(supervisor_mount).count() != 1 {
+        return Err("kernel/nexus-ostd/x must live-mount the supervisor exactly once".into());
     }
     if continued_shell_lines(kernel_dockerfile)?
         .iter()
@@ -2871,6 +2914,14 @@ fn validate_portal_abi_image_binding(kernel: &str, kernel_dockerfile: &str) -> R
         != 1
     {
         return Err("kernel Dockerfile must bake the portal ABI exactly once".into());
+    }
+    if continued_shell_lines(kernel_dockerfile)?
+        .iter()
+        .filter(|line| *line == "COPY crates/nexus-supervisor /crates/nexus-supervisor")
+        .count()
+        != 1
+    {
+        return Err("kernel Dockerfile must bake the supervisor exactly once".into());
     }
     Ok(())
 }
@@ -5555,6 +5606,15 @@ mod tests {
             validate_portal_abi_image_binding(&in_command_comment, &kernel_dockerfile)
                 .expect_err("a portal ABI input in a continued-command comment must be rejected");
         }
+        for relative in SUPERVISOR_IMAGE_INPUTS {
+            let input = format!("$repo_root/crates/nexus-supervisor/{relative}");
+            let missing = kernel_source.replacen(&input, "removed-supervisor-input", 1);
+            validate_portal_abi_image_binding(&missing, &kernel_dockerfile)
+                .expect_err("every supervisor source must affect the kernel image identity");
+            let commented = format!("{missing}\n# retained marker only: {input}\n");
+            validate_portal_abi_image_binding(&commented, &kernel_dockerfile)
+                .expect_err("a supervisor input retained only in a comment must be rejected");
+        }
         let missing_portal_mount = kernel_source.replacen(
             r#"-v "$repo_root/crates/nexus-portal-abi:/crates/nexus-portal-abi:ro,z""#,
             "removed-portal-abi-mount",
@@ -5574,6 +5634,13 @@ mod tests {
         );
         validate_portal_abi_image_binding(&commented_portal_mount, &kernel_dockerfile)
             .expect_err("a portal ABI mount retained only in a comment must be rejected");
+        let missing_supervisor_mount = kernel_source.replacen(
+            r#"-v "$repo_root/crates/nexus-supervisor:/crates/nexus-supervisor:ro,z""#,
+            "removed-supervisor-mount",
+            1,
+        );
+        validate_portal_abi_image_binding(&missing_supervisor_mount, &kernel_dockerfile)
+            .expect_err("the live kernel build must mount the supervisor source");
         let missing_portal_copy = kernel_dockerfile.replacen(
             "COPY crates/nexus-portal-abi /crates/nexus-portal-abi",
             "COPY removed-portal-abi /crates/nexus-portal-abi",
@@ -5586,6 +5653,13 @@ mod tests {
         );
         validate_portal_abi_image_binding(&kernel_source, &commented_portal_copy)
             .expect_err("a portal ABI COPY retained only in a comment must be rejected");
+        let missing_supervisor_copy = kernel_dockerfile.replacen(
+            "COPY crates/nexus-supervisor /crates/nexus-supervisor",
+            "COPY removed-supervisor /crates/nexus-supervisor",
+            1,
+        );
+        validate_portal_abi_image_binding(&kernel_source, &missing_supervisor_copy)
+            .expect_err("the cold kernel image must bake the supervisor source");
 
         let unsafe_default = frontdoor.replace("mode=${1:-cache}", "mode=${1:---all}");
         validate_clean_contract(&unsafe_default)
@@ -6148,12 +6222,21 @@ verify_all() {
 "#;
         let suffix = "\n}\n";
         let ordered = format!(
-            "{prefix}run_xtask begin\nrun_xtask verify\nrun_system\nrun_same_boot_acceptance\nrun_backend kernel eval-stage7b\nrun_xtask stage7b-evidence\nrun_xtask complete\nrun_xtask manifest\nrun_xtask bundle{suffix}"
+            "{prefix}run_xtask begin\nrun_xtask verify\nrun_system\nrun_same_boot_acceptance\nrun_xtask research production-identity-postcommit-crash\nrun_backend kernel eval-stage7b\nrun_xtask stage7b-evidence\nrun_xtask complete\nrun_xtask manifest\nrun_xtask bundle{suffix}"
         );
         validate_full_verify_order(&ordered).expect("ordered full verify");
 
+        let missing_postcommit_research = ordered.replace(
+            "run_xtask research production-identity-postcommit-crash\n",
+            "",
+        );
+        let error = validate_full_verify_order(&missing_postcommit_research)
+            .expect_err("full verify without the postcommit receipt must be rejected")
+            .to_string();
+        assert!(error.contains("lacks ordered stage"));
+
         let spliced = format!(
-            "{prefix}run_xtask begin\nrun_xtask verify\nrun_xtask complete\nrun_system\nrun_same_boot_acceptance\nrun_backend kernel eval-stage7b\nrun_xtask stage7b-evidence\nrun_xtask manifest\nrun_xtask bundle{suffix}"
+            "{prefix}run_xtask begin\nrun_xtask verify\nrun_xtask complete\nrun_system\nrun_same_boot_acceptance\nrun_xtask research production-identity-postcommit-crash\nrun_backend kernel eval-stage7b\nrun_xtask stage7b-evidence\nrun_xtask manifest\nrun_xtask bundle{suffix}"
         );
         let error = validate_full_verify_order(&spliced)
             .expect_err("completion before system must be rejected")
@@ -6161,7 +6244,7 @@ verify_all() {
         assert!(error.contains("missing or out of order"));
 
         let late_same_boot = format!(
-            "{prefix}run_xtask begin\nrun_xtask verify\nrun_system\nrun_backend kernel eval-stage7b\nrun_xtask stage7b-evidence\nrun_xtask complete\nrun_same_boot_acceptance\nrun_xtask manifest\nrun_xtask bundle{suffix}"
+            "{prefix}run_xtask begin\nrun_xtask verify\nrun_system\nrun_backend kernel eval-stage7b\nrun_xtask stage7b-evidence\nrun_xtask complete\nrun_same_boot_acceptance\nrun_xtask research production-identity-postcommit-crash\nrun_xtask manifest\nrun_xtask bundle{suffix}"
         );
         let error = validate_full_verify_order(&late_same_boot)
             .expect_err("same-boot acceptance after completion must be rejected")
@@ -6203,14 +6286,31 @@ run_xtask() {
     fn requires_the_same_boot_acceptance_route() {
         let positive = r#"run_backend "$kernel_backend" test-same-boot "Nexus same-boot production filesystem""#;
         let precommit = r#"run_backend "$kernel_backend" test-same-boot-precommit "Nexus same-boot precommit revocation""#;
-        let route = format!("run_same_boot_acceptance() {{\n    {positive}\n    {precommit}\n}}\n");
+        let postcommit = r#"run_backend "$kernel_backend" test-same-boot-postcommit-crash "Nexus same-boot postcommit service crash""#;
+        let route = format!(
+            "run_same_boot_acceptance() {{\n    {positive}\n    {precommit}\n    {postcommit}\n}}\n"
+        );
         validate_same_boot_acceptance_route(&route).expect("complete same-boot route");
 
         for broken in [
-            format!("run_same_boot_acceptance() {{\n    {precommit}\n}}\n"),
-            format!("run_same_boot_acceptance() {{\n    {positive}\n}}\n"),
-            format!("run_same_boot_acceptance() {{\n    {precommit}\n    {positive}\n}}\n"),
+            format!("run_same_boot_acceptance() {{\n    {positive}\n    {precommit}\n}}\n"),
+            format!("run_same_boot_acceptance() {{\n    {positive}\n    {postcommit}\n}}\n"),
+            format!("run_same_boot_acceptance() {{\n    {precommit}\n    {postcommit}\n}}\n"),
+            format!(
+                "run_same_boot_acceptance() {{\n    {positive}\n    {postcommit}\n    {precommit}\n}}\n"
+            ),
+            format!(
+                "run_same_boot_acceptance() {{\n    {precommit}\n    {positive}\n    {postcommit}\n}}\n"
+            ),
             route.replacen("$kernel_backend", "$virtio_backend", 1),
+            route.replace(
+                precommit,
+                &precommit.replacen("$kernel_backend", "$virtio_backend", 1),
+            ),
+            route.replace(
+                postcommit,
+                &postcommit.replacen("$kernel_backend", "$virtio_backend", 1),
+            ),
         ] {
             assert!(validate_same_boot_acceptance_route(&broken).is_err());
         }
@@ -6220,9 +6320,12 @@ run_xtask() {
     fn requires_the_prospective_production_identity_route() {
         let route = r#"
 research production-identity
+research production-identity-postcommit-crash
 doctor|build|test|run|fmt|check|quick|model|spec|system|research|verify|verify-bundle|clean
-research requires exactly one target: production-identity
+research requires exactly one target: production-identity, production-identity-postcommit-crash, or handoff-admission
 production-identity) run_xtask research production-identity
+production-identity-postcommit-crash)
+run_xtask research production-identity-postcommit-crash
 unknown research target: $1
 "#;
         validate_production_identity_route(route).expect("complete research route");

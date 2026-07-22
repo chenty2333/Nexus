@@ -1219,7 +1219,8 @@ require_count "$dispatch" \
     'runtime.verify_causal_session(cookie, captured.identity.effect())' 1
 require_order "$dispatch" \
     'runtime.verify_causal_session(cookie, captured.identity.effect())' \
-    'registry.reserve_device_preparation_for_session(session, coordinates)' \
+    'registry.reserve_device_preparation_for_session(' \
+    'filesystem.identity.effect(),' \
     'device.preflight_read_sector0(&mut root)' \
     'runtime.registry.begin_device_hardware_apply(reservation)' \
     'let request = match permit.apply()'
@@ -1260,7 +1261,8 @@ reject_fixed "$source_file" 'DeviceRollbackReceipt {'
 # reset and IOTLB and is consumed only by the coupled closure install before
 # leaf draining or frame-credit reuse.
 for required in \
-    'reserve_device_preparation_for_session(session, coordinates)' \
+    'reserve_device_preparation_for_session(' \
+    'filesystem.identity.effect(),' \
     'cancel_device_preparation(reservation)' \
     'FsDeviceFlight::PreparationApplying {' \
     'device.issue_preparation_receipt(request)' \
@@ -1277,7 +1279,8 @@ done
 require_count "$dispatch" \
     'runtime.put_flight(FsDeviceFlight::PreparedPendingAck {' 2
 require_order "$dispatch" \
-    'registry.reserve_device_preparation_for_session(session, coordinates)' \
+    'registry.reserve_device_preparation_for_session(' \
+    'filesystem.identity.effect(),' \
     'device.preflight_read_sector0(&mut root)' \
     'runtime.registry.begin_device_hardware_apply(reservation)' \
     'let request = match permit.apply()' \

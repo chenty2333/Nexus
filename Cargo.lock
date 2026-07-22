@@ -250,6 +250,7 @@ dependencies = [
  "cser-transition-gates",
  "nexus-effect-peer-wire",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]

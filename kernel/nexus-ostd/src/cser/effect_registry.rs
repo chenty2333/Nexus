@@ -3816,10 +3816,13 @@ impl EffectRegistry {
     }
 
     /// Reserves a device preparation through an opaque causal-workload
-    /// session. The infrastructure context never crosses into the personality.
+    /// session. The caller names the immediate business parent, but the
+    /// Registry proves that its complete live ancestry terminates at the
+    /// session's exact root before the infrastructure context is used.
     pub(crate) fn reserve_device_preparation_for_session(
         &mut self,
         session: &runtime_causal::CausalWorkloadSession,
+        parent_effect: EffectKey,
         coordinates: DeviceReservationCoordinates,
     ) -> Result<DevicePreparationTicket, RegistryError> {
         let identity =
@@ -3829,9 +3832,31 @@ impl EffectRegistry {
                     runtime_causal::CausalWorkloadError::Infrastructure(error) => error.into(),
                     _ => RegistryError::InvalidHandle,
                 })?;
+        let mut cursor = Some(parent_effect);
+        let mut rooted = false;
+        while let Some(effect) = cursor {
+            let record = self
+                .effects
+                .get(&effect)
+                .ok_or(RegistryError::UnknownEffect)?;
+            if record.identity.scope != identity.scope()
+                || record.identity.authority_epoch != identity.authority_epoch
+                || record.phase.is_terminal()
+            {
+                return Err(RegistryError::InvalidHandle);
+            }
+            if effect == identity.root_effect() {
+                rooted = true;
+                break;
+            }
+            cursor = record.identity.parent;
+        }
+        if !rooted {
+            return Err(RegistryError::InvalidHandle);
+        }
         self.reserve_device_preparation(
             session.infrastructure_context(),
-            identity.root_effect(),
+            parent_effect,
             coordinates,
         )
     }
@@ -8998,6 +9023,16 @@ impl EffectRegistry {
             .revision
             .checked_add(1)
             .ok_or(RegistryError::CounterOverflow)?;
+        let infrastructure_fence = if self.infrastructure.is_enabled(scope_key) {
+            Some(self.infrastructure.prepare_domain_fence(
+                scope_key,
+                domain,
+                previous_binding_epoch,
+                binding_epoch,
+            )?)
+        } else {
+            None
+        };
 
         let scope = self.scopes.get_mut(&scope_key).unwrap();
         scope.revision = root_revision;
@@ -9017,6 +9052,10 @@ impl EffectRegistry {
             origin: DomainRecoveryOrigin::SupervisorCrash,
         });
         scope.invalidate_recovery_readiness();
+        if let Some(fence) = infrastructure_fence {
+            self.infrastructure.apply_domain_fence(fence);
+        }
+        __cser_core::debug_assert!(self.check_infrastructure_root_links().is_ok());
         Ok(DomainCrashReceipt {
             scope: scope_key,
             domain,
@@ -15819,7 +15858,7 @@ fn ordinary_domain_crash_rejects_a_forged_fault_origin() {
             authority_epoch: 1,
             binding_epoch: 1,
             supervisor: ROOT_OWNER,
-            credits: __cser_alloc::vec![],
+            credits: __cser_alloc::vec![CreditLimit::new(CreditClass::new(0xfd20), 1)],
         })
         .unwrap();
     registry
@@ -15832,10 +15871,43 @@ fn ordinary_domain_crash_rejects_a_forged_fault_origin() {
             },
         )
         .unwrap();
+    let root = registry
+        .register_derived(DerivedRegisterRequest {
+            request: RegisterRequest {
+                scope: SCOPE,
+                task: SERVICE_OWNER,
+                operation: OperationClass::new(0xfd30),
+                descriptor: SyscallDescriptor::new(0xfd30, [0; 6]),
+                resources: __cser_alloc::vec![],
+                credits: __cser_alloc::vec![CreditCharge::new(CreditClass::new(0xfd20), 1)],
+                publication: PublicationMode::None,
+            },
+            domain: SERVICE,
+            parent: None,
+        })
+        .unwrap();
+    registry.prepare(SERVICE_OWNER, root.handle).unwrap();
+    registry
+        .enable_infrastructure_for_scope(
+            SCOPE,
+            root.identity.effect(),
+            infrastructure::InfrastructureLimits::new(1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2)
+                .unwrap(),
+        )
+        .unwrap();
     registry
         .crash_domain(SCOPE, SERVICE, SERVICE_OWNER)
         .unwrap();
     registry.check_invariants().unwrap();
+    let service_epoch = registry
+        .infrastructure
+        .scope_links()
+        .find(|link| link.scope == SCOPE)
+        .unwrap()
+        .domains
+        .iter()
+        .find_map(|(domain, epoch)| (*domain == SERVICE).then_some(*epoch));
+    __cser_core::assert_eq!(service_epoch, Some(2));
     __cser_core::assert_eq!(
         registry.scopes[&SCOPE].domains[&SERVICE]
             .recovery

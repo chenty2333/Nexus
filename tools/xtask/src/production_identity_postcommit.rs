@@ -56,7 +56,9 @@ const SOURCE_FILES: &[&str] = &[
     "crates/cser-model/tests/production_identity_postcommit_properties.rs",
     "kernel/nexus-ostd/Cargo.toml",
     "kernel/nexus-ostd/Cargo.lock",
+    "kernel/nexus-ostd/Dockerfile",
     "kernel/nexus-ostd/OSDK.toml",
+    "kernel/nexus-ostd/cser-production-sources.txt",
     "kernel/nexus-ostd/x",
     "kernel/nexus-ostd/src/lib.rs",
     "kernel/nexus-ostd/src/cser/device_flight.rs",
@@ -66,9 +68,14 @@ const SOURCE_FILES: &[&str] = &[
     "kernel/nexus-ostd/src/cser/infrastructure/device_receipt_bridge.rs",
     "kernel/nexus-ostd/src/personality/linux_fs.rs",
     "kernel/nexus-ostd/src/personality/linux_fs_input.rs",
+    "kernel/nexus-ostd/src/personality/linux_fs_postcommit.rs",
     "kernel/nexus-ostd/guest/linux-fsd-v2-postcommit.S",
     "kernel/nexus-ostd/guest/linux-fsd-v3.S",
     "kernel/nexus-ostd/scripts/build-guest.sh",
+    "kernel/nexus-ostd/scripts/assert-linux-futex-entry-debugcon.sh",
+    "kernel/nexus-ostd/scripts/assert-linux-futex-startup.sh",
+    "kernel/nexus-ostd/scripts/assert-runtime-fs-same-boot-source.sh",
+    "kernel/nexus-ostd/scripts/assert-stream-capture.sh",
     "kernel/nexus-ostd/scripts/qemu-stream-capture.sh",
     "kernel/nexus-ostd/scripts/assert-runtime-fs-same-boot-postcommit-crash.sh",
     "kernel/nexus-ostd/scripts/assert-runtime-fs-same-boot-postcommit-crash.awk",
@@ -449,13 +456,12 @@ fn validate_runtime_artifacts(root: &Path) -> Result<Vec<ArtifactReceipt>> {
             if bytes.is_empty() {
                 return Err(format!("postcommit runtime artifact is empty: {relative}").into());
             }
-            if let Some(marker) = marker {
-                if !String::from_utf8_lossy(&bytes).contains(marker) {
-                    return Err(format!(
-                        "postcommit runtime artifact lacks {marker:?}: {relative}"
-                    )
-                    .into());
-                }
+            if let Some(marker) = marker
+                && !String::from_utf8_lossy(&bytes).contains(marker)
+            {
+                return Err(
+                    format!("postcommit runtime artifact lacks {marker:?}: {relative}").into(),
+                );
             }
             Ok(ArtifactReceipt {
                 path: String::from(*relative),

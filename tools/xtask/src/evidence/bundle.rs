@@ -846,19 +846,19 @@ mod tests {
         validate_checkout_binding(&manifest, &checkout).expect("matching clean checkout");
         verify_bundle_directory(&bundle, &SPECS).expect("verify complete bundle internally");
         assert_eq!(manifest.specifications.len(), 12);
-        assert_eq!(manifest.stages.len(), 17);
-        assert_eq!(manifest.artifacts.len(), 58);
+        assert_eq!(manifest.stages.len(), 18);
+        assert_eq!(manifest.artifacts.len(), 66);
         assert_eq!(
             toolchain_files(&manifest.formal_verifier.toolchain).len(),
             4
         );
 
         let files = collect_files(&bundle).expect("collect bundle files");
-        assert_eq!(files.len(), 68);
+        assert_eq!(files.len(), 76);
         let sums =
             parse_checksum_index(&fs::read(bundle.join(CHECKSUMS)).expect("read checksum index"))
                 .expect("parse checksum index");
-        assert_eq!(sums.len(), 67);
+        assert_eq!(sums.len(), 75);
         fs::remove_dir_all(root).expect("remove fixture");
     }
 
@@ -1009,24 +1009,29 @@ mod tests {
 
     #[test]
     fn bundle_rejects_same_boot_oracle_mutation_with_rewritten_checksums() {
-        let root = fixture();
-        write_source_fixture(&root);
-        let bundle = write_bundle(&root, &SPECS).expect("write complete bundle");
-        let artifact = "kernel/nexus-ostd/artifacts/runtime-fs-same-boot-precommit/oracle.log";
-        assert!(
-            required_artifacts(&SPECS)
-                .iter()
-                .any(|(path, _)| path == artifact)
-        );
-        fs::write(bundle.join(artifact), "mutated same-boot oracle\n")
-            .expect("mutate same-boot oracle");
-        rewrite_checksum_index_from_payload(&bundle);
+        for artifact in [
+            "kernel/nexus-ostd/artifacts/runtime-fs-same-boot-precommit/oracle.log",
+            "kernel/nexus-ostd/artifacts/runtime-fs-same-boot-postcommit-crash/oracle.log",
+            "target/research/production-identity-postcommit-crash/receipt.json",
+        ] {
+            let root = fixture();
+            write_source_fixture(&root);
+            let bundle = write_bundle(&root, &SPECS).expect("write complete bundle");
+            assert!(
+                required_artifacts(&SPECS)
+                    .iter()
+                    .any(|(path, _)| path == artifact)
+            );
+            fs::write(bundle.join(artifact), "mutated same-boot oracle\n")
+                .expect("mutate same-boot oracle");
+            rewrite_checksum_index_from_payload(&bundle);
 
-        let error = verify_bundle_directory(&bundle, &SPECS)
-            .expect_err("manifest digest must reject same-boot oracle mutation")
-            .to_string();
-        assert!(error.contains("disagree with manifest"));
-        fs::remove_dir_all(root).expect("remove fixture");
+            let error = verify_bundle_directory(&bundle, &SPECS)
+                .expect_err("manifest digest must reject same-boot oracle mutation")
+                .to_string();
+            assert!(error.contains("disagree with manifest"));
+            fs::remove_dir_all(root).expect("remove fixture");
+        }
     }
 
     #[test]
@@ -1038,6 +1043,8 @@ mod tests {
             "kernel/nexus-ostd/artifacts/runtime-fs-same-boot/task-entry-debugcon-oracle.log",
             "kernel/nexus-ostd/artifacts/runtime-fs-same-boot-precommit/task-entry-debugcon.log",
             "kernel/nexus-ostd/artifacts/runtime-fs-same-boot-precommit/task-entry-debugcon-oracle.log",
+            "kernel/nexus-ostd/artifacts/runtime-fs-same-boot-postcommit-crash/task-entry-debugcon.log",
+            "kernel/nexus-ostd/artifacts/runtime-fs-same-boot-postcommit-crash/task-entry-debugcon-oracle.log",
         ];
 
         for artifact in artifacts {

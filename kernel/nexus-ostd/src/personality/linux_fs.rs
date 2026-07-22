@@ -15,6 +15,10 @@
 //! the Registry, and sources the guest reply only from the completed device
 //! buffer.
 
+#[cfg(feature = "virtio-cser-postcommit-fault")]
+#[path = "linux_fs_postcommit.rs"]
+mod linux_fs_postcommit;
+
 use alloc::{collections::BTreeMap, sync::Arc, vec, vec::Vec};
 use core::fmt;
 
@@ -120,6 +124,8 @@ const ROOT_OWNER: TaskKey = TaskKey::new(954, 1);
 const PERSONALITY_V1: TaskKey = TaskKey::new(952, 1);
 const FILESYSTEM_V1: TaskKey = TaskKey::new(951, 1);
 const FILESYSTEM_V2: TaskKey = TaskKey::new(951, 2);
+#[cfg(feature = "virtio-cser-postcommit-fault")]
+const FILESYSTEM_V3_TRIGGER: TaskKey = TaskKey::new(951, 3);
 const BLOCK_V1: TaskKey = TaskKey::new(953, 1);
 const AUTHORITY_EPOCH: u64 = 141;
 const ROOT_BINDING_EPOCH: u64 = 1;
@@ -203,6 +209,8 @@ const SCENARIO_DONE_EFFECT: u64 = 950;
 const FSD_V1_DONE_EFFECT: u64 = 955;
 #[cfg(feature = "virtio-cser-facade")]
 const FSD_V2_DONE_EFFECT: u64 = 956;
+#[cfg(feature = "virtio-cser-postcommit-fault")]
+const FSD_V3_DONE_EFFECT: u64 = 958;
 #[cfg(feature = "virtio-cser-facade")]
 const FSD_REPLY_EFFECT: u64 = 957;
 #[cfg(feature = "virtio-cser-facade")]
@@ -228,6 +236,8 @@ const FSD_REBIND: usize = 0x4e74_0012;
 const FSD_ADOPT_NEXT: usize = 0x4e74_0013;
 #[cfg(feature = "virtio-cser-facade")]
 const FSD_REPLAY_OLD: usize = 0x4e74_0014;
+#[cfg(feature = "virtio-cser-postcommit-fault")]
+const FSD_POSTCOMMIT_PROBE: usize = 0x4e74_0015;
 #[cfg(feature = "virtio-cser-facade")]
 const FSD_DONE: usize = 0x4e74_0020;
 #[cfg(feature = "virtio-cser-facade")]
@@ -238,6 +248,8 @@ const FSD_OP_WAIT: usize = 0;
 const FSD_OP_REQUEST: usize = 1;
 #[cfg(feature = "virtio-cser-facade")]
 const FSD_RESULT_STALE_BINDING: usize = 2;
+#[cfg(feature = "virtio-cser-postcommit-fault")]
+const FSD_RESULT_STALE_AUTHORITY: usize = 1;
 #[cfg(feature = "virtio-cser-facade")]
 const SAME_BOOT_COMPLETION_PROBE_LIMIT: usize = 10_000_000;
 const AT_EMPTY_PATH: usize = 0x1000;
@@ -269,8 +281,15 @@ const BLOCK_PREPARATION_FNV1A: u64 = 0xfbde_9edc_fd5f_41c8;
 const RUNTIME_FS_ELF: &[u8] = include_bytes!("../../guest/linux-runtime-fs.elf");
 #[cfg(feature = "virtio-cser-facade")]
 const FSD_V1_PROGRAM: &[u8] = include_bytes!("../../guest/linux-fsd-v1.bin");
-#[cfg(feature = "virtio-cser-facade")]
+#[cfg(all(
+    feature = "virtio-cser-facade",
+    not(feature = "virtio-cser-postcommit-fault")
+))]
 const FSD_V2_PROGRAM: &[u8] = include_bytes!("../../guest/linux-fsd-v2.bin");
+#[cfg(feature = "virtio-cser-postcommit-fault")]
+const FSD_V2_PROGRAM: &[u8] = include_bytes!("../../guest/linux-fsd-v2-postcommit.bin");
+#[cfg(feature = "virtio-cser-postcommit-fault")]
+const FSD_V3_PROGRAM: &[u8] = include_bytes!("../../guest/linux-fsd-v3.bin");
 
 /// Read-only receipt proving that the retained filesystem workload completed
 /// its own production root. No live handle is exported after root closure; the
@@ -890,7 +909,7 @@ struct FsCausalTerminalClear {
 }
 
 #[cfg(feature = "virtio-cser-facade")]
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum FsCausalAdapterError {
     AlreadyActive {
         identity: CausalWorkloadIdentity,
@@ -2527,6 +2546,10 @@ enum FsServicePhase {
     Rebound,
     Adopted,
     Executed,
+    #[cfg(feature = "virtio-cser-postcommit-fault")]
+    PostcommitCrashed,
+    #[cfg(feature = "virtio-cser-postcommit-fault")]
+    PostcommitProbed,
     ReplyReady,
     Done,
     Isolated,
@@ -2559,6 +2582,16 @@ enum FsServiceProtocolError {
     Registry {
         portal: &'static str,
         error: RegistryError,
+    },
+    #[cfg(feature = "virtio-cser-postcommit-fault")]
+    Causal {
+        portal: &'static str,
+        error: FsCausalAdapterError,
+    },
+    #[cfg(feature = "virtio-cser-postcommit-fault")]
+    PostcommitInvariant {
+        portal: &'static str,
+        detail: &'static str,
     },
 }
 
@@ -2608,6 +2641,14 @@ struct FsServiceProjection {
     stale_replay_observed: bool,
     service_done: bool,
     termination_present: bool,
+    #[cfg(feature = "virtio-cser-postcommit-fault")]
+    postcommit_fault_observed: bool,
+    #[cfg(feature = "virtio-cser-postcommit-fault")]
+    postcommit_stale_probe_observed: bool,
+    #[cfg(feature = "virtio-cser-postcommit-fault")]
+    postcommit_wake_triggered: bool,
+    #[cfg(feature = "virtio-cser-postcommit-fault")]
+    postcommit_causal_identity: Option<CausalWorkloadIdentity>,
 }
 
 #[cfg(feature = "virtio-cser-facade")]
@@ -2626,6 +2667,14 @@ struct FsServiceProtocol {
     stale_replay_observed: bool,
     service_done: bool,
     termination: Option<FsServiceTerminationReceipt>,
+    #[cfg(feature = "virtio-cser-postcommit-fault")]
+    postcommit_fault_observed: bool,
+    #[cfg(feature = "virtio-cser-postcommit-fault")]
+    postcommit_stale_probe_observed: bool,
+    #[cfg(feature = "virtio-cser-postcommit-fault")]
+    postcommit_wake_triggered: bool,
+    #[cfg(feature = "virtio-cser-postcommit-fault")]
+    postcommit_causal_identity: Option<CausalWorkloadIdentity>,
 }
 
 #[cfg(feature = "virtio-cser-facade")]
@@ -2646,6 +2695,14 @@ impl FsServiceProtocol {
             stale_replay_observed: false,
             service_done: false,
             termination: None,
+            #[cfg(feature = "virtio-cser-postcommit-fault")]
+            postcommit_fault_observed: false,
+            #[cfg(feature = "virtio-cser-postcommit-fault")]
+            postcommit_stale_probe_observed: false,
+            #[cfg(feature = "virtio-cser-postcommit-fault")]
+            postcommit_wake_triggered: false,
+            #[cfg(feature = "virtio-cser-postcommit-fault")]
+            postcommit_causal_identity: None,
         }
     }
 
@@ -2669,6 +2726,14 @@ impl FsServiceProtocol {
             stale_replay_observed: self.stale_replay_observed,
             service_done: self.service_done,
             termination_present: self.termination.is_some(),
+            #[cfg(feature = "virtio-cser-postcommit-fault")]
+            postcommit_fault_observed: self.postcommit_fault_observed,
+            #[cfg(feature = "virtio-cser-postcommit-fault")]
+            postcommit_stale_probe_observed: self.postcommit_stale_probe_observed,
+            #[cfg(feature = "virtio-cser-postcommit-fault")]
+            postcommit_wake_triggered: self.postcommit_wake_triggered,
+            #[cfg(feature = "virtio-cser-postcommit-fault")]
+            postcommit_causal_identity: self.postcommit_causal_identity,
         }
     }
 
@@ -2790,6 +2855,13 @@ impl FsServiceProtocol {
         assert!(self.stale_replay_observed);
         assert!(self.service_done);
         assert!(self.termination.is_none());
+        #[cfg(feature = "virtio-cser-postcommit-fault")]
+        {
+            assert!(self.postcommit_fault_observed);
+            assert!(self.postcommit_stale_probe_observed);
+            assert!(self.postcommit_wake_triggered);
+            assert!(self.postcommit_causal_identity.is_some());
+        }
     }
 }
 
@@ -3878,6 +3950,17 @@ impl FsScenario {
             filesystem,
             adopted_handle,
         );
+        if let PublicationAuthority::Retained { flight_cookie } = &outcome.authority {
+            let runtime = self.production.lock();
+            let stage = match &runtime.flight {
+                FsDeviceFlight::Retained { stage, .. } => *stage,
+                _ => "non-retained-flight",
+            };
+            println!(
+                "LINUX_FS_SAME_BOOT RetainedOutcome cookie={} stage={} result={} exit={} guest_publication=false owner_runtime_resident=true",
+                flight_cookie, stage, outcome.result, outcome.exit,
+            );
+        }
         let mut service = self.service.lock();
         service.require_phase("commit/install", "Adopted without outcome", |phase| {
             phase == FsServicePhase::Adopted && service.outcome.is_none()
@@ -4285,18 +4368,27 @@ impl FsScenario {
                         );
                     }
                 };
-                registry.reserve_device_preparation_for_session(session, coordinates)
+                registry.reserve_device_preparation_for_session(
+                    session,
+                    filesystem.identity.effect(),
+                    coordinates,
+                )
             };
             let reservation = match reservation {
                 Ok(reservation) => reservation,
-                Err(_) => {
+                Err(error) => {
                     runtime.put_flight(FsDeviceFlight::Captured {
                         cookie,
                         root,
                         device,
                         syscall: captured,
                     });
-                    return DispatchOutcome::retained(runtime.retain_current("device_reservation"));
+                    let retained = runtime.retain_current("device_reservation");
+                    println!(
+                        "LINUX_FS_SAME_BOOT Retained stage=device_reservation cookie={} error={:?} guest_publication=false owner_runtime_resident=true",
+                        retained, error,
+                    );
+                    return DispatchOutcome::retained(retained);
                 }
             };
             if runtime
@@ -4606,6 +4698,11 @@ impl FsScenario {
             let materialized = match materialized {
                 Ok(materialized) => materialized,
                 Err(failure) => {
+                    println!(
+                        "LINUX_FS_SAME_BOOT Retained stage=device_cohort_materialization cookie={} error={:?} guest_publication=false owner_runtime_resident=true",
+                        cookie.get(),
+                        failure.error(),
+                    );
                     runtime.put_flight(FsDeviceFlight::Prepared {
                         cookie,
                         root,
@@ -7144,15 +7241,40 @@ impl FsScenario {
                     }
                     _ => return PublicationResult::Retained,
                 };
-                if let Err(error) =
-                    runtime.close_or_verify_causal_terminal(causal_cookie, root_effect)
+                #[cfg(feature = "virtio-cser-postcommit-fault")]
+                let active_identity = match runtime
+                    .verify_causal_session(causal_cookie, root_effect)
                 {
+                    Ok(identity) => identity,
+                    Err(error) => {
+                        println!(
+                            "LINUX_FS_SAME_BOOT Retained stage=postcommit_causal_active_preflight error={:?}",
+                            error
+                        );
+                        return PublicationResult::Retained;
+                    }
+                };
+                let closed_identity =
+                    runtime.close_or_verify_causal_terminal(causal_cookie, root_effect);
+                let closed_identity = match closed_identity {
+                    Ok(identity) => identity,
+                    Err(error) => {
+                        println!(
+                            "LINUX_FS_SAME_BOOT Retained stage=causal_close_before_outer_ack error={:?}",
+                            error
+                        );
+                        return PublicationResult::Retained;
+                    }
+                };
+                #[cfg(feature = "virtio-cser-postcommit-fault")]
+                if closed_identity != active_identity {
                     println!(
-                        "LINUX_FS_SAME_BOOT Retained stage=causal_close_before_outer_ack error={:?}",
-                        error
+                        "LINUX_FS_SAME_BOOT Retained stage=postcommit_causal_identity_changed_at_close"
                     );
                     return PublicationResult::Retained;
                 }
+                #[cfg(not(feature = "virtio-cser-postcommit-fault"))]
+                let _ = closed_identity;
                 let causal_clear = match runtime
                     .causal
                     .prepare_terminal_clear(causal_cookie, root_effect)
@@ -7196,6 +7318,13 @@ impl FsScenario {
                 };
                 runtime.put_flight(FsDeviceFlight::Complete { root, device });
                 runtime.causal.apply_terminal_clear(causal_clear);
+                #[cfg(feature = "virtio-cser-postcommit-fault")]
+                if !runtime.causal.is_vacant() {
+                    println!(
+                        "LINUX_FS_SAME_BOOT Retained stage=postcommit_causal_not_vacant_after_outer_ack"
+                    );
+                    return PublicationResult::Retained;
+                }
                 if let Err(error) = runtime.verify_complete() {
                     println!(
                         "LINUX_FS_SAME_BOOT Retained stage=runtime_completion_validation error={:?}",
@@ -7209,7 +7338,20 @@ impl FsScenario {
                 } else {
                     None
                 };
+                #[cfg(feature = "virtio-cser-postcommit-fault")]
+                println!(
+                    "LINUX_FS_POSTCOMMIT CausalPublication flight_cookie={} ticket_effect={} causal_request={} causal_root={} before_close=Active after_close=Closed outer_ack_apply=true after_outer_ack=Vacant publication_actor=original_guest",
+                    causal_cookie.get(),
+                    ticket.effect().id(),
+                    closed_identity.request_id(),
+                    closed_identity.root_effect().id(),
+                );
                 drop(runtime);
+                #[cfg(feature = "virtio-cser-postcommit-fault")]
+                println!(
+                    "LINUX_FS_POSTCOMMIT GuestPublication actor=original_guest trigger=fsd-v3 result={} bytes=4 source=CompletedRequest registry_ack=true revoke_complete=true causal_state=Vacant",
+                    outcome.result,
+                );
                 #[cfg(not(feature = "virtio-cser-precommit-fault"))]
                 println!(
                     "LINUX_FS_SAME_BOOT GuestPublication result={} bytes={} source={} registry_ack=true revoke_complete=true",
@@ -7712,6 +7854,59 @@ fn run_fsd_v2(scenario: Arc<FsScenario>, vm_space: Arc<VmSpace>, done: EffectWak
                 }
             },
             ReturnReason::UserException => {
+                #[cfg(feature = "virtio-cser-postcommit-fault")]
+                {
+                    let Some(exception) = user_mode.context_mut().take_exception() else {
+                        terminate_fsd(
+                            &scenario,
+                            sender,
+                            FsServiceTerminationReason::MissingException,
+                            &done,
+                        );
+                        return;
+                    };
+                    let info = match exception {
+                        CpuException::PageFault(info) if info.addr == EXPECTED_FSD_FAULT => info,
+                        CpuException::PageFault(info) => {
+                            terminate_fsd(
+                                &scenario,
+                                sender,
+                                FsServiceTerminationReason::UnexpectedPageFault {
+                                    address: info.addr,
+                                },
+                                &done,
+                            );
+                            return;
+                        }
+                        other => {
+                            terminate_fsd(
+                                &scenario,
+                                sender,
+                                FsServiceTerminationReason::UnexpectedException(other),
+                                &done,
+                            );
+                            return;
+                        }
+                    };
+                    if let Err(error) = scenario.fsd_crash_postcommit_v2(sender, info.addr) {
+                        terminate_fsd(
+                            &scenario,
+                            sender,
+                            FsServiceTerminationReason::PortalRejected(error),
+                            &done,
+                        );
+                        return;
+                    }
+                    println!(
+                        "FSD_V2_POSTCOMMIT EXIT task={} task_generation={} reason=real_user_page_fault addr={:#x} device_committed=true backend_completed=true flight=AwaitingPublication causal_state=Active guest_reply=false reply_wakeups=0",
+                        sender.id(),
+                        sender.generation(),
+                        info.addr,
+                    );
+                    done.wake_up();
+                    return;
+                }
+                #[cfg(not(feature = "virtio-cser-postcommit-fault"))]
                 let reason = match user_mode.context_mut().take_exception() {
                     Some(CpuException::PageFault(info)) => {
                         FsServiceTerminationReason::UnexpectedPageFault { address: info.addr }
@@ -7719,7 +7914,9 @@ fn run_fsd_v2(scenario: Arc<FsScenario>, vm_space: Arc<VmSpace>, done: EffectWak
                     Some(other) => FsServiceTerminationReason::UnexpectedException(other),
                     None => FsServiceTerminationReason::MissingException,
                 };
+                #[cfg(not(feature = "virtio-cser-postcommit-fault"))]
                 terminate_fsd(&scenario, sender, reason, &done);
+                #[cfg(not(feature = "virtio-cser-postcommit-fault"))]
                 return;
             }
             ReturnReason::KernelEvent => Task::yield_now(),
@@ -7809,14 +8006,16 @@ pub(crate) fn run_linux_fs_slice() -> Result<RuntimeFsSliceReceipt, RuntimeFsSli
     );
     #[cfg(all(
         feature = "virtio-cser-facade",
-        not(feature = "virtio-cser-precommit-fault")
+        not(feature = "virtio-cser-precommit-fault"),
+        not(feature = "virtio-cser-postcommit-fault")
     ))]
     println!(
         "LINUX_FS_SLICE BEGIN workload=linux-runtime-fs-smoke format=ELF64 type=ET_EXEC retained=true adapted=false syscalls=14 registry=shared_production compatibility_syscalls=payload_only_not_cser root_scope=95 domains=3 typed_credit_classes=6 filesystem=bounded_in_memory pager=bounded block=virtio_blk polling=true irq=false smp=1"
     );
     #[cfg(all(
         feature = "virtio-cser-facade",
-        not(feature = "virtio-cser-precommit-fault")
+        not(feature = "virtio-cser-precommit-fault"),
+        not(feature = "virtio-cser-postcommit-fault")
     ))]
     println!(
         "LINUX_FS_ARTIFACT source_sha256={} elf_sha256={} sector_sha256={} full_image_sha256={} sector_fnv1a={:#018x} relation=same_boot identity_preserving=true real_dma=true polling=true irq=false smp=1",
@@ -7833,6 +8032,19 @@ pub(crate) fn run_linux_fs_slice() -> Result<RuntimeFsSliceReceipt, RuntimeFsSli
     #[cfg(feature = "virtio-cser-precommit-fault")]
     println!(
         "LINUX_FS_ARTIFACT source_sha256={} elf_sha256={} sector_sha256={} full_image_sha256={} sector_fnv1a={:#018x} relation=same_boot_precommit identity_preserving=true real_dma_prepared=true device_visible=false polling=false irq=false smp=1",
+        EXPECTED_SOURCE_SHA256,
+        EXPECTED_ELF_SHA256,
+        SAME_BOOT_SECTOR_SHA256,
+        SAME_BOOT_IMAGE_SHA256,
+        SAME_BOOT_SECTOR_FNV1A,
+    );
+    #[cfg(feature = "virtio-cser-postcommit-fault")]
+    println!(
+        "LINUX_FS_POSTCOMMIT BEGIN workload=linux-runtime-fs-smoke crash_boundary=post_backend_pre_publication backend=virtio_blk flight=AwaitingPublication v2_fault=real_user_page_fault v3=closure_trigger_only registry_replacement=false publication_actor=original_guest polling=true irq=false smp=1"
+    );
+    #[cfg(feature = "virtio-cser-postcommit-fault")]
+    println!(
+        "LINUX_FS_ARTIFACT source_sha256={} elf_sha256={} sector_sha256={} full_image_sha256={} sector_fnv1a={:#018x} relation=same_boot_postcommit identity_preserving=true real_dma=true polling=true irq=false smp=1",
         EXPECTED_SOURCE_SHA256,
         EXPECTED_ELF_SHA256,
         SAME_BOOT_SECTOR_SHA256,
@@ -7909,6 +8121,71 @@ pub(crate) fn run_linux_fs_slice() -> Result<RuntimeFsSliceReceipt, RuntimeFsSli
         if let Some(reason) = scenario.isolation_reason() {
             return Err(RuntimeFsSliceIsolation::new(reason, scenario));
         }
+        #[cfg(feature = "virtio-cser-postcommit-fault")]
+        {
+            let postcommit_phase = scenario.service.lock().phase;
+            if postcommit_phase != FsServicePhase::PostcommitCrashed {
+                let receipt = scenario.isolate_fsd(
+                    FILESYSTEM_V2,
+                    FsServiceTerminationReason::PortalRejected(
+                        FsServiceProtocolError::UnexpectedPhase {
+                            portal: "run_slice/after_postcommit_v2",
+                            expected: "PostcommitCrashed",
+                            observed: postcommit_phase,
+                        },
+                    ),
+                );
+                return Err(RuntimeFsSliceIsolation::new(
+                    RuntimeFsSliceIsolationReason::Service(receipt),
+                    scenario,
+                ));
+            }
+            let v3_vm = Arc::new(create_vm_space(FSD_V3_PROGRAM));
+            assert!(!Arc::ptr_eq(&v1_vm, &v3_vm));
+            assert!(!Arc::ptr_eq(&v2_vm, &v3_vm));
+            let (v3_waiter, v3_waker) = EffectWaiter::new_pair(EffectToken {
+                authority_epoch: AUTHORITY_EPOCH,
+                scope_id: SCOPE.id(),
+                effect_id: FSD_V3_DONE_EFFECT,
+            });
+            let v3_task = {
+                let task_scenario = scenario.clone();
+                let task_vm = v3_vm.clone();
+                let data_vm = v3_vm.clone();
+                Arc::new(
+                    TaskOptions::new(move || {
+                        linux_fs_postcommit::run_fsd_v3(task_scenario, task_vm, v3_waker)
+                    })
+                    .data(TaskData::new_postcommit_trigger(
+                        FILESYSTEM_V3_TRIGGER,
+                        Some(data_vm),
+                    ))
+                    .build()
+                    .expect("build fresh postcommit closure trigger after fsd-v2 crash"),
+                )
+            };
+            assert!(!Arc::ptr_eq(&v1_task, &v3_task));
+            assert!(!Arc::ptr_eq(&v2_task, &v3_task));
+            let trigger_data = v3_task
+                .data()
+                .downcast_ref::<TaskData>()
+                .expect("postcommit closure trigger carries Nexus TaskData");
+            assert_eq!(
+                trigger_data.postcommit_trigger_task,
+                Some(FILESYSTEM_V3_TRIGGER)
+            );
+            assert!(trigger_data.cser_task.is_none());
+            println!(
+                "LINUX_FS_POSTCOMMIT FreshTrigger runner=fsd-v3 task={} task_generation={} vm=fresh after_v2_waiter=true phase=PostcommitCrashed distinct_task=true distinct_vm=true closure_trigger_only=true registry_replacement=false registry_task=false causal_service_task_facade_observed=false causal_fault_matrix_promotion=false recommit=false rebind=false adopt=false polling=true irq=false smp=1",
+                FILESYSTEM_V3_TRIGGER.id(),
+                FILESYSTEM_V3_TRIGGER.generation(),
+            );
+            v3_task.run();
+            v3_waiter.wait();
+            if let Some(reason) = scenario.isolation_reason() {
+                return Err(RuntimeFsSliceIsolation::new(reason, scenario));
+            }
+        }
     }
     done_waiter.wait();
     if let Some(reason) = scenario.isolation_reason() {
@@ -7933,7 +8210,10 @@ pub(crate) fn run_linux_fs_slice() -> Result<RuntimeFsSliceReceipt, RuntimeFsSli
     #[cfg(feature = "virtio-cser-facade")]
     {
         scenario.service.lock().assert_complete();
-        #[cfg(not(feature = "virtio-cser-precommit-fault"))]
+        #[cfg(all(
+            not(feature = "virtio-cser-precommit-fault"),
+            not(feature = "virtio-cser-postcommit-fault")
+        ))]
         println!(
             "LINUX_FS_SERVICE PASS real_user_service_crash=true fsd_v1_page_fault=true fsd_v2_post_crash_construction=true fsd_v2_fresh_task=true fsd_v2_fresh_vm=true current_task_key_bound=true crash_cohort=filesystem_read_only delayed_old_prepare=true stale_old_binding_full_projection_unchanged=true old_sender_current_handle_rejected=true device_commit_gate_after_rebind=true device_committed_after_rebind=true guest_reply_after_rebind=true reply_wakeups=1 exactly_once=true registry_quiescent=true bounded=true single_cpu=true"
         );
@@ -7941,6 +8221,24 @@ pub(crate) fn run_linux_fs_slice() -> Result<RuntimeFsSliceReceipt, RuntimeFsSli
         println!(
             "LINUX_FS_SERVICE PASS real_user_service_crash=true fsd_v1_page_fault=true fsd_v2_post_crash_construction=true fsd_v2_fresh_task=true fsd_v2_fresh_vm=true current_task_key_bound=true crash_cohort=filesystem_read_only delayed_old_prepare=true stale_old_binding_full_projection_unchanged=true old_sender_current_handle_rejected=true device_commit_gate_after_rebind=true device_committed_after_rebind=false guest_reply_after_rebind=true reply_wakeups=1 exactly_once=true registry_quiescent=true bounded=true single_cpu=true"
         );
+        #[cfg(feature = "virtio-cser-postcommit-fault")]
+        {
+            let production = scenario.production.lock();
+            if let Err(error) = production.verify_complete() {
+                println!(
+                    "LINUX_FS_POSTCOMMIT FAIL stage=final_completion_validation error={:?}",
+                    error,
+                );
+                ostd::power::poweroff(ostd::power::ExitCode::Failure)
+            }
+            let final_scope = production.registry.scope_projection(SCOPE).unwrap();
+            assert_eq!(final_scope.phase, ScopePhase::Revoked);
+            assert_eq!(final_scope.live_effects, 0);
+            assert_eq!(final_scope.pending_publications, 0);
+            println!(
+                "LINUX_FS_POSTCOMMIT PASS post_backend_pre_reply_crash=true prebackend_crash=false v2_real_user_page_fault=true v3_fresh_closure_trigger=true v3_registry_replacement=false v3_registry_task=false causal_service_task_facade_observed=false causal_fault_matrix_promotion=false phase=Revoked live_effects=0 pending_publications=0 publication_acks=1 terminalizations=6 same_flight=true same_ticket=true same_outcome=true same_causal_session=true causal_before_v2_crash=Active causal_before_stale_probe=Active causal_before_wake_trigger=Active causal_publication_transition=Active,Closed,Vacant stale_v2_authority=StaleAuthority registry_projection_unchanged=true flight_identity_unchanged=true causal_identity_unchanged=true recommit=false rebind=false adopt=false reply_wakeups=1 exactly_once=true publication_actor=original_guest polling=true irq=false smp=1 quiescent=true"
+            );
+        }
     }
     #[cfg(all(
         feature = "virtio-cser-facade",

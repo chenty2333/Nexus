@@ -36,6 +36,8 @@ Focused commands:
   system                  run both QEMU receipts and composition oracle
   research production-identity
                           run the prospective v0.2 formal identity gate
+  research production-identity-postcommit-crash
+                          bind the post-backend/pre-reply crash receipt
   research handoff-admission
                           run the prospective RFC-0002 local handoff gate
 EOF
@@ -206,6 +208,7 @@ run_system() {
 run_same_boot_acceptance() {
     run_backend "$kernel_backend" test-same-boot "Nexus same-boot production filesystem"
     run_backend "$kernel_backend" test-same-boot-precommit "Nexus same-boot precommit revocation"
+    run_backend "$kernel_backend" test-same-boot-postcommit-crash "Nexus same-boot postcommit service crash"
 }
 
 check_host_shell_sources() {
@@ -278,6 +281,7 @@ verify_all() {
     # receives access to the Docker socket.
     run_system
     run_same_boot_acceptance
+    run_xtask research production-identity-postcommit-crash
     run_backend "$kernel_backend" eval-stage7b "Nexus Stage 7B evaluator"
     run_xtask stage7b-evidence
     run_xtask complete
@@ -433,10 +437,13 @@ case "$command" in
     research)
         require_docker
         if (( $# != 1 )); then
-            die "research requires exactly one target: production-identity or handoff-admission"
+            die "research requires exactly one target: production-identity, production-identity-postcommit-crash, or handoff-admission"
         fi
         case "$1" in
             production-identity) run_xtask research production-identity ;;
+            production-identity-postcommit-crash)
+                run_xtask research production-identity-postcommit-crash
+                ;;
             handoff-admission) run_xtask research handoff-admission ;;
             *) die "unknown research target: $1" ;;
         esac

@@ -23,6 +23,7 @@ mod evidence;
 mod guest;
 mod handoff_admission;
 mod production_identity;
+mod production_identity_postcommit;
 mod scenario;
 mod stage7b;
 mod stage7b_concurrency;
@@ -75,6 +76,7 @@ enum XtaskInvocation {
     VerifyBundle(Option<PathBuf>),
     HandoffAdmissionResearch,
     ProductionIdentityResearch,
+    ProductionIdentityPostcommitResearch,
 }
 
 fn real_main() -> Result<()> {
@@ -82,6 +84,9 @@ fn real_main() -> Result<()> {
     match parse_invocation(env::args().skip(1))? {
         XtaskInvocation::HandoffAdmissionResearch => handoff_admission::run(&root, &TLA_SPECS),
         XtaskInvocation::ProductionIdentityResearch => production_identity::run(&root, &TLA_SPECS),
+        XtaskInvocation::ProductionIdentityPostcommitResearch => {
+            production_identity_postcommit::run(&root)
+        }
         XtaskInvocation::VerifyBundle(argument) => {
             let path =
                 argument.unwrap_or_else(|| PathBuf::from("target/verification/artifact-bundle"));
@@ -130,11 +135,14 @@ fn parse_invocation(mut args: impl Iterator<Item = String>) -> Result<XtaskInvoc
         ("research", [target]) if target == "production-identity" => {
             Ok(XtaskInvocation::ProductionIdentityResearch)
         }
+        ("research", [target]) if target == "production-identity-postcommit-crash" => {
+            Ok(XtaskInvocation::ProductionIdentityPostcommitResearch)
+        }
         ("research", [target]) if target == "handoff-admission" => {
             Ok(XtaskInvocation::HandoffAdmissionResearch)
         }
         ("research", []) => {
-            Err("research requires target production-identity or handoff-admission".into())
+            Err("research requires target production-identity, production-identity-postcommit-crash, or handoff-admission".into())
         }
         ("research", [target]) => Err(format!("unknown research target: {target}").into()),
         ("research", [_, extra, ..]) => Err(format!("unexpected argument: {extra}").into()),
@@ -154,7 +162,9 @@ fn repo_root() -> PathBuf {
 fn print_usage() {
     eprintln!("usage: cargo run --manifest-path tools/xtask/Cargo.toml -- <command>");
     eprintln!("commands: doctor build fmt check test quick model spec verify verify-bundle");
-    eprintln!("prospective research: research production-identity|handoff-admission");
+    eprintln!(
+        "prospective research: research production-identity|production-identity-postcommit-crash|handoff-admission"
+    );
     eprintln!("internal evidence commands: begin stage7b-evidence complete manifest bundle");
 }
 
@@ -1495,6 +1505,21 @@ mod tests {
                 .into_iter()
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn parses_the_additive_production_identity_postcommit_route() {
+        assert_eq!(
+            parse_invocation(
+                [
+                    String::from("research"),
+                    String::from("production-identity-postcommit-crash"),
+                ]
+                .into_iter()
+            )
+            .expect("additive postcommit research route"),
+            XtaskInvocation::ProductionIdentityPostcommitResearch
         );
     }
 

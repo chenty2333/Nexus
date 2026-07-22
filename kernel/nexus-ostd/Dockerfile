@@ -121,6 +121,8 @@ COPY kernel/nexus-ostd/guest/linux-futex-core-personality-v1.S \
     kernel/nexus-ostd/guest/linux-netd-v2.S \
     kernel/nexus-ostd/guest/linux-fsd-v1.S \
     kernel/nexus-ostd/guest/linux-fsd-v2.S \
+    kernel/nexus-ostd/guest/linux-fsd-v2-postcommit.S \
+    kernel/nexus-ostd/guest/linux-fsd-v3.S \
     /tmp/nexus-ostd-inputs/guest/
 COPY kernel/nexus-ostd/scripts/build-guest.sh \
     kernel/nexus-ostd/scripts/assert-linux-elf.sh \
@@ -178,6 +180,10 @@ RUN --mount=type=bind,source=kernel/nexus-ostd,target=/tmp/nexus-ostd-source,rea
         /tmp/nexus-ostd-source/guest/linux-fsd-v1.S \
     && cmp /tmp/nexus-ostd-inputs/guest/linux-fsd-v2.S \
         /tmp/nexus-ostd-source/guest/linux-fsd-v2.S \
+    && cmp /tmp/nexus-ostd-inputs/guest/linux-fsd-v2-postcommit.S \
+        /tmp/nexus-ostd-source/guest/linux-fsd-v2-postcommit.S \
+    && cmp /tmp/nexus-ostd-inputs/guest/linux-fsd-v3.S \
+        /tmp/nexus-ostd-source/guest/linux-fsd-v3.S \
     && cmp /tmp/nexus-ostd-inputs/scripts/build-guest.sh \
         /tmp/nexus-ostd-source/scripts/build-guest.sh \
     && cmp /tmp/nexus-ostd-inputs/scripts/assert-linux-elf.sh \
@@ -233,9 +239,11 @@ RUN --mount=type=bind,source=kernel/nexus-ostd,target=/tmp/nexus-ostd-source,rea
     && cargo osdk check --locked \
     && bash scripts/check-fsbase-api.sh \
     && bash scripts/check-scheduler-attempt.sh \
-    && cargo osdk build \
-    && cargo osdk build --scheme runtime-fs-same-boot \
-    && cargo osdk build --scheme runtime-fs-same-boot-precommit \
+    && cargo fetch --manifest-path target/osdk/nexus-kernel-run-base/Cargo.toml --locked \
+    && CARGO_NET_OFFLINE=true cargo osdk build \
+    && CARGO_NET_OFFLINE=true cargo osdk build --scheme runtime-fs-same-boot \
+    && CARGO_NET_OFFLINE=true cargo osdk build --scheme runtime-fs-same-boot-precommit \
+    && CARGO_NET_OFFLINE=true cargo osdk build --scheme runtime-fs-same-boot-postcommit-crash \
     && cmp /tmp/nexus-ostd-inputs/Cargo.lock /work/Cargo.lock \
     && diff -ru /tmp/nexus-ostd-inputs/osdk-runner-base \
         /work/target/osdk/nexus-kernel-run-base \

@@ -431,6 +431,15 @@ struct Boundaries {
     same_boot_runtime_fs_registry_domains: u64,
     same_boot_runtime_fs_real_dma_observed: bool,
     same_boot_runtime_fs_precommit_revoke_wins_observed: bool,
+    same_boot_runtime_fs_post_backend_pre_reply_service_crash_observed: bool,
+    same_boot_runtime_fs_publication_pending_across_crash_observed: bool,
+    same_boot_runtime_fs_causal_active_across_crash_observed: bool,
+    same_boot_runtime_fs_fresh_trigger_registry_replacement_observed: bool,
+    same_boot_runtime_fs_causal_service_task_facade_observed: bool,
+    same_boot_runtime_fs_causal_fault_matrix_promoted: bool,
+    same_boot_runtime_fs_outer_ack_failure_observed: bool,
+    same_boot_runtime_fs_post_commit_pre_backend_service_crash_observed: bool,
+    same_boot_runtime_fs_logical_request_lost_ack_observed: bool,
     same_boot_runtime_fs_all_fault_paths_observed: bool,
     same_boot_runtime_fs_irq_observed: bool,
     same_boot_runtime_fs_smp_vcpus: u64,
@@ -493,6 +502,15 @@ impl Boundaries {
             same_boot_runtime_fs_registry_domains: 3,
             same_boot_runtime_fs_real_dma_observed: true,
             same_boot_runtime_fs_precommit_revoke_wins_observed: true,
+            same_boot_runtime_fs_post_backend_pre_reply_service_crash_observed: true,
+            same_boot_runtime_fs_publication_pending_across_crash_observed: true,
+            same_boot_runtime_fs_causal_active_across_crash_observed: true,
+            same_boot_runtime_fs_fresh_trigger_registry_replacement_observed: false,
+            same_boot_runtime_fs_causal_service_task_facade_observed: false,
+            same_boot_runtime_fs_causal_fault_matrix_promoted: false,
+            same_boot_runtime_fs_outer_ack_failure_observed: false,
+            same_boot_runtime_fs_post_commit_pre_backend_service_crash_observed: false,
+            same_boot_runtime_fs_logical_request_lost_ack_observed: false,
             same_boot_runtime_fs_all_fault_paths_observed: false,
             same_boot_runtime_fs_irq_observed: false,
             same_boot_runtime_fs_smp_vcpus: 1,
@@ -590,6 +608,31 @@ fn manifest_stages(specs: &[&str]) -> Vec<Stage> {
                 String::from(
                     "kernel/nexus-ostd/artifacts/runtime-fs-same-boot-precommit/oracle.log",
                 ),
+            ],
+        },
+        Stage {
+            id: "ostd-runtime-filesystem-postbackend-pre-reply-service-crash",
+            evidence: vec![
+                String::from(
+                    "kernel/nexus-ostd/artifacts/runtime-fs-same-boot-postcommit-crash/serial.log",
+                ),
+                String::from(
+                    "kernel/nexus-ostd/artifacts/runtime-fs-same-boot-postcommit-crash/qemu-debug.log",
+                ),
+                String::from(
+                    "kernel/nexus-ostd/artifacts/runtime-fs-same-boot-postcommit-crash/task-entry-debugcon.log",
+                ),
+                String::from(
+                    "kernel/nexus-ostd/artifacts/runtime-fs-same-boot-postcommit-crash/task-entry-debugcon-oracle.log",
+                ),
+                String::from(
+                    "kernel/nexus-ostd/artifacts/runtime-fs-same-boot-postcommit-crash/oracle.log",
+                ),
+                String::from(
+                    "target/research/production-identity-postcommit-crash/rust-oracle.log",
+                ),
+                String::from("target/research/production-identity-postcommit-crash/summary.txt"),
+                String::from("target/research/production-identity-postcommit-crash/receipt.json"),
             ],
         },
         Stage {
@@ -1318,6 +1361,48 @@ fn system_artifacts() -> Vec<(String, Option<&'static str>)> {
             ),
         ),
         (
+            String::from(
+                "kernel/nexus-ostd/artifacts/runtime-fs-same-boot-postcommit-crash/serial.log",
+            ),
+            Some("LINUX_FS_POSTCOMMIT PASS"),
+        ),
+        (
+            String::from(
+                "kernel/nexus-ostd/artifacts/runtime-fs-same-boot-postcommit-crash/qemu-debug.log",
+            ),
+            Some("vtd_inv_desc_iotlb_global"),
+        ),
+        (
+            String::from(
+                "kernel/nexus-ostd/artifacts/runtime-fs-same-boot-postcommit-crash/task-entry-debugcon.log",
+            ),
+            None,
+        ),
+        (
+            String::from(
+                "kernel/nexus-ostd/artifacts/runtime-fs-same-boot-postcommit-crash/task-entry-debugcon-oracle.log",
+            ),
+            Some(ENTRY_DEBUGCON_PASS),
+        ),
+        (
+            String::from(
+                "kernel/nexus-ostd/artifacts/runtime-fs-same-boot-postcommit-crash/oracle.log",
+            ),
+            Some("runtime filesystem same-boot postcommit crash serial/debug assertions: PASS"),
+        ),
+        (
+            String::from("target/research/production-identity-postcommit-crash/rust-oracle.log"),
+            Some("==> production-identity postcommit sequence oracle"),
+        ),
+        (
+            String::from("target/research/production-identity-postcommit-crash/summary.txt"),
+            Some("post_backend_pre_reply_same_boot_observed=true"),
+        ),
+        (
+            String::from("target/research/production-identity-postcommit-crash/receipt.json"),
+            Some("nexus.research.production-identity-postcommit-crash.v1"),
+        ),
+        (
             String::from("experiments/ostd-virtio-cser-spike/artifacts/kernel.log"),
             Some("VIRTIO_CSER PASS"),
         ),
@@ -1784,6 +1869,15 @@ mod tests {
         assert_eq!(boundaries.same_boot_runtime_fs_registry_domains, 3);
         assert!(boundaries.same_boot_runtime_fs_real_dma_observed);
         assert!(boundaries.same_boot_runtime_fs_precommit_revoke_wins_observed);
+        assert!(boundaries.same_boot_runtime_fs_post_backend_pre_reply_service_crash_observed);
+        assert!(boundaries.same_boot_runtime_fs_publication_pending_across_crash_observed);
+        assert!(boundaries.same_boot_runtime_fs_causal_active_across_crash_observed);
+        assert!(!boundaries.same_boot_runtime_fs_fresh_trigger_registry_replacement_observed);
+        assert!(!boundaries.same_boot_runtime_fs_causal_service_task_facade_observed);
+        assert!(!boundaries.same_boot_runtime_fs_causal_fault_matrix_promoted);
+        assert!(!boundaries.same_boot_runtime_fs_outer_ack_failure_observed);
+        assert!(!boundaries.same_boot_runtime_fs_post_commit_pre_backend_service_crash_observed);
+        assert!(!boundaries.same_boot_runtime_fs_logical_request_lost_ack_observed);
         assert!(!boundaries.same_boot_runtime_fs_all_fault_paths_observed);
         assert!(!boundaries.same_boot_runtime_fs_irq_observed);
         assert_eq!(boundaries.same_boot_runtime_fs_smp_vcpus, 1);
@@ -1820,6 +1914,42 @@ mod tests {
         assert_eq!(
             json["same_boot_runtime_fs_precommit_revoke_wins_observed"],
             true
+        );
+        assert_eq!(
+            json["same_boot_runtime_fs_post_backend_pre_reply_service_crash_observed"],
+            true
+        );
+        assert_eq!(
+            json["same_boot_runtime_fs_publication_pending_across_crash_observed"],
+            true
+        );
+        assert_eq!(
+            json["same_boot_runtime_fs_causal_active_across_crash_observed"],
+            true
+        );
+        assert_eq!(
+            json["same_boot_runtime_fs_fresh_trigger_registry_replacement_observed"],
+            false
+        );
+        assert_eq!(
+            json["same_boot_runtime_fs_causal_service_task_facade_observed"],
+            false
+        );
+        assert_eq!(
+            json["same_boot_runtime_fs_causal_fault_matrix_promoted"],
+            false
+        );
+        assert_eq!(
+            json["same_boot_runtime_fs_outer_ack_failure_observed"],
+            false
+        );
+        assert_eq!(
+            json["same_boot_runtime_fs_post_commit_pre_backend_service_crash_observed"],
+            false
+        );
+        assert_eq!(
+            json["same_boot_runtime_fs_logical_request_lost_ack_observed"],
+            false
         );
         assert_eq!(json["same_boot_runtime_fs_all_fault_paths_observed"], false);
         assert_eq!(json["same_boot_runtime_fs_irq_observed"], false);

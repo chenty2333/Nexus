@@ -574,12 +574,16 @@ osdk_oracle() {
         /-chardev file,id=entry-debugcon,path=\/work\/artifacts\/runtime-fs-same-boot-precommit\/task-entry-debugcon\.log/ {
             precommit_paths++
         }
+        /-chardev file,id=entry-debugcon,path=\/work\/artifacts\/runtime-fs-same-boot-postcommit-crash\/task-entry-debugcon\.log/ {
+            postcommit_paths++
+        }
         /-device isa-debugcon,iobase=0xe9,chardev=entry-debugcon/ {
             debugcon_devices++
         }
         END {
             if (standard_scratch_paths != 1 || same_boot_paths != 1 ||
-                precommit_paths != 1 || debugcon_devices != 3)
+                precommit_paths != 1 || postcommit_paths != 1 ||
+                debugcon_devices != 4)
                 exit 1
         }
     ' "$1"

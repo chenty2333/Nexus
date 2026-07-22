@@ -5,6 +5,14 @@
 
 extern crate alloc;
 
+#[cfg(all(
+    feature = "virtio-cser-precommit-fault",
+    feature = "virtio-cser-postcommit-fault"
+))]
+compile_error!(
+    "virtio-cser-precommit-fault and virtio-cser-postcommit-fault are mutually exclusive"
+);
+
 #[cfg(not(feature = "virtio-cser-facade"))]
 #[path = "cser/composition.rs"]
 mod composition;
@@ -111,6 +119,8 @@ pub struct TaskData {
     pub(crate) vm_space: Option<Arc<VmSpace>>,
     #[cfg(feature = "virtio-cser-facade")]
     pub(crate) cser_task: Option<TaskKey>,
+    #[cfg(feature = "virtio-cser-postcommit-fault")]
+    pub(crate) postcommit_trigger_task: Option<TaskKey>,
     supervisor_exit: Option<supervisor_runtime::OstdSupervisorTaskExitBinding>,
     supervisor_causal_owner: Option<Arc<supervisor_runtime::CausalServiceTaskOwner>>,
     supervisor_worker_exit: Option<supervisor_runtime::OstdSupervisorWorkerExitBinding>,
@@ -124,6 +134,8 @@ impl TaskData {
             vm_space,
             #[cfg(feature = "virtio-cser-facade")]
             cser_task: None,
+            #[cfg(feature = "virtio-cser-postcommit-fault")]
+            postcommit_trigger_task: None,
             supervisor_exit: None,
             supervisor_causal_owner: None,
             supervisor_worker_exit: None,
@@ -141,6 +153,8 @@ impl TaskData {
             id: task.id(),
             vm_space,
             cser_task: Some(task),
+            #[cfg(feature = "virtio-cser-postcommit-fault")]
+            postcommit_trigger_task: None,
             supervisor_exit: None,
             supervisor_causal_owner: None,
             supervisor_worker_exit: None,
@@ -161,6 +175,8 @@ impl TaskData {
             vm_space,
             #[cfg(feature = "virtio-cser-facade")]
             cser_task: { Some(task) },
+            #[cfg(feature = "virtio-cser-postcommit-fault")]
+            postcommit_trigger_task: None,
             supervisor_exit: Some(supervisor_exit),
             supervisor_causal_owner: Some(supervisor_causal_owner),
             supervisor_worker_exit: None,
@@ -179,6 +195,8 @@ impl TaskData {
             vm_space: None,
             #[cfg(feature = "virtio-cser-facade")]
             cser_task: None,
+            #[cfg(feature = "virtio-cser-postcommit-fault")]
+            postcommit_trigger_task: None,
             supervisor_exit: None,
             supervisor_causal_owner: None,
             supervisor_worker_exit: Some(supervisor_worker_exit),
@@ -194,10 +212,28 @@ impl TaskData {
             vm_space: None,
             #[cfg(feature = "virtio-cser-facade")]
             cser_task: None,
+            #[cfg(feature = "virtio-cser-postcommit-fault")]
+            postcommit_trigger_task: None,
             supervisor_exit: None,
             supervisor_causal_owner: None,
             supervisor_worker_exit: None,
             dynamic_vm_space: Some(vm_space),
+        }
+    }
+
+    /// Binds a fresh postcommit closure trigger to its exact OSTD task without
+    /// granting it a Registry service incarnation or recovery authority.
+    #[cfg(feature = "virtio-cser-postcommit-fault")]
+    pub(crate) fn new_postcommit_trigger(task: TaskKey, vm_space: Option<Arc<VmSpace>>) -> Self {
+        Self {
+            id: task.id(),
+            vm_space,
+            cser_task: None,
+            postcommit_trigger_task: Some(task),
+            supervisor_exit: None,
+            supervisor_causal_owner: None,
+            supervisor_worker_exit: None,
+            dynamic_vm_space: None,
         }
     }
 }
@@ -535,8 +571,32 @@ fn run_fallback_probe(scheduler: &'static CserScheduler, old_binding: scheduler:
     };
     #[cfg(all(
         feature = "virtio-cser-facade",
-        not(feature = "virtio-cser-precommit-fault")
+        not(feature = "virtio-cser-precommit-fault"),
+        not(feature = "virtio-cser-postcommit-fault")
     ))]
+    {
+        assert_eq!(fs_receipt.scope.id(), 95);
+        assert_eq!(fs_receipt.closed_authority_epoch, 141);
+        assert_eq!(fs_receipt.final_authority_epoch, 142);
+        assert_eq!(fs_receipt.terminalizations, 6);
+        assert_eq!(fs_receipt.publication_acks, 1);
+        assert_eq!(fs_receipt.production_effects, 6);
+        assert_eq!(fs_receipt.production_domains, 3);
+        assert!(fs_receipt.preparation_identity_observed);
+        assert!(fs_receipt.quiescent);
+        assert_eq!(
+            fs_receipt.source_sha256,
+            "c5a4014d88794ddccd1c5239957a43500a6637a433640c2293e699fea72b870f"
+        );
+        assert_eq!(
+            fs_receipt.elf_sha256,
+            "0dc5ad40cb05e39592592ef3272ed45be4d71f9b147a534be20b9a5626c17bef"
+        );
+        println!("SPIKE_RESULT PASS");
+        poweroff(ExitCode::Success);
+    }
+
+    #[cfg(feature = "virtio-cser-postcommit-fault")]
     {
         assert_eq!(fs_receipt.scope.id(), 95);
         assert_eq!(fs_receipt.closed_authority_epoch, 141);

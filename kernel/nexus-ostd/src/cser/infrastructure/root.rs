@@ -9,17 +9,17 @@ use __cser_alloc::vec::Vec;
 use super::ClosureRecord;
 use super::{
     CausalWorkloadBootstrapInstall, ChildWorkloadOpenPlan, ContinuationPhase, DeadlinePhase,
-    DelayedCommandPhase, DeviceCreditOwnership, DevicePhase, DomainKey, EffectKey, FaultPhase,
-    InfrastructureClosureFinishPlan, InfrastructureClosureProgress, InfrastructureClosureReceipt,
-    InfrastructureClosureSelection, InfrastructureClosureStartPlan, InfrastructureError,
-    InfrastructureEventKind, InfrastructureKind, InfrastructureLimits, InfrastructureLiveCounts,
-    InfrastructureRootBinding, InfrastructureScopeInstallPlan, InfrastructureScopeLink,
-    InfrastructureState, LedgerMode, ParentStamp, PreparedWorkloadMint, ReplyPhase, RequestKey,
-    ReverseIndexRecord, ReverseParent, RootStamp, ScopeInfrastructure, ScopeKey,
-    ServiceRequestPhase, TaskAnchorPhase, TaskPhase, WorkloadCloseIntent, WorkloadContext,
-    WorkloadContextDescription, WorkloadParentDescription, WorkloadPhase, WorkloadRecord,
-    WorkloadRequestPresentation, WorkloadRootPresentation, check_scope_invariants, checked_add,
-    checked_sub, first_live_child_kind, mint_workload_context, prepare_workload_mint,
+    DelayedCommandPhase, DeviceCreditOwnership, DevicePhase, DomainFencePlan, DomainKey, EffectKey,
+    FaultPhase, InfrastructureClosureFinishPlan, InfrastructureClosureProgress,
+    InfrastructureClosureReceipt, InfrastructureClosureSelection, InfrastructureClosureStartPlan,
+    InfrastructureError, InfrastructureEventKind, InfrastructureKind, InfrastructureLimits,
+    InfrastructureLiveCounts, InfrastructureRootBinding, InfrastructureScopeInstallPlan,
+    InfrastructureScopeLink, InfrastructureState, LedgerMode, ParentStamp, PreparedWorkloadMint,
+    ReplyPhase, RequestKey, ReverseIndexRecord, ReverseParent, RootStamp, ScopeInfrastructure,
+    ScopeKey, ServiceRequestPhase, TaskAnchorPhase, TaskPhase, WorkloadCloseIntent,
+    WorkloadContext, WorkloadContextDescription, WorkloadParentDescription, WorkloadPhase,
+    WorkloadRecord, WorkloadRequestPresentation, WorkloadRootPresentation, check_scope_invariants,
+    checked_add, checked_sub, first_live_child_kind, mint_workload_context, prepare_workload_mint,
     preview_nonce, preview_revision, preview_workload_child_add, preview_workload_child_sub,
     require_vacancy, rewrite_scope_stamps, validate_active_admission, validate_context,
     validate_recovery_context, validate_root_presentation, validate_workload_mint, workload_bearer,
@@ -144,6 +144,55 @@ impl InfrastructureState {
                 closure_finished: record.closure.map(|closure| closure.finished),
                 domains: &record.domains,
             })
+    }
+
+    /// Prevalidates one outer-Registry supervisor crash against the exact
+    /// infrastructure domain binding. The plan is opaque outside the parent
+    /// Registry module so an adapter cannot advance infrastructure authority
+    /// independently of the business recovery transition.
+    pub(in super::super) fn prepare_domain_fence(
+        &self,
+        scope: ScopeKey,
+        domain: DomainKey,
+        previous: u64,
+        next: u64,
+    ) -> Result<DomainFencePlan, InfrastructureError> {
+        self.require_authoritative()?;
+        let record = self.scope(scope)?;
+        validate_active_admission(record)?;
+        if record.binding_epoch(domain)? != previous
+            || next
+                != previous
+                    .checked_add(1)
+                    .ok_or(InfrastructureError::CounterOverflow)?
+        {
+            return Err(InfrastructureError::StaleBinding);
+        }
+        Ok(DomainFencePlan {
+            scope,
+            domain,
+            previous,
+            next,
+            next_revision: preview_revision(record)?,
+        })
+    }
+
+    /// Allocation-free installation of a prevalidated outer domain fence.
+    pub(in super::super) fn apply_domain_fence(&mut self, plan: DomainFencePlan) {
+        let record = self
+            .scope_mut(plan.scope)
+            .expect("prevalidated infrastructure scope remains present");
+        let epoch = record
+            .binding_epoch_mut(plan.domain)
+            .expect("prevalidated infrastructure domain remains present");
+        __cser_core::debug_assert_eq!(*epoch, plan.previous);
+        *epoch = plan.next;
+        record.revision = plan.next_revision;
+        record.events.push(
+            InfrastructureEventKind::DomainFenced,
+            u64::from(plan.domain.value()),
+            plan.next,
+        );
     }
 
     /// Bounded root/sequence shape shared by the full checker and exact-scope
