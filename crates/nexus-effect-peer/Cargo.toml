@@ -7,9 +7,8 @@ publish = false
 
 [dependencies]
 cser-transition-gates = { path = "../cser-transition-gates" }
-serde = { version = "=1.0.228", features = ["derive"] }
+nexus-effect-peer-wire = { path = "../nexus-effect-peer-wire" }
 serde_json = "=1.0.150"
-sha2 = "=0.10.9"
 
 [[bin]]
 name = "nexus-effect-peer"

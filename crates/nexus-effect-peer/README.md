@@ -38,9 +38,11 @@ signature, KMS decision, or freshness proof.
 The request, response, and native-receipt schemas ending in `.v1` are frozen.
 Native v1 accepts compatibility-preserving fixes only; new commands, fields,
 receipt kinds, or semantics require native v2 or an explicitly versioned
-extension with distinct schema identifiers. The machine contract and canonical
-serde snapshot are kept in `status/effect-peer-native-v1.json` and checked by
-`wire_v1_freeze` during the normal effect-peer test gate.
+extension with distinct schema identifiers. The independently consumable
+`nexus-effect-peer-wire` crate owns the serde types, canonical encoding and
+producer corpus; this process crate depends on and re-exports that public API.
+The machine contract is kept in `status/effect-peer-native-v1.json`, mirrored
+byte-for-byte in the wire package, and checked during both crate test gates.
 
 ## Process lifecycle
 
@@ -162,7 +164,9 @@ bypass these production transitions and remains unsupported.
 ## Verification
 
 ```sh
+cargo test -p nexus-effect-peer-wire
 cargo test -p nexus-effect-peer
+cargo clippy -p nexus-effect-peer-wire --all-targets -- -D warnings
 cargo clippy -p nexus-effect-peer --all-targets -- -D warnings
 ```
 

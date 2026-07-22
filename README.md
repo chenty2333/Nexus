@@ -134,7 +134,8 @@ The exact tier contracts and claim discipline are kept in
 | `specs/cser/` | Normative PlusCal/TLA+ protocols and properties |
 | `crates/cser-model/` | Independent `no_std + alloc` safe-Rust reference model |
 | `crates/cser-transition-gates/` | Production-transition-source Loom harnesses |
-| `crates/nexus-effect-peer/` | Frozen native-v1 logical effect peer and replay boundary |
+| `crates/nexus-effect-peer-wire/` | Independently consumable frozen native-v1 serde contract and canonical corpus |
+| `crates/nexus-effect-peer/` | Same-boot production Registry process and replay boundary; re-exports the wire crate |
 | `crates/nexus-portal-abi/` | `nexus.portal.v2` preview wire/dispatcher contract, exercised by the session-local kernel Registry adapter; no user/kernel transport or persistent selector recovery yet |
 | `crates/nexus-supervisor/` | Bounded provider-neutral restart/recovery manager; its generic OSTD adapter has an initial-active binding, UserMode-only fault boundary, Nexus-owned bounded worker, and exact reap/health permit, but no filesystem lifecycle run is claimed |
 | `kernel/nexus-ostd/` | Maintained OSTD kernel prototype and bounded workload paths |

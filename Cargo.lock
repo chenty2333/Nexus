@@ -248,6 +248,14 @@ name = "nexus-effect-peer"
 version = "0.1.0"
 dependencies = [
  "cser-transition-gates",
+ "nexus-effect-peer-wire",
+ "serde_json",
+]
+
+[[package]]
+name = "nexus-effect-peer-wire"
+version = "0.1.0"
+dependencies = [
  "serde",
  "serde_json",
  "sha2",

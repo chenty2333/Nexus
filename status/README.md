@@ -38,9 +38,16 @@ recomputes the canonical native-v1 serde snapshot:
 
 ```sh
 ./x test --quick
+cargo test -p nexus-effect-peer-wire --test frozen_v1
 cargo test -p nexus-effect-peer --test wire_v1_freeze
 cargo test --manifest-path tools/xtask/Cargo.toml causal_evidence_overlay
 ```
+
+`crates/nexus-effect-peer-wire/contract/effect-peer-native-v1.json` is a
+byte-identical consumer-package mirror. The wire-crate test checks that it has
+not diverged from this status contract and exports the canonical fixture
+population used to recompute the frozen digest. The mirror does not create a
+second semantic authority: this status file remains the repository contract.
 
 Updating a checkpoint requires a new exact revision, evidence boundary, and
 non-claim list. Updating the frozen native-v1 snapshot is allowed only to repair
