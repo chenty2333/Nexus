@@ -1,0 +1,180 @@
+{
+  "schema": "nexus.research.production-identity.v2",
+  "status": "passed",
+  "prospective": true,
+  "command": "./x research production-identity",
+  "revision": "8e5123c46569e8ebdaba9f4f56bea6584ab58586",
+  "worktree_dirty": false,
+  "source_fingerprint": "b8f3fb55529e79c4f0aabe7443bdd94883f3b8fda1b9769ab47db4d2dc1a48fb",
+  "source_files": [
+    "x",
+    "Dockerfile",
+    ".cargo/config.toml",
+    "Cargo.toml",
+    "Cargo.lock",
+    "rust-toolchain.toml",
+    "crates/cser-model/Cargo.toml",
+    "crates/cser-model/src/lib.rs",
+    "crates/cser-model/src/production_identity.rs",
+    "crates/cser-model/tests/production_identity_support/mod.rs",
+    "crates/cser-model/tests/production_identity_sequences.rs",
+    "crates/cser-model/tests/production_identity_properties.rs",
+    "crates/cser-model/tests/production_identity_loom.rs",
+    "kernel/nexus-ostd/src/cser/effect_registry.rs",
+    "evaluation/production-identity/transition-map.toml",
+    "evaluation/production-identity/fault-matrix.toml",
+    "evaluation/production-identity/README.md",
+    "tools/xtask/Cargo.toml",
+    "tools/xtask/Cargo.lock",
+    "tools/xtask/src/main.rs",
+    "tools/xtask/src/production_identity.rs",
+    "specs/cser/check.sh",
+    "specs/cser/ProductionIdentityCser.tla",
+    "specs/cser/ProductionIdentityCserSafetyMC.cfg",
+    "specs/cser/ProductionIdentityCserSmp4SafetyMC.cfg",
+    "specs/cser/ProductionIdentityCserActionMC.cfg",
+    "specs/cser/ProductionIdentityCserProgressMC.cfg",
+    "specs/cser/PRODUCTION_IDENTITY.md",
+    "specs/cser/README.md",
+    "docs/rfcs/0001-production-identity.md"
+  ],
+  "translation_current": true,
+  "full_configurations": 4,
+  "configurations": [
+    {
+      "config": "ProductionIdentityCserSafetyMC.cfg",
+      "status": "complete",
+      "generated": 4793,
+      "distinct": 3396,
+      "depth": 33,
+      "states_left_on_queue": 0,
+      "property_mode": "safety"
+    },
+    {
+      "config": "ProductionIdentityCserSmp4SafetyMC.cfg",
+      "status": "complete",
+      "generated": 4793,
+      "distinct": 3396,
+      "depth": 33,
+      "states_left_on_queue": 0,
+      "property_mode": "safety"
+    },
+    {
+      "config": "ProductionIdentityCserActionMC.cfg",
+      "status": "complete",
+      "generated": 4793,
+      "distinct": 3396,
+      "depth": 33,
+      "states_left_on_queue": 0,
+      "property_mode": "action-properties"
+    },
+    {
+      "config": "ProductionIdentityCserProgressMC.cfg",
+      "status": "complete",
+      "generated": 3356,
+      "distinct": 2670,
+      "depth": 32,
+      "states_left_on_queue": 0,
+      "property_mode": "conditional-progress-5-temporal-branches"
+    }
+  ],
+  "reachability_witnesses": 8,
+  "witnesses": [
+    {
+      "config": "ProductionIdentityCserSafetyMC.cfg",
+      "invariant": "IdentityPreservingReadAbsent",
+      "description": "workload-created identities survive one same-effect block read and root closure",
+      "status": "reachable"
+    },
+    {
+      "config": "ProductionIdentityCserSafetyMC.cfg",
+      "invariant": "FilesystemCrashAdoptAbsent",
+      "description": "filesystem crash/rebind/adopt changes only the current domain binding",
+      "status": "reachable"
+    },
+    {
+      "config": "ProductionIdentityCserSafetyMC.cfg",
+      "invariant": "CommitWinsRevokeRaceAbsent",
+      "description": "device batch commit wins the shared root gate before revocation",
+      "status": "reachable"
+    },
+    {
+      "config": "ProductionIdentityCserSafetyMC.cfg",
+      "invariant": "RevokeWinsCommitRaceAbsent",
+      "description": "root revocation wins the shared gate and aborts every uncommitted descendant",
+      "status": "reachable"
+    },
+    {
+      "config": "ProductionIdentityCserSafetyMC.cfg",
+      "invariant": "ResetIotlbSameEffectAbsent",
+      "description": "reset and IOTLB timeouts retain the same effect through retry and closure",
+      "status": "reachable"
+    },
+    {
+      "config": "ProductionIdentityCserSafetyMC.cfg",
+      "invariant": "CrossRegistryGenerationRejectAbsent",
+      "description": "foreign-registry and stale-device-generation inputs reject without semantic mutation",
+      "status": "reachable"
+    },
+    {
+      "config": "ProductionIdentityCserSafetyMC.cfg",
+      "invariant": "ActorSeparationAbsent",
+      "description": "2-CPU abstract service/kernel/IRQ roles retain one identity chain",
+      "status": "reachable"
+    },
+    {
+      "config": "ProductionIdentityCserSmp4SafetyMC.cfg",
+      "invariant": "ActorSeparationAbsent",
+      "description": "4-CPU abstract service/kernel/IRQ roles retain one identity chain",
+      "status": "reachable"
+    }
+  ],
+  "rust_oracle": {
+    "independent_from_production_registry": true,
+    "sequence_tests": 5,
+    "property_tests": 3,
+    "loom_tests": 3,
+    "total_tests": 11
+  },
+  "transition_map": {
+    "path": "evaluation/production-identity/transition-map.toml",
+    "sha256": "6ddaf74045ffe8cacc6ffc56ee4e8399d19fad6a70e44283b18b4677821cf609",
+    "entries": 22,
+    "checked": 20,
+    "observed": 0,
+    "planned": 2
+  },
+  "fault_contract": {
+    "path": "evaluation/production-identity/fault-matrix.toml",
+    "sha256": "09ee81d198cb7501057884308b041d81a757005c927ce23bcb15bea0d035a13e",
+    "cells": 35,
+    "families": 15,
+    "checked": 12,
+    "observed": 0,
+    "planned": 23,
+    "required_observation_fields": 14,
+    "shared_production_registry_execution_observed": false
+  },
+  "actor_boundary": "abstract 2/4-CPU Service/Kernel/IRQ identities",
+  "boundedness_statement": "Abstract 2/4-CPU actor identities only; not OSTD SpinLock, IRQ delivery, memory-ordering, or real SMP evidence.",
+  "real_ostd_smp_claimed": false,
+  "release_boundary": {
+    "accepted_release": "v0.1.0",
+    "accepted_specifications": 12,
+    "successor_in_v0_1_catalog": false,
+    "successor_artifacts_in_v0_1_manifest": false
+  },
+  "generated_unix_seconds": 1784274171,
+  "logs": {
+    "pluscal_translation": "target/research/production-identity/pluscal.log",
+    "tlc": "target/research/production-identity/tlc.log",
+    "rust_oracle": "target/research/production-identity/rust-oracle.log",
+    "summary": "target/research/production-identity/summary.txt"
+  },
+  "digests": {
+    "pluscal_translation_sha256": "7c6cab9c18d2e1d7ecc177d57a18b5bda9089914234161c0d86e75b5bc25fa9f",
+    "tlc_sha256": "f05b029a4e376d88ea63cadf8da9efeb309d9e85fd68d02ac063388cca4efe67",
+    "rust_oracle_sha256": "fdb7fa65f9a5ff062a8278fb3e54e8e94de5e372d62fa3df08516697e77c1a7c",
+    "summary_sha256": "3c7c507e273f426c8bd92719ee79fa8dbe5344b21939c7b7787899dbfb54caf9"
+  }
+}

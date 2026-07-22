@@ -1,0 +1,83 @@
+==> production-identity sequence oracle
+   Compiling once_cell v1.21.4
+   Compiling getrandom v0.3.4
+   Compiling rustversion v1.0.23
+   Compiling zerocopy v0.8.54
+   Compiling shlex v2.0.1
+   Compiling getrandom v0.4.3
+   Compiling find-msvc-tools v0.1.9
+   Compiling regex-syntax v0.8.11
+   Compiling rustix v1.1.4
+   Compiling autocfg v1.5.1
+   Compiling log v0.4.33
+   Compiling bitflags v2.13.0
+   Compiling linux-raw-sys v0.12.1
+   Compiling fastrand v2.4.1
+   Compiling lazy_static v1.5.0
+   Compiling pin-project-lite v0.2.17
+   Compiling sharded-slab v0.1.7
+   Compiling wait-timeout v0.2.1
+   Compiling tracing-core v0.1.36
+   Compiling cc v1.2.67
+   Compiling thread_local v1.1.10
+   Compiling nu-ansi-term v0.50.3
+   Compiling smallvec v1.15.2
+   Compiling bit-vec v0.8.0
+   Compiling quick-error v1.2.3
+   Compiling fnv v1.0.7
+   Compiling rand_core v0.9.5
+   Compiling cser-model v0.1.0 (/work/crates/cser-model)
+   Compiling scoped-tls v1.0.1
+   Compiling num-traits v0.2.19
+   Compiling unarray v0.1.4
+   Compiling bit-set v0.8.0
+   Compiling rand_xorshift v0.4.0
+   Compiling rand v0.9.4
+   Compiling tracing-log v0.2.0
+   Compiling tracing v0.1.44
+   Compiling generator v0.8.9
+   Compiling regex-automata v0.4.15
+   Compiling tempfile v3.27.0
+   Compiling rusty-fork v0.3.1
+   Compiling matchers v0.2.0
+   Compiling tracing-subscriber v0.3.23
+   Compiling ppv-lite86 v0.2.21
+   Compiling rand_chacha v0.9.0
+   Compiling proptest v1.11.0
+   Compiling loom v0.7.2
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.43s
+     Running tests/production_identity_sequences.rs (target/cargo/debug/deps/production_identity_sequences-68b2b59155304d30)
+
+running 5 tests
+test wrong_parent_registration_rejects_the_complete_projection ... ok
+test normal_read_preserves_one_tree_through_device_and_one_shot_guest_reply ... ok
+test crash_snapshot_ready_rebind_adopt_changes_only_current_binding ... ok
+test revoke_winner_aborts_the_complete_tree_in_leaf_first_order ... ok
+test reset_timeout_is_indeterminate_until_same_identity_retry_and_iotlb_ack ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+==> production-identity property oracle
+   Compiling cser-model v0.1.0 (/work/crates/cser-model)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.35s
+     Running tests/production_identity_properties.rs (target/cargo/debug/deps/production_identity_properties-9190fd7521fd9d5d)
+
+running 3 tests
+test foreign_root_tokens_never_mutate_registration_or_revoke ... ok
+test substituted_registry_root_generations_and_parent_reject_atomically ... ok
+test arbitrary_domain_recovery_preserves_every_immutable_effect_identity ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+==> production-identity Loom oracle
+   Compiling cser-model v0.1.0 (/work/crates/cser-model)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.37s
+     Running tests/production_identity_loom.rs (target/cargo/debug/deps/production_identity_loom-feeb536a9d897559)
+
+running 3 tests
+test loom_block_commit_and_root_revoke_have_one_gate_winner ... ok
+test loom_domain_crash_fences_or_follows_device_commit_without_identity_replacement ... ok
+test loom_retry_iotlb_ack_and_old_completion_cannot_double_publish ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
