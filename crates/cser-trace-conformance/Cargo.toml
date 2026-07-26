@@ -1,0 +1,10 @@
+[package]
+name = "cser-trace-conformance"
+version = "0.1.0"
+edition = "2024"
+license = "Unlicense"
+description = "Replays TLC counterexample traces of specs/cser/Cser.tla against the cser-model oracle"
+publish = false
+
+[dependencies]
+cser-model = { path = "../cser-model" }

@@ -702,6 +702,21 @@ fn clippy(root: &Path) -> Result<()> {
             "-D",
             "warnings",
         ],
+    )?;
+
+    section("clippy CSER trace conformance");
+    cargo(
+        root,
+        [
+            "clippy",
+            "--locked",
+            "-p",
+            "cser-trace-conformance",
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ],
     )
 }
 
@@ -710,6 +725,23 @@ fn test(root: &Path) -> Result<()> {
     cargo(
         root,
         ["test", "--locked", "-p", "cser-model", "--all-features"],
+    )?;
+
+    // Replays TLC counterexamples of the Cser and ProductionIdentityCser
+    // families against cser-model. The lane invokes the pinned tla2tools JAR,
+    // so it belongs with the unit tests only while the image that runs them
+    // also provides java.
+    section("test CSER trace conformance");
+    cargo(
+        root,
+        [
+            "test",
+            "--locked",
+            "-p",
+            "cser-trace-conformance",
+            "--all-targets",
+            "--no-fail-fast",
+        ],
     )?;
 
     section("test production transition gates");

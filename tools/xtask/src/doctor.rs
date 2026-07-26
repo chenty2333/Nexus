@@ -10,6 +10,8 @@ const REQUIRED_PATHS: &[&str] = &[
     "x",
     ".github/workflows/ci.yml",
     "crates/cser-model/Cargo.toml",
+    "crates/cser-trace-conformance/Cargo.toml",
+    "crates/cser-trace-conformance/README.md",
     "crates/cser-transition-gates/tests/production_registry.rs",
     "crates/nexus-effect-peer/Cargo.toml",
     "crates/nexus-effect-peer-wire/Cargo.toml",

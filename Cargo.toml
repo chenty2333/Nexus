@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/cser-model",
+    "crates/cser-trace-conformance",
     "crates/cser-transition-gates",
     "crates/nexus-effect-peer",
     "crates/nexus-effect-peer-wire",

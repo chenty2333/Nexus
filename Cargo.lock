@@ -91,6 +91,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "cser-trace-conformance"
+version = "0.1.0"
+dependencies = [
+ "cser-model",
+]
+
+[[package]]
 name = "cser-transition-gates"
 version = "0.1.0"
 dependencies = [
