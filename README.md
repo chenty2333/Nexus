@@ -184,6 +184,8 @@ runtime result.
 
 ## Documentation
 
+- [docs/CSER.md](docs/CSER.md) is the two-page self-contained statement of the
+  mechanism, the candidate contribution, and the evidence boundary.
 - [NARRATIVE.md](NARRATIVE.md) is the end-to-end technical research account and
   claim ledger.
 - [VISION.md](VISION.md) defines the research question, candidate contribution,
@@ -200,6 +202,9 @@ runtime result.
 - [RFC 0003](docs/rfcs/0003-causal-coverage-closure.md) records the prospective
   closure order for the current causal-coverage gaps; it is a design contract,
   not implementation or runtime evidence.
+- [RFC 0005](docs/rfcs/0005-postcommit-reply-adoption.md) defines the
+  prospective post-commit reply-adoption (Adopt-vs-Abort) contract; nothing in
+  it is implemented or observed yet.
 - [REWORK.md](REWORK.md) is the historical migration and deletion ledger; it is
   not the current roadmap or semantics source.
 
