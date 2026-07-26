@@ -1,0 +1,40 @@
+canonical OSTD CSER patch: PASS archive=pinned patch=hash-bound apply=true reverse=true first_task_pre_irq=post-schedule+guarded+preserved+first-only+before-irq pre_irq_mutations=7 first_task_entry=post-irq+before-func task_exit=created+started+dequeued+reaped+claimed wake_exit=reservation-gated+interleaving-modeled observer=irq-enabled+exactly-once+before-arc-drop exit_mutations=14 arbitrary_kill=false scheduler_tcb=true apic_timer=callback-rearmed-one-shot irq_tail=kernel+user dynamic_vector=true timer_mutations=8 dma_closure=true gsi=edge+level/high+low ioapic_bits=13+15 irte_tm_bit=4 legacy=edge-high
+canonical virtio-drivers CSER patch: PASS archive=pinned license=MIT+pinned patch=hash-bound apply=true reverse=true prepared_token=linear+fail-closed+non-clone prepare=descriptor+dma+avail-slot+validation-atomic publish=unique-infallible-release cancel=recycle+unshare legacy_add=split-compatible
+production VirtIO substrate: PASS authority=registry-external identity=descriptive+reconstructible physical_owner=one-bdf+one-active-session intx=descriptive-route+linear-owner-epoch+masked-unmasked preparation=owner-bound-preflight+polling+irq+typed-rollback-or-indeterminate+sequence-atomic receipt=opaque+owner-coupled linear_owner=non-clone+fail-closed preflight=failure-atomic publication=receipt-revalidated+intent-only+infallible+post-release-moves-only hardware_intent=real-owner+non-clone+failure-returns-owner+infallible-reset+completion-state-pop-aware notification=kick-or-suppressed+replay-safe completion=polling+irq+one-step-actor+one-validator+exact-used-length+pending-or-failed-resettable+pop-state reset_ack=one-step-actor+bounded-retry+unique-finalize cancel=exact-buffers generation=prevalidate+infallible-apply quiescence=prevalidate+infallible-apply legacy_portal=retained
+OSTD/VirtIO source assertions: PASS canonical_ostd_patch=shared canonical_virtio_patch=shared owner_bound_dma_mmio=true split_avail_idx_release=true reset_abandon_drop=true
+OSTD VirtIO facade boundary: PASS client_unsafe=false raw_api=false opaque_root=true substrate_modules=4 production_authority=external experiment_equivalence=runtime_oracle kernel_default=disabled
+Stage 7B I/O gate adapter: PASS authority_identity=delegated session_device_instance=bound pre_pci_dma_negative=executed commit_gate=shared reset_typestate=shared iotlb_typestate=shared shadow_ledger=false
+Stage 7B I/O gate negative assertions: PASS virtio_release_relaxed=rejected virtio_missing_linear_owner=rejected virtio_missing_recycle=rejected facade_authority=rejected facade_post_release_assert=rejected facade_branching_generation=rejected facade_branching_quiescence=rejected facade_overlapping_session=rejected facade_forced_notification=rejected facade_unchecked_used_length=rejected facade_status_before_used_length=rejected missing_gate=rejected missing_commit_gate=rejected missing_instance_namespace=rejected missing_session_instance_binding=rejected missing_session_negative_execution=rejected late_session_negative_execution=rejected conditional_session_negative_execution=rejected fabricated_session_marker=rejected copied_gate_probe=rejected shadow_epoch=rejected
+[2J[01;01H[=3h[2J[01;01H[2J[01;01H[8;056;240t0[2J[01;01HBdsDxe: loading Boot0002 "UEFI QEMU DVD-ROM QM00005 " from PciRoot(0x0)/Pci(0x1F,0x2)/Sata(0x2,0xFFFF,0x0)
+BdsDxe: starting Boot0002 "UEFI QEMU DVD-ROM QM00005 " from PciRoot(0x0)/Pci(0x1F,0x2)/Sata(0x2,0xFFFF,0x0)
+WARNING: no console will be available to OS
+error: no suitable video mode found.
+IRQ_SPIKE KERNEL_MARKER stage=phase_a oracle_suffix=true
+IRQ_SPIKE BEGIN device=blk completion=polling delivery=intx trigger=edge polarity=active_high intremap=on claim=none
+IRQ_SPIKE Route bdf=00:05.0 firmware_line=10 pin=1 source=pci_config_0x3c
+IRQ_SPIKE Masked stage=claimed line=10
+IRQ_SPIKE Armed gsi=10 vector=35 remapping_index=Some(0) trigger=edge polarity=active_high
+IRQ_SPIKE Armed gsi=16 vector=36 remapping_index=Some(1) trigger=edge polarity=active_high
+IRQ_SPIKE Armed gsi=17 vector=37 remapping_index=Some(2) trigger=edge polarity=active_high
+IRQ_SPIKE Armed gsi=18 vector=38 remapping_index=Some(3) trigger=edge polarity=active_high
+IRQ_SPIKE Armed gsi=19 vector=39 remapping_index=Some(4) trigger=edge polarity=active_high
+IRQ_SPIKE Armed gsi=20 vector=40 remapping_index=Some(5) trigger=edge polarity=active_high
+IRQ_SPIKE Armed gsi=21 vector=41 remapping_index=Some(6) trigger=edge polarity=active_high
+IRQ_SPIKE Armed gsi=22 vector=42 remapping_index=Some(7) trigger=edge polarity=active_high
+IRQ_SPIKE Armed gsi=23 vector=43 remapping_index=Some(8) trigger=edge polarity=active_high
+IRQ_SPIKE Prepared session=0x4e58505200280001 generation=1 queue=0 descriptor=0 notifications_enabled=true
+IRQ_SPIKE Published commit_point=avail_idx_release notification=Kicked
+IRQ_SPIKE Unmasking stage=window_open line=10 isr_unread=true reentry_expected=true
+IRQ_SPIKE Remasked stage=window_closed line=10 iterations=0 deliveries=2
+IRQ_SPIKE Candidate gsi=10 vector=35 remapping_index=Some(0) deliveries=1
+IRQ_SPIKE Candidate gsi=16 vector=36 remapping_index=Some(1) deliveries=0
+IRQ_SPIKE Candidate gsi=17 vector=37 remapping_index=Some(2) deliveries=0
+IRQ_SPIKE Candidate gsi=18 vector=38 remapping_index=Some(3) deliveries=0
+IRQ_SPIKE Candidate gsi=19 vector=39 remapping_index=Some(4) deliveries=0
+IRQ_SPIKE Candidate gsi=20 vector=40 remapping_index=Some(5) deliveries=0
+IRQ_SPIKE Candidate gsi=21 vector=41 remapping_index=Some(6) deliveries=1
+IRQ_SPIKE Candidate gsi=22 vector=42 remapping_index=Some(7) deliveries=0
+IRQ_SPIKE Candidate gsi=23 vector=43 remapping_index=Some(8) deliveries=0
+IRQ_SPIKE Completion source=polling observed=true used_len=513
+IRQ_SPIKE PASS delivery=observed deliveries=2 firmware_line=10 firmware_line_delivered=true pirq_gsi=Some(21) iterations=0 candidates=9 intremap=on trigger=edge polarity=active_high completion=polling completion_observed=true claim=none
+FIXTURE Hash before=27a4e8fed7b428b42ff04e3f62eadfe2e3f3310dac4e2fe8ecfff04be3cca254 after=27a4e8fed7b428b42ff04e3f62eadfe2e3f3310dac4e2fe8ecfff04be3cca254 readonly=true
