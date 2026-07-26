@@ -565,7 +565,7 @@ fn frozen_source_crash_preserves_cohort_and_abort_requires_recovery() {
 
 #[test]
 fn retained_tombstones_block_or_delay_but_never_fabricate_closure() {
-    effect_registry::production_handoff_retained_self_test(
+    effect_registry::evidence::production_handoff_retained_self_test(
         EffectRegistry::new(),
         EffectRegistry::new(),
     );

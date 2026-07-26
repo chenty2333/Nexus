@@ -13,8 +13,9 @@ use cser_transition_gates::{
     },
 };
 use effect_registry::{
-    CommitOutcome, EffectRegistry, PortalHandle, ProductionDeviceBatchRaceFixture, RegistryError,
-    RevokeSelection, ScopePhase, Stage7bActiveFixture, Stage7bFixtureConfig, TerminalOutcome,
+    CommitOutcome, EffectRegistry, PortalHandle, RegistryError, RevokeSelection, ScopePhase,
+    TerminalOutcome,
+    evidence::{ProductionDeviceBatchRaceFixture, Stage7bActiveFixture, Stage7bFixtureConfig},
 };
 use loom::{
     model,

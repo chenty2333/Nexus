@@ -56,13 +56,12 @@ impl RegistryUnit {
     }
 }
 
-const CURRENT_UNITS: &[RegistryUnit] = &[RegistryUnit::Authority];
+const CURRENT_UNITS: &[RegistryUnit] = &[RegistryUnit::Authority, RegistryUnit::Evidence];
 
 /// The task/fault self-tests and the direct production call which admits them
-/// currently live in the authority source. This coordinate will move to
-/// `Evidence` only when that source exists and its complete owner-map update is
-/// reviewed in the same change.
-pub(super) const TASK_FAULT_EVIDENCE_UNIT: RegistryUnit = RegistryUnit::Authority;
+/// live in the activated `Evidence` source together with the complete owner-map
+/// update reviewed in the same change.
+pub(super) const TASK_FAULT_EVIDENCE_UNIT: RegistryUnit = RegistryUnit::Evidence;
 
 #[derive(Debug)]
 pub(super) struct RegistrySourceSet {
@@ -95,13 +94,6 @@ impl RegistrySourceSet {
             }
         }
         Ok(Self { sources })
-    }
-
-    #[cfg(test)]
-    pub(super) fn from_authority(source: &str) -> Self {
-        Self {
-            sources: BTreeMap::from([(RegistryUnit::Authority, source.to_owned())]),
-        }
     }
 
     pub(super) fn source(&self, unit: RegistryUnit) -> Result<&str, String> {
@@ -208,7 +200,7 @@ const CHECKED_ITEM_OWNERSHIP: &[CheckedItemOwner] = &[
     owned(
         CheckedItemKind::Struct,
         "Stage7bFaultBudget",
-        RegistryUnit::Authority,
+        RegistryUnit::Evidence,
     ),
     owned(
         CheckedItemKind::RegistryMethod,
@@ -263,42 +255,42 @@ const CHECKED_ITEM_OWNERSHIP: &[CheckedItemOwner] = &[
     owned(
         CheckedItemKind::Function,
         "task_owned_fault_outer_transaction_self_test",
-        RegistryUnit::Authority,
+        RegistryUnit::Evidence,
     ),
     owned(
         CheckedItemKind::Function,
         "ordinary_domain_crash_rejects_a_forged_fault_origin",
-        RegistryUnit::Authority,
+        RegistryUnit::Evidence,
     ),
     owned(
         CheckedItemKind::Function,
         "device_preparation_outer_credit_self_test",
-        RegistryUnit::Authority,
+        RegistryUnit::Evidence,
     ),
     owned(
         CheckedItemKind::Function,
         "device_preparation_outer_materialization_self_test",
-        RegistryUnit::Authority,
+        RegistryUnit::Evidence,
     ),
     owned(
         CheckedItemKind::Function,
         "supervisor_domain_recovery_primitives_self_test",
-        RegistryUnit::Authority,
+        RegistryUnit::Evidence,
     ),
     owned(
         CheckedItemKind::Function,
         "production_identity_registry_self_test",
-        RegistryUnit::Authority,
+        RegistryUnit::Evidence,
     ),
     owned(
         CheckedItemKind::Function,
         "production_device_batch_registry_self_test",
-        RegistryUnit::Authority,
+        RegistryUnit::Evidence,
     ),
     owned(
         CheckedItemKind::Function,
         "retained_semantic_test_fixture",
-        RegistryUnit::Authority,
+        RegistryUnit::Evidence,
     ),
 ];
 
@@ -336,27 +328,27 @@ const ALLOWED_REGISTRY_HOLDERS: &[AllowedRegistryHolder] = &[
         field: "replacement",
     },
     AllowedRegistryHolder {
-        owner: RegistryUnit::Authority,
+        owner: RegistryUnit::Evidence,
         item: "Stage7bFaultBudget",
         field: "registry",
     },
     AllowedRegistryHolder {
-        owner: RegistryUnit::Authority,
+        owner: RegistryUnit::Evidence,
         item: "Stage7bFaultBudgetState",
         field: "registry",
     },
     AllowedRegistryHolder {
-        owner: RegistryUnit::Authority,
+        owner: RegistryUnit::Evidence,
         item: "Stage7bActiveFixture",
         field: "registry",
     },
     AllowedRegistryHolder {
-        owner: RegistryUnit::Authority,
+        owner: RegistryUnit::Evidence,
         item: "Stage7bCompleteFixture",
         field: "registry",
     },
     AllowedRegistryHolder {
-        owner: RegistryUnit::Authority,
+        owner: RegistryUnit::Evidence,
         item: "ProductionDeviceBatchRaceFixture",
         field: "registry",
     },

@@ -68,6 +68,8 @@ COPY kernel/nexus-ostd/src/cser/device_flight.rs \
     kernel/nexus-ostd/src/cser/portal_v2.rs \
     kernel/nexus-ostd/src/cser/supervisor_runtime.rs \
     /kernel/nexus-ostd/src/cser/
+COPY kernel/nexus-ostd/src/cser/effect_registry/evidence.rs \
+    /kernel/nexus-ostd/src/cser/effect_registry/evidence.rs
 COPY kernel/nexus-ostd/src/cser/effect_registry/root_lanes.rs \
     /kernel/nexus-ostd/src/cser/effect_registry/root_lanes.rs
 COPY kernel/nexus-ostd/src/cser/effect_registry/runtime_causal.rs \

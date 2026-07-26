@@ -19,7 +19,7 @@ mod device_flight;
 /// filesystem and device workload.
 #[test]
 fn production_identity_chain_uses_one_registry_and_shared_ledger() {
-    effect_registry::production_identity_registry_self_test();
+    effect_registry::evidence::production_identity_registry_self_test();
     device_flight::retained_semantic_self_test();
     portal_v2::production_portal_v2_self_test();
 }

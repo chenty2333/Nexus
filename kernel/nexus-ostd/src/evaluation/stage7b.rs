@@ -24,10 +24,13 @@ use cser_transition_gates::{
 use ostd::{irq, prelude::*, task::disable_preempt};
 
 use crate::effect_registry::{
-    RegistryError, RegistryProjection, ScopePhase, Stage7bActiveFixture, Stage7bFaultBinding,
-    Stage7bFaultBudget, Stage7bFaultBudgetProjection, Stage7bFaultCase, Stage7bFaultCredit,
-    Stage7bFaultOperation, Stage7bFaultTerminal, Stage7bFixtureConfig, Stage7bNoCredit,
-    Stage7bNoCreditProjection, TerminalOutcome, stage7b_causal_commit_self_test,
+    RegistryError, RegistryProjection, ScopePhase, TerminalOutcome,
+    evidence::{
+        Stage7bActiveFixture, Stage7bFaultBinding, Stage7bFaultBudget,
+        Stage7bFaultBudgetProjection, Stage7bFaultCase, Stage7bFaultCredit,
+        Stage7bFaultOperation, Stage7bFaultTerminal, Stage7bFixtureConfig, Stage7bNoCredit,
+        Stage7bNoCreditProjection, stage7b_causal_commit_self_test,
+    },
 };
 
 const WARMUPS: usize = 7;

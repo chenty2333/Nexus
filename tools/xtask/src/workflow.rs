@@ -1346,7 +1346,8 @@ fn audit_cser_attribute(attribute: &syn::Attribute) -> Option<String> {
             };
             (!matches!(
                 path.value().as_str(),
-                "effect_registry/root_lanes.rs"
+                "effect_registry/evidence.rs"
+                    | "effect_registry/root_lanes.rs"
                     | "effect_registry/runtime_causal.rs"
                     | "effect_registry/runtime_service_task.rs"
                     | "effect_registry/runtime_task.rs"
@@ -2829,10 +2830,10 @@ fn validate_backend_docker_source_set_semantics(
 fn expected_backend_docker_sha256(relative: &str) -> Result<&'static str> {
     match relative {
         "kernel/nexus-ostd/Dockerfile" => {
-            Ok("441f84f7e674117702f2d69ce267571db807e2fb1510ec09efd905381726c539")
+            Ok("3610d396da705a8531bc6572071f0c3177746e7c8bd75c91168e28fe697691a0")
         }
         "experiments/ostd-virtio-cser-spike/Dockerfile" => {
-            Ok("d13b7c6629849de19957ad0536033706e2ebef9e54d761a4a0357beae332b1dc")
+            Ok("e478eb1eab911acb14d6a5e02f973d6574728e5f28d74b914b5eb70417fbea99")
         }
         _ => Err(format!("unknown production backend Dockerfile: {relative}").into()),
     }
@@ -3543,7 +3544,7 @@ fn validate_production_registry_gate(source: &str) -> Result<()> {
             )
         })?;
     let expected = [
-        "effect_registry::production_identity_registry_self_test",
+        "effect_registry::evidence::production_identity_registry_self_test",
         "device_flight::retained_semantic_self_test",
         "portal_v2::production_portal_v2_self_test",
     ];
@@ -5934,7 +5935,7 @@ mod tests {
         validate_production_registry_gate(&conditional_module)
             .expect_err("a conditionally compiled-out production module must be rejected");
         for required_call in [
-            "effect_registry::production_identity_registry_self_test();",
+            "effect_registry::evidence::production_identity_registry_self_test();",
             "device_flight::retained_semantic_self_test();",
             "portal_v2::production_portal_v2_self_test();",
         ] {

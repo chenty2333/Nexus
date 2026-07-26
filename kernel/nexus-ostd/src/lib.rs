@@ -486,7 +486,7 @@ fn run_fallback_probe(scheduler: &'static CserScheduler, old_binding: scheduler:
         AUTHORITY_EPOCH,
     );
 
-    let registry = effect_registry::bounded_registry_self_test();
+    let registry = effect_registry::evidence::bounded_registry_self_test();
     assert!(registry.stale_authority_rejected);
     assert!(registry.quiescent);
     println!(

@@ -343,7 +343,7 @@ pub(crate) fn commit_or_recover_device_flight_with_apply<T>(
 
 #[cfg(test)]
 pub(crate) fn retained_semantic_self_test() {
-    let fixture = crate::effect_registry::retained_semantic_test_fixture();
+    let fixture = crate::effect_registry::evidence::retained_semantic_test_fixture();
     let exact_key = DeviceFlightKey::from_operation(fixture.exact_operation).unwrap();
     let exact = RetainedSemantic::from_close_error(
         exact_key,

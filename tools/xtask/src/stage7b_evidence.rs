@@ -974,7 +974,13 @@ fn validate_non_device_candidate_caller_counts(
     observed: &BTreeMap<String, usize>,
 ) -> Result<(), String> {
     let expected = BTreeMap::from([
-        (FAULT_REGISTRY_SOURCE.to_owned(), 4usize),
+        (FAULT_REGISTRY_SOURCE.to_owned(), 1usize),
+        (
+            registry_source_set::RegistryUnit::Evidence
+                .path()
+                .to_owned(),
+            3usize,
+        ),
         (
             "kernel/nexus-ostd/src/cser/composition.rs".to_owned(),
             1usize,
@@ -1021,23 +1027,35 @@ fn validate_fault_registry_source_set(
     task_fault_source::validate_task_fault_self_tests_source(task_fault_source)?;
 
     let authority = sources.source(registry_source_set::RegistryUnit::Authority)?;
-    validate_fault_registry_authority_source_text(authority)
+    let evidence = sources.source(registry_source_set::RegistryUnit::Evidence)?;
+    validate_fault_registry_unit_sources(authority, evidence)
 }
 
 #[cfg(test)]
-fn validate_fault_registry_source_text(source: &str) -> Result<(), String> {
-    validate_fault_registry_source_set(&registry_source_set::RegistrySourceSet::from_authority(
-        source,
-    ))
+fn validate_fault_registry_units_text(authority: &str, evidence: &str) -> Result<(), String> {
+    let sources = registry_source_set::RegistrySourceSet::for_test([
+        (
+            registry_source_set::RegistryUnit::Authority,
+            authority.to_owned(),
+        ),
+        (
+            registry_source_set::RegistryUnit::Evidence,
+            evidence.to_owned(),
+        ),
+    ])?;
+    validate_fault_registry_source_set(&sources)
 }
 
-fn validate_fault_registry_authority_source_text(source: &str) -> Result<(), String> {
-    if source.contains("validate_device_replay_fence_candidate") {
-        return Err(
-            "production Registry must not retain the obsolete read-only replay-fence validator"
-                .into(),
-        );
+fn validate_fault_registry_unit_sources(authority: &str, evidence: &str) -> Result<(), String> {
+    for source in [authority, evidence] {
+        if source.contains("validate_device_replay_fence_candidate") {
+            return Err(
+                "production Registry must not retain the obsolete read-only replay-fence validator"
+                    .into(),
+            );
+        }
     }
+    let source = evidence;
     let publication_start = source
         .find("fn publication_ack_and_revoke_complete_self_test() {")
         .ok_or_else(|| "Registry lacks combined publication/revoke self-test".to_owned())?;
@@ -1226,7 +1244,8 @@ fn validate_fault_registry_authority_source_text(source: &str) -> Result<(), Str
     let population = &device[..population_end];
     if device.matches("EffectRegistry::new()").count() != 0
         || population.matches(".register_derived(").count() != 2
-        || source.matches("clone_non_device_candidate").count() != 4
+        || authority.matches("clone_non_device_candidate").count() != 1
+        || source.matches("clone_non_device_candidate").count() != 3
         || population.matches("clone_non_device_candidate").count() != 3
         || device.matches("clone_non_device_candidate").count() != 3
         || population.matches(".register_device_derived(").count() != 1
@@ -1697,6 +1716,14 @@ fn validate_fault_registry_authority_source_text(source: &str) -> Result<(), Str
         "causal.binding_epoch <= target.binding_epoch",
         "source.commit.as_ref() == Some(causal)",
         "completion has invalid causal commit",
+    ] {
+        if !authority.contains(required) {
+            return Err(format!(
+                "Stage 7B Registry lacks causal receipt provenance gate {required:?}"
+            ));
+        }
+    }
+    for required in [
         "pub(crate) fn stage7b_causal_commit_self_test()",
         "TerminalRequest::completed_by(2, source_commit.clone())",
         cser_core_macro!("assert_eq", "(cross_scope, cross_scope_before);"),
@@ -1711,17 +1738,20 @@ fn validate_fault_registry_authority_source_text(source: &str) -> Result<(), Str
             ));
         }
     }
-    if source.matches("!causal_commit_matches(").count() != 2 {
+    if authority.matches("!causal_commit_matches(").count() != 2 {
         return Err(
             "Stage 7B Registry must validate causal commits both at transition and invariant reconstruction"
                 .into(),
         );
     }
-    validate_production_device_batch_source_text(source)?;
+    validate_production_device_batch_source_text(authority, evidence)?;
     Ok(())
 }
 
-fn validate_production_device_batch_source_text(source: &str) -> Result<(), String> {
+fn validate_production_device_batch_source_text(
+    source: &str,
+    evidence: &str,
+) -> Result<(), String> {
     let terminal_start = source
         .find("pub(crate) enum TerminalOutcome {")
         .ok_or_else(|| "production Registry lacks its terminal outcome type".to_owned())?;
@@ -3000,21 +3030,6 @@ fn validate_production_device_batch_source_text(source: &str) -> Result<(), Stri
         "fn prepare_device_derived_cohort(",
         "fn apply_device_derived_cohort(",
         "non-device candidate acquired device publication state",
-        "let mut non_device_candidate = registry.clone_non_device_candidate().unwrap();",
-        "non_device_candidate.kernel_root_authority(SCOPE, ROOT_OWNER)",
-        "non_device_candidate.register_device_derived(DeviceDerivedRegisterRequest {",
-        cser_core_macro!(
-            "assert_eq",
-            "(non_device_candidate, non_device_before_registration);"
-        ),
-        "registry.clone_non_device_candidate(),",
-        "disabled_enrollment.device_publication_mode =",
-        "DevicePublicationMode::DisabledNonDeviceCandidate;",
-        "disabled_enrollment.enroll_device_batch(authority, &handles, device)",
-        cser_core_macro!(
-            "assert_eq",
-            "(disabled_enrollment, disabled_enrollment_before);"
-        ),
         "pub(crate) fn enroll_device_batch(",
         "if self.scopes[&record.identity.scope].device_root.is_some() {",
         "return Err(RegistryError::InvalidDeviceEnvelope);",
@@ -3054,9 +3069,32 @@ fn validate_production_device_batch_source_text(source: &str) -> Result<(), Stri
         "retained published credits lack timeout tombstone",
         "TerminalOutcome::IndeterminateAfterReset",
         "DeviceClosureResult::AbortedBeforeCommit",
-        "pub(crate) struct ProductionDeviceBatchRaceFixture",
     ] {
         if !source.contains(required) {
+            return Err(format!(
+                "production device-batch source lacks authority/replay/race invariant {required:?}"
+            ));
+        }
+    }
+    for required in [
+        "let mut non_device_candidate = registry.clone_non_device_candidate().unwrap();",
+        "non_device_candidate.kernel_root_authority(SCOPE, ROOT_OWNER)",
+        "non_device_candidate.register_device_derived(DeviceDerivedRegisterRequest {",
+        cser_core_macro!(
+            "assert_eq",
+            "(non_device_candidate, non_device_before_registration);"
+        ),
+        "registry.clone_non_device_candidate(),",
+        "disabled_enrollment.device_publication_mode =",
+        "DevicePublicationMode::DisabledNonDeviceCandidate;",
+        "disabled_enrollment.enroll_device_batch(authority, &handles, device)",
+        cser_core_macro!(
+            "assert_eq",
+            "(disabled_enrollment, disabled_enrollment_before);"
+        ),
+        "pub(crate) struct ProductionDeviceBatchRaceFixture",
+    ] {
+        if !evidence.contains(required) {
             return Err(format!(
                 "production device-batch source lacks authority/replay/race invariant {required:?}"
             ));
@@ -4078,6 +4116,18 @@ mod tests {
         include_str!("../../../kernel/nexus-ostd/src/cser/effect_registry.rs").into()
     }
 
+    fn checked_evidence_source() -> String {
+        include_str!("../../../kernel/nexus-ostd/src/cser/effect_registry/evidence.rs").into()
+    }
+
+    fn validate_fault_registry_source_text(source: &str) -> Result<(), String> {
+        validate_fault_registry_units_text(source, &checked_evidence_source())
+    }
+
+    fn validate_fault_registry_evidence_text(evidence: &str) -> Result<(), String> {
+        validate_fault_registry_units_text(&checked_registry_source(), evidence)
+    }
+
     fn checked_device_module_source() -> String {
         include_str!("../../../kernel/nexus-ostd/src/cser/infrastructure/mod.rs").into()
     }
@@ -4087,12 +4137,28 @@ mod tests {
     }
 
     fn checked_registry_source_set() -> registry_source_set::RegistrySourceSet {
-        registry_source_set::RegistrySourceSet::from_authority(&checked_registry_source())
+        registry_source_set::RegistrySourceSet::for_test([
+            (
+                registry_source_set::RegistryUnit::Authority,
+                checked_registry_source(),
+            ),
+            (
+                registry_source_set::RegistryUnit::Evidence,
+                checked_evidence_source(),
+            ),
+        ])
+        .unwrap()
     }
 
     fn checked_non_device_candidate_callers() -> BTreeMap<String, usize> {
         BTreeMap::from([
-            (FAULT_REGISTRY_SOURCE.to_owned(), 4usize),
+            (FAULT_REGISTRY_SOURCE.to_owned(), 1usize),
+            (
+                registry_source_set::RegistryUnit::Evidence
+                    .path()
+                    .to_owned(),
+                3usize,
+            ),
             (
                 "kernel/nexus-ostd/src/cser/composition.rs".to_owned(),
                 1usize,
@@ -4199,19 +4265,24 @@ mod tests {
 
     #[test]
     fn registry_source_set_rejects_checked_item_moved_between_units() {
-        let source = checked_registry_source();
-        let moved = source.replacen(
+        let evidence = checked_evidence_source();
+        let moved = evidence.replacen(
             "pub(crate) struct Stage7bFaultBudget {",
             "pub(crate) struct Stage7bFaultBudgetMoved {",
             1,
         );
-        assert_ne!(moved, source);
+        assert_ne!(moved, evidence);
         let sources = registry_source_set::RegistrySourceSet::for_test([
-            (registry_source_set::RegistryUnit::Authority, moved),
             (
-                registry_source_set::RegistryUnit::Evidence,
-                "pub(crate) struct Stage7bFaultBudget;".to_owned(),
+                registry_source_set::RegistryUnit::Authority,
+                format!(
+                    "{}
+pub(crate) struct Stage7bFaultBudget;
+",
+                    checked_registry_source()
+                ),
             ),
+            (registry_source_set::RegistryUnit::Evidence, moved),
         ])
         .unwrap();
         let error = registry_source_set::validate_source_set(&sources).unwrap_err();
@@ -4227,11 +4298,14 @@ mod tests {
         let sources = registry_source_set::RegistrySourceSet::for_test([
             (
                 registry_source_set::RegistryUnit::Authority,
-                checked_registry_source(),
+                format!(
+                    "{}\npub(crate) struct Stage7bFaultBudget;\n",
+                    checked_registry_source()
+                ),
             ),
             (
                 registry_source_set::RegistryUnit::Evidence,
-                "pub(crate) struct Stage7bFaultBudget;".to_owned(),
+                checked_evidence_source(),
             ),
         ])
         .unwrap();
@@ -4245,14 +4319,14 @@ mod tests {
 
     #[test]
     fn registry_source_set_rejects_unbound_device_preparation_self_test() {
-        let source = checked_registry_source();
-        let mutated = source.replacen(
+        let evidence = checked_evidence_source();
+        let mutated = evidence.replacen(
             "    device_preparation_outer_credit_self_test();",
             "    device_preparation_outer_credit_self_test_disabled();",
             1,
         );
-        assert_ne!(mutated, source);
-        let error = validate_fault_registry_source_text(&mutated).unwrap_err();
+        assert_ne!(mutated, evidence);
+        let error = validate_fault_registry_evidence_text(&mutated).unwrap_err();
         assert!(
             error.contains("device-preparation credit self-test")
                 && error.contains("must be called exactly once"),
@@ -4262,14 +4336,14 @@ mod tests {
 
     #[test]
     fn registry_source_set_rejects_unbound_device_materialization_self_test() {
-        let source = checked_registry_source();
-        let mutated = source.replacen(
+        let evidence = checked_evidence_source();
+        let mutated = evidence.replacen(
             "    device_preparation_outer_materialization_self_test();",
             "    device_preparation_outer_materialization_self_test_disabled();",
             1,
         );
-        assert_ne!(mutated, source);
-        let error = validate_fault_registry_source_text(&mutated).unwrap_err();
+        assert_ne!(mutated, evidence);
+        let error = validate_fault_registry_evidence_text(&mutated).unwrap_err();
         assert!(
             error.contains("device-preparation materialization self-test")
                 && error.contains("must be called exactly once"),
@@ -4302,7 +4376,12 @@ mod tests {
             ),
             (
                 registry_source_set::RegistryUnit::Evidence,
-                "struct HiddenRegistryWrapper { inner: EffectRegistry }".to_owned(),
+                format!(
+                    "{}
+struct HiddenRegistryWrapper {{ inner: EffectRegistry }}
+",
+                    checked_evidence_source()
+                ),
             ),
         ])
         .unwrap();
@@ -4322,6 +4401,10 @@ mod tests {
                 checked_registry_source(),
             ),
             (
+                registry_source_set::RegistryUnit::Evidence,
+                checked_evidence_source(),
+            ),
+            (
                 registry_source_set::RegistryUnit::Core,
                 "struct EffectRegistry;".to_owned(),
             ),
@@ -4338,6 +4421,10 @@ mod tests {
             (
                 registry_source_set::RegistryUnit::Authority,
                 checked_registry_source(),
+            ),
+            (
+                registry_source_set::RegistryUnit::Evidence,
+                checked_evidence_source(),
             ),
             (
                 registry_source_set::RegistryUnit::Core,
@@ -4387,11 +4474,14 @@ mod tests {
         fs::write(&authority, checked_registry_source()).unwrap();
         let evidence = root.join(registry_source_set::RegistryUnit::Evidence.path());
         fs::create_dir_all(evidence.parent().unwrap()).unwrap();
-        fs::write(&evidence, "struct HiddenEvidence;").unwrap();
+        fs::write(&evidence, checked_evidence_source()).unwrap();
+        let core = root.join(registry_source_set::RegistryUnit::Core.path());
+        fs::create_dir_all(core.parent().unwrap()).unwrap();
+        fs::write(&core, "struct HiddenCore;").unwrap();
 
         let error = registry_source_set::RegistrySourceSet::read_current(&root).unwrap_err();
         assert!(
-            error.contains("inactive Stage 7B Registry unit") && error.contains("Evidence"),
+            error.contains("inactive Stage 7B Registry unit") && error.contains("Core"),
             "inactive child failed through the wrong source-set gate: {error}"
         );
         fs::remove_dir_all(root).unwrap();
@@ -4456,9 +4546,10 @@ mod tests {
             std::process::id()
         ));
         for (relative, source) in [
+            (FAULT_REGISTRY_SOURCE, "clone_non_device_candidate"),
             (
-                FAULT_REGISTRY_SOURCE,
-                "clone_non_device_candidate clone_non_device_candidate clone_non_device_candidate clone_non_device_candidate",
+                registry_source_set::RegistryUnit::Evidence.path(),
+                "clone_non_device_candidate clone_non_device_candidate clone_non_device_candidate",
             ),
             (
                 "kernel/nexus-ostd/src/cser/composition.rs",
@@ -4489,6 +4580,7 @@ mod tests {
     #[test]
     fn production_device_batch_gate_rejects_operation_publish_and_apply_mutations() {
         let source = checked_registry_source();
+        let evidence = checked_evidence_source();
 
         let forgeable_operation = source.replacen(
             "    caller_nonce: u64,\n}",
@@ -4645,21 +4737,21 @@ mod tests {
         assert_ne!(double_revoke_increment, source);
         assert!(validate_fault_registry_source_text(&double_revoke_increment).is_err());
 
-        let weakened_revoke_overflow = source.replacen(
+        let weakened_revoke_overflow = evidence.replacen(
             "close_revoke_overflow.next_revoke_sequence = u64::MAX;",
             "close_revoke_overflow.next_revoke_sequence = u64::MAX - 1;",
             1,
         );
-        assert_ne!(weakened_revoke_overflow, source);
-        assert!(validate_fault_registry_source_text(&weakened_revoke_overflow).is_err());
+        assert_ne!(weakened_revoke_overflow, evidence);
+        assert!(validate_fault_registry_evidence_text(&weakened_revoke_overflow).is_err());
 
-        let weakened_second_revision_overflow = source.replacen(
+        let weakened_second_revision_overflow = evidence.replacen(
             "revision = u64::MAX - 1;\n    assert_fresh_close_overflow(&mut close_revoke_revision_overflow);",
             "revision = u64::MAX - 2;\n    assert_fresh_close_overflow(&mut close_revoke_revision_overflow);",
             1,
         );
-        assert_ne!(weakened_second_revision_overflow, source);
-        assert!(validate_fault_registry_source_text(&weakened_second_revision_overflow).is_err());
+        assert_ne!(weakened_second_revision_overflow, evidence);
+        assert!(validate_fault_registry_evidence_text(&weakened_second_revision_overflow).is_err());
 
         let reordered = source.replacen(
             "let publication = publish(&plan.receipt);\n                let receipt = self.apply_device_batch(plan);",
@@ -4721,6 +4813,7 @@ mod tests {
     #[test]
     fn production_device_closure_gate_rejects_enrollment_retention_and_generation_bypasses() {
         let source = checked_registry_source();
+        let evidence = checked_evidence_source();
 
         let copyable_device_authority = source.replacen(
             "candidate.device_publication_mode = DevicePublicationMode::DisabledNonDeviceCandidate;",
@@ -4948,21 +5041,21 @@ mod tests {
         assert_ne!(unenrolled_commit, source);
         assert!(validate_fault_registry_source_text(&unenrolled_commit).is_err());
 
-        let missing_emergency_freeze = source.replacen(
+        let missing_emergency_freeze = evidence.replacen(
             "let cancel_enrollment = pending_cancel.freeze_pending_device_cancel(SCOPE).unwrap();",
             "let cancel_enrollment = enrollment.clone();",
             1,
         );
-        assert_ne!(missing_emergency_freeze, source);
-        assert!(validate_fault_registry_source_text(&missing_emergency_freeze).is_err());
+        assert_ne!(missing_emergency_freeze, evidence);
+        assert!(validate_fault_registry_evidence_text(&missing_emergency_freeze).is_err());
 
-        let missing_cancel_only_witness = source.replacen(
+        let missing_cancel_only_witness = evidence.replacen(
             cser_core_macro!("assert", "(cancel_enrollment.cancel_only());"),
             cser_core_macro!("assert_eq", "(cancel_enrollment.effects().len(), 6);"),
             1,
         );
-        assert_ne!(missing_cancel_only_witness, source);
-        assert!(validate_fault_registry_source_text(&missing_cancel_only_witness).is_err());
+        assert_ne!(missing_cancel_only_witness, evidence);
+        assert!(validate_fault_registry_evidence_text(&missing_cancel_only_witness).is_err());
 
         let publishable_cancel_enrollment =
             source.replacen("|| enrollment.cancel_only", "|| false", 1);
@@ -5215,31 +5308,32 @@ mod tests {
     #[test]
     fn fault_registry_gate_rejects_capacity_sidecar_instance_and_causal_mutations() {
         let source = checked_registry_source();
-        let capacity = source.replacen(
+        let evidence = checked_evidence_source();
+        let capacity = evidence.replacen(
             "ScopePhase::Revoked => credits.free,",
             "ScopePhase::Revoked => credits.capacity,",
             1,
         );
-        assert_ne!(capacity, source);
-        assert!(validate_fault_registry_source_text(&capacity).is_err());
+        assert_ne!(capacity, evidence);
+        assert!(validate_fault_registry_evidence_text(&capacity).is_err());
 
-        let sidecar = source.replacen(
+        let sidecar = evidence.replacen(
             "registry.check_invariants()?;\n        Ok(Self {",
             "registry.check_invariants()?;\n        let _sidecar = EffectRegistry::new();\n        Ok(Self {",
             1,
         );
-        assert_ne!(sidecar, source);
-        assert!(validate_fault_registry_source_text(&sidecar).is_err());
+        assert_ne!(sidecar, evidence);
+        assert!(validate_fault_registry_evidence_text(&sidecar).is_err());
 
-        let external_sidecar = source.replacen(
+        let external_sidecar = evidence.replacen(
             "pub(crate) struct Stage7bFaultCredit {",
             "fn hidden_fault_sidecar() -> EffectRegistry { EffectRegistry::new() }\n\npub(crate) struct Stage7bFaultCredit {",
             1,
         );
-        assert_ne!(external_sidecar, source);
-        assert!(validate_fault_registry_source_text(&external_sidecar).is_err());
+        assert_ne!(external_sidecar, evidence);
+        assert!(validate_fault_registry_evidence_text(&external_sidecar).is_err());
 
-        let cloned_sidecar = source
+        let cloned_sidecar = evidence
             .replacen(
                 "    registry: EffectRegistry,\n    scope: ScopeKey,",
                 "    registry: EffectRegistry,\n    sidecar: EffectRegistry,\n    scope: ScopeKey,",
@@ -5250,21 +5344,21 @@ mod tests {
                 "            sidecar: registry.clone(),\n            registry,\n            scope,",
                 1,
             );
-        assert_ne!(cloned_sidecar, source);
-        assert!(validate_fault_registry_source_text(&cloned_sidecar).is_err());
+        assert_ne!(cloned_sidecar, evidence);
+        assert!(validate_fault_registry_evidence_text(&cloned_sidecar).is_err());
 
-        let credit_sum = source.replacen(
+        let credit_sum = evidence.replacen(
             "ScopePhase::Revoked => credits.free,",
             "ScopePhase::Revoked => credits.free.checked_add(credits.held).and_then(|value| value.checked_add(credits.committed)).ok_or(RegistryError::CounterOverflow)?,",
             1,
         );
-        assert_ne!(credit_sum, source);
-        assert!(validate_fault_registry_source_text(&credit_sum).is_err());
+        assert_ne!(credit_sum, evidence);
+        assert!(validate_fault_registry_evidence_text(&credit_sum).is_err());
 
         let missing_instance =
-            source.replacen("|| credit.instance_id != self.instance_id", "|| false", 1);
-        assert_ne!(missing_instance, source);
-        assert!(validate_fault_registry_source_text(&missing_instance).is_err());
+            evidence.replacen("|| credit.instance_id != self.instance_id", "|| false", 1);
+        assert_ne!(missing_instance, evidence);
+        assert!(validate_fault_registry_evidence_text(&missing_instance).is_err());
 
         let unauthenticated_causal = source.replacen(
             "source.commit.as_ref() == Some(causal)",
@@ -5293,7 +5387,7 @@ mod tests {
 
     #[test]
     fn fault_registry_gate_structurally_binds_all_self_test_registries() {
-        let source = checked_registry_source();
+        let source = checked_evidence_source();
 
         let moved_combined = source
             .replacen(
@@ -5311,7 +5405,7 @@ mod tests {
             source.matches("EffectRegistry::new()").count(),
             "mutation must preserve the global constructor count"
         );
-        assert!(validate_fault_registry_source_text(&moved_combined).is_err());
+        assert!(validate_fault_registry_evidence_text(&moved_combined).is_err());
 
         let moved_atomic = source
             .replacen(
@@ -5329,7 +5423,7 @@ mod tests {
             source.matches("EffectRegistry::new()").count(),
             "mutation must preserve the global constructor count"
         );
-        assert!(validate_fault_registry_source_text(&moved_atomic).is_err());
+        assert!(validate_fault_registry_evidence_text(&moved_atomic).is_err());
 
         let moved_production = source
             .replacen(
@@ -5347,7 +5441,7 @@ mod tests {
             source.matches("EffectRegistry::new()").count(),
             "mutation must preserve the global constructor count"
         );
-        assert!(validate_fault_registry_source_text(&moved_production).is_err());
+        assert!(validate_fault_registry_evidence_text(&moved_production).is_err());
 
         let moved_publication = source
             .replacen(
@@ -5365,7 +5459,7 @@ mod tests {
             source.matches("EffectRegistry::new()").count(),
             "mutation must preserve the global constructor count"
         );
-        assert!(validate_fault_registry_source_text(&moved_publication).is_err());
+        assert!(validate_fault_registry_evidence_text(&moved_publication).is_err());
 
         let moved_retained = source
             .replacen(
@@ -5383,14 +5477,14 @@ mod tests {
             source.matches("EffectRegistry::new()").count(),
             "mutation must preserve the global constructor count"
         );
-        assert!(validate_fault_registry_source_text(&moved_retained).is_err());
+        assert!(validate_fault_registry_evidence_text(&moved_retained).is_err());
 
         let detached = source.replacen(
             "production_identity_registry_self_test();",
             "/* detached production identity self-test */",
             1,
         );
-        assert!(validate_fault_registry_source_text(&detached).is_err());
+        assert!(validate_fault_registry_evidence_text(&detached).is_err());
 
         let moved_to_fault_helper = source
             .replacen(
@@ -5410,7 +5504,7 @@ mod tests {
             1,
             "mutation must preserve the implementation self-test call count"
         );
-        assert!(validate_fault_registry_source_text(&moved_to_fault_helper).is_err());
+        assert!(validate_fault_registry_evidence_text(&moved_to_fault_helper).is_err());
 
         task_fault_source::exercise_negative_mutations(&source);
     }
@@ -5589,6 +5683,9 @@ mod tests {
         let registry = root.join(FAULT_REGISTRY_SOURCE);
         fs::create_dir_all(registry.parent().unwrap()).unwrap();
         fs::write(&registry, checked_registry_source()).unwrap();
+        let evidence = root.join(registry_source_set::RegistryUnit::Evidence.path());
+        fs::create_dir_all(evidence.parent().unwrap()).unwrap();
+        fs::write(&evidence, checked_evidence_source()).unwrap();
         for (relative, source) in [
             (
                 DEVICE_INFRASTRUCTURE_MODULE_SOURCE,

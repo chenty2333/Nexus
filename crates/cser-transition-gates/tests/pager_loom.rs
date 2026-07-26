@@ -13,7 +13,10 @@ use cser_transition_gates::{
         PagerLifecycle,
     },
 };
-use effect_registry::{ScopePhase, Stage7bActiveFixture, Stage7bFixtureConfig};
+use effect_registry::{
+    ScopePhase,
+    evidence::{Stage7bActiveFixture, Stage7bFixtureConfig},
+};
 use loom::{
     model,
     sync::{
