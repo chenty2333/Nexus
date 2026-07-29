@@ -33,16 +33,16 @@ pub use domain::{
     ObligationSpec, ReceiptBinding,
 };
 pub use engine::{
-    AuthorityState, ChargeProjection, ClaimScope, ClaimUseError, Command, CommandDecodeError,
-    CommandRequest, CommitIntent, CommitState, CommitUseError, CoreError, CoreLimits, CustodyState,
-    EffectFactChallenge, EffectFactKind, EffectReceiptVerifier, Engine, EstateProjection,
-    EvidenceChallenge, ExternalOutcome, JournalFailure, OutcomeState, PressureProjection,
-    ReceiptVerifier, RecoveryAnchor, RecoveryAnchorError, RecoveryItem, RecoveryReport,
-    RecoverySnapshot, RetirementState, ReusePermit, RootRecoveryState, SettlementClaim,
-    SettlementState, TransitionEvent, TransitionOutput, TransitionReceipt, TxError,
-    VerificationError, VerifiedApplyReceipt, VerifiedCommitOutcome, VerifiedEffectObservation,
-    VerifiedObservation, VerifiedRetirementEvidence, VerifiedSettlementAck, VerifierIdentity,
-    VerifierStamp,
+    AuthorityState, ChargeProjection, ClaimProjection, ClaimScope, ClaimUseError, Command,
+    CommandDecodeError, CommandRequest, CommitIntent, CommitState, CommitUseError, CoreError,
+    CoreLimits, CustodyState, EffectFactChallenge, EffectFactKind, EffectReceiptVerifier, Engine,
+    EstateProjection, EvidenceChallenge, ExternalOutcome, JournalFailure, OutcomeState,
+    PressureProjection, ReceiptVerifier, RecoveryAnchor, RecoveryAnchorError, RecoveryItem,
+    RecoveryReport, RecoverySnapshot, RetirementState, ReusePermit, RootRecoveryState,
+    SettlementClaim, SettlementState, TransitionEvent, TransitionOutput, TransitionReceipt,
+    TxError, VerificationError, VerifiedApplyReceipt, VerifiedCommitOutcome,
+    VerifiedEffectObservation, VerifiedObservation, VerifiedRetirementEvidence,
+    VerifiedSettlementAck, VerifierIdentity, VerifierStamp,
 };
 pub use identity::{
     BootGeneration, ChargeAccountId, ClaimId, ClaimKindId, CreditClassId, DeviceGeneration,

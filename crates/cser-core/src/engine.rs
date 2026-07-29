@@ -1616,6 +1616,37 @@ pub struct EstateProjection {
     pub retained_claims: usize,
 }
 
+/// Public, non-authorizing projection of one domain-defined resource claim.
+///
+/// This is the boot-recovery enumeration surface.  It contains enough exact
+/// identity to challenge a platform verifier after replay, but no release,
+/// reuse, adoption, or settlement authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ClaimProjection {
+    /// Estate which owns the claim.
+    pub effect: EffectId,
+    /// Stable claim identity within the estate.
+    pub claim: ClaimId,
+    /// Domain which defined the claim lifecycle.
+    pub domain: DomainId,
+    /// Domain-defined claim class.
+    pub kind: ClaimKindId,
+    /// Conserved credit class charged while the claim is retained.
+    pub credit_class: CreditClassId,
+    /// Logical or exact device scope.
+    pub scope: ClaimScope,
+    /// Concrete resource identity protected from premature reuse.
+    pub resource: ResourceId,
+    /// Generation of the protected resource.
+    pub resource_generation: ResourceGeneration,
+    /// Conserved units charged to the estate.
+    pub units: u64,
+    /// Freshness under which the claim was enrolled.
+    pub enrolled_freshness: Freshness,
+    /// Whether every configured retirement requirement has been accepted.
+    pub retired: bool,
+}
+
 /// One estate in a core-generated recovery cohort.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RecoveryItem {
@@ -2839,6 +2870,43 @@ impl Engine {
     /// Returns a public estate projection.
     pub fn estate(&self, effect: EffectId) -> Option<EstateProjection> {
         self.state.estates.get(&effect).map(project_estate)
+    }
+
+    /// Returns every claim for one exact estate in stable claim-id order.
+    ///
+    /// The returned values are observations only.  A recovery adapter must
+    /// still request an exact evidence challenge and submit the resulting
+    /// one-shot command before any resource becomes reusable.
+    pub fn claims(&self, effect: EffectId) -> Result<Vec<ClaimProjection>, CoreError> {
+        let estate = self
+            .state
+            .estates
+            .get(&effect)
+            .ok_or(CoreError::UnknownEstate)?;
+        Ok(estate
+            .claims
+            .values()
+            .map(|claim| project_claim(effect, claim))
+            .collect())
+    }
+
+    /// Enumerates all non-retired claims in stable effect/claim order.
+    ///
+    /// Boot recovery uses this bounded projection to reconstruct physical
+    /// custodians and quarantine work from the authoritative replayed state;
+    /// adapters must not persist a parallel semantic tombstone index.
+    pub fn retained_claims(&self) -> Vec<ClaimProjection> {
+        self.state
+            .estates
+            .iter()
+            .flat_map(|(effect, estate)| {
+                estate
+                    .claims
+                    .values()
+                    .filter(|claim| !claim.retired)
+                    .map(|claim| project_claim(*effect, claim))
+            })
+            .collect()
     }
 
     /// Returns a root recovery projection.
@@ -5000,6 +5068,22 @@ fn project_estate(estate: &EstateRecord) -> EstateProjection {
             .values()
             .filter(|claim| !claim.retired)
             .count(),
+    }
+}
+
+fn project_claim(effect: EffectId, claim: &ClaimRecord) -> ClaimProjection {
+    ClaimProjection {
+        effect,
+        claim: claim.id,
+        domain: claim.domain,
+        kind: claim.kind,
+        credit_class: claim.credit_class,
+        scope: claim.scope,
+        resource: claim.resource,
+        resource_generation: claim.resource_generation,
+        units: claim.units,
+        enrolled_freshness: claim.enrolled_freshness,
+        retired: claim.retired,
     }
 }
 

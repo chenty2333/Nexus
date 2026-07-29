@@ -34,6 +34,51 @@ fn dma_retained_units(harness: &Harness, account_value: u64) -> u64 {
         .sum()
 }
 
+#[test]
+fn replay_exposes_exact_retained_claims_without_an_adapter_side_tombstone_index() {
+    let mut harness = Harness::new();
+    let (effect, _origin, _subject) = committed_dma(&mut harness, 91, 91);
+
+    let claims = harness.engine.claims(effect).unwrap();
+    assert_eq!(claims.len(), 3);
+    assert_eq!(
+        claims
+            .iter()
+            .map(|projection| projection.claim.get())
+            .collect::<Vec<_>>(),
+        vec![QUEUE_CLAIM, PAGE_CLAIM, IOVA_CLAIM]
+    );
+    for projection in &claims {
+        assert_eq!(projection.effect, effect);
+        assert_eq!(projection.domain, DEVICE_DOMAIN);
+        assert_eq!(
+            projection.scope,
+            cser_core::ClaimScope::Device(cser_core::DeviceScopeId::new(1).unwrap())
+        );
+        assert_eq!(projection.resource_generation.get(), 1);
+        assert!(!projection.retired);
+    }
+
+    let report = Engine::recover(
+        standard_catalog(),
+        CoreLimits::bounded_default(),
+        RecoveryAnchor::from_trusted_provider(
+            standard_catalog().digest(),
+            freshness(1, 1, 1, 1, 1),
+            freshness(2, 1, 1, 2, 2),
+            harness.engine.revision(),
+            harness.engine.head(),
+        )
+        .unwrap(),
+        &harness.journal,
+    )
+    .unwrap();
+    let recovered = report.into_engine();
+    assert_eq!(recovered.claims(effect).unwrap(), claims);
+    assert_eq!(recovered.retained_claims(), claims);
+    assert!(recovered.pressure().quarantined);
+}
+
 fn registered_dma(
     harness: &mut Harness,
     root_value: u64,
