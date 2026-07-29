@@ -8,8 +8,8 @@
 
 set -euo pipefail
 
-if (($# != 1)); then
-    echo "usage: $0 STATE_DIR" >&2
+if (($# < 1 || $# > 2)); then
+    echo "usage: $0 STATE_DIR [CATALOG_SHA256_HEX]" >&2
     exit 2
 fi
 
@@ -23,6 +23,18 @@ for command in swtpm tpm2_nvdefine tpm2_nvreadpublic tpm2_nvread \
 done
 
 state_dir=$1
+catalog_hex=${2:-}
+if [[ -z $catalog_hex ]]; then
+    for _ in {1..32}; do
+        catalog_hex+=42
+    done
+fi
+if [[ ! $catalog_hex =~ ^[[:xdigit:]]{64}$ ]]; then
+    echo "catalog digest must be exactly 64 hexadecimal characters" >&2
+    exit 2
+fi
+catalog_hex=${catalog_hex,,}
+readonly catalog_hex
 mkdir -p -- "$state_dir"
 if [[ -n $(find "$state_dir" -mindepth 1 -maxdepth 1 -print -quit) ]]; then
     echo "TPM state directory must be empty before provisioning: $state_dir" >&2
@@ -91,13 +103,11 @@ tpm2_nvdefine -Q -T "$tcti" "$LEASE_SLOT_0" -C p -s "$LEASE_SIZE" \
 tpm2_nvdefine -Q -T "$tcti" "$LEASE_SLOT_1" -C p -s "$LEASE_SIZE" \
     -a "$SLOT_ATTRIBUTES" -L "$work_dir/delete-policy.bin"
 
-catalog_hex=
 head_hex=
 for _ in {1..32}; do
-    catalog_hex+=42
     head_hex+=00
 done
-readonly catalog_hex head_hex
+readonly head_hex
 readonly one=0000000000000001
 readonly zero=0000000000000000
 readonly prefix_tip=4353455254504d31000101000000000000000001

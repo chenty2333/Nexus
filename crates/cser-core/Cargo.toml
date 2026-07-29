@@ -22,3 +22,8 @@ proptest = "=1.11.0"
 name = "cser-restart-fixture"
 path = "src/bin/cser-restart-fixture.rs"
 required-features = ["std"]
+
+[[bin]]
+name = "cser-catalog-digest"
+path = "src/bin/cser-catalog-digest.rs"
+required-features = ["std"]

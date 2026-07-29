@@ -363,6 +363,17 @@ where
         self.committed
     }
 
+    /// Returns the greatest recovery freshness durably issued by the lease
+    /// selector, including a lease whose subsequent journal checkpoint may
+    /// have been interrupted.
+    ///
+    /// Boot quarantine uses this only to choose a device generation which is
+    /// no older than either trusted selector. It does not authorize a core
+    /// transition or advance the TPM state.
+    pub(crate) const fn issued(&self) -> Freshness {
+        self.issued
+    }
+
     fn transport_mut(&mut self) -> &mut T {
         self.transport
             .as_mut()
