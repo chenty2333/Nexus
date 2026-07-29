@@ -59,9 +59,9 @@ impl OstdRecoveryBoundary {
 }
 
 #[derive(Debug)]
-struct RuntimeState<J> {
+struct RuntimeState<P> {
     engine: Engine,
-    journal: J,
+    persistence: P,
 }
 
 /// Single-writer OSTD owner of one portable CSER engine and its journal.
@@ -70,15 +70,23 @@ struct RuntimeState<J> {
 /// cutover must install exactly one recovered instance before opening ingress
 /// and must remove the old Registry path in the same change.
 #[derive(Debug)]
-pub(crate) struct OstdCserRuntime<J> {
-    state: Mutex<RuntimeState<J>>,
+pub(crate) struct OstdCserRuntime<P> {
+    state: Mutex<RuntimeState<P>>,
 }
 
-impl<J> OstdCserRuntime<J> {
-    /// Wraps an already-created engine without activating any kernel ingress.
-    pub(crate) const fn from_engine(engine: Engine, journal: J) -> Self {
+impl<P> OstdCserRuntime<P> {
+    /// Wraps an already-created engine and its transition durability provider
+    /// without activating any kernel ingress.
+    ///
+    /// Reply and DMA adapters must share this owner after the production
+    /// cutover. Domain-specific physical custody lives outside the core, while
+    /// every semantic transition and durability decision is serialized here.
+    pub(crate) const fn from_engine(engine: Engine, persistence: P) -> Self {
         Self {
-            state: Mutex::new(RuntimeState { engine, journal }),
+            state: Mutex::new(RuntimeState {
+                engine,
+                persistence,
+            }),
         }
     }
 
@@ -92,7 +100,7 @@ impl<J> OstdCserRuntime<J> {
         limits: CoreLimits,
         anchor: RecoveryAnchor,
         bytes: &[u8],
-        journal: J,
+        persistence: P,
     ) -> Result<(Self, OstdRecoveryBoundary), CoreError> {
         let report = Engine::recover(catalog, limits, anchor, bytes)?;
         let boundary = OstdRecoveryBoundary {
@@ -100,13 +108,26 @@ impl<J> OstdCserRuntime<J> {
             acknowledged_head: report.acknowledged_head(),
             journal_repair: report.journal_repair(),
         };
-        Ok((Self::from_engine(report.into_engine(), journal), boundary))
+        Ok((
+            Self::from_engine(report.into_engine(), persistence),
+            boundary,
+        ))
     }
 
     /// Runs a read-only operation under the authoritative writer lock.
     pub(crate) fn observe<R>(&self, operation: impl FnOnce(&Engine) -> R) -> R {
         let state = self.state.lock();
         operation(&state.engine)
+    }
+
+    /// Runs a read-only durability-provider observation under the same owner
+    /// lock as the engine.
+    ///
+    /// This is for diagnostics and provider lifecycle checks only. It cannot
+    /// append journal bytes or advance a trusted anchor.
+    pub(crate) fn observe_persistence<R>(&self, operation: impl FnOnce(&P) -> R) -> R {
+        let state = self.state.lock();
+        operation(&state.persistence)
     }
 
     /// Executes one explicitly non-durable development transition.
@@ -137,7 +158,7 @@ impl<P: TransitionDurability> OstdCserRuntime<P> {
         let mut state = self.state.lock();
         let RuntimeState {
             engine,
-            journal: persistence,
+            persistence,
         } = &mut *state;
         engine.transact_durable(command, persistence)
     }

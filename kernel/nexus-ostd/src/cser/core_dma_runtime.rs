@@ -19,13 +19,17 @@
 //! persistent-provider suite.
 
 use alloc::{sync::Arc, vec::Vec};
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::{
+    convert::Infallible,
+    sync::atomic::{AtomicBool, AtomicU32, Ordering},
+};
 
 use cser_core::{
     BootGeneration, ChargeAccountId, ClaimId, Command, CommandRequest, CoreError, CoreLimits,
     DeviceGeneration, Digest, EffectId, Engine, Freshness, JournalGeneration, JournalRecord,
     PrincipalId, PrincipalIncarnation, RegistryInstance, ResourceGeneration, ResourceId, RootId,
-    SnapshotId, TransitionOutput, TransitionReceipt, TxError, standard_catalog,
+    SnapshotId, TransitionDurability, TransitionOutput, TransitionReceipt, TxError,
+    standard_catalog,
 };
 use nexus_ostd_virtio::{
     CompletedRequest, CompletionMode, InterruptCompletionProgress, InterruptNotReadyReason,
@@ -45,52 +49,66 @@ use super::core_dma_adapter::{
     ClaimRole, CoreDmaClaim, CoreDmaClaims, CoreDmaCohort, acknowledge_real_irq,
     apply_real_iotlb_closure, apply_real_reset_generation, complete_real_irq, publish_real_queue,
 };
+use super::core_runtime::OstdCserRuntime;
 
 const MAX_DEVICE_TURNS: usize = 16_384;
 const MAX_IRQ_SPINS: usize = 20_000_000;
 
-struct VolatileCore {
-    engine: Engine,
+/// Development-only persistence backend for the QEMU hardware slice.
+///
+/// This value satisfies the portable transition protocol, so the slice takes
+/// the same [`OstdCserRuntime`] path as a recovered production owner. Its bytes
+/// are still volatile and have no independent trusted anchor; therefore they
+/// are not reboot-persistence evidence.
+struct VolatileDmaDurability {
     journal: Vec<u8>,
 }
 
-impl VolatileCore {
-    fn new() -> Self {
+impl VolatileDmaDurability {
+    const fn new() -> Self {
         Self {
-            engine: Engine::new(
-                standard_catalog(),
-                CoreLimits::bounded_default(),
-                Freshness::new(
-                    nz::<BootGeneration>(1),
-                    nz::<RegistryInstance>(1),
-                    1,
-                    nz::<DeviceGeneration>(1),
-                    nz::<JournalGeneration>(1),
-                )
-                .expect("DMA runtime freshness is complete"),
-            ),
             journal: Vec::new(),
         }
     }
 
-    fn tx<C: Into<Command>>(&mut self, command: C) -> TransitionReceipt {
-        let journal = &mut self.journal;
-        self.engine
-            .transact(command, |record: &JournalRecord| {
-                journal.extend_from_slice(record.bytes());
-                Ok::<(), ()>(())
-            })
-            .map_err(|error| match error {
-                TxError::Core(error) => error,
-                TxError::Journal(error) => CoreError::Journal(error),
-                TxError::Persist(()) => unreachable!("memory journal append cannot fail"),
-            })
-            .expect("portable core transition must succeed")
+    fn encoded_len(&self) -> usize {
+        self.journal.len()
     }
+}
 
-    fn output<C: Into<Command>>(&mut self, command: C) -> TransitionOutput {
-        self.tx(command).into_output()
+impl TransitionDurability for VolatileDmaDurability {
+    type Error = Infallible;
+
+    fn persist_transition(
+        &mut self,
+        record: &JournalRecord,
+        resulting_freshness: Freshness,
+    ) -> Result<(), Self::Error> {
+        assert!(!record.bytes().is_empty());
+        assert_ne!(resulting_freshness.boot().get(), 0);
+        self.journal.extend_from_slice(record.bytes());
+        Ok(())
     }
+}
+
+type DmaRuntime = OstdCserRuntime<VolatileDmaDurability>;
+
+fn new_dma_runtime() -> DmaRuntime {
+    OstdCserRuntime::from_engine(
+        Engine::new(
+            standard_catalog(),
+            CoreLimits::bounded_default(),
+            Freshness::new(
+                nz::<BootGeneration>(1),
+                nz::<RegistryInstance>(1),
+                1,
+                nz::<DeviceGeneration>(1),
+                nz::<JournalGeneration>(1),
+            )
+            .expect("DMA runtime freshness is complete"),
+        ),
+        VolatileDmaDurability::new(),
+    )
 }
 
 struct ServiceControl {
@@ -195,8 +213,12 @@ pub(crate) fn launch() -> ! {
     unreachable!("the CSER core DMA manager powers the machine off")
 }
 
+// Queue-commit failures intentionally retain the complete non-clone hardware
+// request and commit intent. Boxing after device publication would add a new
+// allocation failure at exactly the wrong authority boundary.
+#[allow(clippy::result_large_err)]
 fn run_dma_recovery_slice() {
-    let mut core = VolatileCore::new();
+    let core = new_dma_runtime();
     let root_id = nz::<RootId>(0xd001);
     let effect1 = EffectId::new(root_id, 1).expect("first DMA effect is valid");
     let origin = principal(0xd001, 1);
@@ -245,15 +267,15 @@ fn run_dma_recovery_slice() {
     )
     .expect("first real request binds to the portable core");
 
-    enroll_new_effect(&mut core, cohort1);
-    let intent1 = commit_intent(&mut core, cohort1, digest(0x11));
+    enroll_new_effect(&core, cohort1);
+    let intent1 = commit_intent(&core, cohort1, digest(0x11));
     let published1 = publish_real_queue(&device, receipted, cohort1)
         .unwrap_or_else(|_| panic!("first real queue publication must succeed"));
-    let committed1 = published1
-        .verify_commit(&core.engine, intent1, cohort1)
+    let committed1 = core
+        .observe(move |engine| published1.verify_commit(engine, intent1, cohort1))
         .unwrap_or_else(|_| panic!("first real queue commit receipt must verify"));
     let (request1, acknowledgement1) = committed1.into_parts();
-    core.tx(acknowledgement1);
+    tx(&core, acknowledgement1);
     assert_eq!(device.device_generation(), 1);
 
     println!(
@@ -267,64 +289,80 @@ fn run_dma_recovery_slice() {
     );
 
     stop_and_reap(&origin_task, &origin_control);
-    core.tx(CommandRequest::FenceIncarnation {
-        root: root_id,
-        crashed: origin,
-        binding_generation: 1,
-    });
+    tx(
+        &core,
+        CommandRequest::FenceIncarnation {
+            root: root_id,
+            crashed: origin,
+            binding_generation: 1,
+        },
+    );
     assert_retained(&core, cohort1);
 
     let snapshot1 = core
-        .engine
-        .snapshot_root(root_id, nz::<SnapshotId>(1))
+        .observe(|engine| engine.snapshot_root(root_id, nz::<SnapshotId>(1)))
         .expect("first DMA post-mortem snapshot is available");
     assert_eq!(snapshot1.items().len(), 1);
-    core.tx(snapshot1.record());
-    core.tx(CommandRequest::Ready {
-        root: root_id,
-        snapshot: nz::<SnapshotId>(1),
-        successor: successor1,
-    });
-    core.tx(CommandRequest::Rebind {
-        root: root_id,
-        snapshot: nz::<SnapshotId>(1),
-        successor: successor1,
-        binding_generation: 2,
-    });
+    tx(&core, snapshot1.record());
+    tx(
+        &core,
+        CommandRequest::Ready {
+            root: root_id,
+            snapshot: nz::<SnapshotId>(1),
+            successor: successor1,
+        },
+    );
+    tx(
+        &core,
+        CommandRequest::Rebind {
+            root: root_id,
+            snapshot: nz::<SnapshotId>(1),
+            successor: successor1,
+            binding_generation: 2,
+        },
+    );
 
     // A fresh successor dies before it can settle the physical tombstone.
     // The manager retains the real queue/DMA owners and fences the exact
     // rebound incarnation a second time.
     let (successor1_task, successor1_control) = spawn_service(successor1, "successor-v2");
     stop_and_reap(&successor1_task, &successor1_control);
-    core.tx(CommandRequest::FenceIncarnation {
-        root: root_id,
-        crashed: successor1,
-        binding_generation: 2,
-    });
+    tx(
+        &core,
+        CommandRequest::FenceIncarnation {
+            root: root_id,
+            crashed: successor1,
+            binding_generation: 2,
+        },
+    );
     assert_retained(&core, cohort1);
     let snapshot2 = core
-        .engine
-        .snapshot_root(root_id, nz::<SnapshotId>(2))
+        .observe(|engine| engine.snapshot_root(root_id, nz::<SnapshotId>(2)))
         .expect("second-crash DMA snapshot is available");
     assert_eq!(snapshot2.items().len(), 1);
-    core.tx(snapshot2.record());
-    core.tx(CommandRequest::Ready {
-        root: root_id,
-        snapshot: nz::<SnapshotId>(2),
-        successor: successor2,
-    });
-    core.tx(CommandRequest::Rebind {
-        root: root_id,
-        snapshot: nz::<SnapshotId>(2),
-        successor: successor2,
-        binding_generation: 3,
-    });
+    tx(&core, snapshot2.record());
+    tx(
+        &core,
+        CommandRequest::Ready {
+            root: root_id,
+            snapshot: nz::<SnapshotId>(2),
+            successor: successor2,
+        },
+    );
+    tx(
+        &core,
+        CommandRequest::Rebind {
+            root: root_id,
+            snapshot: nz::<SnapshotId>(2),
+            successor: successor2,
+            binding_generation: 3,
+        },
+    );
 
     let (completed1, irq1, irq_turns1, masked_intx) =
         wait_for_real_irq_completion(&mut root, &irq_slot, masked_intx, request1);
     let first_close = close_real_generation(
-        &mut core,
+        &core,
         &mut root,
         &mut device,
         cohort1,
@@ -337,14 +375,17 @@ fn run_dma_recovery_slice() {
     assert_reusable(&core, cohort1);
 
     let effect2 = EffectId::new(root_id, 2).expect("second DMA effect is valid");
-    core.tx(CommandRequest::CreateEstate {
-        effect: effect2,
-        origin: successor2,
-        binding_generation: 3,
-        domain: cser_core::DEVICE_DOMAIN,
-        obligation: cser_core::DEVICE_OBLIGATION_DMA,
-        charge_account: nz::<ChargeAccountId>(0xd001),
-    });
+    tx(
+        &core,
+        CommandRequest::CreateEstate {
+            effect: effect2,
+            origin: successor2,
+            binding_generation: 3,
+            domain: cser_core::DEVICE_DOMAIN,
+            obligation: cser_core::DEVICE_OBLIGATION_DMA,
+            charge_account: nz::<ChargeAccountId>(0xd001),
+        },
+    );
     let claims2 = dma_claims(0x200, 2);
     for (role, claim) in [
         (ClaimRole::Queue, claims2_for(claims2, ClaimRole::Queue)),
@@ -354,19 +395,15 @@ fn run_dma_recovery_slice() {
         ),
         (ClaimRole::Iova, claims2_for(claims2, ClaimRole::Iova)),
     ] {
-        let permit = match core.output(cohort1.reserve_reuse(
-            role,
-            effect2,
-            successor2,
-            3,
-            claim.claim(),
-            claim.units(),
-        )) {
+        let permit = match output(
+            &core,
+            cohort1.reserve_reuse(role, effect2, successor2, 3, claim.claim(), claim.units()),
+        ) {
             TransitionOutput::ReusePermit(permit) => permit,
             other => panic!("expected resource reuse permit, got {other:?}"),
         };
         assert_eq!(permit.generation(), nz::<ResourceGeneration>(2));
-        core.tx(permit.activate());
+        tx(&core, permit.activate());
     }
 
     let (successor2_task, successor2_control) = spawn_service(successor2, "successor-v3");
@@ -388,20 +425,20 @@ fn run_dma_recovery_slice() {
         claims2,
     )
     .expect("second real request binds to reserved generations");
-    core.tx(cohort2.prepare());
-    let intent2 = commit_intent(&mut core, cohort2, digest(0x22));
+    tx(&core, cohort2.prepare());
+    let intent2 = commit_intent(&core, cohort2, digest(0x22));
     let published2 = publish_real_queue(&device, receipted2, cohort2)
         .unwrap_or_else(|_| panic!("second real queue publication must succeed"));
-    let committed2 = published2
-        .verify_commit(&core.engine, intent2, cohort2)
+    let committed2 = core
+        .observe(move |engine| published2.verify_commit(engine, intent2, cohort2))
         .unwrap_or_else(|_| panic!("second real queue commit receipt must verify"));
     let (request2, acknowledgement2) = committed2.into_parts();
-    core.tx(acknowledgement2);
+    tx(&core, acknowledgement2);
 
     // The first generation's genuine ISR receipt is copyable evidence, not
     // authority. The facade rejects it against the fresh request before any
     // used-ring mutation and returns the exact second request owner.
-    let stale_ack_projection = core.engine.projection_digest();
+    let stale_ack_projection = core.observe(Engine::projection_digest);
     let request2 = match complete_real_irq(request2, irq1) {
         InterruptCompletionProgress::NotReady {
             request,
@@ -417,19 +454,25 @@ fn run_dma_recovery_slice() {
             panic!("old-generation ISR receipt mutated the new request")
         }
     };
-    assert_eq!(core.engine.projection_digest(), stale_ack_projection);
+    assert_eq!(
+        core.observe(Engine::projection_digest),
+        stale_ack_projection
+    );
 
     let (completed2, irq2, irq_turns2, masked_intx) =
         wait_for_real_irq_completion(&mut root, &irq_slot, masked_intx, request2);
     stop_and_reap(&successor2_task, &successor2_control);
-    core.tx(CommandRequest::FenceIncarnation {
-        root: root_id,
-        crashed: successor2,
-        binding_generation: 3,
-    });
+    tx(
+        &core,
+        CommandRequest::FenceIncarnation {
+            root: root_id,
+            crashed: successor2,
+            binding_generation: 3,
+        },
+    );
     assert_retained(&core, cohort2);
     let second_close = close_real_generation(
-        &mut core,
+        &core,
         &mut root,
         &mut device,
         cohort2,
@@ -442,11 +485,11 @@ fn run_dma_recovery_slice() {
     assert_reusable(&core, cohort2);
 
     let address_reuse = first_addresses == second_addresses;
-    let final_pressure = core.engine.pressure();
+    let final_pressure = core.observe(Engine::pressure);
     assert_eq!(final_pressure.retained_claims, 0);
     assert!(!final_pressure.persistence_recovery_required);
     assert_eq!(device.device_generation(), 3);
-    assert!(core.journal.len() > 1_000);
+    assert!(core.observe_persistence(VolatileDmaDurability::encoded_len) > 1_000);
     assert_eq!(intx_route.device_bdf(), bdf);
     assert_eq!(masked_intx.route(), intx_route);
     assert_eq!(irq_slot.deliveries.load(Ordering::Acquire), 2);
@@ -473,20 +516,34 @@ fn run_dma_recovery_slice() {
     poweroff(ExitCode::Success);
 }
 
-fn enroll_new_effect(core: &mut VolatileCore, cohort: CoreDmaCohort) {
-    core.tx(cohort.create_estate());
+fn tx<C: Into<Command>>(core: &DmaRuntime, command: C) -> TransitionReceipt {
+    core.transact(command)
+        .map_err(|error| match error {
+            TxError::Core(error) => error,
+            TxError::Journal(error) => CoreError::Journal(error),
+            TxError::Persist(never) => match never {},
+        })
+        .expect("portable core transition must succeed")
+}
+
+fn output<C: Into<Command>>(core: &DmaRuntime, command: C) -> TransitionOutput {
+    tx(core, command).into_output()
+}
+
+fn enroll_new_effect(core: &DmaRuntime, cohort: CoreDmaCohort) {
+    tx(core, cohort.create_estate());
     for claim in cohort.enroll_claims() {
-        core.tx(claim);
+        tx(core, claim);
     }
-    core.tx(cohort.prepare());
+    tx(core, cohort.prepare());
 }
 
 fn commit_intent(
-    core: &mut VolatileCore,
+    core: &DmaRuntime,
     cohort: CoreDmaCohort,
     operation: Digest,
 ) -> cser_core::CommitIntent {
-    match core.output(cohort.record_commit_intent(operation)) {
+    match output(core, cohort.record_commit_intent(operation)) {
         TransitionOutput::CommitIntent(intent) => intent,
         other => panic!("expected commit intent, got {other:?}"),
     }
@@ -591,8 +648,12 @@ struct CloseObservation {
     iotlb_pending_observed: bool,
 }
 
+// Reset/IOTLB failures intentionally return the complete linear hardware
+// tombstone. Keep it inline rather than adding a fallible allocation after
+// reset has begun.
+#[allow(clippy::result_large_err)]
 fn close_real_generation(
-    core: &mut VolatileCore,
+    core: &DmaRuntime,
     root: &mut Root,
     device: &mut ProductionDevice,
     cohort: CoreDmaCohort,
@@ -626,18 +687,18 @@ fn close_real_generation(
     let reset = apply_real_reset_generation(device, reset, cohort)
         .unwrap_or_else(|_| panic!("real reset generation binds to core cohort"));
     for role in [ClaimRole::Queue, ClaimRole::PinnedPages, ClaimRole::Iova] {
-        let command = reset
-            .reset_command(&core.engine, cohort, role)
+        let command = core
+            .observe(|engine| reset.reset_command(engine, cohort, role))
             .expect("real reset receipt verifies sequentially");
-        core.tx(command);
+        tx(core, command);
     }
-    let irq_command = reset
-        .irq_drained_command(&core.engine, cohort, irq)
+    let irq_command = core
+        .observe(|engine| reset.irq_drained_command(engine, cohort, irq))
         .expect("exact real ISR receipt verifies queue drain");
-    core.tx(irq_command);
+    tx(core, irq_command);
 
-    let progress = reset
-        .begin_iotlb(&core.engine, device, cohort, inject_pending)
+    let progress = core
+        .observe(|engine| reset.begin_iotlb(engine, device, cohort, inject_pending))
         .unwrap_or_else(|_| panic!("real IOTLB closure begins after durable reset/IRQ facts"));
     let (closure, iotlb_pending_observed) = match progress {
         ProductionClosureProgress::Complete(closure) => (closure, false),
@@ -658,11 +719,11 @@ fn close_real_generation(
     };
     let closure = apply_real_iotlb_closure(device, closure, cohort)
         .unwrap_or_else(|_| panic!("real IOTLB closure binds to core cohort"));
-    for command in closure
-        .retirement_commands(&core.engine, cohort)
-        .expect("real IOTLB receipt verifies page and IOVA retirement")
-    {
-        core.tx(command);
+    let retirement_commands = core
+        .observe(|engine| closure.retirement_commands(engine, cohort))
+        .expect("real IOTLB receipt verifies page and IOVA retirement");
+    for command in retirement_commands {
+        tx(core, command);
     }
     drop(closure.into_receipt());
     CloseObservation {
@@ -671,36 +732,36 @@ fn close_real_generation(
     }
 }
 
-fn assert_retained(core: &VolatileCore, cohort: CoreDmaCohort) {
-    let estate = core
-        .engine
-        .estate(cohort.effect())
-        .expect("DMA estate remains present");
-    assert_eq!(estate.retained_claims, 3);
-    for role in [ClaimRole::Queue, ClaimRole::PinnedPages, ClaimRole::Iova] {
-        let claim = cohort.claim(role);
-        assert_eq!(
-            core.engine
-                .check_reusable(claim.resource(), claim.generation()),
-            Err(CoreError::ResourceRetained)
-        );
-    }
+fn assert_retained(core: &DmaRuntime, cohort: CoreDmaCohort) {
+    core.observe(|engine| {
+        let estate = engine
+            .estate(cohort.effect())
+            .expect("DMA estate remains present");
+        assert_eq!(estate.retained_claims, 3);
+        for role in [ClaimRole::Queue, ClaimRole::PinnedPages, ClaimRole::Iova] {
+            let claim = cohort.claim(role);
+            assert_eq!(
+                engine.check_reusable(claim.resource(), claim.generation()),
+                Err(CoreError::ResourceRetained)
+            );
+        }
+    });
 }
 
-fn assert_reusable(core: &VolatileCore, cohort: CoreDmaCohort) {
-    let estate = core
-        .engine
-        .estate(cohort.effect())
-        .expect("retired DMA estate remains inspectable");
-    assert_eq!(estate.retained_claims, 0);
-    for role in [ClaimRole::Queue, ClaimRole::PinnedPages, ClaimRole::Iova] {
-        let claim = cohort.claim(role);
-        assert_eq!(
-            core.engine
-                .check_reusable(claim.resource(), claim.generation()),
-            Ok(())
-        );
-    }
+fn assert_reusable(core: &DmaRuntime, cohort: CoreDmaCohort) {
+    core.observe(|engine| {
+        let estate = engine
+            .estate(cohort.effect())
+            .expect("retired DMA estate remains inspectable");
+        assert_eq!(estate.retained_claims, 0);
+        for role in [ClaimRole::Queue, ClaimRole::PinnedPages, ClaimRole::Iova] {
+            let claim = cohort.claim(role);
+            assert_eq!(
+                engine.check_reusable(claim.resource(), claim.generation()),
+                Ok(())
+            );
+        }
+    });
 }
 
 fn dma_claims(claim_base: u64, resource_generation: u64) -> CoreDmaClaims {
