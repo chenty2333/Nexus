@@ -1,49 +1,59 @@
 # CSER Core Production Cutover Release Ledger
 
 - RFC: `docs/rfcs/0006-cser-core-semantic-rebaseline.md`
-- Ledger status: **SEALED -- bounded QEMU cutover evidence**
-- Cutover commit A: `c06e9f43e931ed3f130da6dfcf29452a45406152`
-- Clean four-boot receipt digest D:
+- Ledger status: **RE-SEAL PENDING -- exact CI exposed a host-harness
+  compatibility gap**
+- Historical cutover commit A:
+  `c06e9f43e931ed3f130da6dfcf29452a45406152`
+- Historical clean four-boot receipt digest D-A:
   `e0f959e5c4027fb3952384b77de38b6c97e8c5bdd5a9c20f109c515361cf6f1e`
-- Attestation record B: **this status-only commit; its Git object identity is
-  the external provenance record**
+- Retained D-A preimage:
+  `docs/research/evidence/cser-core-rebaseline/c06e9f43e931ed3f130da6dfcf29452a45406152/combined-receipt.txt`
+- First attestation B: `de13e69363e59843ba5e0302fd983db27f6fd709`
+- Exact-B CI disposition: **FAIL before TPM provisioning completed or any
+  production boot; retained in
+  `docs/research/evidence/cser-core-rebaseline/de13e69363e59843ba5e0302fd983db27f6fd709/ci-failure.txt`**
+- Replacement cutover commit C: **PENDING**
+- Replacement clean receipt digest D-C: **PENDING**
+- Final evidence attestation E: **PENDING**
+- Intended immutable tag: `cser-core-rebaseline-2026-07-30`
 - Static cutover gate: `kernel/nexus-ostd/scripts/assert-cser-core-production-cutover.sh`
 
-Commit A and digest D above came from `seal-core-persistent-recovery` on the
-clean A tree. They were not copied from the earlier dirty-tree
-`combined-proof.txt`. This attestation commit changes only release status and
-documentation; it does not redefine the production cutover whose runtime
-behavior D attests.
+Commit A and D-A remain valid evidence for their exact source revision, and the
+receipt preimage is now retained in Git. They are not the final release seal:
+exact-B CI passed the full core/model/property/Loom gate, then Ubuntu 24.04's
+swtpm 0.7.3 rejected the optional `--tpmstate ...,lock` argument before the
+four-boot run. The replacement runner removes that redundant option under the
+existing single-daemon custody rules. A new clean source-bound receipt and CI
+PASS are required before this ledger returns to `SEALED`.
 
-## Two-Commit Seal Protocol
+## Replacement Seal Protocol
 
-The release used two commits to avoid an impossible commit which both contains
-its own receipt and claims that the receipt was generated from that same clean
-commit:
+The replacement seal avoids a self-referential commit and keeps runtime proof
+separate from evidence attestation:
 
-1. **Cutover commit A** contains the complete production semantic cutover,
-   verification wiring, and this ledger with pending attestation fields. A is
-   the revision whose runtime behavior is being attested.
-2. From the clean A tree,
-   `kernel/nexus-ostd/x seal-core-persistent-recovery`. The seal must complete
-   all four boots and produce `combined-receipt.txt` with `PASS`,
-   `seal_requested=true`, `git_source_tree_clean=true`, and `git_revision=A`.
-   Digest D is the SHA-256 recorded for that exact receipt.
-3. **Attestation commit B** replaces the pending A/D fields with those exact
-   values and records the completed ledger status. B records evidence about A;
-   it does not become a new semantic cutover revision and does not redefine the
-   receipt's execution identity.
+1. **Replacement cutover commit C** contains the unchanged production
+   semantics, the portable swtpm invocation, and this ledger with pending C/D-C
+   fields.
+2. From a clean C tree, run `./x verify`. The command must emit `CSER CORE
+   VERIFY PASS`, complete all focused and four-boot guests, and produce
+   `combined-receipt.txt` with `PASS`, `seal_requested=true`,
+   `git_source_tree_clean=true`, and `git_revision=C`.
+3. Push C by fast-forward and require both exact-C CI jobs to pass. Retain the
+   CI run identity, artifact digest, complete verification log, and the small
+   receipt preimage in Git.
+4. **Final evidence attestation E** records C, D-C, the exact-C CI result, and
+   the retained paths. E changes only documentation and evidence, then the
+   intended immutable tag identifies E without embedding E's own hash.
 
-B must not change production Rust sources, Cargo/OSDK wiring, the runner, the
-static gate, or the cutover contract. If such a change is required, the old D is
-inapplicable: create a new cutover commit A and seal it again. B need not embed
-its own commit hash; its Git object identity supplies that provenance without a
-self-reference cycle.
+E must not change production Rust sources, Cargo/OSDK wiring, the runner, the
+static gate, or the cutover contract. If such a change is required, D-C is
+inapplicable and another clean cutover revision is required.
 
 ## Removed Live Surfaces
 
-The sealed release has no live, default-build, kernel-adapter, or release-workflow
-dependency on these surfaces:
+The replacement production closure has no live, default-build, kernel-adapter,
+or release-workflow dependency on these surfaces:
 
 | Removed production surface | Required disposition at the cutover |
 | --- | --- |
@@ -80,8 +90,8 @@ through a tag.
 
 ## QEMU Evidence Boundary
 
-The clean receipt identified by A and D establishes only one hermetic run of
-the pinned OSTD/QEMU profile with:
+The retained historical receipt identified by A and D-A establishes only one
+hermetic run of the pinned OSTD/QEMU profile with:
 
 - four separate guest boots over the same `journal.raw`, reply `outbox.raw`,
   and swtpm state directory;
@@ -111,8 +121,11 @@ It does **not** establish:
 - physical-device, firmware, PCI, IOMMU, IRQ, SMP, or platform generality;
 - crash-persistent custody or retirement of the retained page frames or IOVAs;
 - authorization to reuse any retained PFN, IOVA, or quarantined queue resource;
-- absence of failures outside the exercised failpoints and bounded profile; or
-- any live dual-write, fallback, or compatibility path to the old Registry.
+- absence of failures outside the exercised failpoints and bounded profile.
+
+The static cutover gate, rather than the QEMU receipt, establishes that no live
+dual-write, fallback, or compatibility path to the old Registry is present in
+the production closure.
 
 QEMU reset, ISR-drain, and IOTLB observations justify continued quarantine only.
 They are not evidence that pre-crash PFN/IOVA ownership was retired or that the
@@ -120,7 +133,7 @@ resources became reusable.
 
 ## Seal Checklist
 
-Cutover commit A satisfied all of the following before it was created:
+Historical cutover A satisfied all of the following before it was created:
 
 - the static cutover gate passes against the default production graph;
 - the ordinary combined runner observes all four boot markers while preserving
@@ -129,10 +142,15 @@ Cutover commit A satisfied all of the following before it was created:
   from production adapters, the kernel, or release workflows; and
 - exactly one recovered core runtime is published before vNext ingress opens.
 
-The clean seal and this attestation then established all of the following:
+The retained clean A seal established all of the following for A:
 
 - the tree is clean before and throughout `seal-core-persistent-recovery`;
 - the clean receipt binds all four markers and its source/tool hashes to A;
 - the receipt retains the QEMU-only and resource-retention non-claims above;
-- digest D is computed from that exact receipt; and
-- attestation commit B records A and D without changing the semantic cutover.
+- digest D-A is computed from that exact receipt; and
+- the D-A preimage is now retained in Git rather than depending on an ignored
+  local artifact.
+
+The replacement release remains open until clean C/D-C and exact-C CI satisfy
+the protocol above. The B failure is negative harness evidence, not a runtime
+PASS and not a reason to weaken any semantic gate.

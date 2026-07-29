@@ -33,8 +33,8 @@ claim. The short technical statement is [docs/CSER.md](docs/CSER.md).
 
 ## Working semantic contract
 
-These requirements define the rebaselined portable core and its current
-production-profile candidate. They are not broader production-readiness or
+These requirements define the rebaselined portable core and its implemented,
+bounded `cser-production` profile. They are not broader production-readiness or
 hardware claims; the evidence boundary for current `main` is stated below.
 
 - **Causal scopes and effects** record the authority that created work and the
@@ -72,7 +72,7 @@ kernel, service, resource, and device map is
 | Track | Status | Meaning |
 | --- | --- | --- |
 | `v0.1.0` | Published, archived research artifact | Bounded CSER composition with reproducible models, implementation slices, and receipts |
-| Current `main` | CSER Core Rebaseline sealed | Portable core, persistent recovery, reply/DMA recovery, and the single production Registry cutover are sealed at `c06e9f4` by the bounded four-boot receipt recorded in the release ledger |
+| Current `main` | CSER Core Rebaseline re-seal pending | Portable core, persistent recovery, reply/DMA recovery, and the single production Registry cutover are implemented; exact CI exposed a swtpm 0.7.3 harness incompatibility after the full core gate, so the portable replacement runner still requires a new clean receipt |
 | Production system | Not established | The `cser-production` profile is a bounded QEMU research path, not a hardware-general, SMP, availability, or production-readiness result |
 | Paper | None peer reviewed | `NARRATIVE.md` is a technical research account; the Zenodo object is software and reproducibility evidence |
 
@@ -119,17 +119,20 @@ reply outbox, and swtpm state, with device quarantine established before
 replay. Those focused schemes provide domain evidence; they are not alternate
 production Registries and do not introduce live dual-write.
 
-The clean exact-revision receipt and release ledger seal the bounded rebaseline
-at `c06e9f4`. The four production boots show initial commit and retained claims,
-a second service crash after durable reply apply intent, reconciliation without
-a second intent and final settlement, and a stable repeated-recovery boot. The
-host oracle verifies service/binding generations `1/1` through `4/4` and
-strictly increasing boot, journal, and device freshness. This receipt remains
-bounded to one-vCPU QEMU/TCG and swtpm: it does not establish physical TPM
-anti-rollback, physical power-loss behavior, hardware-general DMA quiescence or
-custody, crash-persistent PFN/IOVA custody, resource reuse authorization, or SMP
-correctness. Historical IRQ Phase A and `v0.1.0` evidence retain their original
-boundaries.
+The historical clean receipt at `c06e9f4` remains retained evidence for its
+exact runner. It shows initial commit and retained claims, a second service
+crash after durable reply apply intent, reconciliation without a second intent
+and final settlement, a stable repeated-recovery boot, service/binding
+generations `1/1` through `4/4`, and increasing boot, journal, and device
+freshness. Exact-B CI subsequently passed the full core/model/property/Loom
+gate but rejected an optional swtpm state-lock argument before the production
+boots. The replacement single-daemon harness removes that portability defect;
+current release status remains open until its new clean receipt and CI PASS are
+retained. Every such receipt remains bounded to one-vCPU QEMU/TCG and swtpm: it
+does not establish physical TPM anti-rollback, physical power-loss behavior,
+hardware-general DMA quiescence or custody, crash-persistent PFN/IOVA custody,
+resource reuse authorization, or SMP correctness. Historical IRQ Phase A and
+`v0.1.0` evidence retain their original boundaries.
 
 ## Use the repository
 

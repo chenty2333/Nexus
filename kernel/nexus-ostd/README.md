@@ -98,9 +98,12 @@ with `NONSEALABLE`; it is suitable for pre-commit integration but not release
 evidence. `seal-core-persistent-recovery` first requires a clean source tree and
 then writes `combined-receipt.txt` with `PASS` only if the tree remains clean
 through the run. The archived production/focused ISOs, boot serial logs, QEMU
-debug traces, raw media, and swtpm logs remain beside it. Cutover commit
-`c06e9f43e931ed3f130da6dfcf29452a45406152` passed that clean seal; its receipt
-SHA-256 is recorded in the production cutover release ledger.
+debug traces, raw media, and swtpm logs remain beside it. Historical cutover
+`c06e9f43e931ed3f130da6dfcf29452a45406152` passed that clean seal and its
+receipt preimage is retained. After exact CI exposed an optional swtpm 0.7.3
+state-lock incompatibility, the portable replacement runner requires a new
+clean receipt; current disposition is recorded in the production cutover
+release ledger.
 
 ## Workflow
 

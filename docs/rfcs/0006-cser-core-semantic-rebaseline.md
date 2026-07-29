@@ -1,13 +1,14 @@
 # RFC 0006: CSER core semantic rebaseline
 
-- Status: **Implemented and sealed for the bounded QEMU profile**
+- Status: **Implemented; replacement exact-revision seal pending after a
+  swtpm host-harness compatibility correction**
 - Decision date: 2026-07-29
 - Pre-rebaseline checkpoint: `05e68b19b219d0f5288de5438127b5690cd7e50f`
 - Recovery references:
   `archive/pre-cser-core-rebaseline-2026-07-29` and
   `pre-cser-core-rebaseline-2026-07-29`
-- API stability: **R4 closed; profile 1, journal schema 5, and the standard
-  catalog digest are frozen**
+- API stability: **profile 1, journal schema 5, and the standard catalog
+  digest remain frozen; final release attestation is pending**
 - Changes accepted `v0.1.0` claims: **no**
 
 ## Decision
@@ -517,7 +518,8 @@ They are ordered by semantic dependency, not feature count.
 
 ### Current implementation status (2026-07-30)
 
-The R6 cutover is sealed for the bounded evidence profile:
+The runtime implementation is complete, but the R6 release attestation is
+temporarily open while its replacement exact-revision seal runs:
 
 - `cser-core` is the portable authoritative state machine, with domain-defined
   reply and DMA obligation/claim profiles, versioned journal records,
@@ -542,12 +544,18 @@ The R6 cutover is sealed for the bounded evidence profile:
   performs a fresh stable Rebind. The host gate observes exact service/binding
   pairs `1/1`, `2/2`, `3/3`, and `4/4`.
 
-Cutover commit `c06e9f43e931ed3f130da6dfcf29452a45406152` passed the clean
-four-boot seal. The receipt SHA-256 is
+Historical cutover `c06e9f43e931ed3f130da6dfcf29452a45406152` passed a clean
+four-boot seal. Its retained receipt SHA-256 is
 `e0f959e5c4027fb3952384b77de38b6c97e8c5bdd5a9c20f109c515361cf6f1e`;
-the release ledger records its exact boundary. R4, R5, and R6 are closed within
-that boundary. The QEMU/swtpm path does not establish physical TPM
-anti-rollback, physical power-loss recovery, hardware-general DMA quiescence,
+the release ledger records its exact boundary and tracked preimage. Exact-B CI
+then passed the complete core/model/property/Loom gate but found that Ubuntu
+24.04's swtpm 0.7.3 rejects the optional state-backend `lock` parameter before
+TPM provisioning can complete. The single-daemon harness no longer requires
+that optional parameter. R4/R5/R6 release closure now waits for the clean
+replacement receipt and exact-revision CI PASS; the A receipt is historical,
+not substituted for that pending result. The QEMU/swtpm path does not establish
+physical TPM anti-rollback, physical power-loss recovery, hardware-general DMA
+quiescence,
 crash-persistent PFN/IOVA custody, or resource reuse. Global reset, ISR drain,
 and IOTLB observations preserve quarantine; they do not by themselves prove
 retirement of old page/IOVA claims.
@@ -791,7 +799,9 @@ establishes all of the following together:
 - a single production Registry after an atomic cutover; and
 - immutable historical evidence plus exact new claims and non-claims.
 
-The exact source-bound evidence chain above is sealed by the production cutover
-release ledger. Completion is limited to its declared QEMU/swtpm/ATA profile;
-API cleanup, a passing unit suite, or a renamed Registry alone would not have
-satisfied this acceptance contract.
+The implementation and historical A receipt cover these semantics within the
+declared QEMU/swtpm/ATA boundary, but the current source-bound release chain is
+not complete until the replacement clean receipt and exact-revision CI result
+are retained by the production cutover release ledger. API cleanup, a passing
+unit suite, or a renamed Registry alone does not satisfy this acceptance
+contract.

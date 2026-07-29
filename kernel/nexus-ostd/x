@@ -890,9 +890,13 @@ start_core_persistent_swtpm() {
         return 1
     fi
     rm -f "$core_persistent_socket" "$core_persistent_pid_file"
+    # The runner-wide repo/kernel flocks and sequential boot loop give this
+    # daemon exclusive custody of the state directory. Do not require the
+    # optional swtpm backend `lock` flag, which Ubuntu 24.04's swtpm 0.7.3
+    # does not implement.
     swtpm socket \
         --tpm2 \
-        --tpmstate "dir=$core_persistent_state_dir,lock" \
+        --tpmstate "dir=$core_persistent_state_dir" \
         --ctrl "type=unixio,path=$core_persistent_socket" \
         --flags not-need-init,startup-none,disable-auto-shutdown \
         --log "file=$core_persistent_artifact_dir/swtpm.log,level=20" \

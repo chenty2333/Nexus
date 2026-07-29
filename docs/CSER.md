@@ -96,19 +96,21 @@ The complete claim ledger, including every explicit non-claim, is
 
 RFC 0001, RFC 0005, and their phase numbering are historical inputs to
 [RFC 0006](rfcs/0006-cser-core-semantic-rebaseline.md), not the active roadmap.
-The sealed rebaseline uses `cser-core` as the portable semantic owner,
+The implemented rebaseline uses `cser-core` as the portable semantic owner,
 an independent safe-Rust oracle, domain-defined reply and DMA obligations and
 claims, a versioned journal, ATA PIO journal/outbox providers, TPM2 NV
 freshness/catalog binding, boot-time VirtIO/VT-d quarantine, and one recovered
 production Registry shared by the NXP3 portal and core-v1 supervisor.
 
-The clean exact-revision acceptance receipt covers focused real-task reply and
-real-device DMA guests, then four production boots over the same journal,
+The retained historical receipt for `c06e9f4` covers focused real-task reply
+and real-device DMA guests, then four production boots over the same journal,
 outbox, and swtpm state. It establishes exact service reap and production
 ingress closure, fresh Ready/Rebind tasks, a durable apply intent, a second
 successor crash, reconciliation without a second intent, and stable replay
-while retaining page and IOVA claims. The release ledger binds that receipt to
-cutover `c06e9f4`. The QEMU/swtpm evidence does not establish physical TPM
+while retaining page and IOVA claims. Exact CI later exposed an unsupported
+optional swtpm 0.7.3 lock parameter before the boot run, so the portable runner
+requires a replacement clean seal before current release closure. The
+QEMU/swtpm evidence does not establish physical TPM
 anti-rollback, physical power-loss durability, crash-persistent PFN/IOVA
 custody, SMP, or hardware-general DMA quiescence and does not authorize
 resource reuse.

@@ -38,9 +38,11 @@ tcti="swtpm:path=$server_socket"
 
 start_swtpm() {
     rm -f -- "$server_socket" "$control_socket" "$pid_file"
+    # Each restart fully reaps the preceding daemon, so this fixture has one
+    # state-directory owner without relying on the optional backend lock flag.
     swtpm socket \
         --tpm2 \
-        --tpmstate "dir=$fixture_dir,lock" \
+        --tpmstate "dir=$fixture_dir" \
         --ctrl "type=unixio,path=$control_socket" \
         --server "type=unixio,path=$server_socket" \
         --flags not-need-init,startup-clear,disable-auto-shutdown \

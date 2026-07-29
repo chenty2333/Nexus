@@ -15,7 +15,8 @@ fi
 
 for command in swtpm tpm2_nvdefine tpm2_nvreadpublic tpm2_nvread \
     tpm2_nvwrite tpm2_nvincrement tpm2_startauthsession \
-    tpm2_policycommandcode tpm2_flushcontext xxd sha256sum cmp stat; do
+    tpm2_policycommandcode tpm2_flushcontext xxd sha256sum cmp stat \
+    cut flock realpath; do
     if ! command -v "$command" >/dev/null 2>&1; then
         echo "missing required command: $command" >&2
         exit 1
@@ -36,6 +37,15 @@ fi
 catalog_hex=${catalog_hex,,}
 readonly catalog_hex
 mkdir -p -- "$state_dir"
+state_dir=$(realpath -e -- "$state_dir")
+state_lock_key=$(printf '%s' "$state_dir" | sha256sum | cut -c1-32)
+state_lock="/tmp/cser-tpm-nv-provision-$state_lock_key.lock"
+exec 9>"$state_lock"
+if ! flock -n 9; then
+    echo "TPM state directory is already owned by another provisioner: $state_dir" >&2
+    exit 1
+fi
+readonly state_dir state_lock_key state_lock
 if [[ -n $(find "$state_dir" -mindepth 1 -maxdepth 1 -print -quit) ]]; then
     echo "TPM state directory must be empty before provisioning: $state_dir" >&2
     exit 1
@@ -58,9 +68,11 @@ control_socket="$server_socket.ctrl"
 pid_file="$work_dir/swtpm.pid"
 tcti="swtpm:path=$server_socket"
 
+# The host flock above gives this daemon exclusive custody. The optional swtpm
+# backend lock is unnecessary and is not available in Ubuntu 24.04's 0.7.3.
 swtpm socket \
     --tpm2 \
-    --tpmstate "dir=$state_dir,lock" \
+    --tpmstate "dir=$state_dir" \
     --ctrl "type=unixio,path=$control_socket" \
     --server "type=unixio,path=$server_socket" \
     --flags not-need-init,startup-clear,disable-auto-shutdown \
