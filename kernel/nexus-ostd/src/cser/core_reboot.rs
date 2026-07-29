@@ -1,0 +1,767 @@
+// SPDX-License-Identifier: MPL-2.0
+
+//! Fail-closed boot boundary for persistent CSER recovery.
+//!
+//! This module is deliberately production-shaped without pretending that the
+//! current OSTD 0.18 platform supplies a production trusted anchor.  A real
+//! caller must provide three independent owners:
+//!
+//! - a journal which can read, repair, append, and durably synchronize exact
+//!   journal bytes;
+//! - a [`TrustedAnchorBackend`] whose state cannot be rolled back together
+//!   with the journal; and
+//! - a boot quarantine guard which owns every CSER-managed device while reset,
+//!   IRQ drain, and IOTLB reconciliation are incomplete.
+//!
+//! Recovery reserves freshness only after the device quarantine exists.  It
+//! replays exactly the trusted journal head, repairs at most one ignored
+//! suffix, durably checkpoints the reserved boot epoch, and keeps the
+//! quarantine guard alive.  No activation owner is returned until the core has
+//! retired every recovered device claim and the hardware provider explicitly
+//! releases the guard.
+
+use alloc::{boxed::Box, vec::Vec};
+
+use cser_core::{
+    Command, CommandRequest, CoordinatedPersistence, CoordinatedPersistenceError, CoreError,
+    CoreLimits, DeviceGeneration, DomainCatalog, DurableJournalBackend, Engine, JournalRepair,
+    RecoveryBinding, TransitionReceipt, TrustedAnchorBackend, TxError,
+};
+
+/// Platform support absent from the current OSTD 0.18 Nexus embedding.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Ostd018RecoveryGap {
+    /// OSTD exposes no TPM/NV or equivalent non-rollback monotonic store.
+    NonRollbackTrustedAnchor,
+    /// The kernel has no writable, flush-capable persistent journal owner.
+    DurableWritableJournal,
+    /// No boot provider reconstructs and owns all persisted device scopes.
+    PersistentDeviceQuarantine,
+}
+
+/// Current production-recovery gaps.
+///
+/// This constant is an explicit non-claim.  The coordinator below is not
+/// production evidence until concrete providers close all three entries.
+pub(crate) const OSTD_018_RECOVERY_GAPS: [Ostd018RecoveryGap; 3] = [
+    Ostd018RecoveryGap::NonRollbackTrustedAnchor,
+    Ostd018RecoveryGap::DurableWritableJournal,
+    Ostd018RecoveryGap::PersistentDeviceQuarantine,
+];
+
+/// Journal operations required before ordinary durable appends can resume.
+pub(crate) trait OstdBootJournal: DurableJournalBackend {
+    /// Error from boot-time reads or exact suffix repair.
+    type RecoveryError;
+
+    /// Reads the complete durable journal image.
+    fn read_all(&mut self) -> Result<Vec<u8>, Self::RecoveryError>;
+
+    /// Removes exactly the suffix named by anchored recovery and synchronizes
+    /// the repaired durable image before returning.
+    ///
+    /// Returning an error is fail-closed.  The caller will not append or
+    /// activate this journal instance.
+    fn repair_and_sync(&mut self, repair: JournalRepair) -> Result<(), Self::RecoveryError>;
+}
+
+/// Linear owner of the boot-time hardware quarantine.
+///
+/// Dropping a guard must leave device DMA and interrupt authority disabled.
+/// The only operation which may return a live device owner is
+/// [`Self::try_activate`].
+pub(crate) trait BootDeviceQuarantineGuard: Sized {
+    /// Provider-specific activation failure.
+    type Error;
+    /// Live device owner returned only after successful release.
+    type Activation;
+
+    /// Monotonic device generation established while all managed devices are
+    /// physically fenced.
+    fn observed_generation(&self) -> DeviceGeneration;
+
+    /// Attempts to release hardware quarantine.
+    ///
+    /// Failure returns the same guard so the caller cannot accidentally drop
+    /// the only retained recovery owner.
+    fn try_activate(self) -> Result<Self::Activation, (Self, Self::Error)>;
+}
+
+/// Provider which establishes physical quarantine before journal replay.
+pub(crate) trait BootDeviceQuarantine: Sized {
+    /// Provider-specific quarantine failure.
+    type Error;
+    /// Linear guard retaining the quarantined device owners.
+    type Guard: BootDeviceQuarantineGuard;
+
+    /// Fences every device which may be named by the persistent CSER Registry.
+    ///
+    /// A production implementation must disable new queue publication and
+    /// interrupt delivery, retain DMA owners, and establish a reset-domain
+    /// generation before returning.
+    fn quarantine_all(self) -> Result<Self::Guard, Self::Error>;
+}
+
+/// Trusted-provider contract violation detected after a freshness reservation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BootProviderContractError {
+    /// The lease describes a different Registry/catalog/binding tuple.
+    RecoveryBindingMismatch,
+    /// The lease does not bind the generation established by quarantine.
+    DeviceGenerationMismatch,
+}
+
+/// Failure while constructing one quarantined recovered boot.
+#[derive(Debug)]
+pub(crate) enum BootRecoveryError<JournalRecovery, JournalWrite, Anchor, Quarantine> {
+    /// Hardware quarantine could not be established.
+    Quarantine(Quarantine),
+    /// Durable journal bytes could not be read.
+    JournalRead(JournalRecovery),
+    /// The exact ignored suffix could not be durably removed.
+    JournalRepair(JournalRecovery),
+    /// The trusted provider could not reserve a fresh recovery epoch.
+    Anchor(Anchor),
+    /// A provider returned coordinates outside its trusted contract.
+    ProviderContract(BootProviderContractError),
+    /// A reserved lease could not become the core's one-shot recovery anchor.
+    RecoveryAnchor(cser_core::RecoveryAnchorError),
+    /// Anchored journal replay rejected the bytes or freshness coordinates.
+    Core(CoreError),
+    /// Exact repair did not produce a clean anchored prefix.
+    RepairDidNotConverge(JournalRepair),
+    /// The recovery checkpoint failed or became ambiguous.
+    Checkpoint(TxError<CoordinatedPersistenceError<JournalWrite, Anchor>>),
+}
+
+/// Why hardware activation remains blocked.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BootActivationBlock {
+    /// A recovered journal tail still requires repair.
+    JournalRepairRequired,
+    /// A previous durability operation has an ambiguous result.
+    PersistenceRecoveryRequired,
+    /// At least one recovered device claim is still quarantined.
+    DeviceClaimsRetained,
+    /// The engine and trusted anchor do not name the same exact durable tip.
+    TrustedTipMismatch,
+}
+
+/// Failed attempt to turn a quarantined recovery owner into an active owner.
+#[derive(Debug)]
+pub(crate) enum BootActivationFailure<Boot, ProviderError> {
+    /// Core recovery state still forbids device activation.
+    Blocked {
+        /// Exact fail-closed reason.
+        reason: BootActivationBlock,
+        /// Unchanged boot owner retaining the quarantine guard.
+        boot: Box<Boot>,
+    },
+    /// The hardware provider rejected release and returned its guard.
+    Provider {
+        /// Provider-specific failure.
+        error: ProviderError,
+        /// Reconstructed boot owner retaining the returned guard.
+        boot: Box<Boot>,
+    },
+}
+
+/// Recovered core whose physical device owners remain quarantined.
+#[derive(Debug)]
+pub(crate) struct QuarantinedRecoveredBoot<J, A, G> {
+    engine: Engine,
+    persistence: CoordinatedPersistence<J, A>,
+    guard: G,
+}
+
+type DurableTxError<J, A> = TxError<
+    CoordinatedPersistenceError<
+        <J as DurableJournalBackend>::Error,
+        <A as TrustedAnchorBackend>::Error,
+    >,
+>;
+
+type ActivationResult<J, A, G> = Result<
+    ActivatedRecoveredBoot<J, A, <G as BootDeviceQuarantineGuard>::Activation>,
+    BootActivationFailure<
+        QuarantinedRecoveredBoot<J, A, G>,
+        <G as BootDeviceQuarantineGuard>::Error,
+    >,
+>;
+
+type RecoveryResult<J, A, Q> = Result<
+    QuarantinedRecoveredBoot<J, A, <Q as BootDeviceQuarantine>::Guard>,
+    BootRecoveryError<
+        <J as OstdBootJournal>::RecoveryError,
+        <J as DurableJournalBackend>::Error,
+        <A as TrustedAnchorBackend>::Error,
+        <Q as BootDeviceQuarantine>::Error,
+    >,
+>;
+
+impl<J, A, G> QuarantinedRecoveredBoot<J, A, G>
+where
+    J: OstdBootJournal,
+    A: TrustedAnchorBackend,
+    G: BootDeviceQuarantineGuard,
+{
+    /// Runs a read-only observation while no live device owner exists.
+    pub(crate) fn observe<R>(&self, operation: impl FnOnce(&Engine) -> R) -> R {
+        operation(&self.engine)
+    }
+
+    /// Executes a manager-only recovery transition durably.
+    ///
+    /// This does not open external ingress or release the quarantine guard.
+    pub(crate) fn recovery_transact<C>(
+        &mut self,
+        command: C,
+    ) -> Result<TransitionReceipt, DurableTxError<J, A>>
+    where
+        C: Into<Command>,
+    {
+        self.engine.transact_durable(command, &mut self.persistence)
+    }
+
+    /// Returns the exact reason an activation permit cannot yet be issued.
+    pub(crate) fn activation_block(&self) -> Option<BootActivationBlock> {
+        if self.engine.journal_repair_required().is_some() {
+            return Some(BootActivationBlock::JournalRepairRequired);
+        }
+        if self.engine.persistence_recovery_required() || self.persistence.recovery_required() {
+            return Some(BootActivationBlock::PersistenceRecoveryRequired);
+        }
+        if self.engine.pressure().quarantined {
+            return Some(BootActivationBlock::DeviceClaimsRetained);
+        }
+        let committed = self.persistence.committed();
+        if self.engine.revision() != committed.revision()
+            || self.engine.head() != committed.head()
+            || self.engine.freshness() != committed.committed_freshness()
+        {
+            return Some(BootActivationBlock::TrustedTipMismatch);
+        }
+        None
+    }
+
+    /// Consumes the quarantined owner and requests the sole activation token.
+    pub(crate) fn try_activate(self) -> ActivationResult<J, A, G> {
+        if let Some(reason) = self.activation_block() {
+            return Err(BootActivationFailure::Blocked {
+                reason,
+                boot: Box::new(self),
+            });
+        }
+
+        let Self {
+            engine,
+            persistence,
+            guard,
+        } = self;
+        match guard.try_activate() {
+            Ok(devices) => Ok(ActivatedRecoveredBoot {
+                engine,
+                persistence,
+                devices,
+            }),
+            Err((guard, error)) => Err(BootActivationFailure::Provider {
+                error,
+                boot: Box::new(Self {
+                    engine,
+                    persistence,
+                    guard,
+                }),
+            }),
+        }
+    }
+}
+
+/// Activation permit which couples the exact durable tip to live devices.
+///
+/// Constructing this type is impossible while journal repair, ambiguous
+/// persistence, or recovered device claims still impose quarantine.
+#[derive(Debug)]
+pub(crate) struct ActivatedRecoveredBoot<J, A, D> {
+    engine: Engine,
+    persistence: CoordinatedPersistence<J, A>,
+    devices: D,
+}
+
+impl<J, A, D> ActivatedRecoveredBoot<J, A, D>
+where
+    J: OstdBootJournal,
+    A: TrustedAnchorBackend,
+{
+    /// Executes an ordinary durable transition after activation.
+    pub(crate) fn transact<C>(
+        &mut self,
+        command: C,
+    ) -> Result<TransitionReceipt, DurableTxError<J, A>>
+    where
+        C: Into<Command>,
+    {
+        self.engine.transact_durable(command, &mut self.persistence)
+    }
+
+    /// Transfers the exact core, persistence coordinator, and live device
+    /// owner into the production runtime installation boundary.
+    pub(crate) fn into_parts(self) -> (Engine, CoordinatedPersistence<J, A>, D) {
+        (self.engine, self.persistence, self.devices)
+    }
+}
+
+/// Recovers one boot while retaining every physical device owner.
+///
+/// One anchored suffix repair is permitted.  Because a [`RecoveryLease`] is
+/// intentionally single-use, a repaired retry reserves a newer logical
+/// recovery epoch even within the same physical boot.
+pub(crate) fn recover_quarantined_boot<J, A, Q>(
+    catalog: DomainCatalog,
+    limits: CoreLimits,
+    binding: RecoveryBinding,
+    mut journal: J,
+    mut anchor: A,
+    quarantine: Q,
+) -> RecoveryResult<J, A, Q>
+where
+    J: OstdBootJournal,
+    A: TrustedAnchorBackend,
+    Q: BootDeviceQuarantine,
+{
+    let guard = quarantine
+        .quarantine_all()
+        .map_err(BootRecoveryError::Quarantine)?;
+    let observed_generation = guard.observed_generation();
+    let mut repaired_once = false;
+
+    loop {
+        let bytes = journal.read_all().map_err(BootRecoveryError::JournalRead)?;
+        let lease = anchor
+            .reserve_recovery_epoch(binding, observed_generation)
+            .map_err(BootRecoveryError::Anchor)?;
+        if lease.committed().binding() != binding {
+            return Err(BootRecoveryError::ProviderContract(
+                BootProviderContractError::RecoveryBindingMismatch,
+            ));
+        }
+        if lease.next_freshness().device() != observed_generation {
+            return Err(BootRecoveryError::ProviderContract(
+                BootProviderContractError::DeviceGenerationMismatch,
+            ));
+        }
+
+        let next_freshness = lease.next_freshness();
+        let mut persistence = CoordinatedPersistence::from_recovery_lease(journal, anchor, &lease);
+        let report = Engine::recover(
+            catalog.clone(),
+            limits,
+            lease
+                .into_recovery_anchor()
+                .map_err(BootRecoveryError::RecoveryAnchor)?,
+            &bytes,
+        )
+        .map_err(BootRecoveryError::Core)?;
+
+        if let Some(repair) = report.journal_repair() {
+            if repaired_once {
+                return Err(BootRecoveryError::RepairDidNotConverge(repair));
+            }
+            let (mut recovered_journal, recovered_anchor) = persistence.into_backends();
+            recovered_journal
+                .repair_and_sync(repair)
+                .map_err(BootRecoveryError::JournalRepair)?;
+            journal = recovered_journal;
+            anchor = recovered_anchor;
+            repaired_once = true;
+            continue;
+        }
+
+        let mut engine = report.into_engine();
+        engine
+            .transact_durable(
+                CommandRequest::CheckpointRecovery {
+                    boot: next_freshness.boot(),
+                    journal: next_freshness.journal(),
+                    device: next_freshness.device(),
+                },
+                &mut persistence,
+            )
+            .map_err(BootRecoveryError::Checkpoint)?;
+        return Ok(QuarantinedRecoveredBoot {
+            engine,
+            persistence,
+            guard,
+        });
+    }
+}
+
+#[cfg(ktest)]
+mod tests {
+    use super::*;
+    use alloc::vec;
+    use cser_core::{
+        BootGeneration, ChargeAccountId, ClaimId, ClaimScope, DEVICE_CLAIM_QUEUE_SLOT,
+        DEVICE_DOMAIN, DEVICE_OBLIGATION_DMA, DeviceScopeId, Digest, EffectId, Freshness,
+        JournalGeneration, PrincipalId, PrincipalIncarnation, RegistryInstance, ResourceGeneration,
+        ResourceId, RootId, TrustedAnchorSnapshot, standard_catalog,
+    };
+    use ostd::prelude::ktest;
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum MockError {
+        Binding,
+        Stale,
+        Repair,
+    }
+
+    #[derive(Debug)]
+    struct MemoryJournal {
+        bytes: Vec<u8>,
+        repairs: u8,
+    }
+
+    impl DurableJournalBackend for MemoryJournal {
+        type Error = MockError;
+
+        fn append_and_sync(
+            &mut self,
+            record: &cser_core::JournalRecord,
+        ) -> Result<(), Self::Error> {
+            self.bytes.extend_from_slice(record.bytes());
+            Ok(())
+        }
+    }
+
+    impl OstdBootJournal for MemoryJournal {
+        type RecoveryError = MockError;
+
+        fn read_all(&mut self) -> Result<Vec<u8>, Self::RecoveryError> {
+            Ok(self.bytes.clone())
+        }
+
+        fn repair_and_sync(&mut self, repair: JournalRepair) -> Result<(), Self::RecoveryError> {
+            let offset = match repair {
+                JournalRepair::TornTail { offset } | JournalRepair::UnanchoredSuffix { offset } => {
+                    offset
+                }
+            };
+            if offset > self.bytes.len() {
+                return Err(MockError::Repair);
+            }
+            self.bytes.truncate(offset);
+            self.repairs = self.repairs.checked_add(1).ok_or(MockError::Repair)?;
+            Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct MemoryAnchor {
+        committed: TrustedAnchorSnapshot,
+        issued: Freshness,
+        reservations: u8,
+    }
+
+    impl TrustedAnchorBackend for MemoryAnchor {
+        type Error = MockError;
+
+        fn reserve_recovery_epoch(
+            &mut self,
+            binding: RecoveryBinding,
+            observed_device: DeviceGeneration,
+        ) -> Result<cser_core::RecoveryLease, Self::Error> {
+            if binding != self.committed.binding() {
+                return Err(MockError::Binding);
+            }
+            if observed_device.get() < self.issued.device().get() {
+                return Err(MockError::Stale);
+            }
+            let boot = BootGeneration::new(
+                self.issued
+                    .boot()
+                    .get()
+                    .checked_add(1)
+                    .ok_or(MockError::Stale)?,
+            )
+            .map_err(|_| MockError::Stale)?;
+            let journal = JournalGeneration::new(
+                self.issued
+                    .journal()
+                    .get()
+                    .checked_add(1)
+                    .ok_or(MockError::Stale)?,
+            )
+            .map_err(|_| MockError::Stale)?;
+            let next = Freshness::new(
+                boot,
+                binding.registry(),
+                binding.binding(),
+                observed_device,
+                journal,
+            )
+            .map_err(|_| MockError::Stale)?;
+            self.issued = next;
+            self.reservations = self.reservations.checked_add(1).ok_or(MockError::Stale)?;
+            cser_core::RecoveryLease::from_trusted_backend(self.committed, next)
+                .map_err(|_| MockError::Stale)
+        }
+
+        fn compare_and_advance(
+            &mut self,
+            expected: TrustedAnchorSnapshot,
+            replacement: TrustedAnchorSnapshot,
+        ) -> Result<(), Self::Error> {
+            if expected != self.committed
+                || expected.revision().checked_add(1) != Some(replacement.revision())
+                || replacement.committed_freshness() != self.issued
+            {
+                return Err(MockError::Stale);
+            }
+            self.committed = replacement;
+            Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct MockQuarantine {
+        observed: DeviceGeneration,
+        reject_activation: bool,
+    }
+
+    #[derive(Debug)]
+    struct MockGuard {
+        observed: DeviceGeneration,
+        reject_activation: bool,
+    }
+
+    #[derive(Debug)]
+    struct MockLiveDevices;
+
+    impl BootDeviceQuarantine for MockQuarantine {
+        type Error = MockError;
+        type Guard = MockGuard;
+
+        fn quarantine_all(self) -> Result<Self::Guard, Self::Error> {
+            Ok(MockGuard {
+                observed: self.observed,
+                reject_activation: self.reject_activation,
+            })
+        }
+    }
+
+    impl BootDeviceQuarantineGuard for MockGuard {
+        type Error = MockError;
+        type Activation = MockLiveDevices;
+
+        fn observed_generation(&self) -> DeviceGeneration {
+            self.observed
+        }
+
+        fn try_activate(self) -> Result<Self::Activation, (Self, Self::Error)> {
+            if self.reject_activation {
+                Err((self, MockError::Stale))
+            } else {
+                Ok(MockLiveDevices)
+            }
+        }
+    }
+
+    fn initial_freshness(device: u64) -> Freshness {
+        Freshness::new(
+            BootGeneration::new(1).unwrap(),
+            RegistryInstance::new(17).unwrap(),
+            23,
+            DeviceGeneration::new(device).unwrap(),
+            JournalGeneration::new(1).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn binding() -> RecoveryBinding {
+        RecoveryBinding::new(
+            standard_catalog().digest(),
+            RegistryInstance::new(17).unwrap(),
+            23,
+        )
+        .unwrap()
+    }
+
+    fn genesis_anchor() -> MemoryAnchor {
+        let freshness = initial_freshness(1);
+        MemoryAnchor {
+            committed: TrustedAnchorSnapshot::from_trusted_backend(
+                binding(),
+                freshness,
+                0,
+                Digest::ZERO,
+            )
+            .unwrap(),
+            issued: freshness,
+            reservations: 0,
+        }
+    }
+
+    fn quarantined_device_fixture() -> (MemoryJournal, MemoryAnchor) {
+        let mut engine = Engine::new(
+            standard_catalog(),
+            CoreLimits::bounded_default(),
+            initial_freshness(1),
+        );
+        let mut bytes = Vec::new();
+        let root = RootId::new(9).unwrap();
+        let effect = EffectId::new(root, 1).unwrap();
+        let actor = PrincipalIncarnation::new(PrincipalId::new(5).unwrap(), 1).unwrap();
+        for command in [
+            CommandRequest::CreateEstate {
+                effect,
+                origin: actor,
+                binding_generation: 23,
+                domain: DEVICE_DOMAIN,
+                obligation: DEVICE_OBLIGATION_DMA,
+                charge_account: ChargeAccountId::new(7).unwrap(),
+            },
+            CommandRequest::AddClaim {
+                effect,
+                actor,
+                binding_generation: 23,
+                claim: ClaimId::new(1).unwrap(),
+                domain: DEVICE_DOMAIN,
+                kind: DEVICE_CLAIM_QUEUE_SLOT,
+                scope: ClaimScope::Device(DeviceScopeId::new(11).unwrap()),
+                resource: ResourceId::new(31).unwrap(),
+                resource_generation: ResourceGeneration::new(1).unwrap(),
+                units: 1,
+            },
+        ] {
+            engine
+                .transact(command, |record| {
+                    bytes.extend_from_slice(record.bytes());
+                    Ok::<(), MockError>(())
+                })
+                .unwrap();
+        }
+        let committed = TrustedAnchorSnapshot::from_trusted_backend(
+            binding(),
+            engine.freshness(),
+            engine.revision(),
+            engine.head(),
+        )
+        .unwrap();
+        (
+            MemoryJournal { bytes, repairs: 0 },
+            MemoryAnchor {
+                committed,
+                issued: engine.freshness(),
+                reservations: 0,
+            },
+        )
+    }
+
+    #[ktest]
+    fn clean_boot_checkpoints_before_returning_activation_owner() {
+        let boot = recover_quarantined_boot(
+            standard_catalog(),
+            CoreLimits::bounded_default(),
+            binding(),
+            MemoryJournal {
+                bytes: Vec::new(),
+                repairs: 0,
+            },
+            genesis_anchor(),
+            MockQuarantine {
+                observed: DeviceGeneration::new(2).unwrap(),
+                reject_activation: false,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(boot.activation_block(), None);
+        let active = boot.try_activate().unwrap();
+        let (engine, persistence, _devices) = active.into_parts();
+        assert_eq!(engine.revision(), 1);
+        assert_eq!(engine.freshness().boot().get(), 2);
+        assert_eq!(engine.freshness().journal().get(), 2);
+        assert_eq!(engine.freshness().device().get(), 2);
+        assert_eq!(engine.head(), persistence.committed().head());
+    }
+
+    #[ktest]
+    fn retained_device_claim_prevents_activation_after_reboot() {
+        let (journal, anchor) = quarantined_device_fixture();
+        let boot = recover_quarantined_boot(
+            standard_catalog(),
+            CoreLimits::bounded_default(),
+            binding(),
+            journal,
+            anchor,
+            MockQuarantine {
+                observed: DeviceGeneration::new(2).unwrap(),
+                reject_activation: false,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            boot.activation_block(),
+            Some(BootActivationBlock::DeviceClaimsRetained)
+        );
+        assert!(matches!(
+            boot.try_activate(),
+            Err(BootActivationFailure::Blocked {
+                reason: BootActivationBlock::DeviceClaimsRetained,
+                ..
+            })
+        ));
+    }
+
+    #[ktest]
+    fn ignored_suffix_is_repaired_before_a_newer_recovery_epoch() {
+        let boot = recover_quarantined_boot(
+            standard_catalog(),
+            CoreLimits::bounded_default(),
+            binding(),
+            MemoryJournal {
+                bytes: vec![0xaa, 0xbb],
+                repairs: 0,
+            },
+            genesis_anchor(),
+            MockQuarantine {
+                observed: DeviceGeneration::new(2).unwrap(),
+                reject_activation: false,
+            },
+        )
+        .unwrap();
+
+        let active = boot.try_activate().unwrap();
+        let (engine, mut persistence, _devices) = active.into_parts();
+        assert_eq!(engine.freshness().boot().get(), 3);
+        assert_eq!(engine.freshness().journal().get(), 3);
+        assert_eq!(persistence.journal().repairs, 1);
+        assert_eq!(persistence.anchor_mut().reservations, 2);
+    }
+
+    #[ktest]
+    fn provider_release_failure_returns_the_quarantine_guard() {
+        let boot = recover_quarantined_boot(
+            standard_catalog(),
+            CoreLimits::bounded_default(),
+            binding(),
+            MemoryJournal {
+                bytes: Vec::new(),
+                repairs: 0,
+            },
+            genesis_anchor(),
+            MockQuarantine {
+                observed: DeviceGeneration::new(2).unwrap(),
+                reject_activation: true,
+            },
+        )
+        .unwrap();
+
+        let failure = boot.try_activate().unwrap_err();
+        let BootActivationFailure::Provider { error, boot } = failure else {
+            panic!("provider rejection must preserve its guard");
+        };
+        assert_eq!(error, MockError::Stale);
+        assert_eq!(boot.activation_block(), None);
+    }
+}

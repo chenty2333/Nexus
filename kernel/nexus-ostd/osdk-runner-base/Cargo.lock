@@ -96,6 +96,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "cser-core"
+version = "0.1.0"
+dependencies = [
+ "sha2",
+]
+
+[[package]]
 name = "cser-transition-gates"
 version = "0.1.0"
 
@@ -373,6 +380,7 @@ dependencies = [
 name = "nexus-kernel"
 version = "0.1.0"
 dependencies = [
+ "cser-core",
  "cser-transition-gates",
  "linux-raw-sys",
  "nexus-ostd-virtio",

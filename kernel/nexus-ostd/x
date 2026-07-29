@@ -138,6 +138,14 @@ image_key=$(sha256sum \
     "$repo_root/crates/cser-transition-gates/src/scheduler.rs" \
     "$repo_root/crates/cser-transition-gates/src/pager.rs" \
     "$repo_root/crates/cser-transition-gates/src/io.rs" \
+    "$repo_root/crates/cser-core/Cargo.toml" \
+    "$repo_root/crates/cser-core/src/domain.rs" \
+    "$repo_root/crates/cser-core/src/engine.rs" \
+    "$repo_root/crates/cser-core/src/identity.rs" \
+    "$repo_root/crates/cser-core/src/journal.rs" \
+    "$repo_root/crates/cser-core/src/lib.rs" \
+    "$repo_root/crates/cser-core/src/persistence.rs" \
+    "$repo_root/crates/cser-core/src/profiles.rs" \
     "$repo_root/crates/nexus-ostd-virtio/Cargo.toml" \
     "$repo_root/crates/nexus-ostd-virtio/Cargo.lock" \
     "$repo_root/crates/nexus-ostd-virtio/README.md" \
@@ -209,6 +217,7 @@ container() {
         --tmpfs /tmp/nexus-home:rw,exec,nosuid,size=64m,mode=1777 \
         -v "$root:/work:z" \
         -v "$repo_root:/repo:ro,z" \
+        -v "$repo_root/crates/cser-core:/crates/cser-core:ro,z" \
         -v "$repo_root/crates/cser-transition-gates:/crates/cser-transition-gates:ro,z" \
         -v "$repo_root/crates/nexus-ostd-virtio:/crates/nexus-ostd-virtio:ro,z" \
         -v "$repo_root/crates/nexus-portal-abi:/crates/nexus-portal-abi:ro,z" \
@@ -841,6 +850,8 @@ check_kernel() {
     # fixed by the committed osdk-runner-base snapshot below.
     container cargo check --locked --offline --target x86_64-unknown-none \
         --features virtio-cser-facade
+    container cargo check --locked --offline --target x86_64-unknown-none \
+        --no-default-features --features cser-core-runtime-spike
     container cargo osdk check --locked
 }
 
@@ -882,6 +893,116 @@ build_kernel() {
     prepare_runner_base
     container cargo osdk build
     assert_runner_base
+}
+
+build_core_runtime_spike_kernel() {
+    check_kernel
+    prepare_runner_base
+    container cargo osdk build \
+        --no-default-features --features cser-core-runtime-spike
+    assert_runner_base
+}
+
+core_runtime_spike_artifact_dir="$root/artifacts/cser-core-runtime-spike"
+
+prepare_core_runtime_spike_artifacts() {
+    mkdir -p "$core_runtime_spike_artifact_dir"
+    rm -f \
+        "$core_runtime_spike_artifact_dir/serial.log" \
+        "$core_runtime_spike_artifact_dir/qemu-debug.log"
+}
+
+run_core_runtime_spike_kernel() {
+    # Compile outside the runtime deadline, then run the exact mutually
+    # exclusive feature graph whose entry point contains no legacy Registry.
+    build_core_runtime_spike_kernel
+    container bash -c '
+        set -euo pipefail
+        cp /root/ovmf/release/OVMF_VARS.fd "$HOME/OVMF_VARS.fd"
+        exec timeout --signal=TERM --kill-after=2s 30s \
+            cargo osdk run \
+                --no-default-features --features cser-core-runtime-spike
+    '
+    assert_runner_base
+}
+
+capture_core_runtime_spike_run() {
+    # shellcheck source=scripts/qemu-stream-capture.sh
+    source "$capture_helper"
+    capture_qemu_streams \
+        "$core_runtime_spike_artifact_dir/serial.log" \
+        "$core_runtime_spike_artifact_dir/qemu-debug.log" \
+        run_core_runtime_spike_kernel
+
+    tr -d '\r' <"$core_runtime_spike_artifact_dir/serial.log" \
+        | grep -Fx \
+            'CSER_CORE_RUNTIME_SPIKE PASS writer=portable_core legacy_runtime=false live_ingress=false durable_provider=unavailable fail_closed=true' \
+            >/dev/null
+    tr -d '\r' <"$core_runtime_spike_artifact_dir/serial.log" \
+        | grep -Fx \
+            'CSER_CORE_OSTD_TASK_RECOVERY PASS death=task-return exact_reap=true fence_before_snapshot=true ready_in_fresh_task=true rebind_by_manager=true settlement_claim=true second_crash=true reconcile_without_second_intent=true physical_reply=true real_waiter_wake=true client_ack=true duplicate_wake=false postcommit_authority=fenced precommit_adopt_race=true revoke_adopt_orders=2 legacy_runtime=false live_dual_write=false rebind=task-bound-core production_rebind=false receipt_provider=commit-probe+physical-reply real_reply=true journal=volatile-dev-only durable_provider=unavailable' \
+            >/dev/null
+    echo 'CSER_CORE_OSTD_QEMU PASS persistence=fail-closed task_lifecycle=real-reap recovery=volatile-dev-only receipt_provider=commit-probe+physical-reply'
+}
+
+build_core_dma_recovery_kernel() {
+    check_kernel
+    prepare_runner_base
+    container cargo osdk build --scheme cser-core-dma-recovery
+    assert_runner_base
+}
+
+core_dma_recovery_artifact_dir="$root/artifacts/cser-core-dma-recovery"
+
+prepare_core_dma_recovery_artifacts() {
+    mkdir -p "$core_dma_recovery_artifact_dir"
+    rm -f \
+        "$core_dma_recovery_artifact_dir/serial.log" \
+        "$core_dma_recovery_artifact_dir/qemu-debug.log" \
+        "$core_dma_recovery_artifact_dir/task-entry-debugcon.log"
+}
+
+run_core_dma_recovery_kernel() {
+    build_core_dma_recovery_kernel
+    container bash -c '
+        set -euo pipefail
+        readonly fixture=/opt/nexus-fixtures/runtime-fs-block.raw
+        readonly expected=9357413ed9a96a23af1750cc304265dd7dd1835eb58eb1fb50119cd80d0bc8ca
+        cp /root/ovmf/release/OVMF_VARS.fd "$HOME/OVMF_VARS.fd"
+        test "$(sha256sum "$fixture" | cut -d " " -f1)" = "$expected"
+        test "$(stat -c %a "$fixture")" = 444
+        exec timeout --signal=TERM --kill-after=2s 90s \
+            cargo osdk run --scheme cser-core-dma-recovery
+    '
+    assert_runner_base
+}
+
+capture_core_dma_recovery_run() {
+    # shellcheck source=scripts/qemu-stream-capture.sh
+    source "$capture_helper"
+    capture_qemu_streams \
+        "$core_dma_recovery_artifact_dir/serial.log" \
+        "$core_dma_recovery_artifact_dir/qemu-debug.log" \
+        run_core_dma_recovery_kernel
+
+    local serial="$core_dma_recovery_artifact_dir/serial.log"
+    local debug="$core_dma_recovery_artifact_dir/qemu-debug.log"
+    tr -d '\r' <"$serial" \
+        | grep -F \
+            'CSER_CORE_DMA HardwareClosure PASS qemu=true physical_hardware=false real_pci=true real_virtio=true avail_idx_release=true completion=true isr_status_read_ack=true irq_controller_delivery=true hard_irq_actor=true intx_remap=true intx_remasked=true' \
+            >/dev/null
+    tr -d '\r' <"$serial" \
+        | grep -Fx \
+            'CSER_CORE_DMA_OSTD_QEMU PASS death=real-task-reap fence=immediate-manager second_crash=true post_mortem_owner=kernel-manager reply_registry=false legacy_registry=false portal_glue=false live_dual_write=false journal=volatile-dev-only durable_provider=separate-suite qemu=true physical_hardware=false' \
+            >/dev/null
+    grep -F 'virtio_pci_notify_write' "$debug" >/dev/null
+    grep -F 'virtio_blk_handle_read' "$debug" >/dev/null
+    grep -F 'vtd_inv_desc_iotlb_global' "$debug" >/dev/null
+    if grep -F 'vtd_dmar_fault' "$debug" >/dev/null; then
+        echo 'CSER core DMA QEMU run emitted a VT-d translation fault' >&2
+        return 1
+    fi
+    echo 'CSER_CORE_DMA_QEMU PASS queue=real-virtio completion=real-irq reset=real-device iotlb=real-vtd qemu=true physical_hardware=false'
 }
 
 build_same_boot_kernel() {
@@ -1232,6 +1353,35 @@ case "$command" in
         prepare_guest
         build_kernel
         ;;
+    build-core-runtime-spike)
+        ensure_image
+        check_ostd_patch
+        check_virtio_patch
+        prepare_guest
+        build_core_runtime_spike_kernel
+        ;;
+    run-core-runtime-spike)
+        ensure_image
+        check_ostd_patch
+        prepare_guest
+        prepare_core_runtime_spike_artifacts
+        capture_core_runtime_spike_run
+        ;;
+    build-core-dma-recovery)
+        ensure_image
+        check_ostd_patch
+        check_virtio_patch
+        prepare_guest
+        build_core_dma_recovery_kernel
+        ;;
+    run-core-dma-recovery)
+        ensure_image
+        check_ostd_patch
+        check_virtio_patch
+        prepare_guest
+        prepare_core_dma_recovery_artifacts
+        capture_core_dma_recovery_run
+        ;;
     build-same-boot)
         ensure_image
         check_ostd_patch
@@ -1474,7 +1624,7 @@ case "$command" in
         rm -f "$repo_root/target/verification/linux-io-composition-oracle.log"
         ;;
     *)
-        echo "usage: ./x {doctor|image|fmt|check|clippy|build|build-same-boot|build-same-boot-precommit|build-same-boot-postcommit-crash|iommu-probe|run|run-same-boot|run-same-boot-precommit|run-same-boot-postcommit-crash|test|test-same-boot|test-same-boot-precommit|test-same-boot-postcommit-crash|eval-stage7b|clean}" >&2
+        echo "usage: ./x {doctor|image|fmt|check|clippy|build|build-core-runtime-spike|run-core-runtime-spike|build-core-dma-recovery|run-core-dma-recovery|build-same-boot|build-same-boot-precommit|build-same-boot-postcommit-crash|iommu-probe|run|run-same-boot|run-same-boot-precommit|run-same-boot-postcommit-crash|test|test-same-boot|test-same-boot-precommit|test-same-boot-postcommit-crash|eval-stage7b|clean}" >&2
         exit 2
         ;;
 esac

@@ -8,12 +8,15 @@ license = "MPL-2.0"
 publish = false
 
 [features]
+cser-core-runtime-spike = ["dep:cser-core"]
+cser-core-dma-slice = ["cser-core-runtime-spike", "dep:nexus-ostd-virtio"]
 stage7b-eval = []
 virtio-cser-facade = ["dep:nexus-ostd-virtio"]
 virtio-cser-precommit-fault = ["virtio-cser-facade"]
 virtio-cser-postcommit-fault = ["virtio-cser-facade"]
 
 [dependencies]
+cser-core = { path = "../../crates/cser-core", default-features = false, optional = true }
 cser-transition-gates = { path = "../../crates/cser-transition-gates" }
 linux-raw-sys = { version = "=0.12.1", default-features = false, features = ["auxvec", "errno", "general", "net", "no_std"] }
 nexus-ostd-virtio = { path = "../../crates/nexus-ostd-virtio", optional = true }

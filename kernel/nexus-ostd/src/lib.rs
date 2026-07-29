@@ -6,6 +6,14 @@
 extern crate alloc;
 
 #[cfg(all(
+    feature = "cser-core-runtime-spike",
+    any(feature = "stage7b-eval", feature = "virtio-cser-facade")
+))]
+compile_error!(
+    "cser-core-runtime-spike is mutually exclusive with every legacy CSER runtime profile"
+);
+
+#[cfg(all(
     feature = "virtio-cser-precommit-fault",
     feature = "virtio-cser-postcommit-fault"
 ))]
@@ -13,87 +21,163 @@ compile_error!(
     "virtio-cser-precommit-fault and virtio-cser-postcommit-fault are mutually exclusive"
 );
 
-#[cfg(not(feature = "virtio-cser-facade"))]
+#[cfg(all(
+    not(feature = "cser-core-runtime-spike"),
+    not(feature = "virtio-cser-facade")
+))]
 #[path = "cser/composition.rs"]
 mod composition;
+#[cfg(not(feature = "cser-core-runtime-spike"))]
 #[path = "cser/effect.rs"]
 mod effect;
+#[cfg(not(feature = "cser-core-runtime-spike"))]
 #[path = "cser/effect_registry.rs"]
 mod effect_registry;
+// Mutually-exclusive cutover spike. Its entry point calls the portable core,
+// while every legacy module and entry point is absent from this build.
+#[cfg(all(
+    feature = "cser-core-runtime-spike",
+    not(feature = "cser-core-dma-slice")
+))]
+#[path = "cser/core_reply_adapter.rs"]
+mod core_reply_adapter;
+#[cfg(feature = "cser-core-runtime-spike")]
+#[allow(dead_code)]
+#[path = "cser/core_runtime.rs"]
+mod core_runtime;
+#[cfg(all(
+    feature = "cser-core-runtime-spike",
+    not(feature = "cser-core-dma-slice")
+))]
+#[path = "cser/core_runtime_slice.rs"]
+mod core_runtime_slice;
+// Production-shaped reboot coordinator. It remains fail-closed until OSTD has
+// concrete non-rollback anchor, durable journal, and persistent device
+// quarantine providers.
+#[cfg(feature = "cser-core-runtime-spike")]
+#[allow(dead_code)]
+#[path = "cser/core_reboot.rs"]
+mod core_reboot;
+// Feature-only bridge from portable-core claims to the real OSTD VirtIO owner
+// typestates. It cannot coexist with the legacy Registry because its feature
+// includes the mutually-exclusive core runtime profile above.
+#[cfg(feature = "cser-core-dma-slice")]
+#[allow(dead_code)]
+#[path = "cser/core_dma_adapter.rs"]
+mod core_dma_adapter;
+#[cfg(feature = "cser-core-dma-slice")]
+#[path = "cser/core_dma_runtime.rs"]
+mod core_dma_runtime;
 // The generic adapter now earns an activation permit: it binds an unpublished
 // initial service and Nexus-owned manager worker before publication, maps only
 // OSTD UserMode exceptions into typed service faults, and observes exact reap.
 // No filesystem path constructs it yet, and kernel faults remain fail-stop, so
 // permit availability is not runtime lifecycle evidence.
+#[cfg(not(feature = "cser-core-runtime-spike"))]
 #[allow(dead_code)]
 #[path = "cser/supervisor_runtime.rs"]
 mod supervisor_runtime;
 // The adapter is compiled into the kernel now, while its user/kernel transport
 // and persistent session owner land in later portal-v2 tranches.
+#[cfg(not(feature = "cser-core-runtime-spike"))]
 #[allow(dead_code)]
 #[path = "cser/portal_v2.rs"]
 mod portal_v2;
 // The shared semantic spine lands before its first filesystem/IRQ consumer.
 // Keep the temporary dead-code allowance at the module boundary so individual
 // state and transition APIs remain warning-clean while that migration proceeds.
+#[cfg(not(feature = "cser-core-runtime-spike"))]
 #[allow(dead_code)]
 #[path = "cser/device_flight.rs"]
 mod device_flight;
-#[cfg(not(feature = "virtio-cser-facade"))]
+#[cfg(all(
+    not(feature = "cser-core-runtime-spike"),
+    not(feature = "virtio-cser-facade")
+))]
 #[path = "probes/iommu_probe.rs"]
 mod iommu_probe;
+#[cfg(not(feature = "cser-core-runtime-spike"))]
 #[path = "personality/linux.rs"]
 mod linux;
+#[cfg(not(feature = "cser-core-runtime-spike"))]
 #[path = "personality/linux_dynamic.rs"]
 mod linux_dynamic;
+#[cfg(not(feature = "cser-core-runtime-spike"))]
 #[path = "personality/linux_epoll.rs"]
 mod linux_epoll;
+#[cfg(not(feature = "cser-core-runtime-spike"))]
 #[path = "personality/linux_fs.rs"]
 mod linux_fs;
+#[cfg(not(feature = "cser-core-runtime-spike"))]
 #[path = "personality/linux_fs_input.rs"]
 mod linux_fs_input;
+#[cfg(not(feature = "cser-core-runtime-spike"))]
 #[path = "personality/linux_futex.rs"]
 mod linux_futex;
+#[cfg(not(feature = "cser-core-runtime-spike"))]
 #[path = "personality/linux_futex_core.rs"]
 mod linux_futex_core;
-#[cfg(not(feature = "virtio-cser-facade"))]
+#[cfg(all(
+    not(feature = "cser-core-runtime-spike"),
+    not(feature = "virtio-cser-facade")
+))]
 #[path = "cser/linux_io_composition.rs"]
 mod linux_io_composition;
+#[cfg(not(feature = "cser-core-runtime-spike"))]
 #[path = "personality/linux_loader.rs"]
 mod linux_loader;
-#[cfg(not(feature = "virtio-cser-facade"))]
+#[cfg(all(
+    not(feature = "cser-core-runtime-spike"),
+    not(feature = "virtio-cser-facade")
+))]
 #[path = "personality/linux_net.rs"]
 mod linux_net;
+#[cfg(not(feature = "cser-core-runtime-spike"))]
 #[path = "personality/linux_pager.rs"]
 mod linux_pager;
+#[cfg(not(feature = "cser-core-runtime-spike"))]
 #[path = "personality/linux_runtime.rs"]
 mod linux_runtime;
+#[cfg(not(feature = "cser-core-runtime-spike"))]
 #[path = "domains/pager.rs"]
 mod pager;
+#[cfg(not(feature = "cser-core-runtime-spike"))]
 #[path = "domains/readiness.rs"]
 mod readiness;
+#[cfg(not(feature = "cser-core-runtime-spike"))]
 #[path = "domains/scheduler.rs"]
 mod scheduler;
-#[cfg(feature = "stage7b-eval")]
+#[cfg(all(feature = "stage7b-eval", not(feature = "cser-core-runtime-spike")))]
 #[path = "evaluation/stage7b.rs"]
 mod stage7b_evaluation;
-#[cfg(feature = "virtio-cser-facade")]
+#[cfg(all(
+    feature = "virtio-cser-facade",
+    not(feature = "cser-core-runtime-spike")
+))]
 #[path = "personality/virtio_cser_adapter.rs"]
 mod virtio_cser_adapter;
 
+#[cfg(not(feature = "cser-core-runtime-spike"))]
 use alloc::{boxed::Box, sync::Arc};
 
+#[cfg(not(feature = "cser-core-runtime-spike"))]
 use effect::{EffectTimer, EffectToken, EffectWaiter};
+#[cfg(not(feature = "cser-core-runtime-spike"))]
 use effect_registry::TaskKey;
-#[cfg(not(feature = "virtio-cser-facade"))]
+#[cfg(all(
+    not(feature = "cser-core-runtime-spike"),
+    not(feature = "virtio-cser-facade")
+))]
 use iommu_probe::{DmaQuiesceError, DmaQuiescer, Ostd018FailClosed};
+#[cfg(not(feature = "cser-core-runtime-spike"))]
+use ostd::power::{ExitCode, poweroff};
+#[cfg(not(feature = "cser-core-runtime-spike"))]
 use ostd::{
     arch::cpu::context::{CpuException, UserContext},
     irq::DisabledLocalIrqGuard,
     mm::{
         CachePolicy, FrameAllocOptions, PAGE_SIZE, PageFlags, PageProperty, Vaddr, VmIo, VmSpace,
     },
-    power::{ExitCode, poweroff},
     prelude::*,
     sync::SpinLock,
     task::{
@@ -103,17 +187,27 @@ use ostd::{
     },
     user::{ReturnReason, UserMode},
 };
+#[cfg(not(feature = "cser-core-runtime-spike"))]
 use scheduler::{CserScheduler, FIRST_FALLBACK_SELECTION_ATTEMPT, ProposalResult};
 
+#[cfg(not(feature = "cser-core-runtime-spike"))]
 const AUTHORITY_EPOCH: u64 = 41;
+#[cfg(not(feature = "cser-core-runtime-spike"))]
 const POLICY_LEASE_TICKS: u64 = 64;
+#[cfg(not(feature = "cser-core-runtime-spike"))]
 const USER_TASK_ID: u64 = 100;
+#[cfg(not(feature = "cser-core-runtime-spike"))]
 const FALLBACK_TASK_ID: u64 = 200;
+#[cfg(not(feature = "cser-core-runtime-spike"))]
 pub(crate) const USER_MAP_ADDR: Vaddr = 0x0040_0000;
+#[cfg(not(feature = "cser-core-runtime-spike"))]
 const EXPECTED_FAULT_ADDR: Vaddr = 0x0080_0000;
+#[cfg(not(feature = "cser-core-runtime-spike"))]
 const FAULTING_LOAD_LEN: usize = 3;
+#[cfg(not(feature = "cser-core-runtime-spike"))]
 const SYSCALL_PROBE: usize = 0x4353_4552;
 
+#[cfg(not(feature = "cser-core-runtime-spike"))]
 pub struct TaskData {
     pub(crate) id: u64,
     pub(crate) vm_space: Option<Arc<VmSpace>>,
@@ -127,6 +221,7 @@ pub struct TaskData {
     dynamic_vm_space: Option<Arc<SpinLock<Arc<VmSpace>>>>,
 }
 
+#[cfg(not(feature = "cser-core-runtime-spike"))]
 impl TaskData {
     pub(crate) fn new(id: u64, vm_space: Option<Arc<VmSpace>>) -> Self {
         Self {
@@ -238,6 +333,7 @@ impl TaskData {
     }
 }
 
+#[cfg(not(feature = "cser-core-runtime-spike"))]
 #[ostd::main]
 fn kernel_main() {
     #[cfg(feature = "stage7b-eval")]
@@ -250,6 +346,17 @@ fn kernel_main() {
     kernel_main_standard();
 }
 
+#[cfg(feature = "cser-core-runtime-spike")]
+#[ostd::main]
+fn kernel_main() {
+    #[cfg(feature = "cser-core-dma-slice")]
+    core_dma_runtime::launch();
+
+    #[cfg(not(feature = "cser-core-dma-slice"))]
+    core_runtime_slice::launch()
+}
+
+#[cfg(not(feature = "cser-core-runtime-spike"))]
 fn kernel_main_standard() {
     let scheduler: &'static CserScheduler = Box::leak(Box::new(CserScheduler::new(
         AUTHORITY_EPOCH,
@@ -295,6 +402,7 @@ fn kernel_main_standard() {
     unreachable!("bootstrap context is not scheduled again");
 }
 
+#[cfg(not(feature = "cser-core-runtime-spike"))]
 fn activate_current_task_vm() {
     let Some(current) = Task::current() else {
         return;
@@ -310,6 +418,7 @@ fn activate_current_task_vm() {
     linux_futex::record_expire_post_vm_ready(data.id);
 }
 
+#[cfg(not(feature = "cser-core-runtime-spike"))]
 fn admit_current_task_pre_irq(irq_guard: &DisabledLocalIrqGuard) {
     let current = Task::current().expect("pre-IRQ admission requires a current task");
     let data = current
@@ -319,6 +428,7 @@ fn admit_current_task_pre_irq(irq_guard: &DisabledLocalIrqGuard) {
     linux_futex::admit_expire_task_pre_irq(data, irq_guard);
 }
 
+#[cfg(not(feature = "cser-core-runtime-spike"))]
 fn record_current_task_post_irq_entry() {
     let current = Task::current().expect("OSTD task-entry hook requires a current task");
     let data = current
@@ -328,6 +438,7 @@ fn record_current_task_post_irq_entry() {
     linux_futex::record_expire_post_irq_entry(data.id);
 }
 
+#[cfg(not(feature = "cser-core-runtime-spike"))]
 pub(crate) fn create_vm_space(program: &[u8]) -> VmSpace {
     let page_count = program.len().div_ceil(PAGE_SIZE);
     let segment = FrameAllocOptions::new()
@@ -353,6 +464,7 @@ pub(crate) fn create_vm_space(program: &[u8]) -> VmSpace {
     vm_space
 }
 
+#[cfg(not(feature = "cser-core-runtime-spike"))]
 fn run_user_probe(
     vm_space: Arc<VmSpace>,
     scheduler: &'static CserScheduler,
@@ -428,6 +540,7 @@ fn run_user_probe(
     }
 }
 
+#[cfg(not(feature = "cser-core-runtime-spike"))]
 fn run_fallback_probe(scheduler: &'static CserScheduler, old_binding: scheduler::Binding) {
     let evidence = scheduler
         .fallback_evidence()

@@ -2228,6 +2228,32 @@ impl Engine {
         })
     }
 
+    /// Reports whether one exact retirement requirement has already won its
+    /// durable transition.
+    ///
+    /// This read-only projection grants no evidence authority. Hardware
+    /// adapters use it to prove prerequisites are committed before consuming a
+    /// non-replayable reset owner into the next physical closure phase.
+    pub fn retirement_evidence_accepted(
+        &self,
+        effect: EffectId,
+        claim_id: ClaimId,
+        kind: EvidenceKindId,
+    ) -> Result<bool, CoreError> {
+        let claim = self
+            .state
+            .estates
+            .get(&effect)
+            .and_then(|estate| estate.claims.get(&claim_id))
+            .ok_or(CoreError::UnknownClaim)?;
+        claim
+            .requirements
+            .iter()
+            .find(|requirement| requirement.kind == kind)
+            .map(|requirement| requirement.accepted.is_some())
+            .ok_or(CoreError::UnexpectedEvidence)
+    }
+
     /// Verifies one raw domain receipt against an exact, current claim challenge.
     ///
     /// The returned fact is linear and must still win the authoritative

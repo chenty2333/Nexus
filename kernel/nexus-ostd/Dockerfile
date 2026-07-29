@@ -160,6 +160,7 @@ COPY tests/guest/linux/sources/linux-runtime-net-smoke/runtime_net_smoke.S \
 COPY tests/guest/linux/adaptations/round5-epoll-linux-regular-file.patch \
     tests/guest/linux/adaptations/verify-round5-epoll-adaptation.sh \
     /tmp/nexus-ostd-inputs/round5/
+COPY crates/cser-core /crates/cser-core
 RUN --mount=type=bind,source=kernel/nexus-ostd,target=/tmp/nexus-ostd-source,readonly \
     cmp /tmp/nexus-ostd-inputs/Cargo.toml /tmp/nexus-ostd-source/Cargo.toml \
     && cmp /tmp/nexus-ostd-inputs/Cargo.lock /tmp/nexus-ostd-source/Cargo.lock \
@@ -214,9 +215,6 @@ RUN --mount=type=bind,source=kernel/nexus-ostd,target=/tmp/nexus-ostd-source,rea
         /tmp/nexus-ostd-source/scripts/assert-runtime-net-artifacts.sh \
     && rm -rf /work \
     && cp -a /tmp/nexus-ostd-source /work \
-    && mkdir -p /work/target/osdk \
-    && cp -a /tmp/nexus-ostd-inputs/osdk-runner-base \
-        /work/target/osdk/nexus-kernel-run-base \
     && cd /work \
     && NEXUS_LINUX_HELLO_SOURCE=/tmp/nexus-ostd-inputs/linux-hello.S \
         NEXUS_DYNAMIC_PIE_LAUNCHER_SOURCE=/tmp/nexus-ostd-inputs/dynamic_pie_smoke.S \
@@ -238,14 +236,23 @@ RUN --mount=type=bind,source=kernel/nexus-ostd,target=/tmp/nexus-ostd-source,rea
     && test "$(stat -c %a /opt/nexus-fixtures/runtime-fs-block.raw)" = 444 \
     && cargo check --locked --target x86_64-unknown-none \
         --features virtio-cser-facade \
+    && cargo check --locked --target x86_64-unknown-none \
+        --no-default-features --features cser-core-runtime-spike \
     && cargo osdk check --locked \
     && bash scripts/check-fsbase-api.sh \
     && bash scripts/check-scheduler-attempt.sh \
+    && rm -rf target/osdk/nexus-kernel-run-base \
+    && mkdir -p target/osdk \
+    && cp -a /tmp/nexus-ostd-inputs/osdk-runner-base \
+        target/osdk/nexus-kernel-run-base \
+    && chmod a-w target/osdk/nexus-kernel-run-base/Cargo.lock \
     && cargo fetch --manifest-path target/osdk/nexus-kernel-run-base/Cargo.toml --locked \
     && CARGO_NET_OFFLINE=true cargo osdk build \
     && CARGO_NET_OFFLINE=true cargo osdk build --scheme runtime-fs-same-boot \
     && CARGO_NET_OFFLINE=true cargo osdk build --scheme runtime-fs-same-boot-precommit \
     && CARGO_NET_OFFLINE=true cargo osdk build --scheme runtime-fs-same-boot-postcommit-crash \
+    && CARGO_NET_OFFLINE=true cargo osdk build \
+        --no-default-features --features cser-core-runtime-spike \
     && cmp /tmp/nexus-ostd-inputs/Cargo.lock /work/Cargo.lock \
     && diff -ru /tmp/nexus-ostd-inputs/osdk-runner-base \
         /work/target/osdk/nexus-kernel-run-base \
