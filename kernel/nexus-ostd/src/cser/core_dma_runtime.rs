@@ -47,7 +47,8 @@ use ostd::{
 
 use super::core_dma_adapter::{
     ClaimRole, CoreDmaClaim, CoreDmaClaims, CoreDmaCohort, acknowledge_real_irq,
-    apply_real_iotlb_closure, apply_real_reset_generation, complete_real_irq, publish_real_queue,
+    apply_real_iotlb_closure, apply_real_reset_generation, bind_queue_commit, complete_real_irq,
+    publish_real_queue,
 };
 use super::core_runtime::OstdCserRuntime;
 
@@ -269,10 +270,13 @@ fn run_dma_recovery_slice() {
 
     enroll_new_effect(&core, cohort1);
     let intent1 = commit_intent(&core, cohort1, digest(0x11));
-    let published1 = publish_real_queue(&device, receipted, cohort1)
+    let authority1 = core
+        .observe(move |engine| bind_queue_commit(engine, intent1, cohort1))
+        .unwrap_or_else(|_| panic!("first core commit challenge must bind before publication"));
+    let published1 = publish_real_queue(&device, receipted, authority1)
         .unwrap_or_else(|_| panic!("first real queue publication must succeed"));
     let committed1 = core
-        .observe(move |engine| published1.verify_commit(engine, intent1, cohort1))
+        .observe(move |engine| published1.verify_commit(engine))
         .unwrap_or_else(|_| panic!("first real queue commit receipt must verify"));
     let (request1, acknowledgement1) = committed1.into_parts();
     tx(&core, acknowledgement1);
@@ -427,10 +431,13 @@ fn run_dma_recovery_slice() {
     .expect("second real request binds to reserved generations");
     tx(&core, cohort2.prepare());
     let intent2 = commit_intent(&core, cohort2, digest(0x22));
-    let published2 = publish_real_queue(&device, receipted2, cohort2)
+    let authority2 = core
+        .observe(move |engine| bind_queue_commit(engine, intent2, cohort2))
+        .unwrap_or_else(|_| panic!("second core commit challenge must bind before publication"));
+    let published2 = publish_real_queue(&device, receipted2, authority2)
         .unwrap_or_else(|_| panic!("second real queue publication must succeed"));
     let committed2 = core
-        .observe(move |engine| published2.verify_commit(engine, intent2, cohort2))
+        .observe(move |engine| published2.verify_commit(engine))
         .unwrap_or_else(|_| panic!("second real queue commit receipt must verify"));
     let (request2, acknowledgement2) = committed2.into_parts();
     tx(&core, acknowledgement2);

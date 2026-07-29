@@ -11,7 +11,7 @@ use crate::{
 
 /// Magic prefix of every CSER journal record.
 pub const JOURNAL_MAGIC: [u8; 8] = *b"CSERJR5\0";
-/// Current unstable journal schema version.
+/// Frozen journal schema for CSER core semantic API profile 1.
 pub const JOURNAL_SCHEMA_VERSION: u16 = 5;
 
 const PREVIOUS_JOURNAL_MAGIC: [u8; 8] = *b"CSERJR4\0";

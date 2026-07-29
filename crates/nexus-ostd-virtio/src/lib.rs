@@ -3,7 +3,7 @@
 //! Safe facade for Nexus's OSTD 0.18.0 VirtIO block ownership substrate.
 //!
 //! The public API contains no raw pointer, unsafe function, raw PCI root, or
-//! copyable hardware owner. All unsafe operations are confined to the five
+//! copyable hardware owner. All unsafe operations are confined to the four
 //! private implementation modules below. Their invariants are documented at
 //! each unsafe operation and summarized in the crate README.
 //!
@@ -28,8 +28,6 @@ mod dma;
 #[allow(unsafe_code)]
 mod pci;
 #[allow(unsafe_code)]
-mod portal;
-#[allow(unsafe_code)]
 mod production;
 
 pub use boot_quarantine::{
@@ -44,11 +42,6 @@ pub use dma::{OwnerKind, owner_address};
 pub use pci::{
     DeviceBdf, IntxRoute, IntxTransitionError, IntxTransitionFailure, MaskedIntx,
     PciDiscoveryError, Root, UnmaskedIntx, discover_and_own_bars,
-};
-pub use portal::{
-    BindingToken, ClosureProgress, ClosureReceipt, EffectAuthority, IotlbTombstone, Operation,
-    Portal, RegisterError, ResetAck, ResetTombstone, Session, SessionNamespaceIsolationReceipt,
-    SessionOpenError, Terminal, assert_session_namespace_isolation, terminal_label,
 };
 pub use production::{
     CancelledRequest, CompletedRequest, CompletionFailure, CompletionMode, CompletionProbeProgress,

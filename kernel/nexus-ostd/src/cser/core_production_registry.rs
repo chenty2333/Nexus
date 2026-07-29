@@ -1,0 +1,523 @@
+// SPDX-License-Identifier: MPL-2.0
+
+//! Sole production publication boundary for the recovered CSER core.
+//!
+//! Portal, supervisor, reply, and DMA adapters receive clones of one [`Arc`]
+//! containing this owner. The portal remains stateless: any linear bearer
+//! returned by a client-admissible transition is moved into this kernel-owned,
+//! fixed-capacity custody before an untrusted response can be formed.
+
+use alloc::{
+    sync::{Arc, Weak},
+    vec::Vec,
+};
+use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+
+use cser_core::{
+    Command, CommandRequest, CommitIntent, CoreError, Engine, TransitionDurability,
+    TransitionOutput, TransitionReceipt, TxError,
+};
+use ostd::{sync::Mutex, task::Task};
+
+use super::{
+    core_portal_vnext::{
+        CoreObservation, CoreObservationStamp, CoreQuery, CoreRegistry, CoreTransitionView,
+    },
+    core_runtime::OstdCserRuntime,
+    core_supervisor_vnext::RecoveredCoreAuthority,
+};
+
+const MAX_LINEAR_PORTAL_BEARERS: usize = 8;
+const INGRESS_CLOSED: u8 = 0;
+const INGRESS_INSTALLING: u8 = 1;
+const INGRESS_OPEN: u8 = 2;
+
+/// Exact task/root binding admitted through the production portal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ProductionIngressIdentity {
+    root: cser_core::RootId,
+    incarnation: cser_core::PrincipalIncarnation,
+    binding_generation: u64,
+}
+
+impl ProductionIngressIdentity {
+    /// Constructs one non-zero binding whose principal owns the named root.
+    pub(crate) fn new(
+        root: cser_core::RootId,
+        incarnation: cser_core::PrincipalIncarnation,
+        binding_generation: u64,
+    ) -> Result<Self, ProductionIngressError> {
+        if root.get() != incarnation.principal().get() || binding_generation == 0 {
+            return Err(ProductionIngressError::InvalidIdentity);
+        }
+        Ok(Self {
+            root,
+            incarnation,
+            binding_generation,
+        })
+    }
+
+    /// Returns the causal root admitted by this binding.
+    pub(crate) const fn root(self) -> cser_core::RootId {
+        self.root
+    }
+
+    /// Returns the exact admitted principal incarnation.
+    pub(crate) const fn incarnation(self) -> cser_core::PrincipalIncarnation {
+        self.incarnation
+    }
+
+    /// Returns the exact admitted root binding generation.
+    pub(crate) const fn binding_generation(self) -> u64 {
+        self.binding_generation
+    }
+}
+
+/// Atomic production-ingress admission failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProductionIngressError {
+    /// The requested identity is structurally invalid.
+    InvalidIdentity,
+    /// No production service task currently owns ingress.
+    Closed,
+    /// Another exact task binding already owns ingress.
+    AlreadyOpen,
+    /// The caller is not the task bound to this production owner.
+    TaskMismatch,
+    /// The command coordinates differ from the task's installed binding.
+    IdentityMismatch,
+}
+
+/// Exact-reap notification run only after the production gate is closed.
+pub(crate) trait ProductionIngressExitObserver: Send + Sync {
+    /// Receives the task-bound identity and whether this exit closed the gate.
+    fn observe_exit(&self, identity: ProductionIngressIdentity, gate_closed: bool);
+}
+
+/// OSTD task data binding one real task to one production owner and ingress.
+pub(crate) struct ProductionIngressTaskData<S> {
+    identity: ProductionIngressIdentity,
+    owner: Weak<ProductionCoreOwner<S>>,
+    exit_observer: Arc<dyn ProductionIngressExitObserver>,
+}
+
+impl<S> ProductionIngressTaskData<S> {
+    /// Binds task data to the exact shared owner; no owner may be substituted.
+    pub(crate) fn new(
+        owner: &Arc<ProductionCoreOwner<S>>,
+        identity: ProductionIngressIdentity,
+        exit_observer: Arc<dyn ProductionIngressExitObserver>,
+    ) -> Self {
+        Self {
+            identity,
+            owner: Arc::downgrade(owner),
+            exit_observer,
+        }
+    }
+
+    /// Closes the real production gate before publishing exact-reap metadata.
+    pub(crate) fn observe_exact_exit(&self, task: &Task) {
+        if !task.is_reaped() {
+            return;
+        }
+        let gate_closed = self
+            .owner
+            .upgrade()
+            .is_some_and(|owner| owner.close_ingress(self.identity));
+        self.exit_observer.observe_exit(self.identity, gate_closed);
+    }
+}
+
+struct ProductionIngressGate {
+    state: AtomicU8,
+    root: AtomicU64,
+    principal: AtomicU64,
+    incarnation_generation: AtomicU64,
+    binding_generation: AtomicU64,
+}
+
+impl ProductionIngressGate {
+    const fn closed() -> Self {
+        Self {
+            state: AtomicU8::new(INGRESS_CLOSED),
+            root: AtomicU64::new(0),
+            principal: AtomicU64::new(0),
+            incarnation_generation: AtomicU64::new(0),
+            binding_generation: AtomicU64::new(0),
+        }
+    }
+
+    fn open(&self, identity: ProductionIngressIdentity) -> Result<(), ProductionIngressError> {
+        self.state
+            .compare_exchange(
+                INGRESS_CLOSED,
+                INGRESS_INSTALLING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map_err(|_| ProductionIngressError::AlreadyOpen)?;
+        self.root.store(identity.root().get(), Ordering::Relaxed);
+        self.principal
+            .store(identity.incarnation().principal().get(), Ordering::Relaxed);
+        self.incarnation_generation
+            .store(identity.incarnation().generation(), Ordering::Relaxed);
+        self.binding_generation
+            .store(identity.binding_generation(), Ordering::Relaxed);
+        self.state.store(INGRESS_OPEN, Ordering::Release);
+        Ok(())
+    }
+
+    fn identity(&self) -> Option<ProductionIngressIdentity> {
+        if self.state.load(Ordering::Acquire) != INGRESS_OPEN {
+            return None;
+        }
+        let root = cser_core::RootId::new(self.root.load(Ordering::Relaxed)).ok()?;
+        let principal = cser_core::PrincipalId::new(self.principal.load(Ordering::Relaxed)).ok()?;
+        let incarnation = cser_core::PrincipalIncarnation::new(
+            principal,
+            self.incarnation_generation.load(Ordering::Relaxed),
+        )
+        .ok()?;
+        let identity = ProductionIngressIdentity::new(
+            root,
+            incarnation,
+            self.binding_generation.load(Ordering::Relaxed),
+        )
+        .ok()?;
+        (self.state.load(Ordering::Acquire) == INGRESS_OPEN).then_some(identity)
+    }
+
+    fn close(&self, identity: ProductionIngressIdentity) -> bool {
+        if self.identity() != Some(identity) {
+            return false;
+        }
+        self.state
+            .compare_exchange(
+                INGRESS_OPEN,
+                INGRESS_CLOSED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+}
+
+/// One installed core state. Implementations may be active or boot-quarantined,
+/// but every operation must enter the same durable engine owner.
+pub(crate) trait InstalledCore: Send + Sync {
+    /// Persistence-provider error returned by durable transitions.
+    type PersistenceError;
+
+    /// Executes one exact durable core command.
+    fn transact(
+        &self,
+        command: Command,
+    ) -> Result<TransitionReceipt, TxError<Self::PersistenceError>>;
+
+    /// Observes authoritative state under the same writer lock.
+    fn observe<R>(&self, operation: impl FnOnce(&Engine) -> R) -> R;
+}
+
+impl<P> InstalledCore for OstdCserRuntime<P>
+where
+    P: TransitionDurability + Send,
+{
+    type PersistenceError = P::Error;
+
+    fn transact(
+        &self,
+        command: Command,
+    ) -> Result<TransitionReceipt, TxError<Self::PersistenceError>> {
+        OstdCserRuntime::transact(self, command)
+    }
+
+    fn observe<R>(&self, operation: impl FnOnce(&Engine) -> R) -> R {
+        OstdCserRuntime::observe(self, operation)
+    }
+}
+
+/// Failure at the production ingress boundary.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum ProductionRegistryError<E> {
+    /// The real task-bound production ingress gate rejected the caller.
+    Ingress(ProductionIngressError),
+    /// The portable core rejected a read-only projection.
+    Core(CoreError),
+    /// The durable transaction failed or became recovery-required.
+    Transaction(TxError<E>),
+    /// The trusted bearer custody is full before any mutation occurs.
+    LinearCustodyFull,
+    /// A caller tried to bypass the portal's trusted-command policy.
+    TrustedPathRequired,
+    /// A committed client transition returned an unexpected bearer kind.
+    UnexpectedLinearOutput,
+    /// Commit intent became durable without returning its required bearer.
+    MissingCommitIntent,
+}
+
+/// The one Registry published by a production boot.
+pub(crate) struct ProductionCoreOwner<S> {
+    installed: S,
+    linear_custody: Mutex<Vec<TransitionOutput>>,
+    ingress: ProductionIngressGate,
+}
+
+impl<S> ProductionCoreOwner<S> {
+    /// Installs one already-recovered state without opening ingress.
+    pub(crate) fn new(installed: S) -> Self {
+        Self {
+            installed,
+            linear_custody: Mutex::new(Vec::with_capacity(MAX_LINEAR_PORTAL_BEARERS)),
+            ingress: ProductionIngressGate::closed(),
+        }
+    }
+
+    /// Borrows the installed state for provider-specific quarantine work.
+    pub(crate) const fn installed(&self) -> &S {
+        &self.installed
+    }
+
+    /// Returns the number of linear portal bearers retained by the kernel.
+    pub(crate) fn pending_linear_outputs(&self) -> usize {
+        self.linear_custody.lock().len()
+    }
+
+    /// Opens client/domain ingress only for one exact real service task.
+    pub(crate) fn open_ingress(
+        &self,
+        identity: ProductionIngressIdentity,
+    ) -> Result<(), ProductionIngressError> {
+        self.ingress.open(identity)
+    }
+
+    /// Returns the exact currently admitted service binding, if any.
+    pub(crate) fn ingress_identity(&self) -> Option<ProductionIngressIdentity> {
+        self.ingress.identity()
+    }
+
+    /// Proves that the current OSTD task and owner match the installed gate.
+    pub(crate) fn authorize_current_task(
+        &self,
+        expected: ProductionIngressIdentity,
+    ) -> Result<(), ProductionIngressError>
+    where
+        S: 'static,
+    {
+        let identity = self.current_task_identity()?;
+        if identity != expected {
+            return Err(ProductionIngressError::IdentityMismatch);
+        }
+        Ok(())
+    }
+
+    /// Proves that the current OSTD task and owner match the installed gate.
+    pub(crate) fn authorize_current_ingress(
+        &self,
+    ) -> Result<ProductionIngressIdentity, ProductionIngressError>
+    where
+        S: 'static,
+    {
+        let installed = self
+            .ingress
+            .identity()
+            .ok_or(ProductionIngressError::Closed)?;
+        let task_identity = self.current_task_identity()?;
+        if installed == task_identity {
+            Ok(installed)
+        } else {
+            Err(ProductionIngressError::IdentityMismatch)
+        }
+    }
+
+    fn current_task_identity(&self) -> Result<ProductionIngressIdentity, ProductionIngressError>
+    where
+        S: 'static,
+    {
+        let task = Task::current().ok_or(ProductionIngressError::TaskMismatch)?;
+        let data = task
+            .data()
+            .downcast_ref::<ProductionIngressTaskData<S>>()
+            .ok_or(ProductionIngressError::TaskMismatch)?;
+        let owner = data
+            .owner
+            .upgrade()
+            .ok_or(ProductionIngressError::TaskMismatch)?;
+        if !core::ptr::eq(Arc::as_ptr(&owner), self) {
+            return Err(ProductionIngressError::TaskMismatch);
+        }
+        Ok(data.identity)
+    }
+
+    /// Transfers one exact commit intent to its trusted domain custodian.
+    pub(crate) fn take_commit_intent(&self, effect: cser_core::EffectId) -> Option<CommitIntent> {
+        let mut custody = self.linear_custody.lock();
+        let index = custody.iter().position(|output| {
+            matches!(output, TransitionOutput::CommitIntent(intent) if intent.effect() == effect)
+        })?;
+        match custody.swap_remove(index) {
+            TransitionOutput::CommitIntent(intent) => Some(intent),
+            _ => unreachable!("the selected linear output is a commit intent"),
+        }
+    }
+
+    /// Consumes an unpublished owner after every portal bearer was transferred.
+    pub(crate) fn into_installed(self) -> S {
+        let mut owner = self;
+        assert!(owner.linear_custody.get_mut().is_empty());
+        owner.installed
+    }
+
+    fn close_ingress(&self, identity: ProductionIngressIdentity) -> bool {
+        self.ingress.close(identity)
+    }
+}
+
+impl<S: InstalledCore> ProductionCoreOwner<S> {
+    /// Executes a trusted supervisor or domain command without translating its
+    /// linear output.
+    pub(crate) fn transact_trusted<C>(
+        &self,
+        command: C,
+    ) -> Result<TransitionReceipt, TxError<S::PersistenceError>>
+    where
+        C: Into<Command>,
+    {
+        self.installed.transact(command.into())
+    }
+
+    /// Runs a provider or verifier observation under the authoritative lock.
+    pub(crate) fn observe_engine<R>(&self, operation: impl FnOnce(&Engine) -> R) -> R {
+        self.installed.observe(operation)
+    }
+}
+
+impl<S: InstalledCore + 'static> CoreRegistry for ProductionCoreOwner<S> {
+    type Error = ProductionRegistryError<S::PersistenceError>;
+
+    fn transact(&self, request: CommandRequest) -> Result<CoreTransitionView, Self::Error> {
+        let identity = self
+            .authorize_current_ingress()
+            .map_err(ProductionRegistryError::Ingress)?;
+        if command_ingress_identity(&request) != Some(identity) {
+            return Err(ProductionRegistryError::Ingress(
+                ProductionIngressError::IdentityMismatch,
+            ));
+        }
+        let expects_intent = matches!(&request, CommandRequest::RecordCommitIntent { .. });
+        if !matches!(
+            &request,
+            CommandRequest::CreateEstate { .. }
+                | CommandRequest::AddClaim { .. }
+                | CommandRequest::PrepareEffect { .. }
+                | CommandRequest::RecordCommitIntent { .. }
+        ) {
+            return Err(ProductionRegistryError::TrustedPathRequired);
+        }
+
+        let mut custody = self.linear_custody.lock();
+        if custody.len() == MAX_LINEAR_PORTAL_BEARERS {
+            return Err(ProductionRegistryError::LinearCustodyFull);
+        }
+        let receipt = self
+            .installed
+            .transact(request.into())
+            .map_err(ProductionRegistryError::Transaction)?;
+        let view = CoreTransitionView::new(
+            receipt.revision(),
+            receipt.head(),
+            receipt.projection(),
+            receipt.event(),
+        );
+        match receipt.into_output() {
+            TransitionOutput::None if expects_intent => {
+                Err(ProductionRegistryError::MissingCommitIntent)
+            }
+            TransitionOutput::None => Ok(view),
+            output @ TransitionOutput::CommitIntent(_) if expects_intent => {
+                custody.push(output);
+                Ok(view)
+            }
+            output => {
+                custody.push(output);
+                Err(ProductionRegistryError::UnexpectedLinearOutput)
+            }
+        }
+    }
+
+    fn observe(&self, query: CoreQuery) -> Result<CoreObservation, Self::Error> {
+        self.authorize_current_ingress()
+            .map_err(ProductionRegistryError::Ingress)?;
+        self.installed.observe(|engine| {
+            let stamp =
+                CoreObservationStamp::new(engine.revision(), engine.head(), engine.freshness());
+            match query {
+                CoreQuery::Estate(effect) => Ok(CoreObservation::Estate {
+                    stamp,
+                    effect,
+                    estate: engine.estate(effect),
+                }),
+                CoreQuery::Claims(effect) => Ok(CoreObservation::Claims {
+                    stamp,
+                    effect,
+                    claims: engine
+                        .claims(effect)
+                        .map_err(ProductionRegistryError::Core)?,
+                }),
+                CoreQuery::Pressure => Ok(CoreObservation::Pressure {
+                    stamp,
+                    pressure: engine.pressure(),
+                }),
+            }
+        })
+    }
+}
+
+fn command_ingress_identity(request: &CommandRequest) -> Option<ProductionIngressIdentity> {
+    let (root, incarnation, binding_generation) = match request {
+        CommandRequest::CreateEstate {
+            effect,
+            origin,
+            binding_generation,
+            ..
+        } => (effect.root(), *origin, *binding_generation),
+        CommandRequest::AddClaim {
+            effect,
+            actor,
+            binding_generation,
+            ..
+        }
+        | CommandRequest::PrepareEffect {
+            effect,
+            actor,
+            binding_generation,
+        }
+        | CommandRequest::RecordCommitIntent {
+            effect,
+            actor,
+            binding_generation,
+            ..
+        } => (effect.root(), *actor, *binding_generation),
+        _ => return None,
+    };
+    ProductionIngressIdentity::new(root, incarnation, binding_generation).ok()
+}
+
+impl<S: InstalledCore> RecoveredCoreAuthority for ProductionCoreOwner<S> {
+    type PersistenceError = S::PersistenceError;
+
+    fn snapshot_root(
+        &self,
+        root: cser_core::RootId,
+        snapshot: cser_core::SnapshotId,
+    ) -> Result<cser_core::RecoverySnapshot, CoreError> {
+        self.installed
+            .observe(|engine| engine.snapshot_root(root, snapshot))
+    }
+
+    fn transact(
+        &self,
+        command: Command,
+    ) -> Result<TransitionReceipt, TxError<Self::PersistenceError>> {
+        self.installed.transact(command)
+    }
+}

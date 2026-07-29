@@ -5,807 +5,107 @@
 
 extern crate alloc;
 
-#[cfg(all(
-    feature = "cser-core-runtime-spike",
-    any(feature = "stage7b-eval", feature = "virtio-cser-facade")
-))]
-compile_error!(
-    "cser-core-runtime-spike is mutually exclusive with every legacy CSER runtime profile"
-);
+#[cfg(not(any(
+    feature = "cser-production",
+    feature = "cser-core-reply-recovery",
+    feature = "cser-core-dma-recovery",
+    feature = "cser-core-tpm-anchor",
+)))]
+compile_error!("one CSER core runtime profile must be selected");
 
-#[cfg(all(feature = "cser-core-dma-slice", feature = "cser-core-tpm-anchor"))]
-compile_error!("cser-core-dma-slice and cser-core-tpm-anchor are mutually exclusive");
+#[cfg(any(
+    all(feature = "cser-production", feature = "cser-core-reply-recovery"),
+    all(feature = "cser-production", feature = "cser-core-dma-recovery"),
+    all(feature = "cser-production", feature = "cser-core-tpm-anchor"),
+    all(
+        feature = "cser-core-reply-recovery",
+        feature = "cser-core-dma-recovery"
+    ),
+    all(feature = "cser-core-reply-recovery", feature = "cser-core-tpm-anchor"),
+    all(feature = "cser-core-dma-recovery", feature = "cser-core-tpm-anchor"),
+))]
+compile_error!("CSER runtime profiles are mutually exclusive");
 
-#[cfg(all(
-    feature = "virtio-cser-precommit-fault",
-    feature = "virtio-cser-postcommit-fault"
-))]
-compile_error!(
-    "virtio-cser-precommit-fault and virtio-cser-postcommit-fault are mutually exclusive"
-);
-
-#[cfg(all(
-    not(feature = "cser-core-runtime-spike"),
-    not(feature = "virtio-cser-facade")
-))]
-#[path = "cser/composition.rs"]
-mod composition;
-#[cfg(not(feature = "cser-core-runtime-spike"))]
-#[path = "cser/effect.rs"]
-mod effect;
-#[cfg(not(feature = "cser-core-runtime-spike"))]
-#[path = "cser/effect_registry.rs"]
-mod effect_registry;
-// Mutually-exclusive cutover spike. Its entry point calls the portable core,
-// while every legacy module and entry point is absent from this build.
-#[cfg(all(
-    feature = "cser-core-runtime-spike",
-    not(feature = "cser-core-dma-slice"),
-    not(feature = "cser-core-tpm-anchor")
-))]
+#[cfg(any(feature = "cser-production", feature = "cser-core-reply-recovery"))]
 #[path = "cser/core_reply_adapter.rs"]
 mod core_reply_adapter;
-#[cfg(feature = "cser-core-runtime-spike")]
-#[allow(dead_code)]
+
+#[cfg(any(
+    feature = "cser-production",
+    feature = "cser-core-reply-recovery",
+    feature = "cser-core-dma-recovery"
+))]
 #[path = "cser/core_runtime.rs"]
 mod core_runtime;
-#[cfg(all(
-    feature = "cser-core-runtime-spike",
-    not(feature = "cser-core-dma-slice"),
-    not(feature = "cser-core-tpm-anchor")
-))]
+
+#[cfg(feature = "cser-core-reply-recovery")]
 #[path = "cser/core_runtime_slice.rs"]
 mod core_runtime_slice;
-// Production-shaped reboot coordinator. It remains fail-closed until OSTD has
-// concrete non-rollback anchor, durable journal, and persistent device
-// quarantine providers.
-#[cfg(feature = "cser-core-runtime-spike")]
-#[allow(dead_code)]
+
+#[cfg(feature = "cser-production")]
+#[path = "cser/core_portal_vnext.rs"]
+mod core_portal_vnext;
+
+#[cfg(feature = "cser-production")]
+#[path = "cser/core_production_registry.rs"]
+mod core_production_registry;
+
+#[cfg(feature = "cser-production")]
+#[path = "cser/core_supervisor_vnext.rs"]
+mod core_supervisor_vnext;
+
+#[cfg(feature = "cser-production")]
 #[path = "cser/core_reboot.rs"]
 mod core_reboot;
-// Feature-only bridge from portable-core claims to the real OSTD VirtIO owner
-// typestates. It cannot coexist with the legacy Registry because its feature
-// includes the mutually-exclusive core runtime profile above.
-#[cfg(feature = "cser-core-dma-slice")]
-#[allow(dead_code)]
+
+#[cfg(any(feature = "cser-production", feature = "cser-core-dma-recovery"))]
 #[path = "cser/core_dma_adapter.rs"]
 mod core_dma_adapter;
-#[cfg(feature = "cser-core-dma-slice")]
+
+#[cfg(feature = "cser-core-dma-recovery")]
 #[path = "cser/core_dma_runtime.rs"]
 mod core_dma_runtime;
-// Dedicated TPM2 NV provider profile. It exercises only the portable trusted
-// anchor contract and cannot be combined with either live runtime slice.
-#[cfg(feature = "cser-core-tpm-anchor")]
-#[allow(dead_code)]
+
+#[cfg(any(feature = "cser-production", feature = "cser-core-tpm-anchor"))]
 #[path = "cser/core_tpm_anchor.rs"]
 mod core_tpm_anchor;
-// The generic adapter now earns an activation permit: it binds an unpublished
-// initial service and Nexus-owned manager worker before publication, maps only
-// OSTD UserMode exceptions into typed service faults, and observes exact reap.
-// No filesystem path constructs it yet, and kernel faults remain fail-stop, so
-// permit availability is not runtime lifecycle evidence.
-#[cfg(not(feature = "cser-core-runtime-spike"))]
-#[allow(dead_code)]
-#[path = "cser/supervisor_runtime.rs"]
-mod supervisor_runtime;
-// The adapter is compiled into the kernel now, while its user/kernel transport
-// and persistent session owner land in later portal-v2 tranches.
-#[cfg(not(feature = "cser-core-runtime-spike"))]
-#[allow(dead_code)]
-#[path = "cser/portal_v2.rs"]
-mod portal_v2;
-// The shared semantic spine lands before its first filesystem/IRQ consumer.
-// Keep the temporary dead-code allowance at the module boundary so individual
-// state and transition APIs remain warning-clean while that migration proceeds.
-#[cfg(not(feature = "cser-core-runtime-spike"))]
-#[allow(dead_code)]
-#[path = "cser/device_flight.rs"]
-mod device_flight;
-#[cfg(all(
-    not(feature = "cser-core-runtime-spike"),
-    not(feature = "virtio-cser-facade")
-))]
-#[path = "probes/iommu_probe.rs"]
-mod iommu_probe;
-#[cfg(not(feature = "cser-core-runtime-spike"))]
-#[path = "personality/linux.rs"]
-mod linux;
-#[cfg(not(feature = "cser-core-runtime-spike"))]
-#[path = "personality/linux_dynamic.rs"]
-mod linux_dynamic;
-#[cfg(not(feature = "cser-core-runtime-spike"))]
-#[path = "personality/linux_epoll.rs"]
-mod linux_epoll;
-#[cfg(not(feature = "cser-core-runtime-spike"))]
-#[path = "personality/linux_fs.rs"]
-mod linux_fs;
-#[cfg(not(feature = "cser-core-runtime-spike"))]
-#[path = "personality/linux_fs_input.rs"]
-mod linux_fs_input;
-#[cfg(not(feature = "cser-core-runtime-spike"))]
-#[path = "personality/linux_futex.rs"]
-mod linux_futex;
-#[cfg(not(feature = "cser-core-runtime-spike"))]
-#[path = "personality/linux_futex_core.rs"]
-mod linux_futex_core;
-#[cfg(all(
-    not(feature = "cser-core-runtime-spike"),
-    not(feature = "virtio-cser-facade")
-))]
-#[path = "cser/linux_io_composition.rs"]
-mod linux_io_composition;
-#[cfg(not(feature = "cser-core-runtime-spike"))]
-#[path = "personality/linux_loader.rs"]
-mod linux_loader;
-#[cfg(all(
-    not(feature = "cser-core-runtime-spike"),
-    not(feature = "virtio-cser-facade")
-))]
-#[path = "personality/linux_net.rs"]
-mod linux_net;
-#[cfg(not(feature = "cser-core-runtime-spike"))]
-#[path = "personality/linux_pager.rs"]
-mod linux_pager;
-#[cfg(not(feature = "cser-core-runtime-spike"))]
-#[path = "personality/linux_runtime.rs"]
-mod linux_runtime;
-#[cfg(not(feature = "cser-core-runtime-spike"))]
-#[path = "domains/pager.rs"]
-mod pager;
-#[cfg(not(feature = "cser-core-runtime-spike"))]
-#[path = "domains/readiness.rs"]
-mod readiness;
-#[cfg(not(feature = "cser-core-runtime-spike"))]
-#[path = "domains/scheduler.rs"]
-mod scheduler;
-#[cfg(all(feature = "stage7b-eval", not(feature = "cser-core-runtime-spike")))]
-#[path = "evaluation/stage7b.rs"]
-mod stage7b_evaluation;
-#[cfg(all(
-    feature = "virtio-cser-facade",
-    not(feature = "cser-core-runtime-spike")
-))]
-#[path = "personality/virtio_cser_adapter.rs"]
-mod virtio_cser_adapter;
 
-#[cfg(not(feature = "cser-core-runtime-spike"))]
-use alloc::{boxed::Box, sync::Arc};
+#[cfg(feature = "cser-production")]
+#[path = "cser/core_pio_journal.rs"]
+mod core_pio_journal;
 
-#[cfg(not(feature = "cser-core-runtime-spike"))]
-use effect::{EffectTimer, EffectToken, EffectWaiter};
-#[cfg(not(feature = "cser-core-runtime-spike"))]
-use effect_registry::TaskKey;
-#[cfg(all(
-    not(feature = "cser-core-runtime-spike"),
-    not(feature = "virtio-cser-facade")
-))]
-use iommu_probe::{DmaQuiesceError, DmaQuiescer, Ostd018FailClosed};
-#[cfg(not(feature = "cser-core-runtime-spike"))]
-use ostd::power::{ExitCode, poweroff};
-#[cfg(not(feature = "cser-core-runtime-spike"))]
-use ostd::{
-    arch::cpu::context::{CpuException, UserContext},
-    irq::DisabledLocalIrqGuard,
-    mm::{
-        CachePolicy, FrameAllocOptions, PAGE_SIZE, PageFlags, PageProperty, Vaddr, VmIo, VmSpace,
-    },
-    prelude::*,
-    sync::SpinLock,
-    task::{
-        Task, TaskOptions, disable_preempt, inject_first_task_entry_handler,
-        inject_first_task_pre_irq_handler, inject_post_schedule_handler,
-        inject_post_task_exit_handler, scheduler as ostd_scheduler,
-    },
-    user::{ReturnReason, UserMode},
-};
-#[cfg(not(feature = "cser-core-runtime-spike"))]
-use scheduler::{CserScheduler, FIRST_FALLBACK_SELECTION_ATTEMPT, ProposalResult};
+#[cfg(feature = "cser-production")]
+#[path = "cser/core_reply_outbox.rs"]
+mod core_reply_outbox;
 
-#[cfg(not(feature = "cser-core-runtime-spike"))]
-const AUTHORITY_EPOCH: u64 = 41;
-#[cfg(not(feature = "cser-core-runtime-spike"))]
-const POLICY_LEASE_TICKS: u64 = 64;
-#[cfg(not(feature = "cser-core-runtime-spike"))]
-const USER_TASK_ID: u64 = 100;
-#[cfg(not(feature = "cser-core-runtime-spike"))]
-const FALLBACK_TASK_ID: u64 = 200;
-#[cfg(not(feature = "cser-core-runtime-spike"))]
-pub(crate) const USER_MAP_ADDR: Vaddr = 0x0040_0000;
-#[cfg(not(feature = "cser-core-runtime-spike"))]
-const EXPECTED_FAULT_ADDR: Vaddr = 0x0080_0000;
-#[cfg(not(feature = "cser-core-runtime-spike"))]
-const FAULTING_LOAD_LEN: usize = 3;
-#[cfg(not(feature = "cser-core-runtime-spike"))]
-const SYSCALL_PROBE: usize = 0x4353_4552;
+#[cfg(feature = "cser-production")]
+#[path = "cser/core_device_quarantine.rs"]
+mod core_device_quarantine;
 
-#[cfg(not(feature = "cser-core-runtime-spike"))]
-pub struct TaskData {
-    pub(crate) id: u64,
-    pub(crate) vm_space: Option<Arc<VmSpace>>,
-    #[cfg(feature = "virtio-cser-facade")]
-    pub(crate) cser_task: Option<TaskKey>,
-    #[cfg(feature = "virtio-cser-postcommit-fault")]
-    pub(crate) postcommit_trigger_task: Option<TaskKey>,
-    supervisor_exit: Option<supervisor_runtime::OstdSupervisorTaskExitBinding>,
-    supervisor_causal_owner: Option<Arc<supervisor_runtime::CausalServiceTaskOwner>>,
-    supervisor_worker_exit: Option<supervisor_runtime::OstdSupervisorWorkerExitBinding>,
-    dynamic_vm_space: Option<Arc<SpinLock<Arc<VmSpace>>>>,
-}
+#[cfg(feature = "cser-production")]
+#[path = "cser/core_persistent_runtime.rs"]
+mod core_persistent_runtime;
 
-#[cfg(not(feature = "cser-core-runtime-spike"))]
-impl TaskData {
-    pub(crate) fn new(id: u64, vm_space: Option<Arc<VmSpace>>) -> Self {
-        Self {
-            id,
-            vm_space,
-            #[cfg(feature = "virtio-cser-facade")]
-            cser_task: None,
-            #[cfg(feature = "virtio-cser-postcommit-fault")]
-            postcommit_trigger_task: None,
-            supervisor_exit: None,
-            supervisor_causal_owner: None,
-            supervisor_worker_exit: None,
-            dynamic_vm_space: None,
-        }
-    }
-
-    /// Binds an OSTD task to the complete Registry service identity that its
-    /// portal calls must present.  Ordinary guest/scheduler tasks deliberately
-    /// leave this absent; restartable service runners opt in explicitly so a
-    /// closure cannot manufacture a binding generation at the call site.
-    #[cfg(feature = "virtio-cser-facade")]
-    pub(crate) fn new_cser(task: TaskKey, vm_space: Option<Arc<VmSpace>>) -> Self {
-        Self {
-            id: task.id(),
-            vm_space,
-            cser_task: Some(task),
-            #[cfg(feature = "virtio-cser-postcommit-fault")]
-            postcommit_trigger_task: None,
-            supervisor_exit: None,
-            supervisor_causal_owner: None,
-            supervisor_worker_exit: None,
-            dynamic_vm_space: None,
-        }
-    }
-
-    /// Binds a manager-selected service incarnation to OSTD's exact post-exit
-    /// observation before the unpublished task can reach the scheduler.
-    pub(crate) fn new_supervised(
-        task: TaskKey,
-        supervisor_exit: supervisor_runtime::OstdSupervisorTaskExitBinding,
-        supervisor_causal_owner: Arc<supervisor_runtime::CausalServiceTaskOwner>,
-        vm_space: Option<Arc<VmSpace>>,
-    ) -> Self {
-        Self {
-            id: task.id(),
-            vm_space,
-            #[cfg(feature = "virtio-cser-facade")]
-            cser_task: { Some(task) },
-            #[cfg(feature = "virtio-cser-postcommit-fault")]
-            postcommit_trigger_task: None,
-            supervisor_exit: Some(supervisor_exit),
-            supervisor_causal_owner: Some(supervisor_causal_owner),
-            supervisor_worker_exit: None,
-            dynamic_vm_space: None,
-        }
-    }
-
-    /// Installs the manager worker's exact reap sink before publication. The
-    /// worker is kernel infrastructure and never receives service authority.
-    pub(crate) fn new_supervisor_worker(
-        id: u64,
-        supervisor_worker_exit: supervisor_runtime::OstdSupervisorWorkerExitBinding,
-    ) -> Self {
-        Self {
-            id,
-            vm_space: None,
-            #[cfg(feature = "virtio-cser-facade")]
-            cser_task: None,
-            #[cfg(feature = "virtio-cser-postcommit-fault")]
-            postcommit_trigger_task: None,
-            supervisor_exit: None,
-            supervisor_causal_owner: None,
-            supervisor_worker_exit: Some(supervisor_worker_exit),
-            dynamic_vm_space: None,
-        }
-    }
-
-    /// Creates the single-task dynamic-exec variant whose scheduler hook must
-    /// follow the atomically published process image.
-    pub(crate) fn new_dynamic(id: u64, vm_space: Arc<SpinLock<Arc<VmSpace>>>) -> Self {
-        Self {
-            id,
-            vm_space: None,
-            #[cfg(feature = "virtio-cser-facade")]
-            cser_task: None,
-            #[cfg(feature = "virtio-cser-postcommit-fault")]
-            postcommit_trigger_task: None,
-            supervisor_exit: None,
-            supervisor_causal_owner: None,
-            supervisor_worker_exit: None,
-            dynamic_vm_space: Some(vm_space),
-        }
-    }
-
-    /// Binds a fresh postcommit closure trigger to its exact OSTD task without
-    /// granting it a Registry service incarnation or recovery authority.
-    #[cfg(feature = "virtio-cser-postcommit-fault")]
-    pub(crate) fn new_postcommit_trigger(task: TaskKey, vm_space: Option<Arc<VmSpace>>) -> Self {
-        Self {
-            id: task.id(),
-            vm_space,
-            cser_task: None,
-            postcommit_trigger_task: Some(task),
-            supervisor_exit: None,
-            supervisor_causal_owner: None,
-            supervisor_worker_exit: None,
-            dynamic_vm_space: None,
-        }
-    }
-}
-
-#[cfg(not(feature = "cser-core-runtime-spike"))]
+#[cfg(feature = "cser-production")]
 #[ostd::main]
 fn kernel_main() {
-    #[cfg(feature = "stage7b-eval")]
-    {
-        stage7b_evaluation::run();
-        poweroff(ExitCode::Success);
-    }
-
-    #[cfg(not(feature = "stage7b-eval"))]
-    kernel_main_standard();
+    core_persistent_runtime::launch()
 }
 
-#[cfg(feature = "cser-core-runtime-spike")]
+#[cfg(feature = "cser-core-reply-recovery")]
 #[ostd::main]
 fn kernel_main() {
-    #[cfg(feature = "cser-core-tpm-anchor")]
-    core_tpm_anchor::launch();
-
-    #[cfg(all(feature = "cser-core-dma-slice", not(feature = "cser-core-tpm-anchor")))]
-    core_dma_runtime::launch();
-
-    #[cfg(all(
-        not(feature = "cser-core-dma-slice"),
-        not(feature = "cser-core-tpm-anchor")
-    ))]
     core_runtime_slice::launch()
 }
 
-#[cfg(not(feature = "cser-core-runtime-spike"))]
-fn kernel_main_standard() {
-    let scheduler: &'static CserScheduler = Box::leak(Box::new(CserScheduler::new(
-        AUTHORITY_EPOCH,
-        POLICY_LEASE_TICKS,
-    )));
-    linux_futex::init_expire_debugcon();
-    ostd_scheduler::inject_scheduler(scheduler);
-    inject_post_schedule_handler(activate_current_task_vm);
-    inject_post_task_exit_handler(supervisor_runtime::observe_post_task_exit);
-    inject_first_task_pre_irq_handler(admit_current_task_pre_irq);
-    inject_first_task_entry_handler(record_current_task_post_irq_entry);
-
-    let binding = scheduler.binding();
-    println!(
-        "CSER Register authority_epoch={} binding_epoch={} effect=scheduler_policy",
-        binding.authority_epoch, binding.binding_epoch,
-    );
-
-    let vm_space = Arc::new(create_vm_space(include_bytes!("../guest/probe.bin")));
-    let user_vm_space = vm_space.clone();
-    let user_task = Arc::new(
-        TaskOptions::new(move || run_user_probe(user_vm_space, scheduler, binding))
-            .data(TaskData::new(USER_TASK_ID, Some(vm_space)))
-            .build()
-            .unwrap(),
-    );
-    let fallback_task = Arc::new(
-        TaskOptions::new(move || run_fallback_probe(scheduler, binding))
-            .data(TaskData::new(FALLBACK_TASK_ID, None))
-            .build()
-            .unwrap(),
-    );
-
-    user_task.run();
-    fallback_task.run();
-    assert_eq!(
-        scheduler.propose(binding, USER_TASK_ID),
-        ProposalResult::Prepared
-    );
-
-    ostd_scheduler::enable_preemption_on_cpu();
-    Task::yield_now();
-    unreachable!("bootstrap context is not scheduled again");
+#[cfg(feature = "cser-core-dma-recovery")]
+#[ostd::main]
+fn kernel_main() {
+    core_dma_runtime::launch()
 }
 
-#[cfg(not(feature = "cser-core-runtime-spike"))]
-fn activate_current_task_vm() {
-    let Some(current) = Task::current() else {
-        return;
-    };
-    let Some(data) = current.data().downcast_ref::<TaskData>() else {
-        return;
-    };
-    if let Some(vm_space) = &data.dynamic_vm_space {
-        vm_space.lock().activate();
-    } else if let Some(vm_space) = &data.vm_space {
-        vm_space.activate();
-    }
-    linux_futex::record_expire_post_vm_ready(data.id);
-}
-
-#[cfg(not(feature = "cser-core-runtime-spike"))]
-fn admit_current_task_pre_irq(irq_guard: &DisabledLocalIrqGuard) {
-    let current = Task::current().expect("pre-IRQ admission requires a current task");
-    let data = current
-        .data()
-        .downcast_ref::<TaskData>()
-        .expect("all Nexus OSTD tasks carry TaskData");
-    linux_futex::admit_expire_task_pre_irq(data, irq_guard);
-}
-
-#[cfg(not(feature = "cser-core-runtime-spike"))]
-fn record_current_task_post_irq_entry() {
-    let current = Task::current().expect("OSTD task-entry hook requires a current task");
-    let data = current
-        .data()
-        .downcast_ref::<TaskData>()
-        .expect("all Nexus OSTD tasks carry TaskData");
-    linux_futex::record_expire_post_irq_entry(data.id);
-}
-
-#[cfg(not(feature = "cser-core-runtime-spike"))]
-pub(crate) fn create_vm_space(program: &[u8]) -> VmSpace {
-    let page_count = program.len().div_ceil(PAGE_SIZE);
-    let segment = FrameAllocOptions::new()
-        .alloc_segment(page_count)
-        .expect("allocate user probe pages");
-    segment
-        .write_bytes(0, program)
-        .expect("copy user probe into frames");
-
-    let vm_space = VmSpace::new();
-    let guard = disable_preempt();
-    let mut cursor = vm_space
-        .cursor_mut(
-            &guard,
-            &(USER_MAP_ADDR..USER_MAP_ADDR + page_count * PAGE_SIZE),
-        )
-        .expect("create user mapping cursor");
-    let property = PageProperty::new_user(PageFlags::RX, CachePolicy::Writeback);
-    for frame in segment {
-        cursor.map(frame.into(), property);
-    }
-    drop(cursor);
-    vm_space
-}
-
-#[cfg(not(feature = "cser-core-runtime-spike"))]
-fn run_user_probe(
-    vm_space: Arc<VmSpace>,
-    scheduler: &'static CserScheduler,
-    binding: scheduler::Binding,
-) {
-    vm_space.activate();
-    let current = Task::current().expect("user probe runs in a task");
-    let task_data = current
-        .data()
-        .downcast_ref::<TaskData>()
-        .expect("user probe TaskData");
-    assert!(
-        task_data
-            .vm_space
-            .as_ref()
-            .is_some_and(|vm| Arc::ptr_eq(vm, &vm_space))
-    );
-
-    let mut context = UserContext::default();
-    context.set_rip(USER_MAP_ADDR);
-    let mut user_mode = UserMode::new(context);
-    let mut saw_syscall = false;
-    let mut saw_page_fault = false;
-
-    loop {
-        match user_mode.execute(|| false) {
-            ReturnReason::UserSyscall => {
-                assert_eq!(user_mode.context().rax(), SYSCALL_PROBE);
-                saw_syscall = true;
-                user_mode.context_mut().set_rax(0);
-                println!(
-                    "OSTD_PROBE UserMode return=UserSyscall VmSpace=active authority_epoch={}",
-                    AUTHORITY_EPOCH,
-                );
-                assert_eq!(
-                    scheduler.propose(binding, FALLBACK_TASK_ID),
-                    ProposalResult::Prepared
-                );
-            }
-            ReturnReason::UserException => {
-                let exception = user_mode
-                    .context_mut()
-                    .take_exception()
-                    .expect("UserException includes CpuException");
-                match exception {
-                    CpuException::PageFault(info) => {
-                        assert_eq!(info.addr, EXPECTED_FAULT_ADDR);
-                        saw_page_fault = true;
-                        let resume = user_mode.context().rip() + FAULTING_LOAD_LEN;
-                        user_mode.context_mut().set_rip(resume);
-                        println!(
-                            "OSTD_PROBE UserMode return=UserException exception=PageFault addr={:#x} authority_epoch={}",
-                            info.addr, AUTHORITY_EPOCH,
-                        );
-                        assert!(saw_syscall, "policy crash follows its heartbeat/proposal");
-                        scheduler.crash(binding, "user_exception_page_fault");
-                    }
-                    other => panic!("unexpected user exception: {other:?}"),
-                }
-            }
-            ReturnReason::KernelEvent => {
-                panic!("the probe does not request synthetic kernel events")
-            }
-        }
-
-        if saw_syscall && saw_page_fault {
-            println!(
-                "OSTD_PROBE PASS api=UserMode+VmSpace syscall=true page_fault=true authority_epoch={}",
-                AUTHORITY_EPOCH,
-            );
-            return;
-        }
-    }
-}
-
-#[cfg(not(feature = "cser-core-runtime-spike"))]
-fn run_fallback_probe(scheduler: &'static CserScheduler, old_binding: scheduler::Binding) {
-    let evidence = scheduler
-        .fallback_evidence()
-        .expect("fallback selection records evidence");
-    assert_eq!(evidence.pick_task_id, FALLBACK_TASK_ID);
-    assert!(evidence.pick_tick >= evidence.crash_tick);
-    assert_eq!(
-        evidence.pick_selection_attempt,
-        FIRST_FALLBACK_SELECTION_ATTEMPT
-    );
-    println!(
-        "OSTD_PROBE PASS fallback_first_task={} fallback_first_selection_attempt={} observed_tick_delta={} tick_delta_diagnostic=true authority_epoch={} binding_epoch={}",
-        evidence.pick_task_id,
-        evidence.pick_selection_attempt,
-        evidence.pick_tick - evidence.crash_tick,
-        old_binding.authority_epoch,
-        old_binding.binding_epoch + 1,
-    );
-
-    let crashed_binding = scheduler.binding();
-    assert_eq!(crashed_binding.binding_epoch, old_binding.binding_epoch + 1);
-    assert_eq!(
-        scheduler.propose(crashed_binding, USER_TASK_ID),
-        ProposalResult::RejectNoSupervisor
-    );
-    let wait_token = EffectToken {
-        authority_epoch: AUTHORITY_EPOCH,
-        scope_id: 9,
-        effect_id: 1,
-    };
-    println!(
-        "CSER Register authority_epoch={} binding_epoch={} effect=wait effect_id={}",
-        AUTHORITY_EPOCH, crashed_binding.binding_epoch, wait_token.effect_id,
-    );
-    let (waiter, waker) = EffectWaiter::new_pair(wait_token);
-    assert_eq!(waiter.token(), wait_token);
-    assert_eq!(waker.token(), wait_token);
-    assert!(waker.wake_up());
-    waiter.wait();
-
-    let timer_token = EffectToken {
-        authority_epoch: AUTHORITY_EPOCH,
-        scope_id: 9,
-        effect_id: 2,
-    };
-    println!(
-        "CSER Register authority_epoch={} binding_epoch={} effect=timer effect_id={}",
-        AUTHORITY_EPOCH, crashed_binding.binding_epoch, timer_token.effect_id,
-    );
-    let timer = EffectTimer::after(timer_token, 1);
-    assert_eq!(timer.token(), timer_token);
-    assert!(timer.deadline() >= ostd::timer::Jiffies::elapsed().as_u64());
-    let _ = timer.is_expired();
-    println!(
-        "OSTD_PROBE PASS wrappers=wait+timer carry_effect_token=true authority_epoch={}",
-        AUTHORITY_EPOCH,
-    );
-
-    let registry = effect_registry::evidence::bounded_registry_self_test();
-    assert!(registry.stale_authority_rejected);
-    assert!(registry.quiescent);
-    println!(
-        "EFFECT_REGISTRY PASS effects={} recovery_adoptions={} committed_drains={} uncommitted_aborts={} publication_acks={} stale_authority_rejected={} quiescent={}",
-        registry.effects,
-        registry.recovery_adoptions,
-        registry.committed_drains,
-        registry.uncommitted_aborts,
-        registry.publication_acks,
-        registry.stale_authority_rejected,
-        registry.quiescent,
-    );
-
-    let readiness = readiness::bounded_readiness_self_test();
-    assert!(readiness.stale_source_rejected);
-    assert!(readiness.stale_subscription_rejected);
-    assert!(readiness.duplicate_publication_rejected);
-    println!(
-        "READINESS_CORE PASS sample_arm=atomic edge_deliveries={} level_deliveries={} oneshot_deliveries={} immediate_deliveries={} stale_source_rejected={} stale_subscription_rejected={} duplicate_publication_rejected={}",
-        readiness.edge_deliveries,
-        readiness.level_deliveries,
-        readiness.oneshot_deliveries,
-        readiness.immediate_deliveries,
-        readiness.stale_source_rejected,
-        readiness.stale_subscription_rejected,
-        readiness.duplicate_publication_rejected,
-    );
-
-    // Keep the scheduler in its kernel-owned FIFO fallback while pager tasks
-    // block and wake one another. Pager service binding epochs are independent
-    // from this scheduler-policy binding.
-    let pager_receipt = pager::run_pager_slices();
-    #[cfg(feature = "virtio-cser-facade")]
-    let _ = pager_receipt;
-
-    let linux_scheduler_binding = scheduler.rebind(AUTHORITY_EPOCH);
-    assert_eq!(
-        linux_scheduler_binding.binding_epoch,
-        old_binding.binding_epoch + 1
-    );
-
-    // Linux compatibility is a bounded pressure test, not Nexus's native ABI.
-    // Its policy first proposes the runnable guest under a shared workload
-    // scope, then crashes in user mode and forces a fresh FIFO fallback pick.
-    linux::run_linux_hello_slice(scheduler, linux_scheduler_binding);
-
-    assert_eq!(
-        scheduler.binding().binding_epoch,
-        linux_scheduler_binding.binding_epoch + 1
-    );
-
-    let futex_scheduler_binding = scheduler.rebind(AUTHORITY_EPOCH);
-    assert_eq!(
-        futex_scheduler_binding.binding_epoch,
-        linux_scheduler_binding.binding_epoch + 1
-    );
-    linux_futex::run_linux_futex_slice(scheduler, futex_scheduler_binding);
-    assert_eq!(
-        scheduler.binding().binding_epoch,
-        futex_scheduler_binding.binding_epoch + 1
-    );
-
-    // Execute the retained Round 4 ELF through the bounded Linux ABI. Its
-    // private-futex typed index and common current-resource reverse index move
-    // together under the runtime transaction lock.
-    linux_futex_core::run_linux_futex_core_slice();
-
-    // Stage 6B.2 keeps readiness policy in the Linux personality while the
-    // kernel-owned core freezes delivery and the common registry owns effect
-    // lifetime, publication, and scope closure.
-    linux_epoll::run_linux_epoll_slice();
-    linux_dynamic::run_linux_dynamic_slice();
-    let fs_receipt = match linux_fs::run_linux_fs_slice() {
-        Ok(receipt) => receipt,
-        Err(isolation) => {
-            println!(
-                "LINUX_FS_TERMINAL Isolated error={:?} retained_owner=true closure_receipt=false supervisor_handoff=pending demo_policy=poweroff_failure",
-                isolation,
-            );
-            poweroff(ExitCode::Failure)
-        }
-    };
-    #[cfg(all(
-        feature = "virtio-cser-facade",
-        not(feature = "virtio-cser-precommit-fault"),
-        not(feature = "virtio-cser-postcommit-fault")
-    ))]
-    {
-        assert_eq!(fs_receipt.scope.id(), 95);
-        assert_eq!(fs_receipt.closed_authority_epoch, 141);
-        assert_eq!(fs_receipt.final_authority_epoch, 142);
-        assert_eq!(fs_receipt.terminalizations, 6);
-        assert_eq!(fs_receipt.publication_acks, 1);
-        assert_eq!(fs_receipt.production_effects, 6);
-        assert_eq!(fs_receipt.production_domains, 3);
-        assert!(fs_receipt.preparation_identity_observed);
-        assert!(fs_receipt.quiescent);
-        assert_eq!(
-            fs_receipt.source_sha256,
-            "c5a4014d88794ddccd1c5239957a43500a6637a433640c2293e699fea72b870f"
-        );
-        assert_eq!(
-            fs_receipt.elf_sha256,
-            "0dc5ad40cb05e39592592ef3272ed45be4d71f9b147a534be20b9a5626c17bef"
-        );
-        println!("SPIKE_RESULT PASS");
-        poweroff(ExitCode::Success);
-    }
-
-    #[cfg(feature = "virtio-cser-postcommit-fault")]
-    {
-        assert_eq!(fs_receipt.scope.id(), 95);
-        assert_eq!(fs_receipt.closed_authority_epoch, 141);
-        assert_eq!(fs_receipt.final_authority_epoch, 142);
-        assert_eq!(fs_receipt.terminalizations, 6);
-        assert_eq!(fs_receipt.publication_acks, 1);
-        assert_eq!(fs_receipt.production_effects, 6);
-        assert_eq!(fs_receipt.production_domains, 3);
-        assert!(fs_receipt.preparation_identity_observed);
-        assert!(fs_receipt.quiescent);
-        assert_eq!(
-            fs_receipt.source_sha256,
-            "c5a4014d88794ddccd1c5239957a43500a6637a433640c2293e699fea72b870f"
-        );
-        assert_eq!(
-            fs_receipt.elf_sha256,
-            "0dc5ad40cb05e39592592ef3272ed45be4d71f9b147a534be20b9a5626c17bef"
-        );
-        println!("SPIKE_RESULT PASS");
-        poweroff(ExitCode::Success);
-    }
-
-    #[cfg(feature = "virtio-cser-precommit-fault")]
-    {
-        assert_eq!(fs_receipt.scope.id(), 95);
-        assert_eq!(fs_receipt.closed_authority_epoch, 141);
-        assert_eq!(fs_receipt.final_authority_epoch, 142);
-        assert_eq!(fs_receipt.terminalizations, 6);
-        assert_eq!(fs_receipt.publication_acks, 1);
-        assert_eq!(fs_receipt.production_effects, 6);
-        assert_eq!(fs_receipt.production_domains, 3);
-        assert!(fs_receipt.preparation_identity_observed);
-        assert!(fs_receipt.enrolled_revoke_wins_observed);
-        assert!(fs_receipt.quiescent);
-        assert_eq!(
-            fs_receipt.source_sha256,
-            "c5a4014d88794ddccd1c5239957a43500a6637a433640c2293e699fea72b870f"
-        );
-        assert_eq!(
-            fs_receipt.elf_sha256,
-            "0dc5ad40cb05e39592592ef3272ed45be4d71f9b147a534be20b9a5626c17bef"
-        );
-        println!(
-            "LINUX_FS_SAME_BOOT_PRECOMMIT Terminal receipt_checked=true registry=shared_production compatibility_syscalls=payload_only_not_cser poweroff=success"
-        );
-        println!("SPIKE_RESULT PASS");
-        poweroff(ExitCode::Success);
-    }
-
-    #[cfg(not(feature = "virtio-cser-facade"))]
-    {
-        let net_receipt = linux_net::run_linux_net_slice();
-        composition::run_composition_slice(scheduler, pager_receipt);
-        linux_io_composition::run_linux_io_composition_slice(
-            scheduler,
-            pager_receipt,
-            fs_receipt,
-            net_receipt,
-        );
-        assert_eq!(
-            scheduler.propose(old_binding, USER_TASK_ID),
-            ProposalResult::RejectStale
-        );
-
-        let dma_token = EffectToken {
-            authority_epoch: AUTHORITY_EPOCH,
-            scope_id: 10,
-            effect_id: 3,
-        };
-        assert_eq!(
-            Ostd018FailClosed.unmap_invalidate_and_wait(dma_token),
-            Err(DmaQuiesceError::IotlbInvalidationUnavailable)
-        );
-        println!(
-            "IOMMU_PROBE PASS result=FAIL_CLOSED reason=IOTLB_INVALIDATION_UNAVAILABLE ostd=0.18.0 authority_epoch={}",
-            AUTHORITY_EPOCH,
-        );
-
-        println!("SPIKE_RESULT PASS");
-        poweroff(ExitCode::Success);
-    }
+#[cfg(feature = "cser-core-tpm-anchor")]
+#[ostd::main]
+fn kernel_main() {
+    core_tpm_anchor::launch()
 }

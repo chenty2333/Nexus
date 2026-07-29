@@ -1,14 +1,14 @@
 # RFC 0006: CSER core semantic rebaseline
 
-- Status: **Accepted rebaseline; implementation and capability claims remain
-  prospective**
+- Status: **Implemented production-cutover candidate; final exact-revision
+  combined four-boot receipt and release-ledger seal pending**
 - Decision date: 2026-07-29
 - Pre-rebaseline checkpoint: `05e68b19b219d0f5288de5438127b5690cd7e50f`
 - Recovery references:
   `archive/pre-cser-core-rebaseline-2026-07-29` and
   `pre-cser-core-rebaseline-2026-07-29`
-- API stability: **intentionally unstable until the reply and DMA milestones
-  both pass**
+- API stability: **profile 1 and journal schema 5 are mechanically pinned;
+  R4 release closure is recorded only after the clean exact-revision seal**
 - Changes accepted `v0.1.0` claims: **no**
 
 ## Decision
@@ -516,6 +516,41 @@ and hardware drain retain separate evidence gates.
 These are **R milestones**, deliberately unrelated to the old Stage numbers.
 They are ordered by semantic dependency, not feature count.
 
+### Current implementation status (2026-07-30)
+
+Current `main` is an R6 cutover candidate, not a sealed completion claim:
+
+- `cser-core` is the portable authoritative state machine, with domain-defined
+  reply and DMA obligation/claim profiles, versioned journal records,
+  deterministic replay, retained-claim accounting, and freshness coordinates;
+- the independent safe-Rust model, property tests, normalized core/oracle
+  transition-trace comparisons, and
+  production-transition-source Loom cases cover revoke/claim outcomes, stale
+  generations, real Snapshot/Ready/Rebind commands, settlement windows, and a
+  second successor crash;
+- the OSTD default profile installs one recovered `ProductionCoreOwner`, shared
+  by the stateless `NXP3` portal, `core-v1` supervisor, reply adapter, and DMA
+  adapter; the old live Registry, portal/supervisor glue, and kernel semantic
+  mirrors are absent from the production closure;
+- the durable profile binds an ATA PIO journal, a separate ATA reply outbox,
+  TPM2 NV freshness/catalog state, and a pre-replay VirtIO/VT-d quarantine
+  guard; and
+- the ordinary dirty-tree production proof has passed four QEMU boots over the
+  same raw journal, outbox, and swtpm state: boot-one reply/DMA work runs in
+  real service tasks whose exact exit closes production ingress; boot two uses
+  a fresh Ready/Rebind task, records a durable apply intent, and crashes that
+  successor; boot three reconciles without a duplicate intent; and boot four
+  performs a fresh stable Rebind. The host gate observes exact service/binding
+  pairs `1/1`, `2/2`, `3/3`, and `4/4`.
+
+The final combined four-boot receipt has not yet been sealed against the exact
+cutover revision, so R4 release attestation, R6, and this RFC remain open. The
+QEMU/swtpm path cannot establish physical TPM anti-rollback, physical
+power-loss recovery, hardware-general DMA quiescence, crash-persistent
+PFN/IOVA custody, or resource reuse. Global reset, ISR drain, and IOTLB
+observations preserve quarantine; they do not by themselves prove retirement
+of old page/IOVA claims.
+
 ### R0: preserve and rebaseline
 
 - keep the pre-rebaseline checkpoint reachable by an immutable remote
@@ -553,7 +588,9 @@ no alternate live Registry; and no class escape hatch forbidden above.
 - crash the successor at every settlement window and recover with another
   incarnation; and
 - run Loom over the actual core transition source, plus independent model,
-  property, trace, and one-vCPU OSTD evidence.
+  property, normalized differential-trace, and one-vCPU OSTD evidence. The
+  retained pre-rebaseline TLC trace-conformance crate remains historical
+  evidence and is not relabeled as a new formal family.
 
 Exit requires exact source-bound receipts and no Registry-free closure trigger
 standing in for the replacement service.
@@ -654,7 +691,8 @@ conditions below are true:
    portal, supervisor, kernel path, or release workflow depends on the old live
    Registry or compatibility API.
 5. The replacement has one authoritative Registry and no dual-write path.
-6. Independent model, property, production-source Loom, trace conformance,
+6. Independent model, property, production-source Loom, normalized
+   core/oracle trace comparison, retained historical trace-conformance,
    focused runtime, and full cold verification gates pass at the exact source
    revision.
 7. Durable-state deletion additionally waits for R5 recovery, corruption,
@@ -669,8 +707,10 @@ unrecorded environment state.
 
 ## Evidence and claim discipline
 
-This RFC changes direction, not evidence status. Until each milestone closes,
-its words denote requirements and planned mechanisms, not current capability.
+This RFC changes direction, not inherited evidence status. The implementation
+status above identifies current source facts; every unsealed exit condition and
+the remaining milestone text still denote requirements, not accepted
+capability.
 
 Evidence layers remain separate:
 

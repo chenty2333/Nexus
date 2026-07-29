@@ -24,20 +24,11 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Verify formatting, schemas, Rust, Loom, and neutral scenarios
+      - name: Verify formatting, portable core, oracle, and Loom
         run: ./x test --quick
-      - name: Upload quick failure evidence
-        if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: nexus-quick-failure-evidence-${{ github.run_attempt }}
-          if-no-files-found: ignore
-          path: |
-            target/scenario-artifacts
-            target/verification/*.log
 
   verify:
-    name: full system verification
+    name: CSER Core rebaseline verification
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
@@ -45,32 +36,29 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Verify CSER models, the frozen predecessor, and Linux I/O successors
+      - name: Install TPM fixture tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends swtpm tpm2-tools xxd
+          swtpm --version
+          tpm2_nvdefine --version
+      - name: Seal guest reply/DMA evidence and four-boot production recovery
         env:
           NEXUS_REBUILD: "1"
         run: ./x verify
-      - name: Upload complete verification bundle
+      - name: Upload combined CSER Core recovery evidence
         if: success()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: nexus-verification-bundle-${{ github.run_attempt }}
+          name: nexus-cser-core-rebaseline-${{ github.run_attempt }}
           if-no-files-found: error
-          include-hidden-files: true
-          path: target/verification/artifact-bundle
+          path: kernel/nexus-ostd/artifacts/cser-production
       - name: Upload failure evidence
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: nexus-system-composition-evidence-${{ github.run_attempt }}
+          name: nexus-cser-core-rebaseline-failure-${{ github.run_attempt }}
           if-no-files-found: ignore
           include-hidden-files: true
           path: |
-            target/scenario-artifacts
-            target/verification/*.log
-            target/verification/stage7b
-            target/verification/manifest.json
-            target/verification/.stage7a-verify-start.json
-            target/verification/.stage7a-model-spec-complete.json
-            target/verification/.stage7a-verify-complete.json
-            kernel/nexus-ostd/artifacts
-            experiments/ostd-virtio-cser-spike/artifacts
+            kernel/nexus-ostd/artifacts/cser-production

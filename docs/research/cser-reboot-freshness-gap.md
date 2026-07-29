@@ -1,10 +1,40 @@
-# CSER reboot freshness: current OSTD provider gap
+# CSER reboot freshness: historical OSTD provider-gap audit
 
-Status: implementation audit, 2026-07-29.
+Status: **Superseded implementation-gap audit. Provider implementation and the
+ordinary dirty-tree four-boot proof passed; clean exact-revision receipt
+pending, 2026-07-30.**
 
-This note records why the new production-shaped boot coordinator is not yet a
-production anti-rollback implementation. It is an explicit evidence boundary,
-not a roadmap phase or a substitute for platform receipts.
+This note originally recorded why the production-shaped boot coordinator had
+no OSTD persistence provider on 2026-07-29. That inventory is retained as a
+historical negative result, not as current repository status or an active
+roadmap. RFC 0006 supersedes its task ordering.
+
+## Current resolution and remaining boundary
+
+The rebaseline candidate now provides the missing pinned-profile owners:
+
+- `core_tpm_anchor.rs` drives the QEMU TIS TPM2 device and binds six
+  pre-provisioned NV indices to the exact catalog, Registry binding, journal
+  head, and issued/committed freshness coordinates;
+- `core_pio_journal.rs` supplies the primary ATA PIO journal, while
+  `core_reply_outbox.rs` owns a separate secondary ATA PIO reply record;
+- `OSDK.toml` attaches those two raw media files and one persistent swtpm state
+  directory to every production boot; and
+- `core_device_quarantine.rs` fences VirtIO/PCI and observes reset, ISR drain,
+  and global VT-d invalidation before journal replay.
+
+The ordinary combined proof has passed four QEMU boots over those same owners:
+commit, durable apply intent and second crash, reconciliation without a second
+intent, then stable replay. Until its clean exact-revision receipt is sealed,
+this remains a cutover candidate rather than release evidence.
+
+The provider proves only its pinned QEMU/swtpm/ATA protocol. swtpm state and raw
+media remain host-rollbackable, so this is not physical malicious-rollback
+resistance, physical power-loss evidence, crash-persistent PFN/IOVA custody, or
+authorization to reuse retained resources. Reset/ISR/IOTLB observations justify
+continued quarantine only.
+
+## Historical audit snapshot (superseded)
 
 ## What is implemented
 
@@ -33,7 +63,7 @@ Four OSDK kernel tests cover checkpoint-before-activation, retained device
 claims across replay, exact suffix repair followed by a newer recovery epoch,
 and provider release failure retaining the guard.
 
-## Why there is no production provider yet
+## Why the audited tree had no production provider yet
 
 The checked-in OSTD 0.18 integration has no TPM/NV, UEFI runtime-variable, or
 QEMU `fw_cfg` persistence API. Its public `BootInfo` contains a bootloader name,
@@ -66,7 +96,7 @@ rename, barriers, failpoints, and cold reopen. Its own documentation correctly
 states that a normal file is rollbackable and is not production
 anti-rollback evidence.
 
-## Concrete provider work still required
+## Provider work identified by the historical audit
 
 A production integration needs all of the following:
 
@@ -86,9 +116,12 @@ A production integration needs all of the following:
   software-TPM state, rollback-negative tests, and separate physical-platform
   evidence.
 
-Until those owners exist, `OSTD_018_RECOVERY_GAPS` remains non-empty and the
-boot coordinator must not be cited as reboot persistence, anti-rollback
-freshness, or production device-recovery evidence.
+At the audited revision, those owners did not exist, so
+`OSTD_018_RECOVERY_GAPS` was non-empty and the coordinator could not be cited as
+reboot persistence, anti-rollback freshness, or production device-recovery
+evidence. The current implementation and its narrower evidence boundary are
+recorded above; this historical conclusion must not be applied to the new
+source tree verbatim.
 
 ## Reproducible audit commands
 

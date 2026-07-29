@@ -1,5 +1,20 @@
 # OSTD mediated VirtIO CSER spike
 
+> **Archive-only:** this experiment is retained for historical inspection, not
+> as a live build, run, or production-validation target. Its legacy
+> Portal/Registry dependencies were deliberately removed by the CSER Core
+> Rebaseline. `./x` now fails closed before Docker, Cargo, QEMU, or artifact
+> mutation; direct `cargo osdk` and Docker invocations are unsupported.
+>
+> The retained IRQ Phase A evidence is in
+> [`../../docs/research/irq-spike-phase-a/`](../../docs/research/irq-spike-phase-a/).
+> The complete pre-rebaseline source remains recoverable at tag
+> `pre-cser-core-rebaseline-2026-07-29` and remote branch
+> `origin/archive/pre-cser-core-rebaseline-2026-07-29`, both identifying commit
+> `05e68b1`. Nothing in this directory is current CSER production evidence.
+
+## Historical scope (superseded)
+
 This Stage 5B experiment is the first Nexus slice with a real device-visible
 effect. It demonstrates, on one pinned QEMU/OSTD configuration, that a mediated
 VirtIO block request can cross an explicit commit point, complete through
@@ -7,16 +22,17 @@ non-identity VT-d mappings, survive service crash as an indeterminate committed
 effect, and release every request/queue DMA owner only after device reset and
 the matching IOTLB completion.
 
-Run the complete Docker-only receipt with:
+At the pre-rebaseline checkpoint, the complete Docker-only receipt was invoked
+with:
 
 ```bash
 ./x test
 ```
 
-The command rebuilds when any pinned source, patch, kernel module, fixture, or
-oracle changes. Normal check/build/run steps have networking disabled, use
-Cargo offline mode, and byte-check both project and cargo-osdk runner locks.
-Artifacts are written to:
+That historical command rebuilt when any pinned source, patch, kernel module,
+fixture, or oracle changed. Its check/build/run steps had networking disabled,
+used Cargo offline mode, and byte-checked both project and cargo-osdk runner
+locks. The retained workflow wrote artifacts to:
 
 ```text
 artifacts/serial.log      raw build/firmware/guest stdout plus fixture receipt
@@ -33,17 +49,17 @@ an independently anchored QEMU trace sequence in `qemu-debug.log`. It compares
 the three guest-owned IOVA-to-physical-address mappings across the two inputs,
 but does not claim a total order between different file descriptors.
 
-Root `../../x verify` first reruns this split-stream gate over both
-`artifacts/kernel.log` and `artifacts/qemu-debug.log`. Only after that succeeds
-does the system-composition gate consume the validated `kernel.log` as
-independent prerequisite component evidence:
+At the checkpoint, root `../../x verify` first reran this split-stream gate over
+both `artifacts/kernel.log` and `artifacts/qemu-debug.log`. Only after that
+succeeded did the then-live system-composition gate consume the validated
+`kernel.log` as independent prerequisite component evidence:
 
 ```bash
 # after both OSTD backends have produced their retained logs
 ../../x run composition
 ```
 
-That cross-experiment consistency oracle requires this receipt's audited
+That retired cross-experiment consistency oracle required this receipt's audited
 `avail.idx` Release commit, reset timeout, retained DMA owners, retry,
 device-generation fence, IOTLB completion, and final release. It does not
 preserve effect, ticket, or generation identity: this boot completes request 1

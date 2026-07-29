@@ -8,26 +8,17 @@ license = "MPL-2.0"
 publish = false
 
 [features]
-cser-core-runtime-spike = ["dep:cser-core"]
-cser-core-dma-slice = ["cser-core-runtime-spike", "dep:nexus-ostd-virtio"]
-cser-core-tpm-anchor = ["cser-core-runtime-spike"]
-stage7b-eval = []
-virtio-cser-facade = ["dep:nexus-ostd-virtio"]
-virtio-cser-precommit-fault = ["virtio-cser-facade"]
-virtio-cser-postcommit-fault = ["virtio-cser-facade"]
+default = ["cser-production"]
+cser-production = ["dep:nexus-ostd-virtio"]
+cser-core-reply-recovery = []
+cser-core-dma-recovery = ["dep:nexus-ostd-virtio"]
+cser-core-tpm-anchor = []
 
 [dependencies]
-cser-core = { path = "../../crates/cser-core", default-features = false, optional = true }
-cser-transition-gates = { path = "../../crates/cser-transition-gates" }
-linux-raw-sys = { version = "=0.12.1", default-features = false, features = ["auxvec", "errno", "general", "net", "no_std"] }
+cser-core = { path = "../../crates/cser-core", default-features = false }
 nexus-ostd-virtio = { path = "../../crates/nexus-ostd-virtio", optional = true }
-nexus-portal-abi = { path = "../../crates/nexus-portal-abi" }
-nexus-supervisor = { path = "../../crates/nexus-supervisor" }
-object = { version = "=0.39.1", default-features = false, features = ["elf", "read_core"] }
 ostd = { version = "=0.18.0" }
 sha2 = { version = "=0.10.9", default-features = false, features = ["force-soft"] }
-spin = "=0.9.8"
-x86 = "=0.52.0"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(ktest)"] }

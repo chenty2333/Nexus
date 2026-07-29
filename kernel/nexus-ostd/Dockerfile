@@ -7,10 +7,7 @@ RUN rustup target add --toolchain nightly-2026-04-03 x86_64-unknown-none \
     && rustup component add --toolchain nightly-2026-04-03 rustfmt clippy \
     && cargo install cargo-osdk --version 0.18.0 --locked
 
-COPY crates/cser-transition-gates /crates/cser-transition-gates
 COPY crates/nexus-ostd-virtio /crates/nexus-ostd-virtio
-COPY crates/nexus-portal-abi /crates/nexus-portal-abi
-COPY crates/nexus-supervisor /crates/nexus-supervisor
 
 ARG OSTD_CRATE_SHA256=aa160b3c09e0471f85f76a069e327b3df0bc60d5191b2ce3a64cc15cd62038e1
 ARG OSTD_CRATE_URL=https://static.crates.io/crates/ostd/ostd-0.18.0.crate
@@ -56,54 +53,25 @@ RUN set -eu; \
     /usr/local/bin/assert-production-virtio-substrate \
         /crates/nexus-ostd-virtio/src/production.rs \
         /crates/nexus-ostd-virtio/src/lib.rs \
-        /crates/nexus-ostd-virtio/src/portal.rs \
         /crates/nexus-ostd-virtio/src/pci.rs
 COPY patches/cser-cargo-config.toml /root/.cargo/config.toml
 RUN cargo test --manifest-path /opt/nexus-virtio/virtio-drivers-0.13.0/Cargo.toml \
         --lib --no-default-features \
     && rm -rf /opt/nexus-virtio/virtio-drivers-0.13.0/target
 
-COPY kernel/nexus-ostd/src/cser/device_flight.rs \
-    kernel/nexus-ostd/src/cser/effect_registry.rs \
-    kernel/nexus-ostd/src/cser/portal_v2.rs \
-    kernel/nexus-ostd/src/cser/supervisor_runtime.rs \
+COPY kernel/nexus-ostd/src/cser/core_device_quarantine.rs \
+    kernel/nexus-ostd/src/cser/core_dma_adapter.rs \
+    kernel/nexus-ostd/src/cser/core_persistent_runtime.rs \
+    kernel/nexus-ostd/src/cser/core_pio_journal.rs \
+    kernel/nexus-ostd/src/cser/core_portal_vnext.rs \
+    kernel/nexus-ostd/src/cser/core_production_registry.rs \
+    kernel/nexus-ostd/src/cser/core_reboot.rs \
+    kernel/nexus-ostd/src/cser/core_reply_adapter.rs \
+    kernel/nexus-ostd/src/cser/core_reply_outbox.rs \
+    kernel/nexus-ostd/src/cser/core_runtime.rs \
+    kernel/nexus-ostd/src/cser/core_supervisor_vnext.rs \
+    kernel/nexus-ostd/src/cser/core_tpm_anchor.rs \
     /kernel/nexus-ostd/src/cser/
-COPY kernel/nexus-ostd/src/cser/effect_registry/evidence.rs \
-    /kernel/nexus-ostd/src/cser/effect_registry/evidence.rs
-COPY kernel/nexus-ostd/src/cser/effect_registry/root_lanes.rs \
-    /kernel/nexus-ostd/src/cser/effect_registry/root_lanes.rs
-COPY kernel/nexus-ostd/src/cser/effect_registry/runtime_causal.rs \
-    /kernel/nexus-ostd/src/cser/effect_registry/runtime_causal.rs
-COPY kernel/nexus-ostd/src/cser/effect_registry/runtime_service_task.rs \
-    /kernel/nexus-ostd/src/cser/effect_registry/runtime_service_task.rs
-COPY kernel/nexus-ostd/src/cser/effect_registry/runtime_task.rs \
-    /kernel/nexus-ostd/src/cser/effect_registry/runtime_task.rs
-COPY kernel/nexus-ostd/src/cser/infrastructure/continuation.rs \
-    /kernel/nexus-ostd/src/cser/infrastructure/continuation.rs
-COPY kernel/nexus-ostd/src/cser/infrastructure/deadline.rs \
-    /kernel/nexus-ostd/src/cser/infrastructure/deadline.rs
-COPY kernel/nexus-ostd/src/cser/infrastructure/delayed.rs \
-    /kernel/nexus-ostd/src/cser/infrastructure/delayed.rs
-COPY kernel/nexus-ostd/src/cser/infrastructure/device.rs \
-    /kernel/nexus-ostd/src/cser/infrastructure/device.rs
-COPY kernel/nexus-ostd/src/cser/infrastructure/device_receipt_bridge.rs \
-    /kernel/nexus-ostd/src/cser/infrastructure/device_receipt_bridge.rs
-COPY kernel/nexus-ostd/src/cser/infrastructure/fault.rs \
-    /kernel/nexus-ostd/src/cser/infrastructure/fault.rs
-COPY kernel/nexus-ostd/src/cser/infrastructure/invariants.rs \
-    /kernel/nexus-ostd/src/cser/infrastructure/invariants.rs
-COPY kernel/nexus-ostd/src/cser/infrastructure/mod.rs \
-    /kernel/nexus-ostd/src/cser/infrastructure/mod.rs
-COPY kernel/nexus-ostd/src/cser/infrastructure/reply.rs \
-    /kernel/nexus-ostd/src/cser/infrastructure/reply.rs
-COPY kernel/nexus-ostd/src/cser/infrastructure/root.rs \
-    /kernel/nexus-ostd/src/cser/infrastructure/root.rs
-COPY kernel/nexus-ostd/src/cser/infrastructure/service.rs \
-    /kernel/nexus-ostd/src/cser/infrastructure/service.rs
-COPY kernel/nexus-ostd/src/cser/infrastructure/task.rs \
-    /kernel/nexus-ostd/src/cser/infrastructure/task.rs
-COPY kernel/nexus-ostd/src/cser/infrastructure/tests.rs \
-    /kernel/nexus-ostd/src/cser/infrastructure/tests.rs
 COPY kernel/nexus-ostd/cser-production-sources.txt \
     /kernel/nexus-ostd/cser-production-sources.txt
 
@@ -116,51 +84,28 @@ COPY kernel/nexus-ostd/Cargo.toml \
     kernel/nexus-ostd/OSDK.toml \
     /tmp/nexus-ostd-inputs/
 COPY kernel/nexus-ostd/osdk-runner-base /tmp/nexus-ostd-inputs/osdk-runner-base
-COPY kernel/nexus-ostd/userspace/personality /tmp/nexus-ostd-inputs/personality
-COPY kernel/nexus-ostd/guest/linux-futex-core-personality-v1.S \
-    kernel/nexus-ostd/guest/linux-futex-core-personality-v2.S \
-    kernel/nexus-ostd/guest/linux-netd-v1.S \
-    kernel/nexus-ostd/guest/linux-netd-v2.S \
-    kernel/nexus-ostd/guest/linux-fsd-v1.S \
-    kernel/nexus-ostd/guest/linux-fsd-v2.S \
-    kernel/nexus-ostd/guest/linux-fsd-v2-postcommit.S \
-    kernel/nexus-ostd/guest/linux-fsd-v3.S \
-    /tmp/nexus-ostd-inputs/guest/
-COPY kernel/nexus-ostd/scripts/build-guest.sh \
-    kernel/nexus-ostd/scripts/assert-linux-elf.sh \
-    kernel/nexus-ostd/scripts/assert-dynamic-pie-artifacts.sh \
-    kernel/nexus-ostd/scripts/check-fsbase-api.sh \
-    kernel/nexus-ostd/scripts/check-scheduler-attempt.sh \
-    kernel/nexus-ostd/scripts/build-round4.sh \
-    kernel/nexus-ostd/scripts/build-round5.sh \
-    kernel/nexus-ostd/scripts/build-runtime-fs.sh \
+COPY kernel/nexus-ostd/scripts/build-runtime-fs.sh \
     kernel/nexus-ostd/scripts/assert-runtime-fs-artifacts.sh \
     kernel/nexus-ostd/scripts/build-runtime-fs-block-image.sh \
     kernel/nexus-ostd/scripts/assert-runtime-fs-block-image.sh \
-    kernel/nexus-ostd/scripts/build-runtime-net.sh \
-    kernel/nexus-ostd/scripts/assert-runtime-net-artifacts.sh \
     /tmp/nexus-ostd-inputs/scripts/
-COPY tests/guest/linux/sources/linux-hello/hello.S /tmp/nexus-ostd-inputs/linux-hello.S
-COPY tests/guest/linux/sources/linux-dynamic-pie-smoke/dynamic_pie_smoke.S \
-    /tmp/nexus-ostd-inputs/dynamic_pie_smoke.S
-COPY tests/guest/linux/sources/linux-dynamic-pie-main/dynamic_pie_main.c \
-    /tmp/nexus-ostd-inputs/dynamic_pie_main.c
-COPY tests/guest/linux/sources/linux-dynamic-runtime-interp/dynamic_runtime_interp.c \
-    /tmp/nexus-ostd-inputs/dynamic_runtime_interp.c
-COPY tests/guest/linux/sources/linux-round4-futex-smoke/round4_futex_smoke.S \
-    /tmp/nexus-ostd-inputs/round4_futex_smoke.S
-COPY tests/guest/linux/adaptations/round4-futex-modern-requeue.patch \
-    /tmp/nexus-ostd-inputs/round4-futex-modern-requeue.patch
-COPY tests/guest/linux/sources/linux-round5-epoll-smoke/round5_epoll_smoke.S \
-    /tmp/nexus-ostd-inputs/round5_epoll_smoke.S
 COPY tests/guest/linux/sources/linux-runtime-fs-smoke/runtime_fs_smoke.S \
     /tmp/nexus-ostd-inputs/runtime_fs_smoke.S
-COPY tests/guest/linux/sources/linux-runtime-net-smoke/runtime_net_smoke.S \
-    /tmp/nexus-ostd-inputs/runtime_net_smoke.S
-COPY tests/guest/linux/adaptations/round5-epoll-linux-regular-file.patch \
-    tests/guest/linux/adaptations/verify-round5-epoll-adaptation.sh \
-    /tmp/nexus-ostd-inputs/round5/
 COPY crates/cser-core /crates/cser-core
+COPY crates/cser-model /crates/cser-model
+# The catalog-digest helper runs against the repository workspace lockfile in
+# the network-disabled runtime container. Prime that exact locked host graph
+# while building the pinned image so helper execution cannot consult a registry.
+RUN --mount=type=bind,source=.,target=/repo,readonly \
+    set -eu; \
+    mkdir -p /tmp/nexus-cser-cargo-home; \
+    ln -s /root/.cargo/registry /tmp/nexus-cser-cargo-home/registry; \
+    cd /tmp; \
+    HOME=/tmp/nexus-cser-cargo-home \
+        CARGO_HOME=/tmp/nexus-cser-cargo-home \
+        RUSTUP_HOME=/root/.rustup \
+        cargo fetch --locked --manifest-path /repo/Cargo.toml; \
+    rm -rf -- /tmp/nexus-cser-cargo-home
 RUN --mount=type=bind,source=kernel/nexus-ostd,target=/tmp/nexus-ostd-source,readonly \
     cmp /tmp/nexus-ostd-inputs/Cargo.toml /tmp/nexus-ostd-source/Cargo.toml \
     && cmp /tmp/nexus-ostd-inputs/Cargo.lock /tmp/nexus-ostd-source/Cargo.lock \
@@ -169,38 +114,6 @@ RUN --mount=type=bind,source=kernel/nexus-ostd,target=/tmp/nexus-ostd-source,rea
     && cmp /tmp/nexus-ostd-inputs/OSDK.toml /tmp/nexus-ostd-source/OSDK.toml \
     && diff -ru /tmp/nexus-ostd-inputs/osdk-runner-base \
         /tmp/nexus-ostd-source/osdk-runner-base \
-    && diff -ru /tmp/nexus-ostd-inputs/personality \
-        /tmp/nexus-ostd-source/userspace/personality \
-    && cmp /tmp/nexus-ostd-inputs/guest/linux-futex-core-personality-v1.S \
-        /tmp/nexus-ostd-source/guest/linux-futex-core-personality-v1.S \
-    && cmp /tmp/nexus-ostd-inputs/guest/linux-futex-core-personality-v2.S \
-        /tmp/nexus-ostd-source/guest/linux-futex-core-personality-v2.S \
-    && cmp /tmp/nexus-ostd-inputs/guest/linux-netd-v1.S \
-        /tmp/nexus-ostd-source/guest/linux-netd-v1.S \
-    && cmp /tmp/nexus-ostd-inputs/guest/linux-netd-v2.S \
-        /tmp/nexus-ostd-source/guest/linux-netd-v2.S \
-    && cmp /tmp/nexus-ostd-inputs/guest/linux-fsd-v1.S \
-        /tmp/nexus-ostd-source/guest/linux-fsd-v1.S \
-    && cmp /tmp/nexus-ostd-inputs/guest/linux-fsd-v2.S \
-        /tmp/nexus-ostd-source/guest/linux-fsd-v2.S \
-    && cmp /tmp/nexus-ostd-inputs/guest/linux-fsd-v2-postcommit.S \
-        /tmp/nexus-ostd-source/guest/linux-fsd-v2-postcommit.S \
-    && cmp /tmp/nexus-ostd-inputs/guest/linux-fsd-v3.S \
-        /tmp/nexus-ostd-source/guest/linux-fsd-v3.S \
-    && cmp /tmp/nexus-ostd-inputs/scripts/build-guest.sh \
-        /tmp/nexus-ostd-source/scripts/build-guest.sh \
-    && cmp /tmp/nexus-ostd-inputs/scripts/assert-linux-elf.sh \
-        /tmp/nexus-ostd-source/scripts/assert-linux-elf.sh \
-    && cmp /tmp/nexus-ostd-inputs/scripts/assert-dynamic-pie-artifacts.sh \
-        /tmp/nexus-ostd-source/scripts/assert-dynamic-pie-artifacts.sh \
-    && cmp /tmp/nexus-ostd-inputs/scripts/check-fsbase-api.sh \
-        /tmp/nexus-ostd-source/scripts/check-fsbase-api.sh \
-    && cmp /tmp/nexus-ostd-inputs/scripts/check-scheduler-attempt.sh \
-        /tmp/nexus-ostd-source/scripts/check-scheduler-attempt.sh \
-    && cmp /tmp/nexus-ostd-inputs/scripts/build-round4.sh \
-        /tmp/nexus-ostd-source/scripts/build-round4.sh \
-    && cmp /tmp/nexus-ostd-inputs/scripts/build-round5.sh \
-        /tmp/nexus-ostd-source/scripts/build-round5.sh \
     && cmp /tmp/nexus-ostd-inputs/scripts/build-runtime-fs.sh \
         /tmp/nexus-ostd-source/scripts/build-runtime-fs.sh \
     && cmp /tmp/nexus-ostd-inputs/scripts/assert-runtime-fs-artifacts.sh \
@@ -209,25 +122,11 @@ RUN --mount=type=bind,source=kernel/nexus-ostd,target=/tmp/nexus-ostd-source,rea
         /tmp/nexus-ostd-source/scripts/build-runtime-fs-block-image.sh \
     && cmp /tmp/nexus-ostd-inputs/scripts/assert-runtime-fs-block-image.sh \
         /tmp/nexus-ostd-source/scripts/assert-runtime-fs-block-image.sh \
-    && cmp /tmp/nexus-ostd-inputs/scripts/build-runtime-net.sh \
-        /tmp/nexus-ostd-source/scripts/build-runtime-net.sh \
-    && cmp /tmp/nexus-ostd-inputs/scripts/assert-runtime-net-artifacts.sh \
-        /tmp/nexus-ostd-source/scripts/assert-runtime-net-artifacts.sh \
     && rm -rf /work \
     && cp -a /tmp/nexus-ostd-source /work \
     && cd /work \
-    && NEXUS_LINUX_HELLO_SOURCE=/tmp/nexus-ostd-inputs/linux-hello.S \
-        NEXUS_DYNAMIC_PIE_LAUNCHER_SOURCE=/tmp/nexus-ostd-inputs/dynamic_pie_smoke.S \
-        NEXUS_DYNAMIC_PIE_MAIN_SOURCE=/tmp/nexus-ostd-inputs/dynamic_pie_main.c \
-        NEXUS_DYNAMIC_PIE_INTERP_SOURCE=/tmp/nexus-ostd-inputs/dynamic_runtime_interp.c \
-        NEXUS_ROUND4_FUTEX_SOURCE=/tmp/nexus-ostd-inputs/round4_futex_smoke.S \
-        NEXUS_ROUND4_FUTEX_PATCH=/tmp/nexus-ostd-inputs/round4-futex-modern-requeue.patch \
-        NEXUS_ROUND5_EPOLL_SOURCE=/tmp/nexus-ostd-inputs/round5_epoll_smoke.S \
-        NEXUS_ROUND5_EPOLL_PATCH=/tmp/nexus-ostd-inputs/round5/round5-epoll-linux-regular-file.patch \
-        NEXUS_ROUND5_EPOLL_ORACLE=/tmp/nexus-ostd-inputs/round5/verify-round5-epoll-adaptation.sh \
-        NEXUS_RUNTIME_FS_SOURCE=/tmp/nexus-ostd-inputs/runtime_fs_smoke.S \
-        NEXUS_RUNTIME_NET_SOURCE=/tmp/nexus-ostd-inputs/runtime_net_smoke.S \
-        bash scripts/build-guest.sh \
+    && NEXUS_RUNTIME_FS_SOURCE=/tmp/nexus-ostd-inputs/runtime_fs_smoke.S \
+        bash scripts/build-runtime-fs.sh guest/linux-runtime-fs.elf \
     && mkdir -p /opt/nexus-fixtures \
     && bash scripts/build-runtime-fs-block-image.sh \
         guest/linux-runtime-fs.elf /opt/nexus-fixtures/runtime-fs-block.raw \
@@ -235,27 +134,21 @@ RUN --mount=type=bind,source=kernel/nexus-ostd,target=/tmp/nexus-ostd-source,rea
         guest/linux-runtime-fs.elf /opt/nexus-fixtures/runtime-fs-block.raw \
     && test "$(stat -c %a /opt/nexus-fixtures/runtime-fs-block.raw)" = 444 \
     && cargo check --locked --target x86_64-unknown-none \
-        --features virtio-cser-facade \
+        --no-default-features --features cser-production \
     && cargo check --locked --target x86_64-unknown-none \
-        --no-default-features --features cser-core-runtime-spike \
+        --no-default-features --features cser-core-reply-recovery \
+    && cargo check --locked --target x86_64-unknown-none \
+        --no-default-features --features cser-core-dma-recovery \
     && cargo check --locked --target x86_64-unknown-none \
         --no-default-features --features cser-core-tpm-anchor \
     && cargo osdk check --locked \
-    && bash scripts/check-fsbase-api.sh \
-    && bash scripts/check-scheduler-attempt.sh \
     && rm -rf target/osdk/nexus-kernel-run-base \
     && mkdir -p target/osdk \
     && cp -a /tmp/nexus-ostd-inputs/osdk-runner-base \
         target/osdk/nexus-kernel-run-base \
     && chmod a-w target/osdk/nexus-kernel-run-base/Cargo.lock \
     && cargo fetch --manifest-path target/osdk/nexus-kernel-run-base/Cargo.toml --locked \
-    && CARGO_NET_OFFLINE=true cargo osdk build \
-    && CARGO_NET_OFFLINE=true cargo osdk build --scheme runtime-fs-same-boot \
-    && CARGO_NET_OFFLINE=true cargo osdk build --scheme runtime-fs-same-boot-precommit \
-    && CARGO_NET_OFFLINE=true cargo osdk build --scheme runtime-fs-same-boot-postcommit-crash \
-    && CARGO_NET_OFFLINE=true cargo osdk build \
-        --no-default-features --features cser-core-runtime-spike \
-    && CARGO_NET_OFFLINE=true cargo osdk build --scheme cser-core-tpm-anchor \
+    && CARGO_NET_OFFLINE=true cargo osdk build --scheme cser-production \
     && cmp /tmp/nexus-ostd-inputs/Cargo.lock /work/Cargo.lock \
     && diff -ru /tmp/nexus-ostd-inputs/osdk-runner-base \
         /work/target/osdk/nexus-kernel-run-base \

@@ -2,11 +2,11 @@
 
 //! Real OSTD task-lifecycle probe for the mutually-exclusive portable core.
 //!
-//! The probe deliberately uses `Engine::transact_volatile`: it proves the
-//! task/reap/fence/recovery transition binding in one boot, but it is not
-//! reboot-persistence evidence.  The production [`super::core_runtime::
-//! OstdCserRuntime::transact`] path remains fail-closed until an OSTD durable
-//! journal provider is installed. The commit verifier below remains a
+//! The probe uses the same `TransitionDurability` transaction boundary as the
+//! recovered production owner, backed here by a same-boot byte journal. It
+//! proves task/reap/fence/recovery transition binding, but it is not
+//! reboot-persistence evidence because those bytes have no durable provider or
+//! trusted anchor. The commit verifier below remains a
 //! challenge-reflecting probe. Reply application, wake-up, client
 //! acknowledgement, settlement, and retirement use a real task-bound OSTD
 //! `Waiter`/`Waker` through `core_reply_adapter`. `Rebind` is still task-bound
@@ -15,18 +15,25 @@
 //! latch that rejects ingress between exact reap and the durable
 //! `FenceIncarnation` commit.
 
-use alloc::sync::{Arc, Weak};
-use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use alloc::{
+    sync::{Arc, Weak},
+    vec::Vec,
+};
+use core::{
+    convert::Infallible,
+    sync::atomic::{AtomicBool, AtomicU8, Ordering},
+};
 
 use cser_core::{
     AuthorityState, BootGeneration, ChargeAccountId, ClaimId, ClaimScope, CommandRequest,
     CoreError, CoreLimits, Digest, EffectFactChallenge, EffectFactKind, EffectId,
-    EffectReceiptVerifier, ExternalOutcome, Freshness, JournalGeneration, OutcomeState,
-    PrincipalId, PrincipalIncarnation, REPLY_CLAIM_PUBLICATION_SLOT, REPLY_COMMIT_RECEIPT_SCHEMA,
-    REPLY_DOMAIN, REPLY_OBLIGATION_PUBLICATION, REPLY_VERIFIER, ReceiptSchemaId, RegistryInstance,
-    ResourceGeneration, ResourceId, RetirementState, RootId, SettlementClaim, SettlementState,
-    SnapshotId, TransitionOutput, TransitionReceipt, VerificationError, VerifiedEffectObservation,
-    VerifierIdentity, standard_catalog,
+    EffectReceiptVerifier, ExternalOutcome, Freshness, JournalGeneration, JournalRecord,
+    OutcomeState, PrincipalId, PrincipalIncarnation, REPLY_CLAIM_PUBLICATION_SLOT,
+    REPLY_COMMIT_RECEIPT_SCHEMA, REPLY_DOMAIN, REPLY_OBLIGATION_PUBLICATION, REPLY_VERIFIER,
+    ReceiptSchemaId, RegistryInstance, ResourceGeneration, ResourceId, RetirementState, RootId,
+    SettlementClaim, SettlementState, SnapshotId, TransitionDurability, TransitionOutput,
+    TransitionReceipt, TxError, VerificationError, VerifiedEffectObservation, VerifierIdentity,
+    standard_catalog,
 };
 use ostd::{
     power::{ExitCode, poweroff},
@@ -38,9 +45,41 @@ use ostd::{
 use super::core_reply_adapter::{
     ReplyAckError, ReplyCoordinate, ReplyCustody, ReplyPlan, reply_pair,
 };
-use super::core_runtime::{OstdCserRuntime, UnavailableJournal, run_boot_probe};
+use super::core_runtime::OstdCserRuntime;
 
-type SpikeRuntime = OstdCserRuntime<UnavailableJournal>;
+#[path = "core_runtime_dev.rs"]
+mod core_runtime_dev;
+
+use self::core_runtime_dev::run_boot_probe;
+
+struct VolatileReplyDurability {
+    journal: Vec<u8>,
+}
+
+impl VolatileReplyDurability {
+    const fn new() -> Self {
+        Self {
+            journal: Vec::new(),
+        }
+    }
+}
+
+impl TransitionDurability for VolatileReplyDurability {
+    type Error = Infallible;
+
+    fn persist_transition(
+        &mut self,
+        record: &JournalRecord,
+        resulting_freshness: Freshness,
+    ) -> Result<(), Self::Error> {
+        assert!(!record.bytes().is_empty());
+        assert_ne!(resulting_freshness.boot().get(), 0);
+        self.journal.extend_from_slice(record.bytes());
+        Ok(())
+    }
+}
+
+type SpikeRuntime = OstdCserRuntime<VolatileReplyDurability>;
 
 const PHASE_INITIAL: u8 = 0;
 const PHASE_READY: u8 = 1;
@@ -278,7 +317,7 @@ fn run_task_recovery_slice() {
 
     let runtime = Arc::new(OstdCserRuntime::from_engine(
         cser_engine(),
-        UnavailableJournal,
+        VolatileReplyDurability::new(),
     ));
     let inbox = Arc::new(ReapInbox::new());
     let root = root(1);
@@ -500,7 +539,8 @@ fn run_task_recovery_slice() {
          revoke_adopt_orders=2 legacy_runtime=false live_dual_write=false \
          rebind=task-bound-core production_rebind=false \
          receipt_provider=commit-probe+physical-reply real_reply=true \
-         journal=volatile-dev-only durable_provider=unavailable"
+         journal=same-boot-memory durability_boundary=transition-trait \
+         reboot_persistence=false"
     );
     poweroff(ExitCode::Success);
 }
@@ -785,12 +825,12 @@ fn exercise_revoke_adopt_orders(runtime: &SpikeRuntime) {
         },
     );
     assert_eq!(
-        runtime.transact_volatile(CommandRequest::AdoptEffect {
+        runtime.transact(CommandRequest::AdoptEffect {
             effect: revoke_effect,
             successor: revoke_successor,
             binding_generation: 2,
         }),
-        Err(CoreError::GateClosed)
+        Err(TxError::Core(CoreError::GateClosed))
     );
 
     let adopt_effect = effect(root(12), 1);
@@ -819,13 +859,13 @@ fn exercise_revoke_adopt_orders(runtime: &SpikeRuntime) {
         },
     );
     assert_eq!(
-        runtime.transact_volatile(CommandRequest::BeginRevoke {
+        runtime.transact(CommandRequest::BeginRevoke {
             effect: adopt_effect,
             expected_actor: adopt_successor,
             binding_generation: 2,
             authority_epoch: stale_epoch,
         }),
-        Err(CoreError::StaleAuthorityEpoch)
+        Err(TxError::Core(CoreError::StaleAuthorityEpoch))
     );
 }
 
@@ -883,8 +923,8 @@ where
     C: Into<cser_core::Command>,
 {
     runtime
-        .transact_volatile(command)
-        .expect("runtime spike transition succeeds")
+        .transact(command)
+        .expect("same-boot durable transition succeeds")
 }
 
 fn output<C>(runtime: &SpikeRuntime, command: C) -> TransitionOutput

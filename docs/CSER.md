@@ -1,12 +1,13 @@
 # CSER in two pages
 
-This is the short technical statement of Causally Scoped Effect Revocation
-(CSER). It is deliberately self-contained: a reader should be able to decide
-from this page alone what the mechanism is, what the one candidate
-contribution is, and what the released evidence does and does not establish.
-The authoritative long-form documents remain [VISION.md](../VISION.md),
-[NARRATIVE.md](../NARRATIVE.md), and [ARCHITECTURE.md](../ARCHITECTURE.md);
-where this page and those documents disagree, those documents win.
+This is the short technical statement of the accepted `v0.1.0` Causally Scoped
+Effect Revocation (CSER) work. The release claims and evidence below remain
+immutable historical material. For current engineering semantics,
+[RFC 0006](rfcs/0006-cser-core-semantic-rebaseline.md) is authoritative;
+conflicting roadmap, phase, Registry, and compatibility statements in this
+page, [VISION.md](../VISION.md), [NARRATIVE.md](../NARRATIVE.md), and
+[ARCHITECTURE.md](../ARCHITECTURE.md) are **Superseded**. Those documents do
+not override RFC 0006 or describe the current production closure.
 
 ## The problem
 
@@ -93,15 +94,22 @@ The complete claim ledger, including every explicit non-claim, is
 
 ## Where the work is now
 
-Post-release work follows [RFC 0001](rfcs/0001-production-identity.md): does
-one causal identity survive a real `pread64` from the Linux personality
-through filesystem, block, VirtIO queue publication, and IOMMU ownership to a
-guest reply, in one boot, across crash/rebind and root revocation? Bounded
-one-vCPU checkpoints currently observe the filesystem-service crash before
-device commit and a post-commit, pre-reply crash that closes through a
-Registry-free trigger with honest retention. The next contracted step is the
-post-commit *adoption* lane ([RFC 0005](rfcs/0005-postcommit-reply-adoption.md)):
-whether a replacement incarnation can adopt a retained committed device flight
-and publish the guest reply exactly once, or degrade honestly to the tombstone
-lane. Real IRQ delivery, repeated crash, and SMP observation remain open
-boundaries recorded in `status/current-capabilities.toml`.
+RFC 0001, RFC 0005, and their phase numbering are historical inputs to
+[RFC 0006](rfcs/0006-cser-core-semantic-rebaseline.md), not the active roadmap.
+The current cutover candidate uses `cser-core` as the portable semantic owner,
+an independent safe-Rust oracle, domain-defined reply and DMA obligations and
+claims, a versioned journal, ATA PIO journal/outbox providers, TPM2 NV
+freshness/catalog binding, boot-time VirtIO/VT-d quarantine, and one recovered
+production Registry shared by the NXP3 portal and core-v1 supervisor.
+
+The ordinary dirty-tree combined acceptance proof has passed focused real-task
+reply and real-device DMA guests, then four production boots over the same
+journal, outbox, and swtpm state. It covers exact service reap and production
+ingress closure, fresh Ready/Rebind tasks, a durable apply intent, a second
+successor crash, reconciliation without a second intent, and stable replay
+while retaining page and IOVA claims. Until that path is sealed against a
+clean exact revision, the tree remains a production-cutover candidate rather
+than a completed release. The QEMU/swtpm evidence does not establish physical
+TPM anti-rollback, physical power-loss durability, crash-persistent PFN/IOVA
+custody, SMP, or hardware-general DMA quiescence and does not authorize
+resource reuse.

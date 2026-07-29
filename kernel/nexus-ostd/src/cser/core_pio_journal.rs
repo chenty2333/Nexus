@@ -35,7 +35,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::core_reboot::OstdBootJournal;
 
-const SECTOR_BYTES: usize = 512;
+pub(crate) const SECTOR_BYTES: usize = 512;
 const WORDS_PER_SECTOR: usize = SECTOR_BYTES / size_of::<u16>();
 
 // LBA 0 is left untouched so an accidental attachment remains recognizable to
@@ -101,6 +101,7 @@ const ATA_POLL_LIMIT: u32 = 10_000_000;
 /// The QEMU profile must attach an explicit legacy controller, for example
 /// `-device piix3-ide,id=legacy-ide` plus an `ide-hd` on the selected bus.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
 pub(crate) enum AtaJournalFixture {
     PrimaryMaster,
     PrimarySlave,
@@ -211,7 +212,12 @@ pub(crate) enum BankedJournalError<E> {
 
 pub(crate) type AtaPioJournalError = BankedJournalError<AtaPioError>;
 
-trait SectorBackend {
+/// Minimal fixed-sector contract shared by the journal and other dedicated
+/// polling-only ATA persistence providers.
+///
+/// This remains crate-private: it is a mechanical transport primitive, not a
+/// second durability or recovery authority.
+pub(crate) trait SectorBackend {
     type Error;
 
     fn sector_count(&self) -> u32;
@@ -281,14 +287,14 @@ impl AtaPorts {
 
 /// Linear owner of one detected 512-byte-sector ATA fixed disk.
 #[derive(Debug)]
-struct AtaPioDisk {
+pub(crate) struct AtaPioDisk {
     ports: AtaPorts,
     drive: AtaDrive,
     sectors: u32,
 }
 
 impl AtaPioDisk {
-    fn acquire(fixture: AtaJournalFixture) -> Result<Self, AtaPioError> {
+    pub(crate) fn acquire(fixture: AtaJournalFixture) -> Result<Self, AtaPioError> {
         let (base, control, drive) = fixture.coordinates();
         let ports = AtaPorts::acquire(base, control)?;
         // This owner is polling-only.  Mask device-generated legacy IRQs

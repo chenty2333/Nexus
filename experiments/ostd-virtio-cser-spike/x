@@ -1,6 +1,16 @@
 #!/usr/bin/bash -p
 set -euo pipefail
 
+printf '%s\n' \
+    'ARCHIVE_ONLY: experiments/ostd-virtio-cser-spike is not a live build or run target.' \
+    'Its legacy Portal/Registry dependencies were retired by the CSER Core Rebaseline.' \
+    'Retained IRQ Phase A evidence: docs/research/irq-spike-phase-a/' \
+    'Recoverable source checkpoint: pre-cser-core-rebaseline-2026-07-29 (05e68b1).' \
+    'Remote checkpoint: origin/archive/pre-cser-core-rebaseline-2026-07-29.' >&2
+exit 64
+
+# Historical workflow retained below for checkpoint archaeology. It is
+# intentionally unreachable from the current tree.
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 readonly PATH
 root=$(cd "$(/usr/bin/dirname "$0")" && pwd)

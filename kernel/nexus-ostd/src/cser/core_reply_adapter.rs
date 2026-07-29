@@ -75,6 +75,13 @@ impl ReplyPlan {
     pub(crate) const fn value(self) -> u64 {
         self.value
     }
+
+    /// Returns the exact payload identity committed by a durable reply
+    /// outbox before the physical waiter publication is reconciled.
+    #[cfg(feature = "cser-production")]
+    pub(crate) const fn payload_digest(self) -> Digest {
+        self.payload_digest
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -154,6 +161,37 @@ pub(crate) fn reply_pair(coordinate: ReplyCoordinate) -> (ReplyReceiver, ReplyCu
     )
 }
 
+/// Builds the deterministic plan shared by the durable commit provider and
+/// the later physical reply custodian.
+pub(crate) fn reply_plan(
+    coordinate: ReplyCoordinate,
+    publication_sequence: u64,
+    value: u64,
+) -> Result<ReplyPlan, ReplyApplyError> {
+    if publication_sequence == 0 {
+        return Err(ReplyApplyError::WrongCoordinate);
+    }
+    let intent_digest = hash_plan(
+        b"nexus.ostd.cser-core.reply-intent.v1",
+        coordinate,
+        publication_sequence,
+        value,
+    );
+    let payload_digest = hash_plan(
+        b"nexus.ostd.cser-core.reply-payload.v1",
+        coordinate,
+        publication_sequence,
+        value,
+    );
+    Ok(ReplyPlan {
+        coordinate,
+        publication_sequence,
+        value,
+        intent_digest,
+        payload_digest,
+    })
+}
+
 impl ReplyCustody {
     /// Builds an immutable plan for one kernel-owned publication attempt.
     pub(crate) fn plan(
@@ -161,28 +199,7 @@ impl ReplyCustody {
         publication_sequence: u64,
         value: u64,
     ) -> Result<ReplyPlan, ReplyApplyError> {
-        if publication_sequence == 0 {
-            return Err(ReplyApplyError::WrongCoordinate);
-        }
-        let intent_digest = hash_plan(
-            b"nexus.ostd.cser-core.reply-intent.v1",
-            self.coordinate,
-            publication_sequence,
-            value,
-        );
-        let payload_digest = hash_plan(
-            b"nexus.ostd.cser-core.reply-payload.v1",
-            self.coordinate,
-            publication_sequence,
-            value,
-        );
-        Ok(ReplyPlan {
-            coordinate: self.coordinate,
-            publication_sequence,
-            value,
-            intent_digest,
-            payload_digest,
-        })
+        reply_plan(self.coordinate, publication_sequence, value)
     }
 
     /// Applies the real OSTD wake after the core apply intent is durable.

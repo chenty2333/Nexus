@@ -2,16 +2,16 @@
 
 //! Fail-closed boot boundary for persistent CSER recovery.
 //!
-//! This module is deliberately production-shaped without pretending that the
-//! current OSTD 0.18 platform supplies a production trusted anchor.  A real
-//! caller must provide three independent owners:
+//! The coordinator remains provider-generic, while the pinned
+//! `cser-production` profile binds it to three independent concrete owners:
 //!
-//! - a journal which can read, repair, append, and durably synchronize exact
-//!   journal bytes;
-//! - a [`TrustedAnchorBackend`] whose state cannot be rolled back together
-//!   with the journal; and
-//! - a boot quarantine guard which owns every CSER-managed device while reset,
-//!   IRQ drain, and IOTLB reconciliation are incomplete.
+//! - `AtaPioJournal` owns a dedicated primary ATA disk and performs banked
+//!   journal append/repair with explicit ATA `FLUSH CACHE` commands;
+//! - `TpmNvTrustedAnchor<QemuTisTpm2>` binds the catalog, Registry, journal tip,
+//!   and recovery freshness to pre-provisioned TPM2 NV slots and counters; and
+//! - `OstdVirtioBootQuarantine` acquires a linear `BootQuarantineGuard` before
+//!   journal read or replay, performs the fixed PCI fence, VirtIO status reset,
+//!   ISR drain, and global VT-d IOTLB command, and retains the device owner.
 //!
 //! Recovery reserves freshness only after the device quarantine exists.  It
 //! replays exactly the trusted journal head, repairs at most one ignored
@@ -19,6 +19,13 @@
 //! quarantine guard alive.  No activation owner is returned until the core has
 //! retired every recovered device claim and the hardware provider explicitly
 //! releases the guard.
+//!
+//! The current receipt boundary remains the pinned QEMU raw-ATA and
+//! `tpm-tis`/swtpm profile. It does not establish physical TPM anti-rollback,
+//! physical power-loss durability, or crash-persistent PFN/IOVA custody. The
+//! reset, ISR-drain, and global-IOTLB observations justify continued quarantine
+//! only; they do not prove that retained resources were retired or may be
+//! reused.
 
 use alloc::{boxed::Box, vec::Vec};
 
@@ -27,27 +34,6 @@ use cser_core::{
     CoreLimits, DeviceGeneration, DomainCatalog, DurableJournalBackend, Engine, JournalRepair,
     RecoveryBinding, TransitionReceipt, TrustedAnchorBackend, TxError,
 };
-
-/// Platform support absent from the current OSTD 0.18 Nexus embedding.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum Ostd018RecoveryGap {
-    /// OSTD exposes no TPM/NV or equivalent non-rollback monotonic store.
-    NonRollbackTrustedAnchor,
-    /// The kernel has no writable, flush-capable persistent journal owner.
-    DurableWritableJournal,
-    /// No boot provider reconstructs and owns all persisted device scopes.
-    PersistentDeviceQuarantine,
-}
-
-/// Current production-recovery gaps.
-///
-/// This constant is an explicit non-claim.  The coordinator below is not
-/// production evidence until concrete providers close all three entries.
-pub(crate) const OSTD_018_RECOVERY_GAPS: [Ostd018RecoveryGap; 3] = [
-    Ostd018RecoveryGap::NonRollbackTrustedAnchor,
-    Ostd018RecoveryGap::DurableWritableJournal,
-    Ostd018RecoveryGap::PersistentDeviceQuarantine,
-];
 
 /// Journal operations required before ordinary durable appends can resume.
 pub(crate) trait OstdBootJournal: DurableJournalBackend {
@@ -210,6 +196,21 @@ where
         operation(&self.engine)
     }
 
+    /// Runs one boot-reconciliation operation with simultaneous read-only
+    /// access to the authoritative replay and mutable access to the retained
+    /// hardware quarantine owner.
+    ///
+    /// The closure cannot issue a semantic transition: any verified evidence
+    /// it constructs must still be committed through [`Self::recovery_transact`].
+    /// Keeping the guard borrowed prevents a verifier from releasing or
+    /// replacing the physical owner while it inspects an exact claim.
+    pub(crate) fn inspect_with_guard<R>(
+        &mut self,
+        operation: impl FnOnce(&Engine, &mut G) -> R,
+    ) -> R {
+        operation(&self.engine, &mut self.guard)
+    }
+
     /// Executes a manager-only recovery transition durably.
     ///
     /// This does not open external ingress or release the quarantine guard.
@@ -292,6 +293,12 @@ where
     J: OstdBootJournal,
     A: TrustedAnchorBackend,
 {
+    /// Runs a read-only observation before the recovered parts are installed
+    /// in the shared production owner.
+    pub(crate) fn observe<R>(&self, operation: impl FnOnce(&Engine) -> R) -> R {
+        operation(&self.engine)
+    }
+
     /// Executes an ordinary durable transition after activation.
     pub(crate) fn transact<C>(
         &mut self,

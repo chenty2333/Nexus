@@ -4,10 +4,7 @@ set -euo pipefail
 root=$(cd -- "$(dirname -- "$0")" && pwd)
 image=
 kernel_backend="$root/kernel/nexus-ostd/x"
-virtio_backend="$root/experiments/ostd-virtio-cser-spike/x"
-composition_backend="$root/tools/workflow/system-composition.sh"
 root_image_ready=false
-backend_rebuild=
 repo_lock="/tmp/nexus-workflow-${root//\//_}.lock"
 
 usage() {
@@ -16,30 +13,19 @@ usage: ./x COMMAND [TARGET]
 
 Public commands:
   doctor                 validate Docker, repository layout, and pinned tools
-  build [all|model|kernel|virtio]
+  build [all|model|kernel]
                          build the selected artifact graph (default: all)
   test [--unit|--quick|--system|--full]
                          run a verification tier (default: --unit)
-  run [composition|kernel|virtio]
-                         run a QEMU receipt (default: composition)
-  verify                 run the complete model/spec/QEMU/composition gate
-  verify-bundle [DIRECTORY]
-                         verify an existing evidence bundle without QEMU
+  run [kernel]            run the combined reply/DMA and four-boot recovery receipt
+  verify                 seal the clean-revision core/oracle/Loom/production gate
   clean [--all]          remove build caches; --all also removes run evidence
 
 Focused commands:
   fmt                     format Rust workspaces
   check                   run schema and Rust static checks
   quick                   run all non-TLA+, non-QEMU verification
-  model                   alias for the complete reference-model gate
-  spec                    check PlusCal drift and run all TLC families
-  system                  run both QEMU receipts and composition oracle
-  research production-identity
-                          run the prospective v0.2 formal identity gate
-  research production-identity-postcommit-crash
-                          bind the post-backend/pre-reply crash receipt
-  research handoff-admission
-                          run the prospective RFC-0002 local handoff gate
+  model                   alias for the complete host semantic gate
 EOF
 }
 
@@ -91,12 +77,10 @@ compute_image_identity() {
         "$root/.cargo/config.toml" \
         "$root/Cargo.toml" \
         "$root/Cargo.lock" \
+        "$root/crates/cser-core/Cargo.toml" \
         "$root/crates/cser-model/Cargo.toml" \
-        "$root/crates/cser-transition-gates/Cargo.toml" \
-        "$root/crates/nexus-effect-peer/Cargo.toml" \
+        "$root/crates/cser-trace-conformance/Cargo.toml" \
         "$root/crates/nexus-effect-peer-wire/Cargo.toml" \
-        "$root/crates/nexus-portal-abi/Cargo.toml" \
-        "$root/crates/nexus-supervisor/Cargo.toml" \
         "$root/tools/xtask/Cargo.toml" \
         "$root/tools/xtask/Cargo.lock" | cut -d ' ' -f1 | sha256sum | cut -c1-16)
     image="nexus/cser-dev:$image_key"
@@ -130,16 +114,8 @@ ensure_image() {
 run_xtask() {
     local command=$1
     shift
-    local -a token_environment=()
     local -a git_mount=()
     local git_common_dir
-    if [[ $command == begin || $command == complete || $command == manifest ]]; then
-        if [[ ! ${verify_token:-} =~ ^[0-9a-f]{64}$ ]]; then
-            echo "internal verification token is unavailable for $command" >&2
-            exit 1
-        fi
-        token_environment=(--env "NEXUS_VERIFY_TOKEN=$verify_token")
-    fi
     if [[ -f "$root/.git" ]]; then
         if ! git_common_dir=$(git -C "$root" rev-parse --path-format=absolute --git-common-dir) ||
             [[ ! -d $git_common_dir || $git_common_dir == *:* ]]; then
@@ -160,8 +136,6 @@ run_xtask() {
         --tmpfs /tmp/nexus-home:rw,exec,nosuid,size=64m,mode=1777 \
         --env CARGO_TARGET_DIR=/work/target/cargo \
         --env "NEXUS_REBUILD=${NEXUS_REBUILD:-0}" \
-        --env "NEXUS_VERIFY_INVOCATION=${NEXUS_VERIFY_INVOCATION:-}" \
-        "${token_environment[@]}" \
         --volume "$root:/work:z" \
         "${git_mount[@]}" \
         --mount "type=bind,source=$root/Cargo.lock,target=/work/Cargo.lock,readonly" \
@@ -175,40 +149,12 @@ run_backend() {
     local entrypoint=$1
     local backend_command=$2
     local description=$3
-    local rebuild=${backend_rebuild:-${NEXUS_REBUILD:-0}}
+    local rebuild=${NEXUS_REBUILD:-0}
     if [[ ! -x "$entrypoint" ]]; then
         echo "$description entrypoint is missing or not executable: $entrypoint" >&2
         exit 1
     fi
     NEXUS_REBUILD=$rebuild "$entrypoint" "$backend_command"
-}
-
-prepare_cold_backend_images() {
-    if [[ ${NEXUS_REBUILD:-0} != 1 ]]; then
-        return
-    fi
-    backend_rebuild=1
-    run_backend "$kernel_backend" image "Nexus OSTD kernel image"
-    run_backend "$virtio_backend" image "OSTD mediated VirtIO image"
-    # Every later backend process resolves the same content-addressed tag while
-    # the repository lock prevents its input set from changing.
-    backend_rebuild=0
-}
-
-run_composition_oracle() {
-    bash "$composition_backend"
-}
-
-run_system() {
-    run_backend "$kernel_backend" test "Nexus OSTD kernel"
-    run_backend "$virtio_backend" test "OSTD mediated VirtIO"
-    run_composition_oracle
-}
-
-run_same_boot_acceptance() {
-    run_backend "$kernel_backend" test-same-boot "Nexus same-boot production filesystem"
-    run_backend "$kernel_backend" test-same-boot-precommit "Nexus same-boot precommit revocation"
-    run_backend "$kernel_backend" test-same-boot-postcommit-crash "Nexus same-boot postcommit service crash"
 }
 
 check_host_shell_sources() {
@@ -247,46 +193,27 @@ run_quick() {
     check_host_shell_sources
     run_xtask quick
     run_backend "$kernel_backend" check "Nexus OSTD kernel"
-    run_backend "$virtio_backend" check "OSTD mediated VirtIO"
 }
 
 run_check() {
     check_host_shell_sources
     run_xtask check
     run_backend "$kernel_backend" check "Nexus OSTD kernel"
-    run_backend "$virtio_backend" check "OSTD mediated VirtIO"
 }
 
 run_format() {
     run_xtask fmt
     run_backend "$kernel_backend" fmt "Nexus OSTD kernel"
-    run_backend "$virtio_backend" fmt "OSTD mediated VirtIO"
 }
 
 verify_all() {
-    local invocation=$1
-    local verify_token
-    verify_token=$(head -c 32 /dev/urandom | sha256sum | cut -d ' ' -f1)
-    if [[ ! $verify_token =~ ^[0-9a-f]{64}$ ]]; then
-        echo 'failed to generate the verification orchestration token' >&2
-        exit 1
-    fi
-    export NEXUS_VERIFY_INVOCATION=$invocation
     require_docker
     check_host_shell_sources
-    run_xtask begin
     run_xtask verify
-    prepare_cold_backend_images
-    # OSDK images remain host-side backends; the root verification image never
-    # receives access to the Docker socket.
-    run_system
-    run_same_boot_acceptance
-    run_xtask research production-identity-postcommit-crash
-    run_backend "$kernel_backend" eval-stage7b "Nexus Stage 7B evaluator"
-    run_xtask stage7b-evidence
-    run_xtask complete
-    run_xtask manifest
-    run_xtask bundle
+    # The production acceptance path exercises the focused reply/DMA guests,
+    # then one recovered core owner across four real QEMU boots with the same
+    # journal, outbox, and swtpm state.
+    run_backend "$kernel_backend" seal-core-persistent-recovery "Nexus CSER core persistent production"
 }
 
 doctor_host() {
@@ -296,20 +223,15 @@ doctor_host() {
         require_command "$command"
     done
     docker info >/dev/null
-    for entrypoint in \
-        "$root/x" \
-        "$kernel_backend" \
-        "$virtio_backend" \
-        "$composition_backend"; do
+    for entrypoint in "$root/x" "$kernel_backend"; do
         if [[ ! -x "$entrypoint" ]]; then
             echo "required workflow entrypoint is missing or not executable: $entrypoint" >&2
             exit 1
         fi
     done
-    echo "DOCTOR HOST PASS docker=true entrypoints=4 public_frontdoor=./x"
+    echo "DOCTOR HOST PASS docker=true entrypoints=2 public_frontdoor=./x"
     run_xtask doctor
     run_backend "$kernel_backend" doctor "Nexus OSTD kernel"
-    run_backend "$virtio_backend" doctor "OSTD mediated VirtIO"
 }
 
 clean_cache() {
@@ -354,7 +276,7 @@ if (( $# > 0 )); then
     shift
 fi
 case "$command" in
-    doctor|build|test|run|fmt|check|quick|model|spec|system|research|verify|verify-bundle|clean)
+    doctor|build|test|run|fmt|check|quick|model|verify|clean)
         acquire_repo_lock
         ;;
 esac
@@ -374,11 +296,9 @@ case "$command" in
             all)
                 run_xtask build
                 run_backend "$kernel_backend" build "Nexus OSTD kernel"
-                run_backend "$virtio_backend" build "OSTD mediated VirtIO"
                 ;;
             model) run_xtask build ;;
             kernel) run_backend "$kernel_backend" build "Nexus OSTD kernel" ;;
-            virtio) run_backend "$virtio_backend" build "OSTD mediated VirtIO" ;;
             *) die "unknown build target: $target" ;;
         esac
         ;;
@@ -391,21 +311,25 @@ case "$command" in
         case "$profile" in
             --unit) run_xtask test ;;
             --quick) run_quick ;;
-            --system) run_system ;;
-            --full) verify_all "./x test --full" ;;
+            --system)
+                run_backend "$kernel_backend" run-core-persistent-recovery \
+                    "Nexus CSER core persistent production"
+                ;;
+            --full) verify_all ;;
             *) die "unknown test profile: $profile" ;;
         esac
         ;;
     run)
         require_docker
-        target=${1:-composition}
+        target=${1:-kernel}
         if (( $# > 1 )); then
             die "run accepts at most one target"
         fi
         case "$target" in
-            composition) run_system ;;
-            kernel) run_backend "$kernel_backend" run "Nexus OSTD kernel" ;;
-            virtio) run_backend "$virtio_backend" run "OSTD mediated VirtIO" ;;
+            kernel)
+                run_backend "$kernel_backend" run-core-persistent-recovery \
+                    "Nexus CSER core persistent production"
+                ;;
             *) die "unknown run target: $target" ;;
         esac
         ;;
@@ -424,44 +348,14 @@ case "$command" in
         require_docker
         run_quick
         ;;
-    model|spec)
+    model)
         require_no_args "$@"
         require_docker
         run_xtask "$command"
         ;;
-    system)
-        require_no_args "$@"
-        require_docker
-        run_system
-        ;;
-    research)
-        require_docker
-        if (( $# != 1 )); then
-            die "research requires exactly one target: production-identity, production-identity-postcommit-crash, or handoff-admission"
-        fi
-        case "$1" in
-            production-identity) run_xtask research production-identity ;;
-            production-identity-postcommit-crash)
-                run_xtask research production-identity-postcommit-crash
-                ;;
-            handoff-admission) run_xtask research handoff-admission ;;
-            *) die "unknown research target: $1" ;;
-        esac
-        ;;
     verify)
         require_no_args "$@"
-        verify_all "./x verify"
-        ;;
-    verify-bundle)
-        if (( $# > 1 )); then
-            die "verify-bundle accepts at most one directory"
-        fi
-        bundle=${1:-target/verification/artifact-bundle}
-        if [[ $bundle == /* || $bundle == .. || $bundle == ../* || $bundle == */../* || $bundle == */.. ]]; then
-            die "verify-bundle directory must stay within the repository"
-        fi
-        require_docker
-        run_xtask verify-bundle "$bundle"
+        verify_all
         ;;
     clean)
         # Cleaning must remain available before Docker is installed and must

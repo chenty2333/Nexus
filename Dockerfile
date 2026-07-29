@@ -51,30 +51,25 @@ RUN echo "${TLA2TOOLS_SHA256}  /opt/tla2tools/tla2tools.jar" | sha256sum -c - \
 COPY Cargo.lock /tmp/nexus-locks/Cargo.lock
 COPY tools/xtask/Cargo.lock /tmp/nexus-locks/xtask.Cargo.lock
 COPY Cargo.toml /tmp/nexus-inputs/root.Cargo.toml
+COPY crates/cser-core/Cargo.toml /tmp/nexus-inputs/cser-core.Cargo.toml
 COPY crates/cser-model/Cargo.toml /tmp/nexus-inputs/cser-model.Cargo.toml
-COPY crates/cser-transition-gates/Cargo.toml /tmp/nexus-inputs/cser-transition-gates.Cargo.toml
-COPY crates/nexus-effect-peer/Cargo.toml /tmp/nexus-inputs/nexus-effect-peer.Cargo.toml
+COPY crates/cser-trace-conformance/Cargo.toml \
+    /tmp/nexus-inputs/cser-trace-conformance.Cargo.toml
 COPY crates/nexus-effect-peer-wire/Cargo.toml /tmp/nexus-inputs/nexus-effect-peer-wire.Cargo.toml
-COPY crates/nexus-portal-abi/Cargo.toml /tmp/nexus-inputs/nexus-portal-abi.Cargo.toml
-COPY crates/nexus-supervisor/Cargo.toml /tmp/nexus-inputs/nexus-supervisor.Cargo.toml
 COPY tools/xtask/Cargo.toml /tmp/nexus-inputs/xtask.Cargo.toml
 COPY .cargo/config.toml /tmp/nexus-inputs/cargo-config.toml
 RUN --mount=type=bind,source=.,target=/tmp/nexus-workspace,readonly \
     cmp /tmp/nexus-locks/Cargo.lock /tmp/nexus-workspace/Cargo.lock \
     && cmp /tmp/nexus-locks/xtask.Cargo.lock /tmp/nexus-workspace/tools/xtask/Cargo.lock \
     && cmp /tmp/nexus-inputs/root.Cargo.toml /tmp/nexus-workspace/Cargo.toml \
+    && cmp /tmp/nexus-inputs/cser-core.Cargo.toml \
+        /tmp/nexus-workspace/crates/cser-core/Cargo.toml \
     && cmp /tmp/nexus-inputs/cser-model.Cargo.toml \
         /tmp/nexus-workspace/crates/cser-model/Cargo.toml \
-    && cmp /tmp/nexus-inputs/cser-transition-gates.Cargo.toml \
-        /tmp/nexus-workspace/crates/cser-transition-gates/Cargo.toml \
-    && cmp /tmp/nexus-inputs/nexus-effect-peer.Cargo.toml \
-        /tmp/nexus-workspace/crates/nexus-effect-peer/Cargo.toml \
+    && cmp /tmp/nexus-inputs/cser-trace-conformance.Cargo.toml \
+        /tmp/nexus-workspace/crates/cser-trace-conformance/Cargo.toml \
     && cmp /tmp/nexus-inputs/nexus-effect-peer-wire.Cargo.toml \
         /tmp/nexus-workspace/crates/nexus-effect-peer-wire/Cargo.toml \
-    && cmp /tmp/nexus-inputs/nexus-portal-abi.Cargo.toml \
-        /tmp/nexus-workspace/crates/nexus-portal-abi/Cargo.toml \
-    && cmp /tmp/nexus-inputs/nexus-supervisor.Cargo.toml \
-        /tmp/nexus-workspace/crates/nexus-supervisor/Cargo.toml \
     && cmp /tmp/nexus-inputs/xtask.Cargo.toml \
         /tmp/nexus-workspace/tools/xtask/Cargo.toml \
     && cmp /tmp/nexus-inputs/cargo-config.toml \

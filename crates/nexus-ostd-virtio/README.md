@@ -2,14 +2,15 @@
 
 `nexus-ostd-virtio` is the reusable safe boundary around the PCI, DMA, queue,
 reset, and IOTLB substrate first exercised by the separate-boot Stage 5B
-experiment. Its crate root denies unsafe code; only the private `pci`, `dma`,
-`portal`, and `production` modules receive local allowances. Downstream crates cannot name
-the raw HAL, raw PCI root, raw MMIO pointers, or DMA owners.
+experiment. Its crate root denies unsafe code; only the private
+`boot_quarantine`, `dma`, `pci`, and `production` modules receive local
+allowances. Downstream crates cannot name the raw HAL, raw PCI root, raw MMIO
+pointers, or DMA owners.
 
 The facade preserves these ownership invariants:
 
 - one opaque `Root` owns the discovered block device and all acquired memory
-  BARs, and grants exactly one portal claim;
+  BARs, and grants exactly one production-device claim;
 - one production device retains that claimed BDF and admits only one active
   request/reset/IOTLB lifecycle; preparation returns a recoverable result,
   rejects overlap before hardware mutation, and on later validation failure
@@ -38,9 +39,7 @@ The facade preserves these ownership invariants:
   IDs, clears PCI `BUS_MASTER`, masks INTx, and requires exact command readback
   before bus enumeration or BAR acquisition can continue. A mismatch
   permanently poisons rediscovery for that boot;
-- the legacy Stage 5B `Portal` keeps service actions, device completion, reset,
-  and rebind fenced by its shared `cser-transition-gates::io::IoGate` identity;
-- the separate production typestate owns no scope, effect, binding, or commit
+- the hardware typestate owns no scope, effect, binding, or commit
   authority. It exposes reconstructible descriptive PCI/queue/token/generation
   coordinates, failure-atomic publication preflight, an infallible split
   `avail.idx` Release, exact-buffer cancellation, and prevalidated linear
@@ -141,18 +140,15 @@ mutation negatives. The upstream VirtIO license text is retained at
 `patches/virtio-drivers-0.13.0-LICENSE-MIT`; this is not part of the MPL-2.0
 OSTD overlay.
 
-This facade lands atomically with the feature-gated Nexus sibling adapter. The
-adapter reserves Registry credits before hardware work, stores each exact owner
-before acknowledgement, maps the private receipts through provider-neutral
-read-only views, and consumes the materialized Registry bearer only after reset
-and IOTLB closure. The bounded runtime-filesystem lane therefore uses this
-production typestate in the same boot under one causal root. The witness remains
-polling-only with INTx masked: it does not install an OSTD `IrqLine`, execute a
-real IRQ path, establish SMP safety, survive reboot, or provide a persistent
-retained-worker/operator recovery loop.
-In particular, registry envelopes alone do not exclude two roots claiming the
-same physical function and do not prove whole-function reset blast radius; the
-opaque facade owner is the singleton enforcement boundary.
+The OSTD `core_dma_adapter` binds this hardware-only facade to the sole
+portable-core Registry. It records the exact core commit intent before queue
+publication, retains every linear hardware owner across acknowledgement and
+recovery, and submits verifier-minted evidence before claim retirement. The
+combined persistent profile reopens semantic state across two boots, but it
+does not reconstruct pre-crash PFN/IOVA custody or authorize their reuse.
+Registry envelopes alone also cannot exclude two roots claiming the same
+physical function or prove whole-function reset blast radius; the opaque facade
+owner is the singleton hardware enforcement boundary.
 
 ## Boot quarantine boundary
 

@@ -22,9 +22,10 @@ use cser_core::{
     DEVICE_COMMIT_RECEIPT_SCHEMA, DEVICE_DOMAIN, DEVICE_EVIDENCE_IOTLB,
     DEVICE_EVIDENCE_IRQ_DRAINED, DEVICE_EVIDENCE_RESET, DEVICE_OBLIGATION_DMA,
     DEVICE_RECEIPT_SCHEMA, DEVICE_VERIFIER, DeviceGeneration, DeviceScopeId, Digest,
-    EffectFactChallenge, EffectReceiptVerifier, Engine, EvidenceChallenge, EvidenceKindId,
-    ExternalOutcome, PrincipalIncarnation, ReceiptVerifier, ResourceGeneration, ResourceId,
-    VerificationError, VerifiedEffectObservation, VerifiedObservation, VerifierIdentity,
+    EffectFactChallenge, EffectFactKind, EffectReceiptVerifier, Engine, EvidenceChallenge,
+    EvidenceKindId, ExternalOutcome, PrincipalIncarnation, ReceiptVerifier, ResourceGeneration,
+    ResourceId, VerificationError, VerifiedEffectObservation, VerifiedObservation,
+    VerifierIdentity,
 };
 use nexus_ostd_virtio::{
     DeviceSessionIdentity, InterruptCause, InterruptCompletionProgress, InterruptReceipt,
@@ -292,9 +293,66 @@ impl ClaimRole {
     }
 }
 
+/// Exact durable core challenge and physical DMA cohort fixed before queue
+/// publication.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct QueueCommitBinding {
+    cohort: CoreDmaCohort,
+    authority_generation: u64,
+    intent_nonce: u64,
+    operation: Digest,
+}
+
+impl QueueCommitBinding {
+    fn from_challenge(
+        challenge: &EffectFactChallenge,
+        cohort: CoreDmaCohort,
+    ) -> Result<Self, CoreError> {
+        if challenge.kind() != EffectFactKind::CommitOutcome
+            || challenge.effect() != cohort.effect
+            || challenge.domain() != DEVICE_DOMAIN
+            || challenge.obligation() != DEVICE_OBLIGATION_DMA
+            || challenge.actor() != cohort.origin
+            || challenge.generation() == 0
+            || challenge.nonce() == 0
+            || challenge.operation().is_zero()
+            || challenge.predecessor().is_some()
+            || challenge.expected_verifier() != DEVICE_VERIFIER
+            || challenge.expected_receipt_schema() != DEVICE_COMMIT_RECEIPT_SCHEMA
+            || challenge.current_observation().binding() != cohort.binding_generation
+            || challenge.current_observation().device().get() != cohort.hardware.device_generation()
+        {
+            return Err(CoreError::VerificationFailed);
+        }
+        Ok(Self {
+            cohort,
+            authority_generation: challenge.generation(),
+            intent_nonce: challenge.nonce(),
+            operation: challenge.operation(),
+        })
+    }
+
+    fn matches_challenge(self, challenge: &EffectFactChallenge) -> bool {
+        challenge.kind() == EffectFactKind::CommitOutcome
+            && challenge.effect() == self.cohort.effect
+            && challenge.domain() == DEVICE_DOMAIN
+            && challenge.obligation() == DEVICE_OBLIGATION_DMA
+            && challenge.actor() == self.cohort.origin
+            && challenge.generation() == self.authority_generation
+            && challenge.nonce() == self.intent_nonce
+            && challenge.operation() == self.operation
+            && challenge.predecessor().is_none()
+            && challenge.expected_verifier() == DEVICE_VERIFIER
+            && challenge.expected_receipt_schema() == DEVICE_COMMIT_RECEIPT_SCHEMA
+            && challenge.current_observation().binding() == self.cohort.binding_generation
+            && challenge.current_observation().device().get()
+                == self.cohort.hardware.device_generation()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct QueueCommitObservation {
-    hardware: DeviceSessionIdentity,
+    binding: QueueCommitBinding,
     attempt_owner: u64,
     attempt_sequence: u64,
     preparation_digest: u64,
@@ -348,7 +406,7 @@ pub(crate) struct RetirementObservation {
 
 #[derive(Clone, Copy)]
 struct CoreQueueCommitVerifier {
-    cohort: CoreDmaCohort,
+    binding: QueueCommitBinding,
 }
 
 impl EffectReceiptVerifier for CoreQueueCommitVerifier {
@@ -364,18 +422,14 @@ impl EffectReceiptVerifier for CoreQueueCommitVerifier {
         challenge: &EffectFactChallenge,
         receipt: &Self::Receipt,
     ) -> Result<VerifiedEffectObservation, VerificationError> {
-        if challenge.effect() != self.cohort.effect
-            || challenge.domain() != DEVICE_DOMAIN
-            || challenge.obligation() != DEVICE_OBLIGATION_DMA
-            || challenge.actor() != self.cohort.origin
-            || receipt.hardware != self.cohort.hardware
-            || receipt.hardware.device_generation()
-                != challenge.current_observation().device().get()
+        if !self.binding.matches_challenge(challenge)
+            || receipt.binding != self.binding
             || receipt.attempt_owner == 0
             || receipt.attempt_sequence == 0
             || receipt.preparation_digest == 0
             || receipt.notification == NotificationDisposition::AlreadyResolved
             || receipt.digest.is_zero()
+            || receipt.digest != queue_commit_digest(receipt)
         {
             return Err(VerificationError::Rejected);
         }
@@ -455,25 +509,69 @@ impl ReceiptVerifier for CoreRetirementVerifier {
     }
 }
 
+/// Linear durable intent and exact core/DMA binding fixed before publication.
+#[derive(Debug)]
+#[must_use = "publish with this exact authority or retain it for recovery"]
+pub(crate) struct CoreQueuePublishAuthority {
+    intent: CommitIntent,
+    binding: QueueCommitBinding,
+}
+
+/// Challenge binding rejected before hardware publication. The durable intent
+/// remains owned by the failure.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct CoreQueueBindFailure {
+    pub(crate) error: CoreError,
+    pub(crate) intent: CommitIntent,
+}
+
+/// Binds one durable commit intent and one DMA cohort while the authoritative
+/// core projection is observed. The returned linear wrapper is the only input
+/// accepted by real queue publication.
+pub(crate) fn bind_queue_commit(
+    engine: &Engine,
+    intent: CommitIntent,
+    cohort: CoreDmaCohort,
+) -> Result<CoreQueuePublishAuthority, CoreQueueBindFailure> {
+    let challenge = match engine.commit_outcome_challenge(&intent) {
+        Ok(challenge) => challenge,
+        Err(error) => return Err(CoreQueueBindFailure { error, intent }),
+    };
+    let binding = match QueueCommitBinding::from_challenge(&challenge, cohort) {
+        Ok(binding) => binding,
+        Err(error) => return Err(CoreQueueBindFailure { error, intent }),
+    };
+    Ok(CoreQueuePublishAuthority { intent, binding })
+}
+
 /// Queue publication rejected before or during the real facade preflight.
 pub(crate) enum CoreQueuePublishFailure {
-    BindingMismatch(ReceiptedPreparedRequest),
-    Hardware(PreparationPublishFailure),
-    NotificationAlreadyResolved(PublishedRequest),
+    BindingMismatch {
+        owner: ReceiptedPreparedRequest,
+        authority: CoreQueuePublishAuthority,
+    },
+    Hardware {
+        failure: PreparationPublishFailure,
+        authority: CoreQueuePublishAuthority,
+    },
+    NotificationAlreadyResolved {
+        request: PublishedRequest,
+        authority: CoreQueuePublishAuthority,
+    },
 }
 
 /// A real device-visible request paired with its post-publication observation.
 pub(crate) struct CorePublishedQueue {
     request: PublishedRequest,
     observation: QueueCommitObservation,
+    authority: CoreQueuePublishAuthority,
 }
 
-/// Failure after real queue publication; the complete request and core intent
-/// remain retained for reset or reconciliation.
+/// Failure after real queue publication; the complete source-exact publication
+/// and its core authority remain retained for retry, reset, or reconciliation.
 pub(crate) struct CoreQueueCommitFailure {
     pub(crate) error: CoreError,
-    pub(crate) request: PublishedRequest,
-    pub(crate) intent: CommitIntent,
+    pub(crate) published: CorePublishedQueue,
 }
 
 /// A real published request plus its verifier-minted durable acknowledgement.
@@ -498,25 +596,26 @@ impl CoreCommittedQueue {
 pub(crate) fn publish_real_queue(
     device: &ProductionDevice,
     owner: ReceiptedPreparedRequest,
-    cohort: CoreDmaCohort,
+    authority: CoreQueuePublishAuthority,
 ) -> Result<CorePublishedQueue, CoreQueuePublishFailure> {
-    if owner.identity() != cohort.hardware {
-        return Err(CoreQueuePublishFailure::BindingMismatch(owner));
+    if owner.identity() != authority.binding.cohort.hardware {
+        return Err(CoreQueuePublishFailure::BindingMismatch { owner, authority });
     }
     let preparation_digest = owner.receipt().digest();
     let attempt = owner.attempt();
-    let intent = device
-        .preflight_publish(owner, cohort.hardware)
-        .map_err(CoreQueuePublishFailure::Hardware)?;
+    let intent = match device.preflight_publish(owner, authority.binding.cohort.hardware) {
+        Ok(intent) => intent,
+        Err(failure) => {
+            return Err(CoreQueuePublishFailure::Hardware { failure, authority });
+        }
+    };
     let mut request = intent.apply();
     let notification = request.notify();
     if notification == NotificationDisposition::AlreadyResolved {
-        return Err(CoreQueuePublishFailure::NotificationAlreadyResolved(
-            request,
-        ));
+        return Err(CoreQueuePublishFailure::NotificationAlreadyResolved { request, authority });
     }
     let observation = queue_commit_observation(
-        cohort.hardware,
+        authority.binding,
         attempt.owner_id(),
         attempt.sequence(),
         preparation_digest,
@@ -525,6 +624,7 @@ pub(crate) fn publish_real_queue(
     Ok(CorePublishedQueue {
         request,
         observation,
+        authority,
     })
 }
 
@@ -538,29 +638,44 @@ impl CorePublishedQueue {
     pub(crate) fn verify_commit(
         self,
         engine: &Engine,
-        intent: CommitIntent,
-        cohort: CoreDmaCohort,
     ) -> Result<CoreCommittedQueue, CoreQueueCommitFailure> {
-        let verifier = CoreQueueCommitVerifier { cohort };
-        let outcome = match engine.verify_commit_outcome(&intent, &verifier, &self.observation) {
+        let verifier = CoreQueueCommitVerifier {
+            binding: self.authority.binding,
+        };
+        let outcome = match engine.verify_commit_outcome(
+            &self.authority.intent,
+            &verifier,
+            &self.observation,
+        ) {
             Ok(outcome) => outcome,
             Err(error) => {
                 return Err(CoreQueueCommitFailure {
                     error,
-                    request: self.request,
-                    intent,
+                    published: self,
                 });
             }
         };
+        let Self {
+            request,
+            observation,
+            authority,
+        } = self;
+        let CoreQueuePublishAuthority { intent, binding } = authority;
         match intent.acknowledge(outcome) {
             Ok(acknowledgement) => Ok(CoreCommittedQueue {
-                request: self.request,
+                request,
                 acknowledgement,
             }),
             Err(failure) => Err(CoreQueueCommitFailure {
                 error: failure.error().clone(),
-                request: self.request,
-                intent: failure.into_intent(),
+                published: CorePublishedQueue {
+                    request,
+                    observation,
+                    authority: CoreQueuePublishAuthority {
+                        intent: failure.into_intent(),
+                        binding,
+                    },
+                },
             }),
         }
     }
@@ -850,14 +965,14 @@ fn evidence_was_accepted(
 }
 
 fn queue_commit_observation(
-    hardware: DeviceSessionIdentity,
+    binding: QueueCommitBinding,
     attempt_owner: u64,
     attempt_sequence: u64,
     preparation_digest: u64,
     notification: NotificationDisposition,
 ) -> QueueCommitObservation {
     let mut observation = QueueCommitObservation {
-        hardware,
+        binding,
         attempt_owner,
         attempt_sequence,
         preparation_digest,
@@ -892,8 +1007,8 @@ fn retirement_observation(
 
 fn queue_commit_digest(observation: &QueueCommitObservation) -> Digest {
     let mut hasher = Sha256::new();
-    hasher.update(b"nexus.ostd.cser-core.dma.queue-commit.v1");
-    hash_hardware(&mut hasher, observation.hardware);
+    hasher.update(b"nexus.ostd.cser-core.dma.queue-commit.v2");
+    hash_queue_binding(&mut hasher, observation.binding);
     hasher.update(observation.attempt_owner.to_le_bytes());
     hasher.update(observation.attempt_sequence.to_le_bytes());
     hasher.update(observation.preparation_digest.to_le_bytes());
@@ -903,6 +1018,28 @@ fn queue_commit_digest(observation: &QueueCommitObservation) -> Digest {
         NotificationDisposition::AlreadyResolved => 3,
     }]);
     Digest::new(hasher.finalize().into())
+}
+
+fn hash_queue_binding(hasher: &mut Sha256, binding: QueueCommitBinding) {
+    let cohort = binding.cohort;
+    hasher.update(cohort.effect.root().get().to_le_bytes());
+    hasher.update(cohort.effect.sequence().to_le_bytes());
+    hasher.update(cohort.origin.principal().get().to_le_bytes());
+    hasher.update(cohort.origin.generation().to_le_bytes());
+    hasher.update(cohort.binding_generation.to_le_bytes());
+    hasher.update(cohort.account.get().to_le_bytes());
+    hasher.update(cohort.scope.get().to_le_bytes());
+    hash_hardware(hasher, cohort.hardware);
+    for role in [ClaimRole::Queue, ClaimRole::PinnedPages, ClaimRole::Iova] {
+        let claim = cohort.claim(role);
+        hasher.update(claim.claim.get().to_le_bytes());
+        hasher.update(claim.resource.get().to_le_bytes());
+        hasher.update(claim.generation.get().to_le_bytes());
+        hasher.update(claim.units.to_le_bytes());
+    }
+    hasher.update(binding.authority_generation.to_le_bytes());
+    hasher.update(binding.intent_nonce.to_le_bytes());
+    hasher.update(binding.operation.bytes());
 }
 
 fn retirement_digest(observation: &RetirementObservation) -> Digest {
@@ -938,7 +1075,7 @@ mod tests {
     use alloc::vec::Vec;
     use cser_core::{
         BootGeneration, CoreLimits, Freshness, JournalGeneration, PrincipalId, RegistryInstance,
-        RootId, TransitionOutput, TransitionReceipt, TxError, standard_catalog,
+        RootId, SnapshotId, TransitionOutput, TransitionReceipt, TxError, standard_catalog,
     };
     use nexus_ostd_virtio::DeviceBdf;
     use ostd::prelude::ktest;
@@ -1046,7 +1183,30 @@ mod tests {
             );
         }
 
-        let replacement = cohort_with_resources(2, 2, cohort.claims);
+        let replacement = cohort_with_resources(
+            2,
+            2,
+            CoreDmaClaims::new(
+                CoreDmaClaim::new(
+                    id::<ClaimId>(401),
+                    cohort.claim(ClaimRole::Queue).resource,
+                    id::<ResourceGeneration>(2),
+                    cohort.claim(ClaimRole::Queue).units,
+                ),
+                CoreDmaClaim::new(
+                    id::<ClaimId>(402),
+                    cohort.claim(ClaimRole::PinnedPages).resource,
+                    id::<ResourceGeneration>(2),
+                    cohort.claim(ClaimRole::PinnedPages).units,
+                ),
+                CoreDmaClaim::new(
+                    id::<ClaimId>(403),
+                    cohort.claim(ClaimRole::Iova).resource,
+                    id::<ResourceGeneration>(2),
+                    cohort.claim(ClaimRole::Iova).units,
+                ),
+            ),
+        );
         harness.tx(replacement.create_estate()).unwrap();
         for (role, next_claim) in [
             (ClaimRole::Queue, id::<ClaimId>(401)),
@@ -1075,6 +1235,15 @@ mod tests {
                 .retained_claims,
             3
         );
+        harness.tx(replacement.prepare()).unwrap();
+        let intent = match harness.output(replacement.record_commit_intent(digest(0x31))) {
+            TransitionOutput::CommitIntent(intent) => intent,
+            other => panic!("expected reused-generation commit intent, got {other:?}"),
+        };
+        let challenge = harness.engine.commit_outcome_challenge(&intent).unwrap();
+        assert_eq!(challenge.current_observation().device().get(), 2);
+        bind_queue_commit(&harness.engine, intent, replacement)
+            .unwrap_or_else(|_| panic!("activated generation-two cohort must bind"));
     }
 
     #[ktest]
@@ -1118,29 +1287,192 @@ mod tests {
         );
     }
 
-    fn enroll_and_commit(harness: &mut Harness, cohort: CoreDmaCohort) {
-        harness.tx(cohort.create_estate()).unwrap();
-        for command in cohort.enroll_claims() {
-            harness.tx(command).unwrap();
-        }
-        harness.tx(cohort.prepare()).unwrap();
-        let intent = match harness.output(cohort.record_commit_intent(digest(77))) {
-            TransitionOutput::CommitIntent(intent) => intent,
-            other => panic!("expected commit intent, got {other:?}"),
+    #[ktest]
+    fn queue_publication_binding_rejects_foreign_cohort_and_preserves_intent() {
+        let mut harness = Harness::new();
+        let exact = cohort(20, 1);
+        let intent = enroll_and_intent(&mut harness, exact, digest(0x41));
+        let mut foreign = cohort(21, 1);
+        foreign.hardware = exact.hardware;
+
+        let before = harness.engine.projection_digest();
+        let failure = bind_queue_commit(&harness.engine, intent, foreign)
+            .expect_err("foreign effect/cohort must not bind a durable commit intent");
+        assert_eq!(failure.error, CoreError::VerificationFailed);
+        assert_eq!(failure.intent.effect(), exact.effect);
+        assert_eq!(harness.engine.projection_digest(), before);
+    }
+
+    #[ktest]
+    fn queue_commit_receipt_rejects_cross_intent_and_exact_challenge_mismatches() {
+        let mut harness = Harness::new();
+        let first = cohort(30, 1);
+        let first_intent = enroll_and_intent(&mut harness, first, digest(0x51));
+        let first_authority = bind_queue_commit(&harness.engine, first_intent, first)
+            .unwrap_or_else(|_| panic!("first exact challenge binds"));
+        let CoreQueuePublishAuthority {
+            intent: first_intent,
+            binding: first_binding,
+        } = first_authority;
+        let observation =
+            queue_commit_observation(first_binding, 7, 9, 0xfeed, NotificationDisposition::Kicked);
+        let first_verifier = CoreQueueCommitVerifier {
+            binding: first_binding,
         };
-        let observation = queue_commit_observation(
-            cohort.hardware,
-            7,
-            9,
-            0xfeed,
-            NotificationDisposition::Kicked,
+        harness
+            .engine
+            .verify_commit_outcome(&first_intent, &first_verifier, &observation)
+            .expect("source-exact challenge and queue observation verify");
+
+        let mut second = cohort(31, 1);
+        second.hardware = first.hardware;
+        let second_intent = enroll_and_intent(&mut harness, second, digest(0x52));
+        let second_authority = bind_queue_commit(&harness.engine, second_intent, second)
+            .unwrap_or_else(|_| panic!("second exact challenge binds"));
+        let CoreQueuePublishAuthority {
+            intent: second_intent,
+            binding: second_binding,
+        } = second_authority;
+        let second_verifier = CoreQueueCommitVerifier {
+            binding: second_binding,
+        };
+        assert_eq!(
+            harness
+                .engine
+                .verify_commit_outcome(&second_intent, &second_verifier, &observation,),
+            Err(CoreError::VerificationFailed),
+            "one physical publication cannot satisfy another intent/cohort"
         );
-        let verifier = CoreQueueCommitVerifier { cohort };
+
+        let before = harness.engine.projection_digest();
+        let mut forged = observation;
+        forged.binding.authority_generation += 1;
+        forged.digest = queue_commit_digest(&forged);
+        assert_queue_commit_rejected(&harness.engine, &first_intent, first_binding, forged);
+
+        let mut forged = observation;
+        forged.binding.intent_nonce += 1;
+        forged.digest = queue_commit_digest(&forged);
+        assert_queue_commit_rejected(&harness.engine, &first_intent, first_binding, forged);
+
+        let mut forged = observation;
+        forged.binding.operation = digest(0x53);
+        forged.digest = queue_commit_digest(&forged);
+        assert_queue_commit_rejected(&harness.engine, &first_intent, first_binding, forged);
+
+        let mut forged = observation;
+        forged.binding.cohort.effect = second.effect;
+        forged.digest = queue_commit_digest(&forged);
+        assert_queue_commit_rejected(&harness.engine, &first_intent, first_binding, forged);
+        assert_eq!(harness.engine.projection_digest(), before);
+    }
+
+    #[ktest]
+    fn queue_commit_binding_keeps_authority_epoch_distinct_from_root_binding() {
+        let mut harness = Harness::new();
+        let first = cohort(32, 1);
+        harness.tx(first.create_estate()).unwrap();
+        harness
+            .tx(CommandRequest::FenceIncarnation {
+                root: first.effect.root(),
+                crashed: first.origin,
+                binding_generation: 1,
+            })
+            .unwrap();
+        let snapshot = harness
+            .engine
+            .snapshot_root(first.effect.root(), id::<SnapshotId>(1))
+            .unwrap();
+        harness.tx(snapshot.record()).unwrap();
+
+        let successor = PrincipalIncarnation::new(id::<PrincipalId>(32), 2).unwrap();
+        harness
+            .tx(CommandRequest::Ready {
+                root: first.effect.root(),
+                snapshot: id::<SnapshotId>(1),
+                successor,
+            })
+            .unwrap();
+        harness
+            .tx(CommandRequest::Rebind {
+                root: first.effect.root(),
+                snapshot: id::<SnapshotId>(1),
+                successor,
+                binding_generation: 2,
+            })
+            .unwrap();
+
+        let mut replacement = first;
+        replacement.effect = cser_core::EffectId::new(first.effect.root(), 2).unwrap();
+        replacement.origin = successor;
+        replacement.binding_generation = 2;
+        let intent = enroll_and_intent(&mut harness, replacement, digest(0x53));
+        let challenge = harness.engine.commit_outcome_challenge(&intent).unwrap();
+        assert_ne!(challenge.generation(), replacement.binding_generation);
+        assert_eq!(
+            challenge.current_observation().binding(),
+            replacement.binding_generation
+        );
+        let before = harness.engine.projection_digest();
+        let mut wrong_binding = replacement;
+        wrong_binding.binding_generation = 1;
+        let failure = bind_queue_commit(&harness.engine, intent, wrong_binding)
+            .expect_err("stale root binding must fail before publication");
+        assert_eq!(failure.error, CoreError::VerificationFailed);
+
+        let mut wrong_device = replacement;
+        wrong_device.hardware = cohort_with_resources(32, 2, replacement.claims).hardware;
+        let failure = bind_queue_commit(&harness.engine, failure.intent, wrong_device)
+            .expect_err("stale device freshness must fail before publication");
+        assert_eq!(failure.error, CoreError::VerificationFailed);
+        assert_eq!(harness.engine.projection_digest(), before);
+
+        bind_queue_commit(&harness.engine, failure.intent, replacement)
+            .unwrap_or_else(|_| panic!("independent authority and binding generations must bind"));
+    }
+
+    fn enroll_and_commit(harness: &mut Harness, cohort: CoreDmaCohort) {
+        let intent = enroll_and_intent(harness, cohort, digest(77));
+        let authority = bind_queue_commit(&harness.engine, intent, cohort)
+            .unwrap_or_else(|_| panic!("exact queue challenge binds"));
+        let CoreQueuePublishAuthority { intent, binding } = authority;
+        let observation =
+            queue_commit_observation(binding, 7, 9, 0xfeed, NotificationDisposition::Kicked);
+        let verifier = CoreQueueCommitVerifier { binding };
         let outcome = harness
             .engine
             .verify_commit_outcome(&intent, &verifier, &observation)
             .unwrap();
         harness.tx(intent.acknowledge(outcome).unwrap()).unwrap();
+    }
+
+    fn enroll_and_intent(
+        harness: &mut Harness,
+        cohort: CoreDmaCohort,
+        operation: Digest,
+    ) -> CommitIntent {
+        harness.tx(cohort.create_estate()).unwrap();
+        for command in cohort.enroll_claims() {
+            harness.tx(command).unwrap();
+        }
+        harness.tx(cohort.prepare()).unwrap();
+        match harness.output(cohort.record_commit_intent(operation)) {
+            TransitionOutput::CommitIntent(intent) => intent,
+            other => panic!("expected commit intent, got {other:?}"),
+        }
+    }
+
+    fn assert_queue_commit_rejected(
+        engine: &Engine,
+        intent: &CommitIntent,
+        binding: QueueCommitBinding,
+        observation: QueueCommitObservation,
+    ) {
+        let verifier = CoreQueueCommitVerifier { binding };
+        assert_eq!(
+            engine.verify_commit_outcome(intent, &verifier, &observation),
+            Err(CoreError::VerificationFailed)
+        );
     }
 
     fn cohort(root: u64, device_generation: u64) -> CoreDmaCohort {

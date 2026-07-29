@@ -4,8 +4,9 @@
 //!
 //! This module deliberately owns no effect, scope, binding, or commit gate.
 //! Its identities are descriptive hardware coordinates which a kernel adapter
-//! may bind to its own authoritative registry. The legacy Stage 5B `Portal`
-//! remains a separate regression API.
+//! binds to the sole authoritative portable-core Registry. The legacy Stage 5B
+//! `Portal` was removed from the live crate surface during the production
+//! cutover.
 
 use alloc::boxed::Box;
 use bitflags::bitflags;

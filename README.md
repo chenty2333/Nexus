@@ -33,8 +33,9 @@ claim. The short technical statement is [docs/CSER.md](docs/CSER.md).
 
 ## Working semantic contract
 
-These are research requirements, not claims that the current runtime already
-implements a new production core:
+These requirements define the rebaselined portable core and its current
+production-profile candidate. They are not broader production-readiness or
+hardware claims; the evidence boundary for current `main` is stated below.
 
 - **Causal scopes and effects** record the authority that created work and the
   descendants and resources derived from it.
@@ -71,8 +72,8 @@ kernel, service, resource, and device map is
 | Track | Status | Meaning |
 | --- | --- | --- |
 | `v0.1.0` | Published, archived research artifact | Bounded CSER composition with reproducible models, implementation slices, and receipts |
-| Current `main` | Post-release research checkpoint | Additional conformance, reply-adoption oracle, evidence-registry, and IRQ-spike work; not a `v0.2.0` release |
-| Production system | Not established | Real supervisor lifecycle, complete IRQ/reset/IOTLB closure, SMP refinement, resource pressure, and production error paths remain open |
+| Current `main` | CSER Core Rebaseline cutover candidate | Portable core, persistent recovery path, reply/DMA adapters, and one production Registry closure are implemented; the final exact-revision combined recovery receipt and release-ledger seal remain pending |
+| Production system | Not established | The `cser-production` profile is a bounded QEMU research path, not a hardware-general, SMP, availability, or production-readiness result |
 | Paper | None peer reviewed | `NARRATIVE.md` is a technical research account; the Zenodo object is software and reproducibility evidence |
 
 ### What `v0.1.0` establishes
@@ -98,31 +99,37 @@ complete evidence and non-claim ledger is [NARRATIVE.md](NARRATIVE.md).
 
 ### Current research line
 
-Post-release work is testing a stricter question: can the same committed
-effect retain its causal identity and concrete obligations across service
-death, reject every stale incarnation, and permit a fenced successor to
-reach one evidence-backed terminal disposition?
+Post-release work now follows
+[RFC 0006](docs/rfcs/0006-cser-core-semantic-rebaseline.md). The live kernel
+default is the single `cser-production` profile: one recovered portable-core
+owner is shared by the stateless `NXP3` portal, the `core-v1` supervisor, and
+the reply and DMA adapters. The old live Registry, portal glue, supervisor
+state, and kernel semantic mirrors have been removed from the production
+closure; the runtime does not dual-write old and new authority state.
 
-Current `main` contains bounded trace-conformance work, a safe-Rust
-post-commit reply-adoption oracle for the first four obligations in
-[RFC 0005](docs/rfcs/0005-postcommit-reply-adoption.md), an isolated Registry
-evidence unit, and a retained one-vCPU IRQ Phase A observation. These are
-source, model, and component observations. They do not establish the full
-service lifecycle, production transition atomicity, repeated-crash behavior,
-real multi-queue IRQ delivery, hardware DMA quiescence, or SMP correctness.
+The portable core defines domain-classified obligations, claims, fencing,
+adoption, settlement, journal records, replay, and freshness coordinates. Its
+independent safe-Rust oracle, property tests, trace conformance, and Loom tests
+cover reply and DMA semantics, revoke/claim outcomes, stale generations, and
+repeated crash windows. The OSTD harness first runs real guest reply and DMA
+slices through the mutually exclusive, `--no-default-features`, test-only
+`cser-core-reply-recovery` and `cser-core-dma-recovery` OSDK schemes. It then
+boots `cser-production` four times over the same ATA PIO journal, secondary
+reply outbox, and swtpm state, with device quarantine established before
+replay. Those focused schemes provide domain evidence; they are not alternate
+production Registries and do not introduce live dual-write.
 
-The remaining engineering gates are:
-
-1. stable kernel/service ABI and real supervisor lifecycle;
-2. complete causal coverage at dangerous post-commit fault windows;
-3. same-effect retained ownership through IRQ, reset, and IOTLB closure;
-4. SMP and production-lock refinement;
-5. operator-visible reconciliation, quotas, and bounded backpressure; and
-6. resource-pressure, stability, and production error paths.
-
-Design documents and local experiments do not retroactively widen the
-`v0.1.0` claim. Every later milestone requires source-bound evidence at its
-exact revision.
+This is still a cutover candidate, not a sealed result. Final acceptance waits
+for the complete combined receipt at the exact source revision and the release
+ledger seal. The production sequence must show initial commit and retained
+claims, a second crash after durable reply apply intent, reconciliation without
+a second intent and final settlement, and a stable repeated-recovery boot. Its
+host oracle must also verify strictly increasing boot, journal, and device
+freshness. Even a successful receipt is bounded to one-vCPU QEMU/TCG and swtpm:
+it does not establish physical TPM anti-rollback, physical power-loss behavior,
+hardware-general DMA quiescence or custody, crash-persistent PFN/IOVA custody,
+resource reuse authorization, or SMP correctness. Historical IRQ Phase A and
+`v0.1.0` evidence retain their original boundaries.
 
 ## Use the repository
 
@@ -137,40 +144,49 @@ Start with the fast, non-QEMU path:
 ./x test --quick
 ```
 
-Broader development and acceptance entry points are:
+The public workflow is intentionally small:
 
 ```bash
-./x build [all|model|kernel|virtio]
+./x build [all|model|kernel]
 ./x test [--unit|--quick|--system|--full]
-./x run [kernel|virtio|composition]
-NEXUS_REBUILD=1 ./x verify
-./x verify-bundle target/verification/artifact-bundle
+./x run [kernel]
+./x verify
 ./x clean [--all]
 ```
 
-The full gate can take tens of minutes and substantial Docker/workspace
-storage. The immutable `v0.1.0` tag also has a documented cold-fetch caveat
-after an upstream prerelease asset was replaced. Published-bundle audit,
-exact hashes, resource expectations, tier contracts, and archival procedures
-are in [ARTIFACT.md](ARTIFACT.md) and
-[CONTRIBUTING.md](CONTRIBUTING.md).
+`--unit` stays on the host semantic graph and `--quick` adds the kernel static
+gate. `--system` runs the two focused guest evidence schemes followed by the
+four-boot production recovery path and writes an explicitly non-sealable proof.
+`--full` is the same clean-source seal gate as `verify`; it rejects tracked,
+staged, or nonignored untracked source changes before QEMU. Set
+`NEXUS_REBUILD=1` when an intentional cold image rebuild is required. The full
+path can take tens of minutes and substantial Docker/workspace storage. The
+immutable `v0.1.0` artifact workflow and its historical cold-fetch caveat
+remain documented in
+[ARTIFACT.md](ARTIFACT.md) and [CONTRIBUTING.md](CONTRIBUTING.md); those release
+instructions are not the current production-recovery front door.
 
 ## Repository map
 
 | Path | Role |
 | --- | --- |
 | `specs/cser/` | Released PlusCal/TLA+ families and checked boundaries |
-| `crates/cser-model/` | Independent `no_std + alloc` safe-Rust reference oracles |
-| `crates/cser-trace-conformance/`, `crates/cser-transition-gates/` | Trace replay and production-source concurrency checks |
-| `kernel/nexus-ostd/` | Maintained OSTD kernel prototype and bounded workload paths |
-| `experiments/ostd-virtio-cser-spike/` | Mediated VirtIO/reset/IOMMU component evidence |
+| `crates/cser-core/` | Portable authoritative `no_std + alloc` CSER state machine, journal, replay, and domain profiles |
+| `crates/cser-model/` | Independent safe-Rust oracles and Loom scenario drivers |
+| `crates/cser-trace-conformance/` | Frozen-trace replay and projection comparison |
+| `crates/nexus-effect-peer-wire/` | Retained frozen wire corpus boundary; not a live semantic owner |
+| `crates/nexus-ostd-virtio/` | Separate pinned VirtIO/PCI/IOMMU substrate used by the kernel adapter |
+| `kernel/nexus-ostd/` | Sole authoritative `cser-production` profile, two test-only guest evidence schemes, and four-boot recovery harness |
+| `docs/research/irq-spike-phase-a/` | Retained historical one-vCPU IRQ component evidence |
 | `evaluation/`, `status/` | Released evidence and moving exact-revision checkpoints |
-| `tools/xtask/`, `tools/workflow/` | Reproducible build, evaluation, and evidence tooling |
+| `tools/xtask/` | Four-member workspace build, test, Loom, and static-cutover gates |
 | `./x` | Public workflow entry point |
 
-The reference model and OSTD implementation deliberately do not share state
-transition code. Device experiments remain component evidence unless an exact
-same-effect refinement is separately established.
+The root Cargo workspace contains exactly `crates/cser-core`,
+`crates/cser-model`, `crates/cser-trace-conformance`, and
+`crates/nexus-effect-peer-wire`; the OSTD kernel and VirtIO substrate retain
+their separate pinned build graphs. The independent oracle does not call
+production transition code to compute expected results.
 
 ## Documentation
 

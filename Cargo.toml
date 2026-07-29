@@ -4,9 +4,13 @@ members = [
     "crates/cser-core",
     "crates/cser-model",
     "crates/cser-trace-conformance",
+    "crates/nexus-effect-peer-wire",
+]
+exclude = [
     "crates/cser-transition-gates",
     "crates/nexus-effect-peer",
-    "crates/nexus-effect-peer-wire",
+    "crates/nexus-ostd-virtio",
     "crates/nexus-portal-abi",
     "crates/nexus-supervisor",
+    "kernel/nexus-ostd",
 ]

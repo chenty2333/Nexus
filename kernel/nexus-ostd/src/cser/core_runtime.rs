@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! Development-only OSTD ownership boundary for the portable CSER core.
+//! Production OSTD ownership boundary for the portable CSER core.
 //!
-//! This module deliberately owns no global instance and is not connected to
-//! portal, supervisor, filesystem, IRQ, or device ingress.  It establishes the
-//! shape of a future cold cutover without creating a live second writer beside
-//! `EffectRegistry`.
+//! This module owns no global instance. The production bootstrap constructs one
+//! recovered owner and shares it with every ingress adapter that may mutate the
+//! engine.
 //!
 //! Transactions hold an OSTD sleepable [`Mutex`] across the journal append and
 //! durability barrier required by [`Engine::transact_durable`].  Consequently callers
@@ -14,10 +13,8 @@
 //! for that owner; they must never call [`OstdCserRuntime::transact`] directly.
 
 use cser_core::{
-    BootGeneration, ChargeAccountId, Command, CommandRequest, CoreError, CoreLimits, Digest,
-    DomainCatalog, EffectId, Engine, Freshness, JournalGeneration, JournalRecord, JournalRepair,
-    PrincipalId, PrincipalIncarnation, REPLY_DOMAIN, REPLY_OBLIGATION_PUBLICATION, RecoveryAnchor,
-    RegistryInstance, RootId, TransitionDurability, TransitionReceipt, TxError, standard_catalog,
+    Command, CoreError, CoreLimits, Digest, DomainCatalog, Engine, JournalRepair, RecoveryAnchor,
+    TransitionDurability, TransitionReceipt, TxError,
 };
 use ostd::{prelude::*, sync::Mutex};
 
@@ -66,9 +63,8 @@ struct RuntimeState<P> {
 
 /// Single-writer OSTD owner of one portable CSER engine and its journal.
 ///
-/// Construction alone does not publish the runtime.  The eventual production
-/// cutover must install exactly one recovered instance before opening ingress
-/// and must remove the old Registry path in the same change.
+/// Construction alone does not publish the runtime. Production bootstrap must
+/// install exactly one recovered instance before opening ingress.
 #[derive(Debug)]
 pub(crate) struct OstdCserRuntime<P> {
     state: Mutex<RuntimeState<P>>,
@@ -129,20 +125,6 @@ impl<P> OstdCserRuntime<P> {
         let state = self.state.lock();
         operation(&state.persistence)
     }
-
-    /// Executes one explicitly non-durable development transition.
-    ///
-    /// This exists only in the mutually-exclusive runtime spike so real OSTD
-    /// task lifecycle wiring can be exercised before a platform journal
-    /// provider exists.  It must not be used by a production ingress or cited
-    /// as reboot-persistence evidence.
-    pub(crate) fn transact_volatile<C>(&self, command: C) -> Result<TransitionReceipt, CoreError>
-    where
-        C: Into<Command>,
-    {
-        let mut state = self.state.lock();
-        state.engine.transact_volatile(command)
-    }
 }
 
 impl<P: TransitionDurability> OstdCserRuntime<P> {
@@ -162,77 +144,4 @@ impl<P: TransitionDurability> OstdCserRuntime<P> {
         } = &mut *state;
         engine.transact_durable(command, persistence)
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum UnavailableJournalError {
-    NoDurableProvider,
-}
-
-pub(crate) struct UnavailableJournal;
-
-impl TransitionDurability for UnavailableJournal {
-    type Error = UnavailableJournalError;
-
-    fn persist_transition(
-        &mut self,
-        record: &JournalRecord,
-        resulting_freshness: Freshness,
-    ) -> Result<(), Self::Error> {
-        assert!(!record.bytes().is_empty());
-        assert_ne!(resulting_freshness.boot().get(), 0);
-        Err(UnavailableJournalError::NoDurableProvider)
-    }
-}
-
-/// Exercises the mutually-exclusive runtime entry point without fabricating a
-/// persistence receipt.
-///
-/// The compile spike has no OSTD durable-journal provider yet.  Its boot path
-/// therefore attempts one real core transaction, requires persistence to fail,
-/// and checks that the engine latches recovery-required instead of publishing
-/// the candidate estate.
-pub(crate) fn run_boot_probe() {
-    let root = RootId::new(1).expect("spike root is non-zero");
-    let principal = PrincipalId::new(1).expect("spike principal is non-zero");
-    let origin = PrincipalIncarnation::new(principal, 1).expect("spike incarnation is non-zero");
-    let freshness = Freshness::new(
-        BootGeneration::new(1).expect("spike boot is non-zero"),
-        RegistryInstance::new(1).expect("spike Registry is non-zero"),
-        1,
-        cser_core::DeviceGeneration::new(1).expect("spike device generation is non-zero"),
-        JournalGeneration::new(1).expect("spike journal is non-zero"),
-    )
-    .expect("spike freshness is complete");
-    let engine = Engine::new(standard_catalog(), CoreLimits::bounded_default(), freshness);
-    let runtime = OstdCserRuntime::from_engine(engine, UnavailableJournal);
-    let command = CommandRequest::CreateEstate {
-        effect: EffectId::new(root, 1).expect("spike effect is non-zero"),
-        origin,
-        binding_generation: 1,
-        domain: REPLY_DOMAIN,
-        obligation: REPLY_OBLIGATION_PUBLICATION,
-        charge_account: ChargeAccountId::new(1).expect("spike account is non-zero"),
-    };
-
-    assert!(matches!(
-        runtime.transact(command),
-        Err(TxError::Persist(UnavailableJournalError::NoDurableProvider))
-    ));
-    let (revision, estate_absent, recovery_required) = runtime.observe(|engine| {
-        (
-            engine.revision(),
-            engine
-                .estate(EffectId::new(root, 1).expect("spike effect is non-zero"))
-                .is_none(),
-            engine.pressure().persistence_recovery_required,
-        )
-    });
-    assert_eq!(revision, 0);
-    assert!(estate_absent);
-    assert!(recovery_required);
-    println!(
-        "CSER_CORE_RUNTIME_SPIKE PASS writer=portable_core legacy_runtime=false \
-         live_ingress=false durable_provider=unavailable fail_closed=true"
-    );
 }

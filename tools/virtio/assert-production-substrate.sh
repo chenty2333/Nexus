@@ -5,8 +5,7 @@ script_dir=$(cd -- "$(dirname -- "$0")" && pwd)
 repo_root=$(cd -- "$script_dir/../.." && pwd)
 production=${1:-$repo_root/crates/nexus-ostd-virtio/src/production.rs}
 lib=${2:-$repo_root/crates/nexus-ostd-virtio/src/lib.rs}
-portal=${3:-$repo_root/crates/nexus-ostd-virtio/src/portal.rs}
-pci=${4:-$repo_root/crates/nexus-ostd-virtio/src/pci.rs}
+pci=${3:-$repo_root/crates/nexus-ostd-virtio/src/pci.rs}
 
 fail() {
     echo "production VirtIO substrate assertion failed: $*" >&2
@@ -100,17 +99,16 @@ has_manual_clone_or_copy() {
     ' "$source"
 }
 
-for source in "$production" "$lib" "$portal" "$pci"; do
+for source in "$production" "$lib" "$pci"; do
     [[ -f $source && ! -L $source ]] || fail "missing regular source: $source"
 done
 
 if grep -Eq '\b(IoGate|EffectAuthority|cser_transition_gates)\b' "$production"; then
     fail 'hardware facade imports or owns semantic registry authority'
 fi
-grep -Fq 'pub struct Portal {' "$portal" || fail 'legacy Stage 5B Portal disappeared'
-grep -Fq 'gate: IoGate<4>,' "$portal" || fail 'legacy Stage 5B gate disappeared'
-grep -Fq 'pub type EffectAuthority = IoIdentity;' "$portal" \
-    || fail 'legacy Stage 5B authority regression API disappeared'
+if grep -Eq '(^|[[:space:]])mod portal;|pub use portal::' "$lib"; then
+    fail 'retired semantic portal remains in the production VirtIO facade'
+fi
 
 grep -Fq 'pub const fn from_coordinates(' "$production" \
     || fail 'registry envelopes cannot reconstruct descriptive identity'
@@ -1201,4 +1199,4 @@ for export in \
     grep -Fq "$export" "$lib" || fail "public facade omits $export"
 done
 
-echo 'production VirtIO substrate: PASS authority=registry-external identity=descriptive+reconstructible physical_owner=one-bdf+one-active-session intx=descriptive-route+linear-owner-epoch+masked-unmasked preparation=owner-bound-preflight+polling+irq+typed-rollback-or-indeterminate+sequence-atomic receipt=opaque+owner-coupled linear_owner=non-clone+fail-closed preflight=failure-atomic publication=receipt-revalidated+intent-only+infallible+post-release-moves-only hardware_intent=real-owner+non-clone+failure-returns-owner+infallible-reset+completion-state-pop-aware notification=kick-or-suppressed+replay-safe completion=polling+irq+one-step-actor+one-validator+exact-used-length+pending-or-failed-resettable+pop-state reset_ack=one-step-actor+bounded-retry+unique-finalize cancel=exact-buffers generation=prevalidate+infallible-apply quiescence=prevalidate+infallible-apply legacy_portal=retained'
+echo 'production VirtIO substrate: PASS authority=core-external identity=descriptive+reconstructible physical_owner=one-bdf+one-active-session intx=descriptive-route+linear-owner-epoch+masked-unmasked preparation=owner-bound-preflight+polling+irq+typed-rollback-or-indeterminate+sequence-atomic receipt=opaque+owner-coupled linear_owner=non-clone+fail-closed preflight=failure-atomic publication=receipt-revalidated+intent-only+infallible+post-release-moves-only hardware_intent=real-owner+non-clone+failure-returns-owner+infallible-reset+completion-state-pop-aware notification=kick-or-suppressed+replay-safe completion=polling+irq+one-step-actor+one-validator+exact-used-length+pending-or-failed-resettable+pop-state reset_ack=one-step-actor+bounded-retry+unique-finalize cancel=exact-buffers generation=prevalidate+infallible-apply quiescence=prevalidate+infallible-apply legacy_portal=absent'

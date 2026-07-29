@@ -1,15 +1,18 @@
 # `nexus-effect-peer-wire`
 
-`nexus-effect-peer-wire` is the independently consumable Rust source contract
-for the frozen `nexus-effect-peer-native-v1` protocol. It owns the exact serde
-types, compact field-order JSON encoding, SHA-256 receipt-chain helpers, frozen
-contract bytes, and canonical fixture corpus used by the same-boot production
-effect peer.
+`nexus-effect-peer-wire` retains the independently consumable Rust source
+contract for the frozen historical `nexus-effect-peer-native-v1` protocol. It
+owns the exact serde types, compact field-order JSON encoding, SHA-256
+receipt-chain helpers, frozen contract bytes, and canonical fixture corpus
+needed to reproduce and audit that protocol.
 
 The crate contains no production `EffectRegistry`, child-process server,
 ownership log, neutral handoff mapping, kernel adapter, or transport security.
-`nexus-effect-peer` depends on this crate and re-exports its public API while
-remaining the sole owner of Registry execution and bounded JSON Lines stdio.
+The former `nexus-effect-peer` runtime has been deleted from the current source
+tree during the one-time CSER Core production cutover. This retained wire crate
+is therefore a frozen historical protocol and corpus boundary, not the current
+Registry owner, a live runtime route, or evidence for the rebaselined production
+path.
 
 The package remains `publish = false`: it is not currently a crates.io API.
 Consumers must pin an exact Nexus Git revision or a future immutable release

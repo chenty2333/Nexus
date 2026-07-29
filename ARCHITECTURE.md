@@ -1,13 +1,24 @@
 # Nexus architecture
 
-Status: architecture contract for the CSER prototype, July 2026.
+Status: **Historical `v0.1.0` architecture; Superseded for current
+implementation work by RFC 0006, July 2026.**
 
-This document separates the intended architecture from what the repository has
-already demonstrated. The evidence terms **Specified**, **Checked**,
-**Observed**, **Planned**, and **Candidate contribution** have the meanings in
-`VISION.md`.
+The current production architecture contract is
+[`docs/rfcs/0006-cser-core-semantic-rebaseline.md`](docs/rfcs/0006-cser-core-semantic-rebaseline.md).
+Its portable core lives in `crates/cser-core`; its independent oracle lives in
+`crates/cser-model`; and the exact OSTD production closure is listed in
+`kernel/nexus-ostd/cser-production-sources.txt`. Conflicting stage order,
+Registry shape, portal/supervisor API, or roadmap text below is **Superseded**
+and must not be used to reintroduce a second live semantic path.
 
-For baseline operations, `specs/cser/Cser.tla` is the semantic source of truth;
+The remainder of this document is retained to interpret the accepted
+`v0.1.0` release and the pre-rebaseline checkpoint. Its evidence terms
+**Specified**, **Checked**, **Observed**, **Planned**, and **Candidate
+contribution** retain their historical meanings from `VISION.md`.
+
+## Historical semantic sources
+
+For the historical baseline, `specs/cser/Cser.tla` was the semantic source of truth;
 `specs/cser/PagerCser.tla`, `specs/cser/IoCser.tla`, and
 `specs/cser/PersonalityCser.tla` are the explicit pager, mediated-I/O, and
 bounded Linux-personality successor refinements;
@@ -18,9 +29,10 @@ and a common safe-Rust personality registry. `specs/cser/RuntimeFsCser.tla` and
 `specs/cser/CompositionCser.tla` is the explicit frozen five-domain composition
 successor and includes neither runtime domain. `crates/cser-model` provides the
 corresponding executable oracles.
-An implementation must refine those operations or change the relevant model
-first; it must not silently redefine their linearization points. Sections
-marked planned extend beyond the current finite models.
+A change to the accepted historical artifact must preserve those operations or
+change the relevant historical model first. New rebaseline implementation work
+instead follows RFC 0006. Sections marked planned below describe the historical
+prototype and do not reopen superseded tasks.
 
 ## System boundary
 

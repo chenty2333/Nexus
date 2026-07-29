@@ -108,15 +108,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cser-transition-gates"
-version = "0.1.0"
-dependencies = [
- "loom",
- "nexus-portal-abi",
- "sha2",
-]
-
-[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -261,16 +252,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
-name = "nexus-effect-peer"
-version = "0.1.0"
-dependencies = [
- "cser-transition-gates",
- "nexus-effect-peer-wire",
- "serde_json",
- "sha2",
-]
-
-[[package]]
 name = "nexus-effect-peer-wire"
 version = "0.1.0"
 dependencies = [
@@ -278,18 +259,6 @@ dependencies = [
  "serde_json",
  "sha2",
 ]
-
-[[package]]
-name = "nexus-portal-abi"
-version = "0.1.0"
-dependencies = [
- "bitflags",
- "zerocopy",
-]
-
-[[package]]
-name = "nexus-supervisor"
-version = "0.1.0"
 
 [[package]]
 name = "nu-ansi-term"

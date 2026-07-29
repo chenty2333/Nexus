@@ -39,7 +39,7 @@
 //! - an index auth value compiled into a kernel image is test provisioning,
 //!   not a production secret-distribution design.
 
-use alloc::vec::Vec;
+use alloc::{vec, vec::Vec};
 use core::{
     hint::spin_loop,
     sync::atomic::{AtomicBool, Ordering},
@@ -344,8 +344,9 @@ where
         validate_unique_indices(layout)?;
         validate_index_publics(&mut transport, layout)?;
         let (tip_sequence, committed) = read_selected_tip(&mut transport, layout, &auth)?;
-        let (lease_sequence, issued) = read_selected_lease(&mut transport, layout, &auth)?;
-        validate_loaded_state(expected_binding, committed, issued)?;
+        let (lease_sequence, lease_binding, issued) =
+            read_selected_lease(&mut transport, layout, &auth)?;
+        validate_loaded_state(expected_binding, committed, lease_binding, issued)?;
         Ok(Self {
             transport: Some(transport),
             layout,
@@ -394,8 +395,9 @@ where
             .expect("live TPM NV provider retains its transport");
         validate_index_publics(transport, self.layout)?;
         let (tip_sequence, committed) = read_selected_tip(transport, self.layout, &self.auth)?;
-        let (lease_sequence, issued) = read_selected_lease(transport, self.layout, &self.auth)?;
-        validate_loaded_state(self.expected_binding, committed, issued)?;
+        let (lease_sequence, lease_binding, issued) =
+            read_selected_lease(transport, self.layout, &self.auth)?;
+        validate_loaded_state(self.expected_binding, committed, lease_binding, issued)?;
         self.tip_sequence = tip_sequence;
         self.lease_sequence = lease_sequence;
         self.committed = committed;
@@ -413,8 +415,7 @@ where
             .expect("live TPM NV provider retains its transport")
             .write_exact(index, &self.auth, bytes)
             .map_err(TpmNvAnchorError::Transport)?;
-        let mut observed = Vec::new();
-        observed.resize(bytes.len(), 0);
+        let mut observed = vec![0; bytes.len()];
         self.transport
             .as_mut()
             .expect("live TPM NV provider retains its transport")
@@ -601,11 +602,13 @@ where
 fn validate_loaded_state<E>(
     expected_binding: RecoveryBinding,
     committed: TrustedAnchorSnapshot,
+    lease_binding: RecoveryBinding,
     issued: Freshness,
 ) -> Result<(), TpmNvAnchorError<E>> {
     if committed.binding() != expected_binding
-        || issued.registry().get() != expected_binding.registry().get()
-        || issued.binding() != expected_binding.binding()
+        || lease_binding != expected_binding
+        || issued.registry() != lease_binding.registry()
+        || issued.binding() != lease_binding.binding()
     {
         return Err(PersistenceProtocolError::BindingMismatch.into());
     }
@@ -698,7 +701,7 @@ fn read_selected_lease<T>(
     transport: &mut T,
     layout: TpmNvLayout,
     auth: &TpmNvIndexAuth,
-) -> Result<(u64, Freshness), TpmNvAnchorError<T::Error>>
+) -> Result<(u64, RecoveryBinding, Freshness), TpmNvAnchorError<T::Error>>
 where
     T: TpmNvTransport,
 {
@@ -708,9 +711,9 @@ where
     transport
         .read_exact(index, auth, &mut bytes)
         .map_err(TpmNvAnchorError::Transport)?;
-    let (_, issued) = decode_lease_slot(&bytes, sequence)
+    let (binding, issued) = decode_lease_slot(&bytes, sequence)
         .ok_or(TpmNvAnchorError::CorruptSelectedSlot { index })?;
-    Ok((sequence, issued))
+    Ok((sequence, binding, issued))
 }
 
 fn encode_tip_slot(sequence: u64, snapshot: TrustedAnchorSnapshot) -> [u8; TIP_SLOT_LEN] {
@@ -991,8 +994,7 @@ impl QemuTisTpm2 {
             TisTpmError::ResponseTimeout,
         )?;
 
-        let mut response = Vec::new();
-        response.reserve(TPM_HEADER_LEN);
+        let mut response = Vec::with_capacity(TPM_HEADER_LEN);
         self.read_fifo_exact(&mut response, TPM_HEADER_LEN)?;
         let response_size = usize::try_from(u32::from_be_bytes(
             response[2..6].try_into().expect("TPM response size header"),
@@ -1708,6 +1710,39 @@ mod tests {
         assert!(matches!(
             TpmNvTrustedAnchor::open(transport, layout, auth(), binding()),
             Err(TpmNvAnchorError::CorruptSelectedSlot { index }) if index == selected
+        ));
+    }
+
+    #[ktest]
+    fn lease_from_different_catalog_fails_binding_validation() {
+        let layout = TpmNvLayout::qemu_fixture();
+        let expected_binding = binding();
+        let issued = freshness(1, 1, 1);
+        let mut transport = MockNv::provision(layout, 1, expected_binding, issued);
+        let foreign_binding = RecoveryBinding::new(
+            digest(8),
+            expected_binding.registry(),
+            expected_binding.binding(),
+        )
+        .unwrap();
+        let selected = slot_for_sequence(layout.lease_slots, 1);
+        let encoded = encode_lease_slot(1, foreign_binding, issued);
+        assert_eq!(
+            decode_lease_slot(&encoded, 1),
+            Some((foreign_binding, issued))
+        );
+        transport
+            .entries
+            .get_mut(&selected)
+            .unwrap()
+            .bytes
+            .copy_from_slice(&encoded);
+
+        assert!(matches!(
+            TpmNvTrustedAnchor::open(transport, layout, auth(), expected_binding),
+            Err(TpmNvAnchorError::Protocol(
+                PersistenceProtocolError::BindingMismatch
+            ))
         ));
     }
 

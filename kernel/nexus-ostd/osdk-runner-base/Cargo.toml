@@ -19,10 +19,8 @@ version = "0.18.0"
 version = "0.18.0"
 
 [features]
-cser-core-dma-slice = ["nexus-kernel/cser-core-dma-slice"]
-cser-core-runtime-spike = ["nexus-kernel/cser-core-runtime-spike"]
+cser-core-dma-recovery = ["nexus-kernel/cser-core-dma-recovery"]
+cser-core-reply-recovery = ["nexus-kernel/cser-core-reply-recovery"]
 cser-core-tpm-anchor = ["nexus-kernel/cser-core-tpm-anchor"]
-stage7b-eval = ["nexus-kernel/stage7b-eval"]
-virtio-cser-facade = ["nexus-kernel/virtio-cser-facade"]
-virtio-cser-postcommit-fault = ["nexus-kernel/virtio-cser-postcommit-fault"]
-virtio-cser-precommit-fault = ["nexus-kernel/virtio-cser-precommit-fault"]
+cser-production = ["nexus-kernel/cser-production"]
+default = ["cser-production"]

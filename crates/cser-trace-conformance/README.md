@@ -1,5 +1,14 @@
 # cser-trace-conformance
 
+Status: **retained historical TLC-to-oracle evidence for `v0.1.0` and the
+pre-rebaseline checkpoint.** RFC 0006 preserves this unique material but does
+not treat its old specification families as the current core semantic source.
+The rebaseline's normalized transition-trace comparisons live in
+`cser-core/tests/core_rebaseline_oracle.rs` and
+`cser-core/tests/property_differential.rs`: they compare the production core
+projection with the independent `cser-model::core_rebaseline_oracle` after
+each step. Those tests are not TLC trace replay or a TLA+ refinement proof.
+
 A **checked trace-conformance witness between TLC traces and the Rust oracle
 for two of the fourteen CSER specification families.**
 

@@ -16,6 +16,14 @@ extern crate alloc;
 #[cfg(feature = "std")]
 extern crate std;
 
+/// Frozen semantic API profile established after the reply and DMA domain
+/// slices both passed without an adapter-owned semantic escape hatch.
+///
+/// This is a source and durable-semantics compatibility coordinate, not a Rust
+/// ABI promise. An incompatible public contract change must advance this value
+/// and use a new journal schema or an explicit, tested migration.
+pub const CSER_CORE_API_PROFILE_VERSION: u16 = 1;
+
 mod domain;
 mod engine;
 mod identity;

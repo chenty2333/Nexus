@@ -71,23 +71,24 @@ if ((${#cser_production_sources[@]} == 0)); then
 fi
 readonly production_source_manifest
 readonly -a cser_production_sources cser_source_hash_inputs cser_source_mount_args
+mapfile -d '' -t cser_model_image_inputs < <(
+    find "$repo_root/crates/cser-model" -type f -print0 | sort -z
+)
+if ((${#cser_model_image_inputs[@]} == 0)) \
+    || find "$repo_root/crates/cser-model" -type l -print -quit | grep -q .; then
+    echo "cser-model image inputs must be non-empty regular files without symlinks" >&2
+    exit 1
+fi
+readonly -a cser_model_image_inputs
 # Hash only inputs consumed while building the pinned image. Runtime serial
 # oracles execute from the mounted worktree and must not force an image rebuild.
 image_key=$(sha256sum \
+    "$repo_root/Cargo.toml" \
+    "$repo_root/Cargo.lock" \
     "$root/Dockerfile" \
     "$root/.dockerignore" \
     "$repo_root/.dockerignore" \
-    "$repo_root/tests/guest/linux/sources/linux-hello/hello.S" \
-    "$repo_root/tests/guest/linux/sources/linux-dynamic-pie-smoke/dynamic_pie_smoke.S" \
-    "$repo_root/tests/guest/linux/sources/linux-dynamic-pie-main/dynamic_pie_main.c" \
-    "$repo_root/tests/guest/linux/sources/linux-dynamic-runtime-interp/dynamic_runtime_interp.c" \
-    "$repo_root/tests/guest/linux/sources/linux-round4-futex-smoke/round4_futex_smoke.S" \
-    "$repo_root/tests/guest/linux/adaptations/round4-futex-modern-requeue.patch" \
-    "$repo_root/tests/guest/linux/sources/linux-round5-epoll-smoke/round5_epoll_smoke.S" \
-    "$repo_root/tests/guest/linux/adaptations/round5-epoll-linux-regular-file.patch" \
-    "$repo_root/tests/guest/linux/adaptations/verify-round5-epoll-adaptation.sh" \
     "$repo_root/tests/guest/linux/sources/linux-runtime-fs-smoke/runtime_fs_smoke.S" \
-    "$repo_root/tests/guest/linux/sources/linux-runtime-net-smoke/runtime_net_smoke.S" \
     "$root/Cargo.toml" \
     "$root/Cargo.lock" \
     "$root/OSDK.toml" \
@@ -98,46 +99,10 @@ image_key=$(sha256sum \
     "$root/osdk-runner-base/x86_64.ld" \
     "$root/osdk-runner-base/riscv64.ld" \
     "$root/osdk-runner-base/loongarch64.ld" \
-    "$root/scripts/build-guest.sh" \
-    "$root/scripts/assert-linux-elf.sh" \
-    "$root/scripts/assert-dynamic-pie-artifacts.sh" \
-    "$root/scripts/check-fsbase-api.sh" \
-    "$root/scripts/check-scheduler-attempt.sh" \
-    "$root/scripts/build-round4.sh" \
-    "$root/scripts/build-round5.sh" \
     "$root/scripts/build-runtime-fs.sh" \
     "$root/scripts/assert-runtime-fs-artifacts.sh" \
     "$root/scripts/build-runtime-fs-block-image.sh" \
     "$root/scripts/assert-runtime-fs-block-image.sh" \
-    "$root/scripts/build-runtime-net.sh" \
-    "$root/scripts/assert-runtime-net-artifacts.sh" \
-    "$root/guest/linux-futex-shared.S" \
-    "$root/guest/linux-futex-personality-v1.S" \
-    "$root/guest/linux-futex-personality-v2.S" \
-    "$root/guest/linux-dynamic-personality-v1.S" \
-    "$root/guest/linux-dynamic-personality-v2.S" \
-    "$root/guest/linux-futex-core-personality-v1.S" \
-    "$root/guest/linux-futex-core-personality-v2.S" \
-    "$root/guest/linux-netd-v1.S" \
-    "$root/guest/linux-netd-v2.S" \
-    "$root/guest/linux-fsd-v1.S" \
-    "$root/guest/linux-fsd-v2.S" \
-    "$root/guest/linux-fsd-v2-postcommit.S" \
-    "$root/guest/linux-fsd-v3.S" \
-    "$root/src/evaluation/stage7b.rs" \
-    "$root/userspace/personality/.cargo/config.toml" \
-    "$root/userspace/personality/Cargo.toml" \
-    "$root/userspace/personality/Cargo.lock" \
-    "$root/userspace/personality/linker.ld" \
-    "$root/userspace/personality/src/bin/v1.rs" \
-    "$root/userspace/personality/src/bin/v2.rs" \
-    "$repo_root/crates/cser-transition-gates/Cargo.toml" \
-    "$repo_root/crates/cser-transition-gates/src/lib.rs" \
-    "$repo_root/crates/cser-transition-gates/src/oneshot.rs" \
-    "$repo_root/crates/cser-transition-gates/src/deadline.rs" \
-    "$repo_root/crates/cser-transition-gates/src/scheduler.rs" \
-    "$repo_root/crates/cser-transition-gates/src/pager.rs" \
-    "$repo_root/crates/cser-transition-gates/src/io.rs" \
     "$repo_root/crates/cser-core/Cargo.toml" \
     "$repo_root/crates/cser-core/src/domain.rs" \
     "$repo_root/crates/cser-core/src/engine.rs" \
@@ -146,36 +111,16 @@ image_key=$(sha256sum \
     "$repo_root/crates/cser-core/src/lib.rs" \
     "$repo_root/crates/cser-core/src/persistence.rs" \
     "$repo_root/crates/cser-core/src/profiles.rs" \
+    "$repo_root/crates/cser-core/src/bin/cser-catalog-digest.rs" \
+    "${cser_model_image_inputs[@]}" \
     "$repo_root/crates/nexus-ostd-virtio/Cargo.toml" \
     "$repo_root/crates/nexus-ostd-virtio/Cargo.lock" \
     "$repo_root/crates/nexus-ostd-virtio/README.md" \
+    "$repo_root/crates/nexus-ostd-virtio/src/boot_quarantine.rs" \
     "$repo_root/crates/nexus-ostd-virtio/src/lib.rs" \
     "$repo_root/crates/nexus-ostd-virtio/src/dma.rs" \
     "$repo_root/crates/nexus-ostd-virtio/src/pci.rs" \
-    "$repo_root/crates/nexus-ostd-virtio/src/portal.rs" \
     "$repo_root/crates/nexus-ostd-virtio/src/production.rs" \
-    "$repo_root/crates/nexus-portal-abi/Cargo.toml" \
-    "$repo_root/crates/nexus-portal-abi/src/capability.rs" \
-    "$repo_root/crates/nexus-portal-abi/src/digest.rs" \
-    "$repo_root/crates/nexus-portal-abi/src/dispatcher.rs" \
-    "$repo_root/crates/nexus-portal-abi/src/error.rs" \
-    "$repo_root/crates/nexus-portal-abi/src/handle.rs" \
-    "$repo_root/crates/nexus-portal-abi/src/lib.rs" \
-    "$repo_root/crates/nexus-portal-abi/src/lifecycle.rs" \
-    "$repo_root/crates/nexus-portal-abi/src/message.rs" \
-    "$repo_root/crates/nexus-portal-abi/src/request.rs" \
-    "$repo_root/crates/nexus-portal-abi/src/response.rs" \
-    "$repo_root/crates/nexus-portal-abi/src/response/error.rs" \
-    "$repo_root/crates/nexus-portal-abi/src/response/lifecycle.rs" \
-    "$repo_root/crates/nexus-portal-abi/src/response/negotiation.rs" \
-    "$repo_root/crates/nexus-portal-abi/src/response/query.rs" \
-    "$repo_root/crates/nexus-supervisor/Cargo.toml" \
-    "$repo_root/crates/nexus-supervisor/README.md" \
-    "$repo_root/crates/nexus-supervisor/src/backend.rs" \
-    "$repo_root/crates/nexus-supervisor/src/lib.rs" \
-    "$repo_root/crates/nexus-supervisor/src/manager.rs" \
-    "$repo_root/crates/nexus-supervisor/src/tests.rs" \
-    "$repo_root/crates/nexus-supervisor/src/types.rs" \
     "$repo_root/patches/ostd-0.18.0-cser.patch" \
     "$repo_root/patches/virtio-drivers-0.13.0-cser.patch" \
     "$repo_root/patches/virtio-drivers-0.13.0-LICENSE-MIT" \
@@ -227,13 +172,10 @@ container() {
         -v "$root:/work:z" \
         -v "$repo_root:/repo:ro,z" \
         -v "$repo_root/crates/cser-core:/crates/cser-core:ro,z" \
-        -v "$repo_root/crates/cser-transition-gates:/crates/cser-transition-gates:ro,z" \
+        -v "$repo_root/crates/cser-model:/crates/cser-model:ro,z" \
         -v "$repo_root/crates/nexus-ostd-virtio:/crates/nexus-ostd-virtio:ro,z" \
-        -v "$repo_root/crates/nexus-portal-abi:/crates/nexus-portal-abi:ro,z" \
-        -v "$repo_root/crates/nexus-supervisor:/crates/nexus-supervisor:ro,z" \
         "${cser_source_mount_args[@]}" \
         --mount "type=bind,source=$root/Cargo.lock,target=/work/Cargo.lock,readonly" \
-        --mount "type=bind,source=$root/userspace/personality/Cargo.lock,target=/work/userspace/personality/Cargo.lock,readonly" \
         -w /work \
         "$image" \
         "$@"
@@ -284,7 +226,6 @@ check_virtio_patch() {
     container /repo/tools/virtio/assert-production-substrate.sh \
         /crates/nexus-ostd-virtio/src/production.rs \
         /crates/nexus-ostd-virtio/src/lib.rs \
-        /crates/nexus-ostd-virtio/src/portal.rs \
         /crates/nexus-ostd-virtio/src/pci.rs
     container bash -c '
         set -euo pipefail
@@ -301,7 +242,6 @@ check_virtio_patch() {
         installed=/opt/nexus-virtio/virtio-drivers-0.13.0
         source=/crates/nexus-ostd-virtio/src/production.rs
         lib=/crates/nexus-ostd-virtio/src/lib.rs
-        portal=/crates/nexus-ostd-virtio/src/portal.rs
         pci=/crates/nexus-ostd-virtio/src/pci.rs
 
         cp "$canonical" "$tmp/relaxed.patch"
@@ -333,7 +273,7 @@ check_virtio_patch() {
         cp "$source" "$tmp/authority.rs"
         sed -i '\''2i use crate::EffectAuthority;'\'' "$tmp/authority.rs"
         if /repo/tools/virtio/assert-production-substrate.sh \
-            "$tmp/authority.rs" "$lib" "$portal" >/dev/null 2>&1; then
+            "$tmp/authority.rs" "$lib" "$pci" >/dev/null 2>&1; then
             echo "production facade gate accepted semantic authority ownership" >&2
             exit 1
         fi
@@ -342,7 +282,7 @@ check_virtio_patch() {
         sed -i '\''/let (queue, _token) = prepared.publish_prepared();/a\        assert!(true);'\'' \
             "$tmp/post-release-assert.rs"
         if /repo/tools/virtio/assert-production-substrate.sh \
-            "$tmp/post-release-assert.rs" "$lib" "$portal" >/dev/null 2>&1; then
+            "$tmp/post-release-assert.rs" "$lib" "$pci" >/dev/null 2>&1; then
             echo "production facade gate accepted a post-Release assertion" >&2
             exit 1
         fi
@@ -351,7 +291,7 @@ check_virtio_patch() {
         sed -i '\''s/\*self.device_generation = self.next_generation;/if true { *self.device_generation = self.next_generation; }/'\'' \
             "$tmp/branching-generation.rs"
         if /repo/tools/virtio/assert-production-substrate.sh \
-            "$tmp/branching-generation.rs" "$lib" "$portal" >/dev/null 2>&1; then
+            "$tmp/branching-generation.rs" "$lib" "$pci" >/dev/null 2>&1; then
             echo "production facade gate accepted branching generation apply" >&2
             exit 1
         fi
@@ -360,7 +300,7 @@ check_virtio_patch() {
         sed -i '\''s/\*self.active = None;/if true { *self.active = None; }/'\'' \
             "$tmp/branching-quiescence.rs"
         if /repo/tools/virtio/assert-production-substrate.sh \
-            "$tmp/branching-quiescence.rs" "$lib" "$portal" >/dev/null 2>&1; then
+            "$tmp/branching-quiescence.rs" "$lib" "$pci" >/dev/null 2>&1; then
             echo "production facade gate accepted branching quiescence apply" >&2
             exit 1
         fi
@@ -370,7 +310,7 @@ check_virtio_patch() {
             "$tmp/overlapping-session.rs"
         require_mutation "$source" "$tmp/overlapping-session.rs" overlapping-session
         if /repo/tools/virtio/assert-production-substrate.sh \
-            "$tmp/overlapping-session.rs" "$lib" "$portal" >/dev/null 2>&1; then
+            "$tmp/overlapping-session.rs" "$lib" "$pci" >/dev/null 2>&1; then
             echo "production facade gate accepted overlapping hardware sessions" >&2
             exit 1
         fi
@@ -380,7 +320,7 @@ check_virtio_patch() {
             "$tmp/forced-notification.rs"
         require_mutation "$source" "$tmp/forced-notification.rs" forced-notification
         if /repo/tools/virtio/assert-production-substrate.sh \
-            "$tmp/forced-notification.rs" "$lib" "$portal" >/dev/null 2>&1; then
+            "$tmp/forced-notification.rs" "$lib" "$pci" >/dev/null 2>&1; then
             echo "production facade gate accepted mandatory notification despite suppression" >&2
             exit 1
         fi
@@ -390,7 +330,7 @@ check_virtio_patch() {
             "$tmp/unchecked-used-length.rs"
         require_mutation "$source" "$tmp/unchecked-used-length.rs" unchecked-used-length
         if /repo/tools/virtio/assert-production-substrate.sh \
-            "$tmp/unchecked-used-length.rs" "$lib" "$portal" >/dev/null 2>&1; then
+            "$tmp/unchecked-used-length.rs" "$lib" "$pci" >/dev/null 2>&1; then
             echo "production facade gate accepted an unchecked device used length" >&2
             exit 1
         fi
@@ -400,7 +340,7 @@ check_virtio_patch() {
             "$tmp/status-before-used-length.rs"
         require_mutation "$source" "$tmp/status-before-used-length.rs" status-before-used-length
         if /repo/tools/virtio/assert-production-substrate.sh \
-            "$tmp/status-before-used-length.rs" "$lib" "$portal" >/dev/null 2>&1; then
+            "$tmp/status-before-used-length.rs" "$lib" "$pci" >/dev/null 2>&1; then
             echo "production facade gate accepted status access before used-length validation" >&2
             exit 1
         fi
@@ -410,7 +350,7 @@ check_virtio_patch() {
             "$tmp/irq-uses-polling-mode.rs"
         require_mutation "$source" "$tmp/irq-uses-polling-mode.rs" irq-uses-polling-mode
         if /repo/tools/virtio/assert-production-substrate.sh \
-            "$tmp/irq-uses-polling-mode.rs" "$lib" "$portal" "$pci" >/dev/null 2>&1; then
+            "$tmp/irq-uses-polling-mode.rs" "$lib" "$pci" >/dev/null 2>&1; then
             echo "production facade gate accepted IRQ preparation with polling notifications" >&2
             exit 1
         fi
@@ -420,7 +360,7 @@ check_virtio_patch() {
             "$tmp/irq-ack-spins.rs"
         require_mutation "$source" "$tmp/irq-ack-spins.rs" irq-ack-spins
         if /repo/tools/virtio/assert-production-substrate.sh \
-            "$tmp/irq-ack-spins.rs" "$lib" "$portal" "$pci" >/dev/null 2>&1; then
+            "$tmp/irq-ack-spins.rs" "$lib" "$pci" >/dev/null 2>&1; then
             echo "production facade gate accepted a spinning IRQ acknowledgement" >&2
             exit 1
         fi
@@ -430,17 +370,19 @@ check_virtio_patch() {
             "$tmp/cloneable-intx-token.rs"
         require_mutation "$pci" "$tmp/cloneable-intx-token.rs" cloneable-intx-token
         if /repo/tools/virtio/assert-production-substrate.sh \
-            "$source" "$lib" "$portal" "$tmp/cloneable-intx-token.rs" >/dev/null 2>&1; then
+            "$source" "$lib" "$tmp/cloneable-intx-token.rs" >/dev/null 2>&1; then
             echo "production facade gate accepted a cloneable INTx owner token" >&2
             exit 1
         fi
 
         cp "$pci" "$tmp/reclaim-intx.rs"
-        sed -i '\''0,/if self.intx_state != IntxOwnershipState::Unclaimed {/s//if false {/'\'' \
+        sed -i '\''/pub fn claim_masked_intx/,/pub fn unmask_intx/ {
+            s/if self.intx_state != IntxOwnershipState::Unclaimed {/if false {/
+        }'\'' \
             "$tmp/reclaim-intx.rs"
         require_mutation "$pci" "$tmp/reclaim-intx.rs" reclaim-intx
         if /repo/tools/virtio/assert-production-substrate.sh \
-            "$source" "$lib" "$portal" "$tmp/reclaim-intx.rs" >/dev/null 2>&1; then
+            "$source" "$lib" "$tmp/reclaim-intx.rs" >/dev/null 2>&1; then
             echo "production facade gate accepted repeated initial INTx claims" >&2
             exit 1
         fi
@@ -450,7 +392,7 @@ check_virtio_patch() {
             "$tmp/intx-command-collateral.rs"
         require_mutation "$pci" "$tmp/intx-command-collateral.rs" intx-command-collateral
         if /repo/tools/virtio/assert-production-substrate.sh \
-            "$source" "$lib" "$portal" "$tmp/intx-command-collateral.rs" >/dev/null 2>&1; then
+            "$source" "$lib" "$tmp/intx-command-collateral.rs" >/dev/null 2>&1; then
             echo "production facade gate accepted collateral PCI command mutation" >&2
             exit 1
         fi
@@ -460,7 +402,7 @@ check_virtio_patch() {
             "$tmp/intx-readback-forged.rs"
         require_mutation "$pci" "$tmp/intx-readback-forged.rs" intx-readback-forged
         if /repo/tools/virtio/assert-production-substrate.sh \
-            "$source" "$lib" "$portal" "$tmp/intx-readback-forged.rs" >/dev/null 2>&1; then
+            "$source" "$lib" "$tmp/intx-readback-forged.rs" >/dev/null 2>&1; then
             echo "production facade gate accepted forged PCI command readback" >&2
             exit 1
         fi
@@ -470,7 +412,7 @@ check_virtio_patch() {
             "$tmp/intx-owner-validation-bypassed.rs"
         require_mutation "$pci" "$tmp/intx-owner-validation-bypassed.rs" intx-owner-validation-bypassed
         if /repo/tools/virtio/assert-production-substrate.sh \
-            "$source" "$lib" "$portal" "$tmp/intx-owner-validation-bypassed.rs" >/dev/null 2>&1; then
+            "$source" "$lib" "$tmp/intx-owner-validation-bypassed.rs" >/dev/null 2>&1; then
             echo "production facade gate accepted bypassed INTx owner validation" >&2
             exit 1
         fi
@@ -480,7 +422,7 @@ check_virtio_patch() {
             "$tmp/intx-route-mint-bypass.rs"
         require_mutation "$pci" "$tmp/intx-route-mint-bypass.rs" intx-route-mint-bypass
         if /repo/tools/virtio/assert-production-substrate.sh \
-            "$source" "$lib" "$portal" "$tmp/intx-route-mint-bypass.rs" >/dev/null 2>&1; then
+            "$source" "$lib" "$tmp/intx-route-mint-bypass.rs" >/dev/null 2>&1; then
             echo "production facade gate accepted descriptive-route token minting" >&2
             exit 1
         fi
@@ -490,7 +432,7 @@ check_virtio_patch() {
             "$tmp/intx-unmask-preread-bypass.rs"
         require_mutation "$pci" "$tmp/intx-unmask-preread-bypass.rs" intx-unmask-preread-bypass
         if /repo/tools/virtio/assert-production-substrate.sh \
-            "$source" "$lib" "$portal" "$tmp/intx-unmask-preread-bypass.rs" >/dev/null 2>&1; then
+            "$source" "$lib" "$tmp/intx-unmask-preread-bypass.rs" >/dev/null 2>&1; then
             echo "production facade gate accepted unmask without a masked-command pre-read" >&2
             exit 1
         fi
@@ -500,7 +442,7 @@ check_virtio_patch() {
             "$tmp/cloneable-hardware-intent.rs"
         require_mutation "$source" "$tmp/cloneable-hardware-intent.rs" cloneable-hardware-intent
         if /repo/tools/virtio/assert-production-substrate.sh \
-            "$tmp/cloneable-hardware-intent.rs" "$lib" "$portal" "$pci" >/dev/null 2>&1; then
+            "$tmp/cloneable-hardware-intent.rs" "$lib" "$pci" >/dev/null 2>&1; then
             echo "production facade gate accepted a cloneable hardware intent" >&2
             exit 1
         fi
@@ -510,7 +452,7 @@ check_virtio_patch() {
             "$tmp/identity-only-hardware-intent.rs"
         require_mutation "$source" "$tmp/identity-only-hardware-intent.rs" identity-only-hardware-intent
         if /repo/tools/virtio/assert-production-substrate.sh \
-            "$tmp/identity-only-hardware-intent.rs" "$lib" "$portal" "$pci" >/dev/null 2>&1; then
+            "$tmp/identity-only-hardware-intent.rs" "$lib" "$pci" >/dev/null 2>&1; then
             echo "production facade gate accepted an intent made from descriptive identity" >&2
             exit 1
         fi
@@ -520,7 +462,7 @@ check_virtio_patch() {
             "$tmp/cancel-intent-preflight-bypassed.rs"
         require_mutation "$source" "$tmp/cancel-intent-preflight-bypassed.rs" cancel-intent-preflight-bypassed
         if /repo/tools/virtio/assert-production-substrate.sh \
-            "$tmp/cancel-intent-preflight-bypassed.rs" "$lib" "$portal" "$pci" >/dev/null 2>&1; then
+            "$tmp/cancel-intent-preflight-bypassed.rs" "$lib" "$pci" >/dev/null 2>&1; then
             echo "production facade gate accepted a bypassed cancel-intent preflight" >&2
             exit 1
         fi
@@ -530,7 +472,7 @@ check_virtio_patch() {
             "$tmp/hardware-intent-owner-discarded.rs"
         require_mutation "$source" "$tmp/hardware-intent-owner-discarded.rs" hardware-intent-owner-discarded
         if /repo/tools/virtio/assert-production-substrate.sh \
-            "$tmp/hardware-intent-owner-discarded.rs" "$lib" "$portal" "$pci" >/dev/null 2>&1; then
+            "$tmp/hardware-intent-owner-discarded.rs" "$lib" "$pci" >/dev/null 2>&1; then
             echo "production facade gate accepted a preflight error that cannot return its owner" >&2
             exit 1
         fi
@@ -540,7 +482,7 @@ check_virtio_patch() {
             "$tmp/cloneable-completion-reset-intent.rs"
         require_mutation "$source" "$tmp/cloneable-completion-reset-intent.rs" cloneable-completion-reset-intent
         if /repo/tools/virtio/assert-production-substrate.sh \
-            "$tmp/cloneable-completion-reset-intent.rs" "$lib" "$portal" "$pci" >/dev/null 2>&1; then
+            "$tmp/cloneable-completion-reset-intent.rs" "$lib" "$pci" >/dev/null 2>&1; then
             echo "production facade gate accepted a cloneable completion reset intent" >&2
             exit 1
         fi
@@ -550,7 +492,7 @@ check_virtio_patch() {
             "$tmp/completion-reset-identity-bypassed.rs"
         require_mutation "$source" "$tmp/completion-reset-identity-bypassed.rs" completion-reset-identity-bypassed
         if /repo/tools/virtio/assert-production-substrate.sh \
-            "$tmp/completion-reset-identity-bypassed.rs" "$lib" "$portal" "$pci" >/dev/null 2>&1; then
+            "$tmp/completion-reset-identity-bypassed.rs" "$lib" "$pci" >/dev/null 2>&1; then
             echo "production facade gate accepted a bypassed completion reset identity check" >&2
             exit 1
         fi
@@ -560,7 +502,7 @@ check_virtio_patch() {
             "$tmp/completion-reset-popped-as-published.rs"
         require_mutation "$source" "$tmp/completion-reset-popped-as-published.rs" completion-reset-popped-as-published
         if /repo/tools/virtio/assert-production-substrate.sh \
-            "$tmp/completion-reset-popped-as-published.rs" "$lib" "$portal" "$pci" >/dev/null 2>&1; then
+            "$tmp/completion-reset-popped-as-published.rs" "$lib" "$pci" >/dev/null 2>&1; then
             echo "production facade gate accepted a popped completion with published DMA state" >&2
             exit 1
         fi
@@ -570,7 +512,7 @@ check_virtio_patch() {
             "$tmp/completion-probe-spins.rs"
         require_mutation "$source" "$tmp/completion-probe-spins.rs" completion-probe-spins
         if /repo/tools/virtio/assert-production-substrate.sh \
-            "$tmp/completion-probe-spins.rs" "$lib" "$portal" "$pci" >/dev/null 2>&1; then
+            "$tmp/completion-probe-spins.rs" "$lib" "$pci" >/dev/null 2>&1; then
             echo "production facade gate accepted a spinning one-step completion probe" >&2
             exit 1
         fi
@@ -581,7 +523,7 @@ check_virtio_patch() {
             "$tmp/reset-probe-spins.rs"
         require_mutation "$source" "$tmp/reset-probe-spins.rs" reset-probe-spins
         if /repo/tools/virtio/assert-production-substrate.sh \
-            "$tmp/reset-probe-spins.rs" "$lib" "$portal" "$pci" >/dev/null 2>&1; then
+            "$tmp/reset-probe-spins.rs" "$lib" "$pci" >/dev/null 2>&1; then
             echo "production facade gate accepted a polling reset actor probe" >&2
             exit 1
         fi
@@ -591,7 +533,7 @@ check_virtio_patch() {
             "$tmp/reset-probe-drops-owner.rs"
         require_mutation "$source" "$tmp/reset-probe-drops-owner.rs" reset-probe-drops-owner
         if /repo/tools/virtio/assert-production-substrate.sh \
-            "$tmp/reset-probe-drops-owner.rs" "$lib" "$portal" "$pci" >/dev/null 2>&1; then
+            "$tmp/reset-probe-drops-owner.rs" "$lib" "$pci" >/dev/null 2>&1; then
             echo "production facade gate accepted a pending reset probe that drops its owner" >&2
             exit 1
         fi
@@ -601,7 +543,7 @@ check_virtio_patch() {
             "$tmp/duplicate-reset-retirement.rs"
         require_mutation "$source" "$tmp/duplicate-reset-retirement.rs" duplicate-reset-retirement
         if /repo/tools/virtio/assert-production-substrate.sh \
-            "$tmp/duplicate-reset-retirement.rs" "$lib" "$portal" "$pci" >/dev/null 2>&1; then
+            "$tmp/duplicate-reset-retirement.rs" "$lib" "$pci" >/dev/null 2>&1; then
             echo "production facade gate accepted a second reset queue-retirement path" >&2
             exit 1
         fi
@@ -612,7 +554,11 @@ check_virtio_patch() {
 
 doctor() {
     local tool
-    for tool in awk bash chmod cp cut diff dirname flock grep head id mkdir mkfifo mktemp mv rm sed sha256sum tail tee timeout tr wc; do
+    for tool in awk bash chmod cmp cp cut diff dirname find flock git grep head id \
+        mkdir mkfifo mktemp mv rm sed sha256sum sort stat swtpm tail tee timeout \
+        tpm2_flushcontext tpm2_nvincrement tpm2_nvdefine tpm2_nvread \
+        tpm2_nvreadpublic tpm2_nvwrite tpm2_policycommandcode \
+        tpm2_startauthsession tr wc xxd; do
         if ! command -v "$tool" >/dev/null 2>&1; then
             echo "nexus-ostd doctor: missing host tool: $tool" >&2
             return 1
@@ -627,31 +573,17 @@ doctor() {
         "$root/Cargo.lock" \
         "$root/Dockerfile" \
         "$root/OSDK.toml" \
+        "$root/cser-production-sources.txt" \
         "$root/osdk-runner-base/Cargo.lock" \
         "$root/osdk-runner-base/Cargo.toml" \
-        "$root/scripts/assert-serial.sh" \
-        "$root/scripts/assert-linux-io-composition.awk" \
-        "$root/scripts/assert-linux-io-composition.sh" \
-        "$root/scripts/assert-linux-net.awk" \
-        "$root/scripts/assert-runtime-net-artifacts.sh" \
-        "$root/scripts/assert-linux-futex-entry-debugcon.sh" \
-        "$root/scripts/assert-linux-futex-startup.sh" \
-        "$root/scripts/assert-linux-futex-startup-source.sh" \
-        "$root/scripts/assert-stream-capture.sh" \
+        "$root/scripts/assert-cser-core-production-cutover.sh" \
+        "$root/scripts/assert-runtime-fs-artifacts.sh" \
         "$root/scripts/qemu-stream-capture.sh" \
-        "$root/scripts/build-guest.sh" \
+        "$root/scripts/build-runtime-fs.sh" \
         "$root/scripts/build-runtime-fs-block-image.sh" \
         "$root/scripts/assert-runtime-fs-block-image.sh" \
-        "$root/scripts/build-runtime-net.sh" \
-        "$root/scripts/check-linux-net-evidence.sh" \
-        "$root/src/cser/linux_io_composition.rs" \
-        "$root/guest/linux-netd-v1.S" \
-        "$root/guest/linux-netd-v2.S" \
-        "$root/guest/linux-fsd-v1.S" \
-        "$root/guest/linux-fsd-v2.S" \
-        "$root/guest/linux-fsd-v2-postcommit.S" \
-        "$root/guest/linux-fsd-v3.S" \
-        "$repo_root/tests/guest/linux/sources/linux-runtime-net-smoke/runtime_net_smoke.S" \
+        "$root/scripts/provision-cser-tpm-nv.sh" \
+        "$repo_root/tests/guest/linux/sources/linux-runtime-fs-smoke/runtime_fs_smoke.S" \
         "$repo_root/patches/ostd-0.18.0-cser.patch" \
         "$repo_root/patches/virtio-drivers-0.13.0-cser.patch" \
         "$repo_root/patches/virtio-drivers-0.13.0-LICENSE-MIT" \
@@ -659,8 +591,9 @@ doctor() {
         "$repo_root/tools/ostd/assert-cser-patch.sh" \
         "$repo_root/tools/virtio/assert-cser-patch.sh" \
         "$repo_root/tools/virtio/assert-production-substrate.sh" \
-        "$repo_root/crates/nexus-ostd-virtio/src/production.rs" \
-        "$root/scripts/check-scheduler-attempt.sh"; do
+        "$repo_root/crates/cser-core/Cargo.toml" \
+        "$repo_root/crates/cser-model/Cargo.toml" \
+        "$repo_root/crates/nexus-ostd-virtio/src/production.rs"; do
         if [[ ! -f $input ]]; then
             echo "nexus-ostd doctor: missing pinned input: $input" >&2
             return 1
@@ -669,6 +602,7 @@ doctor() {
     ensure_image
     check_ostd_patch
     check_virtio_patch
+    bash "$root/scripts/assert-cser-core-production-cutover.sh" "$repo_root"
     container bash -c '
         set -euo pipefail
         command -v rustc >/dev/null
@@ -686,184 +620,34 @@ doctor() {
     echo "nexus-ostd doctor: PASS docker=$(docker version --format '{{.Server.Version}}') platform=linux/amd64 offline_runtime=true ovmf=true"
 }
 
-prepare_guest() {
-    container bash scripts/build-guest.sh
-    container bash scripts/check-fsbase-api.sh
-    container bash scripts/check-scheduler-attempt.sh
-}
-
-check_oracles() {
-    container bash -c '
-        set -euo pipefail
-        shopt -s nullglob
-        oracles=(scripts/*.awk)
-        ((${#oracles[@]} > 0))
-        for oracle in "${oracles[@]}"; do
-            awk -W dump -f "$oracle" >/dev/null
-        done
-    '
-}
-
-check_runtime_fs_artifact_negatives() {
-    container bash -c '
-        set -euo pipefail
-        tmp=$(mktemp -d)
-        trap '\''rm -rf "$tmp"'\'' EXIT
-        source=/repo/tests/guest/linux/sources/linux-runtime-fs-smoke/runtime_fs_smoke.S
-        oracle=scripts/assert-runtime-fs-artifacts.sh
-
-        cp guest/linux-runtime-fs.elf "$tmp/appended.elf"
-        printf x >>"$tmp/appended.elf"
-        if bash "$oracle" "$source" "$tmp/appended.elf" >/dev/null 2>&1; then
-            echo "runtime filesystem artifact oracle accepted appended ELF bytes" >&2
-            exit 1
-        fi
-
-        cp "$source" "$tmp/mutated.S"
-        printf "\n" >>"$tmp/mutated.S"
-        if bash "$oracle" "$tmp/mutated.S" guest/linux-runtime-fs.elf >/dev/null 2>&1; then
-            echo "runtime filesystem artifact oracle accepted mutated retained source" >&2
-            exit 1
-        fi
-
-        if bash scripts/build-runtime-fs.sh "$tmp/wrong-digest.elf" \
-            0000000000000000000000000000000000000000000000000000000000000000 \
-            >/dev/null 2>&1; then
-            echo "runtime filesystem build accepted wrong expected digest" >&2
-            exit 1
-        fi
-        if [[ -e $tmp/wrong-digest.elf ]]; then
-            echo "runtime filesystem build published an artifact after digest failure" >&2
-            exit 1
-        fi
-        echo "runtime filesystem artifact negative assertions: PASS appended_elf=rejected mutated_source=rejected wrong_digest=rejected failed_output_absent=true"
-    '
-}
-
-check_runtime_fs_production_source() {
-    bash "$root/scripts/assert-linux-fs-production-source.sh" \
-        "$root/src/personality/linux_fs.rs"
-}
-
-check_runtime_fs_same_boot_source() {
-    bash "$root/scripts/assert-runtime-fs-same-boot-source.sh" \
-        "$root/src/personality/linux_fs.rs" \
-        "$root/src/lib.rs"
-}
-
-check_causal_task_facade_source() {
-    bash "$root/scripts/assert-causal-task-facade-source.sh"
-}
-
-check_supervisor_causal_owner_source() {
-    bash "$root/scripts/assert-supervisor-causal-owner-source.sh"
-}
-
-check_runtime_fs_same_boot_precommit_source() {
-    bash "$root/scripts/assert-runtime-fs-same-boot-precommit-source.sh" \
-        "$root/src/personality/linux_fs.rs" \
-        "$root/src/lib.rs" \
-        "$repo_root/crates/nexus-ostd-virtio/src/production.rs"
-}
-
-check_runtime_fs_same_boot_postcommit_crash_source() {
-    bash "$root/scripts/assert-runtime-fs-same-boot-postcommit-crash-source.sh"
-}
-
-check_linux_futex_startup_source() {
-    bash "$root/scripts/assert-linux-futex-startup-source.sh" \
-        "$root/src/personality/linux_futex.rs" \
-        "$root/src/lib.rs" \
-        "$root/OSDK.toml"
-}
-
-check_runtime_net_artifact_negatives() {
-    container bash -c '
-        set -euo pipefail
-        tmp=$(mktemp -d)
-        trap '\''rm -rf "$tmp"'\'' EXIT
-        source=/repo/tests/guest/linux/sources/linux-runtime-net-smoke/runtime_net_smoke.S
-        oracle=scripts/assert-runtime-net-artifacts.sh
-
-        cp guest/linux-runtime-net.elf "$tmp/appended.elf"
-        printf x >>"$tmp/appended.elf"
-        if bash "$oracle" "$source" "$tmp/appended.elf" >/dev/null 2>&1; then
-            echo "runtime network artifact oracle accepted appended ELF bytes" >&2
-            exit 1
-        fi
-
-        cp "$source" "$tmp/mutated.S"
-        printf "\n" >>"$tmp/mutated.S"
-        if bash "$oracle" "$tmp/mutated.S" guest/linux-runtime-net.elf >/dev/null 2>&1; then
-            echo "runtime network artifact oracle accepted mutated retained source" >&2
-            exit 1
-        fi
-
-        if bash scripts/build-runtime-net.sh "$tmp/wrong-digest.elf" \
-            0000000000000000000000000000000000000000000000000000000000000000 \
-            >/dev/null 2>&1; then
-            echo "runtime network build accepted wrong expected digest" >&2
-            exit 1
-        fi
-        if [[ -e $tmp/wrong-digest.elf ]]; then
-            echo "runtime network build published an artifact after digest failure" >&2
-            exit 1
-        fi
-
-        cp guest/linux-runtime-net.elf "$tmp/preserved.elf"
-        preserved_before=$(sha256sum "$tmp/preserved.elf" | cut -d " " -f1)
-        if bash scripts/build-runtime-net.sh "$tmp/preserved.elf" \
-            0000000000000000000000000000000000000000000000000000000000000000 \
-            >/dev/null 2>&1; then
-            echo "runtime network build replaced an existing artifact with a wrong expected digest" >&2
-            exit 1
-        fi
-        preserved_after=$(sha256sum "$tmp/preserved.elf" | cut -d " " -f1)
-        if [[ $preserved_after != "$preserved_before" ]]; then
-            echo "runtime network build changed an existing artifact after digest failure" >&2
-            exit 1
-        fi
-        echo "runtime network artifact negative assertions: PASS appended_elf=rejected mutated_source=rejected wrong_digest=rejected failed_output_absent=true failed_rebuild_preserved=true"
-    '
-}
-
 format_all() {
     container cargo fmt --all
-    container cargo fmt \
-        --manifest-path userspace/personality/Cargo.toml \
-        --all
 }
 
 fmt_check() {
     container cargo fmt --all -- --check
-    container cargo fmt \
-        --manifest-path userspace/personality/Cargo.toml \
-        --all \
-        -- \
-        --check
 }
 
-check_personality() {
-    container cargo check \
-        --manifest-path userspace/personality/Cargo.toml \
-        --target x86_64-unknown-none \
-        --release \
-        --locked \
-        --offline
-}
+kernel_check_complete=false
 
 check_kernel() {
+    if [[ $kernel_check_complete == true ]]; then
+        return
+    fi
     # cargo-osdk 0.18 does not expose --locked on build/run. Gate the project
     # lockfile explicitly before every build; it is also over-mounted read-only
     # so build/run cannot rewrite it. The separate generated runner graph is
     # fixed by the committed osdk-runner-base snapshot below.
     container cargo check --locked --offline --target x86_64-unknown-none \
-        --features virtio-cser-facade
+        --no-default-features --features cser-production
     container cargo check --locked --offline --target x86_64-unknown-none \
-        --no-default-features --features cser-core-runtime-spike
+        --no-default-features --features cser-core-reply-recovery
+    container cargo check --locked --offline --target x86_64-unknown-none \
+        --no-default-features --features cser-core-dma-recovery
     container cargo check --locked --offline --target x86_64-unknown-none \
         --no-default-features --features cser-core-tpm-anchor
     container cargo osdk check --locked
+    kernel_check_complete=true
 }
 
 clippy_all() {
@@ -874,16 +658,11 @@ clippy_all() {
         --locked \
         --offline \
         --target x86_64-unknown-none \
+        --no-default-features \
+        --features cser-production \
         -- \
-        -D warnings
-    container cargo clippy \
-        --manifest-path userspace/personality/Cargo.toml \
-        --target x86_64-unknown-none \
-        --release \
-        --locked \
-        --offline \
-        -- \
-        -D warnings
+        -D warnings \
+        -A dead-code
 }
 
 prepare_runner_base() {
@@ -902,58 +681,22 @@ assert_runner_base() {
 build_kernel() {
     check_kernel
     prepare_runner_base
-    container cargo osdk build
+    container cargo osdk build --scheme cser-production
     assert_runner_base
 }
 
-build_core_runtime_spike_kernel() {
+build_core_persistent_recovery_kernel() {
     check_kernel
     prepare_runner_base
-    container cargo osdk build \
-        --no-default-features --features cser-core-runtime-spike
+    container cargo osdk build --scheme cser-production
     assert_runner_base
 }
 
-core_runtime_spike_artifact_dir="$root/artifacts/cser-core-runtime-spike"
-
-prepare_core_runtime_spike_artifacts() {
-    mkdir -p "$core_runtime_spike_artifact_dir"
-    rm -f \
-        "$core_runtime_spike_artifact_dir/serial.log" \
-        "$core_runtime_spike_artifact_dir/qemu-debug.log"
-}
-
-run_core_runtime_spike_kernel() {
-    # Compile outside the runtime deadline, then run the exact mutually
-    # exclusive feature graph whose entry point contains no legacy Registry.
-    build_core_runtime_spike_kernel
-    container bash -c '
-        set -euo pipefail
-        cp /root/ovmf/release/OVMF_VARS.fd "$HOME/OVMF_VARS.fd"
-        exec timeout --signal=TERM --kill-after=2s 30s \
-            cargo osdk run \
-                --no-default-features --features cser-core-runtime-spike
-    '
+build_core_reply_recovery_kernel() {
+    check_kernel
+    prepare_runner_base
+    container cargo osdk build --scheme cser-core-reply-recovery
     assert_runner_base
-}
-
-capture_core_runtime_spike_run() {
-    # shellcheck source=scripts/qemu-stream-capture.sh
-    source "$capture_helper"
-    capture_qemu_streams \
-        "$core_runtime_spike_artifact_dir/serial.log" \
-        "$core_runtime_spike_artifact_dir/qemu-debug.log" \
-        run_core_runtime_spike_kernel
-
-    tr -d '\r' <"$core_runtime_spike_artifact_dir/serial.log" \
-        | grep -Fx \
-            'CSER_CORE_RUNTIME_SPIKE PASS writer=portable_core legacy_runtime=false live_ingress=false durable_provider=unavailable fail_closed=true' \
-            >/dev/null
-    tr -d '\r' <"$core_runtime_spike_artifact_dir/serial.log" \
-        | grep -Fx \
-            'CSER_CORE_OSTD_TASK_RECOVERY PASS death=task-return exact_reap=true fence_before_snapshot=true ready_in_fresh_task=true rebind_by_manager=true settlement_claim=true second_crash=true reconcile_without_second_intent=true physical_reply=true real_waiter_wake=true client_ack=true duplicate_wake=false postcommit_authority=fenced precommit_adopt_race=true revoke_adopt_orders=2 legacy_runtime=false live_dual_write=false rebind=task-bound-core production_rebind=false receipt_provider=commit-probe+physical-reply real_reply=true journal=volatile-dev-only durable_provider=unavailable' \
-            >/dev/null
-    echo 'CSER_CORE_OSTD_QEMU PASS persistence=fail-closed task_lifecycle=real-reap recovery=volatile-dev-only receipt_provider=commit-probe+physical-reply'
 }
 
 build_core_dma_recovery_kernel() {
@@ -963,471 +706,793 @@ build_core_dma_recovery_kernel() {
     assert_runner_base
 }
 
-core_dma_recovery_artifact_dir="$root/artifacts/cser-core-dma-recovery"
+core_persistent_artifact_dir="$root/artifacts/cser-production"
+core_persistent_state_dir="$core_persistent_artifact_dir/tpmstate"
+core_persistent_socket="$core_persistent_artifact_dir/swtpm-qemu.sock"
+core_persistent_pid_file="$core_persistent_artifact_dir/swtpm.pid"
+core_persistent_journal="$core_persistent_artifact_dir/journal.raw"
+core_persistent_outbox="$core_persistent_artifact_dir/outbox.raw"
+core_persistent_pid=
+core_persistent_seal_requested=false
 
-prepare_core_dma_recovery_artifacts() {
-    mkdir -p "$core_dma_recovery_artifact_dir"
-    rm -f \
-        "$core_dma_recovery_artifact_dir/serial.log" \
-        "$core_dma_recovery_artifact_dir/qemu-debug.log" \
-        "$core_dma_recovery_artifact_dir/task-entry-debugcon.log"
+core_persistent_source_status() {
+    git -C "$repo_root" status --porcelain=v1 --untracked-files=all -- \
+        . \
+        ':(exclude)artifacts/**' \
+        ':(exclude)target/**' \
+        ':(exclude)kernel/nexus-ostd/artifacts/**' \
+        ':(exclude)kernel/nexus-ostd/target/**'
 }
 
-run_core_dma_recovery_kernel() {
-    build_core_dma_recovery_kernel
+require_core_persistent_sealable_tree() {
+    local source_status
+    source_status=$(core_persistent_source_status)
+    if [[ -n $source_status ]]; then
+        echo 'CSER production receipt seal rejected: source tree is dirty' >&2
+        printf '%s\n' "$source_status" >&2
+        return 1
+    fi
+}
+
+copy_core_evidence_iso() {
+    local destination=$1
+    local source="$root/target/osdk/nexus-kernel/nexus-kernel-osdk-bin.iso"
+    if [[ ! -f $source || -L $source ]]; then
+        echo "OSDK evidence ISO is missing or unsafe: $source" >&2
+        return 1
+    fi
+    cp -- "$source" "$destination"
+}
+
+prepare_core_persistent_artifacts() {
+    mkdir -p "$core_persistent_artifact_dir"
+    rm -f \
+        "$core_persistent_artifact_dir/boot1-serial.log" \
+        "$core_persistent_artifact_dir/boot1-qemu-debug.log" \
+        "$core_persistent_artifact_dir/boot2-serial.log" \
+        "$core_persistent_artifact_dir/boot2-qemu-debug.log" \
+        "$core_persistent_artifact_dir/boot3-serial.log" \
+        "$core_persistent_artifact_dir/boot3-qemu-debug.log" \
+        "$core_persistent_artifact_dir/boot4-serial.log" \
+        "$core_persistent_artifact_dir/boot4-qemu-debug.log" \
+        "$core_persistent_artifact_dir/reply-evidence-serial.log" \
+        "$core_persistent_artifact_dir/reply-evidence-qemu-debug.log" \
+        "$core_persistent_artifact_dir/reply-evidence-task-entry-debugcon.log" \
+        "$core_persistent_artifact_dir/reply-evidence-kernel.iso" \
+        "$core_persistent_artifact_dir/dma-evidence-serial.log" \
+        "$core_persistent_artifact_dir/dma-evidence-qemu-debug.log" \
+        "$core_persistent_artifact_dir/dma-evidence-task-entry-debugcon.log" \
+        "$core_persistent_artifact_dir/dma-evidence-kernel.iso" \
+        "$core_persistent_artifact_dir/production-kernel.iso" \
+        "$core_persistent_artifact_dir/boot1-marker.txt" \
+        "$core_persistent_artifact_dir/boot2-marker.txt" \
+        "$core_persistent_artifact_dir/boot3-marker.txt" \
+        "$core_persistent_artifact_dir/boot4-marker.txt" \
+        "$core_persistent_artifact_dir/combined-proof.txt" \
+        "$core_persistent_artifact_dir/combined-proof.sha256" \
+        "$core_persistent_artifact_dir/combined-receipt.txt" \
+        "$core_persistent_artifact_dir/combined-receipt.sha256" \
+        "$core_persistent_artifact_dir/swtpm.log" \
+        "$core_persistent_artifact_dir/task-entry-debugcon.log" \
+        "$core_persistent_socket" \
+        "$core_persistent_pid_file" \
+        "$core_persistent_journal" \
+        "$core_persistent_outbox"
+    rm -rf -- "$core_persistent_state_dir"
+    mkdir -p "$core_persistent_state_dir"
+    truncate -s 4M "$core_persistent_journal"
+    truncate -s 4M "$core_persistent_outbox"
+    chmod 0600 "$core_persistent_journal" "$core_persistent_outbox"
+}
+
+run_core_reply_evidence_guest() {
+    container bash -c '
+        set -euo pipefail
+        cp /root/ovmf/release/OVMF_VARS.fd "$HOME/OVMF_VARS.fd"
+        exec timeout --signal=TERM --kill-after=2s 60s \
+            cargo osdk run --scheme cser-core-reply-recovery
+    '
+    assert_runner_base
+}
+
+capture_core_reply_evidence() {
+    build_core_reply_recovery_kernel
+    # shellcheck source=scripts/qemu-stream-capture.sh
+    source "$capture_helper"
+    capture_qemu_streams \
+        "$core_persistent_artifact_dir/reply-evidence-serial.log" \
+        "$core_persistent_artifact_dir/reply-evidence-qemu-debug.log" \
+        run_core_reply_evidence_guest
+    copy_core_evidence_iso \
+        "$core_persistent_artifact_dir/reply-evidence-kernel.iso"
+
+    require_core_persistent_marker \
+        "$core_persistent_artifact_dir/reply-evidence-serial.log" \
+        'CSER_CORE_OSTD_TASK_RECOVERY PASS' \
+        'death=task-return' \
+        'exact_reap=true' \
+        'settlement_claim=true' \
+        'second_crash=true' \
+        'reconcile_without_second_intent=true' \
+        'physical_reply=true' \
+        'real_waiter_wake=true' \
+        'precommit_adopt_race=true' \
+        'revoke_adopt_orders=2' \
+        'legacy_runtime=false' \
+        'live_dual_write=false'
+    echo 'CSER_CORE_REPLY_EVIDENCE_QEMU PASS runtime=real-task-reap reply=physical settlement=claimed second_crash=reconciled production_registry=false'
+}
+
+run_core_dma_evidence_guest() {
     container bash -c '
         set -euo pipefail
         readonly fixture=/opt/nexus-fixtures/runtime-fs-block.raw
         readonly expected=9357413ed9a96a23af1750cc304265dd7dd1835eb58eb1fb50119cd80d0bc8ca
-        cp /root/ovmf/release/OVMF_VARS.fd "$HOME/OVMF_VARS.fd"
         test "$(sha256sum "$fixture" | cut -d " " -f1)" = "$expected"
         test "$(stat -c %a "$fixture")" = 444
+        cp /root/ovmf/release/OVMF_VARS.fd "$HOME/OVMF_VARS.fd"
         exec timeout --signal=TERM --kill-after=2s 90s \
             cargo osdk run --scheme cser-core-dma-recovery
     '
     assert_runner_base
 }
 
-capture_core_dma_recovery_run() {
+capture_core_dma_evidence() {
+    build_core_dma_recovery_kernel
     # shellcheck source=scripts/qemu-stream-capture.sh
     source "$capture_helper"
     capture_qemu_streams \
-        "$core_dma_recovery_artifact_dir/serial.log" \
-        "$core_dma_recovery_artifact_dir/qemu-debug.log" \
-        run_core_dma_recovery_kernel
+        "$core_persistent_artifact_dir/dma-evidence-serial.log" \
+        "$core_persistent_artifact_dir/dma-evidence-qemu-debug.log" \
+        run_core_dma_evidence_guest
+    copy_core_evidence_iso \
+        "$core_persistent_artifact_dir/dma-evidence-kernel.iso"
 
-    local serial="$core_dma_recovery_artifact_dir/serial.log"
-    local debug="$core_dma_recovery_artifact_dir/qemu-debug.log"
-    tr -d '\r' <"$serial" \
-        | grep -F \
-            'CSER_CORE_DMA HardwareClosure PASS qemu=true physical_hardware=false real_pci=true real_virtio=true avail_idx_release=true completion=true isr_status_read_ack=true irq_controller_delivery=true hard_irq_actor=true intx_remap=true intx_remasked=true' \
-            >/dev/null
-    tr -d '\r' <"$serial" \
-        | grep -Fx \
-            'CSER_CORE_DMA_OSTD_QEMU PASS death=real-task-reap fence=immediate-manager second_crash=true post_mortem_owner=kernel-manager reply_registry=false legacy_registry=false portal_glue=false live_dual_write=false journal=volatile-dev-only durable_provider=separate-suite qemu=true physical_hardware=false' \
-            >/dev/null
-    grep -F 'virtio_pci_notify_write' "$debug" >/dev/null
-    grep -F 'virtio_blk_handle_read' "$debug" >/dev/null
-    grep -F 'vtd_inv_desc_iotlb_global' "$debug" >/dev/null
-    if grep -F 'vtd_dmar_fault' "$debug" >/dev/null; then
-        echo 'CSER core DMA QEMU run emitted a VT-d translation fault' >&2
+    require_core_persistent_marker \
+        "$core_persistent_artifact_dir/dma-evidence-serial.log" \
+        'CSER_CORE_DMA HardwareClosure PASS' \
+        'qemu=true' \
+        'physical_hardware=false' \
+        'real_pci=true' \
+        'real_virtio=true' \
+        'completion=true' \
+        'isr_status_read_ack=true' \
+        'irq_controller_delivery=true' \
+        'reset_status_zero=true' \
+        'bus_master_disabled=true' \
+        'vt_d_iotlb_submit_poll_complete=true' \
+        'stale_old_irq_ack=rejected_without_mutation'
+    require_core_persistent_marker \
+        "$core_persistent_artifact_dir/dma-evidence-serial.log" \
+        'CSER_CORE_DMA_OSTD_QEMU PASS' \
+        'death=real-task-reap' \
+        'second_crash=true' \
+        'legacy_registry=false' \
+        'portal_glue=false' \
+        'live_dual_write=false'
+    grep -F 'virtio_pci_notify_write' \
+        "$core_persistent_artifact_dir/dma-evidence-qemu-debug.log" >/dev/null
+    grep -F 'virtio_blk_handle_read' \
+        "$core_persistent_artifact_dir/dma-evidence-qemu-debug.log" >/dev/null
+    grep -F 'vtd_inv_desc_iotlb_global' \
+        "$core_persistent_artifact_dir/dma-evidence-qemu-debug.log" >/dev/null
+    if grep -F 'vtd_dmar_fault' \
+        "$core_persistent_artifact_dir/dma-evidence-qemu-debug.log" >/dev/null; then
+        echo 'CSER core DMA evidence run emitted a VT-d translation fault' >&2
         return 1
     fi
-    echo 'CSER_CORE_DMA_QEMU PASS queue=real-virtio completion=real-irq reset=real-device iotlb=real-vtd qemu=true physical_hardware=false'
+    echo 'CSER_CORE_DMA_EVIDENCE_QEMU PASS queue=real-virtio completion=real-irq reset=real-device iotlb=real-vtd production_registry=false qemu=true physical_hardware=false'
 }
 
-build_core_tpm_anchor_kernel() {
-    check_kernel
-    prepare_runner_base
-    container cargo osdk build --scheme cser-core-tpm-anchor
-    assert_runner_base
-}
-
-core_tpm_anchor_artifact_dir="$root/artifacts/cser-core-tpm-anchor"
-core_tpm_anchor_state_dir="$core_tpm_anchor_artifact_dir/tpmstate"
-core_tpm_anchor_socket="$core_tpm_anchor_artifact_dir/swtpm-qemu.sock"
-core_tpm_anchor_pid_file="$core_tpm_anchor_artifact_dir/swtpm.pid"
-core_tpm_anchor_pid=
-
-prepare_core_tpm_anchor_artifacts() {
-    mkdir -p "$core_tpm_anchor_artifact_dir"
-    rm -f \
-        "$core_tpm_anchor_artifact_dir/boot1-serial.log" \
-        "$core_tpm_anchor_artifact_dir/boot1-qemu-debug.log" \
-        "$core_tpm_anchor_artifact_dir/boot2-serial.log" \
-        "$core_tpm_anchor_artifact_dir/boot2-qemu-debug.log" \
-        "$core_tpm_anchor_artifact_dir/swtpm.log" \
-        "$core_tpm_anchor_artifact_dir/task-entry-debugcon.log" \
-        "$core_tpm_anchor_socket" \
-        "$core_tpm_anchor_pid_file"
-    rm -rf -- "$core_tpm_anchor_state_dir"
-    mkdir -p "$core_tpm_anchor_state_dir"
-}
-
-start_core_tpm_anchor_swtpm() {
+start_core_persistent_swtpm() {
     if ! command -v swtpm >/dev/null 2>&1; then
-        echo "run-core-tpm-anchor requires host swtpm" >&2
+        echo "run-core-persistent-recovery requires host swtpm" >&2
         return 1
     fi
-    rm -f "$core_tpm_anchor_socket" "$core_tpm_anchor_pid_file"
+    rm -f "$core_persistent_socket" "$core_persistent_pid_file"
     swtpm socket \
         --tpm2 \
-        --tpmstate "dir=$core_tpm_anchor_state_dir,lock" \
-        --ctrl "type=unixio,path=$core_tpm_anchor_socket" \
+        --tpmstate "dir=$core_persistent_state_dir,lock" \
+        --ctrl "type=unixio,path=$core_persistent_socket" \
         --flags not-need-init,startup-none,disable-auto-shutdown \
-        --log "file=$core_tpm_anchor_artifact_dir/swtpm.log,level=20" \
-        --pid "file=$core_tpm_anchor_pid_file" \
+        --log "file=$core_persistent_artifact_dir/swtpm.log,level=20" \
+        --pid "file=$core_persistent_pid_file" \
         --daemon
-    core_tpm_anchor_pid=$(tr -d '\n' <"$core_tpm_anchor_pid_file")
-    if [[ ! -S $core_tpm_anchor_socket ]] \
-        || ! kill -0 "$core_tpm_anchor_pid" 2>/dev/null; then
-        echo "swtpm did not create a live QEMU control socket" >&2
+    core_persistent_pid=$(tr -d '\n' <"$core_persistent_pid_file")
+    if [[ ! -S $core_persistent_socket ]] \
+        || ! kill -0 "$core_persistent_pid" 2>/dev/null; then
+        echo "swtpm did not create the persistent-profile socket" >&2
         return 1
     fi
 }
 
-stop_core_tpm_anchor_swtpm() {
-    if [[ -n ${core_tpm_anchor_pid:-} ]] \
-        && kill -0 "$core_tpm_anchor_pid" 2>/dev/null; then
-        # No TPM2_Shutdown: each guest boundary is a non-orderly emulator
-        # restart, while all CSER indices have TPMA_NV_ORDERLY clear.
-        kill -KILL "$core_tpm_anchor_pid"
+stop_core_persistent_swtpm() {
+    if [[ -n ${core_persistent_pid:-} ]] \
+        && kill -0 "$core_persistent_pid" 2>/dev/null; then
+        kill -KILL "$core_persistent_pid"
         for _ in {1..100}; do
-            if ! kill -0 "$core_tpm_anchor_pid" 2>/dev/null; then
+            if ! kill -0 "$core_persistent_pid" 2>/dev/null; then
                 break
             fi
             sleep 0.01
         done
     fi
-    core_tpm_anchor_pid=
+    core_persistent_pid=
 }
 
-run_core_tpm_anchor_guest() {
+run_core_persistent_guest() {
     NEXUS_CONTAINER_HOST_UNIX_SOCKET=1 container bash -c '
         set -euo pipefail
+        readonly fixture=/opt/nexus-fixtures/runtime-fs-block.raw
+        readonly expected=9357413ed9a96a23af1750cc304265dd7dd1835eb58eb1fb50119cd80d0bc8ca
+        test "$(sha256sum "$fixture" | cut -d " " -f1)" = "$expected"
         cp /root/ovmf/release/OVMF_VARS.fd "$HOME/OVMF_VARS.fd"
-        exec timeout --signal=TERM --kill-after=2s 60s \
-            cargo osdk run --scheme cser-core-tpm-anchor
+        exec timeout --signal=TERM --kill-after=2s 90s \
+            cargo osdk run --scheme cser-production
     '
     assert_runner_base
 }
 
-capture_core_tpm_anchor_boot() (
+capture_core_persistent_boot() (
     local serial=$1
     local debug=$2
-    start_core_tpm_anchor_swtpm
-    trap stop_core_tpm_anchor_swtpm EXIT
+    start_core_persistent_swtpm
+    trap stop_core_persistent_swtpm EXIT
     # shellcheck source=scripts/qemu-stream-capture.sh
     source "$capture_helper"
-    capture_qemu_streams "$serial" "$debug" run_core_tpm_anchor_guest
+    capture_qemu_streams "$serial" "$debug" run_core_persistent_guest
 )
 
-capture_core_tpm_anchor_run() {
-    build_core_tpm_anchor_kernel
+require_core_persistent_marker() {
+    local serial=$1
+    local marker=$2
+    shift 2
+    local line field
+    if ! line=$(tr -d '\r' <"$serial" | grep -F "$marker" | tail -n 1); then
+        echo "missing persistent recovery marker '$marker' in $serial" >&2
+        return 1
+    fi
+    for field in "$@"; do
+        if [[ " $line " != *" $field "* ]]; then
+            echo "persistent recovery marker '$marker' lacks '$field'" >&2
+            return 1
+        fi
+    done
+}
+
+core_persistent_marker_u64() {
+    local line=$1
+    local field=$2
+    local token value= count=0
+    for token in $line; do
+        if [[ $token == "$field="* ]]; then
+            value=${token#*=}
+            ((count += 1))
+        fi
+    done
+    if (( count != 1 )) || [[ ! $value =~ ^[1-9][0-9]*$ ]]; then
+        echo "persistent recovery marker has an invalid $field coordinate: $line" >&2
+        return 1
+    fi
+    printf '%s\n' "$value"
+}
+
+assert_core_persistent_freshness_progression() {
+    local -a markers=("$@")
+    local -a revisions=() boots=() journals=() devices=()
+    local marker index previous coordinate
+    for marker in "${markers[@]}"; do
+        coordinate=$(core_persistent_marker_u64 "$marker" revision) || return 1
+        revisions+=("$coordinate")
+        coordinate=$(core_persistent_marker_u64 "$marker" boot) || return 1
+        boots+=("$coordinate")
+        coordinate=$(core_persistent_marker_u64 "$marker" journal) || return 1
+        journals+=("$coordinate")
+        coordinate=$(core_persistent_marker_u64 "$marker" device) || return 1
+        devices+=("$coordinate")
+    done
+    if (( ${#markers[@]} != 4 )); then
+        echo "persistent freshness progression requires exactly four markers" >&2
+        return 1
+    fi
+    for index in 1 2 3; do
+        previous=$((index - 1))
+        if (( 10#${revisions[$index]} <= 10#${revisions[$previous]} )) \
+            || (( 10#${boots[$index]} <= 10#${boots[$previous]} )) \
+            || (( 10#${journals[$index]} <= 10#${journals[$previous]} )) \
+            || (( 10#${devices[$index]} <= 10#${devices[$previous]} )); then
+            echo "persistent recovery freshness did not strictly increase at boot $((index + 1))" >&2
+            return 1
+        fi
+    done
+    printf 'revision=%s boot=%s journal=%s device=%s\n' \
+        "$(IFS=,; echo "${revisions[*]}")" \
+        "$(IFS=,; echo "${boots[*]}")" \
+        "$(IFS=,; echo "${journals[*]}")" \
+        "$(IFS=,; echo "${devices[*]}")"
+}
+
+assert_core_persistent_service_identity_progression() {
+    local -a markers=("$@")
+    local -a principals=() bindings=()
+    local marker index expected coordinate
+    if (( ${#markers[@]} != 4 )); then
+        echo "persistent service identity progression requires exactly four markers" >&2
+        return 1
+    fi
+    for marker in "${markers[@]}"; do
+        coordinate=$(core_persistent_marker_u64 \
+            "$marker" service_principal_generation) || return 1
+        principals+=("$coordinate")
+        coordinate=$(core_persistent_marker_u64 \
+            "$marker" binding_generation) || return 1
+        bindings+=("$coordinate")
+    done
+    for index in 0 1 2 3; do
+        expected=$((index + 1))
+        if (( 10#${principals[$index]} != expected )) \
+            || (( 10#${bindings[$index]} != expected )); then
+            echo "persistent service identity is not the exact fresh boot $expected pair" >&2
+            return 1
+        fi
+    done
+    printf 'service_principal_generation=%s binding_generation=%s\n' \
+        "$(IFS=,; echo "${principals[*]}")" \
+        "$(IFS=,; echo "${bindings[*]}")"
+}
+
+core_persistent_qemu_event_count() {
+    local debug_log=$1
+    local event_prefix=$2
+    awk -v prefix="$event_prefix" '
+        index($0, prefix) == 1 { count += 1 }
+        END { print count + 0 }
+    ' "$debug_log"
+}
+
+hash_core_persistent_tree() {
+    local directory=$1
+    if find "$directory" -type l -print -quit | grep -q .; then
+        echo "persistent evidence tree contains a symlink: $directory" >&2
+        return 1
+    fi
+    (
+        cd "$directory"
+        local relative digest
+        while IFS= read -r -d '' relative; do
+            digest=$(sha256sum -- "$relative" | cut -d ' ' -f1)
+            printf '%s\0%s\0' "$relative" "$digest"
+        done < <(find . -type f -printf '%P\0' | LC_ALL=C sort -z)
+    ) | sha256sum | cut -d ' ' -f1
+}
+
+capture_core_persistent_run() {
+    build_core_persistent_recovery_kernel
+    copy_core_evidence_iso \
+        "$core_persistent_artifact_dir/production-kernel.iso"
+    local catalog_digest image_source_proof core_api_profile journal_schema
+    local -a image_source_proof_lines
+    catalog_digest=$(container bash -c '
+        set -euo pipefail
+        readonly cargo_home=/tmp/nexus-cser-catalog-cargo-home
+        mkdir -p "$cargo_home"
+        ln -s /root/.cargo/registry "$cargo_home/registry"
+        CARGO_HOME="$cargo_home" \
+            CARGO_TARGET_DIR=/tmp/nexus-cser-catalog-target \
+            cargo run --offline -q \
+                --locked --manifest-path /repo/Cargo.toml \
+                -p cser-core --features std --bin cser-catalog-digest
+    ')
+    if [[ ! $catalog_digest =~ ^[0-9a-f]{64}$ ]]; then
+        echo "catalog helper returned an invalid digest: $catalog_digest" >&2
+        return 1
+    fi
+    core_api_profile=$(sed -n \
+        's/^pub const CSER_CORE_API_PROFILE_VERSION: u16 = \([0-9][0-9]*\);$/\1/p' \
+        "$repo_root/crates/cser-core/src/lib.rs")
+    journal_schema=$(sed -n \
+        's/^pub const JOURNAL_SCHEMA_VERSION: u16 = \([0-9][0-9]*\);$/\1/p' \
+        "$repo_root/crates/cser-core/src/journal.rs")
+    if [[ $core_api_profile != 1 || $journal_schema != 5 ]]; then
+        echo "unfrozen core API/journal profile: api=$core_api_profile journal=$journal_schema" >&2
+        return 1
+    fi
+    image_source_proof=$(container cat /nexus-cser-verified)
+    mapfile -t image_source_proof_lines <<<"$image_source_proof"
+    if ((${#image_source_proof_lines[@]} != 2)) \
+        || [[ ${image_source_proof_lines[0]} != nexus.cser.image-source-proof.v1 ]] \
+        || [[ ! ${image_source_proof_lines[1]} =~ ^[0-9a-f]{64}$ ]]; then
+        echo 'pinned image returned an invalid CSER source proof' >&2
+        return 1
+    fi
     bash "$root/scripts/provision-cser-tpm-nv.sh" \
-        "$core_tpm_anchor_state_dir"
+        "$core_persistent_state_dir" "$catalog_digest"
 
-    capture_core_tpm_anchor_boot \
-        "$core_tpm_anchor_artifact_dir/boot1-serial.log" \
-        "$core_tpm_anchor_artifact_dir/boot1-qemu-debug.log"
-    capture_core_tpm_anchor_boot \
-        "$core_tpm_anchor_artifact_dir/boot2-serial.log" \
-        "$core_tpm_anchor_artifact_dir/boot2-qemu-debug.log"
+    capture_core_persistent_boot \
+        "$core_persistent_artifact_dir/boot1-serial.log" \
+        "$core_persistent_artifact_dir/boot1-qemu-debug.log"
+    capture_core_persistent_boot \
+        "$core_persistent_artifact_dir/boot2-serial.log" \
+        "$core_persistent_artifact_dir/boot2-qemu-debug.log"
+    capture_core_persistent_boot \
+        "$core_persistent_artifact_dir/boot3-serial.log" \
+        "$core_persistent_artifact_dir/boot3-qemu-debug.log"
+    capture_core_persistent_boot \
+        "$core_persistent_artifact_dir/boot4-serial.log" \
+        "$core_persistent_artifact_dir/boot4-qemu-debug.log"
 
-    tr -d '\r' <"$core_tpm_anchor_artifact_dir/boot1-serial.log" \
-        | grep -Fx \
-            'CSER_TPM_NV_QEMU PASS transport=qemu-tis provider=tpm2-nv selectors=tip+lease single_writer_enforced=true writeall=true before_revision=0 after_revision=1 before_boot=1 after_boot=2 before_journal=1 after_journal=2 transition_committed=true physical_antirollback=false swtpm_state_rollbackable=true device_reset_evidence=false journal_payload=absent' \
-            >/dev/null
-    tr -d '\r' <"$core_tpm_anchor_artifact_dir/boot2-serial.log" \
-        | grep -Fx \
-            'CSER_TPM_NV_QEMU PASS transport=qemu-tis provider=tpm2-nv selectors=tip+lease single_writer_enforced=true writeall=true before_revision=1 after_revision=2 before_boot=2 after_boot=3 before_journal=2 after_journal=3 transition_committed=true physical_antirollback=false swtpm_state_rollbackable=true device_reset_evidence=false journal_payload=absent' \
-            >/dev/null
-    echo \
-        'CSER_TPM_NV_QEMU_RESTART PASS boots=2 qemu_tis=true real_tpm2_commands=true single_writer_enforced=true writeall=true non_orderly_swtpm_restart=true tip_revision=0->1->2 freshness=1->2->3 physical_antirollback=false durable_journal=false'
-}
-
-build_same_boot_kernel() {
-    check_kernel
-    prepare_runner_base
-    container cargo osdk build --scheme runtime-fs-same-boot
-    assert_runner_base
-}
-
-build_same_boot_precommit_kernel() {
-    check_kernel
-    container cargo check --locked --offline --target x86_64-unknown-none \
-        --features virtio-cser-precommit-fault
-    prepare_runner_base
-    container cargo osdk build --scheme runtime-fs-same-boot-precommit
-    assert_runner_base
-}
-
-build_same_boot_postcommit_crash_kernel() {
-    check_kernel
-    container cargo check --locked --offline --target x86_64-unknown-none \
-        --features virtio-cser-postcommit-fault
-    prepare_runner_base
-    container cargo osdk build --scheme runtime-fs-same-boot-postcommit-crash
-    assert_runner_base
-}
-
-run_kernel() {
-    # Keep compilation outside the runtime deadline. On a cold CI worker the
-    # OSDK wrapper and ISO build can consume nearly all of 30 seconds before
-    # QEMU starts, which would turn a build-time variance into a false runtime
-    # timeout.
-    build_kernel
-    container bash -c '
-        cp /root/ovmf/release/OVMF_VARS.fd "$HOME/OVMF_VARS.fd"
-        exec timeout --signal=TERM --kill-after=2s 30s cargo osdk run
-    '
-    assert_runner_base
-}
-
-standard_artifact_dir="$root/artifacts"
-standard_debugcon_raw="$standard_artifact_dir/task-entry-debugcon.log"
-standard_debugcon_scratch="$standard_artifact_dir/task-entry-debugcon-scratch.log"
-standard_debugcon_oracle="$standard_artifact_dir/task-entry-debugcon-oracle.log"
-
-prepare_standard_artifacts() {
-    mkdir -p "$standard_artifact_dir"
-    rm -f \
-        "$standard_artifact_dir/serial.log" \
-        "$standard_artifact_dir/qemu-debug.log" \
-        "$standard_debugcon_raw" \
-        "$standard_debugcon_scratch" \
-        "$standard_debugcon_oracle"
-}
-
-capture_standard_run() {
-    # shellcheck source=scripts/qemu-stream-capture.sh
-    source "$capture_helper"
-    capture_qemu_streams \
-        "$standard_artifact_dir/serial.log" \
-        "$standard_artifact_dir/qemu-debug.log" \
-        run_kernel
-    if [[ ! -f $standard_debugcon_scratch || -L $standard_debugcon_scratch ]]; then
-        echo "standard QEMU run did not produce a regular entry debugcon stream: $standard_debugcon_scratch" >&2
+    require_core_persistent_marker \
+        "$core_persistent_artifact_dir/boot1-serial.log" \
+        'CSER_CORE_PERSISTENT_BOOT1 PASS' \
+        'production_registry=single' \
+        'portal=nxp3' \
+        'supervisor=core-v1' \
+        'reply=committed-unsettled' \
+        'dma=queue-published-retained' \
+        'retained=4' \
+        'dma_retained=3' \
+        'resumed_prefix=false' \
+        'service_principal_generation=1' \
+        'binding_generation=1' \
+        'reply_service_task=true' \
+        'reply_service_death=task-return' \
+        'reply_exact_reap=true' \
+        'dma_service_task=true' \
+        'dma_service_death=task-return' \
+        'dma_exact_reap=true' \
+        'ingress_latch=closed' \
+        'closed_ingress_rejected=true' \
+        'production_rebind=initial'
+    require_core_persistent_marker \
+        "$core_persistent_artifact_dir/boot2-serial.log" \
+        'CSER_CORE_PERSISTENT_BOOT2 PASS' \
+        'production_registry=single' \
+        'portal=nxp3' \
+        'supervisor=core-v1' \
+        'reply=apply-intent-durable' \
+        'second_crash=service-exact-reap' \
+        'no_external_apply=true' \
+        'dma_queue=retired' \
+        'dma_queue_resource=scope-quarantined' \
+        'dma_pages_iova=retained' \
+        'retained=3' \
+        'dma_retained=2' \
+        'activation=blocked' \
+        'resource_reuse_authorized=false' \
+        'reset_submitted=3' \
+        'irq_submitted=1' \
+        'service_principal_generation=2' \
+        'successor_generation=2' \
+        'binding_generation=2' \
+        'fresh_service_task=true' \
+        'ready_in_fresh_task=true' \
+        'production_rebind=true' \
+        'service_death=task-return' \
+        'exact_reap=true' \
+        'ingress_latch=closed' \
+        'closed_ingress_rejected=true'
+    require_core_persistent_marker \
+        "$core_persistent_artifact_dir/boot3-serial.log" \
+        'CSER_CORE_PERSISTENT_BOOT3 PASS' \
+        'production_registry=single' \
+        'portal=nxp3' \
+        'supervisor=core-v1' \
+        'reply=settled-after-second-crash' \
+        'reconciliation=true' \
+        'second_apply_intent=false' \
+        'dma_queue=retired' \
+        'dma_queue_resource=scope-quarantined' \
+        'dma_pages_iova=retained' \
+        'retained=2' \
+        'dma_retained=2' \
+        'activation=blocked' \
+        'resource_reuse_authorized=false' \
+        'reset_submitted=0' \
+        'irq_submitted=0' \
+        'service_principal_generation=3' \
+        'successor_generation=3' \
+        'binding_generation=3' \
+        'fresh_service_task=true' \
+        'ready_in_fresh_task=true' \
+        'production_rebind=true' \
+        'service_state=live' \
+        'ingress_latch=open' \
+        'prior_service_fence=boot-checkpoint'
+    require_core_persistent_marker \
+        "$core_persistent_artifact_dir/boot4-serial.log" \
+        'CSER_CORE_PERSISTENT_BOOT4 PASS' \
+        'production_registry=single' \
+        'portal=nxp3' \
+        'supervisor=core-v1' \
+        'reply=settled' \
+        'repeated_recovery=stable' \
+        'duplicate_apply_intent=false' \
+        'duplicate_dma_evidence=false' \
+        'dma_queue=retired' \
+        'dma_queue_resource=scope-quarantined' \
+        'dma_pages_iova=retained' \
+        'retained=2' \
+        'dma_retained=2' \
+        'activation=blocked' \
+        'resource_reuse_authorized=false' \
+        'reset_submitted=0' \
+        'irq_submitted=0' \
+        'service_principal_generation=4' \
+        'successor_generation=4' \
+        'binding_generation=4' \
+        'fresh_service_task=true' \
+        'ready_in_fresh_task=true' \
+        'production_rebind=true' \
+        'service_state=live' \
+        'ingress_latch=open' \
+        'prior_service_fence=boot-checkpoint'
+    grep -F 'vtd_inv_desc_iotlb_global' \
+        "$core_persistent_artifact_dir/boot1-qemu-debug.log" >/dev/null
+    grep -F 'vtd_inv_desc_iotlb_global' \
+        "$core_persistent_artifact_dir/boot2-qemu-debug.log" >/dev/null
+    grep -F 'vtd_inv_desc_iotlb_global' \
+        "$core_persistent_artifact_dir/boot3-qemu-debug.log" >/dev/null
+    grep -F 'vtd_inv_desc_iotlb_global' \
+        "$core_persistent_artifact_dir/boot4-qemu-debug.log" >/dev/null
+    local boot1_notify_count boot2_notify_count boot3_notify_count boot4_notify_count
+    local boot1_read_count boot2_read_count boot3_read_count boot4_read_count
+    local boot1_dma_translation_count boot2_dma_translation_count
+    local boot3_dma_translation_count boot4_dma_translation_count
+    boot1_notify_count=$(core_persistent_qemu_event_count \
+        "$core_persistent_artifact_dir/boot1-qemu-debug.log" 'virtio_queue_notify ')
+    boot2_notify_count=$(core_persistent_qemu_event_count \
+        "$core_persistent_artifact_dir/boot2-qemu-debug.log" 'virtio_queue_notify ')
+    boot3_notify_count=$(core_persistent_qemu_event_count \
+        "$core_persistent_artifact_dir/boot3-qemu-debug.log" 'virtio_queue_notify ')
+    boot4_notify_count=$(core_persistent_qemu_event_count \
+        "$core_persistent_artifact_dir/boot4-qemu-debug.log" 'virtio_queue_notify ')
+    boot1_read_count=$(core_persistent_qemu_event_count \
+        "$core_persistent_artifact_dir/boot1-qemu-debug.log" 'virtio_blk_handle_read ')
+    boot2_read_count=$(core_persistent_qemu_event_count \
+        "$core_persistent_artifact_dir/boot2-qemu-debug.log" 'virtio_blk_handle_read ')
+    boot3_read_count=$(core_persistent_qemu_event_count \
+        "$core_persistent_artifact_dir/boot3-qemu-debug.log" 'virtio_blk_handle_read ')
+    boot4_read_count=$(core_persistent_qemu_event_count \
+        "$core_persistent_artifact_dir/boot4-qemu-debug.log" 'virtio_blk_handle_read ')
+    boot1_dma_translation_count=$(core_persistent_qemu_event_count \
+        "$core_persistent_artifact_dir/boot1-qemu-debug.log" \
+        'vtd_dmar_translate dev 00:05.00 ')
+    boot2_dma_translation_count=$(core_persistent_qemu_event_count \
+        "$core_persistent_artifact_dir/boot2-qemu-debug.log" \
+        'vtd_dmar_translate dev 00:05.00 ')
+    boot3_dma_translation_count=$(core_persistent_qemu_event_count \
+        "$core_persistent_artifact_dir/boot3-qemu-debug.log" \
+        'vtd_dmar_translate dev 00:05.00 ')
+    boot4_dma_translation_count=$(core_persistent_qemu_event_count \
+        "$core_persistent_artifact_dir/boot4-qemu-debug.log" \
+        'vtd_dmar_translate dev 00:05.00 ')
+    if (( boot2_notify_count == 0 \
+        || boot2_notify_count != boot3_notify_count \
+        || boot2_notify_count != boot4_notify_count \
+        || boot2_read_count == 0 \
+        || boot2_read_count != boot3_read_count \
+        || boot2_read_count != boot4_read_count )); then
+        echo 'persistent recovery has an unstable shared boot-time VirtIO baseline' >&2
         return 1
     fi
-    mv -- "$standard_debugcon_scratch" "$standard_debugcon_raw"
-    echo 'QEMU_CAPTURE PASS profile=standard live_replay=false serial=artifacts/serial.log debug=artifacts/qemu-debug.log'
-}
-
-run_same_boot_kernel() {
-    # Keep compilation outside the runtime deadline and verify the immutable
-    # block fixture on both sides of the QEMU execution. Hosted TCG can exhibit
-    # long scheduler-to-user-entry tails on shared CI workers, so retain one
-    # non-retried run but give the runtime 90 seconds of diagnostic headroom.
-    build_same_boot_kernel
-    container bash -c '
-        set -euo pipefail
-        readonly fixture=/opt/nexus-fixtures/runtime-fs-block.raw
-        readonly expected=9357413ed9a96a23af1750cc304265dd7dd1835eb58eb1fb50119cd80d0bc8ca
-        cp /root/ovmf/release/OVMF_VARS.fd "$HOME/OVMF_VARS.fd"
-        before=$(sha256sum "$fixture" | cut -d " " -f1)
-        before_mode=$(stat -c %a "$fixture")
-        test "$before" = "$expected"
-        test "$before_mode" = 444
-        set +e
-        timeout --signal=TERM --kill-after=2s 90s \
-            cargo osdk run --scheme runtime-fs-same-boot
-        status=$?
-        set -e
-        after=$(sha256sum "$fixture" | cut -d " " -f1)
-        after_mode=$(stat -c %a "$fixture")
-        test "$after" = "$expected"
-        test "$after_mode" = 444
-        echo "RUNTIME_FS_SAME_BOOT_FIXTURE before=$before after=$after mode=$after_mode readonly=true"
-        exit "$status"
-    '
-    assert_runner_base
-}
-
-same_boot_artifact_dir="$root/artifacts/runtime-fs-same-boot"
-
-prepare_same_boot_build_artifact() {
-    mkdir -p "$same_boot_artifact_dir"
-    rm -f "$same_boot_artifact_dir/build.log"
-}
-
-prepare_same_boot_artifacts() {
-    mkdir -p "$same_boot_artifact_dir"
-    rm -f \
-        "$same_boot_artifact_dir/serial.log" \
-        "$same_boot_artifact_dir/qemu-debug.log" \
-        "$same_boot_artifact_dir/task-entry-debugcon.log" \
-        "$same_boot_artifact_dir/task-entry-debugcon-oracle.log" \
-        "$same_boot_artifact_dir/oracle.log"
-}
-
-capture_same_boot_run() {
-    # shellcheck source=scripts/qemu-stream-capture.sh
-    source "$capture_helper"
-    capture_qemu_streams \
-        "$same_boot_artifact_dir/serial.log" \
-        "$same_boot_artifact_dir/qemu-debug.log" \
-        run_same_boot_kernel
-    echo 'QEMU_CAPTURE PASS profile=runtime-fs-same-boot live_replay=false serial=artifacts/runtime-fs-same-boot/serial.log debug=artifacts/runtime-fs-same-boot/qemu-debug.log'
-}
-
-run_same_boot_precommit_kernel() {
-    # Match the positive same-boot run's single-attempt hosted-TCG headroom.
-    build_same_boot_precommit_kernel
-    container bash -c '
-        set -euo pipefail
-        readonly fixture=/opt/nexus-fixtures/runtime-fs-block.raw
-        readonly expected=9357413ed9a96a23af1750cc304265dd7dd1835eb58eb1fb50119cd80d0bc8ca
-        cp /root/ovmf/release/OVMF_VARS.fd "$HOME/OVMF_VARS.fd"
-        before=$(sha256sum "$fixture" | cut -d " " -f1)
-        before_mode=$(stat -c %a "$fixture")
-        test "$before" = "$expected"
-        test "$before_mode" = 444
-        set +e
-        timeout --signal=TERM --kill-after=2s 90s \
-            cargo osdk run --scheme runtime-fs-same-boot-precommit
-        status=$?
-        set -e
-        after=$(sha256sum "$fixture" | cut -d " " -f1)
-        after_mode=$(stat -c %a "$fixture")
-        test "$after" = "$expected"
-        test "$after_mode" = 444
-        echo "RUNTIME_FS_SAME_BOOT_PRECOMMIT_FIXTURE before=$before after=$after mode=$after_mode readonly=true"
-        exit "$status"
-    '
-    assert_runner_base
-}
-
-same_boot_precommit_artifact_dir="$root/artifacts/runtime-fs-same-boot-precommit"
-
-prepare_same_boot_precommit_build_artifact() {
-    mkdir -p "$same_boot_precommit_artifact_dir"
-    rm -f "$same_boot_precommit_artifact_dir/build.log"
-}
-
-prepare_same_boot_precommit_artifacts() {
-    mkdir -p "$same_boot_precommit_artifact_dir"
-    rm -f \
-        "$same_boot_precommit_artifact_dir/serial.log" \
-        "$same_boot_precommit_artifact_dir/qemu-debug.log" \
-        "$same_boot_precommit_artifact_dir/task-entry-debugcon.log" \
-        "$same_boot_precommit_artifact_dir/task-entry-debugcon-oracle.log" \
-        "$same_boot_precommit_artifact_dir/oracle.log"
-}
-
-capture_same_boot_precommit_run() {
-    # shellcheck source=scripts/qemu-stream-capture.sh
-    source "$capture_helper"
-    capture_qemu_streams \
-        "$same_boot_precommit_artifact_dir/serial.log" \
-        "$same_boot_precommit_artifact_dir/qemu-debug.log" \
-        run_same_boot_precommit_kernel
-    echo 'QEMU_CAPTURE PASS profile=runtime-fs-same-boot-precommit live_replay=false serial=artifacts/runtime-fs-same-boot-precommit/serial.log debug=artifacts/runtime-fs-same-boot-precommit/qemu-debug.log'
-}
-
-run_same_boot_postcommit_crash_kernel() {
-    # Match the other bounded same-boot runs: one attempt with hosted-TCG
-    # headroom and an immutable read-only block fixture checked on both sides.
-    build_same_boot_postcommit_crash_kernel
-    container bash -c '
-        set -euo pipefail
-        readonly fixture=/opt/nexus-fixtures/runtime-fs-block.raw
-        readonly expected=9357413ed9a96a23af1750cc304265dd7dd1835eb58eb1fb50119cd80d0bc8ca
-        cp /root/ovmf/release/OVMF_VARS.fd "$HOME/OVMF_VARS.fd"
-        before=$(sha256sum "$fixture" | cut -d " " -f1)
-        before_mode=$(stat -c %a "$fixture")
-        test "$before" = "$expected"
-        test "$before_mode" = 444
-        set +e
-        timeout --signal=TERM --kill-after=2s 90s \
-            cargo osdk run --scheme runtime-fs-same-boot-postcommit-crash
-        status=$?
-        set -e
-        after=$(sha256sum "$fixture" | cut -d " " -f1)
-        after_mode=$(stat -c %a "$fixture")
-        test "$after" = "$expected"
-        test "$after_mode" = 444
-        echo "RUNTIME_FS_SAME_BOOT_POSTCOMMIT_FIXTURE before=$before after=$after mode=$after_mode readonly=true"
-        exit "$status"
-    '
-    assert_runner_base
-}
-
-same_boot_postcommit_crash_artifact_dir="$root/artifacts/runtime-fs-same-boot-postcommit-crash"
-
-prepare_same_boot_postcommit_crash_build_artifact() {
-    mkdir -p "$same_boot_postcommit_crash_artifact_dir"
-    rm -f "$same_boot_postcommit_crash_artifact_dir/build.log"
-}
-
-prepare_same_boot_postcommit_crash_artifacts() {
-    mkdir -p "$same_boot_postcommit_crash_artifact_dir"
-    rm -f \
-        "$same_boot_postcommit_crash_artifact_dir/serial.log" \
-        "$same_boot_postcommit_crash_artifact_dir/qemu-debug.log" \
-        "$same_boot_postcommit_crash_artifact_dir/task-entry-debugcon.log" \
-        "$same_boot_postcommit_crash_artifact_dir/task-entry-debugcon-oracle.log" \
-        "$same_boot_postcommit_crash_artifact_dir/oracle.log"
-}
-
-capture_same_boot_postcommit_crash_run() {
-    # shellcheck source=scripts/qemu-stream-capture.sh
-    source "$capture_helper"
-    capture_qemu_streams \
-        "$same_boot_postcommit_crash_artifact_dir/serial.log" \
-        "$same_boot_postcommit_crash_artifact_dir/qemu-debug.log" \
-        run_same_boot_postcommit_crash_kernel
-    echo 'QEMU_CAPTURE PASS profile=runtime-fs-same-boot-postcommit-crash live_replay=false serial=artifacts/runtime-fs-same-boot-postcommit-crash/serial.log debug=artifacts/runtime-fs-same-boot-postcommit-crash/qemu-debug.log'
-}
-
-build_stage7b() {
-    check_kernel
-    prepare_runner_base
-    container cargo osdk build --release --features stage7b-eval
-    assert_runner_base
-}
-
-first_allowed_cpu() {
-    local allowed first
-    allowed=$(awk '$1 == "Cpus_allowed_list:" { print $2 }' /proc/self/status)
-    first=${allowed%%,*}
-    first=${first%%-*}
-    if [[ ! $first =~ ^[0-9]+$ ]]; then
-        echo "cannot select first CPU from Cpus_allowed_list=$allowed" >&2
+    if (( boot1_notify_count != boot2_notify_count + 1 \
+        || boot1_read_count != boot2_read_count + 1 \
+        || boot1_dma_translation_count == 0 )); then
+        echo 'boot one lacks exactly one IOMMU-backed production DMA publication' >&2
         return 1
     fi
-    printf '%s\n' "$first"
-}
+    if (( boot2_dma_translation_count != 0 \
+        || boot3_dma_translation_count != 0 \
+        || boot4_dma_translation_count != 0 )); then
+        echo 'persistent recovery republished an IOMMU-backed DMA request after boot one' >&2
+        return 1
+    fi
+    if grep -F 'vtd_dmar_fault' "$core_persistent_artifact_dir"/*-qemu-debug.log \
+        >/dev/null; then
+        echo 'persistent recovery emitted a VT-d translation fault' >&2
+        return 1
+    fi
+    local combined_receipt receipt_basename receipt_checksum_basename
+    local receipt_header receipt_sha256 seal_failure=false
+    local boot1_marker boot2_marker boot3_marker boot4_marker
+    local freshness_progression service_identity_progression
+    local docker_image_id git_revision
+    local reply_evidence_marker dma_hardware_marker dma_runtime_marker
+    local source_status source_tree_clean=true tracked_tree_clean=true tpm_state_sha256
+    boot1_marker=$(tr -d '\r' \
+        <"$core_persistent_artifact_dir/boot1-serial.log" \
+        | grep -F 'CSER_CORE_PERSISTENT_BOOT1 PASS' | tail -n 1)
+    boot2_marker=$(tr -d '\r' \
+        <"$core_persistent_artifact_dir/boot2-serial.log" \
+        | grep -F 'CSER_CORE_PERSISTENT_BOOT2 PASS' | tail -n 1)
+    boot3_marker=$(tr -d '\r' \
+        <"$core_persistent_artifact_dir/boot3-serial.log" \
+        | grep -F 'CSER_CORE_PERSISTENT_BOOT3 PASS' | tail -n 1)
+    boot4_marker=$(tr -d '\r' \
+        <"$core_persistent_artifact_dir/boot4-serial.log" \
+        | grep -F 'CSER_CORE_PERSISTENT_BOOT4 PASS' | tail -n 1)
+    printf '%s\n' "$boot1_marker" \
+        >"$core_persistent_artifact_dir/boot1-marker.txt"
+    printf '%s\n' "$boot2_marker" \
+        >"$core_persistent_artifact_dir/boot2-marker.txt"
+    printf '%s\n' "$boot3_marker" \
+        >"$core_persistent_artifact_dir/boot3-marker.txt"
+    printf '%s\n' "$boot4_marker" \
+        >"$core_persistent_artifact_dir/boot4-marker.txt"
+    freshness_progression=$(assert_core_persistent_freshness_progression \
+        "$boot1_marker" "$boot2_marker" "$boot3_marker" "$boot4_marker")
+    service_identity_progression=$(assert_core_persistent_service_identity_progression \
+        "$boot1_marker" "$boot2_marker" "$boot3_marker" "$boot4_marker")
+    reply_evidence_marker=$(tr -d '\r' \
+        <"$core_persistent_artifact_dir/reply-evidence-serial.log" \
+        | grep -F 'CSER_CORE_OSTD_TASK_RECOVERY PASS' | tail -n 1)
+    dma_hardware_marker=$(tr -d '\r' \
+        <"$core_persistent_artifact_dir/dma-evidence-serial.log" \
+        | grep -F 'CSER_CORE_DMA HardwareClosure PASS' | tail -n 1)
+    dma_runtime_marker=$(tr -d '\r' \
+        <"$core_persistent_artifact_dir/dma-evidence-serial.log" \
+        | grep -F 'CSER_CORE_DMA_OSTD_QEMU PASS' | tail -n 1)
 
-run_stage7b_kernel() {
-    local cpu=$1
-    NEXUS_CONTAINER_CPUSET=$cpu container bash -c '
-        set -euo pipefail
-        cp /root/ovmf/release/OVMF_VARS.fd "$HOME/OVMF_VARS.fd"
-        exec timeout --signal=TERM --kill-after=2s 180s \
-            cargo osdk run --release --features stage7b-eval
-    '
-}
+    docker_image_id=$("$docker_bin" image inspect --format '{{.Id}}' "$image")
+    git_revision=$(git -C "$repo_root" rev-parse --verify HEAD)
+    if ! git -C "$repo_root" diff --quiet -- . \
+        || ! git -C "$repo_root" diff --cached --quiet -- .; then
+        tracked_tree_clean=false
+    fi
+    source_status=$(core_persistent_source_status)
+    if [[ -n $source_status ]]; then
+        source_tree_clean=false
+    fi
+    if [[ ! $docker_image_id =~ ^sha256:[0-9a-f]{64}$ ]] \
+        || [[ ! $git_revision =~ ^[0-9a-f]{40}$ ]]; then
+        echo 'persistent evidence identity is malformed' >&2
+        return 1
+    fi
+    tpm_state_sha256=$(hash_core_persistent_tree "$core_persistent_state_dir")
 
-eval_stage7b() {
-    # Build the release evaluator before the runtime deadline. The run command
-    # reuses this exact generated image and runner graph.
-    build_stage7b
-    local allowed cpu metadata temporary serial debug status
-    allowed=$(awk '$1 == "Cpus_allowed_list:" { print $2 }' /proc/self/status)
-    cpu=$(first_allowed_cpu)
-    mkdir -p "$root/artifacts"
-    serial="$root/artifacts/stage7b-evaluation.log"
-    debug="$root/artifacts/stage7b-qemu-debug.log"
-    metadata="$root/artifacts/stage7b-runtime-metadata.env"
-    temporary="$metadata.tmp.$$"
-    rm -f "$serial" "$debug" "$metadata" "$temporary"
+    combined_receipt='CSER_CORE_PERSISTENT_QEMU_RESTART PASS boots=4 shared_runtime=true evidence_schemes=reply+dma production_registry=single portal=nxp3 supervisor=core-v1 journal=ata-pio outbox=ata-pio-secondary anchor=tpm2-nv quarantine=pre-replay-virtio+vtd reply=committed-then-intent-crash-then-settled second_crash=after-durable-apply-intent reconciliation=without-second-intent stable_recovery=true freshness=strictly-increasing service_principal_generations=1,2,3,4 binding_generations=1,2,3,4 boot1_reply_dma_task_death_exact_reap=true boot1_ingress_closed_rejected=true boot2_fresh_ready_rebind_death_exact_reap=true boot2_ingress_closed_rejected=true boot3_fresh_ready_rebind_live_open=true boot4_fresh_ready_rebind_live_open=true prior_service_fence=boot-checkpoint dma_queue=retired dma_queue_resource=scope-quarantined dma_pages_iova=retained retained=2 activation=blocked resource_reuse_authorized=false qemu=true physical_hardware=false physical_antirollback=false physical_powerloss=false physical_dma_custody=false'
+    receipt_header=nexus.cser.production-receipt.v1
+    receipt_basename=combined-receipt.txt
+    receipt_checksum_basename=combined-receipt.sha256
+    if [[ $core_persistent_seal_requested != true || $source_tree_clean != true ]]; then
+        combined_receipt=${combined_receipt/ PASS / NONSEALABLE }
+        receipt_header=nexus.cser.production-proof.v1
+        receipt_basename=combined-proof.txt
+        receipt_checksum_basename=combined-proof.sha256
+        if [[ $source_tree_clean != true ]]; then
+            combined_receipt+=' nonsealable_reason=source-tree-dirty'
+        else
+            combined_receipt+=' nonsealable_reason=seal-not-requested'
+        fi
+        if [[ $core_persistent_seal_requested == true ]]; then
+            seal_failure=true
+        fi
+    fi
+    combined_receipt+=" seal_requested=$core_persistent_seal_requested"
     {
-        echo 'schema=nexus.stage7b.runtime-metadata.v1'
-        echo 'accel=tcg'
-        echo 'vcpus=1'
-        echo 'threads=1'
-        echo "cpu_pin=$cpu"
-        echo "cpus_allowed_list=$allowed"
-    } >"$temporary"
-    mv "$temporary" "$metadata"
-
-    # shellcheck source=scripts/qemu-stream-capture.sh
-    source "$capture_helper"
-    set +e
-    capture_qemu_streams "$serial" "$debug" run_stage7b_kernel "$cpu"
-    status=$?
-    set -e
-    assert_runner_base
-    if (( status != 0 )); then
-        echo "Stage 7B evaluator failed with status $status" >&2
-        return "$status"
+        printf '%s\n' "$receipt_header"
+        printf 'result=%s\n' "$combined_receipt"
+        printf 'git_revision=%s\n' "$git_revision"
+        printf 'git_tracked_tree_clean=%s\n' "$tracked_tree_clean"
+        printf 'git_source_tree_clean=%s\n' "$source_tree_clean"
+        printf 'seal_requested=%s\n' "$core_persistent_seal_requested"
+        printf 'docker_image_ref=%s\n' "$image"
+        printf 'docker_image_id=%s\n' "$docker_image_id"
+        printf 'image_source_proof_scheme=%s\n' \
+            "${image_source_proof_lines[0]}"
+        printf 'image_source_proof_sha256=%s\n' \
+            "${image_source_proof_lines[1]}"
+        printf 'catalog_digest=%s\n' "$catalog_digest"
+        printf 'core_api_profile=%s\n' "$core_api_profile"
+        printf 'journal_schema=%s\n' "$journal_schema"
+        printf 'production_kernel_iso_sha256=%s\n' "$(sha256sum \
+            "$core_persistent_artifact_dir/production-kernel.iso" \
+            | cut -d ' ' -f1)"
+        printf 'production_source_manifest_sha256=%s\n' "$(sha256sum \
+            "$production_source_manifest" | cut -d ' ' -f1)"
+        printf 'runner_sha256=%s\n' "$(sha256sum "$root/x" | cut -d ' ' -f1)"
+        printf 'static_cutover_gate_sha256=%s\n' "$(sha256sum \
+            "$root/scripts/assert-cser-core-production-cutover.sh" \
+            | cut -d ' ' -f1)"
+        printf 'capture_helper_sha256=%s\n' "$capture_helper_sha256"
+        printf 'tpm_provisioner_sha256=%s\n' "$(sha256sum \
+            "$root/scripts/provision-cser-tpm-nv.sh" | cut -d ' ' -f1)"
+        printf 'host_swtpm_binary_sha256=%s\n' "$(sha256sum \
+            "$(command -v swtpm)" | cut -d ' ' -f1)"
+        printf 'host_swtpm_version_sha256=%s\n' "$(swtpm --version 2>&1 \
+            | sha256sum | cut -d ' ' -f1)"
+        printf 'host_tpm2_nvdefine_binary_sha256=%s\n' "$(sha256sum \
+            "$(command -v tpm2_nvdefine)" | cut -d ' ' -f1)"
+        printf 'host_tpm2_nvdefine_version_sha256=%s\n' \
+            "$(tpm2_nvdefine --version 2>&1 | sha256sum | cut -d ' ' -f1)"
+        printf 'osdk_config_sha256=%s\n' "$(sha256sum \
+            "$root/OSDK.toml" | cut -d ' ' -f1)"
+        printf 'fixture_sha256=%s\n' \
+            9357413ed9a96a23af1750cc304265dd7dd1835eb58eb1fb50119cd80d0bc8ca
+        printf 'reply_evidence_marker=%s\n' "$reply_evidence_marker"
+        printf 'dma_hardware_marker=%s\n' "$dma_hardware_marker"
+        printf 'dma_runtime_marker=%s\n' "$dma_runtime_marker"
+        printf 'reply_evidence_source_sha256=%s\n' "$(sha256sum \
+            "$root/src/cser/core_runtime_slice.rs" | cut -d ' ' -f1)"
+        printf 'dma_evidence_source_sha256=%s\n' "$(sha256sum \
+            "$root/src/cser/core_dma_runtime.rs" | cut -d ' ' -f1)"
+        printf 'reply_evidence_kernel_iso_sha256=%s\n' "$(sha256sum \
+            "$core_persistent_artifact_dir/reply-evidence-kernel.iso" \
+            | cut -d ' ' -f1)"
+        printf 'dma_evidence_kernel_iso_sha256=%s\n' "$(sha256sum \
+            "$core_persistent_artifact_dir/dma-evidence-kernel.iso" \
+            | cut -d ' ' -f1)"
+        printf 'reply_evidence_serial_sha256=%s\n' "$(sha256sum \
+            "$core_persistent_artifact_dir/reply-evidence-serial.log" \
+            | cut -d ' ' -f1)"
+        printf 'reply_evidence_qemu_debug_sha256=%s\n' "$(sha256sum \
+            "$core_persistent_artifact_dir/reply-evidence-qemu-debug.log" \
+            | cut -d ' ' -f1)"
+        printf 'dma_evidence_serial_sha256=%s\n' "$(sha256sum \
+            "$core_persistent_artifact_dir/dma-evidence-serial.log" \
+            | cut -d ' ' -f1)"
+        printf 'dma_evidence_qemu_debug_sha256=%s\n' "$(sha256sum \
+            "$core_persistent_artifact_dir/dma-evidence-qemu-debug.log" \
+            | cut -d ' ' -f1)"
+        printf 'boot1_marker=%s\n' "$boot1_marker"
+        printf 'boot2_marker=%s\n' "$boot2_marker"
+        printf 'boot3_marker=%s\n' "$boot3_marker"
+        printf 'boot4_marker=%s\n' "$boot4_marker"
+        printf 'freshness_progression=%s\n' "$freshness_progression"
+        printf 'service_identity_progression=%s\n' \
+            "$service_identity_progression"
+        printf 'shared_boot_virtio_notify_baseline=%s\n' "$boot2_notify_count"
+        printf 'shared_boot_virtio_read_baseline=%s\n' "$boot2_read_count"
+        printf 'boot1_runtime_notify_delta=%s\n' "$((boot1_notify_count - boot2_notify_count))"
+        printf 'boot1_runtime_read_delta=%s\n' "$((boot1_read_count - boot2_read_count))"
+        printf 'boot1_dma_translation_events=%s\n' "$boot1_dma_translation_count"
+        printf 'post_boot1_dma_translation_events=%s\n' \
+            "$((boot2_dma_translation_count + boot3_dma_translation_count + boot4_dma_translation_count))"
+        printf 'boot1_serial_sha256=%s\n' "$(sha256sum \
+            "$core_persistent_artifact_dir/boot1-serial.log" | cut -d ' ' -f1)"
+        printf 'boot1_qemu_debug_sha256=%s\n' "$(sha256sum \
+            "$core_persistent_artifact_dir/boot1-qemu-debug.log" \
+            | cut -d ' ' -f1)"
+        printf 'boot2_serial_sha256=%s\n' "$(sha256sum \
+            "$core_persistent_artifact_dir/boot2-serial.log" | cut -d ' ' -f1)"
+        printf 'boot2_qemu_debug_sha256=%s\n' "$(sha256sum \
+            "$core_persistent_artifact_dir/boot2-qemu-debug.log" \
+            | cut -d ' ' -f1)"
+        printf 'boot3_serial_sha256=%s\n' "$(sha256sum \
+            "$core_persistent_artifact_dir/boot3-serial.log" | cut -d ' ' -f1)"
+        printf 'boot3_qemu_debug_sha256=%s\n' "$(sha256sum \
+            "$core_persistent_artifact_dir/boot3-qemu-debug.log" \
+            | cut -d ' ' -f1)"
+        printf 'boot4_serial_sha256=%s\n' "$(sha256sum \
+            "$core_persistent_artifact_dir/boot4-serial.log" | cut -d ' ' -f1)"
+        printf 'boot4_qemu_debug_sha256=%s\n' "$(sha256sum \
+            "$core_persistent_artifact_dir/boot4-qemu-debug.log" \
+            | cut -d ' ' -f1)"
+        printf 'journal_sha256=%s\n' "$(sha256sum \
+            "$core_persistent_journal" | cut -d ' ' -f1)"
+        printf 'outbox_sha256=%s\n' "$(sha256sum \
+            "$core_persistent_outbox" | cut -d ' ' -f1)"
+        printf 'tpm_state_sha256=%s\n' "$tpm_state_sha256"
+    } >"$core_persistent_artifact_dir/$receipt_basename"
+    receipt_sha256=$(sha256sum \
+        "$core_persistent_artifact_dir/$receipt_basename" | cut -d ' ' -f1)
+    printf '%s  %s\n' "$receipt_sha256" "$receipt_basename" \
+        >"$core_persistent_artifact_dir/$receipt_checksum_basename"
+    printf '%s git_revision=%s git_source_tree_clean=%s receipt_sha256=%s\n' \
+        "$combined_receipt" "$git_revision" "$source_tree_clean" "$receipt_sha256"
+    if [[ $seal_failure == true ]]; then
+        echo 'CSER production receipt seal rejected: source tree changed during proof' >&2
+        return 1
     fi
-    rm -f "$standard_debugcon_scratch"
-    tr -d '\r' <"$serial" \
-        | grep -Fx 'STAGE7B_EVALUATION PASS faults=20 scale_points=14 performance_cases=29' \
-            >/dev/null
-    echo "STAGE7B QEMU PASS cpu_pin=$cpu accel=tcg threads=1 vcpus=1 profile=release"
+}
+
+
+run_production_recovery() {
+    prepare_core_persistent_artifacts
+    bash "$root/scripts/assert-cser-core-production-cutover.sh" "$repo_root"
+    capture_core_reply_evidence
+    capture_core_dma_evidence
+    capture_core_persistent_run
 }
 
 command=${1:-test}
@@ -1447,318 +1512,45 @@ case "$command" in
         check_ostd_patch
         check_virtio_patch
         fmt_check
-        check_oracles
-        check_runtime_fs_production_source
-        check_runtime_fs_same_boot_source
-        check_causal_task_facade_source
-        check_supervisor_causal_owner_source
-        check_runtime_fs_same_boot_precommit_source
-        check_runtime_fs_same_boot_postcommit_crash_source
-        check_linux_futex_startup_source
-        prepare_guest
-        check_runtime_fs_artifact_negatives
-        check_runtime_net_artifact_negatives
+        bash "$root/scripts/assert-cser-core-production-cutover.sh" "$repo_root"
         check_kernel
-        check_personality
         clippy_all
         ;;
     clippy)
         ensure_image
-        prepare_guest
+        bash "$root/scripts/assert-cser-core-production-cutover.sh" "$repo_root"
         clippy_all
         ;;
-    build)
+    build|build-core-persistent-recovery)
         ensure_image
         check_ostd_patch
         check_virtio_patch
-        prepare_guest
-        build_kernel
+        bash "$root/scripts/assert-cser-core-production-cutover.sh" "$repo_root"
+        build_core_persistent_recovery_kernel
         ;;
-    build-core-runtime-spike)
+    run|test|run-core-persistent-recovery)
         ensure_image
         check_ostd_patch
         check_virtio_patch
-        prepare_guest
-        build_core_runtime_spike_kernel
+        run_production_recovery
         ;;
-    run-core-runtime-spike)
-        ensure_image
-        check_ostd_patch
-        prepare_guest
-        prepare_core_runtime_spike_artifacts
-        capture_core_runtime_spike_run
-        ;;
-    build-core-dma-recovery)
+    seal-core-persistent-recovery)
+        require_core_persistent_sealable_tree
+        core_persistent_seal_requested=true
         ensure_image
         check_ostd_patch
         check_virtio_patch
-        prepare_guest
-        build_core_dma_recovery_kernel
-        ;;
-    run-core-dma-recovery)
-        ensure_image
-        check_ostd_patch
-        check_virtio_patch
-        prepare_guest
-        prepare_core_dma_recovery_artifacts
-        capture_core_dma_recovery_run
-        ;;
-    build-core-tpm-anchor)
-        ensure_image
-        check_ostd_patch
-        prepare_guest
-        build_core_tpm_anchor_kernel
-        ;;
-    run-core-tpm-anchor)
-        ensure_image
-        check_ostd_patch
-        prepare_guest
-        prepare_core_tpm_anchor_artifacts
-        capture_core_tpm_anchor_run
-        ;;
-    build-same-boot)
-        ensure_image
-        check_ostd_patch
-        check_virtio_patch
-        prepare_guest
-        prepare_same_boot_build_artifact
-        build_same_boot_kernel 2>&1 \
-            | tee "$same_boot_artifact_dir/build.log"
-        ;;
-    build-same-boot-precommit)
-        ensure_image
-        check_ostd_patch
-        check_virtio_patch
-        prepare_guest
-        prepare_same_boot_precommit_build_artifact
-        build_same_boot_precommit_kernel 2>&1 \
-            | tee "$same_boot_precommit_artifact_dir/build.log"
-        ;;
-    build-same-boot-postcommit-crash)
-        ensure_image
-        check_ostd_patch
-        check_virtio_patch
-        prepare_guest
-        prepare_same_boot_postcommit_crash_build_artifact
-        build_same_boot_postcommit_crash_kernel 2>&1 \
-            | tee "$same_boot_postcommit_crash_artifact_dir/build.log"
-        ;;
-    iommu-probe)
-        ensure_image
-        container bash scripts/check-iotlb-gap.sh
-        ;;
-    run)
-        ensure_image
-        prepare_guest
-        prepare_standard_artifacts
-        capture_standard_run
-        ;;
-    run-same-boot)
-        ensure_image
-        prepare_guest
-        prepare_same_boot_artifacts
-        capture_same_boot_run
-        ;;
-    run-same-boot-precommit)
-        ensure_image
-        prepare_guest
-        prepare_same_boot_precommit_artifacts
-        capture_same_boot_precommit_run
-        ;;
-    run-same-boot-postcommit-crash)
-        ensure_image
-        prepare_guest
-        prepare_same_boot_postcommit_crash_artifacts
-        capture_same_boot_postcommit_crash_run
-        ;;
-    test)
-        ensure_image
-        check_ostd_patch
-        check_virtio_patch
-        check_runtime_fs_production_source
-        prepare_guest
-        check_runtime_fs_artifact_negatives
-        check_runtime_net_artifact_negatives
-        prepare_standard_artifacts
-        container bash scripts/check-iotlb-gap.sh
-        capture_standard_run
-        bash "$root/scripts/assert-linux-futex-entry-debugcon.sh" \
-            "$standard_debugcon_raw" 2>&1 \
-            | tee "$standard_debugcon_oracle"
-        bash "$root/scripts/assert-linux-futex-startup.sh" \
-            "$root/artifacts/serial.log"
-        "$root/scripts/assert-serial.sh" "$root/artifacts/serial.log"
-        awk -f "$root/scripts/assert-linux-dynamic.awk" "$root/artifacts/serial.log"
-        awk -f "$root/scripts/assert-linux-fs.awk" "$root/artifacts/serial.log"
-        bash "$root/scripts/check-linux-net-evidence.sh" \
-            "$root/artifacts/serial.log" \
-            "$repo_root/target/verification/runtime-net-oracle.log"
-        bash "$root/scripts/assert-linux-io-composition.sh" \
-            "$root/artifacts/serial.log"
-        if sed 's/exec_commits=1/exec_commits=2/' "$root/artifacts/serial.log" \
-            | awk -f "$root/scripts/assert-linux-dynamic.awk" >/dev/null 2>&1; then
-            echo 'dynamic PIE oracle accepted exec_commits=2 mutation' >&2
-            exit 1
-        fi
-        if sed '/^LINUX_DYNAMIC_SLICE PASS /p' "$root/artifacts/serial.log" \
-            | awk -f "$root/scripts/assert-linux-dynamic.awk" >/dev/null 2>&1; then
-            echo 'dynamic PIE oracle accepted duplicate PASS evidence' >&2
-            exit 1
-        fi
-        if awk '
-            { lines[NR] = $0 }
-            /^LINUX_DYNAMIC_RECOVERY Snapshot / { snapshot = NR }
-            /^LINUX_DYNAMIC_RECOVERY Ready / { ready = NR }
-            END {
-                swapped = lines[snapshot]
-                lines[snapshot] = lines[ready]
-                lines[ready] = swapped
-                for (line = 1; line <= NR; line++)
-                    print lines[line]
-            }
-        ' "$root/artifacts/serial.log" \
-            | awk -f "$root/scripts/assert-linux-dynamic.awk" >/dev/null 2>&1; then
-            echo 'dynamic PIE oracle accepted Snapshot/Ready reordering' >&2
-            exit 1
-        fi
-        echo 'dynamic PIE serial negative assertions: PASS exec_commits=2=rejected duplicate_pass=rejected snapshot_ready_swap=rejected'
-        if sed 's/syscalls=14 openat=3/syscalls=15 openat=3/' \
-            "$root/artifacts/serial.log" \
-            | awk -f "$root/scripts/assert-linux-fs.awk" >/dev/null 2>&1; then
-            echo 'runtime filesystem oracle accepted syscalls=15 mutation' >&2
-            exit 1
-        fi
-        if sed '/^LINUX_FS_SLICE PASS /p' "$root/artifacts/serial.log" \
-            | awk -f "$root/scripts/assert-linux-fs.awk" >/dev/null 2>&1; then
-            echo 'runtime filesystem oracle accepted duplicate PASS evidence' >&2
-            exit 1
-        fi
-        if sed \
-            's/elf_sha256=0dc5ad40/elf_sha256=1dc5ad40/' \
-            "$root/artifacts/serial.log" \
-            | awk -f "$root/scripts/assert-linux-fs.awk" >/dev/null 2>&1; then
-            echo 'runtime filesystem oracle accepted ELF digest mutation' >&2
-            exit 1
-        fi
-        if sed \
-            's/block_preparation_sha256=e3229d40/block_preparation_sha256=f3229d40/' \
-            "$root/artifacts/serial.log" \
-            | awk -f "$root/scripts/assert-linux-fs.awk" >/dev/null 2>&1; then
-            echo 'runtime filesystem oracle accepted block-preparation digest mutation' >&2
-            exit 1
-        fi
-        if sed \
-            's/foreign_receipt_accepted=false/foreign_receipt_accepted=true/' \
-            "$root/artifacts/serial.log" \
-            | awk -f "$root/scripts/assert-linux-fs.awk" >/dev/null 2>&1; then
-            echo 'runtime filesystem oracle accepted foreign registry receipt' >&2
-            exit 1
-        fi
-        if sed \
-            's/device_commit=false avail_idx_release=false/device_commit=true avail_idx_release=true/' \
-            "$root/artifacts/serial.log" \
-            | awk -f "$root/scripts/assert-linux-fs.awk" >/dev/null 2>&1; then
-            echo 'runtime filesystem oracle accepted Phase-2 device commit escalation' >&2
-            exit 1
-        fi
-        if awk '
-            { lines[NR] = $0 }
-            /^FILESYSTEM_LIFECYCLE PwriteRace winner=commit / { commit_first = NR }
-            /^FILESYSTEM_LIFECYCLE PwriteRace winner=revoke / { revoke_first = NR }
-            END {
-                swapped = lines[commit_first]
-                lines[commit_first] = lines[revoke_first]
-                lines[revoke_first] = swapped
-                for (line = 1; line <= NR; line++)
-                    print lines[line]
-            }
-        ' "$root/artifacts/serial.log" \
-            | awk -f "$root/scripts/assert-linux-fs.awk" >/dev/null 2>&1; then
-            echo 'runtime filesystem oracle accepted pwrite witness reordering' >&2
-            exit 1
-        fi
-        echo 'runtime filesystem serial negative assertions: PASS syscall_count=rejected duplicate_pass=rejected elf_digest=rejected preparation_digest=rejected foreign_registry_receipt=rejected device_commit_escalation=rejected pwrite_order=rejected'
-        ;;
-    test-same-boot)
-        ensure_image
-        check_ostd_patch
-        check_virtio_patch
-        check_runtime_fs_production_source
-        check_runtime_fs_same_boot_source
-        check_linux_futex_startup_source
-        prepare_guest
-        check_runtime_fs_artifact_negatives
-        bash "$root/scripts/assert-stream-capture.sh"
-        prepare_same_boot_artifacts
-        capture_same_boot_run
-        bash "$root/scripts/assert-linux-futex-entry-debugcon.sh" \
-            "$same_boot_artifact_dir/task-entry-debugcon.log" 2>&1 \
-            | tee "$same_boot_artifact_dir/task-entry-debugcon-oracle.log"
-        bash "$root/scripts/assert-linux-futex-startup.sh" \
-            "$same_boot_artifact_dir/serial.log"
-        bash "$root/scripts/assert-runtime-fs-same-boot.sh" \
-            "$same_boot_artifact_dir/serial.log" \
-            "$same_boot_artifact_dir/qemu-debug.log" 2>&1 \
-            | tee "$same_boot_artifact_dir/oracle.log"
-        ;;
-    test-same-boot-precommit)
-        ensure_image
-        check_ostd_patch
-        check_virtio_patch
-        check_runtime_fs_production_source
-        check_runtime_fs_same_boot_precommit_source
-        check_linux_futex_startup_source
-        prepare_guest
-        check_runtime_fs_artifact_negatives
-        bash "$root/scripts/assert-stream-capture.sh"
-        prepare_same_boot_precommit_artifacts
-        capture_same_boot_precommit_run
-        bash "$root/scripts/assert-linux-futex-entry-debugcon.sh" \
-            "$same_boot_precommit_artifact_dir/task-entry-debugcon.log" 2>&1 \
-            | tee "$same_boot_precommit_artifact_dir/task-entry-debugcon-oracle.log"
-        bash "$root/scripts/assert-linux-futex-startup.sh" \
-            "$same_boot_precommit_artifact_dir/serial.log"
-        bash "$root/scripts/assert-runtime-fs-same-boot-precommit.sh" \
-            "$same_boot_precommit_artifact_dir/serial.log" \
-            "$same_boot_precommit_artifact_dir/qemu-debug.log" 2>&1 \
-            | tee "$same_boot_precommit_artifact_dir/oracle.log"
-        ;;
-    test-same-boot-postcommit-crash)
-        ensure_image
-        check_ostd_patch
-        check_virtio_patch
-        check_runtime_fs_production_source
-        check_runtime_fs_same_boot_postcommit_crash_source
-        check_linux_futex_startup_source
-        prepare_guest
-        check_runtime_fs_artifact_negatives
-        bash "$root/scripts/assert-stream-capture.sh"
-        prepare_same_boot_postcommit_crash_artifacts
-        capture_same_boot_postcommit_crash_run
-        bash "$root/scripts/assert-linux-futex-entry-debugcon.sh" \
-            "$same_boot_postcommit_crash_artifact_dir/task-entry-debugcon.log" 2>&1 \
-            | tee "$same_boot_postcommit_crash_artifact_dir/task-entry-debugcon-oracle.log"
-        bash "$root/scripts/assert-linux-futex-startup.sh" \
-            "$same_boot_postcommit_crash_artifact_dir/serial.log"
-        bash "$root/scripts/assert-runtime-fs-same-boot-postcommit-crash.sh" \
-            "$same_boot_postcommit_crash_artifact_dir/serial.log" \
-            "$same_boot_postcommit_crash_artifact_dir/qemu-debug.log" 2>&1 \
-            | tee "$same_boot_postcommit_crash_artifact_dir/oracle.log"
-        ;;
-    eval-stage7b)
-        ensure_image
-        prepare_guest
-        eval_stage7b
+        run_production_recovery
         ;;
     clean)
-        # Do not make cleanup depend on Docker or on a prebuilt image.
-        rm -rf "$root/target" "$root/artifacts" "$root/userspace/personality/target"
-        rm -f "$root"/guest/*.bin "$root"/guest/*.elf
-        rm -f "$repo_root/target/verification/runtime-net-oracle.log"
-        rm -f "$repo_root/target/verification/linux-io-composition-oracle.log"
+        # Keep cleanup independent of Docker and scoped to generated kernel data.
+        rm -rf "$root/target" "$root/artifacts"
+        ;;
+    -h|--help|help)
+        echo "usage: ./x {doctor|image|fmt|check|clippy|build|run|test|build-core-persistent-recovery|run-core-persistent-recovery|seal-core-persistent-recovery|clean}"
         ;;
     *)
-        echo "usage: ./x {doctor|image|fmt|check|clippy|build|build-core-runtime-spike|run-core-runtime-spike|build-core-dma-recovery|run-core-dma-recovery|build-core-tpm-anchor|run-core-tpm-anchor|build-same-boot|build-same-boot-precommit|build-same-boot-postcommit-crash|iommu-probe|run|run-same-boot|run-same-boot-precommit|run-same-boot-postcommit-crash|test|test-same-boot|test-same-boot-precommit|test-same-boot-postcommit-crash|eval-stage7b|clean}" >&2
+        echo "usage: ./x {doctor|image|fmt|check|clippy|build|run|test|build-core-persistent-recovery|run-core-persistent-recovery|seal-core-persistent-recovery|clean}" >&2
         exit 2
         ;;
 esac

@@ -1,11 +1,13 @@
 schema = "nexus.current-capability-ledger.v1"
 ledger_revision = 1
 as_of = "2026-07-17"
-classification = "current-checkpoints-not-release-evidence"
+classification = "historical-superseded-checkpoints-not-current-implementation"
 canonical_release = "v0.1.0"
 canonical_release_evidence_unchanged = true
 checkpoint_count = 2
 wire_contracts = ["nexus-effect-peer-native-v1"]
+superseded_on = "2026-07-29"
+superseded_by = "docs/rfcs/0006-cser-core-semantic-rebaseline.md"
 
 [policy]
 local_checkpoint = "exact-revision-bounded-observation"
@@ -16,7 +18,8 @@ supersession = "replace-current-entry-with-explicit-exact-revision"
 [[checkpoint]]
 kind = "local"
 id = "nexus-main-8e5123c"
-status = "current-local-baseline"
+status = "historical-local-baseline-superseded"
+current = false
 repository = "https://github.com/chenty2333/Nexus"
 revision = "8e5123c46569e8ebdaba9f4f56bea6584ab58586"
 recorded_on = "2026-07-17"
@@ -56,7 +59,8 @@ sources = [
 [[checkpoint]]
 kind = "external"
 id = "visa-admission-ordered-4314a181"
-status = "exact-sha-ci-checked-not-canonical-or-archived"
+status = "historical-external-checkpoint-pinning-superseded-local-baseline"
+current = false
 repository = "https://github.com/chenty2333/vISA"
 revision = "4314a181ded0862d7b1c7054f57f1bafd0595f07"
 recorded_on = "2026-07-17"

@@ -370,6 +370,11 @@ impl BootVirtioIsrEmptyReceipt {
         self.facts.hardware.bdf
     }
 
+    /// Returns the generation established while the device remained fenced.
+    pub const fn successor_generation(&self) -> u64 {
+        self.facts.hardware.observed_generation
+    }
+
     /// Returns all VirtIO ISR cause bits observed while draining.
     pub const fn observed_isr_bits(&self) -> u32 {
         self.facts.hardware.reset.observed_isr_bits
@@ -1054,8 +1059,7 @@ mod tests {
     fn receipts_bind_scope_resource_and_older_generation() {
         let hardware = evidence(9);
         let coordinates = claim(hardware.scope, 8);
-        let receipts =
-            build_claim_receipts(hardware, coordinates).expect("older generation binds");
+        let receipts = build_claim_receipts(hardware, coordinates).expect("older generation binds");
         let (reset, irq, iotlb) = receipts.into_parts();
 
         assert_eq!(reset.claim(), coordinates);

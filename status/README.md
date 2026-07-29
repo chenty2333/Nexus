@@ -1,16 +1,18 @@
-# Current capability status
+# Historical capability status
 
-This directory records the moving implementation boundary without changing the
-accepted `v0.1.0` manifest, release bundle, tag, DOI, or frozen evaluation
-catalog. A current checkpoint is an exact-revision engineering observation. It
-is not a release acceptance claim and it cannot inherit evidence from an older
-or external checkpoint.
+This directory preserves the exact-revision capability ledger and native-v1
+wire corpus that predate the CSER Core Rebaseline. Its July 17 checkpoints are
+historical observations, not the current implementation boundary. RFC 0001,
+RFC 0005, the old Registry, and the live effect-peer service named below are
+**Superseded** by
+[`docs/rfcs/0006-cser-core-semantic-rebaseline.md`](../docs/rfcs/0006-cser-core-semantic-rebaseline.md).
+Current cutover status is recorded in that RFC and, after an exact clean-source
+proof, `docs/research/cser-core-production-cutover-release-ledger.md`.
 
-`current-capabilities.toml` is the machine-readable checkpoint ledger. Local
-entries identify Nexus implementation observations. External entries identify
-separately owned integration observations and pin the exact Nexus checkpoint
-they consumed. External evidence never upgrades the corresponding Nexus-local
-claim.
+`current-capabilities.toml` retains its filename for compatibility with the
+accepted archive, but its classification and checkpoint statuses explicitly
+mark it historical. External entries remain separately owned observations and
+never upgrade either the old Nexus checkpoint or the rebaselined core.
 
 `effect-peer-native-v1.json` freezes the same-boot native JSON Lines protocol
 used by `nexus-effect-peer`. Native v1 permits compatibility-preserving fixes
@@ -33,14 +35,12 @@ requires a separately reviewed v3 schema and validator with the complete
 production-target, projection, execution-receipt, retained-artifact, path
 containment, date-order, and predecessor-chain gates specified by RFC 0003.
 
-The repository checker validates both files, and the effect-peer test suite
-recomputes the canonical native-v1 serde snapshot:
+The current repository checker preserves the wire bytes without rebuilding the
+deleted live peer or invoking superseded research workflows:
 
 ```sh
 ./x test --quick
 cargo test -p nexus-effect-peer-wire --test frozen_v1
-cargo test -p nexus-effect-peer --test wire_v1_freeze
-cargo test --manifest-path tools/xtask/Cargo.toml causal_evidence_overlay
 ```
 
 `crates/nexus-effect-peer-wire/contract/effect-peer-native-v1.json` is a
@@ -49,7 +49,8 @@ not diverged from this status contract and exports the canonical fixture
 population used to recompute the frozen digest. The mirror does not create a
 second semantic authority: this status file remains the repository contract.
 
-Updating a checkpoint requires a new exact revision, evidence boundary, and
-non-claim list. Updating the frozen native-v1 snapshot is allowed only to repair
-an accidental mismatch with the already published v1 wire; it must not be used
-to add a capability to v1.
+Do not update this file to make an old checkpoint look current. New rebaseline
+evidence requires a clean exact revision, its own evidence boundary and
+non-claim list, and the RFC 0006 release ledger. Updating the frozen native-v1
+snapshot is allowed only to repair an accidental mismatch with the already
+published v1 wire; it must not be used to add a capability to v1.
