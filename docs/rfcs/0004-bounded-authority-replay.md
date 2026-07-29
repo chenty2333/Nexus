@@ -1,5 +1,9 @@
 # RFC 0004: bounded authority and replay lanes
 
+Current disposition: **Bearer layout and API choices superseded by
+[RFC 0006](0006-cser-core-semantic-rebaseline.md); retained for bounded
+authority, replay, and backpressure requirements.**
+
 Status: implementation contract; no production or observed capability claim.
 
 This RFC narrows two implementation choices left open by RFC 0003:

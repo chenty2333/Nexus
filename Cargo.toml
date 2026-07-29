@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/cser-core",
     "crates/cser-model",
     "crates/cser-trace-conformance",
     "crates/cser-transition-gates",

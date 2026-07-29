@@ -1,5 +1,8 @@
 # RFC 0003: closing causal coverage for the production filesystem slice
 
+- Current disposition: **Tranche order and final Registry shape superseded by
+  [RFC 0006](0006-cser-core-semantic-rebaseline.md); retained for typed
+  obligations, accounting, and transition-order requirements.**
 - Status: **Draft / prospective implementation contract**
 - Target: RFC 0001 Phase 2 through Phase 4 refinement work
 - Supersedes: nothing

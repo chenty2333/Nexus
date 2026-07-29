@@ -1,10 +1,18 @@
 # RFC 0005: post-commit reply adoption across service crash
 
-- Status: **Draft / prospective research contract**
+- Status: **Superseded by
+  [RFC 0006](0006-cser-core-semantic-rebaseline.md); retained as a historical
+  research contract**
 - Target: the Adopt-vs-Abort successor of the post-commit closure lane
-- Supersedes: nothing; narrows one obligation left open by
+- Superseded implementation plan: **yes; do not continue this phase sequence**
+- Historical scope: narrows one obligation left open by
   [RFC 0001](0001-production-identity.md)
 - Changes accepted `v0.1.0` claims: **no**
+
+The pre-rebaseline checkpoint later implemented a bounded Phase A sliver for
+obligations 1 through 4. That result does not satisfy the real
+Snapshot/Ready/Rebind, revoke race, repeated-crash, persistence, or
+production-transition Loom requirements now defined by RFC 0006.
 
 ## Claim discipline
 

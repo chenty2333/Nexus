@@ -83,6 +83,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "cser-core"
+version = "0.1.0"
+dependencies = [
+ "cser-model",
+ "loom",
+ "proptest",
+ "sha2",
+]
+
+[[package]]
 name = "cser-model"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,24 @@
+[package]
+name = "cser-core"
+version = "0.1.0"
+edition = "2024"
+license = "MPL-2.0"
+description = "Portable authoritative CSER estate, claim, journal, and recovery core"
+publish = false
+
+[features]
+default = []
+std = []
+
+[dependencies]
+sha2 = { version = "=0.10.9", default-features = false, features = ["force-soft"] }
+
+[dev-dependencies]
+cser-model = { path = "../cser-model", default-features = false }
+loom = "=0.7.2"
+proptest = "=1.11.0"
+
+[[bin]]
+name = "cser-restart-fixture"
+path = "src/bin/cser-restart-fixture.rs"
+required-features = ["std"]

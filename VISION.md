@@ -2,6 +2,13 @@
 
 Status: working research contract, July 2026.
 
+> **Rebaseline notice:** RFC 0006 supersedes this document's Stage numbering,
+> completion order, and use as an active roadmap. The research question,
+> evidence vocabulary, non-goals, and historical claim boundaries below remain
+> inputs to the new core. See
+> [the CSER Core Semantic Rebaseline](docs/rfcs/0006-cser-core-semantic-rebaseline.md)
+> for current semantics and milestones.
+
 Nexus is a research operating system about containing the effects of restartable
 user-space OS services. It is not a Zircon/Fuchsia reimplementation, and Linux
 compatibility is not its research identity.

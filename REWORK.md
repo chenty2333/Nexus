@@ -3,8 +3,10 @@
 > **Historical record:** This ledger records the completed CSER reset and the
 > evidence checkpoints that led to `v0.1.0`. It is not the current roadmap,
 > project overview, or normative semantics source. Current readers should start
-> with [README.md](README.md), [VISION.md](VISION.md),
-> [ARCHITECTURE.md](ARCHITECTURE.md), and [specs/cser/](specs/cser/).
+> with [RFC 0006](docs/rfcs/0006-cser-core-semantic-rebaseline.md). The
+> [README](README.md), [VISION](VISION.md), [architecture](ARCHITECTURE.md), and
+> [specification archive](specs/cser/) retain project and historical evidence
+> context.
 
 This ledger records what survived the CSER reset. It was a deletion plan, not a
 promise to preserve the former Axle/Zircon/Starnix architecture.

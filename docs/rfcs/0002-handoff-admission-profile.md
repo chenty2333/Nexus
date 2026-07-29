@@ -1,5 +1,8 @@
 # RFC 0002: reversible handoff admission and local effect closure
 
+- Current disposition: **Later-phase task order superseded by
+  [RFC 0006](0006-cser-core-semantic-rebaseline.md); retained for its ownership
+  and freshness boundaries.**
 - Status: **Draft / prospective first-round research contract**
 - Target: an out-of-tree vISA/Nexus refinement experiment
 - Supersedes: nothing

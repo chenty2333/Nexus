@@ -1,5 +1,11 @@
 # CSER executable specification
 
+> **Historical model index:** RFC 0006 supersedes the Stage order and the use of
+> these predecessor models as the current production semantics. Their checked
+> results and exact finite boundaries remain immutable evidence. The rebaseline
+> requires a separately identified independent oracle and must not import the
+> production core's transition implementation.
+
 This directory fixes the first finite-state semantics for Causally Scoped
 Effect Revocation (CSER). `Cser.tla` contains both the readable PlusCal source
 and its generated TLA+ transition relation. `CserMC.cfg` is the bounded model

@@ -1,5 +1,8 @@
 # RFC 0001: identity-preserving production-path CSER composition
 
+- Current disposition: **Implementation order and proposed `v0.2.0` shape
+  superseded by [RFC 0006](0006-cser-core-semantic-rebaseline.md); retained as
+  a historical contract and evidence input.**
 - Status: **Draft / prospective research contract**
 - Target: a possible Nexus `v0.2.0` evidence release
 - Supersedes: nothing
