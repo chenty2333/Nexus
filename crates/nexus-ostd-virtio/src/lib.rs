@@ -3,14 +3,14 @@
 //! Safe facade for Nexus's OSTD 0.18.0 VirtIO block ownership substrate.
 //!
 //! The public API contains no raw pointer, unsafe function, raw PCI root, or
-//! copyable hardware owner. All unsafe operations are confined to the four
+//! copyable hardware owner. All unsafe operations are confined to the five
 //! private implementation modules below. Their invariants are documented at
 //! each unsafe operation and summarized in the crate README.
 //!
 //! This extraction preserves the separate-boot Stage 5B polling experiment and
 //! adds a safe INTx/ISR/one-shot completion facade for an IRQ successor. It
-//! does not itself install an OSTD IRQ actor or establish interrupt delivery,
-//! same-boot integration, SMP correctness, or production-identity preservation.
+//! does not itself establish physical-hardware identity, IRQ-controller drain,
+//! or crash-persistent page/IOVA custody.
 
 #![no_std]
 #![deny(unsafe_code)]
@@ -22,6 +22,8 @@ extern crate alloc;
 // so downstream `#![deny(unsafe_code)]` kernels can only use the safe exports
 // below, not the raw HAL, MMIO, DMA, queue, or PCI configuration operations.
 #[allow(unsafe_code)]
+mod boot_quarantine;
+#[allow(unsafe_code)]
 mod dma;
 #[allow(unsafe_code)]
 mod pci;
@@ -30,6 +32,14 @@ mod portal;
 #[allow(unsafe_code)]
 mod production;
 
+pub use boot_quarantine::{
+    ActivatedBootDevice, BootActivationFailure, BootClaimCoordinateError, BootClaimCoordinateField,
+    BootClaimCoordinates, BootClaimQuarantineReceipts, BootDeviceScope,
+    BootGlobalIotlbInvalidationReceipt, BootQuarantineError, BootQuarantineFailure,
+    BootQuarantineGuard, BootQuarantineRequest, BootQuarantineRequestError,
+    BootReceiptBindingError, BootVirtioIsrEmptyReceipt, BootVirtioStatusResetReceipt,
+    quarantine_production_device,
+};
 pub use dma::{OwnerKind, owner_address};
 pub use pci::{
     DeviceBdf, IntxRoute, IntxTransitionError, IntxTransitionFailure, MaskedIntx,

@@ -34,6 +34,10 @@ The facade preserves these ownership invariants:
   acknowledged whole-device reset;
 - reset and IOTLB closure authority are linear, and dropping a tombstone fails
   closed by retaining owners;
+- the boot quarantine entry validates the fixed `00:05.0` VirtIO vendor/device
+  IDs, clears PCI `BUS_MASTER`, masks INTx, and requires exact command readback
+  before bus enumeration or BAR acquisition can continue. A mismatch
+  permanently poisons rediscovery for that boot;
 - the legacy Stage 5B `Portal` keeps service actions, device completion, reset,
   and rebind fenced by its shared `cser-transition-gates::io::IoGate` identity;
 - the separate production typestate owns no scope, effect, binding, or commit
@@ -149,3 +153,43 @@ retained-worker/operator recovery loop.
 In particular, registry envelopes alone do not exclude two roots claiming the
 same physical function and do not prove whole-function reset blast radius; the
 opaque facade owner is the singleton enforcement boundary.
+
+## Boot quarantine boundary
+
+`quarantine_production_device` is the hardware-side provider for persistent
+recovery composition. It retains one linear `BootQuarantineGuard` after:
+
+1. the early PCI fence above;
+2. VirtIO status-zero reset acknowledgement;
+3. real ISR read-to-clear until two consecutive empty observations; and
+4. completion of a patched-OSTD global IOTLB invalidation triggered by a
+   remapped page which was never exposed to the device.
+
+Direct DMA mappings are rejected because they cannot evidence a VT-d command.
+Reset/ISR failure retains the `PciTransport` and MMIO claims; pending or failed
+invalidation retains `PendingDmaUnmap`; activation failure returns the complete
+guard. Successful activation transfers `Root`, `MaskedIntx`, and
+`ProductionDevice` together, and initializes the production device with the
+fresh boot generation rather than restarting it at generation one.
+
+The non-copyable receipt types intentionally use narrow names:
+`BootVirtioStatusResetReceipt`, `BootVirtioIsrEmptyReceipt`, and
+`BootGlobalIotlbInvalidationReceipt`. They bind stable BDF/device scope,
+old/new device generations, and exact effect/claim/resource coordinates. They
+contain no queue, BAR, DMA, or activation authority.
+
+These receipts do **not** yet authorize physical page or IOVA reuse. The
+portable journal currently names abstract `ResourceId` values, not exact PFN
+and IOVA extents, and OSTD does not reserve a crash-persistent DMA arena before
+journal replay. The current VT-d patch also does not expose read/write drain
+capability evidence, while `MaskedIntx` and an empty VirtIO ISR do not prove an
+IOAPIC/IRTE synchronization boundary. Production recovery must therefore add:
+
+- an early-reserved crash-persistent DMA arena or exact PFN/IOVA reservation;
+- an IOMMU root/requester-scope and transaction-drain proof;
+- an IRQ-controller mask/synchronize owner; and
+- stronger physical identity than a QEMU-stable BDF before real-device rebind.
+
+QEMU validates the emulated PCI/VirtIO/VT-d command path only. It is not
+physical PCIe ordering, IOMMU-silicon drain, reset blast-radius, or warm-reboot
+retention evidence.

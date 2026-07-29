@@ -1500,6 +1500,8 @@ pub struct ProductionDevice {
 /// Typed rejection while binding a production owner to an owned PCI root.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProductionDeviceClaimError {
+    /// Zero is reserved for an absent or invalid reset-domain generation.
+    InvalidDeviceGeneration,
     /// The process-wide, non-zero owner namespace cannot advance without
     /// wrapping and is therefore permanently exhausted.
     OwnerIdentityExhausted,
@@ -1514,6 +1516,21 @@ impl ProductionDevice {
     /// may consume an unused facade-local owner number, but it receives no
     /// device claim or transition authority.
     pub fn for_owned_device(root: &mut Root) -> Result<Self, ProductionDeviceClaimError> {
+        Self::for_owned_device_at_generation(root, 1)
+    }
+
+    /// Claims the owned device at a boot-provider-supplied fresh generation.
+    ///
+    /// This is crate-private so ordinary downstream callers cannot reset a
+    /// production generation from a naked integer. The boot quarantine guard
+    /// supplies the generation retained from its trusted recovery request.
+    pub(crate) fn for_owned_device_at_generation(
+        root: &mut Root,
+        device_generation: u64,
+    ) -> Result<Self, ProductionDeviceClaimError> {
+        if device_generation == 0 {
+            return Err(ProductionDeviceClaimError::InvalidDeviceGeneration);
+        }
         let owner_id = allocate_production_owner_id()?;
         let device_function = root
             .try_claim_device_function()
@@ -1524,7 +1541,7 @@ impl ProductionDevice {
             device_bdf: root.device_bdf(),
             next_attempt_sequence: 1,
             next_session_sequence: 1,
-            device_generation: 1,
+            device_generation,
             active: None,
             indeterminate_preparation: None,
         })

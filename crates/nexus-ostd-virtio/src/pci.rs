@@ -6,7 +6,7 @@ use alloc::sync::Arc;
 use core::{
     fmt,
     ptr::NonNull,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use ostd::{
@@ -38,6 +38,7 @@ const INTX_NOT_CONNECTED: u8 = 0xff;
 const EXPECTED_INTX_PIN: u8 = 1;
 
 static NEXT_INTX_OWNER_ID: AtomicU64 = AtomicU64::new(1);
+static INITIAL_FENCE_POISONED: AtomicBool = AtomicBool::new(false);
 
 struct ConfigPorts {
     address: IoPort<u32, ReadWriteAccess>,
@@ -131,6 +132,16 @@ pub enum PciDiscoveryError {
     UnexpectedVendor { observed: u16 },
     /// The discovered function is not the modern VirtIO block device ID.
     UnexpectedDeviceId { observed: u16 },
+    /// The fixed function could not be fenced before bus enumeration and BAR
+    /// ownership acquisition.
+    InitialFenceReadbackMismatch {
+        bus_master_disabled: bool,
+        intx_masked: bool,
+        memory_space_enabled: bool,
+        other_bits_changed: bool,
+    },
+    /// A prior initial-fence mismatch permanently blocked rediscovery.
+    InitialFencePoisoned,
     /// PCI BAR discovery failed for the owned function.
     BarsUnavailable,
     /// A previous root still owns the process-wide BAR registry.
@@ -288,6 +299,25 @@ enum ExpectedIntxState {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BootPciFenceError {
+    AlreadyClaimed,
+    InvalidRoute,
+    CommandReadbackMismatch {
+        bus_master_disabled: bool,
+        intx_masked: bool,
+        memory_space_enabled: bool,
+        other_bits_changed: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BootPciFenceObservation {
+    pub(crate) bus_master_disabled: bool,
+    pub(crate) intx_masked: bool,
+    pub(crate) memory_space_enabled: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct IntxCommandObservation {
     before: Command,
     expected: Command,
@@ -332,6 +362,21 @@ const fn command_with_intx_mask(command: Command, masked: bool) -> Command {
     } else {
         command.difference(Command::INTERRUPT_DISABLE)
     }
+}
+
+const BOOT_FENCE_CONTROLLED_BITS: Command = Command::MEMORY_SPACE
+    .union(Command::BUS_MASTER)
+    .union(Command::INTERRUPT_DISABLE);
+
+const fn command_with_boot_fence(command: Command) -> Command {
+    command
+        .union(Command::MEMORY_SPACE)
+        .union(Command::INTERRUPT_DISABLE)
+        .difference(Command::BUS_MASTER)
+}
+
+fn boot_fence_changed_other_bits(before: Command, observed: Command) -> bool {
+    observed.difference(BOOT_FENCE_CONTROLLED_BITS) != before.difference(BOOT_FENCE_CONTROLLED_BITS)
 }
 
 fn allocate_intx_owner_id() -> Result<u64, PciDiscoveryError> {
@@ -426,6 +471,76 @@ impl Root {
     /// unmask INTx; only the root's linear owner-state methods can do so.
     pub const fn intx_route(&self) -> IntxRoute {
         self.intx_route
+    }
+
+    /// Atomically establishes the PCI half of boot-time device quarantine.
+    ///
+    /// This differs from ordinary [`Self::claim_masked_intx`] by clearing
+    /// `BUS_MASTER` in the same exact command/readback transaction which masks
+    /// INTx. `MEMORY_SPACE` remains enabled so the boot owner can reset the
+    /// VirtIO common configuration before any queue can be published.
+    ///
+    /// A readback mismatch poisons the root. No masked token is returned, so a
+    /// caller cannot mistake a partial command write for a usable quarantine
+    /// owner. The BAR registry remains installed and prevents a replacement
+    /// root from aliasing this function.
+    pub(crate) fn claim_boot_pci_fence(
+        &mut self,
+    ) -> Result<(MaskedIntx, BootPciFenceObservation), BootPciFenceError> {
+        if self.intx_state != IntxOwnershipState::Unclaimed {
+            return Err(BootPciFenceError::AlreadyClaimed);
+        }
+
+        let epoch = 1;
+        let (_, before) = self.inner.get_status_command(self.device_function);
+        let expected = command_with_boot_fence(before);
+        self.inner.set_command(self.device_function, expected);
+        let (_, observed) = self.inner.get_status_command(self.device_function);
+        let observation = BootPciFenceObservation {
+            bus_master_disabled: !observed.contains(Command::BUS_MASTER),
+            intx_masked: observed.contains(Command::INTERRUPT_DISABLE),
+            memory_space_enabled: observed.contains(Command::MEMORY_SPACE),
+        };
+        if observed != expected {
+            self.intx_state = IntxOwnershipState::Poisoned {
+                epoch,
+                observed_masked: observation.intx_masked,
+            };
+            return Err(BootPciFenceError::CommandReadbackMismatch {
+                bus_master_disabled: observation.bus_master_disabled,
+                intx_masked: observation.intx_masked,
+                memory_space_enabled: observation.memory_space_enabled,
+                other_bits_changed: boot_fence_changed_other_bits(before, observed),
+            });
+        }
+        if !self.has_valid_intx_route() {
+            self.intx_state = IntxOwnershipState::Poisoned {
+                epoch,
+                observed_masked: true,
+            };
+            return Err(BootPciFenceError::InvalidRoute);
+        }
+
+        self.intx_state = IntxOwnershipState::Masked { epoch };
+        Ok((
+            MaskedIntx {
+                owner_id: self.intx_owner_id,
+                epoch,
+                route: self.intx_route,
+            },
+            observation,
+        ))
+    }
+
+    /// Revalidates the physical PCI fence without changing owner state.
+    pub(crate) fn boot_pci_fence_is_exact(&self) -> bool {
+        if !matches!(self.intx_state, IntxOwnershipState::Masked { .. }) {
+            return false;
+        }
+        let (_, command) = self.inner.get_status_command(self.device_function);
+        !command.contains(Command::BUS_MASTER)
+            && command.contains(Command::INTERRUPT_DISABLE)
+            && command.contains(Command::MEMORY_SPACE)
     }
 
     /// Claims the root's unique INTx lifecycle in the masked state.
@@ -874,8 +989,43 @@ pub(crate) fn transport_claim_observation() -> TransportClaimObservation {
 /// Discovers exactly one modern VirtIO block device on bus 0 and installs one
 /// owner for each of its memory BARs before raw capability pointers are made.
 pub fn discover_and_own_bars() -> Result<Root, PciDiscoveryError> {
+    if INITIAL_FENCE_POISONED.load(Ordering::Acquire) {
+        return Err(PciDiscoveryError::InitialFencePoisoned);
+    }
     let configuration = PioConfigurationAccess::acquire()?;
     let mut root = RawRoot::new(configuration.clone());
+
+    // Validate and fence the fixed production function before the more
+    // expensive bus walk and BAR ownership acquisition. This closes the
+    // previous interval in which a crashed predecessor could continue bus
+    // mastering while discovery allocated software and MMIO owners.
+    let identity = configuration.read_word(EXPECTED_DEVICE, 0);
+    let vendor_id = identity as u16;
+    let device_id = (identity >> 16) as u16;
+    if vendor_id != 0x1af4 {
+        return Err(PciDiscoveryError::UnexpectedVendor {
+            observed: vendor_id,
+        });
+    }
+    if device_id != MODERN_VIRTIO_BLOCK_DEVICE_ID {
+        return Err(PciDiscoveryError::UnexpectedDeviceId {
+            observed: device_id,
+        });
+    }
+    let (_, before) = root.get_status_command(EXPECTED_DEVICE);
+    let expected = command_with_boot_fence(before);
+    root.set_command(EXPECTED_DEVICE, expected);
+    let (_, observed) = root.get_status_command(EXPECTED_DEVICE);
+    if observed != expected {
+        INITIAL_FENCE_POISONED.store(true, Ordering::Release);
+        return Err(PciDiscoveryError::InitialFenceReadbackMismatch {
+            bus_master_disabled: !observed.contains(Command::BUS_MASTER),
+            intx_masked: observed.contains(Command::INTERRUPT_DISABLE),
+            memory_space_enabled: observed.contains(Command::MEMORY_SPACE),
+            other_bits_changed: boot_fence_changed_other_bits(before, observed),
+        });
+    }
+
     let mut found = None;
 
     for (device_function, info) in root.enumerate_bus(0) {
@@ -893,12 +1043,12 @@ pub fn discover_and_own_bars() -> Result<Root, PciDiscoveryError> {
             observed: DeviceBdf::from(device_function),
         });
     }
-    if info.vendor_id != 0x1af4 {
+    if info.vendor_id != vendor_id {
         return Err(PciDiscoveryError::UnexpectedVendor {
             observed: info.vendor_id,
         });
     }
-    if info.device_id != MODERN_VIRTIO_BLOCK_DEVICE_ID {
+    if info.device_id != device_id {
         return Err(PciDiscoveryError::UnexpectedDeviceId {
             observed: info.device_id,
         });
@@ -1127,13 +1277,16 @@ pub(crate) unsafe fn mmio_phys_to_virt(paddr: PhysAddr, size: usize) -> NonNull<
     panic!("VirtIO requested MMIO outside retained BAR owners");
 }
 
-#[cfg(test)]
+#[cfg(any(test, ktest))]
 mod tests {
     use super::*;
+    #[cfg(ktest)]
+    use ostd::prelude::*;
 
     const SOURCE: &str = include_str!("pci.rs");
 
-    #[test]
+    #[cfg_attr(test, test)]
+    #[cfg_attr(ktest, ktest)]
     fn interrupt_config_word_decodes_line_and_pin_bytes() {
         let bdf = DeviceBdf::from_coordinates(0, 5, 0);
         let route = decode_intx_route(bdf, 0xa5_5a_02_0b);
@@ -1142,7 +1295,8 @@ mod tests {
         assert_eq!(route.pin(), 0x02);
     }
 
-    #[test]
+    #[cfg_attr(test, test)]
+    #[cfg_attr(ktest, ktest)]
     fn intx_command_transition_changes_only_interrupt_disable() {
         let original = Command::MEMORY_SPACE
             | Command::BUS_MASTER
@@ -1172,10 +1326,34 @@ mod tests {
         assert!(collateral.other_bits_changed());
     }
 
-    #[test]
+    #[cfg_attr(test, test)]
+    #[cfg_attr(ktest, ktest)]
+    fn boot_fence_command_changes_only_three_controlled_bits() {
+        let original = Command::IO_SPACE
+            | Command::BUS_MASTER
+            | Command::PARITY_ERROR_RESPONSE
+            | Command::SERR_ENABLE;
+        let fenced = command_with_boot_fence(original);
+
+        assert!(fenced.contains(Command::MEMORY_SPACE));
+        assert!(!fenced.contains(Command::BUS_MASTER));
+        assert!(fenced.contains(Command::INTERRUPT_DISABLE));
+        assert_eq!(
+            fenced.difference(BOOT_FENCE_CONTROLLED_BITS),
+            original.difference(BOOT_FENCE_CONTROLLED_BITS)
+        );
+        assert!(!boot_fence_changed_other_bits(original, fenced));
+        assert!(boot_fence_changed_other_bits(
+            original,
+            fenced | Command::FAST_BACK_TO_BACK_ENABLE
+        ));
+    }
+
+    #[cfg_attr(test, test)]
+    #[cfg_attr(ktest, ktest)]
     fn intx_masking_api_preserves_owner_checked_typestate_shape() {
         let implementation = SOURCE
-            .split_once("#[cfg(test)]")
+            .split_once("#[cfg(any(test, ktest))]")
             .expect("test module follows implementation")
             .0;
         assert!(implementation.contains(

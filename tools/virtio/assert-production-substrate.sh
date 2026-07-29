@@ -129,17 +129,32 @@ device_constructor=$(rust_block '^    pub fn for_owned_device' "$production") \
     || fail 'cannot isolate ProductionDevice constructor'
 for required in \
     '-> Result<Self, ProductionDeviceClaimError>' \
-    'let owner_id = allocate_production_owner_id()?;' \
-    '.try_claim_device_function()' \
-    '.ok_or(ProductionDeviceClaimError::DeviceAlreadyClaimed)?;' \
-    'Ok(Self {' \
-    'owner_id,'; do
+    'Self::for_owned_device_at_generation(root, 1)'; do
     grep -Fq -- "$required" <<<"$device_constructor" \
-        || fail "typed production device claim lacks: $required"
+        || fail "typed production device entrypoint lacks: $required"
 done
 if grep -Eq '(panic!|\.expect\(|\.unwrap\(|assert(_eq|_ne)?!)' \
     <<<"$device_constructor"; then
     fail 'supported production device constructor can panic on claim failure'
+fi
+generation_constructor=$(rust_block '^    pub[(]crate[)] fn for_owned_device_at_generation' "$production") \
+    || fail 'cannot isolate generation-bound ProductionDevice constructor'
+for required in \
+    '-> Result<Self, ProductionDeviceClaimError>' \
+    'if device_generation == 0 {' \
+    'return Err(ProductionDeviceClaimError::InvalidDeviceGeneration);' \
+    'let owner_id = allocate_production_owner_id()?;' \
+    '.try_claim_device_function()' \
+    '.ok_or(ProductionDeviceClaimError::DeviceAlreadyClaimed)?;' \
+    'Ok(Self {' \
+    'owner_id,' \
+    'device_generation,'; do
+    grep -Fq -- "$required" <<<"$generation_constructor" \
+        || fail "generation-bound production device claim lacks: $required"
+done
+if grep -Eq '(panic!|\.expect\(|\.unwrap\(|assert(_eq|_ne)?!)' \
+    <<<"$generation_constructor"; then
+    fail 'generation-bound production device constructor can panic on claim failure'
 fi
 owner_allocator=$(rust_block '^fn allocate_production_owner_id' "$production") \
     || fail 'cannot isolate production owner allocator'
@@ -156,7 +171,7 @@ if grep -Eq '(panic!|\.expect\(|\.unwrap\(|assert(_eq|_ne)?!)' \
 fi
 claim_error=$(rust_block '^pub enum ProductionDeviceClaimError' "$production") \
     || fail 'cannot isolate typed production device claim error'
-for variant in OwnerIdentityExhausted DeviceAlreadyClaimed; do
+for variant in InvalidDeviceGeneration OwnerIdentityExhausted DeviceAlreadyClaimed; do
     grep -Fq "$variant" <<<"$claim_error" \
         || fail "production device claim error lacks $variant"
 done
@@ -177,7 +192,11 @@ fi
 
 # The PCI route is descriptive; only Root's one-shot claim and linear
 # owner/epoch tokens authorize mask state transitions.
-pci_impl=$(awk '/^#\[cfg\(test\)\]$/ { exit } { print }' "$pci")
+pci_impl=$(awk '
+    /^#\[cfg\(test\)\]$/ { exit }
+    /^#\[cfg\(any\(test, ktest\)\)\]$/ { exit }
+    { print }
+' "$pci")
 root_struct=$(rust_block '^pub struct Root [{]' "$pci") \
     || fail 'cannot isolate PCI Root owner'
 for field in \
@@ -269,11 +288,48 @@ fi
 
 masked_constructor_count=$(grep -F -c 'MaskedIntx {' <<<"$pci_impl" || true)
 unmasked_constructor_count=$(grep -F -c 'UnmaskedIntx {' <<<"$pci_impl" || true)
-[[ $masked_constructor_count == 5 && $unmasked_constructor_count == 3 ]] \
+[[ $masked_constructor_count == 6 && $unmasked_constructor_count == 3 ]] \
     || fail "unexpected INTx token construction surface (masked=$masked_constructor_count unmasked=$unmasked_constructor_count)"
 
 claim_intx=$(rust_block '^    pub fn claim_masked_intx' "$pci") \
     || fail 'cannot isolate initial masked INTx claim'
+claim_boot_intx=$(rust_block '^    pub\\(crate\\) fn claim_boot_pci_fence' "$pci") \
+    || fail 'cannot isolate boot-time PCI fence'
+for required in \
+    'let expected = command_with_boot_fence(before);' \
+    'self.inner.set_command(self.device_function, expected);' \
+    'self.inner.get_status_command(self.device_function);' \
+    'bus_master_disabled: !observed.contains(Command::BUS_MASTER)' \
+    'intx_masked: observed.contains(Command::INTERRUPT_DISABLE)' \
+    'memory_space_enabled: observed.contains(Command::MEMORY_SPACE)' \
+    'if observed != expected {' \
+    'IntxOwnershipState::Poisoned {' \
+    'MaskedIntx {'; do
+    grep -Fq "$required" <<<"$claim_boot_intx" \
+        || fail "boot-time PCI fence lacks: $required"
+done
+boot_fence_command=$(rust_block '^const fn command_with_boot_fence' "$pci") \
+    || fail 'cannot isolate boot-time PCI command transform'
+for required in \
+    '.union(Command::MEMORY_SPACE)' \
+    '.union(Command::INTERRUPT_DISABLE)' \
+    '.difference(Command::BUS_MASTER)'; do
+    grep -Fq "$required" <<<"$boot_fence_command" \
+        || fail "boot-time PCI command transform lacks: $required"
+done
+discover_root=$(rust_block '^pub fn discover_and_own_bars' "$pci") \
+    || fail 'cannot isolate boot-time PCI discovery'
+for required in \
+    'if INITIAL_FENCE_POISONED.load(Ordering::Acquire) {' \
+    'let identity = configuration.read_word(EXPECTED_DEVICE, 0);' \
+    'let expected = command_with_boot_fence(before);' \
+    'root.set_command(EXPECTED_DEVICE, expected);' \
+    'if observed != expected {' \
+    'INITIAL_FENCE_POISONED.store(true, Ordering::Release);' \
+    'PciDiscoveryError::InitialFenceReadbackMismatch'; do
+    grep -Fq "$required" <<<"$discover_root" \
+        || fail "boot-time PCI discovery fence lacks: $required"
+done
 unmask_intx=$(rust_block '^    pub fn unmask_intx' "$pci") \
     || fail 'cannot isolate INTx unmask transition'
 mask_intx=$(rust_block '^    pub fn mask_intx' "$pci") \

@@ -141,6 +141,89 @@ impl DmaLedger {
 
 static DMA_LEDGER: SpinLock<DmaLedger> = SpinLock::new(DmaLedger::new());
 
+/// Failure before a boot-time global IOTLB barrier owns a pending invalidation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BootIotlbStartError {
+    AllocationFailed,
+    RemappingUnavailable,
+}
+
+/// Exact completed observation from one remapped, never-device-visible page.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BootIotlbObservation {
+    pub(crate) completed_pages: usize,
+    pub(crate) used_remapped_iova: bool,
+}
+
+/// Ownership-carrying boot-time global IOTLB invalidation.
+///
+/// The backing page was never exposed to a device. It exists only to force the
+/// patched OSTD VT-d path to remove a real remapped PTE and submit a global
+/// invalidation. Losing this value intentionally leaks the pending owner in
+/// OSTD, preserving fail-closed semantics.
+#[must_use = "poll to completion or retain the boot IOTLB tombstone"]
+pub(crate) struct BootIotlbTombstone {
+    pending: Option<PendingDmaUnmap>,
+}
+
+pub(crate) enum BootIotlbProgress {
+    Complete(BootIotlbObservation),
+    Pending(BootIotlbTombstone),
+    RetainedFailure(BootIotlbTombstone),
+}
+
+/// Starts a real global VT-d invalidation without reconstructing dead DMA
+/// owners from unverifiable addresses.
+///
+/// The dummy page is never shared with the device. A direct mapping is
+/// rejected: it would release safely, but it would not traverse VT-d and
+/// therefore cannot evidence a global IOTLB barrier.
+pub(crate) fn begin_boot_iotlb_barrier() -> Result<BootIotlbTombstone, BootIotlbStartError> {
+    let dma = DmaCoherent::alloc(1, true).map_err(|_| BootIotlbStartError::AllocationFailed)?;
+    if dma.daddr() == dma.paddr() {
+        drop(dma);
+        return Err(BootIotlbStartError::RemappingUnavailable);
+    }
+
+    // SAFETY: this allocation was never exposed to any device, and the boot
+    // caller has already reset the sole production fixture and disabled its
+    // bus mastering before entering this helper.
+    let pending = unsafe { dma.begin_unmap_invalidate() };
+    Ok(BootIotlbTombstone {
+        pending: Some(pending),
+    })
+}
+
+impl BootIotlbTombstone {
+    pub(crate) fn retry(mut self, poll_budget: usize) -> BootIotlbProgress {
+        for _ in 0..poll_budget {
+            let pending = self.pending.take().expect("boot IOTLB owner retained");
+            match pending.poll_complete() {
+                Ok(unmapped) => {
+                    assert_eq!(unmapped.size(), PAGE_SIZE);
+                    assert!(
+                        unmapped.original_daddr().is_some(),
+                        "boot barrier must complete through a remapped IOVA"
+                    );
+                    drop(unmapped);
+                    return BootIotlbProgress::Complete(BootIotlbObservation {
+                        completed_pages: 1,
+                        used_remapped_iova: true,
+                    });
+                }
+                Err(pending) => {
+                    let retained_failure = pending.failure().is_some();
+                    self.pending = Some(pending);
+                    if retained_failure {
+                        return BootIotlbProgress::RetainedFailure(self);
+                    }
+                }
+            }
+        }
+        BootIotlbProgress::Pending(self)
+    }
+}
+
 /// Read-only ownership projection used when the production facade issues
 /// preparation evidence.
 ///
