@@ -12,7 +12,7 @@ set -euo pipefail
 
 for command in swtpm tpm2_nvdefine tpm2_nvreadpublic tpm2_nvread \
     tpm2_nvwrite tpm2_nvincrement tpm2_nvundefine tpm2_startauthsession \
-    tpm2_policycommandcode tpm2_flushcontext tpm2_clear cmp xxd dd; do
+    tpm2_policycommandcode tpm2_flushcontext tpm2_clear cmp xxd dd sleep; do
     if ! command -v "$command" >/dev/null 2>&1; then
         echo "missing required command: $command" >&2
         exit 1
@@ -22,12 +22,45 @@ done
 fixture_dir=$(mktemp -d /tmp/cser-tpm-nv-smoke.XXXXXX)
 swtpm_pid=
 
+wait_for_swtpm_exit() {
+    local pid=$1
+    for _ in {1..500}; do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            return 0
+        fi
+        sleep 0.01
+    done
+    echo "swtpm did not exit after SIGKILL: pid=$pid" >&2
+    return 1
+}
+
+stop_swtpm() {
+    local pid=${swtpm_pid:-}
+    if [[ -z $pid ]]; then
+        return 0
+    fi
+    if [[ ! $pid =~ ^[1-9][0-9]*$ ]]; then
+        echo "swtpm returned an invalid pid: $pid" >&2
+        return 1
+    fi
+    if kill -0 "$pid" 2>/dev/null; then
+        if ! kill -KILL "$pid" 2>/dev/null && kill -0 "$pid" 2>/dev/null; then
+            echo "failed to send SIGKILL to swtpm: pid=$pid" >&2
+            return 1
+        fi
+        wait_for_swtpm_exit "$pid" || return 1
+    fi
+    swtpm_pid=
+}
+
 cleanup() {
-    if [[ -n "$swtpm_pid" ]] && kill -0 "$swtpm_pid" 2>/dev/null; then
-        kill "$swtpm_pid" 2>/dev/null || true
-        wait "$swtpm_pid" 2>/dev/null || true
+    local status=$?
+    trap - EXIT
+    if ! stop_swtpm; then
+        status=1
     fi
     rm -rf -- "$fixture_dir"
+    exit "$status"
 }
 trap cleanup EXIT
 
@@ -49,12 +82,15 @@ start_swtpm() {
         --pid "file=$pid_file" \
         --daemon
     swtpm_pid=$(tr -d '\n' <"$pid_file")
+    if [[ ! $swtpm_pid =~ ^[1-9][0-9]*$ ]] \
+        || ! kill -0 "$swtpm_pid" 2>/dev/null; then
+        echo "swtpm did not start the smoke-test daemon" >&2
+        return 1
+    fi
 }
 
 crash_swtpm() {
-    kill -KILL "$swtpm_pid"
-    wait "$swtpm_pid" 2>/dev/null || true
-    swtpm_pid=
+    stop_swtpm
 }
 
 counter_hex() {

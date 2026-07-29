@@ -16,7 +16,7 @@ fi
 for command in swtpm tpm2_nvdefine tpm2_nvreadpublic tpm2_nvread \
     tpm2_nvwrite tpm2_nvincrement tpm2_startauthsession \
     tpm2_policycommandcode tpm2_flushcontext xxd sha256sum cmp stat \
-    cut flock realpath; do
+    cut flock realpath sleep; do
     if ! command -v "$command" >/dev/null 2>&1; then
         echo "missing required command: $command" >&2
         exit 1
@@ -54,12 +54,45 @@ fi
 work_dir=$(mktemp -d /tmp/cser-tpm-nv-provision.XXXXXX)
 swtpm_pid=
 
+wait_for_swtpm_exit() {
+    local pid=$1
+    for _ in {1..500}; do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            return 0
+        fi
+        sleep 0.01
+    done
+    echo "swtpm did not exit after SIGKILL: pid=$pid" >&2
+    return 1
+}
+
+stop_swtpm() {
+    local pid=${swtpm_pid:-}
+    if [[ -z $pid ]]; then
+        return 0
+    fi
+    if [[ ! $pid =~ ^[1-9][0-9]*$ ]]; then
+        echo "swtpm returned an invalid pid: $pid" >&2
+        return 1
+    fi
+    if kill -0 "$pid" 2>/dev/null; then
+        if ! kill -KILL "$pid" 2>/dev/null && kill -0 "$pid" 2>/dev/null; then
+            echo "failed to send SIGKILL to swtpm: pid=$pid" >&2
+            return 1
+        fi
+        wait_for_swtpm_exit "$pid" || return 1
+    fi
+    swtpm_pid=
+}
+
 cleanup() {
-    if [[ -n "$swtpm_pid" ]] && kill -0 "$swtpm_pid" 2>/dev/null; then
-        kill -KILL "$swtpm_pid" 2>/dev/null || true
-        wait "$swtpm_pid" 2>/dev/null || true
+    local status=$?
+    trap - EXIT
+    if ! stop_swtpm; then
+        status=1
     fi
     rm -rf -- "$work_dir"
+    exit "$status"
 }
 trap cleanup EXIT
 
@@ -79,6 +112,11 @@ swtpm socket \
     --pid "file=$pid_file" \
     --daemon
 swtpm_pid=$(tr -d '\n' <"$pid_file")
+if [[ ! $swtpm_pid =~ ^[1-9][0-9]*$ ]] \
+    || ! kill -0 "$swtpm_pid" 2>/dev/null; then
+    echo "swtpm did not start the provisioning daemon" >&2
+    exit 1
+fi
 
 readonly TIP_COUNTER=0x01800100
 readonly TIP_SLOT_0=0x01800101
@@ -196,9 +234,7 @@ cmp "$work_dir/lease-genesis.bin" "$work_dir/lease-readback.bin"
 
 # Stop without TPM2_Shutdown. ORDERLY is clear on every index, so successful
 # writes and increments must already be in the NV version.
-kill -KILL "$swtpm_pid"
-wait "$swtpm_pid" 2>/dev/null || true
-swtpm_pid=
+stop_swtpm
 
 echo \
     "CSER_TPM_NV_PROVISION PASS indices=6 selectors=tip+lease sequence=1 platform_created=true policy_delete=true writeall=true orderly=false fixture_auth=empty swtpm_state_rollbackable=true physical_antirollback=false"

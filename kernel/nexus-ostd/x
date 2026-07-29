@@ -903,7 +903,8 @@ start_core_persistent_swtpm() {
         --pid "file=$core_persistent_pid_file" \
         --daemon
     core_persistent_pid=$(tr -d '\n' <"$core_persistent_pid_file")
-    if [[ ! -S $core_persistent_socket ]] \
+    if [[ ! $core_persistent_pid =~ ^[1-9][0-9]*$ ]] \
+        || [[ ! -S $core_persistent_socket ]] \
         || ! kill -0 "$core_persistent_pid" 2>/dev/null; then
         echo "swtpm did not create the persistent-profile socket" >&2
         return 1
@@ -911,15 +912,28 @@ start_core_persistent_swtpm() {
 }
 
 stop_core_persistent_swtpm() {
-    if [[ -n ${core_persistent_pid:-} ]] \
-        && kill -0 "$core_persistent_pid" 2>/dev/null; then
-        kill -KILL "$core_persistent_pid"
-        for _ in {1..100}; do
-            if ! kill -0 "$core_persistent_pid" 2>/dev/null; then
-                break
+    local pid=${core_persistent_pid:-}
+    if [[ -z $pid ]]; then
+        return 0
+    fi
+    if [[ ! $pid =~ ^[1-9][0-9]*$ ]]; then
+        echo "swtpm returned an invalid persistent-profile pid: $pid" >&2
+        return 1
+    fi
+    if kill -0 "$pid" 2>/dev/null; then
+        if ! kill -KILL "$pid" 2>/dev/null && kill -0 "$pid" 2>/dev/null; then
+            echo "failed to send SIGKILL to persistent-profile swtpm: pid=$pid" >&2
+            return 1
+        fi
+        for _ in {1..500}; do
+            if ! kill -0 "$pid" 2>/dev/null; then
+                core_persistent_pid=
+                return 0
             fi
             sleep 0.01
         done
+        echo "persistent-profile swtpm did not exit after SIGKILL: pid=$pid" >&2
+        return 1
     fi
     core_persistent_pid=
 }
@@ -940,11 +954,16 @@ run_core_persistent_guest() {
 capture_core_persistent_boot() (
     local serial=$1
     local debug=$2
+    local capture_status=0
     start_core_persistent_swtpm
-    trap stop_core_persistent_swtpm EXIT
+    trap 'stop_core_persistent_swtpm || exit 1' EXIT
     # shellcheck source=scripts/qemu-stream-capture.sh
     source "$capture_helper"
-    capture_qemu_streams "$serial" "$debug" run_core_persistent_guest
+    capture_qemu_streams "$serial" "$debug" run_core_persistent_guest \
+        || capture_status=$?
+    stop_core_persistent_swtpm
+    trap - EXIT
+    return "$capture_status"
 )
 
 require_core_persistent_marker() {
