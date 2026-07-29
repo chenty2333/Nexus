@@ -72,7 +72,7 @@ kernel, service, resource, and device map is
 | Track | Status | Meaning |
 | --- | --- | --- |
 | `v0.1.0` | Published, archived research artifact | Bounded CSER composition with reproducible models, implementation slices, and receipts |
-| Current `main` | CSER Core Rebaseline cutover candidate | Portable core, persistent recovery path, reply/DMA adapters, and one production Registry closure are implemented; the final exact-revision combined recovery receipt and release-ledger seal remain pending |
+| Current `main` | CSER Core Rebaseline sealed | Portable core, persistent recovery, reply/DMA recovery, and the single production Registry cutover are sealed at `c06e9f4` by the bounded four-boot receipt recorded in the release ledger |
 | Production system | Not established | The `cser-production` profile is a bounded QEMU research path, not a hardware-general, SMP, availability, or production-readiness result |
 | Paper | None peer reviewed | `NARRATIVE.md` is a technical research account; the Zenodo object is software and reproducibility evidence |
 
@@ -119,17 +119,17 @@ reply outbox, and swtpm state, with device quarantine established before
 replay. Those focused schemes provide domain evidence; they are not alternate
 production Registries and do not introduce live dual-write.
 
-This is still a cutover candidate, not a sealed result. Final acceptance waits
-for the complete combined receipt at the exact source revision and the release
-ledger seal. The production sequence must show initial commit and retained
-claims, a second crash after durable reply apply intent, reconciliation without
-a second intent and final settlement, and a stable repeated-recovery boot. Its
-host oracle must also verify strictly increasing boot, journal, and device
-freshness. Even a successful receipt is bounded to one-vCPU QEMU/TCG and swtpm:
-it does not establish physical TPM anti-rollback, physical power-loss behavior,
-hardware-general DMA quiescence or custody, crash-persistent PFN/IOVA custody,
-resource reuse authorization, or SMP correctness. Historical IRQ Phase A and
-`v0.1.0` evidence retain their original boundaries.
+The clean exact-revision receipt and release ledger seal the bounded rebaseline
+at `c06e9f4`. The four production boots show initial commit and retained claims,
+a second service crash after durable reply apply intent, reconciliation without
+a second intent and final settlement, and a stable repeated-recovery boot. The
+host oracle verifies service/binding generations `1/1` through `4/4` and
+strictly increasing boot, journal, and device freshness. This receipt remains
+bounded to one-vCPU QEMU/TCG and swtpm: it does not establish physical TPM
+anti-rollback, physical power-loss behavior, hardware-general DMA quiescence or
+custody, crash-persistent PFN/IOVA custody, resource reuse authorization, or SMP
+correctness. Historical IRQ Phase A and `v0.1.0` evidence retain their original
+boundaries.
 
 ## Use the repository
 

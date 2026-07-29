@@ -1,27 +1,30 @@
 # CSER Core Production Cutover Release Ledger
 
 - RFC: `docs/rfcs/0006-cser-core-semantic-rebaseline.md`
-- Ledger status: **PENDING -- not release evidence**
-- Cutover commit A: **PENDING**
-- Clean four-boot receipt digest D: **PENDING**
-- Attestation record B: **PENDING -- not yet created**
+- Ledger status: **SEALED -- bounded QEMU cutover evidence**
+- Cutover commit A: `c06e9f43e931ed3f130da6dfcf29452a45406152`
+- Clean four-boot receipt digest D:
+  `e0f959e5c4027fb3952384b77de38b6c97e8c5bdd5a9c20f109c515361cf6f1e`
+- Attestation record B: **this status-only commit; its Git object identity is
+  the external provenance record**
 - Static cutover gate: `kernel/nexus-ostd/scripts/assert-cser-core-production-cutover.sh`
 
-These placeholders are intentional. They must not be filled from a dirty-tree
-`combined-proof.txt`, from an earlier source revision, or before the clean seal
-passes. Until commit A and digest D are recorded by attestation commit B, the
-entries below are required release dispositions rather than claims about the
-current tree.
+Commit A and digest D above came from `seal-core-persistent-recovery` on the
+clean A tree. They were not copied from the earlier dirty-tree
+`combined-proof.txt`. This attestation commit changes only release status and
+documentation; it does not redefine the production cutover whose runtime
+behavior D attests.
 
 ## Two-Commit Seal Protocol
 
-The release avoids an impossible commit which both contains its own receipt and
-claims that the receipt was generated from that same clean commit:
+The release used two commits to avoid an impossible commit which both contains
+its own receipt and claims that the receipt was generated from that same clean
+commit:
 
 1. **Cutover commit A** contains the complete production semantic cutover,
    verification wiring, and this ledger with pending attestation fields. A is
    the revision whose runtime behavior is being attested.
-2. From a clean checkout of A, run
+2. From the clean A tree,
    `kernel/nexus-ostd/x seal-core-persistent-recovery`. The seal must complete
    all four boots and produce `combined-receipt.txt` with `PASS`,
    `seal_requested=true`, `git_source_tree_clean=true`, and `git_revision=A`.
@@ -77,8 +80,8 @@ through a tag.
 
 ## QEMU Evidence Boundary
 
-The clean receipt identified by A and D, when those fields are filled,
-establishes only one hermetic run of the pinned OSTD/QEMU profile with:
+The clean receipt identified by A and D establishes only one hermetic run of
+the pinned OSTD/QEMU profile with:
 
 - four separate guest boots over the same `journal.raw`, reply `outbox.raw`,
   and swtpm state directory;
@@ -117,7 +120,7 @@ resources became reusable.
 
 ## Seal Checklist
 
-Before creating cutover commit A:
+Cutover commit A satisfied all of the following before it was created:
 
 - the static cutover gate passes against the default production graph;
 - the ordinary combined runner observes all four boot markers while preserving
@@ -126,7 +129,7 @@ Before creating cutover commit A:
   from production adapters, the kernel, or release workflows; and
 - exactly one recovered core runtime is published before vNext ingress opens.
 
-After A exists:
+The clean seal and this attestation then established all of the following:
 
 - the tree is clean before and throughout `seal-core-persistent-recovery`;
 - the clean receipt binds all four markers and its source/tool hashes to A;

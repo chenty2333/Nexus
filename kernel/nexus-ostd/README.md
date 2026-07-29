@@ -79,8 +79,9 @@ The acceptance parser requires the following sequence:
    acknowledges the reply without minting a second intent, then settles and
    retires the reply obligation.
 4. Boot 4 repeats recovery without duplicating evidence or settlement and
-   demonstrates the stable retained state. Across all four boots, the host
-   oracle requires boot, journal, and device freshness to increase strictly.
+    demonstrates the stable retained state. Across all four boots, the host
+   oracle requires exact service/binding pairs `1/1` through `4/4`, while boot,
+   journal, and device freshness increase strictly.
 
 The pinned-page and IOVA claims remain retained. Activation stays blocked and
 `resource_reuse_authorized=false`, because a boot-global IOTLB observation does
@@ -97,8 +98,9 @@ with `NONSEALABLE`; it is suitable for pre-commit integration but not release
 evidence. `seal-core-persistent-recovery` first requires a clean source tree and
 then writes `combined-receipt.txt` with `PASS` only if the tree remains clean
 through the run. The archived production/focused ISOs, boot serial logs, QEMU
-debug traces, raw media, and swtpm logs remain beside it. This README does not
-assert that the final cutover receipt has been sealed.
+debug traces, raw media, and swtpm logs remain beside it. Cutover commit
+`c06e9f43e931ed3f130da6dfcf29452a45406152` passed that clean seal; its receipt
+SHA-256 is recorded in the production cutover release ledger.
 
 ## Workflow
 

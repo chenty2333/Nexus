@@ -6,8 +6,8 @@ historical observations, not the current implementation boundary. RFC 0001,
 RFC 0005, the old Registry, and the live effect-peer service named below are
 **Superseded** by
 [`docs/rfcs/0006-cser-core-semantic-rebaseline.md`](../docs/rfcs/0006-cser-core-semantic-rebaseline.md).
-Current cutover status is recorded in that RFC and, after an exact clean-source
-proof, `docs/research/cser-core-production-cutover-release-ledger.md`.
+Current sealed cutover status and its exact clean-source proof are recorded in
+that RFC and `docs/research/cser-core-production-cutover-release-ledger.md`.
 
 `current-capabilities.toml` retains its filename for compatibility with the
 accepted archive, but its classification and checkpoint statuses explicitly

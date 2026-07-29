@@ -1,14 +1,13 @@
 # RFC 0006: CSER core semantic rebaseline
 
-- Status: **Implemented production-cutover candidate; final exact-revision
-  combined four-boot receipt and release-ledger seal pending**
+- Status: **Implemented and sealed for the bounded QEMU profile**
 - Decision date: 2026-07-29
 - Pre-rebaseline checkpoint: `05e68b19b219d0f5288de5438127b5690cd7e50f`
 - Recovery references:
   `archive/pre-cser-core-rebaseline-2026-07-29` and
   `pre-cser-core-rebaseline-2026-07-29`
-- API stability: **profile 1 and journal schema 5 are mechanically pinned;
-  R4 release closure is recorded only after the clean exact-revision seal**
+- API stability: **R4 closed; profile 1, journal schema 5, and the standard
+  catalog digest are frozen**
 - Changes accepted `v0.1.0` claims: **no**
 
 ## Decision
@@ -518,7 +517,7 @@ They are ordered by semantic dependency, not feature count.
 
 ### Current implementation status (2026-07-30)
 
-Current `main` is an R6 cutover candidate, not a sealed completion claim:
+The R6 cutover is sealed for the bounded evidence profile:
 
 - `cser-core` is the portable authoritative state machine, with domain-defined
   reply and DMA obligation/claim profiles, versioned journal records,
@@ -543,13 +542,15 @@ Current `main` is an R6 cutover candidate, not a sealed completion claim:
   performs a fresh stable Rebind. The host gate observes exact service/binding
   pairs `1/1`, `2/2`, `3/3`, and `4/4`.
 
-The final combined four-boot receipt has not yet been sealed against the exact
-cutover revision, so R4 release attestation, R6, and this RFC remain open. The
-QEMU/swtpm path cannot establish physical TPM anti-rollback, physical
-power-loss recovery, hardware-general DMA quiescence, crash-persistent
-PFN/IOVA custody, or resource reuse. Global reset, ISR drain, and IOTLB
-observations preserve quarantine; they do not by themselves prove retirement
-of old page/IOVA claims.
+Cutover commit `c06e9f43e931ed3f130da6dfcf29452a45406152` passed the clean
+four-boot seal. The receipt SHA-256 is
+`e0f959e5c4027fb3952384b77de38b6c97e8c5bdd5a9c20f109c515361cf6f1e`;
+the release ledger records its exact boundary. R4, R5, and R6 are closed within
+that boundary. The QEMU/swtpm path does not establish physical TPM
+anti-rollback, physical power-loss recovery, hardware-general DMA quiescence,
+crash-persistent PFN/IOVA custody, or resource reuse. Global reset, ISR drain,
+and IOTLB observations preserve quarantine; they do not by themselves prove
+retirement of old page/IOVA claims.
 
 ### R0: preserve and rebaseline
 
@@ -790,5 +791,7 @@ establishes all of the following together:
 - a single production Registry after an atomic cutover; and
 - immutable historical evidence plus exact new claims and non-claims.
 
-Any missing item remains open. API cleanup, a passing unit suite, or a renamed
-Registry is not completion.
+The exact source-bound evidence chain above is sealed by the production cutover
+release ledger. Completion is limited to its declared QEMU/swtpm/ATA profile;
+API cleanup, a passing unit suite, or a renamed Registry alone would not have
+satisfied this acceptance contract.

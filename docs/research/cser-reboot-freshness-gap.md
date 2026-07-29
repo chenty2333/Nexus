@@ -1,8 +1,7 @@
 # CSER reboot freshness: historical OSTD provider-gap audit
 
 Status: **Superseded implementation-gap audit. Provider implementation and the
-ordinary dirty-tree four-boot proof passed; clean exact-revision receipt
-pending, 2026-07-30.**
+clean exact-revision four-boot receipt are sealed, 2026-07-30.**
 
 This note originally recorded why the production-shaped boot coordinator had
 no OSTD persistence provider on 2026-07-29. That inventory is retained as a
@@ -23,10 +22,10 @@ The rebaseline candidate now provides the missing pinned-profile owners:
 - `core_device_quarantine.rs` fences VirtIO/PCI and observes reset, ISR drain,
   and global VT-d invalidation before journal replay.
 
-The ordinary combined proof has passed four QEMU boots over those same owners:
+The clean exact-revision receipt passed four QEMU boots over those same owners:
 commit, durable apply intent and second crash, reconciliation without a second
-intent, then stable replay. Until its clean exact-revision receipt is sealed,
-this remains a cutover candidate rather than release evidence.
+intent, then stable replay. Its exact cutover revision, digest, and evidence
+boundary are recorded in the production cutover release ledger.
 
 The provider proves only its pinned QEMU/swtpm/ATA protocol. swtpm state and raw
 media remain host-rollbackable, so this is not physical malicious-rollback
