@@ -145,6 +145,7 @@ Broader development and acceptance entry points are:
 ./x run [kernel|virtio|composition]
 NEXUS_REBUILD=1 ./x verify
 ./x verify-bundle target/verification/artifact-bundle
+./x clean [--all]
 ```
 
 The full gate can take tens of minutes and substantial Docker/workspace
