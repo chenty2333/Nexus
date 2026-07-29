@@ -61,6 +61,30 @@ qemu.args = """\
     -drive if=pflash,format=raw,unit=1,file=/tmp/nexus-home/OVMF_VARS.fd \
 """
 
+[scheme."cser-core-tpm-anchor"]
+build.features = ["cser-core-tpm-anchor"]
+qemu.args = """\
+    -nodefaults \
+    -machine q35,kernel-irqchip=split \
+    -accel tcg,thread=single \
+    -cpu Icelake-Server,+x2apic \
+    -m 1G \
+    -smp 1 \
+    -no-reboot \
+    -display none \
+    -monitor none \
+    -chardev stdio,id=serial0,signal=off \
+    -serial chardev:serial0 \
+    -chardev file,id=entry-debugcon,path=/work/artifacts/cser-core-tpm-anchor/task-entry-debugcon.log \
+    -device isa-debugcon,iobase=0xe9,chardev=entry-debugcon \
+    -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
+    -chardev socket,id=chrtpm,path=/work/artifacts/cser-core-tpm-anchor/swtpm-qemu.sock \
+    -tpmdev emulator,id=tpm0,chardev=chrtpm \
+    -device tpm-tis,tpmdev=tpm0 \
+    -drive if=pflash,format=raw,unit=0,readonly=on,file=/root/ovmf/release/OVMF.fd \
+    -drive if=pflash,format=raw,unit=1,file=/tmp/nexus-home/OVMF_VARS.fd \
+"""
+
 [scheme."runtime-fs-same-boot"]
 build.features = ["virtio-cser-facade"]
 qemu.args = """\

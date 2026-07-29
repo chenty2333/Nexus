@@ -204,12 +204,21 @@ build_image() {
 
 container() {
     local -a cpu_args=()
+    local -a security_args=()
     if [[ -n ${NEXUS_CONTAINER_CPUSET:-} ]]; then
         cpu_args=(--cpuset-cpus "$NEXUS_CONTAINER_CPUSET")
+    fi
+    if [[ ${NEXUS_CONTAINER_HOST_UNIX_SOCKET:-0} == 1 ]]; then
+        # Fedora SELinux denies a container-domain process access to a Unix
+        # socket created by host swtpm even after the bind tree is relabeled.
+        # This opt-out is used only by the isolated TPM fixture container; the
+        # default build and every production workflow retain Docker labeling.
+        security_args=(--security-opt label=disable)
     fi
     command "$docker_bin" run --rm \
         --init \
         "${cpu_args[@]}" \
+        "${security_args[@]}" \
         --platform linux/amd64 \
         --network none \
         --user "$(id -u):$(id -g)" \
@@ -852,6 +861,8 @@ check_kernel() {
         --features virtio-cser-facade
     container cargo check --locked --offline --target x86_64-unknown-none \
         --no-default-features --features cser-core-runtime-spike
+    container cargo check --locked --offline --target x86_64-unknown-none \
+        --no-default-features --features cser-core-tpm-anchor
     container cargo osdk check --locked
 }
 
@@ -1003,6 +1014,116 @@ capture_core_dma_recovery_run() {
         return 1
     fi
     echo 'CSER_CORE_DMA_QEMU PASS queue=real-virtio completion=real-irq reset=real-device iotlb=real-vtd qemu=true physical_hardware=false'
+}
+
+build_core_tpm_anchor_kernel() {
+    check_kernel
+    prepare_runner_base
+    container cargo osdk build --scheme cser-core-tpm-anchor
+    assert_runner_base
+}
+
+core_tpm_anchor_artifact_dir="$root/artifacts/cser-core-tpm-anchor"
+core_tpm_anchor_state_dir="$core_tpm_anchor_artifact_dir/tpmstate"
+core_tpm_anchor_socket="$core_tpm_anchor_artifact_dir/swtpm-qemu.sock"
+core_tpm_anchor_pid_file="$core_tpm_anchor_artifact_dir/swtpm.pid"
+core_tpm_anchor_pid=
+
+prepare_core_tpm_anchor_artifacts() {
+    mkdir -p "$core_tpm_anchor_artifact_dir"
+    rm -f \
+        "$core_tpm_anchor_artifact_dir/boot1-serial.log" \
+        "$core_tpm_anchor_artifact_dir/boot1-qemu-debug.log" \
+        "$core_tpm_anchor_artifact_dir/boot2-serial.log" \
+        "$core_tpm_anchor_artifact_dir/boot2-qemu-debug.log" \
+        "$core_tpm_anchor_artifact_dir/swtpm.log" \
+        "$core_tpm_anchor_artifact_dir/task-entry-debugcon.log" \
+        "$core_tpm_anchor_socket" \
+        "$core_tpm_anchor_pid_file"
+    rm -rf -- "$core_tpm_anchor_state_dir"
+    mkdir -p "$core_tpm_anchor_state_dir"
+}
+
+start_core_tpm_anchor_swtpm() {
+    if ! command -v swtpm >/dev/null 2>&1; then
+        echo "run-core-tpm-anchor requires host swtpm" >&2
+        return 1
+    fi
+    rm -f "$core_tpm_anchor_socket" "$core_tpm_anchor_pid_file"
+    swtpm socket \
+        --tpm2 \
+        --tpmstate "dir=$core_tpm_anchor_state_dir,lock" \
+        --ctrl "type=unixio,path=$core_tpm_anchor_socket" \
+        --flags not-need-init,startup-none,disable-auto-shutdown \
+        --log "file=$core_tpm_anchor_artifact_dir/swtpm.log,level=20" \
+        --pid "file=$core_tpm_anchor_pid_file" \
+        --daemon
+    core_tpm_anchor_pid=$(tr -d '\n' <"$core_tpm_anchor_pid_file")
+    if [[ ! -S $core_tpm_anchor_socket ]] \
+        || ! kill -0 "$core_tpm_anchor_pid" 2>/dev/null; then
+        echo "swtpm did not create a live QEMU control socket" >&2
+        return 1
+    fi
+}
+
+stop_core_tpm_anchor_swtpm() {
+    if [[ -n ${core_tpm_anchor_pid:-} ]] \
+        && kill -0 "$core_tpm_anchor_pid" 2>/dev/null; then
+        # No TPM2_Shutdown: each guest boundary is a non-orderly emulator
+        # restart, while all CSER indices have TPMA_NV_ORDERLY clear.
+        kill -KILL "$core_tpm_anchor_pid"
+        for _ in {1..100}; do
+            if ! kill -0 "$core_tpm_anchor_pid" 2>/dev/null; then
+                break
+            fi
+            sleep 0.01
+        done
+    fi
+    core_tpm_anchor_pid=
+}
+
+run_core_tpm_anchor_guest() {
+    NEXUS_CONTAINER_HOST_UNIX_SOCKET=1 container bash -c '
+        set -euo pipefail
+        cp /root/ovmf/release/OVMF_VARS.fd "$HOME/OVMF_VARS.fd"
+        exec timeout --signal=TERM --kill-after=2s 60s \
+            cargo osdk run --scheme cser-core-tpm-anchor
+    '
+    assert_runner_base
+}
+
+capture_core_tpm_anchor_boot() (
+    local serial=$1
+    local debug=$2
+    start_core_tpm_anchor_swtpm
+    trap stop_core_tpm_anchor_swtpm EXIT
+    # shellcheck source=scripts/qemu-stream-capture.sh
+    source "$capture_helper"
+    capture_qemu_streams "$serial" "$debug" run_core_tpm_anchor_guest
+)
+
+capture_core_tpm_anchor_run() {
+    build_core_tpm_anchor_kernel
+    bash "$root/scripts/provision-cser-tpm-nv.sh" \
+        "$core_tpm_anchor_state_dir"
+
+    capture_core_tpm_anchor_boot \
+        "$core_tpm_anchor_artifact_dir/boot1-serial.log" \
+        "$core_tpm_anchor_artifact_dir/boot1-qemu-debug.log"
+    capture_core_tpm_anchor_boot \
+        "$core_tpm_anchor_artifact_dir/boot2-serial.log" \
+        "$core_tpm_anchor_artifact_dir/boot2-qemu-debug.log"
+
+    tr -d '\r' <"$core_tpm_anchor_artifact_dir/boot1-serial.log" \
+        | grep -Fx \
+            'CSER_TPM_NV_QEMU PASS transport=qemu-tis provider=tpm2-nv selectors=tip+lease single_writer_enforced=true writeall=true before_revision=0 after_revision=1 before_boot=1 after_boot=2 before_journal=1 after_journal=2 transition_committed=true physical_antirollback=false swtpm_state_rollbackable=true device_reset_evidence=false journal_payload=absent' \
+            >/dev/null
+    tr -d '\r' <"$core_tpm_anchor_artifact_dir/boot2-serial.log" \
+        | grep -Fx \
+            'CSER_TPM_NV_QEMU PASS transport=qemu-tis provider=tpm2-nv selectors=tip+lease single_writer_enforced=true writeall=true before_revision=1 after_revision=2 before_boot=2 after_boot=3 before_journal=2 after_journal=3 transition_committed=true physical_antirollback=false swtpm_state_rollbackable=true device_reset_evidence=false journal_payload=absent' \
+            >/dev/null
+    echo \
+        'CSER_TPM_NV_QEMU_RESTART PASS boots=2 qemu_tis=true real_tpm2_commands=true single_writer_enforced=true writeall=true non_orderly_swtpm_restart=true tip_revision=0->1->2 freshness=1->2->3 physical_antirollback=false durable_journal=false'
 }
 
 build_same_boot_kernel() {
@@ -1382,6 +1503,19 @@ case "$command" in
         prepare_core_dma_recovery_artifacts
         capture_core_dma_recovery_run
         ;;
+    build-core-tpm-anchor)
+        ensure_image
+        check_ostd_patch
+        prepare_guest
+        build_core_tpm_anchor_kernel
+        ;;
+    run-core-tpm-anchor)
+        ensure_image
+        check_ostd_patch
+        prepare_guest
+        prepare_core_tpm_anchor_artifacts
+        capture_core_tpm_anchor_run
+        ;;
     build-same-boot)
         ensure_image
         check_ostd_patch
@@ -1624,7 +1758,7 @@ case "$command" in
         rm -f "$repo_root/target/verification/linux-io-composition-oracle.log"
         ;;
     *)
-        echo "usage: ./x {doctor|image|fmt|check|clippy|build|build-core-runtime-spike|run-core-runtime-spike|build-core-dma-recovery|run-core-dma-recovery|build-same-boot|build-same-boot-precommit|build-same-boot-postcommit-crash|iommu-probe|run|run-same-boot|run-same-boot-precommit|run-same-boot-postcommit-crash|test|test-same-boot|test-same-boot-precommit|test-same-boot-postcommit-crash|eval-stage7b|clean}" >&2
+        echo "usage: ./x {doctor|image|fmt|check|clippy|build|build-core-runtime-spike|run-core-runtime-spike|build-core-dma-recovery|run-core-dma-recovery|build-core-tpm-anchor|run-core-tpm-anchor|build-same-boot|build-same-boot-precommit|build-same-boot-postcommit-crash|iommu-probe|run|run-same-boot|run-same-boot-precommit|run-same-boot-postcommit-crash|test|test-same-boot|test-same-boot-precommit|test-same-boot-postcommit-crash|eval-stage7b|clean}" >&2
         exit 2
         ;;
 esac

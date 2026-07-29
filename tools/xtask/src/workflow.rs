@@ -2500,7 +2500,7 @@ fn validate_backend_source_pair_semantics(
         .into());
     }
     let expected_helper_sources = if relative == "kernel/nexus-ostd/x" {
-        7
+        8
     } else {
         1
     };
@@ -2593,7 +2593,7 @@ fn validate_backend_source_pair_semantics(
 fn expected_backend_source_sha256(relative: &str) -> Result<&'static str> {
     match relative {
         "kernel/nexus-ostd/x" => {
-            Ok("0b5dc0471c8ca8baa37e3f6f3b03f12d59859c05037ba3145eac262ad717075c")
+            Ok("0aa239aab9b0a29c36cfac008f552b3e6c7754e782dfc39e3dacb9446d5c3485")
         }
         "experiments/ostd-virtio-cser-spike/x" => {
             Ok("e51d863a8134cfd8b25ff33438441c73a93f6548ea0202fad54a6c4270153ee9")
@@ -2830,7 +2830,7 @@ fn validate_backend_docker_source_set_semantics(
 fn expected_backend_docker_sha256(relative: &str) -> Result<&'static str> {
     match relative {
         "kernel/nexus-ostd/Dockerfile" => {
-            Ok("79c936c6b756ff33da1ea75b368f1aeb42baafc096d9a6212d6c3413b5f4fb17")
+            Ok("37c47c914df77dd3359b3724f185d702e204f31818e4bcb55512ba74c0d5fbb8")
         }
         "experiments/ostd-virtio-cser-spike/Dockerfile" => {
             Ok("e478eb1eab911acb14d6a5e02f973d6574728e5f28d74b914b5eb70417fbea99")

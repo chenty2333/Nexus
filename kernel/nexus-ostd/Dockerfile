@@ -238,6 +238,8 @@ RUN --mount=type=bind,source=kernel/nexus-ostd,target=/tmp/nexus-ostd-source,rea
         --features virtio-cser-facade \
     && cargo check --locked --target x86_64-unknown-none \
         --no-default-features --features cser-core-runtime-spike \
+    && cargo check --locked --target x86_64-unknown-none \
+        --no-default-features --features cser-core-tpm-anchor \
     && cargo osdk check --locked \
     && bash scripts/check-fsbase-api.sh \
     && bash scripts/check-scheduler-attempt.sh \
@@ -253,6 +255,7 @@ RUN --mount=type=bind,source=kernel/nexus-ostd,target=/tmp/nexus-ostd-source,rea
     && CARGO_NET_OFFLINE=true cargo osdk build --scheme runtime-fs-same-boot-postcommit-crash \
     && CARGO_NET_OFFLINE=true cargo osdk build \
         --no-default-features --features cser-core-runtime-spike \
+    && CARGO_NET_OFFLINE=true cargo osdk build --scheme cser-core-tpm-anchor \
     && cmp /tmp/nexus-ostd-inputs/Cargo.lock /work/Cargo.lock \
     && diff -ru /tmp/nexus-ostd-inputs/osdk-runner-base \
         /work/target/osdk/nexus-kernel-run-base \

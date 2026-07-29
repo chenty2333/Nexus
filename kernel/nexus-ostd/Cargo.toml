@@ -10,6 +10,7 @@ publish = false
 [features]
 cser-core-runtime-spike = ["dep:cser-core"]
 cser-core-dma-slice = ["cser-core-runtime-spike", "dep:nexus-ostd-virtio"]
+cser-core-tpm-anchor = ["cser-core-runtime-spike"]
 stage7b-eval = []
 virtio-cser-facade = ["dep:nexus-ostd-virtio"]
 virtio-cser-precommit-fault = ["virtio-cser-facade"]

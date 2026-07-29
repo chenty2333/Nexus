@@ -13,6 +13,9 @@ compile_error!(
     "cser-core-runtime-spike is mutually exclusive with every legacy CSER runtime profile"
 );
 
+#[cfg(all(feature = "cser-core-dma-slice", feature = "cser-core-tpm-anchor"))]
+compile_error!("cser-core-dma-slice and cser-core-tpm-anchor are mutually exclusive");
+
 #[cfg(all(
     feature = "virtio-cser-precommit-fault",
     feature = "virtio-cser-postcommit-fault"
@@ -37,7 +40,8 @@ mod effect_registry;
 // while every legacy module and entry point is absent from this build.
 #[cfg(all(
     feature = "cser-core-runtime-spike",
-    not(feature = "cser-core-dma-slice")
+    not(feature = "cser-core-dma-slice"),
+    not(feature = "cser-core-tpm-anchor")
 ))]
 #[path = "cser/core_reply_adapter.rs"]
 mod core_reply_adapter;
@@ -47,7 +51,8 @@ mod core_reply_adapter;
 mod core_runtime;
 #[cfg(all(
     feature = "cser-core-runtime-spike",
-    not(feature = "cser-core-dma-slice")
+    not(feature = "cser-core-dma-slice"),
+    not(feature = "cser-core-tpm-anchor")
 ))]
 #[path = "cser/core_runtime_slice.rs"]
 mod core_runtime_slice;
@@ -68,6 +73,12 @@ mod core_dma_adapter;
 #[cfg(feature = "cser-core-dma-slice")]
 #[path = "cser/core_dma_runtime.rs"]
 mod core_dma_runtime;
+// Dedicated TPM2 NV provider profile. It exercises only the portable trusted
+// anchor contract and cannot be combined with either live runtime slice.
+#[cfg(feature = "cser-core-tpm-anchor")]
+#[allow(dead_code)]
+#[path = "cser/core_tpm_anchor.rs"]
+mod core_tpm_anchor;
 // The generic adapter now earns an activation permit: it binds an unpublished
 // initial service and Nexus-owned manager worker before publication, maps only
 // OSTD UserMode exceptions into typed service faults, and observes exact reap.
@@ -349,10 +360,16 @@ fn kernel_main() {
 #[cfg(feature = "cser-core-runtime-spike")]
 #[ostd::main]
 fn kernel_main() {
-    #[cfg(feature = "cser-core-dma-slice")]
+    #[cfg(feature = "cser-core-tpm-anchor")]
+    core_tpm_anchor::launch();
+
+    #[cfg(all(feature = "cser-core-dma-slice", not(feature = "cser-core-tpm-anchor")))]
     core_dma_runtime::launch();
 
-    #[cfg(not(feature = "cser-core-dma-slice"))]
+    #[cfg(all(
+        not(feature = "cser-core-dma-slice"),
+        not(feature = "cser-core-tpm-anchor")
+    ))]
     core_runtime_slice::launch()
 }
 
