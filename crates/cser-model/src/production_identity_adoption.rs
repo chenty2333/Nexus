@@ -1,7 +1,15 @@
-//! Executable oracle for the post-commit publication gate of RFC 0005.
+//! Historical executable oracle for the post-commit publication gate of RFC 0005.
 //!
-//! Phase A sliver for RFC 0005 obligations 1 to 4; obligations 5-7 are not
-//! modeled here yet.  The model reproduces the production order up to the
+//! This Phase A sliver remains available for the exact RFC 0005 identity and
+//! credit checks. The current CSER core-rebaseline authority, settlement,
+//! repeated-crash, and concurrency semantics live in
+//! [`crate::core_rebaseline_oracle::EstateOracle`] and
+//! `tests/core_rebaseline_loom.rs`. That successor deliberately separates
+//! precommit `AdoptEffect` from postcommit `ClaimSettlement`, and its Loom tests
+//! execute real concurrent revoke/adopt, revoke/claim, and apply-intent/crash
+//! schedules.
+//!
+//! This historical model reproduces the production order up to the
 //! retention point — compound device commit, kernel backend terminalization of
 //! the six-effect cohort, then the post-commit service crash — and then opens
 //! one publication gate.  Retention keeps the committed flight's causal
@@ -21,22 +29,17 @@
 //! rather than a fallback.  There is no adoption entry point that omits the
 //! presentation, so silent inheritance cannot be expressed.
 //!
-//! What this sliver deliberately does **not** model:
+//! What this historical sliver deliberately does **not** model itself:
 //!
-//! - Obligation 5: `RevokeBegin` racing the gate.
-//! - Obligation 6: repeated crash and a second binding generation.  The fence
-//!   admits exactly one crash generation; a successor crash has no transition.
-//! - Obligation 7 beyond this sliver: only the adopt and tombstone paths balance
-//!   credits and emit receipts here; the revoke-wins and repeated-crash paths do
-//!   not exist.
+//! - `BeginRevoke` racing a rebaseline authority or settlement gate.
+//! - Repeated crash and a second binding generation.
 //! - No successor incarnation is snapshotted, readied, or rebound.  Adoption
 //!   validates the presented identity and the successor epoch, but installs no
 //!   Registry binding; the successor identity appears only in its receipt.
 //!
-//! No Loom harness accompanies this module.  Expressing the gate as a concurrent
-//! interleaving requires the `cser-transition-gates` crate, which is later work;
-//! the property tests instead enumerate arbitrary sequential interleavings of
-//! adoption and tombstone attempts against the same gate.
+//! Its property tests enumerate arbitrary sequential adoption/tombstone
+//! interleavings. They are retained evidence, not the current concurrency claim;
+//! the core-rebaseline Loom harness named above closes that gap.
 
 /// Number of effects in the bounded production read.
 pub const EFFECT_COUNT: usize = 6;

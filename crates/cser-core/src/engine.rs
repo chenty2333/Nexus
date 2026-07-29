@@ -2535,6 +2535,39 @@ impl Engine {
         C: Into<Command>,
         P: FnOnce(&JournalRecord) -> Result<(), E>,
     {
+        self.transact_with_freshness(command, |record, _| persist(record))
+    }
+
+    /// Prepares and commits one transition through a typed durability provider.
+    ///
+    /// Unlike [`Self::transact`], this path also passes the candidate
+    /// post-transition freshness to the provider. That is required for a
+    /// recovery checkpoint, whose record is encoded under the previously
+    /// committed epoch but atomically advances the trusted anchor to the
+    /// already-reserved next epoch.
+    pub fn transact_durable<P, C>(
+        &mut self,
+        command: C,
+        persistence: &mut P,
+    ) -> Result<TransitionReceipt, TxError<P::Error>>
+    where
+        C: Into<Command>,
+        P: crate::TransitionDurability,
+    {
+        self.transact_with_freshness(command, |record, freshness| {
+            persistence.persist_transition(record, freshness)
+        })
+    }
+
+    fn transact_with_freshness<E, P, C>(
+        &mut self,
+        command: C,
+        persist: P,
+    ) -> Result<TransitionReceipt, TxError<E>>
+    where
+        C: Into<Command>,
+        P: FnOnce(&JournalRecord, Freshness) -> Result<(), E>,
+    {
         let Command(command) = command.into();
         if self.journal_repair_required.is_some() {
             return Err(TxError::Core(CoreError::JournalRepairRequired));
@@ -2564,7 +2597,7 @@ impl Engine {
             command,
         )
         .map_err(TxError::Journal)?;
-        if let Err(error) = persist(&record) {
+        if let Err(error) = persist(&record, candidate.freshness) {
             self.persistence_recovery_required = true;
             return Err(TxError::Persist(error));
         }

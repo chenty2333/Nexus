@@ -20,6 +20,7 @@ mod domain;
 mod engine;
 mod identity;
 mod journal;
+mod persistence;
 mod profiles;
 
 #[cfg(feature = "std")]
@@ -52,6 +53,11 @@ pub use identity::{
 pub use journal::{
     JOURNAL_MAGIC, JOURNAL_SCHEMA_VERSION, JournalDecodeError, JournalRecord, JournalRepair,
     JournalScan, scan_journal, scan_journal_to_head,
+};
+pub use persistence::{
+    CoordinatedPersistence, CoordinatedPersistenceError, DurableJournalBackend,
+    PersistenceProtocolError, RecoveryBinding, RecoveryLease, TransitionDurability,
+    TrustedAnchorBackend, TrustedAnchorSnapshot,
 };
 pub use profiles::{
     CREDIT_IOVA, CREDIT_PINNED_PAGE, CREDIT_QUEUE_SLOT, CREDIT_REPLY_SLOT, DEVICE_CLAIM_IOVA,

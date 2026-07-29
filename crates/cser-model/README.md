@@ -13,6 +13,26 @@ The model covers:
 - per-scope live-effect indexes and target-local revocation selection;
 - single terminalization and scalar budget conservation.
 
+The current portable-core differential oracle is
+`core_rebaseline_oracle`. Its `EstateOracle` keeps root liveness, estate
+authority, and postcommit settlement as separate state. A crash immediately
+fences authority; only a precommit orphan can return to `Active` through
+explicit `AdoptEffect`, while a postcommit estate cannot return to `Active`
+after a fence and gives a successor only a settlement claim.
+`tests/core_rebaseline_loom.rs` runs real Loom threads against these oracle
+transitions for precommit adopt/revoke, postcommit claim/revoke, and
+apply-intent/second-crash races. The latter also checks that stale bearer
+generations cannot issue a second apply or settlement.
+The paired production-command tests live in
+`cser-core/tests/production_precommit_adoption_loom.rs` and
+`cser-core/tests/production_transition_loom.rs`.
+
+These are bounded safe-Rust writer-gate schedules. They establish the allowed
+linearized outcomes of the independent oracle and production command state
+machine; they do not establish an OSTD lock implementation, SMP memory-order
+correctness, real task death, journal durability, hardware DMA/IOMMU
+quiescence, or cold-boot anti-rollback.
+
 The `pager` module is the executable oracle for the Stage 4 successor
 protocol. It adds:
 

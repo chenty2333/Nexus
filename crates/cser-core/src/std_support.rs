@@ -10,6 +10,10 @@ use std::{
 
 use crate::{Digest, JournalRecord, JournalRepair, scan_journal, scan_journal_to_head};
 
+mod persistence;
+
+pub use persistence::{HostAnchorError, HostAnchorFailpoint, HostFileTrustedAnchor};
+
 /// Single-writer file journal which validates its durable head before append.
 ///
 /// `FileJournal` is a host adapter and test fixture, not an anti-rollback
@@ -325,6 +329,14 @@ impl FileJournal {
 impl Drop for FileJournal {
     fn drop(&mut self) {
         let _ = File::unlock(&self.file);
+    }
+}
+
+impl crate::DurableJournalBackend for FileJournal {
+    type Error = io::Error;
+
+    fn append_and_sync(&mut self, record: &JournalRecord) -> Result<(), Self::Error> {
+        self.append(record)
     }
 }
 
