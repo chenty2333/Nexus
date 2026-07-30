@@ -1,8 +1,9 @@
 # CSER reboot freshness: historical OSTD provider-gap audit
 
 Status: **Superseded implementation-gap audit. Provider implementation is
-complete; a historical four-boot receipt is retained and the portable swtpm
-harness replacement is awaiting its clean re-seal, 2026-07-30.**
+complete; historical clean four-boot receipts are retained and the
+capability-negotiated swtpm harness is awaiting its clean re-seal,
+2026-07-30.**
 
 This note originally recorded why the production-shaped boot coordinator had
 no OSTD persistence provider on 2026-07-29. That inventory is retained as a
@@ -23,11 +24,12 @@ The implemented bounded rebaseline provides the missing pinned-profile owners:
 - `core_device_quarantine.rs` fences VirtIO/PCI and observes reset, ISR drain,
   and global VT-d invalidation before journal replay.
 
-The retained historical receipt passed four QEMU boots over those same owners:
+The retained clean receipts passed four QEMU boots over those same owners:
 commit, durable apply intent and second crash, reconciliation without a second
-intent, then stable replay. Exact CI later exposed an optional swtpm 0.7.3
-state-lock incompatibility before provisioning completed. Its correction and
-replacement-seal status are recorded in the production cutover release ledger.
+intent, then stable replay. Exact CI later exposed optional swtpm 0.7.3
+state-lock and auto-shutdown-opt-out incompatibilities before provisioning or
+production boot. Their corrections and replacement-seal status are recorded in
+the production cutover release ledger.
 
 The provider proves only its pinned QEMU/swtpm/ATA protocol. swtpm state and raw
 media remain host-rollbackable, so this is not physical malicious-rollback

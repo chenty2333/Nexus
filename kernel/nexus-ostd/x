@@ -885,9 +885,21 @@ capture_core_dma_evidence() {
 }
 
 start_core_persistent_swtpm() {
+    local capabilities flags
     if ! command -v swtpm >/dev/null 2>&1; then
         echo "run-core-persistent-recovery requires host swtpm" >&2
         return 1
+    fi
+    if ! capabilities=$(swtpm socket --print-capabilities); then
+        echo "failed to query host swtpm capabilities" >&2
+        return 1
+    fi
+    flags=not-need-init,startup-none
+    # swtpm added automatic TPM2_Shutdown and its opt-out together in v0.8.
+    # Older releases have neither behavior, so capability negotiation preserves
+    # the same crash-style stop on both sides of that version boundary.
+    if grep -Fq '"flags-opt-disable-auto-shutdown"' <<<"$capabilities"; then
+        flags+=,disable-auto-shutdown
     fi
     rm -f "$core_persistent_socket" "$core_persistent_pid_file"
     # The runner-wide repo/kernel flocks and sequential boot loop give this
@@ -898,7 +910,7 @@ start_core_persistent_swtpm() {
         --tpm2 \
         --tpmstate "dir=$core_persistent_state_dir" \
         --ctrl "type=unixio,path=$core_persistent_socket" \
-        --flags not-need-init,startup-none,disable-auto-shutdown \
+        --flags "$flags" \
         --log "file=$core_persistent_artifact_dir/swtpm.log,level=20" \
         --pid "file=$core_persistent_pid_file" \
         --daemon

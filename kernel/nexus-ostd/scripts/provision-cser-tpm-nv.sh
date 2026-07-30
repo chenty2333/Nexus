@@ -100,6 +100,17 @@ server_socket="$work_dir/server.sock"
 control_socket="$server_socket.ctrl"
 pid_file="$work_dir/swtpm.pid"
 tcti="swtpm:path=$server_socket"
+swtpm_flags=not-need-init,startup-clear
+if ! swtpm_capabilities=$(swtpm socket --print-capabilities); then
+    echo "failed to query swtpm capabilities" >&2
+    exit 1
+fi
+# v0.8 introduced both automatic TPM2_Shutdown and this opt-out. Older swtpm
+# releases need no flag to retain the same crash-style process lifecycle.
+if grep -Fq '"flags-opt-disable-auto-shutdown"' <<<"$swtpm_capabilities"; then
+    swtpm_flags+=,disable-auto-shutdown
+fi
+readonly swtpm_capabilities swtpm_flags
 
 # The host flock above gives this daemon exclusive custody. The optional swtpm
 # backend lock is unnecessary and is not available in Ubuntu 24.04's 0.7.3.
@@ -108,7 +119,7 @@ swtpm socket \
     --tpmstate "dir=$state_dir" \
     --ctrl "type=unixio,path=$control_socket" \
     --server "type=unixio,path=$server_socket" \
-    --flags not-need-init,startup-clear,disable-auto-shutdown \
+    --flags "$swtpm_flags" \
     --pid "file=$pid_file" \
     --daemon
 swtpm_pid=$(tr -d '\n' <"$pid_file")

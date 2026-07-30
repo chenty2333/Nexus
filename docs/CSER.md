@@ -107,10 +107,11 @@ and real-device DMA guests, then four production boots over the same journal,
 outbox, and swtpm state. It establishes exact service reap and production
 ingress closure, fresh Ready/Rebind tasks, a durable apply intent, a second
 successor crash, reconciliation without a second intent, and stable replay
-while retaining page and IOVA claims. Exact CI later exposed an unsupported
-optional swtpm 0.7.3 lock parameter before the boot run, so the portable runner
-requires a replacement clean seal before current release closure. The
-QEMU/swtpm evidence does not establish physical TPM
+while retaining page and IOVA claims. Exact CI later exposed unsupported swtpm
+0.7.3 state-lock and auto-shutdown-opt-out parameters in two successive
+candidates. The runner now negotiates the latter capability, but requires a
+replacement clean seal and exact-revision CI PASS before current release
+closure. The QEMU/swtpm evidence does not establish physical TPM
 anti-rollback, physical power-loss durability, crash-persistent PFN/IOVA
 custody, SMP, or hardware-general DMA quiescence and does not authorize
 resource reuse.

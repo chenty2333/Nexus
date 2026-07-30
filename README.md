@@ -72,7 +72,7 @@ kernel, service, resource, and device map is
 | Track | Status | Meaning |
 | --- | --- | --- |
 | `v0.1.0` | Published, archived research artifact | Bounded CSER composition with reproducible models, implementation slices, and receipts |
-| Current `main` | CSER Core Rebaseline re-seal pending | Portable core, persistent recovery, reply/DMA recovery, and the single production Registry cutover are implemented; exact CI exposed a swtpm 0.7.3 harness incompatibility after the full core gate, so the portable replacement runner still requires a new clean receipt |
+| Current `main` | CSER Core Rebaseline re-seal pending | Portable core, persistent recovery, reply/DMA recovery, and the single production Registry cutover are implemented; exact CI exposed two swtpm 0.7.3 capability gaps, so the capability-negotiated replacement still requires a new clean receipt and exact-revision CI PASS |
 | Production system | Not established | The `cser-production` profile is a bounded QEMU research path, not a hardware-general, SMP, availability, or production-readiness result |
 | Paper | None peer reviewed | `NARRATIVE.md` is a technical research account; the Zenodo object is software and reproducibility evidence |
 
@@ -126,9 +126,12 @@ and final settlement, a stable repeated-recovery boot, service/binding
 generations `1/1` through `4/4`, and increasing boot, journal, and device
 freshness. Exact-B CI subsequently passed the full core/model/property/Loom
 gate but rejected an optional swtpm state-lock argument before the production
-boots. The replacement single-daemon harness removes that portability defect;
-current release status remains open until its new clean receipt and CI PASS are
-retained. Every such receipt remains bounded to one-vCPU QEMU/TCG and swtpm: it
+boots. Candidate C1 removed that option and made daemon shutdown fail-closed;
+exact-C1 CI then passed the core gate and both focused guests before rejecting
+the v0.8 `disable-auto-shutdown` flag. The runner now negotiates that
+capability, and current release status remains open until a new clean receipt
+and exact-revision CI PASS are retained. Every such receipt remains bounded to
+one-vCPU QEMU/TCG and swtpm: it
 does not establish physical TPM anti-rollback, physical power-loss behavior,
 hardware-general DMA quiescence or custody, crash-persistent PFN/IOVA custody,
 resource reuse authorization, or SMP correctness. Historical IRQ Phase A and

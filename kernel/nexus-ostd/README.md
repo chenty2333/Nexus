@@ -99,11 +99,12 @@ evidence. `seal-core-persistent-recovery` first requires a clean source tree and
 then writes `combined-receipt.txt` with `PASS` only if the tree remains clean
 through the run. The archived production/focused ISOs, boot serial logs, QEMU
 debug traces, raw media, and swtpm logs remain beside it. Historical cutover
-`c06e9f43e931ed3f130da6dfcf29452a45406152` passed that clean seal and its
-receipt preimage is retained. After exact CI exposed an optional swtpm 0.7.3
-state-lock incompatibility, the portable replacement runner requires a new
-clean receipt; current disposition is recorded in the production cutover
-release ledger.
+`c06e9f43e931ed3f130da6dfcf29452a45406152` and replacement candidate C1 passed
+clean local seals and their receipt preimages are retained. Exact CI exposed
+optional swtpm 0.7.3 state-lock and auto-shutdown-opt-out incompatibilities.
+The runner now negotiates the latter capability, but requires a new clean
+receipt and exact-revision CI PASS; current disposition is recorded in the
+production cutover release ledger.
 
 ## Workflow
 

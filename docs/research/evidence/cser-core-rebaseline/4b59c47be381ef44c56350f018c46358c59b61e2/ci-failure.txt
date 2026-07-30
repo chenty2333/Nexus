@@ -1,0 +1,23 @@
+nexus.cser.ci-failure.v1
+result=FAIL
+git_revision=4b59c47be381ef44c56350f018c46358c59b61e2
+workflow=ci
+run_id=30512154603
+run_attempt=1
+run_url=https://github.com/chenty2333/Nexus/actions/runs/30512154603
+quick_job_id=90774332677
+quick_result=PASS
+verify_job_id=90774332662
+verify_result=FAIL
+core_verify_marker=CSER CORE VERIFY PASS portable_core=true independent_oracle=true loom=true journal_recovery=true frozen_wire=archive-only
+reply_evidence_marker=CSER_CORE_REPLY_EVIDENCE_QEMU PASS runtime=real-task-reap reply=physical settlement=claimed second_crash=reconciled production_registry=false
+dma_evidence_marker=CSER_CORE_DMA_EVIDENCE_QEMU PASS queue=real-virtio completion=real-irq reset=real-device iotlb=real-vtd production_registry=false qemu=true physical_hardware=false
+failure_stage=after-focused-reply-dma-before-tpm-provisioning-and-production-boots
+host_swtpm_version=0.7.3
+failure=swtpm: Error parsing flags options: Unknown option 'disable-auto-shutdown'
+failure_artifact_id=8747636124
+failure_artifact_name=nexus-cser-core-rebaseline-failure-1
+failure_artifact_sha256=7f3a65f596e2d8d1292e11584f90ac3ae451e1f78069af5f3e928e6d6141b1df
+failure_artifact_expires_at=2026-10-28T03:48:20Z
+complete_ci_log_sha256=3fcfb264f129d5e5d2f6d77ea2c9ce0100045edaee2aab691a46eaa054f77a18
+physical_hardware=false

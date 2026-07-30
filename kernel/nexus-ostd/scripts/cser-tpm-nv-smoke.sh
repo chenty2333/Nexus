@@ -68,6 +68,17 @@ server_socket="$fixture_dir/server.sock"
 control_socket="$server_socket.ctrl"
 pid_file="$fixture_dir/swtpm.pid"
 tcti="swtpm:path=$server_socket"
+swtpm_flags=not-need-init,startup-clear
+if ! swtpm_capabilities=$(swtpm socket --print-capabilities); then
+    echo "failed to query swtpm capabilities" >&2
+    exit 1
+fi
+# v0.8 introduced both automatic TPM2_Shutdown and this opt-out. Older swtpm
+# releases need no flag to retain the same crash-style process lifecycle.
+if grep -Fq '"flags-opt-disable-auto-shutdown"' <<<"$swtpm_capabilities"; then
+    swtpm_flags+=,disable-auto-shutdown
+fi
+readonly swtpm_capabilities swtpm_flags
 
 start_swtpm() {
     rm -f -- "$server_socket" "$control_socket" "$pid_file"
@@ -78,7 +89,7 @@ start_swtpm() {
         --tpmstate "dir=$fixture_dir" \
         --ctrl "type=unixio,path=$control_socket" \
         --server "type=unixio,path=$server_socket" \
-        --flags not-need-init,startup-clear,disable-auto-shutdown \
+        --flags "$swtpm_flags" \
         --pid "file=$pid_file" \
         --daemon
     swtpm_pid=$(tr -d '\n' <"$pid_file")

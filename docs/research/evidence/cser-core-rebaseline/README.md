@@ -24,5 +24,22 @@ artifacts and are named and hashed by the retained receipts.
   `--tpmstate ...,lock` parameter.
 
 This negative result is retained because it invalidated B as a complete release
-attestation and caused a replacement clean seal. A later directory records that
-replacement receipt and exact CI result; no entry here promotes B to PASS.
+attestation and caused a replacement clean seal. No entry here promotes B to
+PASS.
+
+## Replacement candidate C1 CI failure
+
+- Revision: `4b59c47be381ef44c56350f018c46358c59b61e2`
+- Receipt:
+  `4b59c47be381ef44c56350f018c46358c59b61e2/combined-receipt.txt`
+- Clean local receipt SHA-256:
+  `785ef0e13c505cbd324773e4439f9bbb51496c46d01f775ae303093011c844c8`
+- CI record:
+  `4b59c47be381ef44c56350f018c46358c59b61e2/ci-failure.txt`
+- Disposition: the clean local four-boot seal passed. Exact-C1 CI passed quick,
+  the complete core gate, and both focused guests, then swtpm 0.7.3 rejected
+  the v0.8 `disable-auto-shutdown` flag before provisioning or production
+  boot. C1 is valid local evidence for its revision, not the final release seal.
+
+A later directory must record the capability-negotiated replacement receipt
+and exact CI PASS before the release ledger can return to `SEALED`.
