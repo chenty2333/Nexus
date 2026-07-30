@@ -41,5 +41,20 @@ PASS.
   the v0.8 `disable-auto-shutdown` flag before provisioning or production
   boot. C1 is valid local evidence for its revision, not the final release seal.
 
-A later directory must record the capability-negotiated replacement receipt
-and exact CI PASS before the release ledger can return to `SEALED`.
+## Replacement candidate C2 CI failure
+
+- Revision: `2e209bd738a788b174c18b73fa9103d8d65b4bf9`
+- Receipt:
+  `2e209bd738a788b174c18b73fa9103d8d65b4bf9/combined-receipt.txt`
+- Clean local receipt SHA-256:
+  `41a331716873a61288ab0a624551a54886cbd0d0802d1fa11f975b226c0c0356`
+- CI record:
+  `2e209bd738a788b174c18b73fa9103d8d65b4bf9/ci-failure.txt`
+- Disposition: the clean local four-boot seal passed. Exact-C2 CI passed quick,
+  the complete core gate, both focused guests, and TPM provisioning. The first
+  production QEMU process then failed before guest execution because swtpm
+  received `CMD_SET_DATAFD` without its Unix ancillary data socket. C2 is valid
+  local evidence for its revision, not the final release seal.
+
+A later directory must record a host-security-policy-compatible replacement
+receipt and exact CI PASS before the release ledger can return to `SEALED`.

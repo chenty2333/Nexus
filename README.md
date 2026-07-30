@@ -72,7 +72,7 @@ kernel, service, resource, and device map is
 | Track | Status | Meaning |
 | --- | --- | --- |
 | `v0.1.0` | Published, archived research artifact | Bounded CSER composition with reproducible models, implementation slices, and receipts |
-| Current `main` | CSER Core Rebaseline re-seal pending | Portable core, persistent recovery, reply/DMA recovery, and the single production Registry cutover are implemented; exact CI exposed two swtpm 0.7.3 capability gaps, so the capability-negotiated replacement still requires a new clean receipt and exact-revision CI PASS |
+| Current `main` | CSER Core Rebaseline re-seal pending | Portable core, persistent recovery, reply/DMA recovery, and the single production Registry cutover are implemented; exact CI exposed swtpm capability and host/container Unix data-FD harness gaps, so the scoped replacement still requires a new clean receipt and exact-revision CI PASS |
 | Production system | Not established | The `cser-production` profile is a bounded QEMU research path, not a hardware-general, SMP, availability, or production-readiness result |
 | Paper | None peer reviewed | `NARRATIVE.md` is a technical research account; the Zenodo object is software and reproducibility evidence |
 
@@ -129,9 +129,12 @@ gate but rejected an optional swtpm state-lock argument before the production
 boots. Candidate C1 removed that option and made daemon shutdown fail-closed;
 exact-C1 CI then passed the core gate and both focused guests before rejecting
 the v0.8 `disable-auto-shutdown` flag. The runner now negotiates that
-capability, and current release status remains open until a new clean receipt
-and exact-revision CI PASS are retained. Every such receipt remains bounded to
-one-vCPU QEMU/TCG and swtpm: it
+capability. Exact-C2 CI passed TPM provisioning, then lost QEMU's Unix ancillary
+data socket at the Docker/AppArmor host boundary before the first guest ran.
+The AppArmor opt-out is now limited to that network-none TPM fixture container;
+current release status remains open until a new clean receipt and exact-revision
+CI PASS are retained. Every such receipt remains bounded to one-vCPU QEMU/TCG
+and swtpm: it
 does not establish physical TPM anti-rollback, physical power-loss behavior,
 hardware-general DMA quiescence or custody, crash-persistent PFN/IOVA custody,
 resource reuse authorization, or SMP correctness. Historical IRQ Phase A and

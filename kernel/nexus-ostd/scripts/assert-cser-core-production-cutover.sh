@@ -752,4 +752,36 @@ for shared_path in \
         || fail "kernel workflow lacks one shared cross-boot persistence path: $shared_path"
 done
 
-echo "CSER_CORE_PRODUCTION_CUTOVER PASS manifest_sources=${#closure_sources[@]} portable_core=nonoptional default=cser-production registry=single task_bound_ingress=true post_exit_fence=true production_rebind=true vnext_portal=true vnext_supervisor=true volatile_transitions=false evidence_schemes=reply+dma boots=4 shared_media=true"
+container_function=$(awk '
+    /^container\(\)[[:space:]]*\{/ { in_function = 1 }
+    in_function { print }
+    in_function && /^\}[[:space:]]*$/ { found_end = 1; exit }
+    END { if (!in_function || !found_end) exit 1 }
+' "$kernel_workflow") || fail 'cannot isolate kernel container runner'
+persistent_guest=$(awk '
+    /^run_core_persistent_guest\(\)[[:space:]]*\{/ { in_function = 1 }
+    in_function { print }
+    in_function && /^\}[[:space:]]*$/ { found_end = 1; exit }
+    END { if (!in_function || !found_end) exit 1 }
+' "$kernel_workflow") || fail 'cannot isolate persistent production guest runner'
+[[ $(grep -Fc 'NEXUS_CONTAINER_HOST_UNIX_SOCKET' "$kernel_workflow") == 2 ]] \
+    || fail 'host Unix socket policy must have one declaration and one TPM fixture caller'
+grep -Fq 'NEXUS_CONTAINER_HOST_UNIX_SOCKET=1 container bash -c' \
+    <<<"$persistent_guest" \
+    || fail 'persistent production guest does not select the host Unix socket policy'
+require_ordered_tokens "$container_function" 'TPM fixture container policy' \
+    'if [[ ${NEXUS_CONTAINER_HOST_UNIX_SOCKET:-0} == 1 ]]; then' \
+    'security_args=(--security-opt label=disable)' \
+    'if command "$docker_bin" info --format' \
+    "| grep -Fq 'name=apparmor'; then" \
+    'security_args+=(--security-opt apparmor=unconfined)' \
+    'command "$docker_bin" run --rm' \
+    '"${security_args[@]}"' \
+    '--network none'
+for forbidden_container_option in --privileged --cap-add --device; do
+    if grep -Fq -- "$forbidden_container_option" <<<"$container_function"; then
+        fail "TPM fixture container policy grants forbidden option: $forbidden_container_option"
+    fi
+done
+
+echo "CSER_CORE_PRODUCTION_CUTOVER PASS manifest_sources=${#closure_sources[@]} portable_core=nonoptional default=cser-production registry=single task_bound_ingress=true post_exit_fence=true production_rebind=true vnext_portal=true vnext_supervisor=true volatile_transitions=false evidence_schemes=reply+dma boots=4 shared_media=true tpm_fixture_policy=scoped"

@@ -109,9 +109,12 @@ ingress closure, fresh Ready/Rebind tasks, a durable apply intent, a second
 successor crash, reconciliation without a second intent, and stable replay
 while retaining page and IOVA claims. Exact CI later exposed unsupported swtpm
 0.7.3 state-lock and auto-shutdown-opt-out parameters in two successive
-candidates. The runner now negotiates the latter capability, but requires a
-replacement clean seal and exact-revision CI PASS before current release
-closure. The QEMU/swtpm evidence does not establish physical TPM
+candidates. The runner now negotiates the latter capability. Exact-C2 CI passed
+TPM provisioning but lost QEMU's Unix ancillary data socket across the
+Docker/AppArmor boundary before guest execution; the resulting policy opt-out
+is limited to the network-none TPM fixture container. A replacement clean seal
+and exact-revision CI PASS are still required before current release closure.
+The QEMU/swtpm evidence does not establish physical TPM
 anti-rollback, physical power-loss durability, crash-persistent PFN/IOVA
 custody, SMP, or hardware-general DMA quiescence and does not authorize
 resource reuse.

@@ -102,9 +102,12 @@ debug traces, raw media, and swtpm logs remain beside it. Historical cutover
 `c06e9f43e931ed3f130da6dfcf29452a45406152` and replacement candidate C1 passed
 clean local seals and their receipt preimages are retained. Exact CI exposed
 optional swtpm 0.7.3 state-lock and auto-shutdown-opt-out incompatibilities.
-The runner now negotiates the latter capability, but requires a new clean
-receipt and exact-revision CI PASS; current disposition is recorded in the
-production cutover release ledger.
+The runner now negotiates the latter capability. Candidate C2 also passed a
+clean local seal, but exact CI lost QEMU's ancillary data socket across the
+Docker/AppArmor boundary after provisioning and before guest execution. The
+AppArmor opt-out is limited to the network-none TPM fixture container. A new
+clean receipt and exact-revision CI PASS remain required; current disposition
+is recorded in the production cutover release ledger.
 
 ## Workflow
 

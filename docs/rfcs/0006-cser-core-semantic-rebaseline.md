@@ -1,7 +1,7 @@
 # RFC 0006: CSER core semantic rebaseline
 
-- Status: **Implemented; replacement exact-revision seal pending after swtpm
-  0.7.3 capability negotiation corrections**
+- Status: **Implemented; replacement exact-revision seal pending after scoped
+  swtpm host/container policy corrections**
 - Decision date: 2026-07-29
 - Pre-rebaseline checkpoint: `05e68b19b219d0f5288de5438127b5690cd7e50f`
 - Recovery references:
@@ -556,10 +556,16 @@ daemon shutdown fail-closed, and produced clean local receipt
 Exact-C1 CI passed the complete core gate and both focused guests, then found
 that `disable-auto-shutdown` is a v0.8 capability. The runner now requests
 that flag only when `--print-capabilities` advertises it; older swtpm versions
-predate both the option and automatic TPM2 shutdown. R4/R5/R6 release closure
-now waits for the clean C2 receipt and exact-C2 CI PASS; the A and C1 receipts
-are exact-revision evidence, not substitutes for that pending result. The
-QEMU/swtpm path does not establish
+predate both the option and automatic TPM2 shutdown. Candidate C2 produced
+clean local receipt
+`41a331716873a61288ab0a624551a54886cbd0d0802d1fa11f975b226c0c0356`.
+Exact-C2 CI passed TPM provisioning, then received the swtpm control command
+without QEMU's Unix ancillary data socket across its Docker/AppArmor boundary,
+before the first guest executed. The policy opt-out is now limited to that
+network-none TPM fixture container. R4/R5/R6 release closure waits for the clean
+C3 receipt and exact-C3 CI PASS; the A, C1, and C2 receipts are exact-revision
+evidence, not substitutes for that pending result. The QEMU/swtpm path does not
+establish
 physical TPM anti-rollback, physical power-loss recovery, hardware-general DMA
 quiescence,
 crash-persistent PFN/IOVA custody, or resource reuse. Global reset, ISR drain,
@@ -805,9 +811,9 @@ establishes all of the following together:
 - a single production Registry after an atomic cutover; and
 - immutable historical evidence plus exact new claims and non-claims.
 
-The implementation and retained A/C1 receipts cover these semantics within the
-declared QEMU/swtpm/ATA boundary, but the current source-bound release chain is
-not complete until the clean C2 receipt and exact-C2 CI result are retained by
-the production cutover release ledger. API cleanup, a passing
+The implementation and retained A/C1/C2 receipts cover these semantics within
+the declared QEMU/swtpm/ATA boundary, but the current source-bound release chain
+is not complete until the clean C3 receipt and exact-C3 CI result are retained
+by the production cutover release ledger. API cleanup, a passing
 unit suite, or a renamed Registry alone does not satisfy this acceptance
 contract.

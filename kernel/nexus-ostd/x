@@ -156,9 +156,16 @@ container() {
     if [[ ${NEXUS_CONTAINER_HOST_UNIX_SOCKET:-0} == 1 ]]; then
         # Fedora SELinux denies a container-domain process access to a Unix
         # socket created by host swtpm even after the bind tree is relabeled.
-        # This opt-out is used only by the isolated TPM fixture container; the
-        # default build and every production workflow retain Docker labeling.
+        # Docker 28's default AppArmor policy also predates the AppArmor 4 Unix
+        # socket ABI split. QEMU must pass swtpm a data-socket fd over this host
+        # control socket, so confine both label opt-outs to the isolated,
+        # network-none TPM fixture container. Normal build/test containers keep
+        # Docker's default policies.
         security_args=(--security-opt label=disable)
+        if command "$docker_bin" info --format '{{json .SecurityOptions}}' \
+            | grep -Fq 'name=apparmor'; then
+            security_args+=(--security-opt apparmor=unconfined)
+        fi
     fi
     command "$docker_bin" run --rm \
         --init \

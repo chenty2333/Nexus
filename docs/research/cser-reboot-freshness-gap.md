@@ -1,9 +1,8 @@
 # CSER reboot freshness: historical OSTD provider-gap audit
 
 Status: **Superseded implementation-gap audit. Provider implementation is
-complete; historical clean four-boot receipts are retained and the
-capability-negotiated swtpm harness is awaiting its clean re-seal,
-2026-07-30.**
+complete; historical clean four-boot receipts are retained and the scoped TPM
+fixture harness is awaiting its clean re-seal, 2026-07-30.**
 
 This note originally recorded why the production-shaped boot coordinator had
 no OSTD persistence provider on 2026-07-29. That inventory is retained as a
@@ -29,7 +28,9 @@ commit, durable apply intent and second crash, reconciliation without a second
 intent, then stable replay. Exact CI later exposed optional swtpm 0.7.3
 state-lock and auto-shutdown-opt-out incompatibilities before provisioning or
 production boot. Their corrections and replacement-seal status are recorded in
-the production cutover release ledger.
+the production cutover release ledger. Candidate C2 passed provisioning, then
+exposed a Docker/AppArmor Unix ancillary data-FD gap before its first guest
+executed; the correction remains harness-only and fixture-scoped.
 
 The provider proves only its pinned QEMU/swtpm/ATA protocol. swtpm state and raw
 media remain host-rollbackable, so this is not physical malicious-rollback

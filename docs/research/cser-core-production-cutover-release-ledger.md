@@ -1,8 +1,8 @@
 # CSER Core Production Cutover Release Ledger
 
 - RFC: `docs/rfcs/0006-cser-core-semantic-rebaseline.md`
-- Ledger status: **RE-SEAL PENDING -- exact CI exposed two swtpm 0.7.3
-  capability gaps**
+- Ledger status: **RE-SEAL PENDING -- exact CI exposed a host/container Unix
+  data-FD policy gap after the swtpm 0.7.3 capability corrections**
 - Historical cutover commit A:
   `c06e9f43e931ed3f130da6dfcf29452a45406152`
 - Historical clean four-boot receipt digest D-A:
@@ -20,8 +20,15 @@
 - Exact-C1 CI disposition: **FAIL after focused reply/DMA evidence and before
   TPM provisioning or any production boot; retained in
   `docs/research/evidence/cser-core-rebaseline/4b59c47be381ef44c56350f018c46358c59b61e2/ci-failure.txt`**
-- Replacement cutover commit C2: **PENDING**
-- Replacement clean receipt digest D-C2: **PENDING**
+- Failed replacement candidate C2:
+  `2e209bd738a788b174c18b73fa9103d8d65b4bf9`
+- Clean local C2 receipt digest:
+  `41a331716873a61288ab0a624551a54886cbd0d0802d1fa11f975b226c0c0356`
+- Exact-C2 CI disposition: **FAIL after TPM provisioning and before the first
+  production guest executed; retained in
+  `docs/research/evidence/cser-core-rebaseline/2e209bd738a788b174c18b73fa9103d8d65b4bf9/ci-failure.txt`**
+- Replacement cutover commit C3: **PENDING**
+- Replacement clean receipt digest D-C3: **PENDING**
 - Final evidence attestation E: **PENDING**
 - Intended immutable tag: `cser-core-rebaseline-2026-07-30`
 - Static cutover gate: `kernel/nexus-ostd/scripts/assert-cser-core-production-cutover.sh`
@@ -33,32 +40,36 @@ swtpm 0.7.3 rejected the optional `--tpmstate ...,lock` argument before the
 four-boot run. C1 removed that redundant option and made daemon shutdown
 fail-closed. Exact-C1 CI then passed the complete core gate and both focused
 guests before finding that `disable-auto-shutdown` is another v0.8 capability.
-C2 negotiates that flag: swtpm v0.8 and newer receive the opt-out,
-while older versions, which predate automatic TPM2 shutdown, retain their
-equivalent crash behavior. A new clean source-bound receipt and CI PASS are
-required before this ledger returns to `SEALED`.
+C2 negotiated that flag: swtpm v0.8 and newer receive the opt-out, while older
+versions, which predate automatic TPM2 shutdown, retain their equivalent crash
+behavior. Exact-C2 CI passed provisioning, then showed that its Docker 28 /
+AppArmor 4 boundary delivered the QEMU control command without the Unix
+ancillary data FD. C3 scopes the AppArmor opt-out to the network-none TPM
+fixture container; every normal build/test container retains Docker's default
+policy. A new clean source-bound receipt and CI PASS are required before this
+ledger returns to `SEALED`.
 
 ## Replacement Seal Protocol
 
 The replacement seal avoids a self-referential commit and keeps runtime proof
 separate from evidence attestation:
 
-1. **Replacement cutover commit C2** contains the unchanged production
-   semantics, the capability-negotiated swtpm invocation, and this ledger with
-   pending C2/D-C2 fields.
-2. From a clean C2 tree, run `./x verify`. The command must emit `CSER CORE
+1. **Replacement cutover commit C3** contains the unchanged production
+   semantics, the narrowly scoped TPM fixture policy correction, and this
+   ledger with pending C3/D-C3 fields.
+2. From a clean C3 tree, run `./x verify`. The command must emit `CSER CORE
    VERIFY PASS`, complete all focused and four-boot guests, and produce
    `combined-receipt.txt` with `PASS`, `seal_requested=true`,
-   `git_source_tree_clean=true`, and `git_revision=C2`.
-3. Push C2 by fast-forward and require both exact-C2 CI jobs to pass. Retain the
+   `git_source_tree_clean=true`, and `git_revision=C3`.
+3. Push C3 by fast-forward and require both exact-C3 CI jobs to pass. Retain the
    CI run identity, artifact digest, complete verification log, and the small
    receipt preimage in Git.
-4. **Final evidence attestation E** records C2, D-C2, the exact-C2 CI result,
+4. **Final evidence attestation E** records C3, D-C3, the exact-C3 CI result,
    and the retained paths. E changes only documentation and evidence, then the
    intended immutable tag identifies E without embedding E's own hash.
 
 E must not change production Rust sources, Cargo/OSDK wiring, the runner, the
-static gate, or the cutover contract. If such a change is required, D-C2 is
+static gate, or the cutover contract. If such a change is required, D-C3 is
 inapplicable and another clean cutover revision is required.
 
 ## Removed Live Surfaces
@@ -162,7 +173,7 @@ The retained clean A seal established all of the following for A:
 - the D-A preimage is now retained in Git rather than depending on an ignored
   local artifact.
 
-The replacement release remains open until clean C2/D-C2 and exact-C2 CI
-satisfy the protocol above. The B and C1 failures are negative harness
+The replacement release remains open until clean C3/D-C3 and exact-C3 CI
+satisfy the protocol above. The B, C1, and C2 failures are negative harness
 evidence, not production-boot PASS results and not reasons to weaken any
 semantic gate.
