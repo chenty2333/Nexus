@@ -1,14 +1,13 @@
 # RFC 0006: CSER core semantic rebaseline
 
-- Status: **Implemented; replacement exact-revision seal pending after scoped
-  swtpm host/container policy corrections**
+- Status: **Implemented and sealed for the bounded QEMU profile**
 - Decision date: 2026-07-29
 - Pre-rebaseline checkpoint: `05e68b19b219d0f5288de5438127b5690cd7e50f`
 - Recovery references:
   `archive/pre-cser-core-rebaseline-2026-07-29` and
   `pre-cser-core-rebaseline-2026-07-29`
-- API stability: **profile 1, journal schema 5, and the standard catalog
-  digest remain frozen; final release attestation is pending**
+- API stability: **core profile 1, journal schema 5, and the standard catalog
+  digest are frozen**
 - Changes accepted `v0.1.0` claims: **no**
 
 ## Decision
@@ -518,8 +517,7 @@ They are ordered by semantic dependency, not feature count.
 
 ### Current implementation status (2026-07-30)
 
-The runtime implementation is complete, but the R6 release attestation is
-temporarily open while its replacement exact-revision seal runs:
+The runtime implementation and bounded R6 release attestation are complete:
 
 - `cser-core` is the portable authoritative state machine, with domain-defined
   reply and DMA obligation/claim profiles, versioned journal records,
@@ -536,7 +534,7 @@ temporarily open while its replacement exact-revision seal runs:
 - the durable profile binds an ATA PIO journal, a separate ATA reply outbox,
   TPM2 NV freshness/catalog state, and a pre-replay VirtIO/VT-d quarantine
   guard; and
-- the ordinary dirty-tree production proof has passed four QEMU boots over the
+- the clean local C3 seal and exact-C3 CI have passed four QEMU boots over the
   same raw journal, outbox, and swtpm state: boot-one reply/DMA work runs in
   real service tasks whose exact exit closes production ingress; boot two uses
   a fresh Ready/Rebind task, records a durable apply intent, and crashes that
@@ -561,16 +559,24 @@ clean local receipt
 `41a331716873a61288ab0a624551a54886cbd0d0802d1fa11f975b226c0c0356`.
 Exact-C2 CI passed TPM provisioning, then received the swtpm control command
 without QEMU's Unix ancillary data socket across its Docker/AppArmor boundary,
-before the first guest executed. The policy opt-out is now limited to that
-network-none TPM fixture container. R4/R5/R6 release closure waits for the clean
-C3 receipt and exact-C3 CI PASS; the A, C1, and C2 receipts are exact-revision
-evidence, not substitutes for that pending result. The QEMU/swtpm path does not
-establish
-physical TPM anti-rollback, physical power-loss recovery, hardware-general DMA
-quiescence,
-crash-persistent PFN/IOVA custody, or resource reuse. Global reset, ISR drain,
-and IOTLB observations preserve quarantine; they do not by themselves prove
-retirement of old page/IOVA claims.
+before the first guest executed. C3 limits SELinux label disablement and the
+AppArmor opt-out to the caller-UID/GID, network-none persistent QEMU guest-run
+container; host swtpm remains outside it, and exact-C3 used a non-root caller.
+Clean C3 receipt
+`52aed92515920c543814bef0a842141bdfcd7c44ce1c3d8c030935ab4498adb5`
+and exact-C3 CI receipt
+`e3e46c8efdd6755c7f750579f925251b3912b3f1e7a7fa35a92765a3cc995728`
+both passed the complete gates and four boots. The release ledger retains their
+preimages, exact CI run and artifact identity, and complete CI log. R4/R5/R6 are
+therefore closed within the declared bounded profile; A, C1, and C2 remain
+exact-revision or negative evidence, not substitutes for C3. The QEMU/swtpm
+path does not establish physical TPM anti-rollback, physical power-loss
+recovery, hardware-general DMA quiescence, crash-persistent PFN/IOVA custody, or
+authorization to reuse retained cross-reboot PFNs, IOVAs, or quarantined queue
+resources. The focused same-boot DMA slice separately covers fresh-generation
+logical core-resource reuse with `physical_address_reuse=false`. Global reset,
+ISR drain, and IOTLB observations preserve quarantine; they do not by themselves
+prove retirement of old page/IOVA claims.
 
 ### R0: preserve and rebaseline
 
@@ -802,18 +808,18 @@ establishes all of the following together:
 - real Snapshot/Ready/Rebind and exact effect adoption or settlement claim;
 - both revoke/claim race winners and repeated successor crash recovery;
 - the same production transition source under Loom and real adapters;
-- reply publication and real DMA/IOMMU retirement without escape hatches;
+- reply publication and real DMA queue retirement without escape hatches,
+  while page/IOVA claims remain retained until separately proven releasable;
 - a versioned, failure-atomic journal with torn-write recovery;
 - boot-time device quarantine, device tombstone recovery, and typed
-  reset/IRQ/IOTLB evidence before resource reuse;
+  reset/IRQ/IOTLB evidence gating any resource reuse;
 - boot, principal, journal, and device freshness across restart;
 - bounded backpressure and unrelated-root progress while estates remain live;
 - a single production Registry after an atomic cutover; and
 - immutable historical evidence plus exact new claims and non-claims.
 
-The implementation and retained A/C1/C2 receipts cover these semantics within
-the declared QEMU/swtpm/ATA boundary, but the current source-bound release chain
-is not complete until the clean C3 receipt and exact-C3 CI result are retained
-by the production cutover release ledger. API cleanup, a passing
-unit suite, or a renamed Registry alone does not satisfy this acceptance
-contract.
+The implementation, clean C3 receipt, and exact-C3 CI receipt cover these
+semantics together within the declared QEMU/swtpm/ATA boundary. Their preimages,
+exact run and artifact identities, complete CI log, and non-claims are retained
+by the production cutover release ledger. API cleanup, a passing unit suite, or
+a renamed Registry alone would not satisfy this acceptance contract.

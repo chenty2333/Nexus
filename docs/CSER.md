@@ -102,19 +102,20 @@ claims, a versioned journal, ATA PIO journal/outbox providers, TPM2 NV
 freshness/catalog binding, boot-time VirtIO/VT-d quarantine, and one recovered
 production Registry shared by the NXP3 portal and core-v1 supervisor.
 
-The retained historical receipt for `c06e9f4` covers focused real-task reply
+Clean local and exact-C3 CI receipts for `16e87b0` cover focused real-task reply
 and real-device DMA guests, then four production boots over the same journal,
-outbox, and swtpm state. It establishes exact service reap and production
+outbox, and swtpm state. They establish exact service reap and production
 ingress closure, fresh Ready/Rebind tasks, a durable apply intent, a second
 successor crash, reconciliation without a second intent, and stable replay
-while retaining page and IOVA claims. Exact CI later exposed unsupported swtpm
-0.7.3 state-lock and auto-shutdown-opt-out parameters in two successive
-candidates. The runner now negotiates the latter capability. Exact-C2 CI passed
-TPM provisioning but lost QEMU's Unix ancillary data socket across the
-Docker/AppArmor boundary before guest execution; the resulting policy opt-out
-is limited to the network-none TPM fixture container. A replacement clean seal
-and exact-revision CI PASS are still required before current release closure.
-The QEMU/swtpm evidence does not establish physical TPM
+while retaining page and IOVA claims. Earlier exact-CI candidates exposed two
+swtpm 0.7.3 capability gaps and a Docker/AppArmor Unix ancillary data-FD gap;
+their negative records are retained. C3 negotiates the versioned capability and
+limits the label/AppArmor opt-out to the caller-UID/GID, network-none persistent
+QEMU guest-run container; host swtpm remains outside it, and exact-C3 used a
+non-root caller. Exact-C3 CI passed both jobs and all four production boots. The
+QEMU/swtpm evidence does not establish physical TPM
 anti-rollback, physical power-loss durability, crash-persistent PFN/IOVA
-custody, SMP, or hardware-general DMA quiescence and does not authorize
-resource reuse.
+custody, SMP, or hardware-general DMA quiescence and does not authorize reuse of
+retained cross-reboot PFNs, IOVAs, or quarantined queue resources. The focused
+same-boot DMA slice's logical core-resource reuse does not include physical
+address reuse.

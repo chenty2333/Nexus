@@ -6,7 +6,7 @@ historical observations, not the current implementation boundary. RFC 0001,
 RFC 0005, the old Registry, and the live effect-peer service named below are
 **Superseded** by
 [`docs/rfcs/0006-cser-core-semantic-rebaseline.md`](../docs/rfcs/0006-cser-core-semantic-rebaseline.md).
-Current replacement-seal status, historical receipt, and exact-CI disposition
+Current sealed replacement status, historical receipts, and exact-CI disposition
 are recorded in that RFC and
 `docs/research/cser-core-production-cutover-release-ledger.md`.
 

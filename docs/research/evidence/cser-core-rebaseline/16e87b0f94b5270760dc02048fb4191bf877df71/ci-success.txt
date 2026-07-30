@@ -1,0 +1,51 @@
+nexus.cser.ci-success.v1
+result=PASS
+git_revision=16e87b0f94b5270760dc02048fb4191bf877df71
+workflow=ci
+run_id=30517746257
+run_attempt=1
+run_url=https://github.com/chenty2333/Nexus/actions/runs/30517746257
+run_event=push
+run_created_at=2026-07-30T05:50:06Z
+run_completed_at=2026-07-30T05:59:04Z
+runner_image=ubuntu-24.04
+runner_image_version=20260720.247.2
+runner_version=2.336.0
+quick_job_id=90791245396
+quick_result=PASS
+verify_job_id=90791245336
+verify_result=PASS
+core_verify_marker=CSER CORE VERIFY PASS portable_core=true independent_oracle=true loom=true journal_recovery=true frozen_wire=archive-only
+cutover_marker=CSER_CORE_PRODUCTION_CUTOVER PASS manifest_sources=12 portable_core=nonoptional default=cser-production registry=single task_bound_ingress=true post_exit_fence=true production_rebind=true vnext_portal=true vnext_supervisor=true volatile_transitions=false evidence_schemes=reply+dma boots=4 shared_media=true tpm_fixture_policy=scoped
+production_boots_completed=4
+freshness_progression=revision=13,23,31,35 boot=2,3,4,5 journal=2,3,4,5 device=2,3,4,5
+service_identity_progression=service_principal_generation=1,2,3,4 binding_generation=1,2,3,4
+persistent_cross_reboot_resource_reuse_authorized=false
+clean_local_receipt_sha256=52aed92515920c543814bef0a842141bdfcd7c44ce1c3d8c030935ab4498adb5
+clean_local_verify_log_sha256=0e7b7705dd543369f9c93ee84e776fa0466e7bdd8694d5373ad25a0fa8598418
+ci_receipt_sha256=e3e46c8efdd6755c7f750579f925251b3912b3f1e7a7fa35a92765a3cc995728
+ci_artifact_id=8749687823
+ci_artifact_name=nexus-cser-core-rebaseline-1
+ci_artifact_size_bytes=34677478
+ci_artifact_sha256=4196d594294f2797aeafa7bda6bd3a2be2fe97fa7403e1f9438e126f1208c8e6
+ci_artifact_expires_at=2026-10-28T05:50:06Z
+complete_ci_log_sha256=54ccd9155788dbcc7f3e83d20ae2cb69bbfbae66be66035132362b96c2d71121
+complete_ci_log_gzip_sha256=37cc488f4df4a42070975f19c80218cb1e6729e4d0eb80c37c786e63ff5e59ed
+tpm_fixture_policy=scoped-host-swtpm-plus-network-none-guest-run-container
+swtpm_runtime_location=host
+qemu_container_identity=caller-uid-gid
+exact_ci_qemu_container_non_root=true
+apparmor_receive_basis=inferred-from-profile-audit-and-exact-ci-contrast
+artifact_hidden_tpm_lock_included=false
+artifact_hidden_tpm_lock_size=0
+artifact_tpm_state_reconstruction=add-empty-tpmstate/.lock
+artifact_reconstructed_tpm_state_sha256=a3fb319391f07553c4e434addada8394ffc1c06ec45199e7a1969a5255e6a14a
+retained_tpm_state_path=ci-tpmstate
+retained_tpm_state_source=artifact-permall-plus-reconstructed-empty-lock
+retained_tpm_permall_sha256=0cdad324f62c38ac54bfaf3868fcbb964dcd259085be0b38759487f414f61d8b
+retained_tpm_lock_sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+qemu=true
+physical_hardware=false
+physical_antirollback=false
+physical_powerloss=false
+physical_dma_custody=false

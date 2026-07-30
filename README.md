@@ -72,7 +72,7 @@ kernel, service, resource, and device map is
 | Track | Status | Meaning |
 | --- | --- | --- |
 | `v0.1.0` | Published, archived research artifact | Bounded CSER composition with reproducible models, implementation slices, and receipts |
-| Current `main` | CSER Core Rebaseline re-seal pending | Portable core, persistent recovery, reply/DMA recovery, and the single production Registry cutover are implemented; exact CI exposed swtpm capability and host/container Unix data-FD harness gaps, so the scoped replacement still requires a new clean receipt and exact-revision CI PASS |
+| Current `main` | CSER Core Rebaseline sealed | Portable core, persistent recovery, reply/DMA recovery, and the single production Registry cutover are bound to C3 `16e87b0` by clean local and exact-C3 CI four-boot receipts recorded in the release ledger |
 | Production system | Not established | The `cser-production` profile is a bounded QEMU research path, not a hardware-general, SMP, availability, or production-readiness result |
 | Paper | None peer reviewed | `NARRATIVE.md` is a technical research account; the Zenodo object is software and reproducibility evidence |
 
@@ -119,26 +119,25 @@ reply outbox, and swtpm state, with device quarantine established before
 replay. Those focused schemes provide domain evidence; they are not alternate
 production Registries and do not introduce live dual-write.
 
-The historical clean receipt at `c06e9f4` remains retained evidence for its
-exact runner. It shows initial commit and retained claims, a second service
-crash after durable reply apply intent, reconciliation without a second intent
-and final settlement, a stable repeated-recovery boot, service/binding
-generations `1/1` through `4/4`, and increasing boot, journal, and device
-freshness. Exact-B CI subsequently passed the full core/model/property/Loom
-gate but rejected an optional swtpm state-lock argument before the production
-boots. Candidate C1 removed that option and made daemon shutdown fail-closed;
-exact-C1 CI then passed the core gate and both focused guests before rejecting
-the v0.8 `disable-auto-shutdown` flag. The runner now negotiates that
-capability. Exact-C2 CI passed TPM provisioning, then lost QEMU's Unix ancillary
-data socket at the Docker/AppArmor host boundary before the first guest ran.
-The AppArmor opt-out is now limited to that network-none TPM fixture container;
-current release status remains open until a new clean receipt and exact-revision
-CI PASS are retained. Every such receipt remains bounded to one-vCPU QEMU/TCG
-and swtpm: it
-does not establish physical TPM anti-rollback, physical power-loss behavior,
-hardware-general DMA quiescence or custody, crash-persistent PFN/IOVA custody,
-resource reuse authorization, or SMP correctness. Historical IRQ Phase A and
-`v0.1.0` evidence retain their original boundaries.
+The final C3 clean local and exact-C3 CI receipts show initial commit and
+retained claims, a second service crash after durable reply apply intent,
+reconciliation without a second intent and final settlement, a stable
+repeated-recovery boot, service/binding generations `1/1` through `4/4`, and
+increasing boot, journal, and device freshness. Earlier exact-CI candidates
+exposed two swtpm 0.7.3 capability gaps and loss of QEMU's Unix ancillary data
+socket before the first production guest. C3 limits the label/AppArmor opt-out
+to the caller-UID/GID, network-none persistent QEMU guest-run container; host
+swtpm remains outside it, and the exact-C3 runner used a non-root caller. Both
+C3 seals passed and their exact records are retained in the release ledger.
+
+Every such receipt remains bounded to one-vCPU QEMU/TCG and swtpm. It does not
+establish physical TPM anti-rollback, physical power-loss behavior,
+hardware-general DMA quiescence, crash-persistent PFN/IOVA custody,
+authorization to reuse retained cross-reboot PFN/IOVA/quarantined queue
+resources, or SMP correctness. The focused same-boot DMA slice separately
+observes fresh-generation logical core-resource reuse, not physical-address
+reuse. Historical IRQ Phase A and `v0.1.0` evidence retain their original
+boundaries.
 
 ## Use the repository
 

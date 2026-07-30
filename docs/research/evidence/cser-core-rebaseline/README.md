@@ -1,8 +1,8 @@
 # CSER Core rebaseline evidence archive
 
-This directory retains small, source-bound receipt preimages and CI disposition
-records in Git. Large QEMU images, raw media, and debug logs remain workflow
-artifacts and are named and hashed by the retained receipts.
+This directory retains source-bound receipt preimages, CI dispositions, and the
+final verification log in Git. Large QEMU images, raw media, and debug traces
+remain workflow artifacts and are named and hashed by the retained receipts.
 
 ## Historical cutover A
 
@@ -56,5 +56,32 @@ PASS.
   received `CMD_SET_DATAFD` without its Unix ancillary data socket. C2 is valid
   local evidence for its revision, not the final release seal.
 
-A later directory must record a host-security-policy-compatible replacement
-receipt and exact CI PASS before the release ledger can return to `SEALED`.
+## Final replacement C3
+
+- Revision: `16e87b0f94b5270760dc02048fb4191bf877df71`
+- Clean local receipt:
+  `16e87b0f94b5270760dc02048fb4191bf877df71/combined-receipt.txt`
+- Clean local receipt SHA-256:
+  `52aed92515920c543814bef0a842141bdfcd7c44ce1c3d8c030935ab4498adb5`
+- Exact-C3 CI receipt:
+  `16e87b0f94b5270760dc02048fb4191bf877df71/ci-combined-receipt.txt`
+- Exact-C3 CI receipt SHA-256:
+  `e3e46c8efdd6755c7f750579f925251b3912b3f1e7a7fa35a92765a3cc995728`
+- CI disposition:
+  `16e87b0f94b5270760dc02048fb4191bf877df71/ci-success.txt`
+- Complete merged CI log, losslessly compressed:
+  `16e87b0f94b5270760dc02048fb4191bf877df71/ci-complete.log.gz`
+- Uncompressed log SHA-256:
+  `54ccd9155788dbcc7f3e83d20ae2cb69bbfbae66be66035132362b96c2d71121`
+- Artifact retention caveat: the success upload omitted the hidden, zero-byte
+  `tpmstate/.lock`. This archive retains the artifact's byte-exact state file
+  plus the reconstructed empty lock under
+  `16e87b0f94b5270760dc02048fb4191bf877df71/ci-tpmstate/`. That tree reconstructs
+  the receipt's TPM state hash
+  `a3fb319391f07553c4e434addada8394ffc1c06ec45199e7a1969a5255e6a14a`.
+- Disposition: the clean local seal and exact-C3 GitHub run both passed the
+  complete core/model/property/Loom gate, focused reply and DMA guests, and all
+  four production boots. The release ledger records the bounded claims and
+  non-claims. The focused same-boot DMA slice's logical core-resource reuse does
+  not authorize retained cross-reboot PFN/IOVA/quarantined queue or physical
+  address reuse.

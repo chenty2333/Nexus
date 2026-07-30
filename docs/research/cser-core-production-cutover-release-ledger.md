@@ -1,8 +1,7 @@
 # CSER Core Production Cutover Release Ledger
 
 - RFC: `docs/rfcs/0006-cser-core-semantic-rebaseline.md`
-- Ledger status: **RE-SEAL PENDING -- exact CI exposed a host/container Unix
-  data-FD policy gap after the swtpm 0.7.3 capability corrections**
+- Ledger status: **SEALED -- bounded QEMU cutover evidence**
 - Historical cutover commit A:
   `c06e9f43e931ed3f130da6dfcf29452a45406152`
 - Historical clean four-boot receipt digest D-A:
@@ -27,14 +26,30 @@
 - Exact-C2 CI disposition: **FAIL after TPM provisioning and before the first
   production guest executed; retained in
   `docs/research/evidence/cser-core-rebaseline/2e209bd738a788b174c18b73fa9103d8d65b4bf9/ci-failure.txt`**
-- Replacement cutover commit C3: **PENDING**
-- Replacement clean receipt digest D-C3: **PENDING**
-- Final evidence attestation E: **PENDING**
-- Intended immutable tag: `cser-core-rebaseline-2026-07-30`
+- Replacement cutover commit C3:
+  `16e87b0f94b5270760dc02048fb4191bf877df71`
+- Replacement clean receipt digest D-C3:
+  `52aed92515920c543814bef0a842141bdfcd7c44ce1c3d8c030935ab4498adb5`
+- Retained D-C3 preimage:
+  `docs/research/evidence/cser-core-rebaseline/16e87b0f94b5270760dc02048fb4191bf877df71/combined-receipt.txt`
+- Exact-C3 CI disposition: **PASS**, run `30517746257`, jobs `90791245396`
+  and `90791245336`
+- Exact-C3 CI receipt digest:
+  `e3e46c8efdd6755c7f750579f925251b3912b3f1e7a7fa35a92765a3cc995728`
+- Exact-C3 artifact: `8749687823`,
+  `sha256:4196d594294f2797aeafa7bda6bd3a2be2fe97fa7403e1f9438e126f1208c8e6`
+- Exact-C3 CI record and receipt:
+  `docs/research/evidence/cser-core-rebaseline/16e87b0f94b5270760dc02048fb4191bf877df71/`
+- Complete merged CI log SHA-256:
+  `54ccd9155788dbcc7f3e83d20ae2cb69bbfbae66be66035132362b96c2d71121`;
+  its lossless gzip preimage is retained beside the CI record
+- Final evidence attestation E: **this documentation/evidence-only commit; its
+  Git identity is recorded externally by the annotated release tag below**
+- Annotated release tag: `cser-core-rebaseline-2026-07-30`
 - Static cutover gate: `kernel/nexus-ostd/scripts/assert-cser-core-production-cutover.sh`
 
 Commit A and D-A remain valid evidence for their exact source revision, and the
-receipt preimage is now retained in Git. They are not the final release seal:
+receipt preimage is retained in Git. They are not the final release seal:
 exact-B CI passed the full core/model/property/Loom gate, then Ubuntu 24.04's
 swtpm 0.7.3 rejected the optional `--tpmstate ...,lock` argument before the
 four-boot run. C1 removed that redundant option and made daemon shutdown
@@ -44,33 +59,52 @@ C2 negotiated that flag: swtpm v0.8 and newer receive the opt-out, while older
 versions, which predate automatic TPM2 shutdown, retain their equivalent crash
 behavior. Exact-C2 CI passed provisioning, then showed that its Docker 28 /
 AppArmor 4 boundary delivered the QEMU control command without the Unix
-ancillary data FD. C3 scopes the AppArmor opt-out to the network-none TPM
-fixture container; every normal build/test container retains Docker's default
-policy. A new clean source-bound receipt and CI PASS are required before this
-ledger returns to `SEALED`.
+ancillary data FD.
 
-## Replacement Seal Protocol
+C3 scopes SELinux label disablement and AppArmor `unconfined` to the
+caller-UID/GID, network-none persistent QEMU guest-run container; host swtpm
+remains outside it, every normal build/test container retains Docker's default
+policy, and exact-C3 used a non-root caller. An offline Ubuntu profile/source
+audit found rules consistent with the unconfined sender-label diagnosis, but the
+retained CI log does not contain the host AppArmor audit decision. Exact-C3 CI
+directly establishes only that this scoped correction passed both jobs, TPM
+provisioning, all focused gates, and all four production boots on the recorded
+GitHub Ubuntu image. It does not claim the same result for arbitrary host
+AppArmor or Docker policy combinations.
 
-The replacement seal avoids a self-referential commit and keeps runtime proof
+## Completed Replacement Seal Protocol
+
+The replacement seal avoided a self-referential commit and kept runtime proof
 separate from evidence attestation:
 
 1. **Replacement cutover commit C3** contains the unchanged production
-   semantics, the narrowly scoped TPM fixture policy correction, and this
-   ledger with pending C3/D-C3 fields.
-2. From a clean C3 tree, run `./x verify`. The command must emit `CSER CORE
-   VERIFY PASS`, complete all focused and four-boot guests, and produce
+   semantics, the narrowly scoped persistent guest-run container policy
+   correction, and this ledger as it stood with pending C3/D-C3 fields.
+2. From the clean C3 tree, `./x verify` emitted `CSER CORE VERIFY PASS`,
+   completed all focused and four-boot guests, and produced
    `combined-receipt.txt` with `PASS`, `seal_requested=true`,
    `git_source_tree_clean=true`, and `git_revision=C3`.
-3. Push C3 by fast-forward and require both exact-C3 CI jobs to pass. Retain the
-   CI run identity, artifact digest, complete verification log, and the small
-   receipt preimage in Git.
+3. C3 was pushed by fast-forward and both exact-C3 CI jobs passed. The CI run
+   identity, artifact digest, complete losslessly compressed verification log,
+   and local and CI receipt preimages are retained in Git.
 4. **Final evidence attestation E** records C3, D-C3, the exact-C3 CI result,
-   and the retained paths. E changes only documentation and evidence, then the
-   intended immutable tag identifies E without embedding E's own hash.
+   and the retained paths. E changes only documentation and evidence. After E
+   is committed and validated, the annotated release tag identifies E without
+   embedding E's own hash.
 
 E must not change production Rust sources, Cargo/OSDK wiring, the runner, the
 static gate, or the cutover contract. If such a change is required, D-C3 is
 inapplicable and another clean cutover revision is required.
+
+The success upload did not enable `include-hidden-files`, so artifact
+`8749687823` omits the zero-byte `tpmstate/.lock` file while retaining the TPM
+state content in `tpmstate/tpm2-00.permall`. The downloaded artifact alone is
+therefore not a complete preimage for the receipt's TPM tree hash. E retains the
+artifact's byte-exact state file and the reconstructed empty lock under
+`docs/research/evidence/cser-core-rebaseline/16e87b0f94b5270760dc02048fb4191bf877df71/ci-tpmstate/`;
+the runner's documented tree-hash algorithm exactly reconstructs
+`a3fb319391f07553c4e434addada8394ffc1c06ec45199e7a1969a5255e6a14a`.
+This retention caveat does not upgrade or invalidate the executed TPM semantics.
 
 ## Removed Live Surfaces
 
@@ -99,7 +133,7 @@ runtimes are not in that closure.
 Historical material remains recoverable without remaining live:
 
 - Checkpoint commit: `05e68b19b219d0f5288de5438127b5690cd7e50f`.
-- Immutable tag: `pre-cser-core-rebaseline-2026-07-29`.
+- Annotated checkpoint tag: `pre-cser-core-rebaseline-2026-07-29`.
 - Remote archive ref: `archive/pre-cser-core-rebaseline-2026-07-29`.
 - The checkpoint retains the RFC 0005 oracle, trace-conformance material, and
   IRQ Phase A sources and receipts. They retain their original bounded claims.
@@ -112,8 +146,10 @@ through a tag.
 
 ## QEMU Evidence Boundary
 
-The retained historical receipt identified by A and D-A establishes only one
-hermetic run of the pinned OSTD/QEMU profile with:
+The final local and exact-CI receipts identified by C3, D-C3, and the exact-C3
+CI digest establish only two clean, source-bound, environment-recorded runs of
+the pinned container/QEMU profile, including their distinct host swtpm and TPM2
+tool hashes, with:
 
 - four separate guest boots over the same `journal.raw`, reply `outbox.raw`,
   and swtpm state directory;
@@ -145,6 +181,11 @@ It does **not** establish:
 - authorization to reuse any retained PFN, IOVA, or quarantined queue resource;
 - absence of failures outside the exercised failpoints and bounded profile.
 
+The separate focused same-boot DMA receipt's `core_resource_reuse=true` refers
+to fresh-generation logical core-resource reuse only; its adjacent
+`physical_address_reuse=false` explicitly excludes physical address reuse. It
+does not override the production cross-reboot retained-resource non-claim.
+
 The static cutover gate, rather than the QEMU receipt, establishes that no live
 dual-write, fallback, or compatibility path to the old Registry is present in
 the production closure.
@@ -173,7 +214,8 @@ The retained clean A seal established all of the following for A:
 - the D-A preimage is now retained in Git rather than depending on an ignored
   local artifact.
 
-The replacement release remains open until clean C3/D-C3 and exact-C3 CI
-satisfy the protocol above. The B, C1, and C2 failures are negative harness
+The replacement C3 local seal, exact-C3 CI run, and evidence-only E attestation
+satisfy the protocol above. The B, C1, and C2 failures remain negative harness
 evidence, not production-boot PASS results and not reasons to weaken any
-semantic gate.
+semantic gate. After E validation, the annotated release tag identifies E;
+runtime claims remain bound to C3 and its two retained receipt digests.

@@ -98,16 +98,17 @@ with `NONSEALABLE`; it is suitable for pre-commit integration but not release
 evidence. `seal-core-persistent-recovery` first requires a clean source tree and
 then writes `combined-receipt.txt` with `PASS` only if the tree remains clean
 through the run. The archived production/focused ISOs, boot serial logs, QEMU
-debug traces, raw media, and swtpm logs remain beside it. Historical cutover
-`c06e9f43e931ed3f130da6dfcf29452a45406152` and replacement candidate C1 passed
-clean local seals and their receipt preimages are retained. Exact CI exposed
-optional swtpm 0.7.3 state-lock and auto-shutdown-opt-out incompatibilities.
-The runner now negotiates the latter capability. Candidate C2 also passed a
-clean local seal, but exact CI lost QEMU's ancillary data socket across the
-Docker/AppArmor boundary after provisioning and before guest execution. The
-AppArmor opt-out is limited to the network-none TPM fixture container. A new
-clean receipt and exact-revision CI PASS remain required; current disposition
-is recorded in the production cutover release ledger.
+debug traces, raw media, and swtpm logs remain beside it. Final replacement C3
+`16e87b0f94b5270760dc02048fb4191bf877df71` passed a clean local seal and both
+exact-C3 CI jobs; both receipt preimages and the complete CI log are retained.
+Earlier exact-CI candidates exposed optional swtpm 0.7.3 state-lock and
+auto-shutdown-opt-out incompatibilities, then loss of QEMU's ancillary data
+socket across the Docker/AppArmor boundary. C3 negotiates the latter swtpm
+capability and limits the label/AppArmor opt-out to the caller-UID/GID,
+network-none persistent QEMU guest-run container; host swtpm remains outside it,
+and exact-C3 used a non-root caller. Exact identities, digests, negative records,
+and the bounded evidence disposition are in the production cutover release
+ledger.
 
 ## Workflow
 
