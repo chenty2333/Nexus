@@ -1,7 +1,7 @@
 # RFC 0007: CSER composite effect custody
 
-- Status: **Accepted; profile-2 software and bounded QEMU protocol pass on the
-  current dirty worktree; clean release seal and physical hardware open**
+- Status: **Accepted and clean-sealed for profile-2 software and the bounded
+  QEMU protocol at candidate `e8190f4`; physical hardware remains open**
 - Decision date: 2026-07-30
 - Evidence update: 2026-07-31
 - Predecessor: [RFC 0006](0006-cser-core-semantic-rebaseline.md)
@@ -96,16 +96,17 @@ They are not evidence for:
 
 ## Current evidence status
 
-The profile-2 implementation now has a passing but intentionally nonsealable
-evidence chain. The current combined receipt is
-`kernel/nexus-ostd/artifacts/cser-production/combined-proof.txt`; its companion
-digest is
-`5c1da57d103006935cf7f7090bbf5ae721ac0c88070e9d852ac70b4a4a7c56e6`.
-The receipt says `NONSEALABLE`, `nonsealable_reason=source-tree-dirty`, and
-`seal_requested=false`. It records base revision
-`7c82d0c9f26d77a630faeaeb28e139c36beb5319`, which is not an exact name for
-the dirty source and must not be presented as the final implementation
-revision.
+The profile-2 implementation now has a clean, source-bound seal. Candidate C
+is `e8190f45e19f6cc1abd2b9c55e87be7c1079ed01`; its receipt is retained at
+`docs/research/evidence/cser-composite-effect-custody/e8190f45e19f6cc1abd2b9c55e87be7c1079ed01/combined-receipt.txt`
+and has digest
+`29830601a6fe6b2fe357a224ab67595e8021098b5f7598b8f250f3910b76c090`.
+The receipt says `PASS`, `git_source_tree_clean=true`, and
+`seal_requested=true`, and binds the exact candidate source, image source
+proof, catalog, tools, and four-boot protocol.
+Exact-C GitHub Actions run `30618061878` independently passed quick feedback
+and the complete seal. Its retained receipt has digest
+`cbe98981b5f69524d451a0f70f05b99d8da2898ddd9b32387b9559d0696e6a2e`.
 
 The current software evidence establishes:
 
@@ -824,8 +825,7 @@ quiescence.
 
 ### C0: specification and independent model
 
-Current status: **accepted on dirty-tree software evidence; clean seal
-pending**.
+Current status: **accepted at clean candidate C**.
 
 - accept this RFC and the profile-2 acceptance matrix;
 - define the composite catalog and stable oracle/core projection mapping;
@@ -838,8 +838,7 @@ not authorize a production or physical-resource claim.
 
 ### C1: portable profile-2 core and schema 6
 
-Current status: **accepted on dirty-tree software evidence; clean seal
-pending**.
+Current status: **accepted at clean candidate C**.
 
 - implement the parent/component state model and reverse indexes;
 - implement resource-local discharge, tombstones, and reuse permits;
@@ -854,8 +853,7 @@ pairing.
 
 ### C2: one-effect production reply and DMA
 
-Current status: **accepted on dirty-tree static and QEMU evidence; clean seal
-pending**.
+Current status: **accepted at clean candidate C**.
 
 - create one effect from one real operation;
 - bind reply outbox and queue/DMA work to separate components of that effect;
@@ -869,8 +867,8 @@ remains.
 
 ### C3: persistent arena and QEMU generation reuse
 
-Current status: **accepted for the bounded QEMU protocol on dirty-tree
-evidence; clean seal pending**.
+Current status: **accepted for the bounded QEMU protocol at clean candidate
+C**.
 
 - reserve and recover exact guest PFN/IOVA leases before normal allocation;
 - terminalize dedicated-arena generation `g` under the configured typed
@@ -964,8 +962,8 @@ This RFC does not claim:
 
 ## Acceptance summary
 
-The semantic/software and bounded QEMU requirements below have passed on the
-current dirty worktree. RFC 0007 is release-sealed only when one clean,
+The semantic/software and bounded QEMU requirements below passed at the clean
+candidate C. RFC 0007 is release-sealed for the QEMU claim because one
 source-bound evidence chain establishes:
 
 - one real operation and one `EffectId` containing reply and DMA components;
@@ -989,9 +987,11 @@ source-bound evidence chain establishes:
 
 The detailed gate ledger is
 [the composite-effect acceptance matrix](../research/cser-composite-effect-acceptance-matrix.md).
+The source-bound seal, retained artifacts, and exact claim boundary are recorded
+in the
+[composite-effect release ledger](../research/cser-composite-effect-release-ledger.md).
 
-The final clean-source closure must be run after all intended changes are
-committed:
+The final clean-source closure was run on candidate C:
 
 ```console
 cargo test -p cser-model --all-features
@@ -1000,15 +1000,14 @@ bash kernel/nexus-ostd/scripts/assert-cser-core-production-cutover.sh
 kernel/nexus-ostd/x seal-core-persistent-recovery
 ```
 
-The clean run writes `combined-receipt.txt` and
+The clean run wrote `combined-receipt.txt` and
 `combined-receipt.sha256` in the ignored production artifact directory. The
-receipt must self-report the exact candidate `git_revision`,
+receipt self-reports the exact candidate `git_revision`,
 `git_source_tree_clean=true`, `seal_requested=true`, and the bounded QEMU
-non-claims. Its companion checksum, rather than a value copied back into this
-tracked RFC, binds the receipt bytes. Embedding either the final commit SHA or
-that receipt's digest in the same candidate commit would create an impossible
-self-reference and would dirty the source after the seal.
+non-claims. Its companion checksum and the retained evidence archive bind the
+receipt bytes. The evidence-only attestation records those values after C,
+rather than creating an impossible same-commit self-reference.
 
-Until such a receipt exists for the exact candidate revision, C0-C3 are
-accepted as current dirty-tree evidence, no release label is authorized, and
-C4/H-01..H-06 remain open.
+That receipt exists for the exact candidate revision, so C0-C3 and the
+`profile2-core`, `profile2-production`, and `composite-qemu` labels are
+accepted. C4/H-01..H-06 and `composite-hardware` remain open.

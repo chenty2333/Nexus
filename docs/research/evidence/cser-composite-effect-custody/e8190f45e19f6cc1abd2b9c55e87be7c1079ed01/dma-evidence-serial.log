@@ -1,0 +1,13 @@
+[2J[01;01H[=3h[2J[01;01H[2J[01;01H[8;056;240t0[2J[01;01HBdsDxe: loading Boot0002 "UEFI QEMU DVD-ROM QM00005 " from PciRoot(0x0)/Pci(0x1F,0x2)/Sata(0x2,0xFFFF,0x0)
+BdsDxe: starting Boot0002 "UEFI QEMU DVD-ROM QM00005 " from PciRoot(0x0)/Pci(0x1F,0x2)/Sata(0x2,0xFFFF,0x0)
+WARNING: no console will be available to OS
+error: no suitable video mode found.
+CSER_CORE_DMA Commit generation=1 bdf=00:05.0 queue=0 descriptor=0 avail_idx_release=true notification_resolved=true real_virtio=true qemu=true
+CSER_CORE_DMA ServiceExit label=origin principal=53249 incarnation=1 reason=task-return
+CSER_CORE_DMA ExactReap principal=53249 incarnation=1 reaped=true
+CSER_CORE_DMA ServiceExit label=successor-v2 principal=53249 incarnation=2 reason=task-return
+CSER_CORE_DMA ExactReap principal=53249 incarnation=2 reaped=true
+CSER_CORE_DMA ServiceExit label=successor-v3 principal=53249 incarnation=3 reason=task-return
+CSER_CORE_DMA ExactReap principal=53249 incarnation=3 reaped=true
+CSER_CORE_DMA HardwareClosure PASS qemu=true physical_hardware=false real_pci=true real_virtio=true avail_idx_release=true completion=true isr_status_read_ack=true irq_controller_delivery=true hard_irq_actor=true intx_remap=true intx_remasked=true irq_vector=35 irq_remapping_index=Some(0) reset_status_zero=true bus_master_disabled=true reset_generation=3 vt_d_iotlb_submit_poll_complete=true iommu_software_typestate=false retained_dma_pages=3 core_resource_reuse=true physical_address_reuse=false stale_old_irq_ack=rejected_without_mutation first_irq_turns=1 second_irq_turns=1 reset_timeout_retry=true iotlb_pending_retry=true
+CSER_CORE_DMA_OSTD_QEMU PASS death=real-task-reap fence=immediate-manager second_crash=true post_mortem_owner=kernel-manager reply_registry=false legacy_registry=false portal_glue=false live_dual_write=false historical_profile=1 production_profile=false journal=volatile-dev-only durable_provider=separate-suite qemu=true physical_hardware=false

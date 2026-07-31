@@ -1,0 +1,53 @@
+nexus.cser.composite-effect-ci-success.v1
+result=PASS
+git_revision=e8190f45e19f6cc1abd2b9c55e87be7c1079ed01
+workflow=ci
+run_id=30618061878
+run_attempt=1
+run_url=https://github.com/chenty2333/Nexus/actions/runs/30618061878
+run_event=push
+run_created_at=2026-07-31T08:56:09Z
+run_completed_at=2026-07-31T09:06:03Z
+runner_image=ubuntu-24.04
+runner_image_version=20260720.247.2
+runner_version=2.336.0
+quick_job_id=91115785111
+quick_result=PASS
+verify_job_id=91115785000
+verify_result=PASS
+core_verify_marker=CSER CORE VERIFY PASS portable_core=true independent_oracle=true loom=true journal_recovery=true frozen_wire=archive-only
+cutover_marker=CSER_CORE_PRODUCTION_CUTOVER PASS manifest_sources=13 portable_core=nonoptional api_profile=2 catalog_version=5 projection_version=6 snapshot_version=2 journal_schema=6 default=cser-production registry=single operation_effect=shared component_custody=reply+dma production_service_tasks=1 legacy_runtime_estates=false task_bound_ingress=true post_exit_fence=true production_rebind=true vnext_portal=true vnext_supervisor=true volatile_transitions=false evidence_schemes=reply+dma boots=4 shared_media=true tpm_fixture_policy=scoped
+persistent_result=CSER_CORE_PERSISTENT_QEMU_RESTART PASS
+production_boots_completed=4
+schema5_negative_boot=true
+schema5_typed_rejection=migration-required
+schema5_semantic_replay=false
+schema5_pairing_inference=false
+schema5_registry_publication=false
+schema5_device_activation=false
+operation_effect=50433:1
+component_ids=1,2
+freshness_progression=revision=11,24,42,52 boot=2,3,4,5 journal=2,3,4,5 device=2,3,4,5
+service_identity_progression=service_principal_generation=1,2,3,4 binding_generation=1,2,3,4
+dma_arena_reuse_coordinates=resource_generation=1->2 guest_pfn_base=196608 emulated_iova_base=1073741824 host_backing_offset=805306368
+clean_local_receipt_sha256=29830601a6fe6b2fe357a224ab67595e8021098b5f7598b8f250f3910b76c090
+ci_receipt_sha256=cbe98981b5f69524d451a0f70f05b99d8da2898ddd9b32387b9559d0696e6a2e
+ci_artifact_id=8788407380
+ci_artifact_name=nexus-cser-core-rebaseline-1
+ci_artifact_size_bytes=60525208
+ci_artifact_sha256=c15bd84eed12bc981169172483c55181e6fdf36871a0ea83e731030e39a6bceb
+ci_artifact_digest_source=github-api
+ci_artifact_expires_at=2026-10-29T08:56:09Z
+complete_ci_log_sha256=e7169868a3ffe1f2165e044b65db85bf07bdfbd2655e50924d4e98cc42726131
+complete_ci_log_gzip_sha256=280157240c809dc584a35cde9ab694deba70cee802c95b38db9d6841db2a227f
+artifact_hidden_tpm_locks_included=false
+artifact_tpm_state_reconstruction=add-empty-ci-tpmstate/.lock
+artifact_reconstructed_tpm_state_sha256=642630abea0e53a0767e5f636e6b307dca66cb2ec34f97937697e15820f9f35e
+artifact_schema5_tpm_state_reconstruction=add-empty-ci-schema5-negative-tpmstate/.lock
+artifact_reconstructed_schema5_tpm_state_sha256=5961c472dd8c0c31900aa637c086971cef872b756d09bb58d85bf41d0e928a48
+qemu=true
+physical_hardware=false
+host_physical_pfn_identity=false
+physical_dma_drain=false
+physical_antirollback=false
+physical_powerloss=false
