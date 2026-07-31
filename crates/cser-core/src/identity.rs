@@ -107,6 +107,16 @@ nonzero_id!(
 nonzero_id!(SnapshotId, u64, "Stable identity of one recovery snapshot.");
 nonzero_id!(DomainId, u32, "Stable domain schema identity.");
 nonzero_id!(
+    CompositeKindId,
+    u32,
+    "Stable catalog-defined class of one composite effect."
+);
+nonzero_id!(
+    ComponentId,
+    u32,
+    "Stable catalog-defined component identity within a composite effect."
+);
+nonzero_id!(
     ObligationKindId,
     u32,
     "Stable domain-defined obligation class identity."

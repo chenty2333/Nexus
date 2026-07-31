@@ -15,8 +15,8 @@
 use alloc::sync::Arc;
 
 use cser_core::{
-    Command, CommandRequest, CoreError, EffectId, PrincipalIncarnation, RecoverySnapshot, RootId,
-    SnapshotId, TransitionDurability, TransitionReceipt, TxError,
+    Command, CommandRequest, ComponentId, CoreError, EffectId, PrincipalIncarnation,
+    RecoverySnapshot, RootId, SnapshotId, TransitionDurability, TransitionReceipt, TxError,
 };
 
 use super::core_runtime::OstdCserRuntime;
@@ -108,6 +108,9 @@ pub(crate) enum SnapshotTransitionError<E> {
 }
 
 /// Failure from the two-stage fence-and-snapshot operation.
+// Keeping the exact linear receipt inline avoids introducing an allocation
+// failure after the fence has already committed durably.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum FenceSnapshotError<E> {
     /// No durable fence receipt was produced.
@@ -262,14 +265,31 @@ impl<A: RecoveredCoreAuthority> CoreSupervisorVNext<A> {
         self.authority
             .transact(CommandRequest::ClaimSettlement { effect, claimant }.into())
     }
+
+    /// Durably mints one exact component-local successor-settlement claim.
+    pub(crate) fn claim_component_settlement(
+        &self,
+        effect: EffectId,
+        component: ComponentId,
+        claimant: PrincipalIncarnation,
+    ) -> Result<TransitionReceipt, TxError<A::PersistenceError>> {
+        self.authority.transact(
+            CommandRequest::ClaimComponentSettlement {
+                effect,
+                component,
+                claimant,
+            }
+            .into(),
+        )
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use cser_core::{
-        BootGeneration, ChargeAccountId, CoreLimits, DeviceGeneration, Engine, Freshness,
-        JournalGeneration, JournalRecord, PrincipalId, RegistryInstance, TransitionEvent,
-        TransitionOutput, standard_catalog,
+        AGENT_COMPONENT_REPLY, AGENT_OPERATION_COMPOSITE, BootGeneration, ChargeAccountId,
+        CoreLimits, DeviceGeneration, Engine, Freshness, JournalGeneration, JournalRecord,
+        PrincipalId, RegistryInstance, TransitionEvent, TransitionOutput, standard_catalog,
     };
 
     use super::*;
@@ -338,12 +358,11 @@ mod tests {
 
     fn seed_uncommitted_reply(runtime: &OstdCserRuntime<TestDurability>) {
         runtime
-            .transact(CommandRequest::CreateEstate {
+            .transact(CommandRequest::CreateCompositeEffect {
                 effect: effect(),
                 origin: origin(),
                 binding_generation: 1,
-                domain: cser_core::REPLY_DOMAIN,
-                obligation: cser_core::REPLY_OBLIGATION_PUBLICATION,
+                kind: AGENT_OPERATION_COMPOSITE,
                 charge_account: ChargeAccountId::new(7).unwrap(),
             })
             .unwrap();
@@ -393,7 +412,7 @@ mod tests {
             TransitionEvent::EffectAdopted
         );
         assert!(matches!(
-            supervisor.claim_settlement(effect(), successor()),
+            supervisor.claim_component_settlement(effect(), AGENT_COMPONENT_REPLY, successor()),
             Err(TxError::Core(CoreError::WrongCommitState))
         ));
     }

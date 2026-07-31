@@ -24,30 +24,48 @@
 //! physical cold-boot recovery.
 
 use cser_core::{
-    Digest, EffectFactChallenge, EffectFactKind, EffectId, EffectReceiptVerifier, ExternalOutcome,
-    PrincipalIncarnation, REPLY_COMMIT_RECEIPT_SCHEMA, REPLY_DOMAIN, REPLY_OBLIGATION_PUBLICATION,
-    REPLY_VERIFIER, VerificationError, VerifiedEffectObservation, VerifierIdentity,
+    ClaimId, ClaimScope, ComponentId, Digest, EffectFactChallenge, EffectFactKind, EffectId,
+    EffectReceiptVerifier, EvidenceChallenge, ExternalOutcome, PrincipalIncarnation,
+    REPLY_APPLY_RECEIPT_SCHEMA, REPLY_COMMIT_RECEIPT_SCHEMA, REPLY_DOMAIN,
+    REPLY_EVIDENCE_PUBLICATION_ACK, REPLY_OBLIGATION_PUBLICATION, REPLY_RECEIPT_SCHEMA,
+    REPLY_SETTLEMENT_RECEIPT_SCHEMA, REPLY_VERIFIER, ReceiptVerifier, ResourceGeneration,
+    ResourceId, VerificationError, VerifiedEffectObservation, VerifiedObservation,
+    VerifierIdentity,
 };
 use sha2::{Digest as _, Sha256};
 
 use super::core_pio_journal::{
     AtaJournalFixture, AtaPioDisk, AtaPioError, SECTOR_BYTES, SectorBackend,
 };
+use super::core_reply_adapter::ReplyPlan;
 
 // LBA 0 remains untouched.  The bounded append-only shape turns capacity and
 // ambiguous media damage into explicit backpressure rather than overwriting a
 // possibly committed reply.
 const FIRST_OUTBOX_LBA: u32 = 1;
 const OUTBOX_SLOTS: u32 = 128;
-const REQUIRED_OUTBOX_SECTORS: u32 = FIRST_OUTBOX_LBA + OUTBOX_SLOTS;
+const FIRST_DELIVERY_LBA: u32 = FIRST_OUTBOX_LBA + OUTBOX_SLOTS;
+const DELIVERY_SLOTS: u32 = 128;
+const REQUIRED_OUTBOX_SECTORS: u32 = FIRST_DELIVERY_LBA + DELIVERY_SLOTS;
 
 const RECORD_MAGIC: [u8; 8] = *b"CSEROUT\0";
-const RECORD_VERSION: u16 = 1;
+const RECORD_VERSION: u16 = 2;
 const RECORD_LEN: u16 = 208;
 const RECORD_STATE_COMMITTED: u32 = 1;
 
 const CHECKSUM_OFFSET: usize = 176;
 const CHECKSUM_END: usize = 208;
+
+const DELIVERY_MAGIC: [u8; 8] = *b"CSERDLV\0";
+const DELIVERY_VERSION: u16 = 1;
+const DELIVERY_RECORD_LEN: u16 = 288;
+const DELIVERY_STATE_APPLIED: u32 = 1;
+const DELIVERY_STATE_ACKNOWLEDGED: u32 = 2;
+const DELIVERY_SOURCE_COMMIT: u32 = 1;
+const DELIVERY_SOURCE_ATOMIC_ARM: u32 = 2;
+const DELIVERY_SOURCE_APPLY: u32 = 3;
+const DELIVERY_CHECKSUM_OFFSET: usize = 256;
+const DELIVERY_CHECKSUM_END: usize = 288;
 
 /// Stable reply identity below an exact CSER effect.
 ///
@@ -82,6 +100,7 @@ impl ReplyOutboxIdentity {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ReplyCommitKey {
     reply: ReplyOutboxIdentity,
+    component: ComponentId,
     actor: PrincipalIncarnation,
     authority_generation: u64,
     intent_nonce: u64,
@@ -95,6 +114,9 @@ impl ReplyCommitKey {
     ) -> Result<Self, ReplyOutboxRequestError> {
         let Some(reply) = ReplyOutboxIdentity::new(challenge.effect(), reply_sequence) else {
             return Err(ReplyOutboxRequestError::InvalidReplySequence);
+        };
+        let Some(component) = challenge.component() else {
+            return Err(ReplyOutboxRequestError::WrongChallenge);
         };
         if challenge.kind() != EffectFactKind::CommitOutcome
             || challenge.domain() != REPLY_DOMAIN
@@ -111,6 +133,7 @@ impl ReplyCommitKey {
         }
         Ok(Self {
             reply,
+            component,
             actor: challenge.actor(),
             authority_generation: challenge.generation(),
             intent_nonce: challenge.nonce(),
@@ -135,6 +158,10 @@ impl ReplyCommitReceipt {
 
     pub(crate) const fn actor(self) -> PrincipalIncarnation {
         self.key.actor
+    }
+
+    pub(crate) const fn component(self) -> ComponentId {
+        self.key.component
     }
 
     pub(crate) const fn authority_generation(self) -> u64 {
@@ -239,6 +266,144 @@ pub(crate) enum ReplyCommitInspection<E> {
     Indeterminate(ReplyOutboxIndeterminate<E>),
 }
 
+/// Durable source from which one settlement apply publication is
+/// reconstructed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReplyApplySource {
+    /// The ordinary commit-outbox record is present and source-exact.
+    Committed(Digest),
+    /// Atomic component arm survived, but its commit bearer and outbox write
+    /// did not. The successor materializes the deterministic reply from the
+    /// journaled component operation.
+    AtomicArmIndeterminate(Digest),
+}
+
+impl ReplyApplySource {
+    pub(crate) const fn predecessor_digest(self) -> Digest {
+        match self {
+            Self::Committed(digest) | Self::AtomicArmIndeterminate(digest) => digest,
+        }
+    }
+
+    fn parts(self) -> Option<(u32, Digest)> {
+        match self {
+            Self::Committed(digest) if !digest.is_zero() => Some((DELIVERY_SOURCE_COMMIT, digest)),
+            Self::AtomicArmIndeterminate(digest) if !digest.is_zero() => {
+                Some((DELIVERY_SOURCE_ATOMIC_ARM, digest))
+            }
+            Self::Committed(_) | Self::AtomicArmIndeterminate(_) => None,
+        }
+    }
+}
+
+/// Source-exact durable apply publication recovered from the reply disk.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ReplyApplyRecord {
+    record: ReplyDeliveryRecord,
+}
+
+impl ReplyApplyRecord {
+    pub(crate) const fn reply(self) -> ReplyOutboxIdentity {
+        self.record.key.reply
+    }
+
+    pub(crate) const fn semantic_digest(self) -> Digest {
+        self.record.semantic_digest
+    }
+
+    pub(crate) const fn record_checksum(self) -> Digest {
+        self.record.record_checksum
+    }
+
+    pub(crate) fn source(self) -> ReplyApplySource {
+        match self.record.source_kind {
+            DELIVERY_SOURCE_COMMIT => ReplyApplySource::Committed(self.record.predecessor),
+            DELIVERY_SOURCE_ATOMIC_ARM => {
+                ReplyApplySource::AtomicArmIndeterminate(self.record.predecessor)
+            }
+            _ => unreachable!("validated apply records have a known source"),
+        }
+    }
+
+    pub(crate) fn matches_plan(self, plan: ReplyPlan) -> bool {
+        self.record.kind == ReplyDeliveryKind::Applied
+            && self.record.key == ReplyDeliveryKey::from_plan(plan)
+            && self.record.semantic_digest == plan.apply_receipt_digest()
+            && self.record.self_authenticates()
+    }
+}
+
+/// Source-exact durable client acknowledgement recovered from the reply disk.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ReplyAckRecord {
+    record: ReplyDeliveryRecord,
+}
+
+impl ReplyAckRecord {
+    pub(crate) const fn reply(self) -> ReplyOutboxIdentity {
+        self.record.key.reply
+    }
+
+    pub(crate) const fn semantic_digest(self) -> Digest {
+        self.record.semantic_digest
+    }
+
+    pub(crate) const fn apply_record_checksum(self) -> Digest {
+        self.record.predecessor
+    }
+
+    pub(crate) const fn record_checksum(self) -> Digest {
+        self.record.record_checksum
+    }
+
+    pub(crate) fn matches_plan(self, plan: ReplyPlan, apply: ReplyApplyRecord) -> bool {
+        self.record.kind == ReplyDeliveryKind::Acknowledged
+            && self.record.key == ReplyDeliveryKey::from_plan(plan)
+            && self.record.semantic_digest == plan.acknowledgement_digest()
+            && self.record.predecessor == apply.record_checksum()
+            && self.record.self_authenticates()
+    }
+}
+
+/// Exact restart observation of the durable settlement delivery protocol.
+// The complete identity and digest chain remains inline so boot recovery does
+// not allocate while deciding whether wake or reuse is admissible. The enum is
+// bounded by two fixed records and never crosses the client ABI.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum ReplyDeliveryInspection<E> {
+    Absent,
+    Applied(ReplyApplyRecord),
+    Acknowledged {
+        apply: ReplyApplyRecord,
+        acknowledgement: ReplyAckRecord,
+    },
+    Corrupt(ReplyDeliveryCorruption),
+    Indeterminate(ReplyOutboxIndeterminate<E>),
+}
+
+/// Corruption attributable to one stable reply delivery identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReplyDeliveryCorruption {
+    TargetRecord { slot: u32 },
+    ConflictingApply { first_slot: u32, second_slot: u32 },
+    ConflictingAcknowledgement { first_slot: u32, second_slot: u32 },
+    AcknowledgementWithoutApply { slot: u32 },
+    AcknowledgementPredecessorMismatch { slot: u32 },
+}
+
+/// Failure to append or recover one delivery-protocol record.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum ReplyDeliveryError<E> {
+    InvalidSource,
+    PlanConflict,
+    ApplyAbsent,
+    Corrupt(ReplyDeliveryCorruption),
+    Indeterminate(ReplyOutboxIndeterminate<E>),
+    Full,
+    GenerationExhausted,
+}
+
 /// Failure to publish a new immutable commit record.
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum ReplyOutboxCommitError<E> {
@@ -273,8 +438,11 @@ impl ReplyRecord {
         bytes[72..80].copy_from_slice(&self.key.intent_nonce.to_le_bytes());
         bytes[80..112].copy_from_slice(&self.key.operation.bytes());
         bytes[112..144].copy_from_slice(&self.payload_digest.bytes());
-        // 144..176 is reserved and must remain zero.  The digest covers the
-        // exact framing plus every reserved and trailing byte.
+        bytes[144..148].copy_from_slice(&self.key.component.get().to_le_bytes());
+        // 148..176 is reserved and must remain zero.  The digest covers the
+        // exact v2 framing plus every reserved and trailing byte.  A v1 record
+        // is intentionally not inferred or upgraded because it did not bind a
+        // component identity.
         let checksum = sector_checksum(bytes);
         bytes[CHECKSUM_OFFSET..CHECKSUM_END].copy_from_slice(&checksum.bytes());
         bytes
@@ -297,7 +465,7 @@ impl ReplyRecord {
         };
         if read_u64(bytes, 16) == 0
             || bytes[112..144].iter().all(|byte| *byte == 0)
-            || bytes[144..CHECKSUM_OFFSET].iter().any(|byte| *byte != 0)
+            || bytes[148..CHECKSUM_OFFSET].iter().any(|byte| *byte != 0)
             || bytes[CHECKSUM_END..].iter().any(|byte| *byte != 0)
         {
             return SlotInspection::TargetCorrupt(key.reply);
@@ -328,6 +496,240 @@ enum SlotInspection {
     UnknownCorrupt,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReplyDeliveryKind {
+    Applied,
+    Acknowledged,
+}
+
+impl ReplyDeliveryKind {
+    const fn state(self) -> u32 {
+        match self {
+            Self::Applied => DELIVERY_STATE_APPLIED,
+            Self::Acknowledged => DELIVERY_STATE_ACKNOWLEDGED,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ReplyDeliveryKey {
+    reply: ReplyOutboxIdentity,
+    component: Option<ComponentId>,
+    claim: ClaimId,
+    resource: ResourceId,
+    resource_generation: ResourceGeneration,
+    publication_sequence: u64,
+    value: u64,
+    intent_digest: Digest,
+    payload_digest: Digest,
+}
+
+impl ReplyDeliveryKey {
+    fn from_plan(plan: ReplyPlan) -> Self {
+        let coordinate = plan.coordinate();
+        Self {
+            reply: ReplyOutboxIdentity::new(coordinate.effect(), plan.publication_sequence())
+                .expect("validated reply plans have a non-zero publication sequence"),
+            component: coordinate.component(),
+            claim: coordinate.claim(),
+            resource: coordinate.resource(),
+            resource_generation: coordinate.resource_generation(),
+            publication_sequence: plan.publication_sequence(),
+            value: plan.value(),
+            intent_digest: plan.intent_digest(),
+            payload_digest: plan.payload_digest(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ReplyDeliveryRecord {
+    kind: ReplyDeliveryKind,
+    generation: u64,
+    key: ReplyDeliveryKey,
+    source_kind: u32,
+    predecessor: Digest,
+    semantic_digest: Digest,
+    record_checksum: Digest,
+}
+
+impl ReplyDeliveryRecord {
+    fn applied(generation: u64, plan: ReplyPlan, source: ReplyApplySource) -> Option<Self> {
+        let (source_kind, predecessor) = source.parts()?;
+        let mut record = Self {
+            kind: ReplyDeliveryKind::Applied,
+            generation,
+            key: ReplyDeliveryKey::from_plan(plan),
+            source_kind,
+            predecessor,
+            semantic_digest: plan.apply_receipt_digest(),
+            record_checksum: Digest::ZERO,
+        };
+        record.record_checksum = delivery_sector_checksum(record.encode());
+        Some(record)
+    }
+
+    fn acknowledged(generation: u64, plan: ReplyPlan, apply: ReplyApplyRecord) -> Option<Self> {
+        if !apply.matches_plan(plan) {
+            return None;
+        }
+        let mut record = Self {
+            kind: ReplyDeliveryKind::Acknowledged,
+            generation,
+            key: ReplyDeliveryKey::from_plan(plan),
+            source_kind: DELIVERY_SOURCE_APPLY,
+            predecessor: apply.record_checksum(),
+            semantic_digest: plan.acknowledgement_digest(),
+            record_checksum: Digest::ZERO,
+        };
+        record.record_checksum = delivery_sector_checksum(record.encode());
+        Some(record)
+    }
+
+    fn encode(self) -> [u8; SECTOR_BYTES] {
+        let mut bytes = [0u8; SECTOR_BYTES];
+        bytes[..8].copy_from_slice(&DELIVERY_MAGIC);
+        bytes[8..10].copy_from_slice(&DELIVERY_VERSION.to_le_bytes());
+        bytes[10..12].copy_from_slice(&DELIVERY_RECORD_LEN.to_le_bytes());
+        bytes[12..16].copy_from_slice(&self.kind.state().to_le_bytes());
+        bytes[16..24].copy_from_slice(&self.generation.to_le_bytes());
+        bytes[24..32].copy_from_slice(&self.key.reply.effect().root().get().to_le_bytes());
+        bytes[32..40].copy_from_slice(&self.key.reply.effect().sequence().to_le_bytes());
+        bytes[40..48].copy_from_slice(&self.key.reply.sequence().to_le_bytes());
+        bytes[48..52]
+            .copy_from_slice(&self.key.component.map_or(0, ComponentId::get).to_le_bytes());
+        bytes[56..64].copy_from_slice(&self.key.claim.get().to_le_bytes());
+        bytes[64..72].copy_from_slice(&self.key.resource.get().to_le_bytes());
+        bytes[72..80].copy_from_slice(&self.key.resource_generation.get().to_le_bytes());
+        bytes[80..88].copy_from_slice(&self.key.publication_sequence.to_le_bytes());
+        bytes[88..96].copy_from_slice(&self.key.value.to_le_bytes());
+        bytes[96..128].copy_from_slice(&self.key.intent_digest.bytes());
+        bytes[128..160].copy_from_slice(&self.key.payload_digest.bytes());
+        bytes[160..164].copy_from_slice(&self.source_kind.to_le_bytes());
+        bytes[192..224].copy_from_slice(&self.predecessor.bytes());
+        bytes[224..256].copy_from_slice(&self.semantic_digest.bytes());
+        bytes[DELIVERY_CHECKSUM_OFFSET..DELIVERY_CHECKSUM_END]
+            .copy_from_slice(&self.record_checksum.bytes());
+        bytes
+    }
+
+    fn self_authenticates(self) -> bool {
+        if self.generation == 0
+            || self.predecessor.is_zero()
+            || self.semantic_digest.is_zero()
+            || self.record_checksum.is_zero()
+            || self.key.intent_digest.is_zero()
+            || self.key.payload_digest.is_zero()
+            || self.key.publication_sequence == 0
+        {
+            return false;
+        }
+        let mut without_checksum = self;
+        without_checksum.record_checksum = Digest::ZERO;
+        delivery_sector_checksum(without_checksum.encode()) == self.record_checksum
+    }
+
+    fn decode(bytes: &[u8; SECTOR_BYTES]) -> DeliverySlotInspection {
+        if bytes.iter().all(|byte| *byte == 0) {
+            return DeliverySlotInspection::Blank;
+        }
+        let Some((kind, key)) = decode_delivery_structural_key(bytes) else {
+            return DeliverySlotInspection::UnknownCorrupt;
+        };
+        let generation = read_u64(bytes, 16);
+        let source_kind = read_u32(bytes, 160);
+        let predecessor = Digest::new(read_array_32(bytes, 192));
+        let semantic_digest = Digest::new(read_array_32(bytes, 224));
+        let record_checksum = Digest::new(read_array_32(bytes, DELIVERY_CHECKSUM_OFFSET));
+        let reserved_valid = bytes[52..56].iter().all(|byte| *byte == 0)
+            && bytes[164..192].iter().all(|byte| *byte == 0)
+            && bytes[DELIVERY_CHECKSUM_END..].iter().all(|byte| *byte == 0);
+        let source_valid = match kind {
+            ReplyDeliveryKind::Applied => {
+                matches!(
+                    source_kind,
+                    DELIVERY_SOURCE_COMMIT | DELIVERY_SOURCE_ATOMIC_ARM
+                )
+            }
+            ReplyDeliveryKind::Acknowledged => source_kind == DELIVERY_SOURCE_APPLY,
+        };
+        let record = Self {
+            kind,
+            generation,
+            key,
+            source_kind,
+            predecessor,
+            semantic_digest,
+            record_checksum,
+        };
+        if !reserved_valid || !source_valid || !record.self_authenticates() {
+            return DeliverySlotInspection::TargetCorrupt(key.reply);
+        }
+        DeliverySlotInspection::Valid(record)
+    }
+}
+
+// Sector decode is a fixed-size boot path; retaining the decoded record inline
+// avoids one allocation per scanned sector.
+#[allow(clippy::large_enum_variant)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeliverySlotInspection {
+    Blank,
+    Valid(ReplyDeliveryRecord),
+    TargetCorrupt(ReplyOutboxIdentity),
+    UnknownCorrupt,
+}
+
+fn decode_delivery_structural_key(
+    bytes: &[u8; SECTOR_BYTES],
+) -> Option<(ReplyDeliveryKind, ReplyDeliveryKey)> {
+    if bytes[..8] != DELIVERY_MAGIC
+        || read_u16(bytes, 8) != DELIVERY_VERSION
+        || read_u16(bytes, 10) != DELIVERY_RECORD_LEN
+    {
+        return None;
+    }
+    let kind = match read_u32(bytes, 12) {
+        DELIVERY_STATE_APPLIED => ReplyDeliveryKind::Applied,
+        DELIVERY_STATE_ACKNOWLEDGED => ReplyDeliveryKind::Acknowledged,
+        _ => return None,
+    };
+    let root = cser_core::RootId::new(read_u64(bytes, 24)).ok()?;
+    let effect = EffectId::new(root, read_u64(bytes, 32)).ok()?;
+    let reply = ReplyOutboxIdentity::new(effect, read_u64(bytes, 40))?;
+    let component = match read_u32(bytes, 48) {
+        0 => None,
+        value => Some(ComponentId::new(value).ok()?),
+    };
+    let claim = ClaimId::new(read_u64(bytes, 56)).ok()?;
+    let resource = ResourceId::new(read_u64(bytes, 64)).ok()?;
+    let resource_generation = ResourceGeneration::new(read_u64(bytes, 72)).ok()?;
+    let publication_sequence = read_u64(bytes, 80);
+    let intent_digest = Digest::new(read_array_32(bytes, 96));
+    let payload_digest = Digest::new(read_array_32(bytes, 128));
+    if publication_sequence == 0
+        || reply.sequence() != publication_sequence
+        || intent_digest.is_zero()
+        || payload_digest.is_zero()
+    {
+        return None;
+    }
+    Some((
+        kind,
+        ReplyDeliveryKey {
+            reply,
+            component,
+            claim,
+            resource,
+            resource_generation,
+            publication_sequence,
+            value: read_u64(bytes, 88),
+            intent_digest,
+            payload_digest,
+        },
+    ))
+}
+
 fn decode_structural_key(bytes: &[u8; SECTOR_BYTES]) -> Option<ReplyCommitKey> {
     if bytes[..8] != RECORD_MAGIC
         || read_u16(bytes, 8) != RECORD_VERSION
@@ -344,11 +746,13 @@ fn decode_structural_key(bytes: &[u8; SECTOR_BYTES]) -> Option<ReplyCommitKey> {
     let authority_generation = read_u64(bytes, 64);
     let intent_nonce = read_u64(bytes, 72);
     let operation = Digest::new(read_array_32(bytes, 80));
+    let component = ComponentId::new(read_u32(bytes, 144)).ok()?;
     if authority_generation == 0 || intent_nonce == 0 || operation.is_zero() {
         return None;
     }
     Some(ReplyCommitKey {
         reply,
+        component,
         actor,
         authority_generation,
         intent_nonce,
@@ -362,9 +766,24 @@ struct CleanScan {
     max_generation: u64,
 }
 
+struct CleanDeliveryScan {
+    apply: Option<(u32, ReplyApplyRecord)>,
+    acknowledgement: Option<(u32, ReplyAckRecord)>,
+    first_blank: Option<u32>,
+    max_generation: u64,
+}
+
 enum ScanResult<E> {
     Clean(CleanScan),
     Corrupt(ReplyOutboxCorruption),
+    Indeterminate(ReplyOutboxIndeterminate<E>),
+}
+
+// The scan result is stack-local and bounded by exactly one APPLY/ACK pair.
+#[allow(clippy::large_enum_variant)]
+enum DeliveryScanResult<E> {
+    Clean(CleanDeliveryScan),
+    Corrupt(ReplyDeliveryCorruption),
     Indeterminate(ReplyOutboxIndeterminate<E>),
 }
 
@@ -399,6 +818,165 @@ where
                 }),
             ScanResult::Corrupt(corruption) => ReplyCommitInspection::Corrupt(corruption),
             ScanResult::Indeterminate(reason) => ReplyCommitInspection::Indeterminate(reason),
+        }
+    }
+
+    fn inspect_delivery(
+        &mut self,
+        reply: ReplyOutboxIdentity,
+    ) -> ReplyDeliveryInspection<B::Error> {
+        match self.scan_delivery(reply) {
+            DeliveryScanResult::Clean(scan) => match (scan.apply, scan.acknowledgement) {
+                (None, None) => ReplyDeliveryInspection::Absent,
+                (Some((_, apply)), None) => ReplyDeliveryInspection::Applied(apply),
+                (Some((_, apply)), Some((_, acknowledgement))) => {
+                    ReplyDeliveryInspection::Acknowledged {
+                        apply,
+                        acknowledgement,
+                    }
+                }
+                (None, Some((slot, _))) => ReplyDeliveryInspection::Corrupt(
+                    ReplyDeliveryCorruption::AcknowledgementWithoutApply { slot },
+                ),
+            },
+            DeliveryScanResult::Corrupt(corruption) => ReplyDeliveryInspection::Corrupt(corruption),
+            DeliveryScanResult::Indeterminate(reason) => {
+                ReplyDeliveryInspection::Indeterminate(reason)
+            }
+        }
+    }
+
+    fn record_apply(
+        &mut self,
+        plan: ReplyPlan,
+        source: ReplyApplySource,
+    ) -> Result<ReplyApplyRecord, ReplyDeliveryError<B::Error>> {
+        if source.parts().is_none() {
+            return Err(ReplyDeliveryError::InvalidSource);
+        }
+        let key = ReplyDeliveryKey::from_plan(plan);
+        let scan = match self.scan_delivery(key.reply) {
+            DeliveryScanResult::Clean(scan) => scan,
+            DeliveryScanResult::Corrupt(corruption) => {
+                return Err(ReplyDeliveryError::Corrupt(corruption));
+            }
+            DeliveryScanResult::Indeterminate(reason) => {
+                return Err(ReplyDeliveryError::Indeterminate(reason));
+            }
+        };
+        if let Some((_, existing)) = scan.apply {
+            if existing.matches_plan(plan) && existing.source() == source {
+                return Ok(existing);
+            }
+            return Err(ReplyDeliveryError::PlanConflict);
+        }
+        if scan.acknowledgement.is_some() {
+            return Err(ReplyDeliveryError::PlanConflict);
+        }
+        let Some(slot) = scan.first_blank else {
+            return Err(ReplyDeliveryError::Full);
+        };
+        let generation = scan
+            .max_generation
+            .checked_add(1)
+            .ok_or(ReplyDeliveryError::GenerationExhausted)?;
+        let record = ReplyDeliveryRecord::applied(generation, plan, source)
+            .ok_or(ReplyDeliveryError::InvalidSource)?;
+        self.append_delivery(slot, record)?;
+        Ok(ReplyApplyRecord { record })
+    }
+
+    fn record_acknowledgement(
+        &mut self,
+        plan: ReplyPlan,
+        apply: ReplyApplyRecord,
+    ) -> Result<ReplyAckRecord, ReplyDeliveryError<B::Error>> {
+        if !apply.matches_plan(plan) {
+            return Err(ReplyDeliveryError::PlanConflict);
+        }
+        let key = ReplyDeliveryKey::from_plan(plan);
+        let scan = match self.scan_delivery(key.reply) {
+            DeliveryScanResult::Clean(scan) => scan,
+            DeliveryScanResult::Corrupt(corruption) => {
+                return Err(ReplyDeliveryError::Corrupt(corruption));
+            }
+            DeliveryScanResult::Indeterminate(reason) => {
+                return Err(ReplyDeliveryError::Indeterminate(reason));
+            }
+        };
+        let Some((_, persisted_apply)) = scan.apply else {
+            return Err(ReplyDeliveryError::ApplyAbsent);
+        };
+        if persisted_apply != apply {
+            return Err(ReplyDeliveryError::PlanConflict);
+        }
+        if let Some((_, existing)) = scan.acknowledgement {
+            if existing.matches_plan(plan, apply) {
+                return Ok(existing);
+            }
+            return Err(ReplyDeliveryError::PlanConflict);
+        }
+        let Some(slot) = scan.first_blank else {
+            return Err(ReplyDeliveryError::Full);
+        };
+        let generation = scan
+            .max_generation
+            .checked_add(1)
+            .ok_or(ReplyDeliveryError::GenerationExhausted)?;
+        let record = ReplyDeliveryRecord::acknowledged(generation, plan, apply)
+            .ok_or(ReplyDeliveryError::PlanConflict)?;
+        self.append_delivery(slot, record)?;
+        Ok(ReplyAckRecord { record })
+    }
+
+    fn append_delivery(
+        &mut self,
+        slot: u32,
+        record: ReplyDeliveryRecord,
+    ) -> Result<(), ReplyDeliveryError<B::Error>> {
+        let encoded = record.encode();
+        let lba = delivery_slot_lba(slot);
+        if let Err(error) = self.backend.write_sector(lba, &encoded) {
+            return Err(ReplyDeliveryError::Indeterminate(
+                ReplyOutboxIndeterminate::Storage {
+                    operation: ReplyOutboxOperation::Write,
+                    slot: Some(slot),
+                    error,
+                },
+            ));
+        }
+        if let Err(error) = self.backend.flush() {
+            return Err(ReplyDeliveryError::Indeterminate(
+                ReplyOutboxIndeterminate::Storage {
+                    operation: ReplyOutboxOperation::Flush,
+                    slot: Some(slot),
+                    error,
+                },
+            ));
+        }
+        let mut readback = [0u8; SECTOR_BYTES];
+        if let Err(error) = self.backend.read_sector(lba, &mut readback) {
+            return Err(ReplyDeliveryError::Indeterminate(
+                ReplyOutboxIndeterminate::Storage {
+                    operation: ReplyOutboxOperation::Readback,
+                    slot: Some(slot),
+                    error,
+                },
+            ));
+        }
+        if readback != encoded {
+            return Err(ReplyDeliveryError::Indeterminate(
+                ReplyOutboxIndeterminate::PublishReadbackMismatch { slot },
+            ));
+        }
+        match ReplyDeliveryRecord::decode(&readback) {
+            DeliverySlotInspection::Valid(observed) if observed == record => Ok(()),
+            DeliverySlotInspection::Blank
+            | DeliverySlotInspection::Valid(_)
+            | DeliverySlotInspection::TargetCorrupt(_)
+            | DeliverySlotInspection::UnknownCorrupt => Err(ReplyDeliveryError::Indeterminate(
+                ReplyOutboxIndeterminate::PublishReadbackMismatch { slot },
+            )),
         }
     }
 
@@ -562,6 +1140,107 @@ where
         })
     }
 
+    fn scan_delivery(&mut self, reply: ReplyOutboxIdentity) -> DeliveryScanResult<B::Error> {
+        let mut apply: Option<(u32, ReplyApplyRecord)> = None;
+        let mut acknowledgement: Option<(u32, ReplyAckRecord)> = None;
+        let mut first_blank = None;
+        let mut max_generation = 0u64;
+        let mut ambiguous_corruption = None;
+        for slot in 0..DELIVERY_SLOTS {
+            let mut sector = [0u8; SECTOR_BYTES];
+            if let Err(error) = self
+                .backend
+                .read_sector(delivery_slot_lba(slot), &mut sector)
+            {
+                return DeliveryScanResult::Indeterminate(ReplyOutboxIndeterminate::Storage {
+                    operation: ReplyOutboxOperation::Read,
+                    slot: Some(slot),
+                    error,
+                });
+            }
+            match ReplyDeliveryRecord::decode(&sector) {
+                DeliverySlotInspection::Blank => {
+                    first_blank.get_or_insert(slot);
+                }
+                DeliverySlotInspection::Valid(record) => {
+                    max_generation = max_generation.max(record.generation);
+                    if record.key.reply != reply {
+                        continue;
+                    }
+                    match record.kind {
+                        ReplyDeliveryKind::Applied => {
+                            let observed = ReplyApplyRecord { record };
+                            if let Some((first_slot, prior)) = apply {
+                                if prior != observed {
+                                    return DeliveryScanResult::Corrupt(
+                                        ReplyDeliveryCorruption::ConflictingApply {
+                                            first_slot,
+                                            second_slot: slot,
+                                        },
+                                    );
+                                }
+                            } else {
+                                apply = Some((slot, observed));
+                            }
+                        }
+                        ReplyDeliveryKind::Acknowledged => {
+                            let observed = ReplyAckRecord { record };
+                            if let Some((first_slot, prior)) = acknowledgement {
+                                if prior != observed {
+                                    return DeliveryScanResult::Corrupt(
+                                        ReplyDeliveryCorruption::ConflictingAcknowledgement {
+                                            first_slot,
+                                            second_slot: slot,
+                                        },
+                                    );
+                                }
+                            } else {
+                                acknowledgement = Some((slot, observed));
+                            }
+                        }
+                    }
+                }
+                DeliverySlotInspection::TargetCorrupt(candidate) if candidate == reply => {
+                    return DeliveryScanResult::Corrupt(ReplyDeliveryCorruption::TargetRecord {
+                        slot,
+                    });
+                }
+                DeliverySlotInspection::TargetCorrupt(_)
+                | DeliverySlotInspection::UnknownCorrupt => {
+                    ambiguous_corruption.get_or_insert(slot);
+                }
+            }
+        }
+        if apply.is_none()
+            && acknowledgement.is_none()
+            && let Some(slot) = ambiguous_corruption
+        {
+            return DeliveryScanResult::Indeterminate(
+                ReplyOutboxIndeterminate::AmbiguousCorruption { slot },
+            );
+        }
+        if let Some((ack_slot, ack)) = acknowledgement {
+            let Some((_, applied)) = apply else {
+                return DeliveryScanResult::Corrupt(
+                    ReplyDeliveryCorruption::AcknowledgementWithoutApply { slot: ack_slot },
+                );
+            };
+            if ack.record.predecessor != applied.record_checksum()
+                || ack.record.key != applied.record.key
+            {
+                return DeliveryScanResult::Corrupt(
+                    ReplyDeliveryCorruption::AcknowledgementPredecessorMismatch { slot: ack_slot },
+                );
+            }
+        }
+        DeliveryScanResult::Clean(CleanDeliveryScan {
+            apply,
+            acknowledgement,
+            first_blank,
+            max_generation,
+        })
+    }
+
     #[cfg(ktest)]
     fn into_backend(self) -> B {
         self.backend
@@ -617,6 +1296,177 @@ impl AtaPioReplyOutbox {
     ) -> ReplyCommitInspection<AtaPioError> {
         self.outbox.inspect(reply)
     }
+
+    /// Re-opens the durable apply/ack chain for one stable reply identity.
+    pub(crate) fn inspect_delivery(
+        &mut self,
+        reply: ReplyOutboxIdentity,
+    ) -> ReplyDeliveryInspection<AtaPioError> {
+        self.outbox.inspect_delivery(reply)
+    }
+
+    /// Persists and readback-validates the logical apply publication before
+    /// any volatile waiter is woken.
+    pub(crate) fn record_apply(
+        &mut self,
+        plan: ReplyPlan,
+        source: ReplyApplySource,
+    ) -> Result<ReplyApplyRecord, ReplyDeliveryError<AtaPioError>> {
+        self.outbox.record_apply(plan, source)
+    }
+
+    /// Persists the exact client acceptance chained to the durable apply
+    /// record. Returning success means both flush and readback completed.
+    pub(crate) fn record_acknowledgement(
+        &mut self,
+        plan: ReplyPlan,
+        apply: ReplyApplyRecord,
+    ) -> Result<ReplyAckRecord, ReplyDeliveryError<AtaPioError>> {
+        self.outbox.record_acknowledgement(plan, apply)
+    }
+}
+
+/// Core verifier for one independently decoded durable apply record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ReplyDurableApplyVerifier {
+    plan: ReplyPlan,
+}
+
+impl ReplyDurableApplyVerifier {
+    pub(crate) const fn new(plan: ReplyPlan) -> Self {
+        Self { plan }
+    }
+}
+
+impl EffectReceiptVerifier for ReplyDurableApplyVerifier {
+    type Receipt = ReplyApplyRecord;
+
+    fn identity(&self) -> VerifierIdentity {
+        VerifierIdentity::new(REPLY_VERIFIER, 1, REPLY_APPLY_RECEIPT_SCHEMA)
+            .expect("standard durable reply apply verifier identity is valid")
+    }
+
+    fn verify(
+        &self,
+        challenge: &EffectFactChallenge,
+        receipt: &Self::Receipt,
+    ) -> Result<VerifiedEffectObservation, VerificationError> {
+        let coordinate = self.plan.coordinate();
+        if challenge.kind() != EffectFactKind::ApplyCompleted
+            || challenge.effect() != coordinate.effect()
+            || challenge.component() != coordinate.component()
+            || challenge.domain() != REPLY_DOMAIN
+            || challenge.obligation() != REPLY_OBLIGATION_PUBLICATION
+            || challenge.operation() != self.plan.intent_digest()
+            || challenge.predecessor().is_some()
+            || challenge.expected_verifier() != REPLY_VERIFIER
+            || challenge.expected_receipt_schema() != REPLY_APPLY_RECEIPT_SCHEMA
+            || !receipt.matches_plan(self.plan)
+        {
+            return Err(VerificationError::Rejected);
+        }
+        Ok(VerifiedEffectObservation::fact(
+            challenge.current_observation(),
+            receipt.semantic_digest(),
+        ))
+    }
+}
+
+/// Core verifier for one independently decoded durable client acceptance.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ReplyDurableAckVerifier {
+    plan: ReplyPlan,
+    apply: ReplyApplyRecord,
+}
+
+impl ReplyDurableAckVerifier {
+    pub(crate) const fn new(plan: ReplyPlan, apply: ReplyApplyRecord) -> Self {
+        Self { plan, apply }
+    }
+}
+
+impl EffectReceiptVerifier for ReplyDurableAckVerifier {
+    type Receipt = ReplyAckRecord;
+
+    fn identity(&self) -> VerifierIdentity {
+        VerifierIdentity::new(REPLY_VERIFIER, 1, REPLY_SETTLEMENT_RECEIPT_SCHEMA)
+            .expect("standard durable reply acknowledgement verifier identity is valid")
+    }
+
+    fn verify(
+        &self,
+        challenge: &EffectFactChallenge,
+        receipt: &Self::Receipt,
+    ) -> Result<VerifiedEffectObservation, VerificationError> {
+        let coordinate = self.plan.coordinate();
+        if challenge.kind() != EffectFactKind::SettlementAcknowledged
+            || challenge.effect() != coordinate.effect()
+            || challenge.component() != coordinate.component()
+            || challenge.domain() != REPLY_DOMAIN
+            || challenge.obligation() != REPLY_OBLIGATION_PUBLICATION
+            || challenge.operation() != self.plan.intent_digest()
+            || challenge.predecessor() != Some(self.apply.semantic_digest())
+            || challenge.expected_verifier() != REPLY_VERIFIER
+            || challenge.expected_receipt_schema() != REPLY_SETTLEMENT_RECEIPT_SCHEMA
+            || !self.apply.matches_plan(self.plan)
+            || !receipt.matches_plan(self.plan, self.apply)
+        {
+            return Err(VerificationError::Rejected);
+        }
+        Ok(VerifiedEffectObservation::fact(
+            challenge.current_observation(),
+            receipt.semantic_digest(),
+        ))
+    }
+}
+
+/// Retirement verifier which treats the durable client acceptance as the
+/// publication-slot release fact.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ReplyDurableRetirementVerifier {
+    plan: ReplyPlan,
+    apply: ReplyApplyRecord,
+}
+
+impl ReplyDurableRetirementVerifier {
+    pub(crate) const fn new(plan: ReplyPlan, apply: ReplyApplyRecord) -> Self {
+        Self { plan, apply }
+    }
+}
+
+impl ReceiptVerifier for ReplyDurableRetirementVerifier {
+    type Receipt = ReplyAckRecord;
+
+    fn identity(&self) -> VerifierIdentity {
+        VerifierIdentity::new(REPLY_VERIFIER, 1, REPLY_RECEIPT_SCHEMA)
+            .expect("standard durable reply retirement verifier identity is valid")
+    }
+
+    fn verify(
+        &self,
+        challenge: &EvidenceChallenge,
+        receipt: &Self::Receipt,
+    ) -> Result<VerifiedObservation, VerificationError> {
+        let coordinate = self.plan.coordinate();
+        if challenge.effect() != coordinate.effect()
+            || challenge.component() != coordinate.component()
+            || challenge.claim() != coordinate.claim()
+            || challenge.domain() != REPLY_DOMAIN
+            || challenge.kind() != REPLY_EVIDENCE_PUBLICATION_ACK
+            || challenge.scope() != ClaimScope::Logical
+            || challenge.resource() != coordinate.resource()
+            || challenge.resource_generation() != coordinate.resource_generation()
+            || !self.apply.matches_plan(self.plan)
+            || !receipt.matches_plan(self.plan, self.apply)
+        {
+            return Err(VerificationError::Rejected);
+        }
+        Ok(VerifiedObservation::new(
+            challenge.subject(),
+            challenge.current_observation(),
+            self.plan.retirement_receipt_digest(),
+        ))
+    }
 }
 
 /// Core verifier for independently read, source-exact outbox records.
@@ -655,6 +1505,7 @@ impl EffectReceiptVerifier for ReplyOutboxCommitVerifier {
             || challenge.expected_verifier() != REPLY_VERIFIER
             || challenge.expected_receipt_schema() != REPLY_COMMIT_RECEIPT_SCHEMA
             || challenge.effect() != receipt.reply().effect()
+            || challenge.component() != Some(receipt.component())
             || challenge.actor() != receipt.actor()
             || challenge.generation() != receipt.authority_generation()
             || challenge.nonce() != receipt.intent_nonce()
@@ -675,8 +1526,17 @@ const fn slot_lba(slot: u32) -> u32 {
     FIRST_OUTBOX_LBA + slot
 }
 
+const fn delivery_slot_lba(slot: u32) -> u32 {
+    FIRST_DELIVERY_LBA + slot
+}
+
 fn sector_checksum(mut bytes: [u8; SECTOR_BYTES]) -> Digest {
     bytes[CHECKSUM_OFFSET..CHECKSUM_END].fill(0);
+    Digest::new(Sha256::digest(bytes).into())
+}
+
+fn delivery_sector_checksum(mut bytes: [u8; SECTOR_BYTES]) -> Digest {
+    bytes[DELIVERY_CHECKSUM_OFFSET..DELIVERY_CHECKSUM_END].fill(0);
     Digest::new(Sha256::digest(bytes).into())
 }
 
@@ -717,13 +1577,15 @@ mod tests {
     use alloc::{vec, vec::Vec};
 
     use cser_core::{
-        BootGeneration, ChargeAccountId, ClaimId, ClaimScope, CommandRequest, CoreError,
-        CoreLimits, DeviceGeneration, Engine, Freshness, JournalGeneration, JournalRecord,
-        PrincipalId, RegistryInstance, ResourceGeneration, ResourceId, RootId,
-        TransitionDurability, TransitionOutput, standard_catalog,
+        AGENT_COMPONENT_DMA, AGENT_COMPONENT_REPLY, AGENT_OPERATION_COMPOSITE, BootGeneration,
+        ChargeAccountId, ClaimId, ClaimScope, CommandRequest, ComponentCommitOperation, CoreError,
+        CoreLimits, DEVICE_CLAIM_QUEUE_SLOT, DeviceGeneration, DeviceScopeId, Engine, Freshness,
+        JournalGeneration, JournalRecord, PrincipalId, RegistryInstance, ResourceGeneration,
+        ResourceId, RootId, TransitionDurability, TransitionOutput, standard_catalog,
     };
     use ostd::prelude::ktest;
 
+    use super::super::core_reply_adapter::{ReplyCoordinate, reply_plan};
     use super::*;
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -752,6 +1614,7 @@ mod tests {
         sectors: Vec<[u8; SECTOR_BYTES]>,
         flushes: u32,
         fail_write: bool,
+        fail_flush: bool,
         corrupt_readback_lba: Option<u32>,
         last_written_lba: Option<u32>,
     }
@@ -762,6 +1625,7 @@ mod tests {
                 sectors: vec![[0u8; SECTOR_BYTES]; REQUIRED_OUTBOX_SECTORS as usize],
                 flushes: 0,
                 fail_write: false,
+                fail_flush: false,
                 corrupt_readback_lba: None,
                 last_written_lba: None,
             }
@@ -804,6 +1668,9 @@ mod tests {
         }
 
         fn flush(&mut self) -> Result<(), Self::Error> {
+            if self.fail_flush {
+                return Err(MemoryError::Injected);
+            }
             self.flushes += 1;
             Ok(())
         }
@@ -819,11 +1686,24 @@ mod tests {
         let effect = EffectId::new(RootId::new(root).unwrap(), 1).unwrap();
         ReplyCommitKey {
             reply: ReplyOutboxIdentity::new(effect, reply_sequence).unwrap(),
+            component: AGENT_COMPONENT_REPLY,
             actor: PrincipalIncarnation::new(PrincipalId::new(root).unwrap(), 1).unwrap(),
             authority_generation: 1,
             intent_nonce: nonce,
             operation: digest(0x41),
         }
+    }
+
+    fn delivery_plan(root_value: u64, component: ComponentId) -> ReplyPlan {
+        let effect = EffectId::new(RootId::new(root_value).unwrap(), 1).unwrap();
+        let coordinate = ReplyCoordinate::new_component(
+            effect,
+            component,
+            ClaimId::new(root_value).unwrap(),
+            ResourceId::new(root_value).unwrap(),
+            ResourceGeneration::new(1).unwrap(),
+        );
+        reply_plan(coordinate, 1, 0xc5e2).unwrap()
     }
 
     fn commit_challenge(root_value: u64) -> (Engine, cser_core::CommitIntent, EffectFactChallenge) {
@@ -841,12 +1721,11 @@ mod tests {
         let actor = PrincipalIncarnation::new(PrincipalId::new(root_value).unwrap(), 1).unwrap();
         engine
             .transact_durable(
-                CommandRequest::CreateEstate {
+                CommandRequest::CreateCompositeEffect {
                     effect,
                     origin: actor,
                     binding_generation: 1,
-                    domain: REPLY_DOMAIN,
-                    obligation: REPLY_OBLIGATION_PUBLICATION,
+                    kind: AGENT_OPERATION_COMPOSITE,
                     charge_account: ChargeAccountId::new(root_value).unwrap(),
                 },
                 &mut durability,
@@ -854,12 +1733,12 @@ mod tests {
             .unwrap();
         engine
             .transact_durable(
-                CommandRequest::AddClaim {
+                CommandRequest::AddComponentClaim {
                     effect,
+                    component: AGENT_COMPONENT_REPLY,
                     actor,
                     binding_generation: 1,
                     claim: ClaimId::new(root_value).unwrap(),
-                    domain: REPLY_DOMAIN,
                     kind: cser_core::REPLY_CLAIM_PUBLICATION_SLOT,
                     scope: ClaimScope::Logical,
                     resource: ResourceId::new(root_value).unwrap(),
@@ -871,7 +1750,24 @@ mod tests {
             .unwrap();
         engine
             .transact_durable(
-                CommandRequest::PrepareEffect {
+                CommandRequest::AddComponentClaim {
+                    effect,
+                    component: AGENT_COMPONENT_DMA,
+                    actor,
+                    binding_generation: 1,
+                    claim: ClaimId::new(root_value + 1).unwrap(),
+                    kind: DEVICE_CLAIM_QUEUE_SLOT,
+                    scope: ClaimScope::Device(DeviceScopeId::new(root_value).unwrap()),
+                    resource: ResourceId::new(root_value + 1).unwrap(),
+                    resource_generation: ResourceGeneration::new(1).unwrap(),
+                    units: 3,
+                },
+                &mut durability,
+            )
+            .unwrap();
+        engine
+            .transact_durable(
+                CommandRequest::PrepareCompositeEffect {
                     effect,
                     actor,
                     binding_generation: 1,
@@ -881,19 +1777,25 @@ mod tests {
             .unwrap();
         let intent = match engine
             .transact_durable(
-                CommandRequest::RecordCommitIntent {
+                CommandRequest::RecordCompositeCommitIntents {
                     effect,
                     actor,
                     binding_generation: 1,
-                    operation: digest(0x61),
+                    operations: vec![
+                        ComponentCommitOperation::new(AGENT_COMPONENT_REPLY, digest(0x61)),
+                        ComponentCommitOperation::new(AGENT_COMPONENT_DMA, digest(0x62)),
+                    ],
                 },
                 &mut durability,
             )
             .unwrap()
             .into_output()
         {
-            TransitionOutput::CommitIntent(intent) => intent,
-            other => panic!("expected commit intent, got {other:?}"),
+            TransitionOutput::CompositeCommitIntents(intents) => intents
+                .into_iter()
+                .find(|intent| intent.component() == Some(AGENT_COMPONENT_REPLY))
+                .expect("atomic arm returns the reply component intent"),
+            other => panic!("expected atomic composite commit intents, got {other:?}"),
         };
         let challenge = engine.commit_outcome_challenge(&intent).unwrap();
         (engine, intent, challenge)
@@ -1032,6 +1934,225 @@ mod tests {
             engine.verify_commit_outcome(&intent, &verifier, &forged),
             Err(CoreError::VerificationFailed),
             "challenge reflection cannot repair a receipt not decoded from disk"
+        );
+    }
+
+    #[ktest]
+    fn reply_outbox_v2_binds_component_and_v1_fails_closed() {
+        let (engine, intent, challenge) = commit_challenge(46);
+        let key = ReplyCommitKey::from_challenge(&challenge, 12).unwrap();
+        assert_eq!(key.component, AGENT_COMPONENT_REPLY);
+        let payload = digest(0x63);
+        let mut outbox = ReplyOutbox::open(MemoryDisk::fixture()).unwrap();
+        let exact = outbox.commit_exact(key, payload).unwrap();
+        assert_eq!(exact.component(), AGENT_COMPONENT_REPLY);
+
+        let mut disk = outbox.into_backend();
+        let slot = slot_lba(0) as usize;
+        disk.sectors[slot][144..148].copy_from_slice(&AGENT_COMPONENT_DMA.get().to_le_bytes());
+        let checksum = sector_checksum(disk.sectors[slot]);
+        disk.sectors[slot][CHECKSUM_OFFSET..CHECKSUM_END].copy_from_slice(&checksum.bytes());
+        let mut reopened = ReplyOutbox::open(disk).unwrap();
+        let forged = match reopened.inspect(key.reply) {
+            ReplyCommitInspection::Committed(receipt) => receipt,
+            other => panic!("component-mutated v2 record remained structurally exact: {other:?}"),
+        };
+        assert_eq!(forged.component(), AGENT_COMPONENT_DMA);
+        assert_eq!(
+            engine.verify_commit_outcome(
+                &intent,
+                &ReplyOutboxCommitVerifier::new(1).unwrap(),
+                &forged,
+            ),
+            Err(CoreError::VerificationFailed)
+        );
+        assert_eq!(
+            reopened.commit_exact(key, payload),
+            Err(ReplyOutboxCommitError::Corrupt(
+                ReplyOutboxCorruption::IdentityMismatch { slot: 0 }
+            ))
+        );
+
+        let mut v1_disk = MemoryDisk::fixture();
+        let mut v1 = ReplyRecord {
+            key,
+            payload_digest: payload,
+            commit_generation: 1,
+        }
+        .encode();
+        v1[8..10].copy_from_slice(&1u16.to_le_bytes());
+        let checksum = sector_checksum(v1);
+        v1[CHECKSUM_OFFSET..CHECKSUM_END].copy_from_slice(&checksum.bytes());
+        v1_disk.sectors[slot] = v1;
+        let mut v1_outbox = ReplyOutbox::open(v1_disk).unwrap();
+        assert_eq!(
+            v1_outbox.inspect(key.reply),
+            ReplyCommitInspection::Indeterminate(ReplyOutboxIndeterminate::AmbiguousCorruption {
+                slot: 0
+            })
+        );
+    }
+
+    #[ktest]
+    fn reply_delivery_flushes_readbacks_reopens_and_is_idempotent() {
+        let plan = delivery_plan(47, AGENT_COMPONENT_REPLY);
+        let identity = ReplyOutboxIdentity::new(plan.coordinate().effect(), 1).unwrap();
+        let source = ReplyApplySource::Committed(digest(0x64));
+        let mut outbox = ReplyOutbox::open(MemoryDisk::fixture()).unwrap();
+        assert_eq!(
+            outbox.inspect_delivery(identity),
+            ReplyDeliveryInspection::Absent
+        );
+
+        let apply = outbox.record_apply(plan, source).unwrap();
+        assert!(apply.matches_plan(plan));
+        assert_eq!(apply.source(), source);
+        assert!(!apply.semantic_digest().is_zero());
+        assert_eq!(outbox.record_apply(plan, source).unwrap(), apply);
+
+        let acknowledgement = outbox.record_acknowledgement(plan, apply).unwrap();
+        assert!(acknowledgement.matches_plan(plan, apply));
+        assert_eq!(
+            acknowledgement.apply_record_checksum(),
+            apply.record_checksum()
+        );
+        assert!(!acknowledgement.record_checksum().is_zero());
+        assert_eq!(
+            outbox.record_acknowledgement(plan, apply).unwrap(),
+            acknowledgement
+        );
+
+        let disk = outbox.into_backend();
+        assert_eq!(disk.flushes, 2);
+        let mut reopened = ReplyOutbox::open(disk).unwrap();
+        assert_eq!(
+            reopened.inspect_delivery(identity),
+            ReplyDeliveryInspection::Acknowledged {
+                apply,
+                acknowledgement,
+            }
+        );
+        assert_eq!(reopened.record_apply(plan, source).unwrap(), apply);
+        assert_eq!(
+            reopened.record_acknowledgement(plan, apply).unwrap(),
+            acknowledgement
+        );
+        assert_eq!(reopened.into_backend().flushes, 2);
+    }
+
+    #[ktest]
+    fn reply_delivery_rejects_ack_without_apply_and_wrong_predecessor() {
+        let plan = delivery_plan(48, AGENT_COMPONENT_REPLY);
+        let identity = ReplyOutboxIdentity::new(plan.coordinate().effect(), 1).unwrap();
+        let apply_record =
+            ReplyDeliveryRecord::applied(1, plan, ReplyApplySource::Committed(digest(0x65)))
+                .unwrap();
+        let apply = ReplyApplyRecord {
+            record: apply_record,
+        };
+        let acknowledgement = ReplyDeliveryRecord::acknowledged(2, plan, apply).unwrap();
+
+        let mut no_apply_disk = MemoryDisk::fixture();
+        no_apply_disk.sectors[delivery_slot_lba(0) as usize] = acknowledgement.encode();
+        let mut no_apply = ReplyOutbox::open(no_apply_disk).unwrap();
+        assert_eq!(
+            no_apply.inspect_delivery(identity),
+            ReplyDeliveryInspection::Corrupt(
+                ReplyDeliveryCorruption::AcknowledgementWithoutApply { slot: 0 }
+            )
+        );
+
+        let mut wrong_predecessor = acknowledgement;
+        wrong_predecessor.predecessor = digest(0x66);
+        wrong_predecessor.record_checksum = Digest::ZERO;
+        wrong_predecessor.record_checksum = delivery_sector_checksum(wrong_predecessor.encode());
+        let mut mismatch_disk = MemoryDisk::fixture();
+        mismatch_disk.sectors[delivery_slot_lba(0) as usize] = apply_record.encode();
+        mismatch_disk.sectors[delivery_slot_lba(1) as usize] = wrong_predecessor.encode();
+        let mut mismatch = ReplyOutbox::open(mismatch_disk).unwrap();
+        assert_eq!(
+            mismatch.inspect_delivery(identity),
+            ReplyDeliveryInspection::Corrupt(
+                ReplyDeliveryCorruption::AcknowledgementPredecessorMismatch { slot: 1 }
+            )
+        );
+    }
+
+    #[ktest]
+    fn reply_delivery_never_mints_records_after_write_flush_or_readback_failure() {
+        let plan = delivery_plan(49, AGENT_COMPONENT_REPLY);
+        let source = ReplyApplySource::AtomicArmIndeterminate(digest(0x67));
+
+        let mut write_failure = MemoryDisk::fixture();
+        write_failure.fail_write = true;
+        let mut outbox = ReplyOutbox::open(write_failure).unwrap();
+        assert_eq!(
+            outbox.record_apply(plan, source),
+            Err(ReplyDeliveryError::Indeterminate(
+                ReplyOutboxIndeterminate::Storage {
+                    operation: ReplyOutboxOperation::Write,
+                    slot: Some(0),
+                    error: MemoryError::Injected,
+                }
+            ))
+        );
+
+        let mut flush_failure = MemoryDisk::fixture();
+        flush_failure.fail_flush = true;
+        let mut outbox = ReplyOutbox::open(flush_failure).unwrap();
+        assert_eq!(
+            outbox.record_apply(plan, source),
+            Err(ReplyDeliveryError::Indeterminate(
+                ReplyOutboxIndeterminate::Storage {
+                    operation: ReplyOutboxOperation::Flush,
+                    slot: Some(0),
+                    error: MemoryError::Injected,
+                }
+            ))
+        );
+
+        let mut readback_failure = MemoryDisk::fixture();
+        readback_failure.corrupt_readback_lba = Some(delivery_slot_lba(0));
+        let mut outbox = ReplyOutbox::open(readback_failure).unwrap();
+        assert_eq!(
+            outbox.record_apply(plan, source),
+            Err(ReplyDeliveryError::Indeterminate(
+                ReplyOutboxIndeterminate::PublishReadbackMismatch { slot: 0 }
+            ))
+        );
+
+        let mut outbox = ReplyOutbox::open(MemoryDisk::fixture()).unwrap();
+        let apply = outbox.record_apply(plan, source).unwrap();
+        let mut ack_failure_disk = outbox.into_backend();
+        ack_failure_disk.fail_flush = true;
+        let mut outbox = ReplyOutbox::open(ack_failure_disk).unwrap();
+        assert_eq!(
+            outbox.record_acknowledgement(plan, apply),
+            Err(ReplyDeliveryError::Indeterminate(
+                ReplyOutboxIndeterminate::Storage {
+                    operation: ReplyOutboxOperation::Flush,
+                    slot: Some(1),
+                    error: MemoryError::Injected,
+                }
+            ))
+        );
+    }
+
+    #[ktest]
+    fn reply_delivery_rejects_forged_component_plan() {
+        let plan = delivery_plan(50, AGENT_COMPONENT_REPLY);
+        let forged = delivery_plan(50, AGENT_COMPONENT_DMA);
+        let source = ReplyApplySource::Committed(digest(0x68));
+        let mut outbox = ReplyOutbox::open(MemoryDisk::fixture()).unwrap();
+        let apply = outbox.record_apply(plan, source).unwrap();
+        assert!(!apply.matches_plan(forged));
+        assert_eq!(
+            outbox.record_apply(forged, source),
+            Err(ReplyDeliveryError::PlanConflict)
+        );
+        assert_eq!(
+            outbox.record_acknowledgement(forged, apply),
+            Err(ReplyDeliveryError::PlanConflict)
         );
     }
 }

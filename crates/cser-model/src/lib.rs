@@ -11,6 +11,7 @@
 
 extern crate alloc;
 
+pub mod composite_effect_oracle;
 pub mod composition;
 pub mod core_rebaseline_oracle;
 pub mod handoff_admission;

@@ -102,7 +102,7 @@ fn cold_reopen(directory: &Path, observed_device: u64) -> Result<Reopened, CoreE
     }
     let bytes = journal.read_all().unwrap();
     let persistence = CoordinatedPersistence::from_recovery_lease(journal, anchor, &lease);
-    let engine = Engine::recover(
+    let engine = Engine::recover_legacy_compatibility(
         standard_catalog(),
         CoreLimits::bounded_default(),
         lease.into_recovery_anchor().unwrap(),

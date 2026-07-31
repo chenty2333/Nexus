@@ -1,5 +1,6 @@
 core_device_quarantine.rs
 core_dma_adapter.rs
+core_dma_arena_allocator.rs
 core_persistent_runtime.rs
 core_pio_journal.rs
 core_portal_vnext.rs

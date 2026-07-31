@@ -18,7 +18,7 @@
 
 use cser_core::{
     ChargeAccountId, ClaimId, ClaimKindId, ClaimScope, Command, CommandRequest, CommitIntent,
-    CoreError, DEVICE_CLAIM_IOVA, DEVICE_CLAIM_PINNED_PAGE, DEVICE_CLAIM_QUEUE_SLOT,
+    ComponentId, CoreError, DEVICE_CLAIM_IOVA, DEVICE_CLAIM_PINNED_PAGE, DEVICE_CLAIM_QUEUE_SLOT,
     DEVICE_COMMIT_RECEIPT_SCHEMA, DEVICE_DOMAIN, DEVICE_EVIDENCE_IOTLB,
     DEVICE_EVIDENCE_IRQ_DRAINED, DEVICE_EVIDENCE_RESET, DEVICE_OBLIGATION_DMA,
     DEVICE_RECEIPT_SCHEMA, DEVICE_VERIFIER, DeviceGeneration, DeviceScopeId, Digest,
@@ -116,6 +116,44 @@ pub(crate) enum CoreDmaBindingError {
     InvalidHardwareGeneration,
 }
 
+/// Complete cross-generation binding for one resource reuse reservation.
+///
+/// Keeping these coordinates together prevents an adapter from accidentally
+/// combining a successor claim with a different actor, generation, or
+/// provider contract while translating the request into the portable core.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CoreReuseReservation {
+    role: ClaimRole,
+    effect: cser_core::EffectId,
+    actor: PrincipalIncarnation,
+    binding_generation: u64,
+    next_claim: ClaimId,
+    units: u64,
+    reuse_contract: Digest,
+}
+
+impl CoreReuseReservation {
+    pub(crate) const fn new(
+        role: ClaimRole,
+        effect: cser_core::EffectId,
+        actor: PrincipalIncarnation,
+        binding_generation: u64,
+        next_claim: ClaimId,
+        units: u64,
+        reuse_contract: Digest,
+    ) -> Self {
+        Self {
+            role,
+            effect,
+            actor,
+            binding_generation,
+            next_claim,
+            units,
+            reuse_contract,
+        }
+    }
+}
+
 /// Descriptive cross-layer binding for one device-visible DMA obligation.
 ///
 /// This value grants no queue, DMA, reset, or IOTLB authority. Those remain in
@@ -123,6 +161,7 @@ pub(crate) enum CoreDmaBindingError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct CoreDmaCohort {
     effect: cser_core::EffectId,
+    component: Option<ComponentId>,
     origin: PrincipalIncarnation,
     binding_generation: u64,
     account: ChargeAccountId,
@@ -134,6 +173,46 @@ pub(crate) struct CoreDmaCohort {
 impl CoreDmaCohort {
     pub(crate) fn bind(
         effect: cser_core::EffectId,
+        origin: PrincipalIncarnation,
+        binding_generation: u64,
+        account: ChargeAccountId,
+        hardware: DeviceSessionIdentity,
+        claims: CoreDmaClaims,
+    ) -> Result<Self, CoreDmaBindingError> {
+        Self::bind_optional(
+            effect,
+            None,
+            origin,
+            binding_generation,
+            account,
+            hardware,
+            claims,
+        )
+    }
+
+    pub(crate) fn bind_component(
+        effect: cser_core::EffectId,
+        component: ComponentId,
+        origin: PrincipalIncarnation,
+        binding_generation: u64,
+        account: ChargeAccountId,
+        hardware: DeviceSessionIdentity,
+        claims: CoreDmaClaims,
+    ) -> Result<Self, CoreDmaBindingError> {
+        Self::bind_optional(
+            effect,
+            Some(component),
+            origin,
+            binding_generation,
+            account,
+            hardware,
+            claims,
+        )
+    }
+
+    fn bind_optional(
+        effect: cser_core::EffectId,
+        component: Option<ComponentId>,
         origin: PrincipalIncarnation,
         binding_generation: u64,
         account: ChargeAccountId,
@@ -169,6 +248,7 @@ impl CoreDmaCohort {
             DeviceScopeId::new(packed + 1).expect("packed PCI coordinates plus one are non-zero");
         Ok(Self {
             effect,
+            component,
             origin,
             binding_generation,
             account,
@@ -180,6 +260,10 @@ impl CoreDmaCohort {
 
     pub(crate) const fn effect(self) -> cser_core::EffectId {
         self.effect
+    }
+
+    pub(crate) const fn component(self) -> Option<ComponentId> {
+        self.component
     }
 
     pub(crate) const fn scope(self) -> DeviceScopeId {
@@ -210,59 +294,97 @@ impl CoreDmaCohort {
     }
 
     pub(crate) const fn prepare(self) -> CommandRequest {
-        CommandRequest::PrepareEffect {
-            effect: self.effect,
-            actor: self.origin,
-            binding_generation: self.binding_generation,
+        match self.component {
+            Some(_) => CommandRequest::PrepareCompositeEffect {
+                effect: self.effect,
+                actor: self.origin,
+                binding_generation: self.binding_generation,
+            },
+            None => CommandRequest::PrepareEffect {
+                effect: self.effect,
+                actor: self.origin,
+                binding_generation: self.binding_generation,
+            },
         }
     }
 
     pub(crate) const fn record_commit_intent(self, operation: Digest) -> CommandRequest {
-        CommandRequest::RecordCommitIntent {
-            effect: self.effect,
-            actor: self.origin,
-            binding_generation: self.binding_generation,
-            operation,
+        match self.component {
+            Some(component) => CommandRequest::RecordComponentCommitIntent {
+                effect: self.effect,
+                component,
+                actor: self.origin,
+                binding_generation: self.binding_generation,
+                operation,
+            },
+            None => CommandRequest::RecordCommitIntent {
+                effect: self.effect,
+                actor: self.origin,
+                binding_generation: self.binding_generation,
+                operation,
+            },
         }
     }
 
-    pub(crate) const fn reserve_reuse(
-        self,
-        role: ClaimRole,
-        effect: cser_core::EffectId,
-        actor: PrincipalIncarnation,
-        binding_generation: u64,
-        next_claim: ClaimId,
-        units: u64,
-    ) -> CommandRequest {
-        let claim = self.claim(role);
-        CommandRequest::ReserveReuse {
-            effect,
-            actor,
-            binding_generation,
-            claim: next_claim,
-            domain: DEVICE_DOMAIN,
-            kind: role.claim_kind(),
-            scope: ClaimScope::Device(self.scope),
-            resource: claim.resource,
-            expected_generation: claim.generation,
-            units,
+    pub(crate) const fn reserve_reuse(self, reservation: CoreReuseReservation) -> CommandRequest {
+        let claim = self.claim(reservation.role);
+        match self.component {
+            Some(component) => CommandRequest::ReserveComponentReuse {
+                effect: reservation.effect,
+                component,
+                actor: reservation.actor,
+                binding_generation: reservation.binding_generation,
+                claim: reservation.next_claim,
+                kind: reservation.role.claim_kind(),
+                scope: ClaimScope::Device(self.scope),
+                resource: claim.resource,
+                expected_generation: claim.generation,
+                units: reservation.units,
+                reuse_contract: reservation.reuse_contract,
+            },
+            None => CommandRequest::ReserveReuse {
+                effect: reservation.effect,
+                actor: reservation.actor,
+                binding_generation: reservation.binding_generation,
+                claim: reservation.next_claim,
+                domain: DEVICE_DOMAIN,
+                kind: reservation.role.claim_kind(),
+                scope: ClaimScope::Device(self.scope),
+                resource: claim.resource,
+                expected_generation: claim.generation,
+                units: reservation.units,
+                reuse_contract: reservation.reuse_contract,
+            },
         }
     }
 
     const fn add_claim(self, role: ClaimRole) -> CommandRequest {
         let claim = self.claim(role);
-        CommandRequest::AddClaim {
-            effect: self.effect,
-            actor: self.origin,
-            binding_generation: self.binding_generation,
-            claim: claim.claim,
-            domain: DEVICE_DOMAIN,
-            kind: role.claim_kind(),
-            scope: ClaimScope::Device(self.scope),
-            resource: claim.resource,
-            resource_generation: claim.generation,
-            units: claim.units,
+        match self.component {
+            Some(component) => CommandRequest::AddComponentClaim {
+                effect: self.effect,
+                component,
+                actor: self.origin,
+                binding_generation: self.binding_generation,
+                claim: claim.claim,
+                kind: role.claim_kind(),
+                scope: ClaimScope::Device(self.scope),
+                resource: claim.resource,
+                resource_generation: claim.generation,
+                units: claim.units,
+            },
+            None => CommandRequest::AddClaim {
+                effect: self.effect,
+                actor: self.origin,
+                binding_generation: self.binding_generation,
+                claim: claim.claim,
+                domain: DEVICE_DOMAIN,
+                kind: role.claim_kind(),
+                scope: ClaimScope::Device(self.scope),
+                resource: claim.resource,
+                resource_generation: claim.generation,
+                units: claim.units,
+            },
         }
     }
 
@@ -310,6 +432,7 @@ impl QueueCommitBinding {
     ) -> Result<Self, CoreError> {
         if challenge.kind() != EffectFactKind::CommitOutcome
             || challenge.effect() != cohort.effect
+            || challenge.component() != cohort.component
             || challenge.domain() != DEVICE_DOMAIN
             || challenge.obligation() != DEVICE_OBLIGATION_DMA
             || challenge.actor() != cohort.origin
@@ -335,6 +458,7 @@ impl QueueCommitBinding {
     fn matches_challenge(self, challenge: &EffectFactChallenge) -> bool {
         challenge.kind() == EffectFactKind::CommitOutcome
             && challenge.effect() == self.cohort.effect
+            && challenge.component() == self.cohort.component
             && challenge.domain() == DEVICE_DOMAIN
             && challenge.obligation() == DEVICE_OBLIGATION_DMA
             && challenge.actor() == self.cohort.origin
@@ -395,6 +519,7 @@ impl RetirementEvent {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RetirementObservation {
     event: RetirementEvent,
+    component: Option<ComponentId>,
     hardware: DeviceSessionIdentity,
     attempt_owner: u64,
     attempt_sequence: u64,
@@ -481,6 +606,7 @@ impl ReceiptVerifier for CoreRetirementVerifier {
             RetirementEvent::Reset(_) | RetirementEvent::Iotlb(_) => !receipt.irq_queue_observed,
         };
         if challenge.effect() != self.cohort.effect
+            || challenge.component() != self.cohort.component
             || challenge.claim() != claim.claim
             || challenge.domain() != DEVICE_DOMAIN
             || challenge.kind() != receipt.event.kind()
@@ -488,6 +614,7 @@ impl ReceiptVerifier for CoreRetirementVerifier {
             || challenge.resource() != claim.resource
             || challenge.resource_generation() != claim.generation
             || challenge.subject().device().get() != old_generation
+            || receipt.component != self.cohort.component
             || receipt.hardware != self.cohort.hardware
             || old_generation.checked_add(1) != Some(receipt.successor_generation)
             || !current_is_valid
@@ -496,6 +623,7 @@ impl ReceiptVerifier for CoreRetirementVerifier {
             || receipt.attempt_owner == 0
             || receipt.attempt_sequence == 0
             || receipt.digest.is_zero()
+            || receipt.digest != retirement_digest(receipt)
         {
             return Err(VerificationError::Rejected);
         }
@@ -732,7 +860,7 @@ pub(crate) fn apply_real_reset_generation(
     };
     let observation = retirement_observation(
         RetirementEvent::Reset(ClaimRole::Queue),
-        cohort.hardware,
+        cohort,
         attempt.owner_id(),
         attempt.sequence(),
         next,
@@ -894,7 +1022,7 @@ pub(crate) fn apply_real_iotlb_closure(
     }
     let observation = retirement_observation(
         RetirementEvent::Iotlb(ClaimRole::PinnedPages),
-        cohort.hardware,
+        cohort,
         attempt.owner_id(),
         attempt.sequence(),
         successor_generation,
@@ -942,15 +1070,24 @@ fn verify_retirement(
 ) -> Result<Command, CoreError> {
     let verifier = CoreRetirementVerifier { cohort };
     let role = receipt.event.role();
-    engine
-        .verify_retirement_evidence(
+    match cohort.component {
+        Some(component) => engine.verify_component_retirement_evidence(
+            cohort.effect,
+            component,
+            cohort.claim(role).claim,
+            receipt.event.kind(),
+            &verifier,
+            &receipt,
+        ),
+        None => engine.verify_retirement_evidence(
             cohort.effect,
             cohort.claim(role).claim,
             receipt.event.kind(),
             &verifier,
             &receipt,
-        )
-        .map(|evidence| evidence.submit())
+        ),
+    }
+    .map(|evidence| evidence.submit())
 }
 
 fn evidence_was_accepted(
@@ -959,9 +1096,16 @@ fn evidence_was_accepted(
     role: ClaimRole,
     kind: EvidenceKindId,
 ) -> bool {
-    engine
-        .retirement_evidence_accepted(cohort.effect, cohort.claim(role).claim, kind)
-        .unwrap_or(false)
+    match cohort.component {
+        Some(component) => engine.component_retirement_evidence_accepted(
+            cohort.effect,
+            component,
+            cohort.claim(role).claim,
+            kind,
+        ),
+        None => engine.retirement_evidence_accepted(cohort.effect, cohort.claim(role).claim, kind),
+    }
+    .unwrap_or(false)
 }
 
 fn queue_commit_observation(
@@ -985,7 +1129,7 @@ fn queue_commit_observation(
 
 fn retirement_observation(
     event: RetirementEvent,
-    hardware: DeviceSessionIdentity,
+    cohort: CoreDmaCohort,
     attempt_owner: u64,
     attempt_sequence: u64,
     successor_generation: u64,
@@ -993,7 +1137,8 @@ fn retirement_observation(
 ) -> RetirementObservation {
     let mut observation = RetirementObservation {
         event,
-        hardware,
+        component: cohort.component,
+        hardware: cohort.hardware,
         attempt_owner,
         attempt_sequence,
         successor_generation,
@@ -1007,7 +1152,7 @@ fn retirement_observation(
 
 fn queue_commit_digest(observation: &QueueCommitObservation) -> Digest {
     let mut hasher = Sha256::new();
-    hasher.update(b"nexus.ostd.cser-core.dma.queue-commit.v2");
+    hasher.update(b"nexus.ostd.cser-core.dma.queue-commit.v3");
     hash_queue_binding(&mut hasher, observation.binding);
     hasher.update(observation.attempt_owner.to_le_bytes());
     hasher.update(observation.attempt_sequence.to_le_bytes());
@@ -1024,6 +1169,7 @@ fn hash_queue_binding(hasher: &mut Sha256, binding: QueueCommitBinding) {
     let cohort = binding.cohort;
     hasher.update(cohort.effect.root().get().to_le_bytes());
     hasher.update(cohort.effect.sequence().to_le_bytes());
+    hash_component(hasher, cohort.component);
     hasher.update(cohort.origin.principal().get().to_le_bytes());
     hasher.update(cohort.origin.generation().to_le_bytes());
     hasher.update(cohort.binding_generation.to_le_bytes());
@@ -1044,13 +1190,14 @@ fn hash_queue_binding(hasher: &mut Sha256, binding: QueueCommitBinding) {
 
 fn retirement_digest(observation: &RetirementObservation) -> Digest {
     let mut hasher = Sha256::new();
-    hasher.update(b"nexus.ostd.cser-core.dma.retirement.v1");
+    hasher.update(b"nexus.ostd.cser-core.dma.retirement.v2");
     hasher.update([observation.event.tag()]);
     hasher.update([match observation.event.role() {
         ClaimRole::Queue => 1,
         ClaimRole::PinnedPages => 2,
         ClaimRole::Iova => 3,
     }]);
+    hash_component(&mut hasher, observation.component);
     hash_hardware(&mut hasher, observation.hardware);
     hasher.update(observation.attempt_owner.to_le_bytes());
     hasher.update(observation.attempt_sequence.to_le_bytes());
@@ -1058,6 +1205,16 @@ fn retirement_digest(observation: &RetirementObservation) -> Digest {
     hasher.update((observation.completed_pages as u64).to_le_bytes());
     hasher.update([u8::from(observation.irq_queue_observed)]);
     Digest::new(hasher.finalize().into())
+}
+
+fn hash_component(hasher: &mut Sha256, component: Option<ComponentId>) {
+    match component {
+        Some(component) => {
+            hasher.update([1]);
+            hasher.update(component.get().to_le_bytes());
+        }
+        None => hasher.update([0]),
+    }
 }
 
 fn hash_hardware(hasher: &mut Sha256, hardware: DeviceSessionIdentity) {
@@ -1072,10 +1229,12 @@ fn hash_hardware(hasher: &mut Sha256, hardware: DeviceSessionIdentity) {
 #[cfg(ktest)]
 mod tests {
     use super::*;
-    use alloc::vec::Vec;
+    use alloc::{vec, vec::Vec};
     use cser_core::{
-        BootGeneration, CoreLimits, Freshness, JournalGeneration, PrincipalId, RegistryInstance,
-        RootId, SnapshotId, TransitionOutput, TransitionReceipt, TxError, standard_catalog,
+        AGENT_COMPONENT_DMA, AGENT_COMPONENT_REPLY, AGENT_OPERATION_COMPOSITE, BootGeneration,
+        ComponentCommitOperation, CoreLimits, DMA_ARENA_REUSE_COMPOSITE, Freshness,
+        JournalGeneration, PrincipalId, REPLY_CLAIM_PUBLICATION_SLOT, RegistryInstance, RootId,
+        SnapshotId, TransitionOutput, TransitionReceipt, TxError, standard_catalog,
     };
     use nexus_ostd_virtio::DeviceBdf;
     use ostd::prelude::ktest;
@@ -1117,6 +1276,152 @@ mod tests {
     }
 
     #[ktest]
+    fn component_cohort_routes_profile_two_commands_and_rejects_cross_component_receipts() {
+        let mut harness = Harness::new();
+        let legacy = cohort(90, 1);
+        let cohort = CoreDmaCohort::bind_component(
+            legacy.effect,
+            AGENT_COMPONENT_DMA,
+            legacy.origin,
+            legacy.binding_generation,
+            legacy.account,
+            legacy.hardware,
+            legacy.claims,
+        )
+        .unwrap();
+        assert_eq!(cohort.component(), Some(AGENT_COMPONENT_DMA));
+
+        harness
+            .tx(CommandRequest::CreateCompositeEffect {
+                effect: cohort.effect,
+                origin: cohort.origin,
+                binding_generation: cohort.binding_generation,
+                kind: AGENT_OPERATION_COMPOSITE,
+                charge_account: cohort.account,
+            })
+            .unwrap();
+        for command in cohort.enroll_claims() {
+            assert!(matches!(
+                &command,
+                CommandRequest::AddComponentClaim {
+                    component: AGENT_COMPONENT_DMA,
+                    ..
+                }
+            ));
+            harness.tx(command).unwrap();
+        }
+        harness
+            .tx(CommandRequest::AddComponentClaim {
+                effect: cohort.effect,
+                component: AGENT_COMPONENT_REPLY,
+                actor: cohort.origin,
+                binding_generation: cohort.binding_generation,
+                claim: id::<ClaimId>(9_901),
+                kind: REPLY_CLAIM_PUBLICATION_SLOT,
+                scope: ClaimScope::Logical,
+                resource: id::<ResourceId>(9_902),
+                resource_generation: id::<ResourceGeneration>(1),
+                units: 1,
+            })
+            .unwrap();
+        assert!(matches!(
+            cohort.prepare(),
+            CommandRequest::PrepareCompositeEffect { .. }
+        ));
+        harness.tx(cohort.prepare()).unwrap();
+
+        let commit_request = cohort.record_commit_intent(digest(0x61));
+        assert!(matches!(
+            &commit_request,
+            CommandRequest::RecordComponentCommitIntent {
+                component: AGENT_COMPONENT_DMA,
+                ..
+            }
+        ));
+        let intent = match harness.output(CommandRequest::RecordCompositeCommitIntents {
+            effect: cohort.effect,
+            actor: cohort.origin,
+            binding_generation: cohort.binding_generation,
+            operations: vec![
+                ComponentCommitOperation::new(AGENT_COMPONENT_REPLY, digest(0x60)),
+                ComponentCommitOperation::new(AGENT_COMPONENT_DMA, digest(0x61)),
+            ],
+        }) {
+            TransitionOutput::CompositeCommitIntents(intents) => intents
+                .into_iter()
+                .find(|intent| intent.component() == Some(AGENT_COMPONENT_DMA))
+                .expect("atomic arm returns the DMA component intent"),
+            other => panic!("expected atomic composite commit intents, got {other:?}"),
+        };
+        assert_eq!(intent.component(), Some(AGENT_COMPONENT_DMA));
+
+        let mut wrong_component = cohort;
+        wrong_component.component = Some(AGENT_COMPONENT_REPLY);
+        let failure = bind_queue_commit(&harness.engine, intent, wrong_component)
+            .expect_err("a reply component cannot consume the DMA commit intent");
+        assert_eq!(failure.error, CoreError::VerificationFailed);
+        let authority = bind_queue_commit(&harness.engine, failure.intent, cohort)
+            .unwrap_or_else(|_| panic!("the exact DMA component must bind"));
+        let CoreQueuePublishAuthority { intent, binding } = authority;
+        let observation =
+            queue_commit_observation(binding, 7, 9, 0xfeed, NotificationDisposition::Kicked);
+        let verifier = CoreQueueCommitVerifier { binding };
+        let outcome = harness
+            .engine
+            .verify_commit_outcome(&intent, &verifier, &observation)
+            .unwrap();
+        harness.tx(intent.acknowledge(outcome).unwrap()).unwrap();
+
+        let reuse = cohort.reserve_reuse(CoreReuseReservation::new(
+            ClaimRole::Queue,
+            cohort.effect,
+            cohort.origin,
+            cohort.binding_generation,
+            id::<ClaimId>(903),
+            1,
+            digest(0xda),
+        ));
+        assert!(matches!(
+            reuse,
+            CommandRequest::ReserveComponentReuse {
+                component: AGENT_COMPONENT_DMA,
+                ..
+            }
+        ));
+
+        let reset = retirement_observation(
+            RetirementEvent::Reset(ClaimRole::Queue),
+            cohort,
+            11,
+            12,
+            2,
+            3,
+        );
+        let command = verify_retirement(&harness.engine, cohort, reset).unwrap();
+        harness.tx(command).unwrap();
+        assert_eq!(
+            harness.engine.component_retirement_evidence_accepted(
+                cohort.effect,
+                AGENT_COMPONENT_DMA,
+                cohort.claim(ClaimRole::Queue).claim,
+                DEVICE_EVIDENCE_RESET,
+            ),
+            Ok(true)
+        );
+
+        let before = harness.engine.projection_digest();
+        let mut forged = reset;
+        forged.event = RetirementEvent::Reset(ClaimRole::PinnedPages);
+        forged.component = Some(AGENT_COMPONENT_REPLY);
+        forged.digest = retirement_digest(&forged);
+        assert_eq!(
+            verify_retirement(&harness.engine, cohort, forged),
+            Err(CoreError::VerificationFailed)
+        );
+        assert_eq!(harness.engine.projection_digest(), before);
+    }
+
+    #[ktest]
     fn contract_model_retains_then_retires_and_reuses_queue_pages_and_iova() {
         let mut harness = Harness::new();
         let cohort = cohort(1, 1);
@@ -1131,14 +1436,8 @@ mod tests {
             );
         }
 
-        let reset = retirement_observation(
-            RetirementEvent::Reset(ClaimRole::Queue),
-            cohort.hardware,
-            7,
-            9,
-            2,
-            3,
-        );
+        let reset =
+            retirement_observation(RetirementEvent::Reset(ClaimRole::Queue), cohort, 7, 9, 2, 3);
         for role in [ClaimRole::Queue, ClaimRole::PinnedPages, ClaimRole::Iova] {
             let mut receipt = reset;
             receipt.event = RetirementEvent::Reset(role);
@@ -1146,8 +1445,9 @@ mod tests {
             let command = verify_retirement(&harness.engine, cohort, receipt).unwrap();
             harness.tx(command).unwrap();
             assert_eq!(
-                harness.engine.retirement_evidence_accepted(
+                harness.engine.component_retirement_evidence_accepted(
                     cohort.effect,
+                    AGENT_COMPONENT_DMA,
                     cohort.claim(role).claim,
                     DEVICE_EVIDENCE_RESET,
                 ),
@@ -1207,20 +1507,21 @@ mod tests {
                 ),
             ),
         );
-        harness.tx(replacement.create_estate()).unwrap();
+        create_dma_composite_effect(&mut harness, replacement);
         for (role, next_claim) in [
             (ClaimRole::Queue, id::<ClaimId>(401)),
             (ClaimRole::PinnedPages, id::<ClaimId>(402)),
             (ClaimRole::Iova, id::<ClaimId>(403)),
         ] {
-            let permit = match harness.output(cohort.reserve_reuse(
+            let permit = match harness.output(cohort.reserve_reuse(CoreReuseReservation::new(
                 role,
                 replacement.effect,
                 replacement.origin,
                 replacement.binding_generation,
                 next_claim,
                 cohort.claim(role).units,
-            )) {
+                digest(0xdb),
+            ))) {
                 TransitionOutput::ReusePermit(permit) => permit,
                 other => panic!("expected reuse permit, got {other:?}"),
             };
@@ -1230,16 +1531,13 @@ mod tests {
         assert_eq!(
             harness
                 .engine
-                .estate(replacement.effect)
+                .component(replacement.effect, AGENT_COMPONENT_DMA)
                 .unwrap()
                 .retained_claims,
             3
         );
         harness.tx(replacement.prepare()).unwrap();
-        let intent = match harness.output(replacement.record_commit_intent(digest(0x31))) {
-            TransitionOutput::CommitIntent(intent) => intent,
-            other => panic!("expected reused-generation commit intent, got {other:?}"),
-        };
+        let intent = record_dma_composite_intent(&mut harness, replacement, digest(0x31));
         let challenge = harness.engine.commit_outcome_challenge(&intent).unwrap();
         assert_eq!(challenge.current_observation().device().get(), 2);
         bind_queue_commit(&harness.engine, intent, replacement)
@@ -1253,7 +1551,7 @@ mod tests {
         enroll_and_commit(&mut harness, first);
         let reset = retirement_observation(
             RetirementEvent::Reset(ClaimRole::Queue),
-            first.hardware,
+            first,
             11,
             12,
             2,
@@ -1271,7 +1569,7 @@ mod tests {
             RetirementEvent::Iotlb(ClaimRole::PinnedPages),
             RetirementEvent::Iotlb(ClaimRole::Iova),
         ] {
-            let stale = retirement_observation(event, first.hardware, 11, 12, 2, 3);
+            let stale = retirement_observation(event, first, 11, 12, 2, 3);
             assert_eq!(
                 verify_retirement(&harness.engine, second, stale),
                 Err(CoreError::VerificationFailed)
@@ -1371,7 +1669,7 @@ mod tests {
     fn queue_commit_binding_keeps_authority_epoch_distinct_from_root_binding() {
         let mut harness = Harness::new();
         let first = cohort(32, 1);
-        harness.tx(first.create_estate()).unwrap();
+        create_dma_composite_effect(&mut harness, first);
         harness
             .tx(CommandRequest::FenceIncarnation {
                 root: first.effect.root(),
@@ -1451,14 +1749,51 @@ mod tests {
         cohort: CoreDmaCohort,
         operation: Digest,
     ) -> CommitIntent {
-        harness.tx(cohort.create_estate()).unwrap();
+        create_dma_composite(harness, cohort);
+        harness.tx(cohort.prepare()).unwrap();
+        record_dma_composite_intent(harness, cohort, operation)
+    }
+
+    fn create_dma_composite(harness: &mut Harness, cohort: CoreDmaCohort) {
+        create_dma_composite_effect(harness, cohort);
         for command in cohort.enroll_claims() {
             harness.tx(command).unwrap();
         }
-        harness.tx(cohort.prepare()).unwrap();
-        match harness.output(cohort.record_commit_intent(operation)) {
-            TransitionOutput::CommitIntent(intent) => intent,
-            other => panic!("expected commit intent, got {other:?}"),
+    }
+
+    fn create_dma_composite_effect(harness: &mut Harness, cohort: CoreDmaCohort) {
+        assert_eq!(cohort.component(), Some(AGENT_COMPONENT_DMA));
+        harness
+            .tx(CommandRequest::CreateCompositeEffect {
+                effect: cohort.effect,
+                origin: cohort.origin,
+                binding_generation: cohort.binding_generation,
+                kind: DMA_ARENA_REUSE_COMPOSITE,
+                charge_account: cohort.account,
+            })
+            .unwrap();
+    }
+
+    fn record_dma_composite_intent(
+        harness: &mut Harness,
+        cohort: CoreDmaCohort,
+        operation: Digest,
+    ) -> CommitIntent {
+        match harness.output(CommandRequest::RecordCompositeCommitIntents {
+            effect: cohort.effect,
+            actor: cohort.origin,
+            binding_generation: cohort.binding_generation,
+            operations: vec![ComponentCommitOperation::new(
+                AGENT_COMPONENT_DMA,
+                operation,
+            )],
+        }) {
+            TransitionOutput::CompositeCommitIntents(mut intents) if intents.len() == 1 => {
+                let intent = intents.remove(0);
+                assert_eq!(intent.component(), Some(AGENT_COMPONENT_DMA));
+                intent
+            }
+            other => panic!("expected one atomic DMA component intent, got {other:?}"),
         }
     }
 
@@ -1516,8 +1851,9 @@ mod tests {
             1,
             device_generation,
         );
-        CoreDmaCohort::bind(
+        CoreDmaCohort::bind_component(
             cser_core::EffectId::new(root_id, 1).unwrap(),
+            AGENT_COMPONENT_DMA,
             PrincipalIncarnation::new(principal, 1).unwrap(),
             1,
             id::<ChargeAccountId>(root),
@@ -1571,6 +1907,7 @@ mod tests {
         ResourceGeneration,
         ResourceId,
         RootId,
+        SnapshotId,
     );
 
     fn id<T: NonZeroId>(value: u64) -> T {

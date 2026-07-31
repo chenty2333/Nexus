@@ -1,0 +1,208 @@
+diff --git a/src/mm/dma/dma_coherent.rs b/src/mm/dma/dma_coherent.rs
+index 93a806d..03b99a4 100644
+--- a/src/mm/dma/dma_coherent.rs
++++ b/src/mm/dma/dma_coherent.rs
+@@ -5,5 +5,5 @@
+ use super::util::{
+-    BeginDmaUnmap, PendingDmaUnmap as IotlbPendingDmaUnmap, PollDmaUnmap, alloc_kva,
+-    begin_dma_unmap, complete_unprepare_dma, cvm_need_private_protection, poll_dma_unmap,
+-    prepare_dma, split_daddr, unprepare_dma,
++    BeginDmaUnmap, PendingDmaUnmap as IotlbPendingDmaUnmap, PollDmaUnmap, PrepareDmaAtError,
++    alloc_kva, begin_dma_unmap, complete_unprepare_dma, cvm_need_private_protection,
++    poll_dma_unmap, prepare_dma, prepare_dma_at, split_daddr, unprepare_dma,
+ };
+@@ -39,3 +39,44 @@ pub struct DmaCoherent {
++/// Why an exact coherent DMA mapping could not be established.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum ExactDmaMapFailure {
++    /// The caller-supplied segment cannot use its ordinary coherent linear
++    /// mapping in a confidential guest.
++    ConfidentialGuest,
++    /// Exact device addresses require active DMA remapping.
++    DmaRemappingUnavailable,
++    /// The exact device address is unaligned or its range overflows.
++    InvalidDaddr,
++    /// Some part of the exact device-address range is still owned.
++    DaddrUnavailable,
++}
++
++/// An exact coherent DMA mapping failure that returns the caller's segment.
++#[derive(Debug)]
++pub struct ExactDmaMapError {
++    segment: Segment<()>,
++    failure: ExactDmaMapFailure,
++}
++
++impl ExactDmaMapError {
++    /// Returns the reason the exact mapping was rejected.
++    #[must_use]
++    pub const fn failure(&self) -> ExactDmaMapFailure {
++        self.failure
++    }
++
++    /// Returns the unchanged caller-owned segment.
++    #[must_use]
++    pub fn into_segment(self) -> Segment<()> {
++        self.segment
++    }
++
++    /// Returns both the rejection reason and unchanged segment.
++    #[must_use]
++    pub fn into_parts(self) -> (ExactDmaMapFailure, Segment<()>) {
++        (self.failure, self.segment)
++    }
++}
++
+ /// Why a retained DMA owner cannot currently make progress.  The Stage 5A
+ /// patch keeps the backing pages and IOVA owned in either case.
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+@@ -146,3 +187,60 @@ impl DmaCoherent {
++    /// Establishes a coherent DMA mapping for a caller-owned segment at one
++    /// exact device address.
++    ///
++    /// This constructor is intended for persistent DMA arenas that retain PFN
++    /// identity separately from the device-address allocator. It does not
++    /// initialize or otherwise modify the segment contents.
++    ///
++    /// The exact device-address range remains unavailable after teardown
++    /// begins. It can only be reserved again after
++    /// [`PendingDmaUnmap::poll_complete`] observes IOTLB completion and
++    /// releases the previous range.
++    ///
++    /// On any reported error, the returned [`ExactDmaMapError`] owns the
++    /// unchanged segment and no IOVA or IOMMU PTE was installed.
++    ///
++    /// This method [requires](crate::mm::dma#usage-in-irqs) the caller to
++    /// have IRQs enabled. The supplied segment is supported only for a
++    /// cache-coherent device in a non-confidential guest.
++    pub fn from_segment_at(
++        segment: Segment<()>,
++        exact_daddr: Daddr,
++    ) -> Result<Self, ExactDmaMapError> {
++        debug_assert!(irq::is_local_enabled());
++
++        if cvm_need_private_protection() {
++            return Err(ExactDmaMapError {
++                segment,
++                failure: ExactDmaMapFailure::ConfidentialGuest,
++            });
++        }
++
++        let paddr_range = segment.paddr_range();
++        // SAFETY: `segment` owns untyped physical memory and is moved into the
++        // returned DMA owner on success. Every reported failure precedes PFN
++        // tracking and PTE installation.
++        let map_daddr = match unsafe { prepare_dma_at(&paddr_range, exact_daddr) } {
++            Ok(daddr) => daddr,
++            Err(error) => {
++                let failure = match error {
++                    PrepareDmaAtError::RemappingUnavailable => {
++                        ExactDmaMapFailure::DmaRemappingUnavailable
++                    }
++                    PrepareDmaAtError::InvalidDaddr => ExactDmaMapFailure::InvalidDaddr,
++                    PrepareDmaAtError::DaddrUnavailable => ExactDmaMapFailure::DaddrUnavailable,
++                };
++                return Err(ExactDmaMapError { segment, failure });
++            }
++        };
++
++        Ok(Self {
++            inner: Inner::Segment(segment),
++            map_daddr: Some(map_daddr),
++            is_cache_coherent: true,
++            prepared: true,
++        })
++    }
++
+     /// Returns the base CPU pointer for exclusive raw DMA access.
+     ///
+     /// This narrow escape hatch is intended for audited driver libraries that
+diff --git a/src/mm/dma/mod.rs b/src/mm/dma/mod.rs
+index 2dfc728..ad91f6d 100644
+--- a/src/mm/dma/mod.rs
++++ b/src/mm/dma/mod.rs
+@@ -27,2 +27,5 @@ mod util;
+-pub use dma_coherent::{DmaCoherent, DmaUnmapFailure, PendingDmaUnmap, UnmappedDma};
++pub use dma_coherent::{
++    DmaCoherent, DmaUnmapFailure, ExactDmaMapError, ExactDmaMapFailure, PendingDmaUnmap,
++    UnmappedDma,
++};
+ pub use dma_stream::{DmaDirection, DmaStream, FromAndToDevice, FromDevice, ToDevice};
+diff --git a/src/mm/dma/util.rs b/src/mm/dma/util.rs
+index 3729e60..7978614 100644
+--- a/src/mm/dma/util.rs
++++ b/src/mm/dma/util.rs
+@@ -169,3 +169,73 @@ pub(super) unsafe fn prepare_dma(pa_range: &Range<Paddr>) -> Option<Daddr> {
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub(super) enum PrepareDmaAtError {
++    RemappingUnavailable,
++    InvalidDaddr,
++    DaddrUnavailable,
++}
++
++/// Prepares a physical address range at one exact device-address range.
++///
++/// Exact allocation failure happens before PFN tracking or PTE installation,
++/// so the caller can safely recover its unchanged backing segment. Once this
++/// function succeeds, only `complete_unprepare_dma` may return the exact range
++/// to the allocator.
++///
++/// # Safety
++///
++/// The provided physical address range must be untyped DMA memory that
++/// outlives the matching ownership-carrying unmap.
++pub(super) unsafe fn prepare_dma_at(
++    pa_range: &Range<Paddr>,
++    exact_daddr: Daddr,
++) -> Result<Daddr, PrepareDmaAtError> {
++    if !has_dma_remapping() {
++        return Err(PrepareDmaAtError::RemappingUnavailable);
++    }
++    if !exact_daddr.is_multiple_of(PAGE_SIZE) {
++        return Err(PrepareDmaAtError::InvalidDaddr);
++    }
++    let Some(end_daddr) = exact_daddr.checked_add(pa_range.len()) else {
++        return Err(PrepareDmaAtError::InvalidDaddr);
++    };
++    let daddr_range = exact_daddr..end_daddr;
++
++    let irq_guard = irq::disable_local();
++    #[cfg(target_arch = "x86_64")]
++    if allocator::daddr_allocator(&irq_guard)
++        .alloc_specific(&daddr_range)
++        .is_err()
++    {
++        drop(irq_guard);
++        return Err(PrepareDmaAtError::DaddrUnavailable);
++    }
++    #[cfg(not(target_arch = "x86_64"))]
++    {
++        drop(irq_guard);
++        return Err(PrepareDmaAtError::RemappingUnavailable);
++    }
++    #[cfg(target_arch = "x86_64")]
++    drop(irq_guard);
++
++    // SAFETY: The safety condition is upheld by the caller.
++    #[cfg(any(debug_assertions, all(target_arch = "x86_64", feature = "cvm_guest")))]
++    unsafe {
++        alloc_unprotect_physical_range(pa_range);
++    }
++
++    for map_paddr in pa_range.clone().step_by(PAGE_SIZE) {
++        let map_daddr = map_paddr - pa_range.start + exact_daddr;
++        // SAFETY: The caller guarantees that `map_paddr` is backed by the
++        // retained untyped segment. An unexpected map failure panics and
++        // deliberately retains both the exact IOVA and all installed PTEs.
++        unsafe {
++            iommu::map(map_daddr, map_paddr)
++                .expect("failed to install an exact DMA address mapping");
++        }
++    }
++
++    Ok(exact_daddr)
++}
++
+ /// Unprepares a physical address range from DMA mapping.
+ ///
+ /// # Safety

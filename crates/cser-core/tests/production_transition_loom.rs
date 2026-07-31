@@ -81,7 +81,7 @@ struct Harness {
 impl Harness {
     fn new() -> Self {
         Self {
-            engine: Engine::new(
+            engine: Engine::new_legacy_compatibility(
                 standard_catalog(),
                 CoreLimits::bounded_default(),
                 freshness(1, 1, 1, 1, 1),

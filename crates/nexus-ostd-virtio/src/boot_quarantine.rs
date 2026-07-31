@@ -115,6 +115,7 @@ pub struct BootClaimCoordinates {
     scope: BootDeviceScope,
     effect_root: u64,
     effect_sequence: u64,
+    component: Option<u32>,
     claim: u64,
     claim_kind: u32,
     resource: u64,
@@ -181,6 +182,7 @@ impl BootClaimCoordinates {
             scope,
             effect_root,
             effect_sequence,
+            component: None,
             claim,
             claim_kind,
             resource,
@@ -188,6 +190,40 @@ impl BootClaimCoordinates {
             units,
             subject_device_generation,
         })
+    }
+
+    /// Constructs validated component-local replay coordinates.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_component(
+        scope: BootDeviceScope,
+        effect_root: u64,
+        effect_sequence: u64,
+        component: u32,
+        claim: u64,
+        claim_kind: u32,
+        resource: u64,
+        resource_generation: u64,
+        units: u64,
+        subject_device_generation: u64,
+    ) -> Result<Self, BootClaimCoordinateError> {
+        if component == 0 {
+            return Err(BootClaimCoordinateError::Zero(
+                BootClaimCoordinateField::Component,
+            ));
+        }
+        let mut coordinates = Self::new(
+            scope,
+            effect_root,
+            effect_sequence,
+            claim,
+            claim_kind,
+            resource,
+            resource_generation,
+            units,
+            subject_device_generation,
+        )?;
+        coordinates.component = Some(component);
+        Ok(coordinates)
     }
 
     /// Returns the stable device reset-domain scope.
@@ -203,6 +239,11 @@ impl BootClaimCoordinates {
     /// Returns the per-root effect sequence.
     pub const fn effect_sequence(self) -> u64 {
         self.effect_sequence
+    }
+
+    /// Returns the optional composite-effect component slot.
+    pub const fn component(self) -> Option<u32> {
+        self.component
     }
 
     /// Returns the stable claim identity.
@@ -244,6 +285,7 @@ pub enum BootClaimCoordinateField {
     DeviceScope,
     EffectRoot,
     EffectSequence,
+    Component,
     Claim,
     ClaimKind,
     Resource,
@@ -294,6 +336,57 @@ struct BootHardwareEvidence {
     observed_generation: u64,
     reset: ResetDrainObservation,
     iotlb: BootIotlbObservation,
+}
+
+/// Read-only snapshot of the physical facts retained by a boot quarantine.
+///
+/// This value carries no PCI, queue, DMA, or activation authority. Its fields
+/// can only be obtained from a completed [`BootQuarantineGuard`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BootQuarantineObservation {
+    evidence: BootHardwareEvidence,
+}
+
+impl BootQuarantineObservation {
+    /// Reports the exact PCI command readback.
+    pub const fn bus_master_disabled(self) -> bool {
+        self.evidence.reset.pci.bus_master_disabled
+    }
+
+    /// Reports the exact PCI INTx mask readback.
+    pub const fn intx_masked(self) -> bool {
+        self.evidence.reset.pci.intx_masked
+    }
+
+    /// Reports the exact VirtIO status-zero observation.
+    pub const fn reset_status_zero(self) -> bool {
+        self.evidence.reset.reset_status_zero
+    }
+
+    /// Returns all VirtIO ISR cause bits observed while draining.
+    pub const fn observed_isr_bits(self) -> u32 {
+        self.evidence.reset.observed_isr_bits
+    }
+
+    /// Returns the number of real VirtIO ISR reads performed.
+    pub const fn isr_reads(self) -> usize {
+        self.evidence.reset.isr_reads
+    }
+
+    /// Returns the terminal consecutive empty ISR-read count.
+    pub const fn consecutive_empty_isr_reads(self) -> usize {
+        self.evidence.reset.consecutive_empty_isr_reads
+    }
+
+    /// Reports that the IOTLB trigger page used an actual remapped IOVA.
+    pub const fn iotlb_used_remapped_iova(self) -> bool {
+        self.evidence.iotlb.used_remapped_iova
+    }
+
+    /// Returns the number of trigger mappings whose invalidation completed.
+    pub const fn iotlb_completed_trigger_pages(self) -> usize {
+        self.evidence.iotlb.completed_pages
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -611,6 +704,14 @@ impl BootQuarantineGuard {
     /// Returns the trusted generation established while fenced.
     pub const fn observed_generation(&self) -> u64 {
         self.evidence.observed_generation
+    }
+
+    /// Snapshots the completed physical observations without releasing the
+    /// quarantine owner or creating activation authority.
+    pub const fn observation(&self) -> BootQuarantineObservation {
+        BootQuarantineObservation {
+            evidence: self.evidence,
+        }
     }
 
     /// Binds the physical whole-device evidence to one exact replayed claim.

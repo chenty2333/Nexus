@@ -174,7 +174,7 @@ fn origin(path: &Path) -> Result<(), String> {
         return Err("origin requires a new journal".to_owned());
     }
     let mut file = FileJournal::open(path).map_err(io_error)?;
-    let mut engine = Engine::new(
+    let mut engine = Engine::new_legacy_compatibility(
         standard_catalog(),
         CoreLimits::bounded_default(),
         freshness(1, 1),
@@ -267,8 +267,13 @@ fn adopt(path: &Path, minimum_revision: u64, expected_head: Digest) -> Result<()
         expected_head,
     )
     .map_err(|error| format!("invalid recovery anchor: {error:?}"))?;
-    let report = Engine::recover(catalog, CoreLimits::bounded_default(), anchor, &bytes)
-        .map_err(core_error)?;
+    let report = Engine::recover_legacy_compatibility(
+        catalog,
+        CoreLimits::bounded_default(),
+        anchor,
+        &bytes,
+    )
+    .map_err(core_error)?;
     let mut engine = report.into_engine();
     let mut file = FileJournal::open(path).map_err(io_error)?;
     checkpoint(&mut engine, &mut file, target)?;
@@ -309,8 +314,13 @@ fn reconcile(path: &Path, minimum_revision: u64, expected_head: Digest) -> Resul
         expected_head,
     )
     .map_err(|error| format!("invalid recovery anchor: {error:?}"))?;
-    let report = Engine::recover(catalog, CoreLimits::bounded_default(), anchor, &bytes)
-        .map_err(core_error)?;
+    let report = Engine::recover_legacy_compatibility(
+        catalog,
+        CoreLimits::bounded_default(),
+        anchor,
+        &bytes,
+    )
+    .map_err(core_error)?;
     let mut engine = report.into_engine();
     let mut file = FileJournal::open(path).map_err(io_error)?;
     checkpoint(&mut engine, &mut file, target)?;

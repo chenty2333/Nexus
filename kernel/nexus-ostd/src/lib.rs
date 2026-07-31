@@ -83,6 +83,10 @@ mod core_reply_outbox;
 mod core_device_quarantine;
 
 #[cfg(feature = "cser-production")]
+#[path = "cser/core_dma_arena_allocator.rs"]
+mod core_dma_arena_allocator;
+
+#[cfg(feature = "cser-production")]
 #[path = "cser/core_persistent_runtime.rs"]
 mod core_persistent_runtime;
 

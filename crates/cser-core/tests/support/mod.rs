@@ -139,7 +139,7 @@ pub struct Harness {
 impl Harness {
     pub fn new() -> Self {
         Self {
-            engine: Engine::new(
+            engine: Engine::new_legacy_compatibility(
                 standard_catalog(),
                 CoreLimits::bounded_default(),
                 freshness(1, 1, 1, 1, 1),
@@ -150,7 +150,22 @@ impl Harness {
 
     pub fn with_limits(limits: CoreLimits) -> Self {
         Self {
-            engine: Engine::new(standard_catalog(), limits, freshness(1, 1, 1, 1, 1)),
+            engine: Engine::new_legacy_compatibility(
+                standard_catalog(),
+                limits,
+                freshness(1, 1, 1, 1, 1),
+            ),
+            journal: Vec::new(),
+        }
+    }
+
+    pub fn new_profile_two() -> Self {
+        Self {
+            engine: Engine::new(
+                standard_catalog(),
+                CoreLimits::bounded_default(),
+                freshness(1, 1, 1, 1, 1),
+            ),
             journal: Vec::new(),
         }
     }

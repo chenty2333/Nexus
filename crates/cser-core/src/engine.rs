@@ -9,13 +9,25 @@ use core::convert::Infallible;
 use sha2::{Digest as _, Sha256};
 
 use crate::{
-    BootGeneration, ChargeAccountId, ClaimId, ClaimKindId, ClaimScopePolicy, CreditClassId,
-    DeviceGeneration, DeviceGenerationEffect, DeviceScopeId, Digest, DomainCatalog, DomainId,
-    EffectId, EvidenceKindId, Freshness, FreshnessAxes, JournalDecodeError, JournalGeneration,
-    JournalRecord, JournalRepair, ObligationKindId, ObligationPolicy, PrincipalIncarnation,
-    ReceiptSchemaId, RegistryInstance, ResourceGeneration, ResourceId, RootId, SnapshotId,
-    VerifierId, scan_journal, scan_journal_to_head,
+    BootGeneration, ChargeAccountId, ClaimId, ClaimKindId, ClaimScopePolicy, ComponentId,
+    CompositeKindId, CreditClassId, DeviceGeneration, DeviceGenerationEffect, DeviceScopeId,
+    Digest, DomainCatalog, DomainId, EffectId, EvidenceKindId, Freshness, FreshnessAxes,
+    JournalDecodeError, JournalGeneration, JournalRecord, JournalRepair, ObligationKindId,
+    ObligationPolicy, PrincipalIncarnation, ReceiptSchemaId, RegistryInstance, ResourceGeneration,
+    ResourceId, RootId, SnapshotId, VerifierId, scan_journal, scan_journal_to_head,
 };
+
+/// Forces recognized predecessor journals through typed schema rejection even
+/// when the trusted anchor names genesis. Other unanchored bytes remain repairable
+/// failed-write residue rather than authoritative journal state.
+pub(crate) fn reject_recognized_legacy_journal_prefix(
+    bytes: &[u8],
+) -> Result<(), JournalDecodeError> {
+    if bytes.starts_with(b"CSERJR5\0") || bytes.starts_with(b"CSERJR4\0") {
+        scan_journal(bytes)?;
+    }
+    Ok(())
+}
 
 /// Exact runtime scope of one resource claim.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -45,6 +57,32 @@ pub enum CustodyState {
     /// The non-authorizing kernel estate retains the obligation post mortem.
     KernelEstate,
     /// The estate has settled and released every physical claim.
+    Released,
+}
+
+/// Aggregate escape and discharge state of one composite effect.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EffectEscapeState {
+    /// No component crossed an irreversible external commit point.
+    Unescaped,
+    /// At least one component escaped and no component has discharged yet.
+    Escaped,
+    /// At least one claim or component discharged while other work remains.
+    PartiallyDischarged,
+    /// Every component obligation and resource claim is terminal.
+    Retired,
+    /// The terminal composite record was explicitly released.
+    Released,
+}
+
+/// Core-owned projection of the current custodian for one component claim.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClaimCustodian {
+    /// A logical claim is retained by the non-authorizing kernel estate.
+    KernelEstate,
+    /// A physical claim is retained by the provider for one exact device scope.
+    DeviceProvider(DeviceScopeId),
+    /// Typed retirement evidence released the old resource generation.
     Released,
 }
 
@@ -296,6 +334,7 @@ impl VerifierIdentity {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EvidenceChallenge {
     effect: EffectId,
+    component: Option<ComponentId>,
     claim: ClaimId,
     domain: DomainId,
     kind: EvidenceKindId,
@@ -312,6 +351,11 @@ impl EvidenceChallenge {
     /// Returns the exact effect.
     pub const fn effect(self) -> EffectId {
         self.effect
+    }
+
+    /// Returns the component slot for a composite-effect claim.
+    pub const fn component(self) -> Option<ComponentId> {
+        self.component
     }
 
     /// Returns the exact claim.
@@ -457,6 +501,7 @@ pub enum ExternalOutcome {
 pub struct EffectFactChallenge {
     kind: EffectFactKind,
     effect: EffectId,
+    component: Option<ComponentId>,
     domain: DomainId,
     obligation: ObligationKindId,
     actor: PrincipalIncarnation,
@@ -478,6 +523,11 @@ impl EffectFactChallenge {
     /// Returns the exact effect.
     pub const fn effect(self) -> EffectId {
         self.effect
+    }
+
+    /// Returns the component slot for a composite-effect fact.
+    pub const fn component(self) -> Option<ComponentId> {
+        self.component
     }
 
     /// Returns the domain schema.
@@ -613,6 +663,7 @@ impl VerifierStamp {
 pub(crate) struct VerifiedEffectFact {
     kind: EffectFactKind,
     effect: EffectId,
+    component: Option<ComponentId>,
     actor: PrincipalIncarnation,
     generation: u64,
     nonce: u64,
@@ -658,6 +709,7 @@ pub(crate) struct RetirementEvidence {
 #[derive(Debug, Eq, PartialEq)]
 pub struct VerifiedRetirementEvidence {
     effect: EffectId,
+    component: Option<ComponentId>,
     claim: ClaimId,
     evidence: RetirementEvidence,
 }
@@ -665,10 +717,18 @@ pub struct VerifiedRetirementEvidence {
 impl VerifiedRetirementEvidence {
     /// Consumes this verified fact into the only live evidence-ingress command.
     pub fn submit(self) -> Command {
-        Command(CommandKind::SubmitEvidence {
-            effect: self.effect,
-            claim: self.claim,
-            evidence: self.evidence,
+        Command(match self.component {
+            Some(component) => CommandKind::SubmitComponentEvidence {
+                effect: self.effect,
+                component,
+                claim: self.claim,
+                evidence: self.evidence,
+            },
+            None => CommandKind::SubmitEvidence {
+                effect: self.effect,
+                claim: self.claim,
+                evidence: self.evidence,
+            },
         })
     }
 }
@@ -692,6 +752,23 @@ impl VerifiedRetirementEvidence {
 #[derive(Debug, Eq, PartialEq)]
 pub struct Command(CommandKind);
 
+impl Command {
+    /// Returns whether this command belongs to the profile-2 composite state
+    /// machine or to a lifecycle transition shared by both profiles.
+    ///
+    /// A production profile-2 Registry uses this classification at every
+    /// trusted ingress. Offline profile-1 conformance binaries may continue to
+    /// execute the rejected singleton variants directly against an `Engine`.
+    pub const fn is_profile_two_compatible(&self) -> bool {
+        self.0.is_profile_two_compatible()
+    }
+
+    /// Returns stable normalized trace coordinates without granting authority.
+    pub const fn coordinates(&self) -> TransitionCoordinates {
+        self.0.coordinates()
+    }
+}
+
 /// Replayable durable semantic command kind. This is never live ingress.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum CommandKind {
@@ -708,6 +785,19 @@ pub(crate) enum CommandKind {
         /// Domain-defined obligation class.
         obligation: ObligationKindId,
         /// Account charged for retained claims.
+        charge_account: ChargeAccountId,
+    },
+    /// Creates one catalog-bound heterogeneous effect under one authority gate.
+    CreateCompositeEffect {
+        /// Stable escaped-effect identity.
+        effect: EffectId,
+        /// Exact originating principal incarnation.
+        origin: PrincipalIncarnation,
+        /// Initial binding generation.
+        binding_generation: u64,
+        /// Catalog-defined component product.
+        kind: CompositeKindId,
+        /// Account charged for every retained component claim.
         charge_account: ChargeAccountId,
     },
     /// Adds one typed claim before effect preparation.
@@ -733,11 +823,43 @@ pub(crate) enum CommandKind {
         /// Conserved resource units.
         units: u64,
     },
+    /// Adds one claim to an exact catalog-defined component.
+    AddComponentClaim {
+        /// Shared parent effect.
+        effect: EffectId,
+        /// Exact component slot.
+        component: ComponentId,
+        /// Exact live actor.
+        actor: PrincipalIncarnation,
+        /// Exact live binding generation.
+        binding_generation: u64,
+        /// Stable claim identity, unique within the parent effect.
+        claim: ClaimId,
+        /// Domain-defined claim class.
+        kind: ClaimKindId,
+        /// Exact logical or device scope.
+        scope: ClaimScope,
+        /// Exact protected resource.
+        resource: ResourceId,
+        /// Exact allocation generation.
+        resource_generation: ResourceGeneration,
+        /// Conserved resource units.
+        units: u64,
+    },
     /// Freezes claim enrollment and prepares the effect.
     PrepareEffect {
         /// Stable effect identity.
         effect: EffectId,
         /// Exact live principal preparing the effect.
+        actor: PrincipalIncarnation,
+        /// Exact live binding generation.
+        binding_generation: u64,
+    },
+    /// Freezes claim enrollment for every component atomically.
+    PrepareCompositeEffect {
+        /// Shared parent effect.
+        effect: EffectId,
+        /// Exact live actor.
         actor: PrincipalIncarnation,
         /// Exact live binding generation.
         binding_generation: u64,
@@ -752,6 +874,30 @@ pub(crate) enum CommandKind {
         binding_generation: u64,
         /// Digest of the external operation coordinates.
         operation: Digest,
+    },
+    /// Records a component-local write-ahead external commit intent.
+    RecordComponentCommitIntent {
+        /// Shared parent effect.
+        effect: EffectId,
+        /// Exact component crossing its commit gate.
+        component: ComponentId,
+        /// Exact live actor.
+        actor: PrincipalIncarnation,
+        /// Exact live binding generation.
+        binding_generation: u64,
+        /// Digest of the external operation coordinates.
+        operation: Digest,
+    },
+    /// Atomically records the complete component commit-intent cohort.
+    RecordCompositeCommitIntents {
+        /// Shared parent effect.
+        effect: EffectId,
+        /// Exact live actor.
+        actor: PrincipalIncarnation,
+        /// Exact live binding generation.
+        binding_generation: u64,
+        /// Complete catalog-ordered component operation set.
+        operations: Vec<ComponentCommitOperation>,
     },
     /// Acknowledges the exact write-ahead commit intent.
     AcknowledgeCommit {
@@ -805,6 +951,15 @@ pub(crate) enum CommandKind {
         /// Exact rebound binding generation.
         binding_generation: u64,
     },
+    /// Refreshes wholly-precommit component claims after explicit adoption.
+    RebaseCompositePrecommitClaims {
+        /// Stable adopted composite effect identity.
+        effect: EffectId,
+        /// Exact active successor incarnation.
+        actor: PrincipalIncarnation,
+        /// Exact active successor binding generation.
+        binding_generation: u64,
+    },
     /// Claims one exact committed obligation for settlement.
     ClaimSettlement {
         /// Stable effect identity.
@@ -812,10 +967,34 @@ pub(crate) enum CommandKind {
         /// Exact rebound claimant.
         claimant: PrincipalIncarnation,
     },
+    /// Claims one exact committed component obligation for settlement.
+    ClaimComponentSettlement {
+        /// Shared parent effect.
+        effect: EffectId,
+        /// Exact successor-settled component.
+        component: ComponentId,
+        /// Exact rebound claimant.
+        claimant: PrincipalIncarnation,
+    },
     /// Durably records settlement intent before publication or reconciliation.
     RecordApplyIntent {
         /// Stable effect identity.
         effect: EffectId,
+        /// Exact claimant incarnation.
+        claimant: PrincipalIncarnation,
+        /// Claim generation.
+        generation: u64,
+        /// Secret one-shot nonce.
+        nonce: u64,
+        /// Digest of the intended external action.
+        intent: Digest,
+    },
+    /// Records component-local settlement intent before external apply.
+    RecordComponentApplyIntent {
+        /// Shared parent effect.
+        effect: EffectId,
+        /// Exact component.
+        component: ComponentId,
         /// Exact claimant incarnation.
         claimant: PrincipalIncarnation,
         /// Claim generation.
@@ -848,6 +1027,21 @@ pub(crate) enum CommandKind {
         /// Digest describing the unresolved outcome.
         reason: Digest,
     },
+    /// Closes one component settlement authority with an indeterminate result.
+    MarkComponentIndeterminate {
+        /// Shared parent effect.
+        effect: EffectId,
+        /// Exact component.
+        component: ComponentId,
+        /// Exact claimant incarnation.
+        claimant: PrincipalIncarnation,
+        /// Claim generation.
+        generation: u64,
+        /// Secret one-shot nonce.
+        nonce: u64,
+        /// Digest describing the unresolved outcome.
+        reason: Digest,
+    },
     /// Revokes one exact observed authority epoch.
     ///
     /// For a committed effect this closes successor authority without
@@ -871,6 +1065,17 @@ pub(crate) enum CommandKind {
         /// Typed retirement evidence.
         evidence: RetirementEvidence,
     },
+    /// Submits typed evidence for one exact component-local resource claim.
+    SubmitComponentEvidence {
+        /// Shared parent effect.
+        effect: EffectId,
+        /// Exact component.
+        component: ComponentId,
+        /// Stable claim identity.
+        claim: ClaimId,
+        /// Typed retirement evidence.
+        evidence: RetirementEvidence,
+    },
     /// Establishes a fresh boot and reclaims authority from the prior boot.
     CheckpointRecovery {
         /// Fresh boot generation.
@@ -883,6 +1088,11 @@ pub(crate) enum CommandKind {
     /// Releases a settled, fully retired estate record.
     ReleaseEstate {
         /// Stable effect identity.
+        effect: EffectId,
+    },
+    /// Releases a fully terminal composite effect record.
+    ReleaseCompositeEffect {
+        /// Shared parent effect.
         effect: EffectId,
     },
     /// Durably reserves the next allocation generation after exact retirement.
@@ -907,22 +1117,61 @@ pub(crate) enum CommandKind {
         expected_generation: ResourceGeneration,
         /// Conserved resource units retained before hardware reuse.
         units: u64,
+        /// Provider-defined physical layout and drain contract digest.
+        reuse_contract: Digest,
+    },
+    /// Reserves a retired resource generation for one exact component.
+    ReserveComponentReuse {
+        /// Shared parent effect.
+        effect: EffectId,
+        /// Component retaining the next generation.
+        component: ComponentId,
+        /// Exact live actor.
+        actor: PrincipalIncarnation,
+        /// Exact live binding generation.
+        binding_generation: u64,
+        /// Stable new claim identity.
+        claim: ClaimId,
+        /// Domain-defined claim class.
+        kind: ClaimKindId,
+        /// Exact logical or device scope.
+        scope: ClaimScope,
+        /// Stable resource identity.
+        resource: ResourceId,
+        /// Exact retired generation being advanced.
+        expected_generation: ResourceGeneration,
+        /// Conserved units retained before external reuse.
+        units: u64,
+        /// Provider-defined physical layout and drain contract digest.
+        reuse_contract: Digest,
     },
     /// Consumes one exact durable reservation before external resource reuse.
     #[non_exhaustive]
     ActivateResourceReuse {
         /// Estate retaining the resource before external reuse.
         effect: EffectId,
+        /// Composite component retaining the reservation, when applicable.
+        component: Option<ComponentId>,
         /// Exact principal incarnation which received the bearer.
         actor: PrincipalIncarnation,
         /// Exact binding generation which received the bearer.
         binding_generation: u64,
         /// Exact estate authority epoch which received the bearer.
         authority_epoch: u64,
+        /// Exact next-generation claim retained before reuse.
+        claim: ClaimId,
         /// Stable resource identity.
         resource: ResourceId,
+        /// Exact terminal generation from which reuse advances.
+        previous_generation: ResourceGeneration,
         /// Exact reserved allocation generation.
         resource_generation: ResourceGeneration,
+        /// Catalog digest defining the claim and evidence rules.
+        catalog_digest: Digest,
+        /// Digest of the retained old-generation retirement evidence.
+        retirement_digest: Digest,
+        /// Provider-defined physical layout and drain contract digest.
+        reuse_contract: Digest,
         /// One-shot reservation nonce.
         nonce: u64,
         /// Freshness coordinates at reservation time.
@@ -932,17 +1181,176 @@ pub(crate) enum CommandKind {
     ReclaimResourceReuse {
         /// Adopted estate retaining the resource.
         effect: EffectId,
+        /// Composite component retaining the reservation, when applicable.
+        component: Option<ComponentId>,
         /// Exact live successor incarnation.
         actor: PrincipalIncarnation,
         /// Exact live successor binding generation.
         binding_generation: u64,
         /// Exact adopted estate authority epoch.
         authority_epoch: u64,
+        /// Exact pending next-generation claim.
+        claim: ClaimId,
         /// Stable resource identity.
         resource: ResourceId,
         /// Exact pending allocation generation.
         resource_generation: ResourceGeneration,
     },
+}
+
+impl CommandKind {
+    const fn is_profile_two_compatible(&self) -> bool {
+        match self {
+            Self::CreateEstate { .. }
+            | Self::AddClaim { .. }
+            | Self::PrepareEffect { .. }
+            | Self::RecordCommitIntent { .. }
+            | Self::ClaimSettlement { .. }
+            | Self::RecordApplyIntent { .. }
+            | Self::MarkIndeterminate { .. }
+            | Self::SubmitEvidence { .. }
+            | Self::ReleaseEstate { .. }
+            | Self::ReserveReuse { .. } => false,
+            Self::AcknowledgeCommit { fact }
+            | Self::RecordApplied { fact }
+            | Self::Settle { fact } => fact.component.is_some(),
+            Self::ActivateResourceReuse { component, .. }
+            | Self::ReclaimResourceReuse { component, .. } => component.is_some(),
+            Self::CreateCompositeEffect { .. }
+            | Self::AddComponentClaim { .. }
+            | Self::PrepareCompositeEffect { .. }
+            | Self::RecordComponentCommitIntent { .. }
+            | Self::RecordCompositeCommitIntents { .. }
+            | Self::FenceIncarnation { .. }
+            | Self::Snapshot { .. }
+            | Self::Ready { .. }
+            | Self::Rebind { .. }
+            | Self::AdoptEffect { .. }
+            | Self::RebaseCompositePrecommitClaims { .. }
+            | Self::ClaimComponentSettlement { .. }
+            | Self::RecordComponentApplyIntent { .. }
+            | Self::MarkComponentIndeterminate { .. }
+            | Self::BeginRevoke { .. }
+            | Self::SubmitComponentEvidence { .. }
+            | Self::CheckpointRecovery { .. }
+            | Self::ReleaseCompositeEffect { .. }
+            | Self::ReserveComponentReuse { .. } => true,
+        }
+    }
+
+    const fn coordinates(&self) -> TransitionCoordinates {
+        let (root, effect, component, claim) = match self {
+            Self::CreateEstate { effect, .. }
+            | Self::CreateCompositeEffect { effect, .. }
+            | Self::PrepareEffect { effect, .. }
+            | Self::PrepareCompositeEffect { effect, .. }
+            | Self::RecordCommitIntent { effect, .. }
+            | Self::RecordCompositeCommitIntents { effect, .. }
+            | Self::AdoptEffect { effect, .. }
+            | Self::RebaseCompositePrecommitClaims { effect, .. }
+            | Self::ClaimSettlement { effect, .. }
+            | Self::RecordApplyIntent { effect, .. }
+            | Self::MarkIndeterminate { effect, .. }
+            | Self::BeginRevoke { effect, .. }
+            | Self::ReleaseEstate { effect }
+            | Self::ReleaseCompositeEffect { effect } => {
+                (Some(effect.root()), Some(*effect), None, None)
+            }
+            Self::AddClaim { effect, claim, .. }
+            | Self::SubmitEvidence { effect, claim, .. }
+            | Self::ReserveReuse { effect, claim, .. } => {
+                (Some(effect.root()), Some(*effect), None, Some(*claim))
+            }
+            Self::AddComponentClaim {
+                effect,
+                component,
+                claim,
+                ..
+            }
+            | Self::SubmitComponentEvidence {
+                effect,
+                component,
+                claim,
+                ..
+            }
+            | Self::ReserveComponentReuse {
+                effect,
+                component,
+                claim,
+                ..
+            } => (
+                Some(effect.root()),
+                Some(*effect),
+                Some(*component),
+                Some(*claim),
+            ),
+            Self::RecordComponentCommitIntent {
+                effect, component, ..
+            }
+            | Self::ClaimComponentSettlement {
+                effect, component, ..
+            }
+            | Self::RecordComponentApplyIntent {
+                effect, component, ..
+            }
+            | Self::MarkComponentIndeterminate {
+                effect, component, ..
+            } => (Some(effect.root()), Some(*effect), Some(*component), None),
+            Self::AcknowledgeCommit { fact }
+            | Self::RecordApplied { fact }
+            | Self::Settle { fact } => (
+                Some(fact.effect.root()),
+                Some(fact.effect),
+                fact.component,
+                None,
+            ),
+            Self::ActivateResourceReuse {
+                effect,
+                component,
+                claim,
+                ..
+            }
+            | Self::ReclaimResourceReuse {
+                effect,
+                component,
+                claim,
+                ..
+            } => (Some(effect.root()), Some(*effect), *component, Some(*claim)),
+            Self::FenceIncarnation { root, .. }
+            | Self::Snapshot { root, .. }
+            | Self::Ready { root, .. }
+            | Self::Rebind { root, .. } => (Some(*root), None, None, None),
+            Self::CheckpointRecovery { .. } => (None, None, None, None),
+        };
+        TransitionCoordinates::new(root, effect, component, claim)
+    }
+}
+
+/// One component entry in an atomic composite commit-intent cohort.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ComponentCommitOperation {
+    component: ComponentId,
+    operation: Digest,
+}
+
+impl ComponentCommitOperation {
+    /// Binds one component slot to its exact external operation coordinates.
+    pub const fn new(component: ComponentId, operation: Digest) -> Self {
+        Self {
+            component,
+            operation,
+        }
+    }
+
+    /// Returns the catalog component slot.
+    pub const fn component(self) -> ComponentId {
+        self.component
+    }
+
+    /// Returns the exact external operation digest.
+    pub const fn operation(self) -> Digest {
+        self.operation
+    }
 }
 
 /// Untrusted live request surface. Receipt-dependent transitions are absent.
@@ -960,6 +1368,19 @@ pub enum CommandRequest {
         domain: DomainId,
         /// Obligation class.
         obligation: ObligationKindId,
+        /// Retained-resource charge account.
+        charge_account: ChargeAccountId,
+    },
+    /// Registers one catalog-bound heterogeneous effect.
+    CreateCompositeEffect {
+        /// Stable escaped-effect identity.
+        effect: EffectId,
+        /// Exact originating principal incarnation.
+        origin: PrincipalIncarnation,
+        /// Exact live binding generation.
+        binding_generation: u64,
+        /// Catalog-defined component product.
+        kind: CompositeKindId,
         /// Retained-resource charge account.
         charge_account: ChargeAccountId,
     },
@@ -986,9 +1407,41 @@ pub enum CommandRequest {
         /// Conserved units.
         units: u64,
     },
+    /// Enrolls one component-local resource claim before preparation.
+    AddComponentClaim {
+        /// Shared parent effect.
+        effect: EffectId,
+        /// Exact catalog component slot.
+        component: ComponentId,
+        /// Exact live actor.
+        actor: PrincipalIncarnation,
+        /// Exact live binding.
+        binding_generation: u64,
+        /// Stable claim identity, unique within the effect.
+        claim: ClaimId,
+        /// Domain-defined claim class.
+        kind: ClaimKindId,
+        /// Logical or device scope.
+        scope: ClaimScope,
+        /// Stable protected resource.
+        resource: ResourceId,
+        /// Exact allocation generation.
+        resource_generation: ResourceGeneration,
+        /// Conserved units.
+        units: u64,
+    },
     /// Freezes claim enrollment and prepares an effect.
     PrepareEffect {
         /// Stable effect identity.
+        effect: EffectId,
+        /// Exact live actor.
+        actor: PrincipalIncarnation,
+        /// Exact live binding.
+        binding_generation: u64,
+    },
+    /// Atomically freezes enrollment and prepares every component.
+    PrepareCompositeEffect {
+        /// Shared parent effect.
         effect: EffectId,
         /// Exact live actor.
         actor: PrincipalIncarnation,
@@ -1005,6 +1458,30 @@ pub enum CommandRequest {
         binding_generation: u64,
         /// Exact external operation coordinates.
         operation: Digest,
+    },
+    /// Records a component-local write-ahead external commit intent.
+    RecordComponentCommitIntent {
+        /// Shared parent effect.
+        effect: EffectId,
+        /// Exact component crossing its commit gate.
+        component: ComponentId,
+        /// Exact live actor.
+        actor: PrincipalIncarnation,
+        /// Exact live binding.
+        binding_generation: u64,
+        /// Exact external operation coordinates.
+        operation: Digest,
+    },
+    /// Atomically arms every component before any external commit may occur.
+    RecordCompositeCommitIntents {
+        /// Shared parent effect.
+        effect: EffectId,
+        /// Exact live actor.
+        actor: PrincipalIncarnation,
+        /// Exact live binding.
+        binding_generation: u64,
+        /// Complete catalog-ordered component operation set.
+        operations: Vec<ComponentCommitOperation>,
     },
     /// Requests an immediate fence of one exact incarnation.
     FenceIncarnation {
@@ -1044,10 +1521,28 @@ pub enum CommandRequest {
         /// Exact rebound binding.
         binding_generation: u64,
     },
+    /// Requests a freshness rebase for an adopted wholly-precommit composite.
+    RebaseCompositePrecommitClaims {
+        /// Stable adopted composite effect identity.
+        effect: EffectId,
+        /// Exact active successor.
+        actor: PrincipalIncarnation,
+        /// Exact active successor binding.
+        binding_generation: u64,
+    },
     /// Requests a one-shot settlement claim.
     ClaimSettlement {
         /// Stable committed effect.
         effect: EffectId,
+        /// Exact live claimant.
+        claimant: PrincipalIncarnation,
+    },
+    /// Requests a one-shot claim for an exact committed component.
+    ClaimComponentSettlement {
+        /// Shared parent effect.
+        effect: EffectId,
+        /// Exact successor-settled component.
+        component: ComponentId,
         /// Exact live claimant.
         claimant: PrincipalIncarnation,
     },
@@ -1076,6 +1571,11 @@ pub enum CommandRequest {
         /// Stable effect identity.
         effect: EffectId,
     },
+    /// Releases a terminal composite effect.
+    ReleaseCompositeEffect {
+        /// Shared parent effect.
+        effect: EffectId,
+    },
     /// Reserves and retains the next resource allocation generation.
     ReserveReuse {
         /// Estate retaining the new claim.
@@ -1098,7 +1598,59 @@ pub enum CommandRequest {
         expected_generation: ResourceGeneration,
         /// Conserved units retained before external reuse.
         units: u64,
+        /// Provider-defined physical layout and drain contract digest.
+        reuse_contract: Digest,
     },
+    /// Reserves and retains a resource generation in one exact component.
+    ReserveComponentReuse {
+        /// Shared parent effect.
+        effect: EffectId,
+        /// Component retaining the new claim.
+        component: ComponentId,
+        /// Exact live actor.
+        actor: PrincipalIncarnation,
+        /// Exact live binding.
+        binding_generation: u64,
+        /// Stable new claim identity.
+        claim: ClaimId,
+        /// Domain-defined claim class.
+        kind: ClaimKindId,
+        /// Logical or device scope.
+        scope: ClaimScope,
+        /// Stable protected resource.
+        resource: ResourceId,
+        /// Exact retired allocation generation.
+        expected_generation: ResourceGeneration,
+        /// Conserved units.
+        units: u64,
+        /// Provider-defined physical layout and drain contract digest.
+        reuse_contract: Digest,
+    },
+}
+
+impl CommandRequest {
+    /// Returns whether this untrusted request belongs to the profile-2
+    /// composite command grammar.
+    pub const fn is_profile_two_compatible(&self) -> bool {
+        matches!(
+            self,
+            Self::CreateCompositeEffect { .. }
+                | Self::AddComponentClaim { .. }
+                | Self::PrepareCompositeEffect { .. }
+                | Self::RecordComponentCommitIntent { .. }
+                | Self::RecordCompositeCommitIntents { .. }
+                | Self::FenceIncarnation { .. }
+                | Self::Ready { .. }
+                | Self::Rebind { .. }
+                | Self::AdoptEffect { .. }
+                | Self::RebaseCompositePrecommitClaims { .. }
+                | Self::ClaimComponentSettlement { .. }
+                | Self::BeginRevoke { .. }
+                | Self::CheckpointRecovery { .. }
+                | Self::ReleaseCompositeEffect { .. }
+                | Self::ReserveComponentReuse { .. }
+        )
+    }
 }
 
 impl From<CommandRequest> for Command {
@@ -1117,6 +1669,19 @@ impl From<CommandRequest> for Command {
                 binding_generation,
                 domain,
                 obligation,
+                charge_account,
+            },
+            CommandRequest::CreateCompositeEffect {
+                effect,
+                origin,
+                binding_generation,
+                kind,
+                charge_account,
+            } => CommandKind::CreateCompositeEffect {
+                effect,
+                origin,
+                binding_generation,
+                kind,
                 charge_account,
             },
             CommandRequest::AddClaim {
@@ -1142,11 +1707,43 @@ impl From<CommandRequest> for Command {
                 resource_generation,
                 units,
             },
+            CommandRequest::AddComponentClaim {
+                effect,
+                component,
+                actor,
+                binding_generation,
+                claim,
+                kind,
+                scope,
+                resource,
+                resource_generation,
+                units,
+            } => CommandKind::AddComponentClaim {
+                effect,
+                component,
+                actor,
+                binding_generation,
+                claim,
+                kind,
+                scope,
+                resource,
+                resource_generation,
+                units,
+            },
             CommandRequest::PrepareEffect {
                 effect,
                 actor,
                 binding_generation,
             } => CommandKind::PrepareEffect {
+                effect,
+                actor,
+                binding_generation,
+            },
+            CommandRequest::PrepareCompositeEffect {
+                effect,
+                actor,
+                binding_generation,
+            } => CommandKind::PrepareCompositeEffect {
                 effect,
                 actor,
                 binding_generation,
@@ -1161,6 +1758,30 @@ impl From<CommandRequest> for Command {
                 actor,
                 binding_generation,
                 operation,
+            },
+            CommandRequest::RecordComponentCommitIntent {
+                effect,
+                component,
+                actor,
+                binding_generation,
+                operation,
+            } => CommandKind::RecordComponentCommitIntent {
+                effect,
+                component,
+                actor,
+                binding_generation,
+                operation,
+            },
+            CommandRequest::RecordCompositeCommitIntents {
+                effect,
+                actor,
+                binding_generation,
+                operations,
+            } => CommandKind::RecordCompositeCommitIntents {
+                effect,
+                actor,
+                binding_generation,
+                operations,
             },
             CommandRequest::FenceIncarnation {
                 root,
@@ -1200,9 +1821,27 @@ impl From<CommandRequest> for Command {
                 successor,
                 binding_generation,
             },
+            CommandRequest::RebaseCompositePrecommitClaims {
+                effect,
+                actor,
+                binding_generation,
+            } => CommandKind::RebaseCompositePrecommitClaims {
+                effect,
+                actor,
+                binding_generation,
+            },
             CommandRequest::ClaimSettlement { effect, claimant } => {
                 CommandKind::ClaimSettlement { effect, claimant }
             }
+            CommandRequest::ClaimComponentSettlement {
+                effect,
+                component,
+                claimant,
+            } => CommandKind::ClaimComponentSettlement {
+                effect,
+                component,
+                claimant,
+            },
             CommandRequest::BeginRevoke {
                 effect,
                 expected_actor,
@@ -1224,6 +1863,9 @@ impl From<CommandRequest> for Command {
                 device,
             },
             CommandRequest::ReleaseEstate { effect } => CommandKind::ReleaseEstate { effect },
+            CommandRequest::ReleaseCompositeEffect { effect } => {
+                CommandKind::ReleaseCompositeEffect { effect }
+            }
             CommandRequest::ReserveReuse {
                 effect,
                 actor,
@@ -1235,6 +1877,7 @@ impl From<CommandRequest> for Command {
                 resource,
                 expected_generation,
                 units,
+                reuse_contract,
             } => CommandKind::ReserveReuse {
                 effect,
                 actor,
@@ -1246,6 +1889,32 @@ impl From<CommandRequest> for Command {
                 resource,
                 expected_generation,
                 units,
+                reuse_contract,
+            },
+            CommandRequest::ReserveComponentReuse {
+                effect,
+                component,
+                actor,
+                binding_generation,
+                claim,
+                kind,
+                scope,
+                resource,
+                expected_generation,
+                units,
+                reuse_contract,
+            } => CommandKind::ReserveComponentReuse {
+                effect,
+                component,
+                actor,
+                binding_generation,
+                claim,
+                kind,
+                scope,
+                resource,
+                expected_generation,
+                units,
+                reuse_contract,
             },
         })
     }
@@ -1255,6 +1924,7 @@ impl From<CommandRequest> for Command {
 #[derive(Debug, Eq, PartialEq)]
 pub struct CommitIntent {
     effect: EffectId,
+    component: Option<ComponentId>,
     nonce: u64,
 }
 
@@ -1264,11 +1934,17 @@ impl CommitIntent {
         self.effect
     }
 
+    /// Returns the component slot for a composite-effect commit.
+    pub const fn component(&self) -> Option<ComponentId> {
+        self.component
+    }
+
     /// Consumes the intent with a verifier-bound exact external outcome.
     pub fn acknowledge(self, outcome: VerifiedCommitOutcome) -> Result<Command, CommitUseError> {
         let fact = outcome.0;
         if fact.kind != EffectFactKind::CommitOutcome
             || fact.effect != self.effect
+            || fact.component != self.component
             || fact.nonce != self.nonce
         {
             return Err(CommitUseError {
@@ -1312,6 +1988,7 @@ enum ClaimStage {
 #[derive(Debug, Eq, PartialEq)]
 pub struct SettlementClaim {
     effect: EffectId,
+    component: Option<ComponentId>,
     claimant: PrincipalIncarnation,
     generation: u64,
     nonce: u64,
@@ -1343,6 +2020,11 @@ impl SettlementClaim {
         self.effect
     }
 
+    /// Returns the component slot for a composite-effect settlement claim.
+    pub const fn component(&self) -> Option<ComponentId> {
+        self.component
+    }
+
     /// Returns the exact claimant.
     pub const fn claimant(&self) -> PrincipalIncarnation {
         self.claimant
@@ -1361,12 +2043,22 @@ impl SettlementClaim {
                 claim: self,
             });
         }
-        Ok(Command(CommandKind::RecordApplyIntent {
-            effect: self.effect,
-            claimant: self.claimant,
-            generation: self.generation,
-            nonce: self.nonce,
-            intent,
+        Ok(Command(match self.component {
+            Some(component) => CommandKind::RecordComponentApplyIntent {
+                effect: self.effect,
+                component,
+                claimant: self.claimant,
+                generation: self.generation,
+                nonce: self.nonce,
+                intent,
+            },
+            None => CommandKind::RecordApplyIntent {
+                effect: self.effect,
+                claimant: self.claimant,
+                generation: self.generation,
+                nonce: self.nonce,
+                intent,
+            },
         }))
     }
 
@@ -1381,6 +2073,7 @@ impl SettlementClaim {
         let fact = evidence.0;
         if fact.kind != EffectFactKind::ApplyCompleted
             || fact.effect != self.effect
+            || fact.component != self.component
             || fact.actor != self.claimant
             || fact.generation != self.generation
             || fact.nonce != self.nonce
@@ -1407,6 +2100,7 @@ impl SettlementClaim {
         let fact = acknowledgement.0;
         if fact.kind != EffectFactKind::SettlementAcknowledged
             || fact.effect != self.effect
+            || fact.component != self.component
             || fact.actor != self.claimant
             || fact.generation != self.generation
             || fact.nonce != self.nonce
@@ -1421,12 +2115,22 @@ impl SettlementClaim {
 
     /// Consumes any live claim and records an honest indeterminate outcome.
     pub fn mark_indeterminate(self, reason: Digest) -> Command {
-        Command(CommandKind::MarkIndeterminate {
-            effect: self.effect,
-            claimant: self.claimant,
-            generation: self.generation,
-            nonce: self.nonce,
-            reason,
+        Command(match self.component {
+            Some(component) => CommandKind::MarkComponentIndeterminate {
+                effect: self.effect,
+                component,
+                claimant: self.claimant,
+                generation: self.generation,
+                nonce: self.nonce,
+                reason,
+            },
+            None => CommandKind::MarkIndeterminate {
+                effect: self.effect,
+                claimant: self.claimant,
+                generation: self.generation,
+                nonce: self.nonce,
+                reason,
+            },
         })
     }
 }
@@ -1435,11 +2139,17 @@ impl SettlementClaim {
 #[derive(Debug, Eq, PartialEq)]
 pub struct ReusePermit {
     effect: EffectId,
+    component: Option<ComponentId>,
     actor: PrincipalIncarnation,
     binding_generation: u64,
     authority_epoch: u64,
+    claim: ClaimId,
     resource: ResourceId,
+    previous_generation: ResourceGeneration,
     generation: ResourceGeneration,
+    catalog_digest: Digest,
+    retirement_digest: Digest,
+    reuse_contract: Digest,
     freshness: Freshness,
     nonce: u64,
 }
@@ -1455,9 +2165,39 @@ impl ReusePermit {
         self.effect
     }
 
+    /// Returns the component which retains a composite-effect reuse reservation.
+    pub const fn component(&self) -> Option<ComponentId> {
+        self.component
+    }
+
+    /// Returns the exact next-generation claim retained by this permit.
+    pub const fn claim(&self) -> ClaimId {
+        self.claim
+    }
+
+    /// Returns the exact terminal generation from which reuse advances.
+    pub const fn previous_generation(&self) -> ResourceGeneration {
+        self.previous_generation
+    }
+
     /// Returns the exact newly reserved allocation generation.
     pub const fn generation(&self) -> ResourceGeneration {
         self.generation
+    }
+
+    /// Returns the catalog digest defining the claim and evidence contract.
+    pub const fn catalog_digest(&self) -> Digest {
+        self.catalog_digest
+    }
+
+    /// Returns the digest of the retained old-generation retirement evidence.
+    pub const fn retirement_digest(&self) -> Digest {
+        self.retirement_digest
+    }
+
+    /// Returns the provider-defined physical layout and drain contract digest.
+    pub const fn reuse_contract(&self) -> Digest {
+        self.reuse_contract
     }
 
     /// Returns the exact freshness coordinates at authorization.
@@ -1470,15 +2210,74 @@ impl ReusePermit {
     pub fn activate(self) -> Command {
         Command(CommandKind::ActivateResourceReuse {
             effect: self.effect,
+            component: self.component,
             actor: self.actor,
             binding_generation: self.binding_generation,
             authority_epoch: self.authority_epoch,
+            claim: self.claim,
             resource: self.resource,
+            previous_generation: self.previous_generation,
             resource_generation: self.generation,
+            catalog_digest: self.catalog_digest,
+            retirement_digest: self.retirement_digest,
+            reuse_contract: self.reuse_contract,
             nonce: self.nonce,
             freshness: self.freshness,
         })
     }
+}
+
+/// Stable parent/component/claim coordinates carried by normalized trace v2.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TransitionCoordinates {
+    root: Option<RootId>,
+    effect: Option<EffectId>,
+    component: Option<ComponentId>,
+    claim: Option<ClaimId>,
+}
+
+impl TransitionCoordinates {
+    /// Constructs one non-authorizing normalized coordinate tuple.
+    pub const fn new(
+        root: Option<RootId>,
+        effect: Option<EffectId>,
+        component: Option<ComponentId>,
+        claim: Option<ClaimId>,
+    ) -> Self {
+        Self {
+            root,
+            effect,
+            component,
+            claim,
+        }
+    }
+
+    /// Returns the causal root, when the command is root scoped.
+    pub const fn root(self) -> Option<RootId> {
+        self.root
+    }
+
+    /// Returns the parent effect, when the command is effect scoped.
+    pub const fn effect(self) -> Option<EffectId> {
+        self.effect
+    }
+
+    /// Returns the exact component, when the command is component scoped.
+    pub const fn component(self) -> Option<ComponentId> {
+        self.component
+    }
+
+    /// Returns the exact claim, when the command is claim scoped.
+    pub const fn claim(self) -> Option<ClaimId> {
+        self.claim
+    }
+}
+
+/// Normalized outcome of a receipt-bearing transition attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransitionResult {
+    /// The transition became durable and changed the authoritative revision.
+    Applied,
 }
 
 /// Normalized semantic event emitted by a successful transition.
@@ -1504,6 +2303,8 @@ pub enum TransitionEvent {
     Rebound,
     /// One exact uncommitted orphan was explicitly adopted.
     EffectAdopted,
+    /// Adopted wholly-precommit claims were rebound to current freshness.
+    CompositePrecommitClaimsRebased,
     /// A settlement claim was minted.
     SettlementClaimed,
     /// A settlement apply intent became durable.
@@ -1537,6 +2338,8 @@ pub enum TransitionOutput {
     None,
     /// A write-ahead external commit intent.
     CommitIntent(CommitIntent),
+    /// Complete linear bearer set returned by one atomic composite escape gate.
+    CompositeCommitIntents(Vec<CommitIntent>),
     /// A one-shot settlement claim or its next durable stage.
     SettlementClaim(SettlementClaim),
     /// A durable, one-shot resource-generation reservation.
@@ -1546,14 +2349,46 @@ pub enum TransitionOutput {
 /// Receipt for one durably committed semantic transition.
 #[derive(Debug, Eq, PartialEq)]
 pub struct TransitionReceipt {
+    core_api_profile: u16,
+    journal_schema: u16,
+    catalog_digest: Digest,
+    projection_version: u16,
+    trace_version: u16,
     revision: u64,
     head: Digest,
     projection: Digest,
+    coordinates: TransitionCoordinates,
+    result: TransitionResult,
     event: TransitionEvent,
     output: TransitionOutput,
 }
 
 impl TransitionReceipt {
+    /// Returns the semantic API profile which executed the transition.
+    pub const fn core_api_profile(&self) -> u16 {
+        self.core_api_profile
+    }
+
+    /// Returns the durable command grammar bound to the transition.
+    pub const fn journal_schema(&self) -> u16 {
+        self.journal_schema
+    }
+
+    /// Returns the exact catalog digest which interpreted the transition.
+    pub const fn catalog_digest(&self) -> Digest {
+        self.catalog_digest
+    }
+
+    /// Returns the deterministic projection schema coordinate.
+    pub const fn projection_version(&self) -> u16 {
+        self.projection_version
+    }
+
+    /// Returns the normalized trace schema coordinate.
+    pub const fn trace_version(&self) -> u16 {
+        self.trace_version
+    }
+
     /// Returns the new journal revision.
     pub const fn revision(&self) -> u64 {
         self.revision
@@ -1567,6 +2402,16 @@ impl TransitionReceipt {
     /// Returns the complete deterministic projection digest.
     pub const fn projection(&self) -> Digest {
         self.projection
+    }
+
+    /// Returns exact root/effect/component/claim trace coordinates.
+    pub const fn coordinates(&self) -> TransitionCoordinates {
+        self.coordinates
+    }
+
+    /// Returns the committed result represented by this receipt.
+    pub const fn result(&self) -> TransitionResult {
+        self.result
     }
 
     /// Returns the normalized transition event.
@@ -1647,6 +2492,89 @@ pub struct ClaimProjection {
     pub retired: bool,
 }
 
+/// Public projection of one composite effect sharing a single authority gate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompositeEffectProjection {
+    /// Stable escaped-effect identity shared by every component.
+    pub effect: EffectId,
+    /// Catalog-defined heterogeneous component product.
+    pub kind: CompositeKindId,
+    /// Immutable originating incarnation.
+    pub causal_owner: PrincipalIncarnation,
+    /// Current live principal or non-authorizing kernel custodian.
+    pub custodian: CustodyState,
+    /// Account charged for every retained component claim.
+    pub charge_owner: ChargeAccountId,
+    /// Shared authority gate for all components.
+    pub authority: AuthorityState,
+    /// Monotonic epoch of the shared authority gate.
+    pub authority_epoch: u64,
+    /// Aggregate escape/partial-discharge lifecycle.
+    pub escape: EffectEscapeState,
+    /// Exact number of catalog-bound components.
+    pub component_count: usize,
+    /// Claims still retaining an old resource generation.
+    pub retained_claims: usize,
+}
+
+/// Public projection of one obligation component in a composite effect.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ComponentProjection {
+    /// Shared parent effect identity.
+    pub effect: EffectId,
+    /// Stable component slot within the catalog product.
+    pub component: ComponentId,
+    /// Domain-defined obligation class.
+    pub obligation: (DomainId, ObligationKindId),
+    /// Domain-selected lifecycle.
+    pub obligation_policy: ObligationPolicy,
+    /// Component-local external commit state.
+    pub commit: CommitState,
+    /// Exact durable external operation identity, once a commit intent exists.
+    pub commit_operation: Option<Digest>,
+    /// Component-local outcome knowledge.
+    pub outcome: OutcomeState,
+    /// Component-local successor settlement state.
+    pub settlement: SettlementState,
+    /// Component-local physical retirement state.
+    pub retirement: RetirementState,
+    /// Total claims belonging to this component.
+    pub claim_count: usize,
+    /// Claims which still retain resources.
+    pub retained_claims: usize,
+}
+
+/// Public projection of one component-local resource claim.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ComponentClaimProjection {
+    /// Shared parent effect identity.
+    pub effect: EffectId,
+    /// Component which defines this claim.
+    pub component: ComponentId,
+    /// Stable claim identity within the parent effect.
+    pub claim: ClaimId,
+    /// Domain which defines the claim lifecycle.
+    pub domain: DomainId,
+    /// Domain-defined claim class.
+    pub kind: ClaimKindId,
+    /// Conserved credit class charged while retained.
+    pub credit_class: CreditClassId,
+    /// Logical or exact device scope.
+    pub scope: ClaimScope,
+    /// Core-derived current claim custodian.
+    pub custodian: ClaimCustodian,
+    /// Stable protected resource identity.
+    pub resource: ResourceId,
+    /// Exact protected allocation generation.
+    pub resource_generation: ResourceGeneration,
+    /// Conserved units.
+    pub units: u64,
+    /// Enrollment freshness.
+    pub enrolled_freshness: Freshness,
+    /// Whether every typed retirement requirement has been accepted.
+    pub retired: bool,
+}
+
 /// One estate in a core-generated recovery cohort.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RecoveryItem {
@@ -1678,18 +2606,125 @@ pub struct RecoveryItem {
     pub settlement_required: bool,
 }
 
+/// One component-local obligation in a core-generated recovery cohort.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ComponentRecoveryItem {
+    /// Shared parent effect identity.
+    pub effect: EffectId,
+    /// Catalog-defined component slot.
+    pub component: ComponentId,
+    /// Domain-defined obligation class.
+    pub obligation: (DomainId, ObligationKindId),
+    /// Shared effect authority state.
+    pub authority: AuthorityState,
+    /// Exact shared authority epoch observed by the snapshot.
+    pub authority_epoch: u64,
+    /// Component-local external commit state.
+    pub commit: CommitState,
+    /// Durable external operation identity used to validate recovery substrate.
+    pub commit_operation: Option<Digest>,
+    /// Component-local outcome knowledge.
+    pub outcome: OutcomeState,
+    /// Component-local settlement state.
+    pub settlement: SettlementState,
+    /// Component-local retirement state.
+    pub retirement: RetirementState,
+    /// Claims belonging to this component.
+    pub claim_count: usize,
+    /// Claims which still retain resources.
+    pub retained_claims: usize,
+    /// Whether this component still requires successor settlement.
+    pub settlement_required: bool,
+}
+
+/// One verifier-bound retirement fact retained in snapshot schema v2.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RecoveryEvidenceItem {
+    /// Domain-defined evidence class.
+    pub kind: EvidenceKindId,
+    /// Exact freshness of the protected claim when challenged.
+    pub subject: Freshness,
+    /// Exact accepted verifier observation.
+    pub observation: Freshness,
+    /// Verifier identity, epoch, schema, and receipt digest.
+    pub stamp: VerifierStamp,
+}
+
+/// One exact retained component claim in snapshot schema v2.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComponentClaimRecoveryItem {
+    /// Complete non-authorizing claim projection.
+    pub claim: ComponentClaimProjection,
+    /// Accepted retirement facts in catalog requirement order.
+    pub accepted_evidence: Vec<RecoveryEvidenceItem>,
+    /// Evidence kinds still required, in catalog requirement order.
+    pub pending_evidence: Vec<EvidenceKindId>,
+}
+
+/// One parent effect and its ordered component graph in snapshot schema v2.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompositeRecoveryItem {
+    /// Shared parent effect identity.
+    pub effect: EffectId,
+    /// Catalog-defined complete component product.
+    pub kind: CompositeKindId,
+    /// Immutable originating principal.
+    pub causal_owner: PrincipalIncarnation,
+    /// Current parent-level custodian.
+    pub custodian: CustodyState,
+    /// Account charged for retained component claims.
+    pub charge_owner: ChargeAccountId,
+    /// Common parent authority state.
+    pub authority: AuthorityState,
+    /// Common parent authority epoch.
+    pub authority_epoch: u64,
+    /// Derived parent escape and completion state.
+    pub escape: EffectEscapeState,
+    /// Complete ordered component graph.
+    pub components: Vec<ComponentRecoveryItem>,
+    /// Every retained claim and its partial evidence state, ordered by component
+    /// and claim identity.
+    pub retained_claims: Vec<ComponentClaimRecoveryItem>,
+}
+
 /// Exact, non-authorizing recovery cohort generated from core state.
 #[derive(Debug, Eq, PartialEq)]
 pub struct RecoverySnapshot {
+    core_api_profile: u16,
+    snapshot_version: u16,
+    journal_schema: u16,
+    catalog_digest: Digest,
     root: RootId,
     snapshot: SnapshotId,
     digest: Digest,
     covered_revision: u64,
     covered_head: Digest,
     items: Vec<RecoveryItem>,
+    composites: Vec<CompositeRecoveryItem>,
+    component_items: Vec<ComponentRecoveryItem>,
 }
 
 impl RecoverySnapshot {
+    /// Returns the semantic API profile which produced this cohort.
+    pub const fn core_api_profile(&self) -> u16 {
+        self.core_api_profile
+    }
+
+    /// Returns the recovery snapshot schema coordinate.
+    pub const fn snapshot_version(&self) -> u16 {
+        self.snapshot_version
+    }
+
+    /// Returns the journal grammar bound by the covered head.
+    pub const fn journal_schema(&self) -> u16 {
+        self.journal_schema
+    }
+
+    /// Returns the exact catalog used to interpret every component.
+    pub const fn catalog_digest(&self) -> Digest {
+        self.catalog_digest
+    }
+
     /// Returns the causal root covered by this snapshot.
     pub const fn root(&self) -> RootId {
         self.root
@@ -1718,6 +2753,17 @@ impl RecoverySnapshot {
     /// Returns the ordered estate cohort.
     pub fn items(&self) -> &[RecoveryItem] {
         &self.items
+    }
+
+    /// Returns parent-grouped composite graphs in stable effect order.
+    pub fn composites(&self) -> &[CompositeRecoveryItem] {
+        &self.composites
+    }
+
+    /// Returns a compatibility flattening in stable effect/component order.
+    /// Profile-2 consumers should prefer [`Self::composites`].
+    pub fn component_items(&self) -> &[ComponentRecoveryItem] {
+        &self.component_items
     }
 
     /// Consumes the descriptor into the only command which can record this
@@ -1903,6 +2949,8 @@ impl RecoveryReport {
 /// Failure returned by the authoritative state machine.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CoreError {
+    /// A profile-1 singleton command or recovered estate reached profile 2.
+    IncompatibleApiProfile,
     /// At least one limit is zero.
     InvalidLimits,
     /// A generation or nonce overflowed.
@@ -2076,14 +3124,23 @@ struct ClaimRecord {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PendingReuse {
     effect: EffectId,
+    component: Option<ComponentId>,
     actor: PrincipalIncarnation,
     binding_generation: u64,
     authority_epoch: u64,
+    claim: ClaimId,
+    previous_generation: ResourceGeneration,
+    catalog_digest: Digest,
+    retirement_digest: Digest,
+    reuse_contract: Digest,
     nonce: u64,
     freshness: Freshness,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+// Keeping the pending contract inline preserves a non-allocating, Copy state
+// transition on the durable path; its size is bounded by the fixed schema.
+#[allow(clippy::large_enum_variant)]
 enum ResourcePhase {
     Claimed { pending_reuse: Option<PendingReuse> },
     Retired,
@@ -2123,10 +3180,45 @@ struct EstateRecord {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct ComponentRecord {
+    id: ComponentId,
+    domain: DomainId,
+    obligation: ObligationKindId,
+    obligation_policy: ObligationPolicy,
+    commit: CommitState,
+    commit_nonce: Option<u64>,
+    commit_operation: Option<Digest>,
+    commit_fact: Option<VerifiedEffectFact>,
+    outcome: OutcomeState,
+    settlement: SettlementState,
+    settlement_nonce: Option<u64>,
+    claim_stage: Option<ClaimStage>,
+    settlement_intent: Option<Digest>,
+    applied_fact: Option<VerifiedEffectFact>,
+    settlement_fact: Option<VerifiedEffectFact>,
+    retirement: RetirementState,
+    claims: BTreeMap<ClaimId, ClaimRecord>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CompositeEffectRecord {
+    effect: EffectId,
+    kind: CompositeKindId,
+    causal_owner: PrincipalIncarnation,
+    custodian: CustodyState,
+    charge_owner: ChargeAccountId,
+    authority: AuthorityState,
+    authority_epoch: u64,
+    components: BTreeMap<ComponentId, ComponentRecord>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct State {
     roots: BTreeMap<RootId, RootRecord>,
     estates: BTreeMap<EffectId, EstateRecord>,
+    composite_effects: BTreeMap<EffectId, CompositeEffectRecord>,
     resource_index: BTreeMap<ResourceId, Vec<(EffectId, ClaimId)>>,
+    composite_resource_index: BTreeMap<ResourceId, Vec<(EffectId, ComponentId, ClaimId)>>,
     resources: BTreeMap<ResourceId, ResourceRecord>,
     charges: BTreeMap<(ChargeAccountId, CreditClassId), u64>,
     device_generations: BTreeMap<DeviceScopeId, DeviceGeneration>,
@@ -2144,14 +3236,48 @@ struct State {
 pub struct Engine {
     catalog: DomainCatalog,
     limits: CoreLimits,
+    api_mode: EngineApiMode,
     state: State,
     persistence_recovery_required: bool,
     journal_repair_required: Option<JournalRepair>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EngineApiMode {
+    ProfileTwo,
+    LegacyCompatibility,
+}
+
 impl Engine {
-    /// Creates an empty authoritative Registry under exact freshness coordinates.
+    /// Creates an empty profile-2 authoritative Registry under exact freshness coordinates.
     pub fn new(catalog: DomainCatalog, limits: CoreLimits, freshness: Freshness) -> Self {
+        Self::new_with_mode(catalog, limits, freshness, EngineApiMode::ProfileTwo)
+    }
+
+    /// Creates an offline compatibility engine for predecessor profile tests.
+    ///
+    /// Records produced by this mode are intentionally rejected by
+    /// [`Self::recover`]. It must not be installed as a production Registry.
+    #[doc(hidden)]
+    pub fn new_legacy_compatibility(
+        catalog: DomainCatalog,
+        limits: CoreLimits,
+        freshness: Freshness,
+    ) -> Self {
+        Self::new_with_mode(
+            catalog,
+            limits,
+            freshness,
+            EngineApiMode::LegacyCompatibility,
+        )
+    }
+
+    fn new_with_mode(
+        catalog: DomainCatalog,
+        limits: CoreLimits,
+        freshness: Freshness,
+        api_mode: EngineApiMode,
+    ) -> Self {
         let verifier_epochs = catalog
             .verifier_ids()
             .into_iter()
@@ -2160,10 +3286,13 @@ impl Engine {
         Self {
             catalog,
             limits,
+            api_mode,
             state: State {
                 roots: BTreeMap::new(),
                 estates: BTreeMap::new(),
+                composite_effects: BTreeMap::new(),
                 resource_index: BTreeMap::new(),
+                composite_resource_index: BTreeMap::new(),
                 resources: BTreeMap::new(),
                 charges: BTreeMap::new(),
                 device_generations: BTreeMap::new(),
@@ -2246,6 +3375,56 @@ impl Engine {
             scoped_freshness(&self.state, claim.scope, root.last_binding_generation)?;
         Ok(EvidenceChallenge {
             effect,
+            component: None,
+            claim: claim_id,
+            domain: claim.domain,
+            kind,
+            scope: claim.scope,
+            resource: claim.resource,
+            resource_generation: claim.resource_generation,
+            subject: claim.enrolled_freshness,
+            current_observation,
+            expected_verifier: rule.verifier(),
+            expected_receipt_schema: rule.receipt_schema(),
+        })
+    }
+
+    /// Builds the exact current challenge for one component-local claim.
+    pub fn component_evidence_challenge(
+        &self,
+        effect: EffectId,
+        component: ComponentId,
+        claim_id: ClaimId,
+        kind: EvidenceKindId,
+    ) -> Result<EvidenceChallenge, CoreError> {
+        let root = self
+            .state
+            .roots
+            .get(&effect.root())
+            .ok_or(CoreError::UnknownRoot)?;
+        let claim = self
+            .state
+            .composite_effects
+            .get(&effect)
+            .and_then(|composite| composite.components.get(&component))
+            .and_then(|component| component.claims.get(&claim_id))
+            .ok_or(CoreError::UnknownClaim)?;
+        if claim.retired {
+            return Err(CoreError::DuplicateEvidence);
+        }
+        let rule = self
+            .catalog
+            .claim_rule(claim.domain, claim.kind)
+            .ok_or(CoreError::UnknownClaimClass)?
+            .evidence()
+            .iter()
+            .find(|rule| rule.kind() == kind)
+            .ok_or(CoreError::UnexpectedEvidence)?;
+        let current_observation =
+            scoped_freshness(&self.state, claim.scope, root.last_binding_generation)?;
+        Ok(EvidenceChallenge {
+            effect,
+            component: Some(component),
             claim: claim_id,
             domain: claim.domain,
             kind,
@@ -2276,6 +3455,29 @@ impl Engine {
             .estates
             .get(&effect)
             .and_then(|estate| estate.claims.get(&claim_id))
+            .ok_or(CoreError::UnknownClaim)?;
+        claim
+            .requirements
+            .iter()
+            .find(|requirement| requirement.kind == kind)
+            .map(|requirement| requirement.accepted.is_some())
+            .ok_or(CoreError::UnexpectedEvidence)
+    }
+
+    /// Reports whether one component-local retirement requirement is durable.
+    pub fn component_retirement_evidence_accepted(
+        &self,
+        effect: EffectId,
+        component: ComponentId,
+        claim_id: ClaimId,
+        kind: EvidenceKindId,
+    ) -> Result<bool, CoreError> {
+        let claim = self
+            .state
+            .composite_effects
+            .get(&effect)
+            .and_then(|composite| composite.components.get(&component))
+            .and_then(|component| component.claims.get(&claim_id))
             .ok_or(CoreError::UnknownClaim)?;
         claim
             .requirements
@@ -2320,6 +3522,54 @@ impl Engine {
         require_digest(observation.digest())?;
         Ok(VerifiedRetirementEvidence {
             effect,
+            component: None,
+            claim: claim_id,
+            evidence: RetirementEvidence {
+                kind,
+                subject: observation.subject(),
+                freshness: observation.observation(),
+                stamp: VerifierStamp {
+                    identity,
+                    receipt_digest: observation.digest(),
+                },
+            },
+        })
+    }
+
+    /// Verifies one raw receipt for an exact component-local claim.
+    pub fn verify_component_retirement_evidence<V: ReceiptVerifier>(
+        &self,
+        effect: EffectId,
+        component: ComponentId,
+        claim_id: ClaimId,
+        kind: EvidenceKindId,
+        verifier: &V,
+        receipt: &V::Receipt,
+    ) -> Result<VerifiedRetirementEvidence, CoreError> {
+        let challenge = self.component_evidence_challenge(effect, component, claim_id, kind)?;
+        let identity = verifier.identity();
+        if identity.verifier() != challenge.expected_verifier() {
+            return Err(CoreError::UnknownVerifier);
+        }
+        if identity.receipt_schema() != challenge.expected_receipt_schema() {
+            return Err(CoreError::ReceiptSchemaMismatch);
+        }
+        if self
+            .state
+            .verifier_epochs
+            .get(&identity.verifier())
+            .copied()
+            != Some(identity.epoch())
+        {
+            return Err(CoreError::StaleVerifierEpoch);
+        }
+        let observation = verifier
+            .verify(&challenge, receipt)
+            .map_err(|_| CoreError::VerificationFailed)?;
+        require_digest(observation.digest())?;
+        Ok(VerifiedRetirementEvidence {
+            effect,
+            component: Some(component),
             claim: claim_id,
             evidence: RetirementEvidence {
                 kind,
@@ -2338,6 +3588,46 @@ impl Engine {
         &self,
         intent: &CommitIntent,
     ) -> Result<EffectFactChallenge, CoreError> {
+        if let Some(component) = intent.component {
+            let composite = self
+                .state
+                .composite_effects
+                .get(&intent.effect)
+                .ok_or(CoreError::UnknownEstate)?;
+            let component_record = composite
+                .components
+                .get(&component)
+                .ok_or(CoreError::UnknownObligationClass)?;
+            if component_record.commit != CommitState::CommitIntentDurable
+                || component_record.commit_nonce != Some(intent.nonce)
+            {
+                return Err(CoreError::StaleCommitIntent);
+            }
+            let operation = component_record
+                .commit_operation
+                .ok_or(CoreError::InvariantViolation)?;
+            let binding = self
+                .catalog
+                .obligation_rule(component_record.domain, component_record.obligation)
+                .ok_or(CoreError::UnknownObligationClass)?
+                .receipts()
+                .commit_outcome();
+            return Ok(EffectFactChallenge {
+                kind: EffectFactKind::CommitOutcome,
+                effect: intent.effect,
+                component: Some(component),
+                domain: component_record.domain,
+                obligation: component_record.obligation,
+                actor: composite.causal_owner,
+                generation: composite.authority_epoch,
+                nonce: intent.nonce,
+                operation,
+                predecessor: None,
+                current_observation: component_freshness(&self.state, composite, component_record)?,
+                expected_verifier: binding.verifier(),
+                expected_receipt_schema: binding.receipt_schema(),
+            });
+        }
         let estate = self
             .state
             .estates
@@ -2360,6 +3650,7 @@ impl Engine {
         Ok(EffectFactChallenge {
             kind: EffectFactKind::CommitOutcome,
             effect: intent.effect,
+            component: None,
             domain: estate.domain,
             obligation: estate.obligation,
             actor: estate.causal_owner,
@@ -2397,6 +3688,50 @@ impl Engine {
         ) {
             return Err(CoreError::WrongSettlementStage);
         }
+        if let Some(component) = claim.component {
+            let composite = self
+                .state
+                .composite_effects
+                .get(&claim.effect)
+                .ok_or(CoreError::UnknownEstate)?;
+            let component_record = composite
+                .components
+                .get(&component)
+                .ok_or(CoreError::UnknownObligationClass)?;
+            if !component_claim_matches(component_record, claim)
+                || !matches!(
+                    component_record.settlement,
+                    SettlementState::ApplyIntentDurable { .. } | SettlementState::Claimed { .. }
+                )
+            {
+                return Err(CoreError::StaleSettlementClaim);
+            }
+            let operation = component_record
+                .settlement_intent
+                .ok_or(CoreError::InvariantViolation)?;
+            let binding = self
+                .catalog
+                .obligation_rule(component_record.domain, component_record.obligation)
+                .ok_or(CoreError::UnknownObligationClass)?
+                .receipts()
+                .apply_completed()
+                .ok_or(CoreError::WrongSettlementStage)?;
+            return Ok(EffectFactChallenge {
+                kind: EffectFactKind::ApplyCompleted,
+                effect: claim.effect,
+                component: Some(component),
+                domain: component_record.domain,
+                obligation: component_record.obligation,
+                actor: claim.claimant,
+                generation: claim.generation,
+                nonce: claim.nonce,
+                operation,
+                predecessor: None,
+                current_observation: component_freshness(&self.state, composite, component_record)?,
+                expected_verifier: binding.verifier(),
+                expected_receipt_schema: binding.receipt_schema(),
+            });
+        }
         let estate = self
             .state
             .estates
@@ -2423,6 +3758,7 @@ impl Engine {
         Ok(EffectFactChallenge {
             kind: EffectFactKind::ApplyCompleted,
             effect: claim.effect,
+            component: None,
             domain: estate.domain,
             obligation: estate.obligation,
             actor: claim.claimant,
@@ -2460,6 +3796,54 @@ impl Engine {
         ) {
             return Err(CoreError::WrongSettlementStage);
         }
+        if let Some(component) = claim.component {
+            let composite = self
+                .state
+                .composite_effects
+                .get(&claim.effect)
+                .ok_or(CoreError::UnknownEstate)?;
+            let component_record = composite
+                .components
+                .get(&component)
+                .ok_or(CoreError::UnknownObligationClass)?;
+            if !component_claim_matches(component_record, claim)
+                || !matches!(
+                    component_record.settlement,
+                    SettlementState::AppliedUnacknowledged { .. } | SettlementState::Claimed { .. }
+                )
+            {
+                return Err(CoreError::StaleSettlementClaim);
+            }
+            let operation = component_record
+                .settlement_intent
+                .ok_or(CoreError::InvariantViolation)?;
+            let predecessor = component_record
+                .applied_fact
+                .map(|fact| fact.stamp.receipt_digest)
+                .ok_or(CoreError::InvariantViolation)?;
+            let binding = self
+                .catalog
+                .obligation_rule(component_record.domain, component_record.obligation)
+                .ok_or(CoreError::UnknownObligationClass)?
+                .receipts()
+                .settlement_acknowledged()
+                .ok_or(CoreError::WrongSettlementStage)?;
+            return Ok(EffectFactChallenge {
+                kind: EffectFactKind::SettlementAcknowledged,
+                effect: claim.effect,
+                component: Some(component),
+                domain: component_record.domain,
+                obligation: component_record.obligation,
+                actor: claim.claimant,
+                generation: claim.generation,
+                nonce: claim.nonce,
+                operation,
+                predecessor: Some(predecessor),
+                current_observation: component_freshness(&self.state, composite, component_record)?,
+                expected_verifier: binding.verifier(),
+                expected_receipt_schema: binding.receipt_schema(),
+            });
+        }
         let estate = self
             .state
             .estates
@@ -2490,6 +3874,7 @@ impl Engine {
         Ok(EffectFactChallenge {
             kind: EffectFactKind::SettlementAcknowledged,
             effect: claim.effect,
+            component: None,
             domain: estate.domain,
             obligation: estate.obligation,
             actor: claim.claimant,
@@ -2556,6 +3941,7 @@ impl Engine {
         Ok(VerifiedEffectFact {
             kind: challenge.kind(),
             effect: challenge.effect(),
+            component: challenge.component(),
             actor: challenge.actor(),
             generation: challenge.generation(),
             nonce: challenge.nonce(),
@@ -2626,6 +4012,10 @@ impl Engine {
         P: FnOnce(&JournalRecord, Freshness) -> Result<(), E>,
     {
         let Command(command) = command.into();
+        let coordinates = command.coordinates();
+        if self.api_mode == EngineApiMode::ProfileTwo && !command.is_profile_two_compatible() {
+            return Err(TxError::Core(CoreError::IncompatibleApiProfile));
+        }
         if self.journal_repair_required.is_some() {
             return Err(TxError::Core(CoreError::JournalRepairRequired));
         }
@@ -2665,9 +4055,16 @@ impl Engine {
         let output = output.into_public();
         self.state = candidate;
         Ok(TransitionReceipt {
+            core_api_profile: crate::CSER_CORE_API_PROFILE_VERSION,
+            journal_schema: crate::JOURNAL_SCHEMA_VERSION,
+            catalog_digest: self.catalog.digest(),
+            projection_version: crate::PROJECTION_VERSION,
+            trace_version: crate::NORMALIZED_TRACE_VERSION,
             revision: record.revision(),
             head: record.digest(),
             projection: self.projection_digest(),
+            coordinates,
+            result: TransitionResult::Applied,
             event,
             output,
         })
@@ -2697,13 +4094,45 @@ impl Engine {
         anchor: RecoveryAnchor,
         bytes: &[u8],
     ) -> Result<RecoveryReport, CoreError> {
+        Self::recover_with_mode(catalog, limits, anchor, bytes, EngineApiMode::ProfileTwo)
+    }
+
+    /// Recovers predecessor-profile records for offline conformance tests.
+    ///
+    /// Production boot paths must use [`Self::recover`], which rejects the
+    /// predecessor singleton grammar before applying any record.
+    #[doc(hidden)]
+    pub fn recover_legacy_compatibility(
+        catalog: DomainCatalog,
+        limits: CoreLimits,
+        anchor: RecoveryAnchor,
+        bytes: &[u8],
+    ) -> Result<RecoveryReport, CoreError> {
+        Self::recover_with_mode(
+            catalog,
+            limits,
+            anchor,
+            bytes,
+            EngineApiMode::LegacyCompatibility,
+        )
+    }
+
+    fn recover_with_mode(
+        catalog: DomainCatalog,
+        limits: CoreLimits,
+        anchor: RecoveryAnchor,
+        bytes: &[u8],
+        api_mode: EngineApiMode,
+    ) -> Result<RecoveryReport, CoreError> {
         if anchor.catalog_digest != catalog.digest() {
             return Err(CoreError::SchemaMismatch);
         }
         if anchor.minimum_revision == 0 {
+            reject_recognized_legacy_journal_prefix(bytes).map_err(CoreError::Journal)?;
             let journal_repair =
                 (!bytes.is_empty()).then_some(JournalRepair::UnanchoredSuffix { offset: 0 });
-            let mut engine = Self::new(catalog, limits, anchor.committed_freshness);
+            let mut engine =
+                Self::new_with_mode(catalog, limits, anchor.committed_freshness, api_mode);
             engine.state.recovery_target = Some(anchor.next_freshness);
             engine.journal_repair_required = journal_repair;
             return Ok(RecoveryReport {
@@ -2768,9 +4197,14 @@ impl Engine {
             first.journal(),
         )
         .map_err(|_| CoreError::InvariantViolation)?;
-        let mut engine = Self::new(catalog, limits, initial);
+        let mut engine = Self::new_with_mode(catalog, limits, initial, api_mode);
 
         for record in records {
+            if api_mode == EngineApiMode::ProfileTwo
+                && !record.command().is_profile_two_compatible()
+            {
+                return Err(CoreError::IncompatibleApiProfile);
+            }
             if record.base_revision() != engine.state.revision
                 || record.revision()
                     != engine
@@ -2857,6 +4291,18 @@ impl Engine {
                 engine.state.device_quarantine.insert(scope);
             }
         }
+        for claim in engine
+            .state
+            .composite_effects
+            .values()
+            .flat_map(|composite| composite.components.values())
+            .flat_map(|component| component.claims.values())
+            .filter(|claim| !claim.retired)
+        {
+            if let ClaimScope::Device(scope) = claim.scope {
+                engine.state.device_quarantine.insert(scope);
+            }
+        }
         engine.journal_repair_required = journal_repair;
 
         Ok(RecoveryReport {
@@ -2870,6 +4316,36 @@ impl Engine {
     /// Returns a public estate projection.
     pub fn estate(&self, effect: EffectId) -> Option<EstateProjection> {
         self.state.estates.get(&effect).map(project_estate)
+    }
+
+    /// Returns the number of singleton profile-1 estates in recovered state.
+    ///
+    /// Profile-2 production installation requires this value to be zero. The
+    /// count remains public so boot code can fail closed before releasing a
+    /// device quarantine guard; it grants no transition authority.
+    pub fn profile_one_estate_count(&self) -> usize {
+        self.state.estates.len()
+    }
+
+    /// Returns the shared parent projection of one composite effect.
+    pub fn composite_effect(&self, effect: EffectId) -> Option<CompositeEffectProjection> {
+        self.state
+            .composite_effects
+            .get(&effect)
+            .map(project_composite_effect)
+    }
+
+    /// Returns one component-local obligation projection.
+    pub fn component(
+        &self,
+        effect: EffectId,
+        component: ComponentId,
+    ) -> Option<ComponentProjection> {
+        self.state
+            .composite_effects
+            .get(&effect)
+            .and_then(|composite| composite.components.get(&component))
+            .map(|record| project_component(effect, record))
     }
 
     /// Returns every claim for one exact estate in stable claim-id order.
@@ -2890,6 +4366,25 @@ impl Engine {
             .collect())
     }
 
+    /// Returns every claim for one exact component in stable claim-id order.
+    pub fn component_claims(
+        &self,
+        effect: EffectId,
+        component: ComponentId,
+    ) -> Result<Vec<ComponentClaimProjection>, CoreError> {
+        let component_record = self
+            .state
+            .composite_effects
+            .get(&effect)
+            .and_then(|composite| composite.components.get(&component))
+            .ok_or(CoreError::UnknownEstate)?;
+        Ok(component_record
+            .claims
+            .values()
+            .map(|claim| project_component_claim(effect, component, claim))
+            .collect())
+    }
+
     /// Enumerates all non-retired claims in stable effect/claim order.
     ///
     /// Boot recovery uses this bounded projection to reconstruct physical
@@ -2905,6 +4400,26 @@ impl Engine {
                     .values()
                     .filter(|claim| !claim.retired)
                     .map(|claim| project_claim(*effect, claim))
+            })
+            .collect()
+    }
+
+    /// Enumerates every retained component-local claim in stable order.
+    pub fn retained_component_claims(&self) -> Vec<ComponentClaimProjection> {
+        self.state
+            .composite_effects
+            .iter()
+            .flat_map(|(effect, composite)| {
+                composite
+                    .components
+                    .iter()
+                    .flat_map(move |(component, record)| {
+                        record
+                            .claims
+                            .values()
+                            .filter(|claim| !claim.retired)
+                            .map(move |claim| project_component_claim(*effect, *component, claim))
+                    })
             })
             .collect()
     }
@@ -2943,7 +4458,7 @@ impl Engine {
     pub fn pressure(&self) -> PressureProjection {
         PressureProjection {
             roots: self.state.roots.len(),
-            estates: self.state.estates.len(),
+            estates: self.state.estates.len() + self.state.composite_effects.len(),
             retained_claims: self
                 .state
                 .estates
@@ -2955,7 +4470,20 @@ impl Engine {
                         .filter(|claim| !claim.retired)
                         .count()
                 })
-                .sum(),
+                .sum::<usize>()
+                + self
+                    .state
+                    .composite_effects
+                    .values()
+                    .flat_map(|composite| composite.components.values())
+                    .map(|component| {
+                        component
+                            .claims
+                            .values()
+                            .filter(|claim| !claim.retired)
+                            .count()
+                    })
+                    .sum::<usize>(),
             quarantined: self.journal_repair_required.is_some()
                 || !self.state.device_quarantine.is_empty(),
             persistence_recovery_required: self.persistence_recovery_required,
@@ -3032,13 +4560,6 @@ impl Engine {
             .estates
             .get(&effect)
             .ok_or(CoreError::UnknownEstate)?;
-        if !estate.claims.values().any(|claim| {
-            !claim.retired
-                && claim.resource == resource
-                && claim.resource_generation == resource_generation
-        }) {
-            return Err(CoreError::UnknownClaim);
-        }
         let record = self
             .state
             .resources
@@ -3050,19 +4571,92 @@ impl Engine {
         if scope_is_quarantined(&self.state, record.scope) {
             return Err(CoreError::Quarantined);
         }
-        if !matches!(
-            record.phase,
+        let pending = match record.phase {
             ResourcePhase::Claimed {
-                pending_reuse: Some(_)
-            }
-        ) {
-            return Err(CoreError::StaleReusePermit);
+                pending_reuse: Some(pending),
+            } if pending.effect == effect && pending.component.is_none() => pending,
+            _ => return Err(CoreError::StaleReusePermit),
+        };
+        let claim_record = estate
+            .claims
+            .get(&pending.claim)
+            .ok_or(CoreError::UnknownClaim)?;
+        if claim_record.retired
+            || claim_record.resource != resource
+            || claim_record.resource_generation != resource_generation
+        {
+            return Err(CoreError::UnknownClaim);
         }
         Ok(Command(CommandKind::ReclaimResourceReuse {
             effect,
+            component: None,
             actor,
             binding_generation,
             authority_epoch: estate.authority_epoch,
+            claim: pending.claim,
+            resource,
+            resource_generation,
+        }))
+    }
+
+    /// Builds a linear reissue request for one component-local reuse
+    /// reservation after explicit composite-effect adoption.
+    pub fn reclaim_component_resource_reuse(
+        &self,
+        effect: EffectId,
+        component: ComponentId,
+        actor: PrincipalIncarnation,
+        binding_generation: u64,
+        resource: ResourceId,
+        resource_generation: ResourceGeneration,
+    ) -> Result<Command, CoreError> {
+        if self.state.recovery_target.is_some() {
+            return Err(CoreError::RecoveryPending);
+        }
+        require_active_composite_actor(&self.state, effect, actor, binding_generation)?;
+        let composite = self
+            .state
+            .composite_effects
+            .get(&effect)
+            .ok_or(CoreError::UnknownEstate)?;
+        let component_record = composite
+            .components
+            .get(&component)
+            .ok_or(CoreError::UnknownObligationClass)?;
+        let record = self
+            .state
+            .resources
+            .get(&resource)
+            .ok_or(CoreError::UnknownResource)?;
+        if record.generation != resource_generation {
+            return Err(CoreError::StaleResourceGeneration);
+        }
+        if scope_is_quarantined(&self.state, record.scope) {
+            return Err(CoreError::Quarantined);
+        }
+        let pending = match record.phase {
+            ResourcePhase::Claimed {
+                pending_reuse: Some(pending),
+            } if pending.effect == effect && pending.component == Some(component) => pending,
+            _ => return Err(CoreError::StaleReusePermit),
+        };
+        let claim_record = component_record
+            .claims
+            .get(&pending.claim)
+            .ok_or(CoreError::UnknownClaim)?;
+        if claim_record.retired
+            || claim_record.resource != resource
+            || claim_record.resource_generation != resource_generation
+        {
+            return Err(CoreError::UnknownClaim);
+        }
+        Ok(Command(CommandKind::ReclaimResourceReuse {
+            effect,
+            component: Some(component),
+            actor,
+            binding_generation,
+            authority_epoch: composite.authority_epoch,
+            claim: pending.claim,
             resource,
             resource_generation,
         }))
@@ -3074,15 +4668,21 @@ impl Engine {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 enum OutputData {
     None,
     CommitIntent {
         effect: EffectId,
+        component: Option<ComponentId>,
         nonce: u64,
+    },
+    CompositeCommitIntents {
+        effect: EffectId,
+        intents: Vec<(ComponentId, u64)>,
     },
     Settlement {
         effect: EffectId,
+        component: Option<ComponentId>,
         claimant: PrincipalIncarnation,
         generation: u64,
         nonce: u64,
@@ -3090,17 +4690,23 @@ enum OutputData {
     },
     ReusePermit {
         effect: EffectId,
+        component: Option<ComponentId>,
         actor: PrincipalIncarnation,
         binding_generation: u64,
         authority_epoch: u64,
+        claim: ClaimId,
         resource: ResourceId,
+        previous_generation: ResourceGeneration,
         generation: ResourceGeneration,
+        catalog_digest: Digest,
+        retirement_digest: Digest,
+        reuse_contract: Digest,
         freshness: Freshness,
         nonce: u64,
     },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 struct AppliedOutput {
     event: TransitionEvent,
     output: OutputData,
@@ -3117,17 +4723,37 @@ impl AppliedOutput {
     fn into_public(self) -> TransitionOutput {
         match self.output {
             OutputData::None => TransitionOutput::None,
-            OutputData::CommitIntent { effect, nonce } => {
-                TransitionOutput::CommitIntent(CommitIntent { effect, nonce })
+            OutputData::CommitIntent {
+                effect,
+                component,
+                nonce,
+            } => TransitionOutput::CommitIntent(CommitIntent {
+                effect,
+                component,
+                nonce,
+            }),
+            OutputData::CompositeCommitIntents { effect, intents } => {
+                TransitionOutput::CompositeCommitIntents(
+                    intents
+                        .into_iter()
+                        .map(|(component, nonce)| CommitIntent {
+                            effect,
+                            component: Some(component),
+                            nonce,
+                        })
+                        .collect(),
+                )
             }
             OutputData::Settlement {
                 effect,
+                component,
                 claimant,
                 generation,
                 nonce,
                 stage,
             } => TransitionOutput::SettlementClaim(SettlementClaim {
                 effect,
+                component,
                 claimant,
                 generation,
                 nonce,
@@ -3135,20 +4761,32 @@ impl AppliedOutput {
             }),
             OutputData::ReusePermit {
                 effect,
+                component,
                 actor,
                 binding_generation,
                 authority_epoch,
+                claim,
                 resource,
+                previous_generation,
                 generation,
+                catalog_digest,
+                retirement_digest,
+                reuse_contract,
                 freshness,
                 nonce,
             } => TransitionOutput::ReusePermit(ReusePermit {
                 effect,
+                component,
                 actor,
                 binding_generation,
                 authority_epoch,
+                claim,
                 resource,
+                previous_generation,
                 generation,
+                catalog_digest,
+                retirement_digest,
+                reuse_contract,
                 freshness,
                 nonce,
             }),
@@ -3162,7 +4800,7 @@ fn apply_command(
     state: &mut State,
     command: &CommandKind,
 ) -> Result<AppliedOutput, CoreError> {
-    match *command {
+    match command.clone() {
         CommandKind::CreateEstate {
             effect,
             origin,
@@ -3250,6 +4888,113 @@ fn apply_command(
             );
             Ok(AppliedOutput::none(TransitionEvent::EstateCreated))
         }
+        CommandKind::CreateCompositeEffect {
+            effect,
+            origin,
+            binding_generation,
+            kind,
+            charge_account,
+        } => {
+            if binding_generation == 0 {
+                return Err(CoreError::InvalidPayload);
+            }
+            let component_specs = catalog
+                .composite_rule(kind)
+                .ok_or(CoreError::UnknownObligationClass)?
+                .components()
+                .to_vec();
+            if state.estates.contains_key(&effect) || state.composite_effects.contains_key(&effect)
+            {
+                return Err(CoreError::DuplicateEstate);
+            }
+            if state
+                .estates
+                .len()
+                .checked_add(state.composite_effects.len())
+                .ok_or(CoreError::CapacityExceeded)?
+                >= limits.max_estates
+            {
+                return Err(CoreError::CapacityExceeded);
+            }
+            match state.roots.get(&effect.root()) {
+                Some(root) => {
+                    if root.origin.principal() != origin.principal()
+                        || !matches!(
+                            root.state,
+                            RootRecoveryState::Active {
+                                incarnation,
+                                binding_generation: live_binding,
+                            } | RootRecoveryState::Rebound {
+                                successor: incarnation,
+                                binding_generation: live_binding,
+                            } if incarnation == origin && live_binding == binding_generation
+                        )
+                    {
+                        return Err(CoreError::StaleIncarnation);
+                    }
+                }
+                None => {
+                    if state.roots.len() >= limits.max_roots {
+                        return Err(CoreError::CapacityExceeded);
+                    }
+                    state.roots.insert(
+                        effect.root(),
+                        RootRecord {
+                            origin,
+                            state: RootRecoveryState::Active {
+                                incarnation: origin,
+                                binding_generation,
+                            },
+                            last_binding_generation: binding_generation,
+                            last_incarnation_generation: origin.generation(),
+                            crash_generation: 0,
+                        },
+                    );
+                }
+            }
+            let mut components = BTreeMap::new();
+            for spec in component_specs {
+                let obligation = catalog
+                    .obligation_rule(spec.domain(), spec.obligation())
+                    .ok_or(CoreError::UnknownObligationClass)?;
+                components.insert(
+                    spec.component(),
+                    ComponentRecord {
+                        id: spec.component(),
+                        domain: spec.domain(),
+                        obligation: spec.obligation(),
+                        obligation_policy: obligation.policy(),
+                        commit: CommitState::Registered,
+                        commit_nonce: None,
+                        commit_operation: None,
+                        commit_fact: None,
+                        outcome: OutcomeState::Pending,
+                        settlement: SettlementState::Unavailable,
+                        settlement_nonce: None,
+                        claim_stage: None,
+                        settlement_intent: None,
+                        applied_fact: None,
+                        settlement_fact: None,
+                        retirement: RetirementState::Held,
+                        claims: BTreeMap::new(),
+                    },
+                );
+            }
+            state.composite_effects.insert(
+                effect,
+                CompositeEffectRecord {
+                    effect,
+                    kind,
+                    causal_owner: origin,
+                    custodian: CustodyState::Principal(origin),
+                    charge_owner: charge_account,
+                    authority: AuthorityState::Active,
+                    authority_epoch: 1,
+                    components,
+                },
+            );
+            Ok(AppliedOutput::none(TransitionEvent::EstateCreated))
+        }
         CommandKind::AddClaim {
             effect,
             actor,
@@ -3270,6 +5015,33 @@ fn apply_command(
             binding_generation,
             claim,
             domain,
+            kind,
+            scope,
+            resource,
+            resource_generation,
+            units,
+            None,
+        ),
+        CommandKind::AddComponentClaim {
+            effect,
+            component,
+            actor,
+            binding_generation,
+            claim,
+            kind,
+            scope,
+            resource,
+            resource_generation,
+            units,
+        } => enroll_component_claim(
+            catalog,
+            limits,
+            state,
+            effect,
+            component,
+            actor,
+            binding_generation,
+            claim,
             kind,
             scope,
             resource,
@@ -3299,6 +5071,38 @@ fn apply_command(
             estate.commit = CommitState::Prepared;
             Ok(AppliedOutput::none(TransitionEvent::EffectPrepared))
         }
+        CommandKind::PrepareCompositeEffect {
+            effect,
+            actor,
+            binding_generation,
+        } => {
+            require_active_composite_actor(state, effect, actor, binding_generation)?;
+            {
+                let composite = state
+                    .composite_effects
+                    .get(&effect)
+                    .ok_or(CoreError::UnknownEstate)?;
+                if composite.authority != AuthorityState::Active
+                    || composite
+                        .components
+                        .values()
+                        .any(|component| component.commit != CommitState::Registered)
+                {
+                    return Err(CoreError::WrongCommitState);
+                }
+                for component in composite.components.values() {
+                    validate_component_claims(catalog, component)?;
+                }
+            }
+            let composite = state
+                .composite_effects
+                .get_mut(&effect)
+                .ok_or(CoreError::UnknownEstate)?;
+            for component in composite.components.values_mut() {
+                component.commit = CommitState::Prepared;
+            }
+            Ok(AppliedOutput::none(TransitionEvent::EffectPrepared))
+        }
         CommandKind::RecordCommitIntent {
             effect,
             actor,
@@ -3312,14 +5116,6 @@ fn apply_command(
                 .estates
                 .get_mut(&effect)
                 .ok_or(CoreError::UnknownEstate)?;
-            if catalog
-                .obligation_rule(estate.domain, estate.obligation)
-                .ok_or(CoreError::InvariantViolation)?
-                .adoption()
-                != crate::AdoptionPolicy::UncommittedOnly
-            {
-                return Err(CoreError::AdoptionForbidden);
-            }
             if estate.authority != AuthorityState::Active || estate.commit != CommitState::Prepared
             {
                 return Err(CoreError::WrongCommitState);
@@ -3329,10 +5125,107 @@ fn apply_command(
             estate.commit_operation = Some(operation);
             Ok(AppliedOutput {
                 event: TransitionEvent::CommitIntentDurable,
-                output: OutputData::CommitIntent { effect, nonce },
+                output: OutputData::CommitIntent {
+                    effect,
+                    component: None,
+                    nonce,
+                },
+            })
+        }
+        CommandKind::RecordComponentCommitIntent {
+            effect,
+            component,
+            actor,
+            binding_generation,
+            operation,
+        } => {
+            require_digest(operation)?;
+            require_active_composite_actor(state, effect, actor, binding_generation)?;
+            let nonce = allocate_nonce(state)?;
+            let composite = state
+                .composite_effects
+                .get_mut(&effect)
+                .ok_or(CoreError::UnknownEstate)?;
+            if composite.components.len() != 1 {
+                return Err(CoreError::WrongCommitState);
+            }
+            let component_record = composite
+                .components
+                .get_mut(&component)
+                .ok_or(CoreError::UnknownObligationClass)?;
+            if composite.authority != AuthorityState::Active
+                || component_record.commit != CommitState::Prepared
+            {
+                return Err(CoreError::WrongCommitState);
+            }
+            component_record.commit = CommitState::CommitIntentDurable;
+            component_record.commit_nonce = Some(nonce);
+            component_record.commit_operation = Some(operation);
+            Ok(AppliedOutput {
+                event: TransitionEvent::CommitIntentDurable,
+                output: OutputData::CommitIntent {
+                    effect,
+                    component: Some(component),
+                    nonce,
+                },
+            })
+        }
+        CommandKind::RecordCompositeCommitIntents {
+            effect,
+            actor,
+            binding_generation,
+            operations,
+        } => {
+            require_active_composite_actor(state, effect, actor, binding_generation)?;
+            let composite = state
+                .composite_effects
+                .get(&effect)
+                .ok_or(CoreError::UnknownEstate)?;
+            let component_specs = catalog
+                .composite_rule(composite.kind)
+                .ok_or(CoreError::UnknownObligationClass)?
+                .components();
+            if operations.len() != component_specs.len()
+                || operations
+                    .iter()
+                    .zip(component_specs)
+                    .any(|(operation, expected)| {
+                        operation.component() != expected.component()
+                            || operation.operation().is_zero()
+                    })
+                || composite
+                    .components
+                    .values()
+                    .any(|component| component.commit != CommitState::Prepared)
+            {
+                return Err(CoreError::WrongCommitState);
+            }
+            let mut intents = Vec::with_capacity(operations.len());
+            for operation in &operations {
+                intents.push((operation.component(), allocate_nonce(state)?));
+            }
+            let composite = state
+                .composite_effects
+                .get_mut(&effect)
+                .expect("composite was validated before nonce allocation");
+            for (operation, (component, nonce)) in operations.into_iter().zip(&intents) {
+                let record = composite
+                    .components
+                    .get_mut(component)
+                    .expect("catalog-ordered component was validated");
+                record.commit = CommitState::CommitIntentDurable;
+                record.commit_nonce = Some(*nonce);
+                record.commit_operation = Some(operation.operation());
+            }
+            Ok(AppliedOutput {
+                event: TransitionEvent::CommitIntentDurable,
+                output: OutputData::CompositeCommitIntents { effect, intents },
             })
         }
         CommandKind::AcknowledgeCommit { fact } => {
+            if let Some(component) = fact.component {
+                return acknowledge_component_commit(catalog, state, fact.effect, component, fact);
+            }
             let effect = fact.effect;
             {
                 let estate = state.estates.get(&effect).ok_or(CoreError::UnknownEstate)?;
@@ -3486,6 +5379,29 @@ fn apply_command(
             ) {
                 return Err(CoreError::StaleIncarnation);
             }
+            if let Some(composite) = state.composite_effects.get_mut(&effect) {
+                if composite.authority == AuthorityState::Revoked {
+                    return Err(CoreError::GateClosed);
+                }
+                if composite.authority != AuthorityState::Fenced
+                    || composite.custodian != CustodyState::KernelEstate
+                {
+                    return Err(CoreError::WrongCommitState);
+                }
+                for component in composite.components.values() {
+                    validate_component_execution_adoption(catalog, component)?;
+                }
+                composite.authority_epoch = composite
+                    .authority_epoch
+                    .checked_add(1)
+                    .ok_or(CoreError::GenerationExhausted)?;
+                composite.authority = AuthorityState::Active;
+                composite.custodian = CustodyState::Principal(successor);
+                for component in composite.components.values_mut() {
+                    refresh_component_retirement(component, composite.authority);
+                }
+                return Ok(AppliedOutput::none(TransitionEvent::EffectAdopted));
+            }
             let estate = state
                 .estates
                 .get_mut(&effect)
@@ -3513,6 +5429,16 @@ fn apply_command(
             estate.custodian = CustodyState::Principal(successor);
             refresh_retirement(estate);
             Ok(AppliedOutput::none(TransitionEvent::EffectAdopted))
+        }
+        CommandKind::RebaseCompositePrecommitClaims {
+            effect,
+            actor,
+            binding_generation,
+        } => {
+            rebase_composite_precommit_claims(catalog, state, effect, actor, binding_generation)?;
+            Ok(AppliedOutput::none(
+                TransitionEvent::CompositePrecommitClaimsRebased,
+            ))
         }
         CommandKind::ClaimSettlement { effect, claimant } => {
             let root = state
@@ -3593,6 +5519,7 @@ fn apply_command(
                 event: TransitionEvent::SettlementClaimed,
                 output: OutputData::Settlement {
                     effect,
+                    component: None,
                     claimant,
                     generation,
                     nonce,
@@ -3600,6 +5527,11 @@ fn apply_command(
                 },
             })
         }
+        CommandKind::ClaimComponentSettlement {
+            effect,
+            component,
+            claimant,
+        } => claim_component_settlement(state, effect, component, claimant),
         CommandKind::RecordApplyIntent {
             effect,
             claimant,
@@ -3622,6 +5554,39 @@ fn apply_command(
                 event: TransitionEvent::ApplyIntentDurable,
                 output: OutputData::Settlement {
                     effect,
+                    component: None,
+                    claimant,
+                    generation,
+                    nonce,
+                    stage: ClaimStage::Intent,
+                },
+            })
+        }
+        CommandKind::RecordComponentApplyIntent {
+            effect,
+            component,
+            claimant,
+            generation,
+            nonce,
+            intent,
+        } => {
+            require_digest(intent)?;
+            let component_record =
+                exact_component_claim_mut(state, effect, component, claimant, generation, nonce)?;
+            if component_record.claim_stage != Some(ClaimStage::Fresh) {
+                return Err(CoreError::WrongSettlementStage);
+            }
+            component_record.settlement = SettlementState::ApplyIntentDurable {
+                claimant,
+                generation,
+            };
+            component_record.claim_stage = Some(ClaimStage::Intent);
+            component_record.settlement_intent = Some(intent);
+            Ok(AppliedOutput {
+                event: TransitionEvent::ApplyIntentDurable,
+                output: OutputData::Settlement {
+                    effect,
+                    component: Some(component),
                     claimant,
                     generation,
                     nonce,
@@ -3630,6 +5595,9 @@ fn apply_command(
             })
         }
         CommandKind::RecordApplied { fact } => {
+            if let Some(component) = fact.component {
+                return record_component_applied(catalog, state, fact.effect, component, fact);
+            }
             let effect = fact.effect;
             {
                 let estate = state.estates.get(&effect).ok_or(CoreError::UnknownEstate)?;
@@ -3657,6 +5625,7 @@ fn apply_command(
                 event: TransitionEvent::AppliedUnacknowledged,
                 output: OutputData::Settlement {
                     effect,
+                    component: None,
                     claimant: fact.actor,
                     generation: fact.generation,
                     nonce: fact.nonce,
@@ -3665,6 +5634,9 @@ fn apply_command(
             })
         }
         CommandKind::Settle { fact } => {
+            if let Some(component) = fact.component {
+                return settle_component(catalog, state, fact.effect, component, fact);
+            }
             let effect = fact.effect;
             {
                 let estate = state.estates.get(&effect).ok_or(CoreError::UnknownEstate)?;
@@ -3719,6 +5691,39 @@ fn apply_command(
             refresh_retirement(estate);
             Ok(AppliedOutput::none(TransitionEvent::Indeterminate))
         }
+        CommandKind::MarkComponentIndeterminate {
+            effect,
+            component,
+            claimant,
+            generation,
+            nonce,
+            reason,
+        } => {
+            require_digest(reason)?;
+            let authority = state
+                .composite_effects
+                .get(&effect)
+                .ok_or(CoreError::UnknownEstate)?
+                .authority;
+            let component_record =
+                exact_component_claim_mut(state, effect, component, claimant, generation, nonce)?;
+            let applied = matches!(
+                component_record.claim_stage,
+                Some(ClaimStage::Applied | ClaimStage::ReconcileApplied)
+            );
+            let next_generation = generation
+                .checked_add(1)
+                .ok_or(CoreError::GenerationExhausted)?;
+            component_record.outcome = OutcomeState::Indeterminate(reason);
+            component_record.settlement = SettlementState::ReconciliationRequired {
+                generation: next_generation,
+                applied,
+            };
+            component_record.settlement_nonce = None;
+            component_record.claim_stage = None;
+            refresh_component_retirement(component_record, authority);
+            Ok(AppliedOutput::none(TransitionEvent::Indeterminate))
+        }
         CommandKind::BeginRevoke {
             effect,
             expected_actor,
@@ -3745,6 +5750,9 @@ fn apply_command(
             };
             if live != (expected_actor, binding_generation) {
                 return Err(CoreError::StaleIncarnation);
+            }
+            if state.composite_effects.contains_key(&effect) {
+                return revoke_composite_effect(state, effect, expected_actor, authority_epoch);
             }
             let estate = state
                 .estates
@@ -3804,6 +5812,12 @@ fn apply_command(
             claim,
             evidence,
         } => apply_evidence(catalog, state, effect, claim, evidence),
+        CommandKind::SubmitComponentEvidence {
+            effect,
+            component,
+            claim,
+            evidence,
+        } => apply_component_evidence(catalog, state, effect, component, claim, evidence),
         CommandKind::CheckpointRecovery {
             boot,
             journal,
@@ -3814,6 +5828,10 @@ fn apply_command(
                 || target.journal() != journal
                 || target.device() != device
                 || target.registry() != state.freshness.registry()
+                || state
+                    .device_generations
+                    .values()
+                    .any(|generation| *generation > device)
             {
                 return Err(CoreError::FreshnessRollback);
             }
@@ -3823,6 +5841,9 @@ fn apply_command(
             }
             state.freshness.set_boot_and_journal(boot, journal);
             state.freshness.set_device(device);
+            for generation in state.device_generations.values_mut() {
+                *generation = device;
+            }
             state.recovery_target = None;
             Ok(AppliedOutput::none(TransitionEvent::RecoveryCheckpointed))
         }
@@ -3837,7 +5858,9 @@ fn apply_command(
             resource,
             expected_generation,
             units,
+            reuse_contract,
         } => {
+            require_digest(reuse_contract)?;
             if state.recovery_target.is_some() {
                 return Err(CoreError::RecoveryPending);
             }
@@ -3864,6 +5887,9 @@ fn apply_command(
                 ResourcePhase::Claimed { .. } => return Err(CoreError::ResourceRetained),
                 ResourcePhase::Retired => {}
             }
+            let catalog_digest = catalog.digest();
+            let retirement_digest =
+                retirement_contract_digest(catalog_digest, state, resource, expected_generation)?;
             let generation = ResourceGeneration::new(
                 expected_generation
                     .get()
@@ -3881,9 +5907,15 @@ fn apply_command(
                     phase: ResourcePhase::Claimed {
                         pending_reuse: Some(PendingReuse {
                             effect,
+                            component: None,
                             actor,
                             binding_generation,
                             authority_epoch,
+                            claim,
+                            previous_generation: expected_generation,
+                            catalog_digest,
+                            retirement_digest,
+                            reuse_contract,
                             nonce,
                             freshness: reservation_freshness,
                         }),
@@ -3910,11 +5942,128 @@ fn apply_command(
                 event: TransitionEvent::ResourceReuseReserved,
                 output: OutputData::ReusePermit {
                     effect,
+                    component: None,
                     actor,
                     binding_generation,
                     authority_epoch,
+                    claim,
                     resource,
+                    previous_generation: expected_generation,
                     generation,
+                    catalog_digest,
+                    retirement_digest,
+                    reuse_contract,
+                    freshness: reservation_freshness,
+                    nonce,
+                },
+            })
+        }
+        CommandKind::ReserveComponentReuse {
+            effect,
+            component,
+            actor,
+            binding_generation,
+            claim,
+            kind,
+            scope,
+            resource,
+            expected_generation,
+            units,
+            reuse_contract,
+        } => {
+            require_digest(reuse_contract)?;
+            if state.recovery_target.is_some() {
+                return Err(CoreError::RecoveryPending);
+            }
+            if scope_is_quarantined(state, scope) {
+                return Err(CoreError::Quarantined);
+            }
+            require_active_composite_actor(state, effect, actor, binding_generation)?;
+            let authority_epoch = state
+                .composite_effects
+                .get(&effect)
+                .ok_or(CoreError::UnknownEstate)?
+                .authority_epoch;
+            let record = state
+                .resources
+                .get(&resource)
+                .ok_or(CoreError::UnknownResource)?;
+            if record.scope != scope {
+                return Err(CoreError::WrongClaimScope);
+            }
+            if record.generation != expected_generation {
+                return Err(CoreError::StaleResourceGeneration);
+            }
+            match record.phase {
+                ResourcePhase::Claimed { .. } => return Err(CoreError::ResourceRetained),
+                ResourcePhase::Retired => {}
+            }
+            let catalog_digest = catalog.digest();
+            let retirement_digest =
+                retirement_contract_digest(catalog_digest, state, resource, expected_generation)?;
+            let generation = ResourceGeneration::new(
+                expected_generation
+                    .get()
+                    .checked_add(1)
+                    .ok_or(CoreError::GenerationExhausted)?,
+            )
+            .map_err(|_| CoreError::GenerationExhausted)?;
+            let nonce = allocate_nonce(state)?;
+            let reservation_freshness = scoped_freshness(state, scope, binding_generation)?;
+            state.resources.insert(
+                resource,
+                ResourceRecord {
+                    scope,
+                    generation,
+                    phase: ResourcePhase::Claimed {
+                        pending_reuse: Some(PendingReuse {
+                            effect,
+                            component: Some(component),
+                            actor,
+                            binding_generation,
+                            authority_epoch,
+                            claim,
+                            previous_generation: expected_generation,
+                            catalog_digest,
+                            retirement_digest,
+                            reuse_contract,
+                            nonce,
+                            freshness: reservation_freshness,
+                        }),
+                    },
+                },
+            );
+            enroll_component_claim(
+                catalog,
+                limits,
+                state,
+                effect,
+                component,
+                actor,
+                binding_generation,
+                claim,
+                kind,
+                scope,
+                resource,
+                generation,
+                units,
+                Some(nonce),
+            )?;
+            Ok(AppliedOutput {
+                event: TransitionEvent::ResourceReuseReserved,
+                output: OutputData::ReusePermit {
+                    effect,
+                    component: Some(component),
+                    actor,
+                    binding_generation,
+                    authority_epoch,
+                    claim,
+                    resource,
+                    previous_generation: expected_generation,
+                    generation,
+                    catalog_digest,
+                    retirement_digest,
+                    reuse_contract,
                     freshness: reservation_freshness,
                     nonce,
                 },
@@ -3922,23 +6071,67 @@ fn apply_command(
         }
         CommandKind::ActivateResourceReuse {
             effect,
+            component,
             actor,
             binding_generation,
             authority_epoch,
+            claim,
             resource,
+            previous_generation,
             resource_generation,
+            catalog_digest,
+            retirement_digest,
+            reuse_contract,
             nonce,
             freshness,
         } => {
-            require_active_actor(state, effect, actor, binding_generation)?;
-            if state
-                .estates
-                .get(&effect)
-                .ok_or(CoreError::UnknownEstate)?
-                .authority_epoch
-                != authority_epoch
+            if catalog_digest != catalog.digest()
+                || retirement_digest.is_zero()
+                || reuse_contract.is_zero()
+                || previous_generation
+                    .get()
+                    .checked_add(1)
+                    .map(ResourceGeneration::new)
+                    != Some(Ok(resource_generation))
             {
-                return Err(CoreError::StaleAuthorityEpoch);
+                return Err(CoreError::StaleReusePermit);
+            }
+            match component {
+                Some(component) => {
+                    require_active_composite_actor(state, effect, actor, binding_generation)?;
+                    let composite = state
+                        .composite_effects
+                        .get(&effect)
+                        .ok_or(CoreError::UnknownEstate)?;
+                    if composite.authority_epoch != authority_epoch {
+                        return Err(CoreError::StaleAuthorityEpoch);
+                    }
+                    let claim_record = composite
+                        .components
+                        .get(&component)
+                        .and_then(|record| record.claims.get(&claim))
+                        .ok_or(CoreError::UnknownClaim)?;
+                    if claim_record.retired
+                        || claim_record.resource != resource
+                        || claim_record.resource_generation != resource_generation
+                    {
+                        return Err(CoreError::StaleReusePermit);
+                    }
+                }
+                None => {
+                    require_active_actor(state, effect, actor, binding_generation)?;
+                    let estate = state.estates.get(&effect).ok_or(CoreError::UnknownEstate)?;
+                    if estate.authority_epoch != authority_epoch {
+                        return Err(CoreError::StaleAuthorityEpoch);
+                    }
+                    let claim_record = estate.claims.get(&claim).ok_or(CoreError::UnknownClaim)?;
+                    if claim_record.retired
+                        || claim_record.resource != resource
+                        || claim_record.resource_generation != resource_generation
+                    {
+                        return Err(CoreError::StaleReusePermit);
+                    }
+                }
             }
             let scope = state
                 .resources
@@ -3961,16 +6154,28 @@ fn apply_command(
                     pending_reuse:
                         Some(PendingReuse {
                             effect: expected_effect,
+                            component: expected_component,
                             actor: expected_actor,
                             binding_generation: expected_binding,
                             authority_epoch: expected_epoch,
+                            claim: expected_claim,
+                            previous_generation: expected_previous_generation,
+                            catalog_digest: expected_catalog_digest,
+                            retirement_digest: expected_retirement_digest,
+                            reuse_contract: expected_reuse_contract,
                             nonce: expected_nonce,
                             freshness: expected_freshness,
                         }),
                 } if expected_effect == effect
+                    && expected_component == component
                     && expected_actor == actor
                     && expected_binding == binding_generation
                     && expected_epoch == authority_epoch
+                    && expected_claim == claim
+                    && expected_previous_generation == previous_generation
+                    && expected_catalog_digest == catalog_digest
+                    && expected_retirement_digest == retirement_digest
+                    && expected_reuse_contract == reuse_contract
                     && expected_nonce == nonce
                     && expected_freshness == freshness
                     && freshness == current_freshness =>
@@ -3985,23 +6190,53 @@ fn apply_command(
         }
         CommandKind::ReclaimResourceReuse {
             effect,
+            component,
             actor,
             binding_generation,
             authority_epoch,
+            claim,
             resource,
             resource_generation,
         } => {
-            require_active_actor(state, effect, actor, binding_generation)?;
-            let estate = state.estates.get(&effect).ok_or(CoreError::UnknownEstate)?;
-            if estate.authority_epoch != authority_epoch {
-                return Err(CoreError::StaleAuthorityEpoch);
-            }
-            if !estate.claims.values().any(|claim| {
-                !claim.retired
-                    && claim.resource == resource
-                    && claim.resource_generation == resource_generation
-            }) {
-                return Err(CoreError::UnknownClaim);
+            match component {
+                Some(component) => {
+                    require_active_composite_actor(state, effect, actor, binding_generation)?;
+                    let composite = state
+                        .composite_effects
+                        .get(&effect)
+                        .ok_or(CoreError::UnknownEstate)?;
+                    if composite.authority_epoch != authority_epoch {
+                        return Err(CoreError::StaleAuthorityEpoch);
+                    }
+                    let component_record = composite
+                        .components
+                        .get(&component)
+                        .ok_or(CoreError::UnknownObligationClass)?;
+                    let claim_record = component_record
+                        .claims
+                        .get(&claim)
+                        .ok_or(CoreError::UnknownClaim)?;
+                    if claim_record.retired
+                        || claim_record.resource != resource
+                        || claim_record.resource_generation != resource_generation
+                    {
+                        return Err(CoreError::UnknownClaim);
+                    }
+                }
+                None => {
+                    require_active_actor(state, effect, actor, binding_generation)?;
+                    let estate = state.estates.get(&effect).ok_or(CoreError::UnknownEstate)?;
+                    if estate.authority_epoch != authority_epoch {
+                        return Err(CoreError::StaleAuthorityEpoch);
+                    }
+                    let claim_record = estate.claims.get(&claim).ok_or(CoreError::UnknownClaim)?;
+                    if claim_record.retired
+                        || claim_record.resource != resource
+                        || claim_record.resource_generation != resource_generation
+                    {
+                        return Err(CoreError::UnknownClaim);
+                    }
+                }
             }
             let (previous, scope) = match state.resources.get(&resource) {
                 Some(ResourceRecord {
@@ -4021,6 +6256,8 @@ fn apply_command(
                 return Err(CoreError::Quarantined);
             }
             if previous.effect != effect
+                || previous.component != component
+                || previous.claim != claim
                 || previous.authority_epoch >= authority_epoch
                 || (previous.actor == actor && previous.binding_generation == binding_generation)
             {
@@ -4030,9 +6267,15 @@ fn apply_command(
             let reservation_freshness = scoped_freshness(state, scope, binding_generation)?;
             let pending = PendingReuse {
                 effect,
+                component,
                 actor,
                 binding_generation,
                 authority_epoch,
+                claim,
+                previous_generation: previous.previous_generation,
+                catalog_digest: previous.catalog_digest,
+                retirement_digest: previous.retirement_digest,
+                reuse_contract: previous.reuse_contract,
                 nonce,
                 freshness: reservation_freshness,
             };
@@ -4047,11 +6290,17 @@ fn apply_command(
                 event: TransitionEvent::ResourceReuseReclaimed,
                 output: OutputData::ReusePermit {
                     effect,
+                    component,
                     actor,
                     binding_generation,
                     authority_epoch,
+                    claim,
                     resource,
+                    previous_generation: previous.previous_generation,
                     generation: resource_generation,
+                    catalog_digest: previous.catalog_digest,
+                    retirement_digest: previous.retirement_digest,
+                    reuse_contract: previous.reuse_contract,
                     freshness: reservation_freshness,
                     nonce,
                 },
@@ -4074,6 +6323,21 @@ fn apply_command(
             }
             estate.retirement = RetirementState::Released;
             estate.custodian = CustodyState::Released;
+            Ok(AppliedOutput::none(TransitionEvent::EstateReleased))
+        }
+        CommandKind::ReleaseCompositeEffect { effect } => {
+            let composite = state
+                .composite_effects
+                .get_mut(&effect)
+                .ok_or(CoreError::UnknownEstate)?;
+            if composite_escape_state(composite) != EffectEscapeState::Retired {
+                return Err(CoreError::EstateNotReleasable);
+            }
+            composite.custodian = CustodyState::Released;
+            composite.authority = AuthorityState::Revoked;
+            for component in composite.components.values_mut() {
+                component.retirement = RetirementState::Released;
+            }
             Ok(AppliedOutput::none(TransitionEvent::EstateReleased))
         }
     }
@@ -4138,17 +6402,6 @@ fn enroll_claim(
                 generation,
                 phase:
                     ResourcePhase::Claimed {
-                        pending_reuse: None,
-                    },
-            }),
-            None,
-        ) if *existing_scope == scope && *generation == resource_generation => {}
-        (
-            Some(ResourceRecord {
-                scope: existing_scope,
-                generation,
-                phase:
-                    ResourcePhase::Claimed {
                         pending_reuse: Some(PendingReuse { nonce, .. }),
                     },
             }),
@@ -4196,7 +6449,7 @@ fn enroll_claim(
             }),
             None,
         ) => {
-            return Err(CoreError::StaleResourceGeneration);
+            return Err(CoreError::ResourceRetained);
         }
         (Some(ResourceRecord { .. }), Some(_)) | (None, Some(_)) => {
             return Err(CoreError::StaleReusePermit);
@@ -4209,7 +6462,16 @@ fn enroll_claim(
         .estates
         .values()
         .map(|estate| estate.claims.len())
-        .sum();
+        .sum::<usize>()
+        .checked_add(
+            state
+                .composite_effects
+                .values()
+                .flat_map(|composite| composite.components.values())
+                .map(|component| component.claims.len())
+                .sum(),
+        )
+        .ok_or(CoreError::CapacityExceeded)?;
     if total_claims >= limits.max_total_claims {
         return Err(CoreError::CapacityExceeded);
     }
@@ -4309,6 +6571,253 @@ fn enroll_claim(
     Ok(AppliedOutput::none(TransitionEvent::ClaimAdded))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn enroll_component_claim(
+    catalog: &DomainCatalog,
+    limits: CoreLimits,
+    state: &mut State,
+    effect: EffectId,
+    component: ComponentId,
+    actor: PrincipalIncarnation,
+    binding_generation: u64,
+    claim: ClaimId,
+    kind: ClaimKindId,
+    scope: ClaimScope,
+    resource: ResourceId,
+    resource_generation: ResourceGeneration,
+    units: u64,
+    reservation_nonce: Option<u64>,
+) -> Result<AppliedOutput, CoreError> {
+    if units == 0 {
+        return Err(CoreError::InvalidPayload);
+    }
+    require_active_composite_actor(state, effect, actor, binding_generation)?;
+    let (domain, obligation, charge_owner, authority, commit) = {
+        let composite = state
+            .composite_effects
+            .get(&effect)
+            .ok_or(CoreError::UnknownEstate)?;
+        let component_record = composite
+            .components
+            .get(&component)
+            .ok_or(CoreError::UnknownObligationClass)?;
+        (
+            component_record.domain,
+            component_record.obligation,
+            composite.charge_owner,
+            composite.authority,
+            component_record.commit,
+        )
+    };
+    if authority != AuthorityState::Active || commit != CommitState::Registered {
+        return Err(CoreError::WrongCommitState);
+    }
+    let rule = catalog
+        .claim_rule(domain, kind)
+        .ok_or(CoreError::UnknownClaimClass)?;
+    if !matches!(
+        (rule.scope(), scope),
+        (ClaimScopePolicy::Logical, ClaimScope::Logical)
+            | (ClaimScopePolicy::Device, ClaimScope::Device(_))
+    ) {
+        return Err(CoreError::WrongClaimScope);
+    }
+    if let ClaimScope::Device(device_scope) = scope {
+        state
+            .device_generations
+            .entry(device_scope)
+            .or_insert(state.freshness.device());
+        if state.device_quarantine.contains(&device_scope) {
+            return Err(CoreError::Quarantined);
+        }
+    }
+    let cardinality = catalog
+        .obligation_rule(domain, obligation)
+        .ok_or(CoreError::InvariantViolation)?
+        .claims()
+        .iter()
+        .find(|allowed| allowed.kind() == kind)
+        .ok_or(CoreError::ClaimNotAllowed)?;
+    let credit_class = rule.credit_class();
+    let credit_limit = catalog
+        .credit_rule(credit_class)
+        .ok_or(CoreError::InvariantViolation)?
+        .max_units_per_account()
+        .min(limits.max_units_per_account);
+
+    match (state.resources.get(&resource), reservation_nonce) {
+        (None, None) if resource_generation.get() == 1 => {
+            if state.resources.len() >= limits.max_resource_records {
+                return Err(CoreError::CapacityExceeded);
+            }
+        }
+        (
+            Some(ResourceRecord {
+                scope: existing_scope,
+                generation,
+                phase:
+                    ResourcePhase::Claimed {
+                        pending_reuse: Some(pending),
+                    },
+            }),
+            Some(presented_nonce),
+        ) if *existing_scope == scope
+            && *generation == resource_generation
+            && pending.effect == effect
+            && pending.component == Some(component)
+            && pending.nonce == presented_nonce => {}
+        (
+            Some(ResourceRecord {
+                scope: existing, ..
+            }),
+            _,
+        ) if *existing != scope => {
+            return Err(CoreError::WrongClaimScope);
+        }
+        (Some(ResourceRecord { generation, .. }), _) if *generation != resource_generation => {
+            return Err(CoreError::StaleResourceGeneration);
+        }
+        (
+            Some(ResourceRecord {
+                phase: ResourcePhase::Retired,
+                ..
+            }),
+            None,
+        )
+        | (
+            Some(ResourceRecord {
+                phase:
+                    ResourcePhase::Claimed {
+                        pending_reuse: Some(_),
+                    },
+                ..
+            }),
+            None,
+        ) => return Err(CoreError::ResourceReuseRequired),
+        (
+            Some(ResourceRecord {
+                phase:
+                    ResourcePhase::Claimed {
+                        pending_reuse: None,
+                    },
+                ..
+            }),
+            None,
+        ) => return Err(CoreError::ResourceRetained),
+        (Some(ResourceRecord { .. }), Some(_)) | (None, Some(_)) => {
+            return Err(CoreError::StaleReusePermit);
+        }
+        (None, None) => return Err(CoreError::StaleResourceGeneration),
+    }
+
+    let enrolled_freshness = scoped_freshness(state, scope, binding_generation)?;
+    let total_claims = state
+        .estates
+        .values()
+        .map(|estate| estate.claims.len())
+        .sum::<usize>()
+        .checked_add(
+            state
+                .composite_effects
+                .values()
+                .flat_map(|composite| composite.components.values())
+                .map(|component| component.claims.len())
+                .sum(),
+        )
+        .ok_or(CoreError::CapacityExceeded)?;
+    if total_claims >= limits.max_total_claims {
+        return Err(CoreError::CapacityExceeded);
+    }
+    let composite = state
+        .composite_effects
+        .get_mut(&effect)
+        .ok_or(CoreError::UnknownEstate)?;
+    if composite
+        .components
+        .values()
+        .any(|candidate| candidate.claims.contains_key(&claim))
+    {
+        return Err(CoreError::DuplicateClaim);
+    }
+    let component_record = composite
+        .components
+        .get_mut(&component)
+        .ok_or(CoreError::UnknownObligationClass)?;
+    let existing_of_kind = component_record
+        .claims
+        .values()
+        .filter(|candidate| candidate.kind == kind)
+        .count();
+    if existing_of_kind >= usize::from(cardinality.maximum()) {
+        return Err(CoreError::ClaimCardinalityViolation);
+    }
+    if component_record.claims.len() >= limits.max_claims_per_estate {
+        return Err(CoreError::CapacityExceeded);
+    }
+    let charged = state
+        .charges
+        .get(&(charge_owner, credit_class))
+        .copied()
+        .unwrap_or(0);
+    let next = charged.checked_add(units).ok_or(CoreError::Backpressure)?;
+    if next > credit_limit {
+        return Err(CoreError::Backpressure);
+    }
+    let requirements = rule
+        .evidence()
+        .iter()
+        .map(|evidence| RequirementState {
+            kind: evidence.kind(),
+            verifier: evidence.verifier(),
+            receipt_schema: evidence.receipt_schema(),
+            subject_freshness: evidence.subject_freshness(),
+            observation_freshness: evidence.observation_freshness(),
+            strictly_advanced: evidence.strictly_advanced(),
+            device_generation: evidence.device_generation(),
+            prerequisite: evidence.prerequisite(),
+            accepted: None,
+        })
+        .collect();
+    component_record.claims.insert(
+        claim,
+        ClaimRecord {
+            id: claim,
+            domain,
+            kind,
+            credit_class,
+            scope,
+            resource,
+            resource_generation,
+            units,
+            enrolled_freshness,
+            requirements,
+            retired: false,
+        },
+    );
+    *state
+        .charges
+        .entry((charge_owner, credit_class))
+        .or_insert(0) = next;
+    let entries = state.composite_resource_index.entry(resource).or_default();
+    match entries.binary_search(&(effect, component, claim)) {
+        Ok(_) => return Err(CoreError::InvariantViolation),
+        Err(index) => entries.insert(index, (effect, component, claim)),
+    }
+    if reservation_nonce.is_none() {
+        state.resources.insert(
+            resource,
+            ResourceRecord {
+                scope,
+                generation: resource_generation,
+                phase: ResourcePhase::Claimed {
+                    pending_reuse: None,
+                },
+            },
+        );
+    }
+    Ok(AppliedOutput::none(TransitionEvent::ClaimAdded))
+}
+
 fn allocate_nonce(state: &mut State) -> Result<u64, CoreError> {
     let nonce = state.next_nonce;
     state.next_nonce = state
@@ -4343,6 +6852,38 @@ fn validate_obligation_claims(
         }
     }
     if estate.claims.values().any(|claim| {
+        !rule
+            .claims()
+            .iter()
+            .any(|allowed| allowed.kind() == claim.kind)
+    }) {
+        return Err(CoreError::ClaimNotAllowed);
+    }
+    Ok(())
+}
+
+fn validate_component_claims(
+    catalog: &DomainCatalog,
+    component: &ComponentRecord,
+) -> Result<(), CoreError> {
+    let rule = catalog
+        .obligation_rule(component.domain, component.obligation)
+        .ok_or(CoreError::InvariantViolation)?;
+    if component.claims.len() < usize::from(rule.minimum_total_claims()) {
+        return Err(CoreError::ClaimCardinalityViolation);
+    }
+    for cardinality in rule.claims() {
+        let count = component
+            .claims
+            .values()
+            .filter(|claim| claim.kind == cardinality.kind())
+            .count();
+        if count < usize::from(cardinality.minimum()) || count > usize::from(cardinality.maximum())
+        {
+            return Err(CoreError::ClaimCardinalityViolation);
+        }
+    }
+    if component.claims.values().any(|claim| {
         !rule
             .claims()
             .iter()
@@ -4414,6 +6955,224 @@ fn settlement_claim_matches(estate: &EstateRecord, claim: &SettlementClaim) -> b
     identity_matches && estate.settlement_nonce == Some(claim.nonce)
 }
 
+fn component_freshness(
+    state: &State,
+    composite: &CompositeEffectRecord,
+    component: &ComponentRecord,
+) -> Result<Freshness, CoreError> {
+    let binding_generation = state
+        .roots
+        .get(&composite.effect.root())
+        .ok_or(CoreError::UnknownRoot)?
+        .last_binding_generation;
+    let mut device_scope = None;
+    for claim in component.claims.values() {
+        if let ClaimScope::Device(scope) = claim.scope {
+            if device_scope.is_some_and(|existing| existing != scope) {
+                return Err(CoreError::WrongClaimScope);
+            }
+            device_scope = Some(scope);
+        }
+    }
+    scoped_freshness(
+        state,
+        device_scope.map_or(ClaimScope::Logical, ClaimScope::Device),
+        binding_generation,
+    )
+}
+
+fn component_claim_matches(component: &ComponentRecord, claim: &SettlementClaim) -> bool {
+    let identity_matches = match component.settlement {
+        SettlementState::Claimed {
+            claimant,
+            generation,
+        }
+        | SettlementState::ApplyIntentDurable {
+            claimant,
+            generation,
+        }
+        | SettlementState::AppliedUnacknowledged {
+            claimant,
+            generation,
+        } => claimant == claim.claimant && generation == claim.generation,
+        _ => false,
+    };
+    identity_matches && component.settlement_nonce == Some(claim.nonce)
+}
+
+fn component_terminal(component: &ComponentRecord) -> bool {
+    matches!(
+        component.retirement,
+        RetirementState::Retired | RetirementState::Released
+    ) && matches!(
+        component.settlement,
+        SettlementState::Settled | SettlementState::Revoked | SettlementState::NotRequired
+    )
+}
+
+fn validate_component_execution_adoption(
+    catalog: &DomainCatalog,
+    component: &ComponentRecord,
+) -> Result<(), CoreError> {
+    let adoption = catalog
+        .obligation_rule(component.domain, component.obligation)
+        .ok_or(CoreError::InvariantViolation)?
+        .adoption();
+    if adoption != crate::AdoptionPolicy::UncommittedOnly {
+        return Err(CoreError::AdoptionForbidden);
+    }
+    if !matches!(
+        component.commit,
+        CommitState::Registered | CommitState::Prepared
+    ) || component.settlement != SettlementState::Unavailable
+        || !matches!(
+            component.retirement,
+            RetirementState::Held | RetirementState::RetirementPending
+        )
+        || component.claims.values().any(|claim| {
+            claim.retired
+                || claim
+                    .requirements
+                    .iter()
+                    .any(|requirement| requirement.accepted.is_some())
+        })
+    {
+        return Err(CoreError::WrongCommitState);
+    }
+    Ok(())
+}
+
+fn rebase_composite_precommit_claims(
+    catalog: &DomainCatalog,
+    state: &mut State,
+    effect: EffectId,
+    actor: PrincipalIncarnation,
+    binding_generation: u64,
+) -> Result<(), CoreError> {
+    if state.recovery_target.is_some() {
+        return Err(CoreError::RecoveryPending);
+    }
+    require_active_composite_actor(state, effect, actor, binding_generation)?;
+
+    let mut rebases = Vec::new();
+    let mut touched_device_scopes = BTreeSet::new();
+    let mut has_stale_claim = false;
+    {
+        let composite = state
+            .composite_effects
+            .get(&effect)
+            .ok_or(CoreError::UnknownEstate)?;
+        if composite.causal_owner == actor
+            || composite.authority_epoch <= 1
+            || composite_escape_state(composite) != EffectEscapeState::Unescaped
+        {
+            return Err(CoreError::WrongCommitState);
+        }
+        for component in composite.components.values() {
+            validate_component_execution_adoption(catalog, component)?;
+            if !matches!(
+                component.commit,
+                CommitState::Registered | CommitState::Prepared
+            ) || component.commit_nonce.is_some()
+                || component.commit_operation.is_some()
+                || component.commit_fact.is_some()
+                || component.outcome != OutcomeState::Pending
+                || component.settlement != SettlementState::Unavailable
+                || component.settlement_nonce.is_some()
+                || component.claim_stage.is_some()
+                || component.settlement_intent.is_some()
+                || component.applied_fact.is_some()
+                || component.settlement_fact.is_some()
+                || component.retirement != RetirementState::Held
+            {
+                return Err(CoreError::WrongCommitState);
+            }
+            for claim in component.claims.values() {
+                if claim.retired
+                    || claim
+                        .requirements
+                        .iter()
+                        .any(|requirement| requirement.accepted.is_some())
+                {
+                    return Err(CoreError::WrongCommitState);
+                }
+                let current = scoped_freshness(state, claim.scope, binding_generation)?;
+                has_stale_claim |= claim.enrolled_freshness != current;
+                if let ClaimScope::Device(scope) = claim.scope {
+                    touched_device_scopes.insert(scope);
+                }
+                rebases.push((component.id, claim.id, current));
+            }
+        }
+    }
+    if !has_stale_claim {
+        return Err(CoreError::StaleEvidence);
+    }
+    if touched_device_scopes
+        .iter()
+        .any(|scope| device_scope_has_retained_claim_outside_composite(state, *scope, effect))
+    {
+        return Err(CoreError::ResourceRetained);
+    }
+
+    {
+        let composite = state
+            .composite_effects
+            .get_mut(&effect)
+            .expect("composite was validated before claim rebasing");
+        for (component, claim, freshness) in rebases {
+            composite
+                .components
+                .get_mut(&component)
+                .and_then(|record| record.claims.get_mut(&claim))
+                .expect("claim was validated before claim rebasing")
+                .enrolled_freshness = freshness;
+        }
+    }
+    for scope in touched_device_scopes {
+        if !device_scope_has_stale_retained_claim(state, scope)? {
+            state.device_quarantine.remove(&scope);
+        }
+    }
+    Ok(())
+}
+
+fn composite_escape_state(composite: &CompositeEffectRecord) -> EffectEscapeState {
+    if composite.custodian == CustodyState::Released
+        || composite
+            .components
+            .values()
+            .all(|component| component.retirement == RetirementState::Released)
+    {
+        return EffectEscapeState::Released;
+    }
+    if composite.components.values().all(component_terminal) {
+        return EffectEscapeState::Retired;
+    }
+    let escaped = composite.components.values().any(|component| {
+        matches!(
+            component.commit,
+            CommitState::CommitIntentDurable | CommitState::Committed
+        )
+    });
+    if !escaped {
+        return EffectEscapeState::Unescaped;
+    }
+    let discharged = composite.components.values().any(|component| {
+        component.claims.values().any(|claim| claim.retired)
+            || matches!(
+                component.settlement,
+                SettlementState::Settled | SettlementState::Revoked
+            )
+            || component.retirement == RetirementState::Retired
+    });
+    if discharged {
+        EffectEscapeState::PartiallyDischarged
+    } else {
+        EffectEscapeState::Escaped
+    }
+}
+
 fn scope_is_quarantined(state: &State, scope: ClaimScope) -> bool {
     matches!(scope, ClaimScope::Device(device) if state.device_quarantine.contains(&device))
 }
@@ -4459,6 +7218,42 @@ fn require_active_actor(
     Ok(())
 }
 
+fn require_active_composite_actor(
+    state: &State,
+    effect: EffectId,
+    actor: PrincipalIncarnation,
+    binding_generation: u64,
+) -> Result<(), CoreError> {
+    let root = state
+        .roots
+        .get(&effect.root())
+        .ok_or(CoreError::UnknownRoot)?;
+    let live = match root.state {
+        RootRecoveryState::Active {
+            incarnation,
+            binding_generation,
+        }
+        | RootRecoveryState::Rebound {
+            successor: incarnation,
+            binding_generation,
+        } => (incarnation, binding_generation),
+        _ => return Err(CoreError::WrongRecoveryState),
+    };
+    if live != (actor, binding_generation) {
+        return Err(CoreError::StaleIncarnation);
+    }
+    let composite = state
+        .composite_effects
+        .get(&effect)
+        .ok_or(CoreError::UnknownEstate)?;
+    if composite.authority != AuthorityState::Active
+        || composite.custodian != CustodyState::Principal(actor)
+    {
+        return Err(CoreError::StaleIncarnation);
+    }
+    Ok(())
+}
+
 fn exact_claim_mut(
     state: &mut State,
     effect: EffectId,
@@ -4489,6 +7284,40 @@ fn exact_claim_mut(
         return Err(CoreError::StaleSettlementClaim);
     }
     Ok(estate)
+}
+
+fn exact_component_claim_mut(
+    state: &mut State,
+    effect: EffectId,
+    component: ComponentId,
+    claimant: PrincipalIncarnation,
+    generation: u64,
+    nonce: u64,
+) -> Result<&mut ComponentRecord, CoreError> {
+    let component_record = state
+        .composite_effects
+        .get_mut(&effect)
+        .and_then(|composite| composite.components.get_mut(&component))
+        .ok_or(CoreError::UnknownEstate)?;
+    let matches = match component_record.settlement {
+        SettlementState::Claimed {
+            claimant: expected,
+            generation: expected_generation,
+        }
+        | SettlementState::ApplyIntentDurable {
+            claimant: expected,
+            generation: expected_generation,
+        }
+        | SettlementState::AppliedUnacknowledged {
+            claimant: expected,
+            generation: expected_generation,
+        } => expected == claimant && expected_generation == generation,
+        _ => false,
+    };
+    if !matches || component_record.settlement_nonce != Some(nonce) {
+        return Err(CoreError::StaleSettlementClaim);
+    }
+    Ok(component_record)
 }
 
 fn apply_fence_incarnation(
@@ -4585,6 +7414,42 @@ fn fence_estates(state: &mut State, root: RootId) -> Result<bool, CoreError> {
         }
         refresh_retirement(estate);
     }
+    for composite in state
+        .composite_effects
+        .values_mut()
+        .filter(|composite| composite.effect.root() == root)
+    {
+        if composite_escape_state(composite) == EffectEscapeState::Released {
+            continue;
+        }
+        if composite.authority != AuthorityState::Revoked {
+            if composite.authority == AuthorityState::Active {
+                match composite.authority_epoch.checked_add(1) {
+                    Some(next) => composite.authority_epoch = next,
+                    None => authority_epoch_exhausted = true,
+                }
+            }
+            composite.authority = AuthorityState::Fenced;
+            composite.custodian = CustodyState::KernelEstate;
+        }
+        for component in composite.components.values_mut() {
+            if component.commit == CommitState::CommitIntentDurable {
+                let reason = component
+                    .commit_operation
+                    .ok_or(CoreError::InvariantViolation)?;
+                component.commit = CommitState::Committed;
+                component.commit_nonce = None;
+                component.outcome = OutcomeState::Indeterminate(reason);
+            }
+            if component.commit == CommitState::Committed {
+                initialize_component_disposition(component)?;
+                if component.obligation_policy == ObligationPolicy::SuccessorSettlement {
+                    reclaim_component_settlement(component)?;
+                }
+            }
+            refresh_component_retirement(component, composite.authority);
+        }
+    }
     Ok(authority_epoch_exhausted)
 }
 
@@ -4672,21 +7537,108 @@ fn initialize_committed_disposition(estate: &mut EstateRecord) -> Result<(), Cor
     Ok(())
 }
 
+fn initialize_component_disposition(component: &mut ComponentRecord) -> Result<(), CoreError> {
+    match (component.obligation_policy, component.settlement) {
+        (ObligationPolicy::SuccessorSettlement, SettlementState::Unavailable) => {
+            component.settlement = SettlementState::Open { generation: 1 };
+        }
+        (ObligationPolicy::RetirementEvidence, SettlementState::Unavailable) => {
+            component.settlement = SettlementState::NotRequired;
+        }
+        (ObligationPolicy::SuccessorSettlement, SettlementState::NotRequired)
+        | (ObligationPolicy::RetirementEvidence, SettlementState::Open { .. })
+        | (
+            ObligationPolicy::RetirementEvidence,
+            SettlementState::Claimed { .. }
+            | SettlementState::ApplyIntentDurable { .. }
+            | SettlementState::AppliedUnacknowledged { .. }
+            | SettlementState::ReconciliationRequired { .. }
+            | SettlementState::Settled,
+        ) => return Err(CoreError::InvariantViolation),
+        _ => {}
+    }
+    Ok(())
+}
+
+fn reclaim_component_settlement(component: &mut ComponentRecord) -> Result<(), CoreError> {
+    let next_generation =
+        match component.settlement {
+            SettlementState::Unavailable => 1,
+            SettlementState::NotRequired => return Ok(()),
+            SettlementState::Open { generation } | SettlementState::Claimed { generation, .. } => {
+                generation
+                    .checked_add(u64::from(!matches!(
+                        component.settlement,
+                        SettlementState::Open { .. }
+                    )))
+                    .ok_or(CoreError::GenerationExhausted)?
+            }
+            SettlementState::ApplyIntentDurable { generation, .. }
+            | SettlementState::AppliedUnacknowledged { generation, .. }
+            | SettlementState::ReconciliationRequired { generation, .. } => generation
+                .checked_add(1)
+                .ok_or(CoreError::GenerationExhausted)?,
+            SettlementState::Settled | SettlementState::Revoked => return Ok(()),
+        };
+    component.settlement = match component.settlement {
+        SettlementState::Claimed { .. } => match component.claim_stage {
+            Some(ClaimStage::Fresh) => SettlementState::Open {
+                generation: next_generation,
+            },
+            Some(ClaimStage::ReconcileIntent) => SettlementState::ReconciliationRequired {
+                generation: next_generation,
+                applied: false,
+            },
+            Some(ClaimStage::ReconcileApplied) => SettlementState::ReconciliationRequired {
+                generation: next_generation,
+                applied: true,
+            },
+            _ => return Err(CoreError::InvariantViolation),
+        },
+        SettlementState::ApplyIntentDurable { .. } => SettlementState::ReconciliationRequired {
+            generation: next_generation,
+            applied: false,
+        },
+        SettlementState::AppliedUnacknowledged { .. } => SettlementState::ReconciliationRequired {
+            generation: next_generation,
+            applied: true,
+        },
+        SettlementState::ReconciliationRequired { applied, .. } => {
+            SettlementState::ReconciliationRequired {
+                generation: next_generation,
+                applied,
+            }
+        }
+        SettlementState::Settled | SettlementState::Revoked | SettlementState::NotRequired => {
+            component.settlement
+        }
+        _ => SettlementState::Open {
+            generation: next_generation,
+        },
+    };
+    component.settlement_nonce = None;
+    component.claim_stage = None;
+    Ok(())
+}
+
 fn fence_root_for_boot(state: &mut State, root: RootId, max_crashes: u64) -> Result<(), CoreError> {
+    if matches!(
+        state.roots.get(&root).ok_or(CoreError::UnknownRoot)?.state,
+        RootRecoveryState::Fenced { .. } | RootRecoveryState::RecoveryExhausted { .. }
+    ) {
+        return Ok(());
+    }
     let (crashed, binding_generation, quota_exhausted) = {
         let root_record = state.roots.get_mut(&root).ok_or(CoreError::UnknownRoot)?;
-        let already_exhausted = matches!(
-            root_record.state,
-            RootRecoveryState::RecoveryExhausted { .. }
-        );
         let crashed = match root_record.state {
             RootRecoveryState::Active { incarnation, .. }
             | RootRecoveryState::Rebound {
                 successor: incarnation,
                 ..
             } => incarnation,
-            RootRecoveryState::Fenced { crashed, .. }
-            | RootRecoveryState::RecoveryExhausted { crashed, .. } => crashed,
+            RootRecoveryState::Fenced { .. } | RootRecoveryState::RecoveryExhausted { .. } => {
+                unreachable!("terminal fence states returned above")
+            }
             RootRecoveryState::Snapshotted { .. } | RootRecoveryState::Ready { .. } => {
                 PrincipalIncarnation::new(
                     root_record.origin.principal(),
@@ -4695,11 +7647,8 @@ fn fence_root_for_boot(state: &mut State, root: RootId, max_crashes: u64) -> Res
                 .map_err(|_| CoreError::InvariantViolation)?
             }
         };
-        let (crash_generation, quota_exhausted) = if already_exhausted {
-            (root_record.crash_generation, true)
-        } else {
-            next_crash_generation(root_record.crash_generation, max_crashes)
-        };
+        let (crash_generation, quota_exhausted) =
+            next_crash_generation(root_record.crash_generation, max_crashes);
         root_record.crash_generation = crash_generation;
         let binding_generation = root_record.last_binding_generation;
         root_record.state = if quota_exhausted {
@@ -4734,6 +7683,446 @@ fn next_crash_generation(current: u64, max_crashes: u64) -> (u64, bool) {
         Some(next) => (next, next > max_crashes),
         None => (u64::MAX, true),
     }
+}
+
+fn acknowledge_component_commit(
+    catalog: &DomainCatalog,
+    state: &mut State,
+    effect: EffectId,
+    component: ComponentId,
+    fact: VerifiedEffectFact,
+) -> Result<AppliedOutput, CoreError> {
+    {
+        let composite = state
+            .composite_effects
+            .get(&effect)
+            .ok_or(CoreError::UnknownEstate)?;
+        let component_record = composite
+            .components
+            .get(&component)
+            .ok_or(CoreError::UnknownObligationClass)?;
+        validate_component_fact(catalog, state, composite, component_record, fact)?;
+        if fact.kind != EffectFactKind::CommitOutcome
+            || fact.actor != composite.causal_owner
+            || fact.generation != composite.authority_epoch
+            || fact.operation != component_record.commit_operation.unwrap_or(Digest::ZERO)
+            || fact.predecessor.is_some()
+        {
+            return Err(CoreError::StaleCommitIntent);
+        }
+    }
+    let composite = state
+        .composite_effects
+        .get_mut(&effect)
+        .ok_or(CoreError::UnknownEstate)?;
+    let authority = composite.authority;
+    let component_record = composite
+        .components
+        .get_mut(&component)
+        .ok_or(CoreError::UnknownObligationClass)?;
+    if component_record.commit != CommitState::CommitIntentDurable
+        || component_record.commit_nonce != Some(fact.nonce)
+    {
+        return Err(CoreError::StaleCommitIntent);
+    }
+    component_record.outcome = match fact.outcome.ok_or(CoreError::VerificationFailed)? {
+        ExternalOutcome::Success => OutcomeState::KnownSuccess(fact.stamp.receipt_digest),
+        ExternalOutcome::Failure => OutcomeState::KnownFailure(fact.stamp.receipt_digest),
+    };
+    component_record.commit = CommitState::Committed;
+    component_record.commit_nonce = None;
+    component_record.commit_fact = Some(fact);
+    initialize_component_disposition(component_record)?;
+    refresh_component_retirement(component_record, authority);
+    Ok(AppliedOutput::none(TransitionEvent::EffectCommitted))
+}
+
+fn claim_component_settlement(
+    state: &mut State,
+    effect: EffectId,
+    component: ComponentId,
+    claimant: PrincipalIncarnation,
+) -> Result<AppliedOutput, CoreError> {
+    let root = state
+        .roots
+        .get(&effect.root())
+        .ok_or(CoreError::UnknownRoot)?;
+    let live_claimant = match root.state {
+        RootRecoveryState::Active { incarnation, .. } => incarnation,
+        RootRecoveryState::Rebound { successor, .. } => successor,
+        RootRecoveryState::RecoveryExhausted { .. } => {
+            return Err(CoreError::RecoveryExhausted);
+        }
+        _ => return Err(CoreError::WrongRecoveryState),
+    };
+    if live_claimant != claimant {
+        return Err(CoreError::StaleIncarnation);
+    }
+    let (generation, stage) = {
+        let composite = state
+            .composite_effects
+            .get(&effect)
+            .ok_or(CoreError::UnknownEstate)?;
+        let component_record = composite
+            .components
+            .get(&component)
+            .ok_or(CoreError::UnknownObligationClass)?;
+        if component_record.obligation_policy != ObligationPolicy::SuccessorSettlement {
+            return Err(CoreError::WrongSettlementStage);
+        }
+        if composite.authority == AuthorityState::Revoked {
+            return Err(CoreError::GateClosed);
+        }
+        let claimable = match component_record.settlement {
+            SettlementState::Open { generation } => (generation, ClaimStage::Fresh),
+            SettlementState::ReconciliationRequired {
+                generation,
+                applied,
+            } => (
+                generation,
+                if applied {
+                    ClaimStage::ReconcileApplied
+                } else {
+                    ClaimStage::ReconcileIntent
+                },
+            ),
+            SettlementState::Claimed { .. }
+            | SettlementState::ApplyIntentDurable { .. }
+            | SettlementState::AppliedUnacknowledged { .. } => {
+                return Err(CoreError::GateClaimed);
+            }
+            SettlementState::Settled | SettlementState::Revoked => {
+                return Err(CoreError::GateClosed);
+            }
+            SettlementState::Unavailable | SettlementState::NotRequired => {
+                return Err(CoreError::WrongSettlementStage);
+            }
+        };
+        let custody_matches = matches!(
+            (composite.authority, composite.custodian),
+            (AuthorityState::Active, CustodyState::Principal(current)) if current == claimant
+        ) || matches!(
+            (composite.authority, composite.custodian),
+            (AuthorityState::Fenced, CustodyState::KernelEstate)
+        );
+        if component_record.commit != CommitState::Committed || !custody_matches {
+            return Err(CoreError::WrongCommitState);
+        }
+        claimable
+    };
+    let nonce = allocate_nonce(state)?;
+    let component_record = state
+        .composite_effects
+        .get_mut(&effect)
+        .and_then(|composite| composite.components.get_mut(&component))
+        .expect("component validated before nonce allocation");
+    component_record.settlement = SettlementState::Claimed {
+        claimant,
+        generation,
+    };
+    component_record.settlement_nonce = Some(nonce);
+    component_record.claim_stage = Some(stage);
+    Ok(AppliedOutput {
+        event: TransitionEvent::SettlementClaimed,
+        output: OutputData::Settlement {
+            effect,
+            component: Some(component),
+            claimant,
+            generation,
+            nonce,
+            stage,
+        },
+    })
+}
+
+fn record_component_applied(
+    catalog: &DomainCatalog,
+    state: &mut State,
+    effect: EffectId,
+    component: ComponentId,
+    fact: VerifiedEffectFact,
+) -> Result<AppliedOutput, CoreError> {
+    {
+        let composite = state
+            .composite_effects
+            .get(&effect)
+            .ok_or(CoreError::UnknownEstate)?;
+        let component_record = composite
+            .components
+            .get(&component)
+            .ok_or(CoreError::UnknownObligationClass)?;
+        validate_component_fact(catalog, state, composite, component_record, fact)?;
+        if fact.kind != EffectFactKind::ApplyCompleted
+            || fact.operation != component_record.settlement_intent.unwrap_or(Digest::ZERO)
+            || fact.predecessor.is_some()
+        {
+            return Err(CoreError::StaleSettlementClaim);
+        }
+    }
+    let component_record = exact_component_claim_mut(
+        state,
+        effect,
+        component,
+        fact.actor,
+        fact.generation,
+        fact.nonce,
+    )?;
+    let next_stage = match component_record.claim_stage {
+        Some(ClaimStage::Intent) => ClaimStage::Applied,
+        Some(ClaimStage::ReconcileIntent) => ClaimStage::ReconcileApplied,
+        _ => return Err(CoreError::WrongSettlementStage),
+    };
+    component_record.settlement = SettlementState::AppliedUnacknowledged {
+        claimant: fact.actor,
+        generation: fact.generation,
+    };
+    component_record.claim_stage = Some(next_stage);
+    component_record.applied_fact = Some(fact);
+    Ok(AppliedOutput {
+        event: TransitionEvent::AppliedUnacknowledged,
+        output: OutputData::Settlement {
+            effect,
+            component: Some(component),
+            claimant: fact.actor,
+            generation: fact.generation,
+            nonce: fact.nonce,
+            stage: next_stage,
+        },
+    })
+}
+
+fn settle_component(
+    catalog: &DomainCatalog,
+    state: &mut State,
+    effect: EffectId,
+    component: ComponentId,
+    fact: VerifiedEffectFact,
+) -> Result<AppliedOutput, CoreError> {
+    {
+        let composite = state
+            .composite_effects
+            .get(&effect)
+            .ok_or(CoreError::UnknownEstate)?;
+        let component_record = composite
+            .components
+            .get(&component)
+            .ok_or(CoreError::UnknownObligationClass)?;
+        validate_component_fact(catalog, state, composite, component_record, fact)?;
+        if fact.kind != EffectFactKind::SettlementAcknowledged
+            || fact.operation != component_record.settlement_intent.unwrap_or(Digest::ZERO)
+            || fact.predecessor
+                != component_record
+                    .applied_fact
+                    .map(|applied| applied.stamp.receipt_digest)
+        {
+            return Err(CoreError::StaleSettlementClaim);
+        }
+    }
+    let authority = state
+        .composite_effects
+        .get(&effect)
+        .expect("composite was validated")
+        .authority;
+    let component_record = exact_component_claim_mut(
+        state,
+        effect,
+        component,
+        fact.actor,
+        fact.generation,
+        fact.nonce,
+    )?;
+    if !matches!(
+        component_record.claim_stage,
+        Some(ClaimStage::Applied | ClaimStage::ReconcileApplied)
+    ) {
+        return Err(CoreError::WrongSettlementStage);
+    }
+    component_record.settlement = SettlementState::Settled;
+    component_record.settlement_nonce = None;
+    component_record.claim_stage = None;
+    component_record.settlement_fact = Some(fact);
+    refresh_component_retirement(component_record, authority);
+    Ok(AppliedOutput::none(TransitionEvent::Settled))
+}
+
+fn revoke_composite_effect(
+    state: &mut State,
+    effect: EffectId,
+    expected_actor: PrincipalIncarnation,
+    authority_epoch: u64,
+) -> Result<AppliedOutput, CoreError> {
+    let composite = state
+        .composite_effects
+        .get_mut(&effect)
+        .ok_or(CoreError::UnknownEstate)?;
+    if composite.authority_epoch != authority_epoch {
+        return Err(CoreError::StaleAuthorityEpoch);
+    }
+    match (composite.authority, composite.custodian) {
+        (AuthorityState::Active, CustodyState::Principal(actor)) if actor == expected_actor => {}
+        (AuthorityState::Fenced, CustodyState::KernelEstate) => {}
+        (AuthorityState::Revoked, _) => return Err(CoreError::GateClosed),
+        _ => return Err(CoreError::StaleAuthorityEpoch),
+    }
+    if composite.components.values().any(|component| {
+        matches!(
+            component.settlement,
+            SettlementState::Claimed { .. }
+                | SettlementState::ApplyIntentDurable { .. }
+                | SettlementState::AppliedUnacknowledged { .. }
+        )
+    }) {
+        return Err(CoreError::GateClaimed);
+    }
+    if composite.components.values().all(component_terminal) {
+        return Err(CoreError::GateClosed);
+    }
+    if composite.components.values().any(|component| {
+        !matches!(
+            component.commit,
+            CommitState::Registered | CommitState::Prepared
+        ) || component.settlement != SettlementState::Unavailable
+            || component.claims.values().any(|claim| {
+                claim.retired
+                    || claim
+                        .requirements
+                        .iter()
+                        .any(|requirement| requirement.accepted.is_some())
+            })
+    }) {
+        return Err(CoreError::WrongCommitState);
+    }
+    let charge_owner = composite.charge_owner;
+    let claims = composite
+        .components
+        .iter()
+        .flat_map(|(component, record)| {
+            record.claims.values().map(|claim| {
+                (
+                    *component,
+                    claim.id,
+                    claim.credit_class,
+                    claim.scope,
+                    claim.resource,
+                    claim.resource_generation,
+                    claim.units,
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    for (component, claim, _, _, resource, resource_generation, _) in &claims {
+        let record = state
+            .resources
+            .get(resource)
+            .ok_or(CoreError::InvariantViolation)?;
+        if record.generation != *resource_generation {
+            return Err(CoreError::InvariantViolation);
+        }
+        if resource_generation.get() > 1
+            && !matches!(
+                record.phase,
+                ResourcePhase::Claimed {
+                    pending_reuse: Some(PendingReuse {
+                        effect: pending_effect,
+                        component: Some(pending_component),
+                        claim: pending_claim,
+                        ..
+                    })
+                } if pending_effect == effect
+                    && pending_component == *component
+                    && pending_claim == *claim
+            )
+        {
+            // A consumed generation+1 permit may already have authorized
+            // external reuse. It cannot be collapsed by a precommit abort.
+            return Err(CoreError::WrongCommitState);
+        }
+    }
+
+    composite.authority_epoch = composite
+        .authority_epoch
+        .checked_add(1)
+        .ok_or(CoreError::GenerationExhausted)?;
+    composite.authority = AuthorityState::Revoked;
+    composite.custodian = CustodyState::KernelEstate;
+    for component in composite.components.values_mut() {
+        component.settlement = SettlementState::Revoked;
+        component.claims.clear();
+        component.settlement_nonce = None;
+        component.claim_stage = None;
+    }
+
+    let mut released_device_scopes = BTreeSet::new();
+    for (component, claim, credit_class, scope, resource, resource_generation, units) in claims {
+        let charged = state
+            .charges
+            .get_mut(&(charge_owner, credit_class))
+            .ok_or(CoreError::InvariantViolation)?;
+        *charged = charged
+            .checked_sub(units)
+            .ok_or(CoreError::InvariantViolation)?;
+        let entries = state
+            .composite_resource_index
+            .get_mut(&resource)
+            .ok_or(CoreError::InvariantViolation)?;
+        let before = entries.len();
+        entries.retain(|entry| *entry != (effect, component, claim));
+        if entries.len() + 1 != before {
+            return Err(CoreError::InvariantViolation);
+        }
+        if entries.is_empty() {
+            state.composite_resource_index.remove(&resource);
+        }
+        if !state.resource_index.contains_key(&resource)
+            && !state.composite_resource_index.contains_key(&resource)
+        {
+            let record = *state
+                .resources
+                .get(&resource)
+                .ok_or(CoreError::InvariantViolation)?;
+            if record.generation != resource_generation
+                || !matches!(record.phase, ResourcePhase::Claimed { .. })
+            {
+                return Err(CoreError::InvariantViolation);
+            }
+            match record.phase {
+                ResourcePhase::Claimed {
+                    pending_reuse: Some(pending),
+                } => {
+                    state.resources.insert(
+                        resource,
+                        ResourceRecord {
+                            scope: record.scope,
+                            generation: pending.previous_generation,
+                            phase: ResourcePhase::Retired,
+                        },
+                    );
+                }
+                ResourcePhase::Claimed {
+                    pending_reuse: None,
+                } => {
+                    state.resources.remove(&resource);
+                }
+                ResourcePhase::Retired => return Err(CoreError::InvariantViolation),
+            }
+        }
+        if let ClaimScope::Device(scope) = scope {
+            released_device_scopes.insert(scope);
+        }
+    }
+    let composite = state
+        .composite_effects
+        .get_mut(&effect)
+        .expect("composite remains present during atomic abort");
+    for component in composite.components.values_mut() {
+        refresh_component_retirement(component, composite.authority);
+    }
+    for scope in released_device_scopes {
+        if !device_scope_has_retained_claim(state, scope) {
+            state.device_quarantine.remove(&scope);
+        }
+    }
+    Ok(AppliedOutput::none(TransitionEvent::Revoked))
 }
 
 fn apply_evidence(
@@ -4885,6 +8274,10 @@ fn apply_evidence(
         }
         if entries.is_empty() {
             state.resource_index.remove(&resource);
+        }
+        if !state.resource_index.contains_key(&resource)
+            && !state.composite_resource_index.contains_key(&resource)
+        {
             let record = state
                 .resources
                 .get_mut(&resource)
@@ -4902,18 +8295,284 @@ fn apply_evidence(
             .expect("estate remains present while evidence retires");
         refresh_retirement(estate);
         if let ClaimScope::Device(scope) = claim_scope
-            && !state.estates.values().any(|estate| {
-                estate
-                    .claims
-                    .values()
-                    .any(|claim| !claim.retired && claim.scope == ClaimScope::Device(scope))
-            })
+            && !device_scope_has_retained_claim(state, scope)
         {
             state.device_quarantine.remove(&scope);
         }
     }
 
     Ok(AppliedOutput::none(TransitionEvent::EvidenceAccepted))
+}
+
+fn apply_component_evidence(
+    catalog: &DomainCatalog,
+    state: &mut State,
+    effect: EffectId,
+    component: ComponentId,
+    claim_id: ClaimId,
+    evidence: RetirementEvidence,
+) -> Result<AppliedOutput, CoreError> {
+    require_digest(evidence.stamp.receipt_digest)?;
+    let binding_generation = state
+        .roots
+        .get(&effect.root())
+        .ok_or(CoreError::UnknownRoot)?
+        .last_binding_generation;
+    let claim_record = state
+        .composite_effects
+        .get(&effect)
+        .and_then(|composite| composite.components.get(&component))
+        .and_then(|component| component.claims.get(&claim_id))
+        .ok_or(CoreError::UnknownClaim)?;
+    let claim_scope = claim_record.scope;
+    let declared = catalog
+        .claim_rule(claim_record.domain, claim_record.kind)
+        .ok_or(CoreError::UnknownClaimClass)?
+        .evidence()
+        .iter()
+        .find(|rule| rule.kind() == evidence.kind)
+        .copied()
+        .ok_or(CoreError::UnexpectedEvidence)?;
+    if evidence.stamp.identity.verifier() != declared.verifier() {
+        return Err(CoreError::UnknownVerifier);
+    }
+    if evidence.stamp.identity.receipt_schema() != declared.receipt_schema() {
+        return Err(CoreError::ReceiptSchemaMismatch);
+    }
+    if state.verifier_epochs.get(&declared.verifier()).copied()
+        != Some(evidence.stamp.identity.epoch())
+    {
+        return Err(CoreError::StaleVerifierEpoch);
+    }
+    if declared.device_generation() == DeviceGenerationEffect::AdvanceOne {
+        let ClaimScope::Device(device_scope) = claim_scope else {
+            return Err(CoreError::InvariantViolation);
+        };
+        let current = state
+            .device_generations
+            .get(&device_scope)
+            .copied()
+            .ok_or(CoreError::WrongClaimScope)?;
+        let observed = evidence.freshness.device();
+        let next = current
+            .get()
+            .checked_add(1)
+            .and_then(|value| DeviceGeneration::new(value).ok())
+            .ok_or(CoreError::GenerationExhausted)?;
+        if observed == next {
+            state.device_generations.insert(device_scope, next);
+        } else if observed != current || observed.get() <= evidence.subject.device().get() {
+            return Err(CoreError::InvalidDeviceGenerationAdvance);
+        }
+    }
+    let current_freshness = scoped_freshness(state, claim_scope, binding_generation)?;
+    let (charge_owner, authority, credit_class, resource, resource_generation, units, retired_now) = {
+        let composite = state
+            .composite_effects
+            .get_mut(&effect)
+            .ok_or(CoreError::UnknownEstate)?;
+        let authority = composite.authority;
+        if composite.custodian == CustodyState::Released {
+            return Err(CoreError::EstateNotReleasable);
+        }
+        let component_record = composite
+            .components
+            .get_mut(&component)
+            .ok_or(CoreError::UnknownObligationClass)?;
+        if component_record.commit != CommitState::Committed {
+            return Err(CoreError::WrongCommitState);
+        }
+        if component_record.retirement == RetirementState::Released {
+            return Err(CoreError::EstateNotReleasable);
+        }
+        let claim = component_record
+            .claims
+            .get_mut(&claim_id)
+            .ok_or(CoreError::UnknownClaim)?;
+        let rule = catalog
+            .claim_rule(claim.domain, claim.kind)
+            .ok_or(CoreError::UnknownClaimClass)?;
+        if rule.evidence().len() != claim.requirements.len() {
+            return Err(CoreError::InvariantViolation);
+        }
+        if claim.retired {
+            return Err(CoreError::DuplicateEvidence);
+        }
+        let requirement_index = claim
+            .requirements
+            .iter()
+            .position(|requirement| requirement.kind == evidence.kind)
+            .ok_or(CoreError::UnexpectedEvidence)?;
+        let requirement = &claim.requirements[requirement_index];
+        if requirement.accepted.is_some() {
+            return Err(CoreError::DuplicateEvidence);
+        }
+        if let Some(prerequisite) = requirement.prerequisite
+            && !claim
+                .requirements
+                .iter()
+                .any(|candidate| candidate.kind == prerequisite && candidate.accepted.is_some())
+        {
+            return Err(CoreError::EvidenceOutOfOrder);
+        }
+        validate_evidence_freshness(
+            requirement,
+            evidence,
+            claim.enrolled_freshness,
+            current_freshness,
+            binding_generation,
+        )?;
+        claim.requirements[requirement_index].accepted = Some(AcceptedEvidence {
+            subject: evidence.subject,
+            observation: evidence.freshness,
+            stamp: evidence.stamp,
+        });
+        let retired_now = claim
+            .requirements
+            .iter()
+            .all(|requirement| requirement.accepted.is_some());
+        if retired_now {
+            claim.retired = true;
+        }
+        (
+            composite.charge_owner,
+            authority,
+            claim.credit_class,
+            claim.resource,
+            claim.resource_generation,
+            claim.units,
+            retired_now,
+        )
+    };
+    if retired_now {
+        let charged = state
+            .charges
+            .get_mut(&(charge_owner, credit_class))
+            .ok_or(CoreError::InvariantViolation)?;
+        *charged = charged
+            .checked_sub(units)
+            .ok_or(CoreError::InvariantViolation)?;
+        let entries = state
+            .composite_resource_index
+            .get_mut(&resource)
+            .ok_or(CoreError::InvariantViolation)?;
+        let before = entries.len();
+        entries.retain(|entry| *entry != (effect, component, claim_id));
+        if entries.len() + 1 != before {
+            return Err(CoreError::InvariantViolation);
+        }
+        if entries.is_empty() {
+            state.composite_resource_index.remove(&resource);
+        }
+        if !state.resource_index.contains_key(&resource)
+            && !state.composite_resource_index.contains_key(&resource)
+        {
+            let record = state
+                .resources
+                .get_mut(&resource)
+                .ok_or(CoreError::InvariantViolation)?;
+            if record.generation != resource_generation
+                || !matches!(record.phase, ResourcePhase::Claimed { .. })
+            {
+                return Err(CoreError::InvariantViolation);
+            }
+            record.phase = ResourcePhase::Retired;
+        }
+        let composite = state
+            .composite_effects
+            .get_mut(&effect)
+            .expect("composite remains present while evidence retires");
+        let component_record = composite
+            .components
+            .get_mut(&component)
+            .expect("component remains present while evidence retires");
+        refresh_component_retirement(component_record, authority);
+        if let ClaimScope::Device(scope) = claim_scope
+            && !device_scope_has_retained_claim(state, scope)
+        {
+            state.device_quarantine.remove(&scope);
+        }
+    }
+    Ok(AppliedOutput::none(TransitionEvent::EvidenceAccepted))
+}
+
+fn device_scope_has_retained_claim(state: &State, scope: DeviceScopeId) -> bool {
+    state.estates.values().any(|estate| {
+        estate
+            .claims
+            .values()
+            .any(|claim| !claim.retired && claim.scope == ClaimScope::Device(scope))
+    }) || state.composite_effects.values().any(|composite| {
+        composite.components.values().any(|component| {
+            component
+                .claims
+                .values()
+                .any(|claim| !claim.retired && claim.scope == ClaimScope::Device(scope))
+        })
+    })
+}
+
+fn device_scope_has_retained_claim_outside_composite(
+    state: &State,
+    scope: DeviceScopeId,
+    effect: EffectId,
+) -> bool {
+    state.estates.values().any(|estate| {
+        estate
+            .claims
+            .values()
+            .any(|claim| !claim.retired && claim.scope == ClaimScope::Device(scope))
+    }) || state
+        .composite_effects
+        .iter()
+        .any(|(candidate, composite)| {
+            *candidate != effect
+                && composite.components.values().any(|component| {
+                    component
+                        .claims
+                        .values()
+                        .any(|claim| !claim.retired && claim.scope == ClaimScope::Device(scope))
+                })
+        })
+}
+
+fn device_scope_has_stale_retained_claim(
+    state: &State,
+    scope: DeviceScopeId,
+) -> Result<bool, CoreError> {
+    for estate in state.estates.values() {
+        let binding_generation = state
+            .roots
+            .get(&estate.effect.root())
+            .ok_or(CoreError::InvariantViolation)?
+            .last_binding_generation;
+        let current = scoped_freshness(state, ClaimScope::Device(scope), binding_generation)?;
+        if estate.claims.values().any(|claim| {
+            !claim.retired
+                && claim.scope == ClaimScope::Device(scope)
+                && claim.enrolled_freshness != current
+        }) {
+            return Ok(true);
+        }
+    }
+    for composite in state.composite_effects.values() {
+        let binding_generation = state
+            .roots
+            .get(&composite.effect.root())
+            .ok_or(CoreError::InvariantViolation)?
+            .last_binding_generation;
+        let current = scoped_freshness(state, ClaimScope::Device(scope), binding_generation)?;
+        if composite.components.values().any(|component| {
+            component.claims.values().any(|claim| {
+                !claim.retired
+                    && claim.scope == ClaimScope::Device(scope)
+                    && claim.enrolled_freshness != current
+            })
+        }) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn validate_effect_fact(
@@ -4928,6 +8587,53 @@ fn validate_effect_fact(
     }
     let receipts = catalog
         .obligation_rule(estate.domain, estate.obligation)
+        .ok_or(CoreError::UnknownObligationClass)?
+        .receipts();
+    let binding = match fact.kind {
+        EffectFactKind::CommitOutcome => Some(receipts.commit_outcome()),
+        EffectFactKind::ApplyCompleted => receipts.apply_completed(),
+        EffectFactKind::SettlementAcknowledged => receipts.settlement_acknowledged(),
+    }
+    .ok_or(CoreError::WrongSettlementStage)?;
+    if fact.stamp.identity.verifier() != binding.verifier() {
+        return Err(CoreError::UnknownVerifier);
+    }
+    if fact.stamp.identity.receipt_schema() != binding.receipt_schema() {
+        return Err(CoreError::ReceiptSchemaMismatch);
+    }
+    if state.verifier_epochs.get(&binding.verifier()).copied() != Some(fact.stamp.identity.epoch())
+    {
+        return Err(CoreError::StaleVerifierEpoch);
+    }
+    if matches!(
+        (fact.kind, fact.outcome),
+        (EffectFactKind::CommitOutcome, None)
+            | (
+                EffectFactKind::ApplyCompleted | EffectFactKind::SettlementAcknowledged,
+                Some(_)
+            )
+    ) {
+        return Err(CoreError::VerificationFailed);
+    }
+    Ok(())
+}
+
+fn validate_component_fact(
+    catalog: &DomainCatalog,
+    state: &State,
+    composite: &CompositeEffectRecord,
+    component: &ComponentRecord,
+    fact: VerifiedEffectFact,
+) -> Result<(), CoreError> {
+    require_digest(fact.stamp.receipt_digest)?;
+    if fact.effect != composite.effect
+        || fact.component != Some(component.id)
+        || fact.freshness != component_freshness(state, composite, component)?
+    {
+        return Err(CoreError::StaleEvidence);
+    }
+    let receipts = catalog
+        .obligation_rule(component.domain, component.obligation)
         .ok_or(CoreError::UnknownObligationClass)?
         .receipts();
     let binding = match fact.kind {
@@ -5048,6 +8754,29 @@ fn refresh_retirement(estate: &mut EstateRecord) {
     };
 }
 
+fn refresh_component_retirement(component: &mut ComponentRecord, authority: AuthorityState) {
+    if component.retirement == RetirementState::Released {
+        return;
+    }
+    if component.claims.is_empty() {
+        component.retirement = if component.commit == CommitState::Committed
+            || component.settlement == SettlementState::Revoked
+        {
+            RetirementState::Retired
+        } else {
+            RetirementState::Held
+        };
+        return;
+    }
+    component.retirement = if component.claims.values().all(|claim| claim.retired) {
+        RetirementState::Retired
+    } else if component.commit == CommitState::Committed || authority != AuthorityState::Active {
+        RetirementState::RetirementPending
+    } else {
+        RetirementState::Held
+    };
+}
+
 fn project_estate(estate: &EstateRecord) -> EstateProjection {
     EstateProjection {
         effect: estate.effect,
@@ -5068,6 +8797,76 @@ fn project_estate(estate: &EstateRecord) -> EstateProjection {
             .values()
             .filter(|claim| !claim.retired)
             .count(),
+    }
+}
+
+fn project_composite_effect(composite: &CompositeEffectRecord) -> CompositeEffectProjection {
+    CompositeEffectProjection {
+        effect: composite.effect,
+        kind: composite.kind,
+        causal_owner: composite.causal_owner,
+        custodian: composite.custodian,
+        charge_owner: composite.charge_owner,
+        authority: composite.authority,
+        authority_epoch: composite.authority_epoch,
+        escape: composite_escape_state(composite),
+        component_count: composite.components.len(),
+        retained_claims: composite
+            .components
+            .values()
+            .flat_map(|component| component.claims.values())
+            .filter(|claim| !claim.retired)
+            .count(),
+    }
+}
+
+fn project_component(effect: EffectId, component: &ComponentRecord) -> ComponentProjection {
+    ComponentProjection {
+        effect,
+        component: component.id,
+        obligation: (component.domain, component.obligation),
+        obligation_policy: component.obligation_policy,
+        commit: component.commit,
+        commit_operation: component.commit_operation,
+        outcome: component.outcome,
+        settlement: component.settlement,
+        retirement: component.retirement,
+        claim_count: component.claims.len(),
+        retained_claims: component
+            .claims
+            .values()
+            .filter(|claim| !claim.retired)
+            .count(),
+    }
+}
+
+fn project_component_claim(
+    effect: EffectId,
+    component: ComponentId,
+    claim: &ClaimRecord,
+) -> ComponentClaimProjection {
+    let custodian = if claim.retired {
+        ClaimCustodian::Released
+    } else {
+        match claim.scope {
+            ClaimScope::Logical => ClaimCustodian::KernelEstate,
+            ClaimScope::Device(scope) => ClaimCustodian::DeviceProvider(scope),
+        }
+    };
+    ComponentClaimProjection {
+        effect,
+        component,
+        claim: claim.id,
+        domain: claim.domain,
+        kind: claim.kind,
+        credit_class: claim.credit_class,
+        scope: claim.scope,
+        custodian,
+        resource: claim.resource,
+        resource_generation: claim.resource_generation,
+        units: claim.units,
+        enrolled_freshness: claim.enrolled_freshness,
+        retired: claim.retired,
     }
 }
 
@@ -5145,8 +8944,85 @@ fn build_recovery_snapshot(
                 ),
         });
     }
+    let mut composites = Vec::new();
+    let mut component_items = Vec::new();
+    for composite in state
+        .composite_effects
+        .values()
+        .filter(|composite| composite.effect.root() == root)
+    {
+        let mut components = Vec::new();
+        let mut retained_claims = Vec::new();
+        for component in composite.components.values() {
+            let item = ComponentRecoveryItem {
+                effect: composite.effect,
+                component: component.id,
+                obligation: (component.domain, component.obligation),
+                authority: composite.authority,
+                authority_epoch: composite.authority_epoch,
+                commit: component.commit,
+                commit_operation: component.commit_operation,
+                outcome: component.outcome,
+                settlement: component.settlement,
+                retirement: component.retirement,
+                claim_count: component.claims.len(),
+                retained_claims: component
+                    .claims
+                    .values()
+                    .filter(|claim| !claim.retired)
+                    .count(),
+                settlement_required: component.obligation_policy
+                    == ObligationPolicy::SuccessorSettlement
+                    && component.commit == CommitState::Committed
+                    && !matches!(
+                        component.settlement,
+                        SettlementState::Settled
+                            | SettlementState::Revoked
+                            | SettlementState::NotRequired
+                    ),
+            };
+            components.push(item);
+            component_items.push(item);
+            for claim in component.claims.values().filter(|claim| !claim.retired) {
+                let mut accepted_evidence = Vec::new();
+                let mut pending_evidence = Vec::new();
+                for requirement in &claim.requirements {
+                    match requirement.accepted {
+                        Some(accepted) => accepted_evidence.push(RecoveryEvidenceItem {
+                            kind: requirement.kind,
+                            subject: accepted.subject,
+                            observation: accepted.observation,
+                            stamp: accepted.stamp,
+                        }),
+                        None => pending_evidence.push(requirement.kind),
+                    }
+                }
+                retained_claims.push(ComponentClaimRecoveryItem {
+                    claim: project_component_claim(composite.effect, component.id, claim),
+                    accepted_evidence,
+                    pending_evidence,
+                });
+            }
+        }
+        composites.push(CompositeRecoveryItem {
+            effect: composite.effect,
+            kind: composite.kind,
+            causal_owner: composite.causal_owner,
+            custodian: composite.custodian,
+            charge_owner: composite.charge_owner,
+            authority: composite.authority,
+            authority_epoch: composite.authority_epoch,
+            escape: project_composite_effect(composite).escape,
+            components,
+            retained_claims,
+        });
+    }
     let mut hasher = Sha256::new();
-    hasher.update(b"nexus.cser.recovery-snapshot.v1");
+    hasher.update(b"nexus.cser.recovery-snapshot.v2");
+    hasher.update(crate::CSER_CORE_API_PROFILE_VERSION.to_le_bytes());
+    hasher.update(crate::RECOVERY_SNAPSHOT_VERSION.to_le_bytes());
+    hasher.update(crate::JOURNAL_SCHEMA_VERSION.to_le_bytes());
+    hasher.update(catalog.digest().bytes());
     hasher.update(root.get().to_le_bytes());
     hasher.update(snapshot.get().to_le_bytes());
     hasher.update(state.revision.to_le_bytes());
@@ -5168,13 +9044,77 @@ fn build_recovery_snapshot(
         hasher.update((item.retained_claims as u64).to_le_bytes());
         hasher.update([u8::from(item.adoptable), u8::from(item.settlement_required)]);
     }
+    hasher.update([0xfd]);
+    for composite in &composites {
+        hasher.update(composite.effect.root().get().to_le_bytes());
+        hasher.update(composite.effect.sequence().to_le_bytes());
+        hasher.update(composite.kind.get().to_le_bytes());
+        hash_incarnation(&mut hasher, composite.causal_owner);
+        hash_custody(&mut hasher, composite.custodian);
+        hasher.update(composite.charge_owner.get().to_le_bytes());
+        hasher.update([authority_tag(composite.authority)]);
+        hasher.update(composite.authority_epoch.to_le_bytes());
+        hasher.update([effect_escape_tag(composite.escape)]);
+        hasher.update((composite.components.len() as u64).to_le_bytes());
+        for item in &composite.components {
+            hasher.update(item.component.get().to_le_bytes());
+            hasher.update(item.obligation.0.get().to_le_bytes());
+            hasher.update(item.obligation.1.get().to_le_bytes());
+            hasher.update([authority_tag(item.authority)]);
+            hasher.update(item.authority_epoch.to_le_bytes());
+            hasher.update([commit_tag(item.commit)]);
+            hasher.update([u8::from(item.commit_operation.is_some())]);
+            if let Some(operation) = item.commit_operation {
+                hasher.update(operation.bytes());
+            }
+            hash_outcome(&mut hasher, item.outcome);
+            hash_settlement(&mut hasher, item.settlement);
+            hasher.update([retirement_tag(item.retirement)]);
+            hasher.update((item.claim_count as u64).to_le_bytes());
+            hasher.update((item.retained_claims as u64).to_le_bytes());
+            hasher.update([u8::from(item.settlement_required)]);
+        }
+        hasher.update([0xfc]);
+        hasher.update((composite.retained_claims.len() as u64).to_le_bytes());
+        for item in &composite.retained_claims {
+            let claim = item.claim;
+            hasher.update(claim.component.get().to_le_bytes());
+            hasher.update(claim.claim.get().to_le_bytes());
+            hasher.update(claim.domain.get().to_le_bytes());
+            hasher.update(claim.kind.get().to_le_bytes());
+            hasher.update(claim.credit_class.get().to_le_bytes());
+            hash_claim_scope(&mut hasher, claim.scope);
+            hash_claim_custodian(&mut hasher, claim.custodian);
+            hasher.update(claim.resource.get().to_le_bytes());
+            hasher.update(claim.resource_generation.get().to_le_bytes());
+            hasher.update(claim.units.to_le_bytes());
+            hash_freshness(&mut hasher, claim.enrolled_freshness);
+            hasher.update((item.accepted_evidence.len() as u64).to_le_bytes());
+            for evidence in &item.accepted_evidence {
+                hasher.update(evidence.kind.get().to_le_bytes());
+                hash_freshness(&mut hasher, evidence.subject);
+                hash_freshness(&mut hasher, evidence.observation);
+                hash_verifier_stamp(&mut hasher, evidence.stamp);
+            }
+            hasher.update((item.pending_evidence.len() as u64).to_le_bytes());
+            for evidence in &item.pending_evidence {
+                hasher.update(evidence.get().to_le_bytes());
+            }
+        }
+    }
     Ok(RecoverySnapshot {
+        core_api_profile: crate::CSER_CORE_API_PROFILE_VERSION,
+        snapshot_version: crate::RECOVERY_SNAPSHOT_VERSION,
+        journal_schema: crate::JOURNAL_SCHEMA_VERSION,
+        catalog_digest: catalog.digest(),
         root,
         snapshot,
         digest: Digest::new(hasher.finalize().into()),
         covered_revision: state.revision,
         covered_head: state.head,
         items,
+        composites,
+        component_items,
     })
 }
 
@@ -5184,7 +9124,7 @@ fn check_invariants(
     state: &State,
 ) -> Result<(), CoreError> {
     if state.roots.len() > limits.max_roots
-        || state.estates.len() > limits.max_estates
+        || state.estates.len() + state.composite_effects.len() > limits.max_estates
         || state.resources.len() > limits.max_resource_records
     {
         return Err(CoreError::InvariantViolation);
@@ -5193,13 +9133,23 @@ fn check_invariants(
         .estates
         .values()
         .map(|estate| estate.claims.len())
-        .sum();
+        .sum::<usize>()
+        + state
+            .composite_effects
+            .values()
+            .flat_map(|composite| composite.components.values())
+            .map(|component| component.claims.len())
+            .sum::<usize>();
     if total_claims > limits.max_total_claims || state.next_nonce == 0 {
         return Err(CoreError::InvariantViolation);
     }
 
     let mut expected_charges: BTreeMap<(ChargeAccountId, CreditClassId), u64> = BTreeMap::new();
     let mut expected_resources: BTreeMap<ResourceId, Vec<(EffectId, ClaimId)>> = BTreeMap::new();
+    let mut expected_composite_resources: BTreeMap<
+        ResourceId,
+        Vec<(EffectId, ComponentId, ClaimId)>,
+    > = BTreeMap::new();
     let mut active_resource_generations: BTreeMap<ResourceId, ResourceGeneration> = BTreeMap::new();
     let mut active_resource_scopes: BTreeMap<ResourceId, ClaimScope> = BTreeMap::new();
     for estate in state.estates.values() {
@@ -5473,6 +9423,327 @@ fn check_invariants(
             return Err(CoreError::InvariantViolation);
         }
     }
+    for composite in state.composite_effects.values() {
+        let composite_rule = catalog
+            .composite_rule(composite.kind)
+            .ok_or(CoreError::InvariantViolation)?;
+        let root = state
+            .roots
+            .get(&composite.effect.root())
+            .ok_or(CoreError::InvariantViolation)?;
+        if state.estates.contains_key(&composite.effect)
+            || root.origin.principal() != composite.causal_owner.principal()
+            || composite.authority_epoch == 0
+            || composite.components.len() != composite_rule.components().len()
+            || !composite_rule.components().iter().all(|declared| {
+                composite
+                    .components
+                    .get(&declared.component())
+                    .is_some_and(|component| {
+                        component.domain == declared.domain()
+                            && component.obligation == declared.obligation()
+                    })
+            })
+            || !matches!(
+                (composite.authority, composite.custodian),
+                (AuthorityState::Active, CustodyState::Principal(_))
+                    | (
+                        AuthorityState::Fenced | AuthorityState::Revoked,
+                        CustodyState::KernelEstate
+                    )
+                    | (AuthorityState::Revoked, CustodyState::Released)
+            )
+        {
+            return Err(CoreError::InvariantViolation);
+        }
+        let released = composite.custodian == CustodyState::Released;
+        if released
+            != composite
+                .components
+                .values()
+                .all(|component| component.retirement == RetirementState::Released)
+        {
+            return Err(CoreError::InvariantViolation);
+        }
+        let mut claim_ids = BTreeSet::new();
+        for component in composite.components.values() {
+            let obligation_rule = catalog
+                .obligation_rule(component.domain, component.obligation)
+                .ok_or(CoreError::InvariantViolation)?;
+            if obligation_rule.policy() != component.obligation_policy
+                || component.claims.len() > limits.max_claims_per_estate
+                || component.id.get() == 0
+            {
+                return Err(CoreError::InvariantViolation);
+            }
+            for cardinality in obligation_rule.claims() {
+                let count = component
+                    .claims
+                    .values()
+                    .filter(|claim| claim.kind == cardinality.kind())
+                    .count();
+                if count > usize::from(cardinality.maximum())
+                    || (component.commit != CommitState::Registered
+                        && component.settlement != SettlementState::Revoked
+                        && count < usize::from(cardinality.minimum()))
+                {
+                    return Err(CoreError::InvariantViolation);
+                }
+            }
+            if component.claims.values().any(|claim| {
+                !obligation_rule
+                    .claims()
+                    .iter()
+                    .any(|allowed| allowed.kind() == claim.kind)
+            }) || (component.commit != CommitState::Registered
+                && component.settlement != SettlementState::Revoked
+                && component.claims.len() < usize::from(obligation_rule.minimum_total_claims()))
+            {
+                return Err(CoreError::InvariantViolation);
+            }
+            match component.commit {
+                CommitState::CommitIntentDurable
+                    if component.commit_nonce.is_none() || component.commit_operation.is_none() =>
+                {
+                    return Err(CoreError::InvariantViolation);
+                }
+                CommitState::CommitIntentDurable => {}
+                _ if component.commit_nonce.is_some() => {
+                    return Err(CoreError::InvariantViolation);
+                }
+                _ => {}
+            }
+            let receipts = obligation_rule.receipts();
+            if let Some(fact) = component.commit_fact {
+                if component.commit != CommitState::Committed
+                    || fact.kind != EffectFactKind::CommitOutcome
+                    || fact.effect != composite.effect
+                    || fact.component != Some(component.id)
+                    || fact.actor != composite.causal_owner
+                    || fact.operation != component.commit_operation.unwrap_or(Digest::ZERO)
+                    || fact.predecessor.is_some()
+                    || fact.outcome.is_none()
+                    || !fact_stamp_matches(
+                        state,
+                        fact,
+                        receipts.commit_outcome().verifier(),
+                        receipts.commit_outcome().receipt_schema(),
+                    )
+                {
+                    return Err(CoreError::InvariantViolation);
+                }
+                if matches!(
+                    component.outcome,
+                    OutcomeState::KnownSuccess(digest) | OutcomeState::KnownFailure(digest)
+                        if digest != fact.stamp.receipt_digest
+                ) {
+                    return Err(CoreError::InvariantViolation);
+                }
+            } else if matches!(
+                component.outcome,
+                OutcomeState::KnownSuccess(_) | OutcomeState::KnownFailure(_)
+            ) {
+                return Err(CoreError::InvariantViolation);
+            }
+            if let Some(fact) = component.applied_fact {
+                let Some(binding) = receipts.apply_completed() else {
+                    return Err(CoreError::InvariantViolation);
+                };
+                if fact.kind != EffectFactKind::ApplyCompleted
+                    || fact.effect != composite.effect
+                    || fact.component != Some(component.id)
+                    || fact.operation != component.settlement_intent.unwrap_or(Digest::ZERO)
+                    || fact.predecessor.is_some()
+                    || fact.outcome.is_some()
+                    || !fact_stamp_matches(
+                        state,
+                        fact,
+                        binding.verifier(),
+                        binding.receipt_schema(),
+                    )
+                {
+                    return Err(CoreError::InvariantViolation);
+                }
+            }
+            let applied_required = matches!(
+                component.settlement,
+                SettlementState::AppliedUnacknowledged { .. }
+                    | SettlementState::ReconciliationRequired { applied: true, .. }
+                    | SettlementState::Settled
+            ) || matches!(
+                component.claim_stage,
+                Some(ClaimStage::Applied | ClaimStage::ReconcileApplied)
+            );
+            if applied_required != component.applied_fact.is_some() {
+                return Err(CoreError::InvariantViolation);
+            }
+            if let Some(fact) = component.settlement_fact {
+                let Some(binding) = receipts.settlement_acknowledged() else {
+                    return Err(CoreError::InvariantViolation);
+                };
+                if component.settlement != SettlementState::Settled
+                    || fact.kind != EffectFactKind::SettlementAcknowledged
+                    || fact.effect != composite.effect
+                    || fact.component != Some(component.id)
+                    || fact.operation != component.settlement_intent.unwrap_or(Digest::ZERO)
+                    || fact.predecessor
+                        != component
+                            .applied_fact
+                            .map(|applied| applied.stamp.receipt_digest)
+                    || fact.outcome.is_some()
+                    || !fact_stamp_matches(
+                        state,
+                        fact,
+                        binding.verifier(),
+                        binding.receipt_schema(),
+                    )
+                {
+                    return Err(CoreError::InvariantViolation);
+                }
+            } else if component.settlement == SettlementState::Settled {
+                return Err(CoreError::InvariantViolation);
+            }
+            let claim_authority_live = matches!(
+                component.settlement,
+                SettlementState::Claimed { .. }
+                    | SettlementState::ApplyIntentDurable { .. }
+                    | SettlementState::AppliedUnacknowledged { .. }
+            );
+            if claim_authority_live
+                != (component.settlement_nonce.is_some() && component.claim_stage.is_some())
+            {
+                return Err(CoreError::InvariantViolation);
+            }
+            match component.obligation_policy {
+                ObligationPolicy::SuccessorSettlement
+                    if component.settlement == SettlementState::NotRequired =>
+                {
+                    return Err(CoreError::InvariantViolation);
+                }
+                ObligationPolicy::RetirementEvidence
+                    if component.commit == CommitState::Committed
+                        && component.settlement != SettlementState::NotRequired =>
+                {
+                    return Err(CoreError::InvariantViolation);
+                }
+                _ => {}
+            }
+            for claim in component.claims.values() {
+                if !claim_ids.insert(claim.id) {
+                    return Err(CoreError::InvariantViolation);
+                }
+                let rule = catalog
+                    .claim_rule(claim.domain, claim.kind)
+                    .ok_or(CoreError::InvariantViolation)?;
+                if claim.domain != component.domain
+                    || claim.credit_class != rule.credit_class()
+                    || rule.evidence().len() != claim.requirements.len()
+                    || !matches!(
+                        (rule.scope(), claim.scope),
+                        (ClaimScopePolicy::Logical, ClaimScope::Logical)
+                            | (ClaimScopePolicy::Device, ClaimScope::Device(_))
+                    )
+                    || claim.retired
+                        != claim
+                            .requirements
+                            .iter()
+                            .all(|requirement| requirement.accepted.is_some())
+                {
+                    return Err(CoreError::InvariantViolation);
+                }
+                for (requirement, declared) in claim.requirements.iter().zip(rule.evidence().iter())
+                {
+                    if requirement.kind != declared.kind()
+                        || requirement.verifier != declared.verifier()
+                        || requirement.receipt_schema != declared.receipt_schema()
+                        || requirement.subject_freshness != declared.subject_freshness()
+                        || requirement.observation_freshness != declared.observation_freshness()
+                        || requirement.strictly_advanced != declared.strictly_advanced()
+                        || requirement.device_generation != declared.device_generation()
+                        || requirement.prerequisite != declared.prerequisite()
+                    {
+                        return Err(CoreError::InvariantViolation);
+                    }
+                    if let Some(accepted) = requirement.accepted
+                        && (accepted.stamp.receipt_digest == Digest::ZERO
+                            || accepted.stamp.identity.verifier() != requirement.verifier
+                            || accepted.stamp.identity.receipt_schema()
+                                != requirement.receipt_schema
+                            || accepted.stamp.identity.epoch() == 0
+                            || !freshness_matches(
+                                requirement.subject_freshness,
+                                accepted.subject,
+                                claim.enrolled_freshness,
+                                claim.enrolled_freshness.binding(),
+                            )
+                            || !freshness_strictly_advances(
+                                requirement.strictly_advanced,
+                                accepted.subject,
+                                accepted.observation,
+                            )
+                            || requirement.prerequisite.is_some_and(|prerequisite| {
+                                !claim.requirements.iter().any(|candidate| {
+                                    candidate.kind == prerequisite && candidate.accepted.is_some()
+                                })
+                            }))
+                    {
+                        return Err(CoreError::InvariantViolation);
+                    }
+                }
+                if !claim.retired {
+                    let charged = expected_charges
+                        .entry((composite.charge_owner, claim.credit_class))
+                        .or_insert(0);
+                    *charged = charged
+                        .checked_add(claim.units)
+                        .ok_or(CoreError::InvariantViolation)?;
+                    expected_composite_resources
+                        .entry(claim.resource)
+                        .or_default()
+                        .push((composite.effect, component.id, claim.id));
+                    if active_resource_generations
+                        .insert(claim.resource, claim.resource_generation)
+                        .is_some_and(|generation| generation != claim.resource_generation)
+                    {
+                        return Err(CoreError::InvariantViolation);
+                    }
+                    if active_resource_scopes
+                        .insert(claim.resource, claim.scope)
+                        .is_some_and(|scope| scope != claim.scope)
+                    {
+                        return Err(CoreError::InvariantViolation);
+                    }
+                }
+            }
+            let retained_claims = component
+                .claims
+                .values()
+                .filter(|claim| !claim.retired)
+                .count();
+            let expected_retirement = if component.retirement == RetirementState::Released {
+                RetirementState::Released
+            } else if component.claims.is_empty() {
+                if component.commit == CommitState::Committed
+                    || component.settlement == SettlementState::Revoked
+                {
+                    RetirementState::Retired
+                } else {
+                    RetirementState::Held
+                }
+            } else if retained_claims == 0 {
+                RetirementState::Retired
+            } else if component.commit == CommitState::Committed
+                || composite.authority != AuthorityState::Active
+            {
+                RetirementState::RetirementPending
+            } else {
+                RetirementState::Held
+            };
+            if component.retirement != expected_retirement {
+                return Err(CoreError::InvariantViolation);
+            }
+        }
+    }
     for key in state.charges.keys().chain(expected_charges.keys()) {
         let actual = state.charges.get(key).copied().unwrap_or(0);
         let expected = expected_charges.get(key).copied().unwrap_or(0);
@@ -5488,6 +9759,9 @@ fn check_invariants(
     if state.resource_index != expected_resources {
         return Err(CoreError::InvariantViolation);
     }
+    if state.composite_resource_index != expected_composite_resources {
+        return Err(CoreError::InvariantViolation);
+    }
     for (resource, record) in &state.resources {
         match record.phase {
             ResourcePhase::Claimed { pending_reuse } => {
@@ -5495,15 +9769,36 @@ fn check_invariants(
                     pending.nonce == 0
                         || pending.binding_generation == 0
                         || pending.authority_epoch == 0
-                        || !state.estates.get(&pending.effect).is_some_and(|estate| {
-                            estate.claims.values().any(|claim| {
-                                !claim.retired
-                                    && claim.resource == *resource
-                                    && claim.resource_generation == record.generation
-                            })
-                        })
+                        || pending.catalog_digest != catalog.digest()
+                        || pending.retirement_digest.is_zero()
+                        || pending.reuse_contract.is_zero()
+                        || pending.previous_generation.get().checked_add(1)
+                            != Some(record.generation.get())
+                        || match pending.component {
+                            Some(component) => !state
+                                .composite_effects
+                                .get(&pending.effect)
+                                .and_then(|composite| composite.components.get(&component))
+                                .is_some_and(|component| {
+                                    component.claims.get(&pending.claim).is_some_and(|claim| {
+                                        !claim.retired
+                                            && claim.resource == *resource
+                                            && claim.resource_generation == record.generation
+                                    })
+                                }),
+                            None => !state.estates.get(&pending.effect).is_some_and(|estate| {
+                                estate.claims.get(&pending.claim).is_some_and(|claim| {
+                                    !claim.retired
+                                        && claim.resource == *resource
+                                        && claim.resource_generation == record.generation
+                                })
+                            }),
+                        }
                 });
-                if expected_resources.get(resource).is_none_or(Vec::is_empty)
+                if (expected_resources.get(resource).is_none_or(Vec::is_empty)
+                    && expected_composite_resources
+                        .get(resource)
+                        .is_none_or(Vec::is_empty))
                     || active_resource_generations.get(resource) != Some(&record.generation)
                     || active_resource_scopes.get(resource) != Some(&record.scope)
                     || pending_is_invalid
@@ -5512,7 +9807,9 @@ fn check_invariants(
                 }
             }
             ResourcePhase::Retired => {
-                if expected_resources.contains_key(resource) {
+                if expected_resources.contains_key(resource)
+                    || expected_composite_resources.contains_key(resource)
+                {
                     return Err(CoreError::InvariantViolation);
                 }
             }
@@ -5520,6 +9817,7 @@ fn check_invariants(
     }
     if expected_resources
         .keys()
+        .chain(expected_composite_resources.keys())
         .any(|resource| !state.resources.contains_key(resource))
     {
         return Err(CoreError::InvariantViolation);
@@ -5547,9 +9845,89 @@ fn check_invariants(
     Ok(())
 }
 
+fn retirement_contract_digest(
+    catalog_digest: Digest,
+    state: &State,
+    resource: ResourceId,
+    generation: ResourceGeneration,
+) -> Result<Digest, CoreError> {
+    let record = state
+        .resources
+        .get(&resource)
+        .ok_or(CoreError::UnknownResource)?;
+    if record.generation != generation || record.phase != ResourcePhase::Retired {
+        return Err(CoreError::ResourceRetained);
+    }
+
+    let mut claims = Vec::new();
+    for (effect, estate) in &state.estates {
+        for claim in estate.claims.values() {
+            if claim.resource == resource && claim.resource_generation == generation {
+                claims.push((*effect, None, claim));
+            }
+        }
+    }
+    for (effect, composite) in &state.composite_effects {
+        for (component, record) in &composite.components {
+            for claim in record.claims.values() {
+                if claim.resource == resource && claim.resource_generation == generation {
+                    claims.push((*effect, Some(*component), claim));
+                }
+            }
+        }
+    }
+    if claims.is_empty()
+        || claims.iter().any(|(_, _, claim)| {
+            !claim.retired
+                || claim
+                    .requirements
+                    .iter()
+                    .any(|requirement| requirement.accepted.is_none())
+        })
+    {
+        return Err(CoreError::InvariantViolation);
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"CSER-RESOURCE-RETIREMENT-V1");
+    hasher.update(catalog_digest.bytes());
+    hasher.update(resource.get().to_le_bytes());
+    hasher.update(generation.get().to_le_bytes());
+    hash_claim_scope(&mut hasher, record.scope);
+    hasher.update((claims.len() as u64).to_le_bytes());
+    for (effect, component, claim) in claims {
+        hasher.update(effect.root().get().to_le_bytes());
+        hasher.update(effect.sequence().to_le_bytes());
+        hash_optional_component(&mut hasher, component);
+        hasher.update(claim.id.get().to_le_bytes());
+        hasher.update(claim.domain.get().to_le_bytes());
+        hasher.update(claim.kind.get().to_le_bytes());
+        hasher.update(claim.credit_class.get().to_le_bytes());
+        hash_claim_scope(&mut hasher, claim.scope);
+        hasher.update(claim.resource.get().to_le_bytes());
+        hasher.update(claim.resource_generation.get().to_le_bytes());
+        hasher.update(claim.units.to_le_bytes());
+        hash_freshness(&mut hasher, claim.enrolled_freshness);
+        hasher.update((claim.requirements.len() as u64).to_le_bytes());
+        for requirement in &claim.requirements {
+            hasher.update(requirement.kind.get().to_le_bytes());
+            hasher.update(requirement.verifier.get().to_le_bytes());
+            hasher.update(requirement.receipt_schema.get().to_le_bytes());
+            let accepted = requirement.accepted.ok_or(CoreError::InvariantViolation)?;
+            hash_freshness(&mut hasher, accepted.subject);
+            hash_freshness(&mut hasher, accepted.observation);
+            hash_verifier_stamp(&mut hasher, accepted.stamp);
+        }
+    }
+    Ok(Digest::new(hasher.finalize().into()))
+}
+
 fn projection_digest(state: &State, catalog: Digest) -> Digest {
     let mut hasher = Sha256::new();
-    hasher.update(b"nexus.cser.projection.v5");
+    hasher.update(b"nexus.cser.projection.v6");
+    hasher.update(crate::CSER_CORE_API_PROFILE_VERSION.to_le_bytes());
+    hasher.update(crate::PROJECTION_VERSION.to_le_bytes());
+    hasher.update(crate::JOURNAL_SCHEMA_VERSION.to_le_bytes());
     hasher.update(catalog.bytes());
     hasher.update(state.revision.to_le_bytes());
     hasher.update(state.head.bytes());
@@ -5632,6 +10010,79 @@ fn projection_digest(state: &State, catalog: Digest) -> Digest {
         }
         hasher.update([0xfd]);
     }
+    hasher.update([0xf9]);
+    for (effect_id, composite) in &state.composite_effects {
+        hasher.update(effect_id.root().get().to_le_bytes());
+        hasher.update(effect_id.sequence().to_le_bytes());
+        hasher.update(composite.kind.get().to_le_bytes());
+        hash_incarnation(&mut hasher, composite.causal_owner);
+        hash_custody(&mut hasher, composite.custodian);
+        hasher.update(composite.charge_owner.get().to_le_bytes());
+        hasher.update([
+            authority_tag(composite.authority),
+            effect_escape_tag(composite_escape_state(composite)),
+        ]);
+        hasher.update(composite.authority_epoch.to_le_bytes());
+        for (component_id, component) in &composite.components {
+            hasher.update(component_id.get().to_le_bytes());
+            hasher.update(component.domain.get().to_le_bytes());
+            hasher.update(component.obligation.get().to_le_bytes());
+            hasher.update([
+                component.obligation_policy.tag(),
+                commit_tag(component.commit),
+                retirement_tag(component.retirement),
+            ]);
+            hash_outcome(&mut hasher, component.outcome);
+            hash_settlement(&mut hasher, component.settlement);
+            hash_optional_u64(&mut hasher, component.commit_nonce);
+            hash_optional_digest(&mut hasher, component.commit_operation);
+            hash_optional_effect_fact(&mut hasher, component.commit_fact);
+            hash_optional_u64(&mut hasher, component.settlement_nonce);
+            hasher.update([component.claim_stage.map(claim_stage_tag).unwrap_or(0)]);
+            hash_optional_digest(&mut hasher, component.settlement_intent);
+            hash_optional_effect_fact(&mut hasher, component.applied_fact);
+            hash_optional_effect_fact(&mut hasher, component.settlement_fact);
+            for (claim_id, claim) in &component.claims {
+                hasher.update(claim_id.get().to_le_bytes());
+                hasher.update(claim.domain.get().to_le_bytes());
+                hasher.update(claim.kind.get().to_le_bytes());
+                hasher.update(claim.credit_class.get().to_le_bytes());
+                hash_claim_scope(&mut hasher, claim.scope);
+                hasher.update(claim.resource.get().to_le_bytes());
+                hasher.update(claim.resource_generation.get().to_le_bytes());
+                hasher.update(claim.units.to_le_bytes());
+                hash_freshness(&mut hasher, claim.enrolled_freshness);
+                hasher.update([u8::from(claim.retired)]);
+                for requirement in &claim.requirements {
+                    hasher.update(requirement.kind.get().to_le_bytes());
+                    hasher.update(requirement.verifier.get().to_le_bytes());
+                    hasher.update(requirement.receipt_schema.get().to_le_bytes());
+                    hasher.update([requirement.subject_freshness.bits()]);
+                    hasher.update([requirement.observation_freshness.bits()]);
+                    hasher.update([requirement.strictly_advanced.bits()]);
+                    hasher.update([match requirement.device_generation {
+                        DeviceGenerationEffect::None => 1,
+                        DeviceGenerationEffect::AdvanceOne => 2,
+                    }]);
+                    hasher.update(
+                        requirement
+                            .prerequisite
+                            .map(EvidenceKindId::get)
+                            .unwrap_or(0)
+                            .to_le_bytes(),
+                    );
+                    hasher.update([u8::from(requirement.accepted.is_some())]);
+                    if let Some(accepted) = requirement.accepted {
+                        hash_freshness(&mut hasher, accepted.subject);
+                        hash_freshness(&mut hasher, accepted.observation);
+                        hash_verifier_stamp(&mut hasher, accepted.stamp);
+                    }
+                }
+            }
+            hasher.update([0xf8]);
+        }
+        hasher.update([0xf7]);
+    }
     hasher.update([0xfc]);
     for (resource, record) in &state.resources {
         hasher.update(resource.get().to_le_bytes());
@@ -5643,9 +10094,15 @@ fn projection_digest(state: &State, catalog: Digest) -> Digest {
                 if let Some(pending) = pending_reuse {
                     hasher.update(pending.effect.root().get().to_le_bytes());
                     hasher.update(pending.effect.sequence().to_le_bytes());
+                    hash_optional_component(&mut hasher, pending.component);
                     hash_incarnation(&mut hasher, pending.actor);
                     hasher.update(pending.binding_generation.to_le_bytes());
                     hasher.update(pending.authority_epoch.to_le_bytes());
+                    hasher.update(pending.claim.get().to_le_bytes());
+                    hasher.update(pending.previous_generation.get().to_le_bytes());
+                    hasher.update(pending.catalog_digest.bytes());
+                    hasher.update(pending.retirement_digest.bytes());
+                    hasher.update(pending.reuse_contract.bytes());
                     hasher.update(pending.nonce.to_le_bytes());
                     hash_freshness(&mut hasher, pending.freshness);
                 }
@@ -5680,6 +10137,7 @@ fn hash_optional_effect_fact(hasher: &mut Sha256, fact: Option<VerifiedEffectFac
         hasher.update([fact.kind.tag()]);
         hasher.update(fact.effect.root().get().to_le_bytes());
         hasher.update(fact.effect.sequence().to_le_bytes());
+        hash_optional_component(hasher, fact.component);
         hash_incarnation(hasher, fact.actor);
         hasher.update(fact.generation.to_le_bytes());
         hasher.update(fact.nonce.to_le_bytes());
@@ -5692,6 +10150,23 @@ fn hash_optional_effect_fact(hasher: &mut Sha256, fact: Option<VerifiedEffectFac
             Some(ExternalOutcome::Success) => 1,
             Some(ExternalOutcome::Failure) => 2,
         }]);
+    }
+}
+
+fn hash_optional_component(hasher: &mut Sha256, component: Option<ComponentId>) {
+    hasher.update([u8::from(component.is_some())]);
+    if let Some(component) = component {
+        hasher.update(component.get().to_le_bytes());
+    }
+}
+
+const fn effect_escape_tag(state: EffectEscapeState) -> u8 {
+    match state {
+        EffectEscapeState::Unescaped => 1,
+        EffectEscapeState::Escaped => 2,
+        EffectEscapeState::PartiallyDischarged => 3,
+        EffectEscapeState::Retired => 4,
+        EffectEscapeState::Released => 5,
     }
 }
 
@@ -5726,6 +10201,17 @@ fn hash_custody(hasher: &mut Sha256, custody: CustodyState) {
         }
         CustodyState::KernelEstate => hasher.update([2]),
         CustodyState::Released => hasher.update([3]),
+    }
+}
+
+fn hash_claim_custodian(hasher: &mut Sha256, custody: ClaimCustodian) {
+    match custody {
+        ClaimCustodian::KernelEstate => hasher.update([1]),
+        ClaimCustodian::DeviceProvider(scope) => {
+            hasher.update([2]);
+            hasher.update(scope.get().to_le_bytes());
+        }
+        ClaimCustodian::Released => hasher.update([3]),
     }
 }
 
@@ -5911,7 +10397,7 @@ pub enum CommandDecodeError {
 impl CommandKind {
     pub(crate) fn encode_payload(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
-        match *self {
+        match self.clone() {
             Self::CreateEstate {
                 effect,
                 origin,
@@ -6124,6 +10610,7 @@ impl CommandKind {
                 resource,
                 expected_generation,
                 units,
+                reuse_contract,
             } => {
                 put_u8(&mut bytes, 22);
                 put_effect(&mut bytes, effect);
@@ -6136,42 +10623,237 @@ impl CommandKind {
                 put_u64(&mut bytes, resource.get());
                 put_u64(&mut bytes, expected_generation.get());
                 put_u64(&mut bytes, units);
+                put_digest(&mut bytes, reuse_contract);
             }
             Self::ActivateResourceReuse {
                 effect,
+                component,
                 actor,
                 binding_generation,
                 authority_epoch,
+                claim,
                 resource,
+                previous_generation,
                 resource_generation,
+                catalog_digest,
+                retirement_digest,
+                reuse_contract,
                 nonce,
                 freshness,
             } => {
                 put_u8(&mut bytes, 23);
                 put_effect(&mut bytes, effect);
+                put_optional_component(&mut bytes, component);
                 put_incarnation(&mut bytes, actor);
                 put_u64(&mut bytes, binding_generation);
                 put_u64(&mut bytes, authority_epoch);
+                put_u64(&mut bytes, claim.get());
                 put_u64(&mut bytes, resource.get());
+                put_u64(&mut bytes, previous_generation.get());
                 put_u64(&mut bytes, resource_generation.get());
+                put_digest(&mut bytes, catalog_digest);
+                put_digest(&mut bytes, retirement_digest);
+                put_digest(&mut bytes, reuse_contract);
                 put_u64(&mut bytes, nonce);
                 put_freshness(&mut bytes, freshness);
             }
             Self::ReclaimResourceReuse {
                 effect,
+                component,
                 actor,
                 binding_generation,
                 authority_epoch,
+                claim,
                 resource,
                 resource_generation,
             } => {
                 put_u8(&mut bytes, 24);
                 put_effect(&mut bytes, effect);
+                put_optional_component(&mut bytes, component);
                 put_incarnation(&mut bytes, actor);
                 put_u64(&mut bytes, binding_generation);
                 put_u64(&mut bytes, authority_epoch);
+                put_u64(&mut bytes, claim.get());
                 put_u64(&mut bytes, resource.get());
                 put_u64(&mut bytes, resource_generation.get());
+            }
+            Self::CreateCompositeEffect {
+                effect,
+                origin,
+                binding_generation,
+                kind,
+                charge_account,
+            } => {
+                put_u8(&mut bytes, 25);
+                put_effect(&mut bytes, effect);
+                put_incarnation(&mut bytes, origin);
+                put_u64(&mut bytes, binding_generation);
+                put_u32(&mut bytes, kind.get());
+                put_u64(&mut bytes, charge_account.get());
+            }
+            Self::AddComponentClaim {
+                effect,
+                component,
+                actor,
+                binding_generation,
+                claim,
+                kind,
+                scope,
+                resource,
+                resource_generation,
+                units,
+            } => {
+                put_u8(&mut bytes, 26);
+                put_effect(&mut bytes, effect);
+                put_u32(&mut bytes, component.get());
+                put_incarnation(&mut bytes, actor);
+                put_u64(&mut bytes, binding_generation);
+                put_u64(&mut bytes, claim.get());
+                put_u32(&mut bytes, kind.get());
+                put_claim_scope(&mut bytes, scope);
+                put_u64(&mut bytes, resource.get());
+                put_u64(&mut bytes, resource_generation.get());
+                put_u64(&mut bytes, units);
+            }
+            Self::PrepareCompositeEffect {
+                effect,
+                actor,
+                binding_generation,
+            } => {
+                put_u8(&mut bytes, 27);
+                put_effect(&mut bytes, effect);
+                put_incarnation(&mut bytes, actor);
+                put_u64(&mut bytes, binding_generation);
+            }
+            Self::RecordComponentCommitIntent {
+                effect,
+                component,
+                actor,
+                binding_generation,
+                operation,
+            } => {
+                put_u8(&mut bytes, 28);
+                put_effect(&mut bytes, effect);
+                put_u32(&mut bytes, component.get());
+                put_incarnation(&mut bytes, actor);
+                put_u64(&mut bytes, binding_generation);
+                put_digest(&mut bytes, operation);
+            }
+            Self::ClaimComponentSettlement {
+                effect,
+                component,
+                claimant,
+            } => {
+                put_u8(&mut bytes, 29);
+                put_effect(&mut bytes, effect);
+                put_u32(&mut bytes, component.get());
+                put_incarnation(&mut bytes, claimant);
+            }
+            Self::RecordComponentApplyIntent {
+                effect,
+                component,
+                claimant,
+                generation,
+                nonce,
+                intent,
+            } => {
+                put_u8(&mut bytes, 30);
+                put_effect(&mut bytes, effect);
+                put_u32(&mut bytes, component.get());
+                put_incarnation(&mut bytes, claimant);
+                put_u64(&mut bytes, generation);
+                put_u64(&mut bytes, nonce);
+                put_digest(&mut bytes, intent);
+            }
+            Self::MarkComponentIndeterminate {
+                effect,
+                component,
+                claimant,
+                generation,
+                nonce,
+                reason,
+            } => {
+                put_u8(&mut bytes, 31);
+                put_effect(&mut bytes, effect);
+                put_u32(&mut bytes, component.get());
+                put_incarnation(&mut bytes, claimant);
+                put_u64(&mut bytes, generation);
+                put_u64(&mut bytes, nonce);
+                put_digest(&mut bytes, reason);
+            }
+            Self::SubmitComponentEvidence {
+                effect,
+                component,
+                claim,
+                evidence,
+            } => {
+                put_u8(&mut bytes, 32);
+                put_effect(&mut bytes, effect);
+                put_u32(&mut bytes, component.get());
+                put_u64(&mut bytes, claim.get());
+                put_u32(&mut bytes, evidence.kind.get());
+                put_freshness(&mut bytes, evidence.subject);
+                put_freshness(&mut bytes, evidence.freshness);
+                put_u32(&mut bytes, evidence.stamp.identity.verifier().get());
+                put_u64(&mut bytes, evidence.stamp.identity.epoch());
+                put_u32(&mut bytes, evidence.stamp.identity.receipt_schema().get());
+                put_digest(&mut bytes, evidence.stamp.receipt_digest);
+            }
+            Self::ReleaseCompositeEffect { effect } => {
+                put_u8(&mut bytes, 33);
+                put_effect(&mut bytes, effect);
+            }
+            Self::ReserveComponentReuse {
+                effect,
+                component,
+                actor,
+                binding_generation,
+                claim,
+                kind,
+                scope,
+                resource,
+                expected_generation,
+                units,
+                reuse_contract,
+            } => {
+                put_u8(&mut bytes, 34);
+                put_effect(&mut bytes, effect);
+                put_u32(&mut bytes, component.get());
+                put_incarnation(&mut bytes, actor);
+                put_u64(&mut bytes, binding_generation);
+                put_u64(&mut bytes, claim.get());
+                put_u32(&mut bytes, kind.get());
+                put_claim_scope(&mut bytes, scope);
+                put_u64(&mut bytes, resource.get());
+                put_u64(&mut bytes, expected_generation.get());
+                put_u64(&mut bytes, units);
+                put_digest(&mut bytes, reuse_contract);
+            }
+            Self::RecordCompositeCommitIntents {
+                effect,
+                actor,
+                binding_generation,
+                operations,
+            } => {
+                put_u8(&mut bytes, 35);
+                put_effect(&mut bytes, effect);
+                put_incarnation(&mut bytes, actor);
+                put_u64(&mut bytes, binding_generation);
+                put_u32(&mut bytes, operations.len() as u32);
+                for operation in operations {
+                    put_u32(&mut bytes, operation.component().get());
+                    put_digest(&mut bytes, operation.operation());
+                }
+            }
+            Self::RebaseCompositePrecommitClaims {
+                effect,
+                actor,
+                binding_generation,
+            } => {
+                put_u8(&mut bytes, 36);
+                put_effect(&mut bytes, effect);
+                put_incarnation(&mut bytes, actor);
+                put_u64(&mut bytes, binding_generation);
             }
         }
         bytes
@@ -6333,28 +11015,178 @@ impl CommandKind {
                 expected_generation: ResourceGeneration::new(cursor.u64()?)
                     .map_err(|_| CommandDecodeError::InvalidIdentity)?,
                 units: cursor.nonzero_u64()?,
+                reuse_contract: cursor.digest()?,
             },
             23 => Self::ActivateResourceReuse {
                 effect: cursor.effect()?,
+                component: cursor.optional_component()?,
                 actor: cursor.incarnation()?,
                 binding_generation: cursor.nonzero_u64()?,
                 authority_epoch: cursor.nonzero_u64()?,
+                claim: ClaimId::new(cursor.u64()?)
+                    .map_err(|_| CommandDecodeError::InvalidIdentity)?,
                 resource: ResourceId::new(cursor.u64()?)
+                    .map_err(|_| CommandDecodeError::InvalidIdentity)?,
+                previous_generation: ResourceGeneration::new(cursor.u64()?)
                     .map_err(|_| CommandDecodeError::InvalidIdentity)?,
                 resource_generation: ResourceGeneration::new(cursor.u64()?)
                     .map_err(|_| CommandDecodeError::InvalidIdentity)?,
+                catalog_digest: cursor.digest()?,
+                retirement_digest: cursor.digest()?,
+                reuse_contract: cursor.digest()?,
                 nonce: cursor.nonzero_u64()?,
                 freshness: cursor.freshness()?,
             },
             24 => Self::ReclaimResourceReuse {
                 effect: cursor.effect()?,
+                component: cursor.optional_component()?,
                 actor: cursor.incarnation()?,
                 binding_generation: cursor.nonzero_u64()?,
                 authority_epoch: cursor.nonzero_u64()?,
+                claim: ClaimId::new(cursor.u64()?)
+                    .map_err(|_| CommandDecodeError::InvalidIdentity)?,
                 resource: ResourceId::new(cursor.u64()?)
                     .map_err(|_| CommandDecodeError::InvalidIdentity)?,
                 resource_generation: ResourceGeneration::new(cursor.u64()?)
                     .map_err(|_| CommandDecodeError::InvalidIdentity)?,
+            },
+            25 => Self::CreateCompositeEffect {
+                effect: cursor.effect()?,
+                origin: cursor.incarnation()?,
+                binding_generation: cursor.nonzero_u64()?,
+                kind: CompositeKindId::new(cursor.u32()?)
+                    .map_err(|_| CommandDecodeError::InvalidIdentity)?,
+                charge_account: ChargeAccountId::new(cursor.u64()?)
+                    .map_err(|_| CommandDecodeError::InvalidIdentity)?,
+            },
+            26 => Self::AddComponentClaim {
+                effect: cursor.effect()?,
+                component: ComponentId::new(cursor.u32()?)
+                    .map_err(|_| CommandDecodeError::InvalidIdentity)?,
+                actor: cursor.incarnation()?,
+                binding_generation: cursor.nonzero_u64()?,
+                claim: ClaimId::new(cursor.u64()?)
+                    .map_err(|_| CommandDecodeError::InvalidIdentity)?,
+                kind: ClaimKindId::new(cursor.u32()?)
+                    .map_err(|_| CommandDecodeError::InvalidIdentity)?,
+                scope: cursor.claim_scope()?,
+                resource: ResourceId::new(cursor.u64()?)
+                    .map_err(|_| CommandDecodeError::InvalidIdentity)?,
+                resource_generation: ResourceGeneration::new(cursor.u64()?)
+                    .map_err(|_| CommandDecodeError::InvalidIdentity)?,
+                units: cursor.nonzero_u64()?,
+            },
+            27 => Self::PrepareCompositeEffect {
+                effect: cursor.effect()?,
+                actor: cursor.incarnation()?,
+                binding_generation: cursor.nonzero_u64()?,
+            },
+            28 => Self::RecordComponentCommitIntent {
+                effect: cursor.effect()?,
+                component: ComponentId::new(cursor.u32()?)
+                    .map_err(|_| CommandDecodeError::InvalidIdentity)?,
+                actor: cursor.incarnation()?,
+                binding_generation: cursor.nonzero_u64()?,
+                operation: cursor.digest()?,
+            },
+            29 => Self::ClaimComponentSettlement {
+                effect: cursor.effect()?,
+                component: ComponentId::new(cursor.u32()?)
+                    .map_err(|_| CommandDecodeError::InvalidIdentity)?,
+                claimant: cursor.incarnation()?,
+            },
+            30 => Self::RecordComponentApplyIntent {
+                effect: cursor.effect()?,
+                component: ComponentId::new(cursor.u32()?)
+                    .map_err(|_| CommandDecodeError::InvalidIdentity)?,
+                claimant: cursor.incarnation()?,
+                generation: cursor.nonzero_u64()?,
+                nonce: cursor.nonzero_u64()?,
+                intent: cursor.digest()?,
+            },
+            31 => Self::MarkComponentIndeterminate {
+                effect: cursor.effect()?,
+                component: ComponentId::new(cursor.u32()?)
+                    .map_err(|_| CommandDecodeError::InvalidIdentity)?,
+                claimant: cursor.incarnation()?,
+                generation: cursor.nonzero_u64()?,
+                nonce: cursor.nonzero_u64()?,
+                reason: cursor.digest()?,
+            },
+            32 => Self::SubmitComponentEvidence {
+                effect: cursor.effect()?,
+                component: ComponentId::new(cursor.u32()?)
+                    .map_err(|_| CommandDecodeError::InvalidIdentity)?,
+                claim: ClaimId::new(cursor.u64()?)
+                    .map_err(|_| CommandDecodeError::InvalidIdentity)?,
+                evidence: RetirementEvidence {
+                    kind: EvidenceKindId::new(cursor.u32()?)
+                        .map_err(|_| CommandDecodeError::InvalidIdentity)?,
+                    subject: cursor.freshness()?,
+                    freshness: cursor.freshness()?,
+                    stamp: VerifierStamp {
+                        identity: VerifierIdentity {
+                            verifier: VerifierId::new(cursor.u32()?)
+                                .map_err(|_| CommandDecodeError::InvalidIdentity)?,
+                            epoch: cursor.nonzero_u64()?,
+                            receipt_schema: ReceiptSchemaId::new(cursor.u32()?)
+                                .map_err(|_| CommandDecodeError::InvalidIdentity)?,
+                        },
+                        receipt_digest: cursor.digest()?,
+                    },
+                },
+            },
+            33 => Self::ReleaseCompositeEffect {
+                effect: cursor.effect()?,
+            },
+            34 => Self::ReserveComponentReuse {
+                effect: cursor.effect()?,
+                component: ComponentId::new(cursor.u32()?)
+                    .map_err(|_| CommandDecodeError::InvalidIdentity)?,
+                actor: cursor.incarnation()?,
+                binding_generation: cursor.nonzero_u64()?,
+                claim: ClaimId::new(cursor.u64()?)
+                    .map_err(|_| CommandDecodeError::InvalidIdentity)?,
+                kind: ClaimKindId::new(cursor.u32()?)
+                    .map_err(|_| CommandDecodeError::InvalidIdentity)?,
+                scope: cursor.claim_scope()?,
+                resource: ResourceId::new(cursor.u64()?)
+                    .map_err(|_| CommandDecodeError::InvalidIdentity)?,
+                expected_generation: ResourceGeneration::new(cursor.u64()?)
+                    .map_err(|_| CommandDecodeError::InvalidIdentity)?,
+                units: cursor.nonzero_u64()?,
+                reuse_contract: cursor.digest()?,
+            },
+            35 => {
+                let effect = cursor.effect()?;
+                let actor = cursor.incarnation()?;
+                let binding_generation = cursor.nonzero_u64()?;
+                let count = cursor.u32()? as usize;
+                let encoded_len = count
+                    .checked_mul(core::mem::size_of::<u32>() + 32)
+                    .ok_or(CommandDecodeError::UnexpectedEof)?;
+                if cursor.remaining() < encoded_len {
+                    return Err(CommandDecodeError::UnexpectedEof);
+                }
+                let mut operations = Vec::with_capacity(count);
+                for _ in 0..count {
+                    operations.push(ComponentCommitOperation::new(
+                        ComponentId::new(cursor.u32()?)
+                            .map_err(|_| CommandDecodeError::InvalidIdentity)?,
+                        cursor.digest()?,
+                    ));
+                }
+                Self::RecordCompositeCommitIntents {
+                    effect,
+                    actor,
+                    binding_generation,
+                    operations,
+                }
+            }
+            36 => Self::RebaseCompositePrecommitClaims {
+                effect: cursor.effect()?,
+                actor: cursor.incarnation()?,
+                binding_generation: cursor.nonzero_u64()?,
             },
             _ => return Err(CommandDecodeError::InvalidTag),
         };
@@ -6384,6 +11216,10 @@ fn put_effect(bytes: &mut Vec<u8>, effect: EffectId) {
     put_u64(bytes, effect.sequence());
 }
 
+fn put_optional_component(bytes: &mut Vec<u8>, component: Option<ComponentId>) {
+    put_u32(bytes, component.map(ComponentId::get).unwrap_or(0));
+}
+
 fn put_incarnation(bytes: &mut Vec<u8>, incarnation: PrincipalIncarnation) {
     put_u64(bytes, incarnation.principal().get());
     put_u64(bytes, incarnation.generation());
@@ -6410,6 +11246,7 @@ fn put_freshness(bytes: &mut Vec<u8>, freshness: Freshness) {
 fn put_effect_fact(bytes: &mut Vec<u8>, fact: VerifiedEffectFact) {
     put_u8(bytes, fact.kind.tag());
     put_effect(bytes, fact.effect);
+    put_optional_component(bytes, fact.component);
     put_incarnation(bytes, fact.actor);
     put_u64(bytes, fact.generation);
     put_u64(bytes, fact.nonce);
@@ -6454,6 +11291,10 @@ impl<'a> Cursor<'a> {
             .ok_or(CommandDecodeError::UnexpectedEof)?;
         self.position = end;
         Ok(value)
+    }
+
+    fn remaining(&self) -> usize {
+        self.bytes.len().saturating_sub(self.position)
     }
 
     fn u8(&mut self) -> Result<u8, CommandDecodeError> {
@@ -6505,6 +11346,17 @@ impl<'a> Cursor<'a> {
             .map_err(|_| CommandDecodeError::InvalidIdentity)
     }
 
+    fn optional_component(&mut self) -> Result<Option<ComponentId>, CommandDecodeError> {
+        let raw = self.u32()?;
+        if raw == 0 {
+            Ok(None)
+        } else {
+            ComponentId::new(raw)
+                .map(Some)
+                .map_err(|_| CommandDecodeError::InvalidIdentity)
+        }
+    }
+
     fn claim_scope(&mut self) -> Result<ClaimScope, CommandDecodeError> {
         match self.u8()? {
             1 => Ok(ClaimScope::Logical),
@@ -6537,6 +11389,7 @@ impl<'a> Cursor<'a> {
             _ => return Err(CommandDecodeError::InvalidTag),
         };
         let effect = self.effect()?;
+        let component = self.optional_component()?;
         let actor = self.incarnation()?;
         let generation = self.nonzero_u64()?;
         let nonce = self.nonzero_u64()?;
@@ -6562,6 +11415,7 @@ impl<'a> Cursor<'a> {
         Ok(VerifiedEffectFact {
             kind,
             effect,
+            component,
             actor,
             generation,
             nonce,
@@ -6586,5 +11440,201 @@ impl<'a> Cursor<'a> {
         } else {
             Err(CommandDecodeError::TrailingBytes)
         }
+    }
+}
+
+#[cfg(test)]
+mod projection_v6_tests {
+    use super::*;
+    use crate::{
+        AGENT_COMPONENT_DMA, AGENT_OPERATION_COMPOSITE, CREDIT_QUEUE_SLOT, DEVICE_CLAIM_QUEUE_SLOT,
+        DEVICE_DOMAIN, DEVICE_OBLIGATION_DMA,
+    };
+
+    fn digest(tag: u8) -> Digest {
+        Digest::new([tag; 32])
+    }
+
+    fn freshness(binding: u64, device: u64) -> Freshness {
+        Freshness::new(
+            BootGeneration::new(1).unwrap(),
+            RegistryInstance::new(2).unwrap(),
+            binding,
+            DeviceGeneration::new(device).unwrap(),
+            JournalGeneration::new(3).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn pending_reuse_mut(state: &mut State, resource: ResourceId) -> &mut PendingReuse {
+        match &mut state.resources.get_mut(&resource).unwrap().phase {
+            ResourcePhase::Claimed {
+                pending_reuse: Some(pending),
+            } => pending,
+            _ => panic!("projection fixture must retain a pending reuse contract"),
+        }
+    }
+
+    fn assert_projection_changes(
+        baseline: &State,
+        catalog: Digest,
+        mutate: impl FnOnce(&mut State),
+    ) {
+        let expected_revision = baseline.revision;
+        let expected_head = baseline.head;
+        let expected = projection_digest(baseline, catalog);
+        let mut changed = baseline.clone();
+        mutate(&mut changed);
+        assert_eq!(changed.revision, expected_revision);
+        assert_eq!(changed.head, expected_head);
+        assert_ne!(projection_digest(&changed, catalog), expected);
+    }
+
+    #[test]
+    fn projection_v6_binds_composite_claim_and_pending_reuse_fields_at_fixed_head() {
+        let catalog = crate::standard_catalog();
+        let catalog_digest = catalog.digest();
+        let mut engine = Engine::new(catalog, CoreLimits::bounded_default(), freshness(1, 1));
+        let effect = EffectId::new(RootId::new(0xc607).unwrap(), 11).unwrap();
+        let actor = PrincipalIncarnation::new(crate::PrincipalId::new(7).unwrap(), 3).unwrap();
+        let claim = ClaimId::new(17).unwrap();
+        let resource = ResourceId::new(23).unwrap();
+        let scope = ClaimScope::Device(DeviceScopeId::new(29).unwrap());
+        let mut claims = BTreeMap::new();
+        claims.insert(
+            claim,
+            ClaimRecord {
+                id: claim,
+                domain: DEVICE_DOMAIN,
+                kind: DEVICE_CLAIM_QUEUE_SLOT,
+                credit_class: CREDIT_QUEUE_SLOT,
+                scope,
+                resource,
+                resource_generation: ResourceGeneration::new(2).unwrap(),
+                units: 1,
+                enrolled_freshness: freshness(3, 2),
+                requirements: Vec::new(),
+                retired: false,
+            },
+        );
+        let mut components = BTreeMap::new();
+        components.insert(
+            AGENT_COMPONENT_DMA,
+            ComponentRecord {
+                id: AGENT_COMPONENT_DMA,
+                domain: DEVICE_DOMAIN,
+                obligation: DEVICE_OBLIGATION_DMA,
+                obligation_policy: ObligationPolicy::RetirementEvidence,
+                commit: CommitState::Registered,
+                commit_nonce: None,
+                commit_operation: None,
+                commit_fact: None,
+                outcome: OutcomeState::Pending,
+                settlement: SettlementState::NotRequired,
+                settlement_nonce: None,
+                claim_stage: None,
+                settlement_intent: None,
+                applied_fact: None,
+                settlement_fact: None,
+                retirement: RetirementState::Held,
+                claims,
+            },
+        );
+        engine.state.composite_effects.insert(
+            effect,
+            CompositeEffectRecord {
+                effect,
+                kind: AGENT_OPERATION_COMPOSITE,
+                causal_owner: actor,
+                custodian: CustodyState::Principal(actor),
+                charge_owner: ChargeAccountId::new(31).unwrap(),
+                authority: AuthorityState::Active,
+                authority_epoch: 1,
+                components,
+            },
+        );
+        engine.state.resources.insert(
+            resource,
+            ResourceRecord {
+                scope,
+                generation: ResourceGeneration::new(2).unwrap(),
+                phase: ResourcePhase::Claimed {
+                    pending_reuse: Some(PendingReuse {
+                        effect,
+                        component: Some(AGENT_COMPONENT_DMA),
+                        actor,
+                        binding_generation: 3,
+                        authority_epoch: 1,
+                        claim,
+                        previous_generation: ResourceGeneration::new(1).unwrap(),
+                        catalog_digest,
+                        retirement_digest: digest(0x41),
+                        reuse_contract: digest(0x42),
+                        nonce: 5,
+                        freshness: freshness(3, 2),
+                    }),
+                },
+            },
+        );
+
+        let baseline = engine.state;
+        let golden = projection_digest(&baseline, catalog_digest);
+        assert_eq!(
+            golden.bytes(),
+            [
+                52, 151, 145, 165, 231, 155, 248, 186, 161, 217, 230, 12, 194, 20, 133, 111, 200,
+                46, 142, 215, 64, 210, 40, 29, 33, 239, 161, 28, 108, 62, 181, 99,
+            ]
+        );
+
+        assert_projection_changes(&baseline, catalog_digest, |state| {
+            state
+                .composite_effects
+                .get_mut(&effect)
+                .unwrap()
+                .authority_epoch = 2;
+        });
+        assert_projection_changes(&baseline, catalog_digest, |state| {
+            state
+                .composite_effects
+                .get_mut(&effect)
+                .unwrap()
+                .components
+                .get_mut(&AGENT_COMPONENT_DMA)
+                .unwrap()
+                .settlement = SettlementState::Settled;
+        });
+        assert_projection_changes(&baseline, catalog_digest, |state| {
+            state
+                .composite_effects
+                .get_mut(&effect)
+                .unwrap()
+                .components
+                .get_mut(&AGENT_COMPONENT_DMA)
+                .unwrap()
+                .claims
+                .get_mut(&claim)
+                .unwrap()
+                .units = 2;
+        });
+        assert_projection_changes(&baseline, catalog_digest, |state| {
+            pending_reuse_mut(state, resource).claim = ClaimId::new(18).unwrap();
+        });
+        assert_projection_changes(&baseline, catalog_digest, |state| {
+            pending_reuse_mut(state, resource).previous_generation =
+                ResourceGeneration::new(9).unwrap();
+        });
+        assert_projection_changes(&baseline, catalog_digest, |state| {
+            pending_reuse_mut(state, resource).catalog_digest = digest(0x51);
+        });
+        assert_projection_changes(&baseline, catalog_digest, |state| {
+            pending_reuse_mut(state, resource).retirement_digest = digest(0x52);
+        });
+        assert_projection_changes(&baseline, catalog_digest, |state| {
+            pending_reuse_mut(state, resource).reuse_contract = digest(0x53);
+        });
+        assert_projection_changes(&baseline, catalog_digest, |state| {
+            pending_reuse_mut(state, resource).freshness = freshness(4, 2);
+        });
     }
 }

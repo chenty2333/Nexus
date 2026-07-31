@@ -13,8 +13,8 @@
 //! ambiguous reply instead of relying on session-local replay memory.
 //!
 //! The client surface is deliberately narrower than [`CommandRequest`]. It
-//! admits estate creation, claim enrollment, preparation, and write-ahead
-//! commit intent. Fencing, recovery, adoption, settlement, revocation,
+//! admits composite-effect creation, component-local claim enrollment,
+//! preparation, and write-ahead commit intent. Fencing, recovery, adoption, settlement, revocation,
 //! freshness checkpoints, retirement, and resource reuse belong to trusted
 //! supervisor or domain paths. Receipt-dependent transitions are represented
 //! by linear [`cser_core::Command`] values and cannot enter this interface at
@@ -25,8 +25,9 @@ extern crate core as __cser_core;
 
 use __cser_alloc::{sync::Arc, vec::Vec};
 use cser_core::{
-    ClaimProjection, CommandRequest, Digest, EffectId, EstateProjection, Freshness,
-    PressureProjection, TransitionEvent,
+    CommandRequest, ComponentClaimProjection, ComponentId, ComponentProjection,
+    CompositeEffectProjection, Digest, EffectId, Freshness, PressureProjection,
+    TransitionCoordinates, TransitionEvent, TransitionReceipt, TransitionResult,
 };
 
 /// Wire-family marker for the rebaselined portal contract.
@@ -92,10 +93,12 @@ impl PortalProtocolHeader {
 /// Non-authorizing query evaluated under the production owner's core lock.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CoreQuery {
-    /// Project one exact estate by its stable identity.
-    Estate(EffectId),
-    /// Enumerate claims for one exact estate in stable claim-id order.
-    Claims(EffectId),
+    /// Project one exact composite parent by its stable identity.
+    CompositeEffect(EffectId),
+    /// Project one exact obligation component.
+    Component(EffectId, ComponentId),
+    /// Enumerate claims for one exact component in stable claim-id order.
+    ComponentClaims(EffectId, ComponentId),
     /// Project bounded global admission and quarantine pressure.
     Pressure,
 }
@@ -158,26 +161,60 @@ impl PortalRequest {
 /// output merely to form this view is an integration error.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct CoreTransitionView {
+    core_api_profile: u16,
+    journal_schema: u16,
+    catalog_digest: Digest,
+    projection_version: u16,
+    trace_version: u16,
     revision: u64,
     head: Digest,
     projection: Digest,
+    coordinates: TransitionCoordinates,
+    result: TransitionResult,
     event: TransitionEvent,
 }
 
 impl CoreTransitionView {
-    /// Constructs a view after the owner has retained any linear output.
-    pub(crate) const fn new(
-        revision: u64,
-        head: Digest,
-        projection: Digest,
-        event: TransitionEvent,
-    ) -> Self {
+    /// Copies the non-linear metadata from an authoritative durable receipt.
+    pub(crate) const fn from_receipt(receipt: &TransitionReceipt) -> Self {
         Self {
-            revision,
-            head,
-            projection,
-            event,
+            core_api_profile: receipt.core_api_profile(),
+            journal_schema: receipt.journal_schema(),
+            catalog_digest: receipt.catalog_digest(),
+            projection_version: receipt.projection_version(),
+            trace_version: receipt.trace_version(),
+            revision: receipt.revision(),
+            head: receipt.head(),
+            projection: receipt.projection(),
+            coordinates: receipt.coordinates(),
+            result: receipt.result(),
+            event: receipt.event(),
         }
+    }
+
+    /// Returns the semantic API profile which committed the transition.
+    pub(crate) const fn core_api_profile(self) -> u16 {
+        self.core_api_profile
+    }
+
+    /// Returns the durable command grammar coordinate.
+    pub(crate) const fn journal_schema(self) -> u16 {
+        self.journal_schema
+    }
+
+    /// Returns the catalog digest used by the authoritative owner.
+    pub(crate) const fn catalog_digest(self) -> Digest {
+        self.catalog_digest
+    }
+
+    /// Returns the deterministic projection schema coordinate.
+    pub(crate) const fn projection_version(self) -> u16 {
+        self.projection_version
+    }
+
+    /// Returns the normalized trace schema coordinate.
+    pub(crate) const fn trace_version(self) -> u16 {
+        self.trace_version
     }
 
     /// Returns the committed journal revision.
@@ -193,6 +230,16 @@ impl CoreTransitionView {
     /// Returns the deterministic complete-state projection digest.
     pub(crate) const fn projection(self) -> Digest {
         self.projection
+    }
+
+    /// Returns exact normalized root/effect/component/claim coordinates.
+    pub(crate) const fn coordinates(self) -> TransitionCoordinates {
+        self.coordinates
+    }
+
+    /// Returns the normalized committed result.
+    pub(crate) const fn result(self) -> TransitionResult {
+        self.result
     }
 
     /// Returns the normalized transition event.
@@ -238,23 +285,36 @@ impl CoreObservationStamp {
 /// Non-authorizing projection returned directly from the portable core.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum CoreObservation {
-    /// Exact estate projection, or absence at the observed revision.
-    Estate {
+    /// Exact composite parent projection, or absence at the observed revision.
+    CompositeEffect {
         /// Lock-consistent core coordinates.
         stamp: CoreObservationStamp,
         /// Stable identity requested by the caller.
         effect: EffectId,
         /// Current core projection.
-        estate: Option<EstateProjection>,
+        composite: Option<CompositeEffectProjection>,
     },
-    /// Exact claim set for one estate.
-    Claims {
+    /// Exact component projection, or absence at the observed revision.
+    Component {
+        /// Lock-consistent core coordinates.
+        stamp: CoreObservationStamp,
+        /// Stable parent identity requested by the caller.
+        effect: EffectId,
+        /// Stable component slot requested by the caller.
+        component: ComponentId,
+        /// Current core projection.
+        projection: Option<ComponentProjection>,
+    },
+    /// Exact claim set for one component.
+    ComponentClaims {
         /// Lock-consistent core coordinates.
         stamp: CoreObservationStamp,
         /// Stable identity requested by the caller.
         effect: EffectId,
+        /// Stable component slot requested by the caller.
+        component: ComponentId,
         /// Current core projections in stable claim-id order.
-        claims: Vec<ClaimProjection>,
+        claims: Vec<ComponentClaimProjection>,
     },
     /// Current bounded global pressure.
     Pressure {
@@ -269,8 +329,9 @@ impl CoreObservation {
     /// Returns the coordinates bound to this projection.
     pub(crate) const fn stamp(&self) -> CoreObservationStamp {
         match self {
-            Self::Estate { stamp, .. }
-            | Self::Claims { stamp, .. }
+            Self::CompositeEffect { stamp, .. }
+            | Self::Component { stamp, .. }
+            | Self::ComponentClaims { stamp, .. }
             | Self::Pressure { stamp, .. } => *stamp,
         }
     }
@@ -300,6 +361,8 @@ pub(crate) enum TrustedTransition {
 /// Policy rejection before the production owner is called.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PortalPolicyError {
+    /// A profile-1 singleton command cannot enter production profile 2.
+    ProfileOneCommandForbidden,
     /// The operation belongs to a trusted domain or supervisor interface.
     TrustedPathRequired(TrustedTransition),
 }
@@ -404,19 +467,35 @@ impl<R: CoreRegistry> CorePortalVNext<R> {
 }
 
 fn require_client_command(request: &CommandRequest) -> Result<(), PortalPolicyError> {
+    if !request.is_profile_two_compatible() {
+        return Err(PortalPolicyError::ProfileOneCommandForbidden);
+    }
     let trusted = match request {
+        CommandRequest::CreateCompositeEffect { .. }
+        | CommandRequest::AddComponentClaim { .. }
+        | CommandRequest::PrepareCompositeEffect { .. }
+        | CommandRequest::RecordComponentCommitIntent { .. }
+        | CommandRequest::RecordCompositeCommitIntents { .. } => return Ok(()),
         CommandRequest::CreateEstate { .. }
         | CommandRequest::AddClaim { .. }
         | CommandRequest::PrepareEffect { .. }
-        | CommandRequest::RecordCommitIntent { .. } => return Ok(()),
+        | CommandRequest::RecordCommitIntent { .. } => {
+            return Err(PortalPolicyError::ProfileOneCommandForbidden);
+        }
         CommandRequest::FenceIncarnation { .. } => TrustedTransition::Fence,
         CommandRequest::Ready { .. } | CommandRequest::Rebind { .. } => TrustedTransition::Recovery,
-        CommandRequest::AdoptEffect { .. } => TrustedTransition::Adoption,
-        CommandRequest::ClaimSettlement { .. } => TrustedTransition::Settlement,
+        CommandRequest::AdoptEffect { .. }
+        | CommandRequest::RebaseCompositePrecommitClaims { .. } => TrustedTransition::Adoption,
+        CommandRequest::ClaimSettlement { .. }
+        | CommandRequest::ClaimComponentSettlement { .. } => TrustedTransition::Settlement,
         CommandRequest::BeginRevoke { .. } => TrustedTransition::Revocation,
         CommandRequest::CheckpointRecovery { .. } => TrustedTransition::FreshnessCheckpoint,
-        CommandRequest::ReleaseEstate { .. } => TrustedTransition::Retirement,
-        CommandRequest::ReserveReuse { .. } => TrustedTransition::ResourceReuse,
+        CommandRequest::ReleaseEstate { .. } | CommandRequest::ReleaseCompositeEffect { .. } => {
+            TrustedTransition::Retirement
+        }
+        CommandRequest::ReserveReuse { .. } | CommandRequest::ReserveComponentReuse { .. } => {
+            TrustedTransition::ResourceReuse
+        }
     };
     Err(PortalPolicyError::TrustedPathRequired(trusted))
 }
@@ -427,10 +506,11 @@ mod tests {
     use __cser_core::sync::atomic::{AtomicUsize, Ordering};
 
     use cser_core::{
-        BootGeneration, ChargeAccountId, ClaimId, ClaimScope, CommandRequest, CoreError,
-        DeviceGeneration, DomainId, EffectId, Freshness, JournalGeneration, ObligationKindId,
-        PrincipalId, PrincipalIncarnation, RegistryInstance, ResourceGeneration, ResourceId,
-        RootId, SnapshotId, TransitionEvent,
+        BootGeneration, ChargeAccountId, ClaimId, ClaimScope, CommandRequest,
+        ComponentCommitOperation, ComponentId, CompositeKindId, CoreError, DeviceGeneration,
+        DomainId, EffectId, Freshness, JournalGeneration, ObligationKindId, PrincipalId,
+        PrincipalIncarnation, RegistryInstance, ResourceGeneration, ResourceId, RootId, SnapshotId,
+        TransitionEvent,
     };
 
     use super::*;
@@ -455,34 +535,57 @@ mod tests {
         fn transact(&self, request: CommandRequest) -> Result<CoreTransitionView, Self::Error> {
             let count = self.transacts.fetch_add(1, Ordering::AcqRel) + 1;
             let event = match request {
-                CommandRequest::CreateEstate { .. } => TransitionEvent::EstateCreated,
-                CommandRequest::AddClaim { .. } => TransitionEvent::ClaimAdded,
-                CommandRequest::PrepareEffect { .. } => TransitionEvent::EffectPrepared,
-                CommandRequest::RecordCommitIntent { .. } => TransitionEvent::CommitIntentDurable,
+                CommandRequest::CreateEstate { .. }
+                | CommandRequest::CreateCompositeEffect { .. } => TransitionEvent::EstateCreated,
+                CommandRequest::AddClaim { .. } | CommandRequest::AddComponentClaim { .. } => {
+                    TransitionEvent::ClaimAdded
+                }
+                CommandRequest::PrepareEffect { .. }
+                | CommandRequest::PrepareCompositeEffect { .. } => TransitionEvent::EffectPrepared,
+                CommandRequest::RecordCommitIntent { .. }
+                | CommandRequest::RecordComponentCommitIntent { .. } => {
+                    TransitionEvent::CommitIntentDurable
+                }
                 _ => return Err(CoreError::InvariantViolation),
             };
-            Ok(CoreTransitionView::new(
-                count as u64,
-                digest(count as u8),
-                digest((count + 32) as u8),
+            Ok(CoreTransitionView {
+                core_api_profile: cser_core::CSER_CORE_API_PROFILE_VERSION,
+                journal_schema: cser_core::JOURNAL_SCHEMA_VERSION,
+                catalog_digest: digest(77),
+                projection_version: cser_core::PROJECTION_VERSION,
+                trace_version: cser_core::NORMALIZED_TRACE_VERSION,
+                revision: count as u64,
+                head: digest(count as u8),
+                projection: digest((count + 32) as u8),
+                coordinates: TransitionCoordinates::new(None, None, None, None),
+                result: TransitionResult::Applied,
                 event,
-            ))
+            })
         }
 
         fn observe(&self, query: CoreQuery) -> Result<CoreObservation, Self::Error> {
             self.observations.fetch_add(1, Ordering::AcqRel);
             let stamp = CoreObservationStamp::new(9, digest(9), freshness());
             match query {
-                CoreQuery::Estate(effect) => Ok(CoreObservation::Estate {
+                CoreQuery::CompositeEffect(effect) => Ok(CoreObservation::CompositeEffect {
                     stamp,
                     effect,
-                    estate: None,
+                    composite: None,
                 }),
-                CoreQuery::Claims(effect) => Ok(CoreObservation::Claims {
+                CoreQuery::Component(effect, component) => Ok(CoreObservation::Component {
                     stamp,
                     effect,
-                    claims: Vec::new(),
+                    component,
+                    projection: None,
                 }),
+                CoreQuery::ComponentClaims(effect, component) => {
+                    Ok(CoreObservation::ComponentClaims {
+                        stamp,
+                        effect,
+                        component,
+                        claims: Vec::new(),
+                    })
+                }
                 CoreQuery::Pressure => Ok(CoreObservation::Pressure {
                     stamp,
                     pressure: PressureProjection {
@@ -503,6 +606,10 @@ mod tests {
 
     fn effect() -> EffectId {
         EffectId::new(root(), 11).unwrap()
+    }
+
+    fn component() -> ComponentId {
+        ComponentId::new(17).unwrap()
     }
 
     fn actor() -> PrincipalIncarnation {
@@ -550,6 +657,31 @@ mod tests {
         }
     }
 
+    fn create_composite() -> CommandRequest {
+        CommandRequest::CreateCompositeEffect {
+            effect: effect(),
+            origin: actor(),
+            binding_generation: 4,
+            kind: CompositeKindId::new(41).unwrap(),
+            charge_account: ChargeAccountId::new(23).unwrap(),
+        }
+    }
+
+    fn add_component_claim() -> CommandRequest {
+        CommandRequest::AddComponentClaim {
+            effect: effect(),
+            component: component(),
+            actor: actor(),
+            binding_generation: 4,
+            claim: ClaimId::new(29).unwrap(),
+            kind: cser_core::ClaimKindId::new(31).unwrap(),
+            scope: ClaimScope::Logical,
+            resource: ResourceId::new(37).unwrap(),
+            resource_generation: ResourceGeneration::new(1).unwrap(),
+            units: 1,
+        }
+    }
+
     #[test]
     fn protocol_identity_is_distinct_and_fail_closed() {
         assert_eq!(NXP3_MAGIC, *b"NXP3");
@@ -574,7 +706,7 @@ mod tests {
     }
 
     #[test]
-    fn only_client_lifecycle_prefix_reaches_the_shared_owner() {
+    fn profile_one_client_prefix_is_rejected_before_the_shared_owner() {
         let owner = Arc::new(FakeRegistry::new());
         let portal = CorePortalVNext::new(Arc::clone(&owner));
         let commands = [
@@ -595,14 +727,53 @@ mod tests {
 
         for (index, command) in commands.into_iter().enumerate() {
             let request_id = u64::try_from(index).unwrap() + 1;
+            assert_eq!(
+                portal.dispatch(PortalRequest::transact(request_id, command).unwrap()),
+                Err(PortalDispatchError::Policy(
+                    PortalPolicyError::ProfileOneCommandForbidden
+                ))
+            );
+        }
+        assert_eq!(owner.transacts.load(Ordering::Acquire), 0);
+        assert_eq!(Arc::strong_count(&owner), 2);
+    }
+
+    #[test]
+    fn composite_creation_prefix_reaches_the_shared_owner() {
+        let owner = Arc::new(FakeRegistry::new());
+        let portal = CorePortalVNext::new(Arc::clone(&owner));
+        let commands = [
+            create_composite(),
+            add_component_claim(),
+            CommandRequest::PrepareCompositeEffect {
+                effect: effect(),
+                actor: actor(),
+                binding_generation: 4,
+            },
+            CommandRequest::RecordComponentCommitIntent {
+                effect: effect(),
+                component: component(),
+                actor: actor(),
+                binding_generation: 4,
+                operation: digest(43),
+            },
+            CommandRequest::RecordCompositeCommitIntents {
+                effect: effect(),
+                actor: actor(),
+                binding_generation: 4,
+                operations: vec![ComponentCommitOperation::new(component(), digest(44))],
+            },
+        ];
+
+        for (index, command) in commands.into_iter().enumerate() {
+            let request_id = u64::try_from(index).unwrap() + 1;
             let response = portal
                 .dispatch(PortalRequest::transact(request_id, command).unwrap())
                 .unwrap();
             assert_eq!(response.request_id(), request_id);
             assert!(matches!(response.body(), PortalResponseBody::Transition(_)));
         }
-        assert_eq!(owner.transacts.load(Ordering::Acquire), 4);
-        assert_eq!(Arc::strong_count(&owner), 2);
+        assert_eq!(owner.transacts.load(Ordering::Acquire), 5);
     }
 
     #[test]
@@ -644,8 +815,24 @@ mod tests {
                 TrustedTransition::Adoption,
             ),
             (
+                CommandRequest::RebaseCompositePrecommitClaims {
+                    effect: effect(),
+                    actor: actor(),
+                    binding_generation: 4,
+                },
+                TrustedTransition::Adoption,
+            ),
+            (
                 CommandRequest::ClaimSettlement {
                     effect: effect(),
+                    claimant: actor(),
+                },
+                TrustedTransition::Settlement,
+            ),
+            (
+                CommandRequest::ClaimComponentSettlement {
+                    effect: effect(),
+                    component: component(),
                     claimant: actor(),
                 },
                 TrustedTransition::Settlement,
@@ -672,6 +859,10 @@ mod tests {
                 TrustedTransition::Retirement,
             ),
             (
+                CommandRequest::ReleaseCompositeEffect { effect: effect() },
+                TrustedTransition::Retirement,
+            ),
+            (
                 CommandRequest::ReserveReuse {
                     effect: effect(),
                     actor: actor(),
@@ -683,6 +874,23 @@ mod tests {
                     resource: ResourceId::new(37).unwrap(),
                     expected_generation: ResourceGeneration::new(1).unwrap(),
                     units: 1,
+                    reuse_contract: digest(17),
+                },
+                TrustedTransition::ResourceReuse,
+            ),
+            (
+                CommandRequest::ReserveComponentReuse {
+                    effect: effect(),
+                    component: component(),
+                    actor: actor(),
+                    binding_generation: 4,
+                    claim: ClaimId::new(53).unwrap(),
+                    kind: cser_core::ClaimKindId::new(31).unwrap(),
+                    scope: ClaimScope::Logical,
+                    resource: ResourceId::new(37).unwrap(),
+                    expected_generation: ResourceGeneration::new(1).unwrap(),
+                    units: 1,
+                    reuse_contract: digest(18),
                 },
                 TrustedTransition::ResourceReuse,
             ),
@@ -708,8 +916,9 @@ mod tests {
         let portal = CorePortalVNext::new(Arc::clone(&owner));
 
         for query in [
-            CoreQuery::Estate(effect()),
-            CoreQuery::Claims(effect()),
+            CoreQuery::CompositeEffect(effect()),
+            CoreQuery::Component(effect(), component()),
+            CoreQuery::ComponentClaims(effect(), component()),
             CoreQuery::Pressure,
         ] {
             let response = portal
@@ -722,9 +931,9 @@ mod tests {
             assert_eq!(observation.stamp().head(), digest(9));
             assert_eq!(observation.stamp().freshness(), freshness());
         }
-        assert_eq!(owner.observations.load(Ordering::Acquire), 3);
+        assert_eq!(owner.observations.load(Ordering::Acquire), 4);
 
-        let request = PortalRequest::transact(60, create()).unwrap();
+        let request = PortalRequest::transact(60, create_composite()).unwrap();
         portal.dispatch(request.clone()).unwrap();
         portal.dispatch(request).unwrap();
         assert_eq!(owner.transacts.load(Ordering::Acquire), 2);

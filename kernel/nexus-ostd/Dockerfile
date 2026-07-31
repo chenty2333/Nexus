@@ -14,11 +14,15 @@ ARG OSTD_CRATE_URL=https://static.crates.io/crates/ostd/ostd-0.18.0.crate
 ARG VIRTIO_DRIVERS_CRATE_SHA256=cfdc1c628cdd8ce7c3b9e65a8ed550d0338e9ef9f911e729666f1cce097de2f7
 ARG VIRTIO_DRIVERS_CRATE_URL=https://static.crates.io/crates/virtio-drivers/virtio-drivers-0.13.0.crate
 COPY patches/ostd-0.18.0-cser.patch /tmp/nexus-patches/ostd-0.18.0-cser.patch
+COPY kernel/nexus-ostd/patches/ostd-0.18.0-cser-arena.patch \
+    /tmp/nexus-patches/ostd-0.18.0-cser-arena.patch
 COPY patches/virtio-drivers-0.13.0-cser.patch \
     /tmp/nexus-patches/virtio-drivers-0.13.0-cser.patch
 COPY patches/virtio-drivers-0.13.0-LICENSE-MIT \
     /tmp/nexus-patches/virtio-drivers-0.13.0-LICENSE-MIT
 COPY tools/ostd/assert-cser-patch.sh /usr/local/bin/assert-ostd-cser-patch
+COPY kernel/nexus-ostd/patches/assert-ostd-cser-arena-patch.sh \
+    /usr/local/bin/assert-ostd-cser-arena-patch
 COPY tools/virtio/assert-cser-patch.sh /usr/local/bin/assert-virtio-cser-patch
 COPY tools/virtio/assert-production-substrate.sh \
     /usr/local/bin/assert-production-virtio-substrate
@@ -32,6 +36,14 @@ RUN set -eu; \
         < /tmp/nexus-patches/ostd-0.18.0-cser.patch; \
     patch --batch --dry-run --reverse -d /opt/nexus-ostd/ostd-0.18.0 -p1 \
         < /tmp/nexus-patches/ostd-0.18.0-cser.patch; \
+    /usr/local/bin/assert-ostd-cser-patch \
+        /tmp/nexus-patches/ostd-0.18.0-cser.patch \
+        /opt/nexus-ostd/ostd-0.18.0; \
+    patch --fuzz=0 --batch --forward -d /opt/nexus-ostd/ostd-0.18.0 -p1 \
+        < /tmp/nexus-patches/ostd-0.18.0-cser-arena.patch; \
+    patch --fuzz=0 --batch --dry-run --reverse \
+        -d /opt/nexus-ostd/ostd-0.18.0 -p1 \
+        < /tmp/nexus-patches/ostd-0.18.0-cser-arena.patch; \
     virtio_archive=/opt/nexus-source/virtio-drivers-0.13.0.crate; \
     curl --fail --silent --show-error --location "$VIRTIO_DRIVERS_CRATE_URL" \
         --output "$virtio_archive"; \
@@ -43,9 +55,10 @@ RUN set -eu; \
         -d /opt/nexus-virtio/virtio-drivers-0.13.0 -p1 \
         < /tmp/nexus-patches/virtio-drivers-0.13.0-cser.patch; \
     chmod -R a+rX /opt/nexus-source /opt/nexus-ostd /opt/nexus-virtio; \
-    /usr/local/bin/assert-ostd-cser-patch \
-        /tmp/nexus-patches/ostd-0.18.0-cser.patch \
-        /opt/nexus-ostd/ostd-0.18.0; \
+    /usr/local/bin/assert-ostd-cser-arena-patch \
+        /tmp/nexus-patches/ostd-0.18.0-cser-arena.patch \
+        /opt/nexus-ostd/ostd-0.18.0 \
+        /tmp/nexus-patches/ostd-0.18.0-cser.patch; \
     /usr/local/bin/assert-virtio-cser-patch \
         /tmp/nexus-patches/virtio-drivers-0.13.0-cser.patch \
         /opt/nexus-virtio/virtio-drivers-0.13.0 \
@@ -61,6 +74,7 @@ RUN cargo test --manifest-path /opt/nexus-virtio/virtio-drivers-0.13.0/Cargo.tom
 
 COPY kernel/nexus-ostd/src/cser/core_device_quarantine.rs \
     kernel/nexus-ostd/src/cser/core_dma_adapter.rs \
+    kernel/nexus-ostd/src/cser/core_dma_arena_allocator.rs \
     kernel/nexus-ostd/src/cser/core_persistent_runtime.rs \
     kernel/nexus-ostd/src/cser/core_pio_journal.rs \
     kernel/nexus-ostd/src/cser/core_portal_vnext.rs \

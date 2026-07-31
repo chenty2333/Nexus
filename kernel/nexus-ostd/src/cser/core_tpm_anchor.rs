@@ -39,7 +39,7 @@
 //! - an index auth value compiled into a kernel image is test provisioning,
 //!   not a production secret-distribution design.
 
-use alloc::{vec, vec::Vec};
+use alloc::{boxed::Box, vec, vec::Vec};
 use core::{
     hint::spin_loop,
     sync::atomic::{AtomicBool, Ordering},
@@ -312,6 +312,85 @@ impl<E> From<PersistenceProtocolError> for TpmNvAnchorError<E> {
     }
 }
 
+/// Inspected TPM2 NV state which is not yet bound to one expected deployment.
+///
+/// Inspection validates the index layout, selected slots, agreement between the
+/// tip and lease bindings, and monotonic freshness while retaining both the
+/// transport and the boot-lifetime single-writer lease. It deliberately does
+/// not authorize the observed catalog/Registry/binding tuple. Only
+/// [`Self::bind`] may turn this linear candidate into a trusted-anchor backend.
+pub(crate) struct TpmNvAnchorCandidate<T> {
+    transport: Option<T>,
+    layout: TpmNvLayout,
+    auth: TpmNvIndexAuth,
+    tip_sequence: u64,
+    lease_sequence: u64,
+    committed: TrustedAnchorSnapshot,
+    issued: Freshness,
+    _exclusive: ExclusiveProviderLease,
+}
+
+type TpmNvBindingRejection<T> = Box<(
+    TpmNvAnchorCandidate<T>,
+    TpmNvAnchorError<<T as TpmNvTransport>::Error>,
+)>;
+
+impl<T> TpmNvAnchorCandidate<T>
+where
+    T: TpmNvTransport,
+{
+    /// Returns the selected tip as trusted TPM state, without asserting that its
+    /// deployment binding is the caller's expected binding.
+    pub(crate) const fn committed(&self) -> TrustedAnchorSnapshot {
+        self.committed
+    }
+
+    /// Returns the greatest recovery freshness durably issued by the selected
+    /// lease slot, without asserting a deployment binding.
+    pub(crate) const fn issued(&self) -> Freshness {
+        self.issued
+    }
+
+    /// Consumes this candidate only when its internally coherent binding is the
+    /// exact binding expected by the caller.
+    ///
+    /// A mismatch returns the unchanged candidate so boot code can retain the
+    /// TPM transport and single-writer authority while keeping an already
+    /// established device quarantine alive.
+    pub(crate) fn bind(
+        self,
+        expected_binding: RecoveryBinding,
+    ) -> Result<TpmNvTrustedAnchor<T>, TpmNvBindingRejection<T>> {
+        if self.committed.binding() != expected_binding {
+            return Err(Box::new((
+                self,
+                PersistenceProtocolError::BindingMismatch.into(),
+            )));
+        }
+        let Self {
+            transport,
+            layout,
+            auth,
+            tip_sequence,
+            lease_sequence,
+            committed,
+            issued,
+            _exclusive,
+        } = self;
+        Ok(TpmNvTrustedAnchor {
+            transport,
+            layout,
+            auth,
+            expected_binding,
+            tip_sequence,
+            lease_sequence,
+            committed,
+            issued,
+            _exclusive,
+        })
+    }
+}
+
 /// TPM2 NV implementation of the portable core's trusted-anchor backend.
 ///
 /// Construction validates the exact public attributes and selected state of
@@ -334,30 +413,44 @@ impl<T> TpmNvTrustedAnchor<T>
 where
     T: TpmNvTransport,
 {
-    pub(crate) fn open(
+    /// Inspects internally coherent TPM state without authorizing its deployment
+    /// binding.
+    pub(crate) fn inspect(
         mut transport: T,
         layout: TpmNvLayout,
         auth: TpmNvIndexAuth,
-        expected_binding: RecoveryBinding,
-    ) -> Result<Self, TpmNvAnchorError<T::Error>> {
+    ) -> Result<TpmNvAnchorCandidate<T>, TpmNvAnchorError<T::Error>> {
         let exclusive = ExclusiveProviderLease::acquire()?;
         validate_unique_indices(layout)?;
         validate_index_publics(&mut transport, layout)?;
         let (tip_sequence, committed) = read_selected_tip(&mut transport, layout, &auth)?;
         let (lease_sequence, lease_binding, issued) =
             read_selected_lease(&mut transport, layout, &auth)?;
-        validate_loaded_state(expected_binding, committed, lease_binding, issued)?;
-        Ok(Self {
+        validate_inspected_state(committed, lease_binding, issued)?;
+        Ok(TpmNvAnchorCandidate {
             transport: Some(transport),
             layout,
             auth,
-            expected_binding,
             tip_sequence,
             lease_sequence,
             committed,
             issued,
             _exclusive: exclusive,
         })
+    }
+
+    pub(crate) fn open(
+        transport: T,
+        layout: TpmNvLayout,
+        auth: TpmNvIndexAuth,
+        expected_binding: RecoveryBinding,
+    ) -> Result<Self, TpmNvAnchorError<T::Error>> {
+        Self::inspect(transport, layout, auth)?
+            .bind(expected_binding)
+            .map_err(|rejected| {
+                let (_candidate, error) = *rejected;
+                error
+            })
     }
 
     pub(crate) const fn committed(&self) -> TrustedAnchorSnapshot {
@@ -605,8 +698,19 @@ fn validate_loaded_state<E>(
     lease_binding: RecoveryBinding,
     issued: Freshness,
 ) -> Result<(), TpmNvAnchorError<E>> {
-    if committed.binding() != expected_binding
-        || lease_binding != expected_binding
+    validate_inspected_state(committed, lease_binding, issued)?;
+    if committed.binding() != expected_binding {
+        return Err(PersistenceProtocolError::BindingMismatch.into());
+    }
+    Ok(())
+}
+
+fn validate_inspected_state<E>(
+    committed: TrustedAnchorSnapshot,
+    lease_binding: RecoveryBinding,
+    issued: Freshness,
+) -> Result<(), TpmNvAnchorError<E>> {
+    if committed.binding() != lease_binding
         || issued.registry() != lease_binding.registry()
         || issued.binding() != lease_binding.binding()
     {
@@ -1617,6 +1721,47 @@ mod tests {
 
     fn auth() -> TpmNvIndexAuth {
         TpmNvIndexAuth::new(b"ktest-only-index-auth").unwrap()
+    }
+
+    #[ktest]
+    fn inspected_candidate_retains_authority_across_binding_rejection() {
+        let layout = TpmNvLayout::qemu_fixture();
+        let observed_binding = binding();
+        let observed_freshness = freshness(1, 1, 1);
+        let transport = MockNv::provision(layout, 1, observed_binding, observed_freshness);
+        let candidate = TpmNvTrustedAnchor::inspect(transport, layout, auth()).unwrap();
+        assert_eq!(candidate.committed().binding(), observed_binding);
+        assert_eq!(candidate.issued(), observed_freshness);
+
+        let expected_binding = RecoveryBinding::new(
+            digest(8),
+            observed_binding.registry(),
+            observed_binding.binding(),
+        )
+        .unwrap();
+        let (candidate, error) = match candidate.bind(expected_binding) {
+            Ok(_) => panic!("foreign candidate binding must fail closed"),
+            Err(rejected) => *rejected,
+        };
+        assert!(matches!(
+            error,
+            TpmNvAnchorError::Protocol(PersistenceProtocolError::BindingMismatch)
+        ));
+        assert_eq!(candidate.committed().binding(), observed_binding);
+        assert_eq!(candidate.issued(), observed_freshness);
+
+        let second_transport = MockNv::provision(layout, 1, observed_binding, observed_freshness);
+        assert!(matches!(
+            TpmNvTrustedAnchor::inspect(second_transport, layout, auth()),
+            Err(TpmNvAnchorError::ProviderAlreadyOpen)
+        ));
+
+        let anchor = match candidate.bind(observed_binding) {
+            Ok(anchor) => anchor,
+            Err(_) => panic!("exact observed binding must consume the candidate"),
+        };
+        assert_eq!(anchor.committed().binding(), observed_binding);
+        assert_eq!(anchor.issued(), observed_freshness);
     }
 
     #[ktest]

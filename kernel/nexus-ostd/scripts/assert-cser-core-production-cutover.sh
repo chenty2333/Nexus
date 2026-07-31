@@ -70,9 +70,14 @@ kernel_entry=$repo_root/kernel/nexus-ostd/src/lib.rs
 root_workflow=$repo_root/x
 kernel_workflow=$repo_root/kernel/nexus-ostd/x
 core_lib=$repo_root/crates/cser-core/src/lib.rs
+core_engine=$repo_root/crates/cser-core/src/engine.rs
 core_journal=$repo_root/crates/cser-core/src/journal.rs
+core_profiles=$repo_root/crates/cser-core/src/profiles.rs
 production_registry=$cser_source_root/core_production_registry.rs
+portal_vnext=$cser_source_root/core_portal_vnext.rs
 persistent_runtime=$cser_source_root/core_persistent_runtime.rs
+reply_outbox=$cser_source_root/core_reply_outbox.rs
+tpm_anchor=$cser_source_root/core_tpm_anchor.rs
 
 for input in \
     "$manifest" \
@@ -82,18 +87,46 @@ for input in \
     "$root_workflow" \
     "$kernel_workflow" \
     "$core_lib" \
+    "$core_engine" \
     "$core_journal" \
+    "$core_profiles" \
     "$production_registry" \
-    "$persistent_runtime"; do
+    "$portal_vnext" \
+    "$persistent_runtime" \
+    "$reply_outbox" \
+    "$tpm_anchor"; do
     [[ -f $input && ! -L $input ]] || fail "required input is not a regular non-symlink file: $input"
 done
 [[ -d $cser_source_root && ! -L $cser_source_root ]] \
     || fail "CSER source root is not a directory: $cser_source_root"
 
-grep -Fxq 'pub const CSER_CORE_API_PROFILE_VERSION: u16 = 1;' "$core_lib" \
-    || fail 'portable core API profile 1 is not frozen at the cutover'
-grep -Fxq 'pub const JOURNAL_SCHEMA_VERSION: u16 = 5;' "$core_journal" \
-    || fail 'portable core journal schema 5 is not frozen at the cutover'
+grep -Fxq 'pub const CSER_CORE_API_PROFILE_VERSION: u16 = 2;' "$core_lib" \
+    || fail 'portable core API profile 2 is not frozen at the cutover'
+grep -Fxq 'pub const STANDARD_CATALOG_VERSION: u16 = 5;' "$core_lib" \
+    || fail 'portable standard catalog v5 is not frozen at the cutover'
+grep -Fxq 'pub const PROJECTION_VERSION: u16 = 6;' "$core_lib" \
+    || fail 'portable projection v6 is not frozen at the cutover'
+grep -Fxq 'pub const RECOVERY_SNAPSHOT_VERSION: u16 = 2;' "$core_lib" \
+    || fail 'portable recovery snapshot v2 is not frozen at the cutover'
+grep -Fxq 'pub const JOURNAL_MAGIC: [u8; 8] = *b"CSERJR6\0";' "$core_journal" \
+    || fail 'portable core journal magic is not bound to schema 6'
+grep -Fxq 'pub const JOURNAL_SCHEMA_VERSION: u16 = 6;' "$core_journal" \
+    || fail 'portable core journal schema 6 is not frozen at the cutover'
+for profile2_engine_guard in \
+    'Self::new_with_mode(catalog, limits, freshness, EngineApiMode::ProfileTwo)' \
+    'if self.api_mode == EngineApiMode::ProfileTwo && !command.is_profile_two_compatible() {' \
+    '&& !record.command().is_profile_two_compatible()'; do
+    grep -Fq "$profile2_engine_guard" "$core_engine" \
+        || fail "portable profile-2 Engine lacks a fail-closed grammar guard: $profile2_engine_guard"
+done
+for profile_coordinate in \
+    'pub const AGENT_OPERATION_COMPOSITE: CompositeKindId = match CompositeKindId::new(1) {' \
+    'pub const AGENT_COMPONENT_REPLY: ComponentId = match ComponentId::new(1) {' \
+    'pub const AGENT_COMPONENT_DMA: ComponentId = match ComponentId::new(2) {' \
+    'pub const DMA_ARENA_REUSE_COMPOSITE: CompositeKindId = match CompositeKindId::new(2) {'; do
+    grep -Fxq "$profile_coordinate" "$core_profiles" \
+        || fail "portable profile 2 lacks frozen composite coordinate: $profile_coordinate"
+done
 
 declare -a closure_sources=()
 declare -A manifest_entries=()
@@ -122,6 +155,7 @@ done <"$manifest"
 required_sources=(
     core_device_quarantine.rs
     core_dma_adapter.rs
+    core_dma_arena_allocator.rs
     core_persistent_runtime.rs
     core_pio_journal.rs
     core_portal_vnext.rs
@@ -204,6 +238,8 @@ forbidden_tokens=(
     nexus-supervisor
     nexus_supervisor
     transact_volatile
+    new_legacy_compatibility
+    recover_legacy_compatibility
 )
 closure_inputs=("${closure_sources[@]}" "$kernel_entry")
 for token in "${forbidden_tokens[@]}"; do
@@ -344,10 +380,47 @@ client_transact=$(extract_rust_item \
     "$production_registry") \
     || fail 'cannot isolate client-facing production Registry transact'
 require_ordered_tokens "$client_transact" 'client-facing production Registry transact' \
+    'if !request.is_profile_two_compatible() {' \
+    'return Err(ProductionRegistryError::ProfileOneCommandForbidden);' \
     '.authorize_current_ingress()' \
     'if command_ingress_identity(&request) != Some(identity) {' \
     '.installed' \
     '.transact(request.into())'
+for component_command in \
+    'CommandRequest::CreateCompositeEffect { .. }' \
+    'CommandRequest::AddComponentClaim { .. }' \
+    'CommandRequest::PrepareCompositeEffect { .. }' \
+    'CommandRequest::RecordComponentCommitIntent { .. }' \
+    'CommandRequest::RecordCompositeCommitIntents { .. }'; do
+    grep -Fq "$component_command" <<<"$client_transact" \
+        || fail "client-facing production Registry rejects profile 2 command: $component_command"
+done
+
+component_intent_take=$(extract_rust_item \
+    'pub(crate) fn take_component_commit_intent(' \
+    "$production_registry") \
+    || fail 'cannot isolate component-local commit-intent transfer'
+for component_coordinate in \
+    '        effect: cser_core::EffectId,' \
+    '        component: cser_core::ComponentId,' \
+    '        self.take_matching_commit_intent(effect, Some(component))'; do
+    grep -Fxq "$component_coordinate" <<<"$component_intent_take" \
+        || fail "production Registry component bearer lacks exact coordinate: $component_coordinate"
+done
+
+composite_intent_take=$(extract_rust_item \
+    'pub(crate) fn take_composite_commit_intents(' \
+    "$production_registry") \
+    || fail 'cannot isolate atomic composite commit-intent transfer'
+require_ordered_tokens "$composite_intent_take" 'atomic composite commit-intent transfer' \
+    'effect: cser_core::EffectId,' \
+    'TransitionOutput::CompositeCommitIntents(intents)' \
+    'intents.iter().all(|intent| intent.effect() == effect)' \
+    'TransitionOutput::CompositeCommitIntents(intents) => Some(intents)'
+if grep -Fq 'TransitionOutput::CommitIntent(intent) => Some(intent)' \
+    <<<"$composite_intent_take"; then
+    fail 'atomic composite bearer can be partially extracted as a singleton intent'
+fi
 
 client_observe=$(extract_rust_item \
     'fn observe(&self, query: CoreQuery)' \
@@ -361,11 +434,346 @@ trusted_transact=$(extract_rust_item \
     'pub(crate) fn transact_trusted<C>(' \
     "$production_registry") \
     || fail 'cannot isolate trusted production Registry transact'
-grep -Fq 'self.installed.transact(command.into())' <<<"$trusted_transact" \
-    || fail 'trusted supervisor/domain path does not directly enter the installed durable core'
+require_ordered_tokens "$trusted_transact" 'trusted production Registry transact' \
+    'let command = command.into();' \
+    'if !command.is_profile_two_compatible() {' \
+    'return Err(TxError::Core(CoreError::IncompatibleApiProfile));' \
+    'self.installed.transact(command)'
 if grep -Fq 'authorize_current_ingress' <<<"$trusted_transact"; then
     fail 'trusted supervisor/domain path is incorrectly coupled to client task ingress'
 fi
+
+profile2_install=$(extract_rust_item \
+    'pub(crate) fn new(installed: S)' \
+    "$production_registry") \
+    || fail 'cannot isolate profile-2 production owner installation'
+require_ordered_tokens "$profile2_install" 'profile-2 production owner installation' \
+    'installed.observe(Engine::profile_one_estate_count) != 0' \
+    'return Err((CoreError::IncompatibleApiProfile, installed));' \
+    'linear_custody: Mutex::new(Vec::with_capacity(MAX_LINEAR_PORTAL_BEARERS))'
+
+portal_policy=$(extract_rust_item \
+    'fn require_client_command(request: &CommandRequest)' \
+    "$portal_vnext") \
+    || fail 'cannot isolate profile-2 portal policy'
+require_ordered_tokens "$portal_policy" 'profile-2 portal policy' \
+    'if !request.is_profile_two_compatible() {' \
+    'return Err(PortalPolicyError::ProfileOneCommandForbidden);' \
+    'CommandRequest::CreateCompositeEffect { .. }' \
+    '| CommandRequest::RecordComponentCommitIntent { .. }' \
+    '| CommandRequest::RecordCompositeCommitIntents { .. } => return Ok(())'
+
+if grep -Fq 'pub(crate) fn take_commit_intent(' "$production_registry"; then
+    fail 'production Registry still exposes a profile-1 commit-intent transfer'
+fi
+for legacy_query in 'Estate(EffectId)' 'Claims(EffectId)'; do
+    if grep -Fq "$legacy_query" "$portal_vnext"; then
+        fail "production portal still exposes a profile-1 query: $legacy_query"
+    fi
+done
+
+runtime_effect_helper_count=$(grep -Ec \
+    '^fn [[:alpha:]_][[:alnum:]_]*effect\(\) -> EffectId' \
+    "$persistent_runtime" || true)
+(( runtime_effect_helper_count == 2 )) \
+    || fail "production runtime must define exactly the operation and reuse EffectId helpers; found $runtime_effect_helper_count"
+runtime_effect_constructor_count=$(grep -Fc 'EffectId::new(' "$persistent_runtime" || true)
+(( runtime_effect_constructor_count == 2 )) \
+    || fail "production runtime must construct exactly one operation and one reuse EffectId; found $runtime_effect_constructor_count"
+
+operation_root=$(extract_rust_item \
+    'fn operation_root() -> RootId {' \
+    "$persistent_runtime") \
+    || fail 'cannot isolate production operation root'
+grep -Fxq '    root(0xc501)' <<<"$operation_root" \
+    || fail 'production operation root is not the frozen shared root'
+
+operation_effect=$(extract_rust_item \
+    'fn operation_effect() -> EffectId {' \
+    "$persistent_runtime") \
+    || fail 'cannot isolate production operation effect'
+grep -Fxq \
+    '    EffectId::new(operation_root(), 1).expect("agent operation effect is non-zero")' \
+    <<<"$operation_effect" \
+    || fail 'production operation effect is not derived once from the shared root'
+
+reuse_effect=$(extract_rust_item \
+    'fn reuse_effect() -> EffectId {' \
+    "$persistent_runtime") \
+    || fail 'cannot isolate production DMA reuse effect'
+for coordinate in \
+    '    EffectId::new(operation_root(), REUSE_EFFECT_SEQUENCE)' \
+    '        .expect("DMA reuse effect identity is non-zero")'; do
+    grep -Fxq "$coordinate" <<<"$reuse_effect" \
+        || fail "production DMA reuse effect lacks exact root/sequence coordinate: $coordinate"
+done
+grep -Fxq 'const REUSE_EFFECT_SEQUENCE: u64 = 2;' "$persistent_runtime" \
+    || fail 'production DMA reuse effect is not the frozen second effect on the agent root'
+
+operation_origin=$(extract_rust_item \
+    'fn operation_origin() -> PrincipalIncarnation {' \
+    "$persistent_runtime") \
+    || fail 'cannot isolate production operation origin'
+grep -Fxq '    principal(0xc501, 1)' <<<"$operation_origin" \
+    || fail 'production operation origin is not bound to the shared root'
+
+activation_boot=$(extract_rust_item \
+    'fn run_activation_boot(boot: PersistentBoot) -> ! {' \
+    "$persistent_runtime") \
+    || fail 'cannot isolate first-boot production activation'
+activation_service_count=$(grep -Fc 'build_production_service(' <<<"$activation_boot" || true)
+(( activation_service_count == 1 )) \
+    || fail "first-boot operation must run in exactly one production service task; found $activation_service_count"
+require_ordered_tokens "$activation_boot" 'first-boot composite production service' \
+    'let service_identity = match prepare_production_service(' \
+    'operation_root(),' \
+    'operation_origin(),' \
+    'ProductionServiceStage::InitialCompositePublication,' \
+    'let service = match build_production_service(' \
+    'let output = publish_first_boot_operation('
+
+composite_prepare=$(extract_rust_item \
+    'fn ensure_composite_prepared<S>(' \
+    "$persistent_runtime") \
+    || fail 'cannot isolate production composite preparation'
+create_composite_count=$(grep -Fc 'CommandRequest::CreateCompositeEffect {' \
+    <<<"$composite_prepare" || true)
+prepare_composite_count=$(grep -Fc 'CommandRequest::PrepareCompositeEffect {' \
+    <<<"$composite_prepare" || true)
+(( create_composite_count == 1 && prepare_composite_count == 1 )) \
+    || fail 'production composite preparation must create and prepare one shared effect'
+require_ordered_tokens "$composite_prepare" 'production composite preparation' \
+    'let effect = operation_effect();' \
+    'CommandRequest::CreateCompositeEffect {' \
+    'kind: AGENT_OPERATION_COMPOSITE,' \
+    'engine.component(effect, AGENT_COMPONENT_REPLY)' \
+    'engine.component(effect, AGENT_COMPONENT_DMA)' \
+    'CommandRequest::AddComponentClaim {' \
+    'component: AGENT_COMPONENT_REPLY,' \
+    'engine.component_claims(effect, AGENT_COMPONENT_DMA)' \
+    'dma.enroll_claims()' \
+    'CommandRequest::PrepareCompositeEffect {'
+
+reply_commit=$(extract_rust_item \
+    'fn ensure_reply_component_committed<S>(' \
+    "$persistent_runtime") \
+    || fail 'cannot isolate reply component commit'
+require_ordered_tokens "$reply_commit" 'reply component commit' \
+    'projection.commit == CommitState::Committed' \
+    'projection.commit != CommitState::CommitIntentDurable' \
+    'let intent = intent.ok_or("reply-atomic-commit-intent-custody")?;' \
+    'intent.component() != Some(AGENT_COMPONENT_REPLY)' \
+    '.commit(&challenge, REPLY_SEQUENCE, plan.payload_digest())' \
+    '.acknowledge(outcome)'
+if grep -Fq 'CommandRequest::RecordComponentCommitIntent {' <<<"$reply_commit"; then
+    fail 'reply component still arms a singleton commit intent outside the atomic cohort'
+fi
+
+initial_commit_arm=$(extract_rust_item \
+    'fn arm_initial_component_commits<S>(' \
+    "$persistent_runtime") \
+    || fail 'cannot isolate atomic initial component commit arm'
+require_ordered_tokens "$initial_commit_arm" 'atomic initial component commit arm' \
+    'CommandRequest::RecordCompositeCommitIntents {' \
+    'effect: operation_effect(),' \
+    'operations: vec![' \
+    'ComponentCommitOperation::new(AGENT_COMPONENT_REPLY, digest(0xc1))' \
+    'ComponentCommitOperation::new(AGENT_COMPONENT_DMA, dma_operation)' \
+    '.take_composite_commit_intents(operation_effect())' \
+    'intents.len() != 2' \
+    'intent.component() == Some(AGENT_COMPONENT_REPLY)' \
+    'dma.component() != Some(AGENT_COMPONENT_DMA)'
+if grep -Fq 'CommandRequest::RecordComponentCommitIntent {' <<<"$initial_commit_arm"; then
+    fail 'initial composite arm falls back to a singleton component intent'
+fi
+
+first_publication=$(extract_rust_item \
+    'fn publish_first_boot_operation(' \
+    "$persistent_runtime") \
+    || fail 'cannot isolate first-boot composite publication'
+require_ordered_tokens "$first_publication" 'first-boot composite publication' \
+    'let cohort = CoreDmaCohort::bind_component(' \
+    'operation_effect(),' \
+    'AGENT_COMPONENT_DMA,' \
+    'ensure_composite_prepared(' \
+    'let arena = persistent_dma_arena_layout().ok_or("dma-arena-layout-absent")?;' \
+    'let arena_digest = dma_arena_digest(arena);' \
+    'arm_initial_component_commits(portal, owner, actor, binding_generation, arena_digest)?;' \
+    'ensure_reply_component_committed(owner, &mut outbox, Some(reply_intent))?;' \
+    'component.commit != CommitState::CommitIntentDurable' \
+    'bind_queue_commit(engine, dma_intent, cohort)' \
+    'publish_real_queue(' \
+    'published.verify_commit(engine)'
+composite_intent_take_count=$(grep -Fc '.take_composite_commit_intents(' \
+    "$persistent_runtime" || true)
+(( composite_intent_take_count == 1 )) \
+    || fail "production runtime must transfer exactly one atomic reply+DMA intent cohort; found $composite_intent_take_count"
+component_intent_take_count=$(grep -Fc '.take_component_commit_intent(' \
+    "$persistent_runtime" || true)
+(( component_intent_take_count == 0 )) \
+    || fail "initial reply/DMA operation still transfers singleton component intents; found $component_intent_take_count"
+
+component_settlement=$(extract_rust_item \
+    'fn claim_component_settlement(' \
+    "$persistent_runtime") \
+    || fail 'cannot isolate component-local settlement claim'
+require_ordered_tokens "$component_settlement" 'component-local settlement claim' \
+    'self.authorize_ingress()?;' \
+    'CoreSupervisorVNext::new(Arc::clone(&self.owner))' \
+    '.claim_component_settlement(effect, component, self.identity.ingress.incarnation())'
+reply_component_settlement_count=$(grep -Fc \
+    'ingress.claim_component_settlement(operation_effect(), AGENT_COMPONENT_REPLY)?;' \
+    "$persistent_runtime" || true)
+(( reply_component_settlement_count == 2 )) \
+    || fail "reply component must be claimed at second-crash arm and recovery; found $reply_component_settlement_count"
+
+for settlement_stage in \
+    'fn arm_reply_second_crash(' \
+    'fn reconcile_reply_in_service<S>('; do
+    stage_contract=$(extract_rust_item "$settlement_stage" "$persistent_runtime") \
+        || fail "cannot isolate reply component settlement stage: $settlement_stage"
+    grep -Fq \
+        'ingress.claim_component_settlement(operation_effect(), AGENT_COMPONENT_REPLY)?;' \
+        <<<"$stage_contract" \
+        || fail "reply settlement stage lacks shared-effect component claim: $settlement_stage"
+done
+
+reply_reconcile=$(extract_rust_item \
+    'fn reconcile_reply_in_service<S>(' \
+    "$persistent_runtime") \
+    || fail 'cannot isolate durable reply reconciliation'
+require_ordered_tokens "$reply_reconcile" 'durable APPLY before physical wake' \
+    '.record_apply(plan, source)' \
+    '.redeliver_durable(plan, apply.semantic_digest())'
+reply_completion=${reply_reconcile#*"let acknowledgement = match durable_ack {"}
+[[ $reply_completion != "$reply_reconcile" ]] \
+    || fail 'cannot isolate durable reply acknowledgement completion'
+require_ordered_tokens "$reply_completion" 'receiver acceptance before durable ACK and settlement' \
+    'result.wait_take_bounded()' \
+    '.record_acknowledgement(plan, apply)' \
+    'engine.verify_settlement_ack(' \
+    '.settle(verified_ack)' \
+    'ingress.transact(settle)' \
+    'retire_reply_from_durable_ack('
+
+delivery_append=$(extract_rust_item \
+    'fn append_delivery(' \
+    "$reply_outbox") \
+    || fail 'cannot isolate durable reply delivery append'
+require_ordered_tokens "$delivery_append" 'durable reply delivery write protocol' \
+    'self.backend.write_sector(lba, &encoded)' \
+    'self.backend.flush()' \
+    'self.backend.read_sector(lba, &mut readback)' \
+    'if readback != encoded' \
+    'ReplyDeliveryRecord::decode(&readback)'
+
+arm_second_crash=$(extract_rust_item \
+    'fn arm_reply_second_crash(' \
+    "$persistent_runtime") \
+    || fail 'cannot isolate second-crash arm'
+for forbidden_retry in \
+    'outbox.commit(' \
+    'ensure_reply_component_committed(' \
+    '.redeliver_durable(' \
+    '.record_acknowledgement('; do
+    if grep -Fq "$forbidden_retry" <<<"$arm_second_crash"; then
+        fail "second-crash arm may blindly replay an unknown external reply: $forbidden_retry"
+    fi
+done
+grep -Fq '.record_apply_intent(plan.intent_digest())' <<<"$arm_second_crash" \
+    || fail 'second-crash arm lacks its durable logical apply intent'
+
+dma_recovery=$(extract_rust_item \
+    'fn reconcile_dma_tombstones(' \
+    "$persistent_runtime") \
+    || fail 'cannot isolate DMA component tombstone recovery'
+require_ordered_tokens "$dma_recovery" 'DMA component tombstone recovery' \
+    'let layout = persistent_dma_arena_layout().ok_or("dma-arena-layout-absent")?;' \
+    'if component.commit_operation != Some(layout_digest) {' \
+    '.retained_component_claims()' \
+    'claim.effect == effect' \
+    'claim.component == AGENT_COMPONENT_DMA' \
+    'engine.component_retirement_evidence_accepted(' \
+    '.inspect_with_guard(|_, guard| project_replayed_component_claim(guard, claim))' \
+    '.verify_component_retirement_evidence('
+for component_recovery_token in \
+    '&OstdBootClaimVerifier::new_component(claim),' \
+    '&OstdBootIrqVerifier::new_component(claim),' \
+    'let verifier = QemuArenaIotlbVerifier::new_component(' \
+    'report.resource_reuse_authorized = validate_dma_reuse_boundary(owner, effect, expected);'; do
+    grep -Fq "$component_recovery_token" <<<"$dma_recovery" \
+        || fail "DMA tombstone recovery lacks component-local token: $component_recovery_token"
+done
+
+reuse_publication=$(extract_rust_item \
+    'fn publish_reused_dma(' \
+    "$persistent_runtime") \
+    || fail 'cannot isolate generation+1 DMA reuse publication'
+require_ordered_tokens "$reuse_publication" 'generation+1 DMA reuse publication' \
+    'engine.component_claims(operation_effect(), AGENT_COMPONENT_DMA)' \
+    'claims.iter().any(|claim| !claim.retired)' \
+    'CommandRequest::CreateCompositeEffect {' \
+    'effect: reuse_effect(),' \
+    'kind: DMA_ARENA_REUSE_COMPOSITE,' \
+    'ensure_uncommitted_composite_actor(' \
+    'if let Some(projection) = projections' \
+    'engine.reclaim_component_resource_reuse(' \
+    'Err(CoreError::StaleReusePermit) => {}' \
+    'CommandRequest::ReserveComponentReuse {' \
+    'expected_generation: old.generation(),' \
+    'CommandRequest::PrepareCompositeEffect {' \
+    'let precommit = ingress.observe(validate_reuse_precommit)?;' \
+    '.prepare_read_sector0(&mut root)' \
+    'CoreDmaCohort::bind_component(' \
+    'reused_dma_claims(),' \
+    'cohort.record_commit_intent(dma_arena_digest(arena))' \
+    'publish_real_queue(' \
+    'published.verify_commit(engine)'
+reuse_permit_count=$(grep -Fc 'CommandRequest::ReserveComponentReuse {' \
+    <<<"$reuse_publication" || true)
+(( reuse_permit_count == 1 )) \
+    || fail "generation+1 DMA reuse must use one role-driven permit loop; found $reuse_permit_count"
+reuse_activation_count=$(grep -Fc \
+    'expect_no_output_checked(ingress.transact(permit.activate())?)?;' \
+    <<<"$reuse_publication" || true)
+(( reuse_activation_count == 2 )) \
+    || fail "generation+1 DMA reuse must activate both reclaimed and new permits; found $reuse_activation_count activation sites"
+if grep -Fq 'reuse_effect()' <<<"$reply_commit"; then
+    fail 'reply publication is incorrectly coupled to the DMA reuse effect'
+fi
+for settlement_stage in \
+    'fn arm_reply_second_crash(' \
+    'fn reconcile_reply_in_service<S>('; do
+    stage_contract=$(extract_rust_item "$settlement_stage" "$persistent_runtime") \
+        || fail "cannot isolate reply component settlement stage: $settlement_stage"
+    if grep -Fq 'reuse_effect()' <<<"$stage_contract"; then
+        fail "reply settlement stage is incorrectly coupled to the DMA reuse effect: $settlement_stage"
+    fi
+done
+
+legacy_runtime_tokens=(
+    'CommandRequest::CreateEstate'
+    'CommandRequest::AddClaim'
+    'CommandRequest::PrepareEffect'
+    'CommandRequest::RecordCommitIntent'
+    '.take_commit_intent('
+    'engine.estate('
+    'engine.claims('
+    'engine.retained_claims('
+    'fn reply_effect('
+    'fn dma_effect('
+    'fn reply_root('
+    'fn dma_root('
+    'fn reply_origin('
+    'fn dma_origin('
+    'reply_service_task=true'
+    'dma_service_task=true'
+)
+for legacy_runtime_token in "${legacy_runtime_tokens[@]}"; do
+    if grep -Fq "$legacy_runtime_token" "$persistent_runtime"; then
+        fail "production runtime retains legacy estate or split-effect path: $legacy_runtime_token"
+    fi
+done
 
 service_ready=$(extract_rust_item \
     'fn ready_and_wait_for_rebind(&self)' \
@@ -417,14 +825,16 @@ for boot in 1 2 3 4; do
     case $boot in
         1)
             boot_contract=(
+                'profile=2'
+                'composite_effect=true'
+                'effect_identity=shared'
+                'component_ids=reply+dma'
                 'service_principal_generation={}'
                 'binding_generation={}'
-                'reply_service_task=true'
-                'reply_service_death=task-return'
-                'reply_exact_reap=true'
-                'dma_service_task=true'
-                'dma_service_death=task-return'
-                'dma_exact_reap=true'
+                'production_service_tasks=1'
+                'service_death=task-return'
+                'exact_reap=true'
+                'same_boot_fence=true'
                 'ingress_latch=closed'
                 'closed_ingress_rejected=true'
                 'production_rebind=initial'
@@ -440,11 +850,24 @@ for boot in 1 2 3 4; do
                 'production_rebind=true'
                 'service_death=task-return'
                 'exact_reap=true'
+                'same_boot_fence=true'
                 'ingress_latch=closed'
                 'closed_ingress_rejected=true'
             )
             ;;
-        3|4)
+        3)
+            boot_contract=(
+                'service_principal_generation={}'
+                'binding_generation={}'
+                'fresh_service_task=true'
+                'ready_in_fresh_task=true'
+                'production_rebind=true'
+                'service_state=live'
+                'ingress_latch=open'
+                'prior_service_fence=same-boot-exact-reap'
+            )
+            ;;
+        4)
             boot_contract=(
                 'service_principal_generation={}'
                 'binding_generation={}'
@@ -598,7 +1021,7 @@ done
 
 for forbidden in \
     'prepare_guest' \
-    'same-boot' \
+    'run_same_boot_acceptance' \
     'stage7b' \
     'check-scheduler-attempt' \
     'src/personality' \
@@ -683,6 +1106,39 @@ persistent_run=$(awk '
     in_function && /^\}[[:space:]]*$/ { found_end = 1; exit }
     END { if (!in_function || !found_end) exit 1 }
 ' "$kernel_workflow") || fail 'cannot isolate kernel combined persistent recovery runner'
+runtime_recovery=$(extract_rust_item \
+    'fn run_persistent_recovery() {' \
+    "$persistent_runtime") \
+    || fail 'cannot isolate production persistent recovery entry'
+require_ordered_tokens "$runtime_recovery" 'production trusted-state recovery order' \
+    'let candidate = match TpmNvTrustedAnchor::inspect(' \
+    'let guard = match OstdVirtioBootQuarantine::new(observed_generation).quarantine_all() {' \
+    'let selected_bytes = match journal.read_all() {' \
+    'scan_journal(&selected_bytes),' \
+    'let anchor = match candidate.bind(binding) {' \
+    'let boot = match recover_quarantined_boot('
+for schema5_fail_closed_token in \
+    'Err(JournalDecodeError::UnsupportedVersion { version: 5 })' \
+    'selected_tip.revision() == 0 || selected_tip.head().is_zero()' \
+    'trusted_tpm_candidate_selected=true' \
+    'profile2_binding_authorized=false' \
+    'typed_error=migration-required' \
+    'semantic_replay=false inferred_pairing=false pre_replay_quarantine=true' \
+    'device_guard_retained=true production_registry=false device_activation=false' \
+    '"schema5-migration-required",' \
+    '(arena, candidate, guard, journal),'; do
+    grep -Fq "$schema5_fail_closed_token" <<<"$runtime_recovery" \
+        || fail "production schema-5 rejection lacks retained authority token: $schema5_fail_closed_token"
+done
+for anchor_candidate_token in \
+    'pub(crate) struct TpmNvAnchorCandidate<T> {' \
+    'pub(crate) fn inspect(' \
+    'pub(crate) fn bind(' \
+    'return Err(Box::new((' \
+    'PersistenceProtocolError::BindingMismatch.into(),'; do
+    grep -Fq "$anchor_candidate_token" "$tpm_anchor" \
+        || fail "TPM anchor lacks linear pre-binding inspection token: $anchor_candidate_token"
+done
 grep -Fq '"$core_persistent_artifact_dir/production-kernel.iso"' \
     <<<"$persistent_run" \
     || fail 'combined persistent recovery does not archive the production ISO'
@@ -764,6 +1220,62 @@ persistent_guest=$(awk '
     in_function && /^\}[[:space:]]*$/ { found_end = 1; exit }
     END { if (!in_function || !found_end) exit 1 }
 ' "$kernel_workflow") || fail 'cannot isolate persistent production guest runner'
+persistent_capture=$(awk '
+    /^capture_core_persistent_boot\(\)[[:space:]]*\(/ { in_function = 1 }
+    in_function { print }
+    in_function && /^\)[[:space:]]*$/ { found_end = 1; exit }
+    END { if (!in_function || !found_end) exit 1 }
+' "$kernel_workflow") || fail 'cannot isolate persistent production capture wrapper'
+schema5_negative=$(awk '
+    /^capture_core_schema5_negative_boot\(\)[[:space:]]*\{/ { in_function = 1 }
+    in_function { print }
+    in_function && /^\}[[:space:]]*$/ { found_end = 1; exit }
+    END { if (!in_function || !found_end) exit 1 }
+' "$kernel_workflow") || fail 'cannot isolate schema-5 negative boot cell'
+swtpm_start=$(awk '
+    /^start_core_persistent_swtpm\(\)[[:space:]]*\{/ { in_function = 1 }
+    in_function { print }
+    in_function && /^\}[[:space:]]*$/ { found_end = 1; exit }
+    END { if (!in_function || !found_end) exit 1 }
+' "$kernel_workflow") || fail 'cannot isolate persistent swtpm owner'
+if grep -Eq 'capture_qemu_streams.*(\|\||&&)' <<<"$persistent_capture"; then
+    fail 'persistent production capture disables helper errexit through a conditional invocation'
+fi
+require_ordered_tokens "$persistent_capture" 'persistent capture strict-status boundary' \
+    "trap 'stop_core_persistent_swtpm || exit 1' EXIT" \
+    'start_core_persistent_swtpm' \
+    'set +e' \
+    'capture_qemu_streams "$serial" "$debug" run_core_persistent_guest' \
+    'capture_status=$?' \
+    'set -e' \
+    '    stop_core_persistent_swtpm'
+for swtpm_owner_marker in \
+    'core_persistent_pid=$!' \
+    'stop_core_persistent_swtpm' \
+    'return 1'; do
+    grep -Fq "$swtpm_owner_marker" <<<"$swtpm_start" \
+        || fail "persistent swtpm owner lacks failure cleanup marker: $swtpm_owner_marker"
+done
+if grep -Fq -- '--daemon' <<<"$swtpm_start"; then
+    fail 'persistent swtpm escaped the runner-owned background process'
+fi
+grep -Fxq \
+    'core_schema5_fixture_catalog=f58ad9f2c973e65532b10d6392f0528838bf95c09668f30395743816a58ddf25' \
+    "$kernel_workflow" \
+    || fail 'schema-5 negative boot lacks the frozen profile-1 catalog digest'
+require_ordered_tokens "$schema5_negative" 'authentic schema-5 negative boot' \
+    'build_core_schema5_selected_fixture' \
+    'bash "$root/scripts/provision-cser-tpm-nv.sh"' \
+    '"$core_schema5_fixture_catalog"' \
+    'capture_core_persistent_boot' \
+    'cmp "$core_schema5_journal" "$core_persistent_journal"' \
+    "'CSER_CORE_SCHEMA5_MIGRATION_REQUIRED PASS'" \
+    "'anchor_binding_match=false'" \
+    "'device_guard_retained=true'" \
+    'assert_core_schema5_post_quarantine_trace'
+if grep -Fq '"$catalog_digest" \' <<<"$schema5_negative"; then
+    fail 'schema-5 negative boot provisions TPM authority with the profile-2 catalog'
+fi
 [[ $(grep -Fc 'NEXUS_CONTAINER_HOST_UNIX_SOCKET' "$kernel_workflow") == 2 ]] \
     || fail 'host Unix socket policy must have one declaration and one TPM fixture caller'
 grep -Fq 'NEXUS_CONTAINER_HOST_UNIX_SOCKET=1 container bash -c' \
@@ -784,4 +1296,4 @@ for forbidden_container_option in --privileged --cap-add --device; do
     fi
 done
 
-echo "CSER_CORE_PRODUCTION_CUTOVER PASS manifest_sources=${#closure_sources[@]} portable_core=nonoptional default=cser-production registry=single task_bound_ingress=true post_exit_fence=true production_rebind=true vnext_portal=true vnext_supervisor=true volatile_transitions=false evidence_schemes=reply+dma boots=4 shared_media=true tpm_fixture_policy=scoped"
+echo "CSER_CORE_PRODUCTION_CUTOVER PASS manifest_sources=${#closure_sources[@]} portable_core=nonoptional api_profile=2 catalog_version=5 projection_version=6 snapshot_version=2 journal_schema=6 default=cser-production registry=single operation_effect=shared component_custody=reply+dma production_service_tasks=1 legacy_runtime_estates=false task_bound_ingress=true post_exit_fence=true production_rebind=true vnext_portal=true vnext_supervisor=true volatile_transitions=false evidence_schemes=reply+dma boots=4 shared_media=true tpm_fixture_policy=scoped"

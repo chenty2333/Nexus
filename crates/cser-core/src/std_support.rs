@@ -8,7 +8,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::{Digest, JournalRecord, JournalRepair, scan_journal, scan_journal_to_head};
+use crate::{
+    Digest, JournalRecord, JournalRepair, engine::reject_recognized_legacy_journal_prefix,
+    scan_journal, scan_journal_to_head,
+};
 
 mod persistence;
 
@@ -97,6 +100,7 @@ impl FileJournal {
             if accepted_revision != 0 || !accepted_head.is_zero() {
                 return Err(anchor_not_found());
             }
+            reject_recognized_legacy_journal_prefix(&bytes).map_err(invalid_journal)?;
             let durable_len = u64::try_from(bytes.len()).map_err(|_| {
                 io::Error::new(io::ErrorKind::InvalidData, "journal length exceeds u64")
             })?;
@@ -444,7 +448,19 @@ mod tests {
     }
 
     #[test]
-    fn previous_v4_schema_is_rejected_explicitly() {
+    fn profile_one_v5_schema_is_rejected_explicitly() {
+        let mut bytes = record(0, Digest::ZERO).bytes().to_vec();
+        bytes[..8].copy_from_slice(b"CSERJR5\0");
+        bytes[8..10].copy_from_slice(&5u16.to_le_bytes());
+
+        assert!(matches!(
+            scan_journal(&bytes),
+            Err(JournalDecodeError::UnsupportedVersion { version: 5 })
+        ));
+    }
+
+    #[test]
+    fn legacy_v4_schema_is_rejected_explicitly() {
         let mut bytes = record(0, Digest::ZERO).bytes().to_vec();
         bytes[..8].copy_from_slice(b"CSERJR4\0");
         bytes[8..10].copy_from_slice(&4u16.to_le_bytes());
@@ -574,5 +590,52 @@ mod tests {
         let reopened = FileJournal::open(&temp.path).unwrap();
         assert_eq!(reopened.revision(), 0);
         assert_eq!(reopened.head(), Digest::ZERO);
+    }
+
+    #[test]
+    fn anchored_open_rejects_profile_one_before_repair_without_reclassifying_residue() {
+        for (label, suffix) in [
+            ("profile-one-prefix", &[][..]),
+            (
+                "profile-one-arbitrary-suffix",
+                &b"\xffroots-and-timestamps\x00"[..],
+            ),
+        ] {
+            let temp = TempJournal::new(label);
+            let mut bytes = Vec::from(*b"CSERJR5\0");
+            bytes.extend_from_slice(suffix);
+            std::fs::write(&temp.path, &bytes).unwrap();
+
+            let error =
+                FileJournal::open_anchored(&temp.path, 0, Digest::ZERO).expect_err("reject v5");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+            assert_eq!(
+                error.to_string(),
+                "invalid CSER journal: UnsupportedVersion { version: 5 }"
+            );
+            assert_eq!(std::fs::read(&temp.path).unwrap(), bytes);
+        }
+
+        let temp = TempJournal::new("profile-one-non-genesis-anchor");
+        let bytes = Vec::from(*b"CSERJR5\0");
+        std::fs::write(&temp.path, &bytes).unwrap();
+        let error = FileJournal::open_anchored(&temp.path, 1, digest(77))
+            .expect_err("reject v5 before searching a non-genesis anchor");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "invalid CSER journal: UnsupportedVersion { version: 5 }"
+        );
+        assert_eq!(std::fs::read(&temp.path).unwrap(), bytes);
+
+        let temp = TempJournal::new("genesis-arbitrary-residue");
+        let residue = b"arbitrary failed-write residue";
+        std::fs::write(&temp.path, residue).unwrap();
+        let mut journal = FileJournal::open_anchored(&temp.path, 0, Digest::ZERO).unwrap();
+        assert_eq!(
+            journal.journal_repair(),
+            Some(JournalRepair::UnanchoredSuffix { offset: 0 })
+        );
+        assert_eq!(journal.read_all().unwrap(), residue);
     }
 }

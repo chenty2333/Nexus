@@ -8,8 +8,8 @@
 
 set -euo pipefail
 
-if (($# < 1 || $# > 2)); then
-    echo "usage: $0 STATE_DIR [CATALOG_SHA256_HEX]" >&2
+if (($# < 1 || $# > 4)); then
+    echo "usage: $0 STATE_DIR [CATALOG_SHA256_HEX [TIP_REVISION TIP_HEAD_SHA256_HEX]]" >&2
     exit 2
 fi
 
@@ -25,6 +25,8 @@ done
 
 state_dir=$1
 catalog_hex=${2:-}
+tip_revision=${3:-0}
+tip_head_hex=${4:-}
 if [[ -z $catalog_hex ]]; then
     for _ in {1..32}; do
         catalog_hex+=42
@@ -35,7 +37,34 @@ if [[ ! $catalog_hex =~ ^[[:xdigit:]]{64}$ ]]; then
     exit 2
 fi
 catalog_hex=${catalog_hex,,}
-readonly catalog_hex
+if [[ ! $tip_revision =~ ^(0|[1-9][0-9]*)$ ]] \
+    || (( ${#tip_revision} > 20 )) \
+    || { (( ${#tip_revision} == 20 )) \
+        && [[ $tip_revision > 18446744073709551615 ]]; }; then
+    echo "tip revision must be an unsigned 64-bit decimal" >&2
+    exit 2
+fi
+if [[ -z $tip_head_hex ]]; then
+    for _ in {1..32}; do
+        tip_head_hex+=00
+    done
+fi
+if [[ ! $tip_head_hex =~ ^[[:xdigit:]]{64}$ ]]; then
+    echo "tip head must be exactly 64 hexadecimal characters" >&2
+    exit 2
+fi
+tip_head_hex=${tip_head_hex,,}
+zero_head_hex=
+for _ in {1..32}; do
+    zero_head_hex+=00
+done
+if { [[ $tip_revision == 0 ]] && [[ $tip_head_hex != "$zero_head_hex" ]]; } \
+    || { [[ $tip_revision != 0 ]] && [[ $tip_head_hex == "$zero_head_hex" ]]; }; then
+    echo "tip revision and head must name genesis together or a non-genesis tip together" >&2
+    exit 2
+fi
+printf -v tip_revision_hex '%016x' "$tip_revision"
+readonly catalog_hex tip_revision tip_revision_hex tip_head_hex zero_head_hex
 mkdir -p -- "$state_dir"
 state_dir=$(realpath -e -- "$state_dir")
 state_lock_key=$(printf '%s' "$state_dir" | sha256sum | cut -c1-32)
@@ -164,18 +193,13 @@ tpm2_nvdefine -Q -T "$tcti" "$LEASE_SLOT_0" -C p -s "$LEASE_SIZE" \
 tpm2_nvdefine -Q -T "$tcti" "$LEASE_SLOT_1" -C p -s "$LEASE_SIZE" \
     -a "$SLOT_ATTRIBUTES" -L "$work_dir/delete-policy.bin"
 
-head_hex=
-for _ in {1..32}; do
-    head_hex+=00
-done
-readonly head_hex
 readonly one=0000000000000001
 readonly zero=0000000000000000
 readonly prefix_tip=4353455254504d31000101000000000000000001
 readonly prefix_lease=4353455254504d31000102000000000000000001
 readonly binding_hex="${catalog_hex}${one}${one}"
 readonly freshness_hex="${one}${one}${one}${one}${one}"
-readonly tip_body_hex="${prefix_tip}${binding_hex}${freshness_hex}${zero}${head_hex}"
+readonly tip_body_hex="${prefix_tip}${binding_hex}${freshness_hex}${tip_revision_hex}${tip_head_hex}"
 readonly lease_body_hex="${prefix_lease}${binding_hex}${freshness_hex}"
 
 make_slot() {
@@ -248,4 +272,4 @@ cmp "$work_dir/lease-genesis.bin" "$work_dir/lease-readback.bin"
 stop_swtpm
 
 echo \
-    "CSER_TPM_NV_PROVISION PASS indices=6 selectors=tip+lease sequence=1 platform_created=true policy_delete=true writeall=true orderly=false fixture_auth=empty swtpm_state_rollbackable=true physical_antirollback=false"
+    "CSER_TPM_NV_PROVISION PASS indices=6 selectors=tip+lease sequence=1 tip_revision=$tip_revision tip_head=$tip_head_hex platform_created=true policy_delete=true writeall=true orderly=false fixture_auth=empty swtpm_state_rollbackable=true physical_antirollback=false"

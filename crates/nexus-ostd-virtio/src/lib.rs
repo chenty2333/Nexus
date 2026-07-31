@@ -34,11 +34,15 @@ pub use boot_quarantine::{
     ActivatedBootDevice, BootActivationFailure, BootClaimCoordinateError, BootClaimCoordinateField,
     BootClaimCoordinates, BootClaimQuarantineReceipts, BootDeviceScope,
     BootGlobalIotlbInvalidationReceipt, BootQuarantineError, BootQuarantineFailure,
-    BootQuarantineGuard, BootQuarantineRequest, BootQuarantineRequestError,
-    BootReceiptBindingError, BootVirtioIsrEmptyReceipt, BootVirtioStatusResetReceipt,
-    quarantine_production_device,
+    BootQuarantineGuard, BootQuarantineObservation, BootQuarantineRequest,
+    BootQuarantineRequestError, BootReceiptBindingError, BootVirtioIsrEmptyReceipt,
+    BootVirtioStatusResetReceipt, quarantine_production_device,
 };
-pub use dma::{OwnerKind, owner_address};
+pub use dma::{
+    OwnerKind, PersistentDmaArenaError, PersistentDmaArenaLayout, PersistentDmaArenaObservation,
+    install_persistent_dma_arena, owner_address, persistent_dma_arena_layout,
+    persistent_dma_arena_observation, qemu_hypervisor_detected,
+};
 pub use pci::{
     DeviceBdf, IntxRoute, IntxTransitionError, IntxTransitionFailure, MaskedIntx,
     PciDiscoveryError, Root, UnmaskedIntx, discover_and_own_bars,

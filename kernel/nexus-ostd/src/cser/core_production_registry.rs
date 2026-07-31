@@ -249,6 +249,8 @@ pub(crate) enum ProductionRegistryError<E> {
     LinearCustodyFull,
     /// A caller tried to bypass the portal's trusted-command policy.
     TrustedPathRequired,
+    /// A profile-1 singleton command reached the profile-2 production owner.
+    ProfileOneCommandForbidden,
     /// A committed client transition returned an unexpected bearer kind.
     UnexpectedLinearOutput,
     /// Commit intent became durable without returning its required bearer.
@@ -264,12 +266,18 @@ pub(crate) struct ProductionCoreOwner<S> {
 
 impl<S> ProductionCoreOwner<S> {
     /// Installs one already-recovered state without opening ingress.
-    pub(crate) fn new(installed: S) -> Self {
-        Self {
+    pub(crate) fn new(installed: S) -> Result<Self, (CoreError, S)>
+    where
+        S: InstalledCore,
+    {
+        if installed.observe(Engine::profile_one_estate_count) != 0 {
+            return Err((CoreError::IncompatibleApiProfile, installed));
+        }
+        Ok(Self {
             installed,
             linear_custody: Mutex::new(Vec::with_capacity(MAX_LINEAR_PORTAL_BEARERS)),
             ingress: ProductionIngressGate::closed(),
-        }
+        })
     }
 
     /// Borrows the installed state for provider-specific quarantine work.
@@ -348,15 +356,52 @@ impl<S> ProductionCoreOwner<S> {
         Ok(data.identity)
     }
 
-    /// Transfers one exact commit intent to its trusted domain custodian.
-    pub(crate) fn take_commit_intent(&self, effect: cser_core::EffectId) -> Option<CommitIntent> {
+    /// Transfers one exact component commit intent to its trusted custodian.
+    pub(crate) fn take_component_commit_intent(
+        &self,
+        effect: cser_core::EffectId,
+        component: cser_core::ComponentId,
+    ) -> Option<CommitIntent> {
+        self.take_matching_commit_intent(effect, Some(component))
+    }
+
+    fn take_matching_commit_intent(
+        &self,
+        effect: cser_core::EffectId,
+        component: Option<cser_core::ComponentId>,
+    ) -> Option<CommitIntent> {
         let mut custody = self.linear_custody.lock();
         let index = custody.iter().position(|output| {
-            matches!(output, TransitionOutput::CommitIntent(intent) if intent.effect() == effect)
+            matches!(
+                output,
+                TransitionOutput::CommitIntent(intent)
+                    if intent.effect() == effect && intent.component() == component
+            )
         })?;
         match custody.swap_remove(index) {
             TransitionOutput::CommitIntent(intent) => Some(intent),
             _ => unreachable!("the selected linear output is a commit intent"),
+        }
+    }
+
+    /// Transfers one complete atomic composite commit cohort to its trusted
+    /// cross-domain publisher. Partial extraction is deliberately impossible.
+    pub(crate) fn take_composite_commit_intents(
+        &self,
+        effect: cser_core::EffectId,
+    ) -> Option<Vec<CommitIntent>> {
+        let mut custody = self.linear_custody.lock();
+        let index = custody.iter().position(|output| {
+            matches!(
+                output,
+                TransitionOutput::CompositeCommitIntents(intents)
+                    if !intents.is_empty()
+                        && intents.iter().all(|intent| intent.effect() == effect)
+            )
+        })?;
+        match custody.swap_remove(index) {
+            TransitionOutput::CompositeCommitIntents(intents) => Some(intents),
+            _ => unreachable!("the selected linear output is a composite intent cohort"),
         }
     }
 
@@ -382,7 +427,11 @@ impl<S: InstalledCore> ProductionCoreOwner<S> {
     where
         C: Into<Command>,
     {
-        self.installed.transact(command.into())
+        let command = command.into();
+        if !command.is_profile_two_compatible() {
+            return Err(TxError::Core(CoreError::IncompatibleApiProfile));
+        }
+        self.installed.transact(command)
     }
 
     /// Runs a provider or verifier observation under the authoritative lock.
@@ -395,6 +444,9 @@ impl<S: InstalledCore + 'static> CoreRegistry for ProductionCoreOwner<S> {
     type Error = ProductionRegistryError<S::PersistenceError>;
 
     fn transact(&self, request: CommandRequest) -> Result<CoreTransitionView, Self::Error> {
+        if !request.is_profile_two_compatible() {
+            return Err(ProductionRegistryError::ProfileOneCommandForbidden);
+        }
         let identity = self
             .authorize_current_ingress()
             .map_err(ProductionRegistryError::Ingress)?;
@@ -403,13 +455,14 @@ impl<S: InstalledCore + 'static> CoreRegistry for ProductionCoreOwner<S> {
                 ProductionIngressError::IdentityMismatch,
             ));
         }
-        let expects_intent = matches!(&request, CommandRequest::RecordCommitIntent { .. });
+        let expected_intent = command_commit_intent_identity(&request);
         if !matches!(
             &request,
-            CommandRequest::CreateEstate { .. }
-                | CommandRequest::AddClaim { .. }
-                | CommandRequest::PrepareEffect { .. }
-                | CommandRequest::RecordCommitIntent { .. }
+            CommandRequest::CreateCompositeEffect { .. }
+                | CommandRequest::AddComponentClaim { .. }
+                | CommandRequest::PrepareCompositeEffect { .. }
+                | CommandRequest::RecordComponentCommitIntent { .. }
+                | CommandRequest::RecordCompositeCommitIntents { .. }
         ) {
             return Err(ProductionRegistryError::TrustedPathRequired);
         }
@@ -422,20 +475,42 @@ impl<S: InstalledCore + 'static> CoreRegistry for ProductionCoreOwner<S> {
             .installed
             .transact(request.into())
             .map_err(ProductionRegistryError::Transaction)?;
-        let view = CoreTransitionView::new(
-            receipt.revision(),
-            receipt.head(),
-            receipt.projection(),
-            receipt.event(),
-        );
+        let view = CoreTransitionView::from_receipt(&receipt);
         match receipt.into_output() {
-            TransitionOutput::None if expects_intent => {
+            TransitionOutput::None if expected_intent.is_some() => {
                 Err(ProductionRegistryError::MissingCommitIntent)
             }
             TransitionOutput::None => Ok(view),
-            output @ TransitionOutput::CommitIntent(_) if expects_intent => {
-                custody.push(output);
-                Ok(view)
+            TransitionOutput::CommitIntent(intent) => {
+                let matches_request = matches!(
+                    expected_intent,
+                    Some(ExpectedCommitIntent::Single(effect, component))
+                        if effect == intent.effect() && component == intent.component()
+                );
+                custody.push(TransitionOutput::CommitIntent(intent));
+                if matches_request {
+                    Ok(view)
+                } else {
+                    Err(ProductionRegistryError::UnexpectedLinearOutput)
+                }
+            }
+            TransitionOutput::CompositeCommitIntents(intents) => {
+                let matches_request = match &expected_intent {
+                    Some(ExpectedCommitIntent::Composite { effect, components }) => {
+                        !intents.is_empty()
+                            && intents.len() == components.len()
+                            && intents.iter().zip(components).all(|(intent, component)| {
+                                intent.effect() == *effect && intent.component() == Some(*component)
+                            })
+                    }
+                    _ => false,
+                };
+                custody.push(TransitionOutput::CompositeCommitIntents(intents));
+                if matches_request {
+                    Ok(view)
+                } else {
+                    Err(ProductionRegistryError::UnexpectedLinearOutput)
+                }
             }
             output => {
                 custody.push(output);
@@ -451,18 +526,27 @@ impl<S: InstalledCore + 'static> CoreRegistry for ProductionCoreOwner<S> {
             let stamp =
                 CoreObservationStamp::new(engine.revision(), engine.head(), engine.freshness());
             match query {
-                CoreQuery::Estate(effect) => Ok(CoreObservation::Estate {
+                CoreQuery::CompositeEffect(effect) => Ok(CoreObservation::CompositeEffect {
                     stamp,
                     effect,
-                    estate: engine.estate(effect),
+                    composite: engine.composite_effect(effect),
                 }),
-                CoreQuery::Claims(effect) => Ok(CoreObservation::Claims {
+                CoreQuery::Component(effect, component) => Ok(CoreObservation::Component {
                     stamp,
                     effect,
-                    claims: engine
-                        .claims(effect)
-                        .map_err(ProductionRegistryError::Core)?,
+                    component,
+                    projection: engine.component(effect, component),
                 }),
+                CoreQuery::ComponentClaims(effect, component) => {
+                    Ok(CoreObservation::ComponentClaims {
+                        stamp,
+                        effect,
+                        component,
+                        claims: engine
+                            .component_claims(effect, component)
+                            .map_err(ProductionRegistryError::Core)?,
+                    })
+                }
                 CoreQuery::Pressure => Ok(CoreObservation::Pressure {
                     stamp,
                     pressure: engine.pressure(),
@@ -474,24 +558,30 @@ impl<S: InstalledCore + 'static> CoreRegistry for ProductionCoreOwner<S> {
 
 fn command_ingress_identity(request: &CommandRequest) -> Option<ProductionIngressIdentity> {
     let (root, incarnation, binding_generation) = match request {
-        CommandRequest::CreateEstate {
+        CommandRequest::CreateCompositeEffect {
             effect,
             origin,
             binding_generation,
             ..
         } => (effect.root(), *origin, *binding_generation),
-        CommandRequest::AddClaim {
+        CommandRequest::AddComponentClaim {
             effect,
             actor,
             binding_generation,
             ..
         }
-        | CommandRequest::PrepareEffect {
+        | CommandRequest::PrepareCompositeEffect {
             effect,
             actor,
             binding_generation,
         }
-        | CommandRequest::RecordCommitIntent {
+        | CommandRequest::RecordComponentCommitIntent {
+            effect,
+            actor,
+            binding_generation,
+            ..
+        }
+        | CommandRequest::RecordCompositeCommitIntents {
             effect,
             actor,
             binding_generation,
@@ -500,6 +590,32 @@ fn command_ingress_identity(request: &CommandRequest) -> Option<ProductionIngres
         _ => return None,
     };
     ProductionIngressIdentity::new(root, incarnation, binding_generation).ok()
+}
+
+enum ExpectedCommitIntent {
+    Single(cser_core::EffectId, Option<cser_core::ComponentId>),
+    Composite {
+        effect: cser_core::EffectId,
+        components: Vec<cser_core::ComponentId>,
+    },
+}
+
+fn command_commit_intent_identity(request: &CommandRequest) -> Option<ExpectedCommitIntent> {
+    match request {
+        CommandRequest::RecordComponentCommitIntent {
+            effect, component, ..
+        } => Some(ExpectedCommitIntent::Single(*effect, Some(*component))),
+        CommandRequest::RecordCompositeCommitIntents {
+            effect, operations, ..
+        } => Some(ExpectedCommitIntent::Composite {
+            effect: *effect,
+            components: operations
+                .iter()
+                .map(|operation| operation.component())
+                .collect(),
+        }),
+        _ => None,
+    }
 }
 
 impl<S: InstalledCore> RecoveredCoreAuthority for ProductionCoreOwner<S> {
@@ -518,6 +634,9 @@ impl<S: InstalledCore> RecoveredCoreAuthority for ProductionCoreOwner<S> {
         &self,
         command: Command,
     ) -> Result<TransitionReceipt, TxError<Self::PersistenceError>> {
+        if !command.is_profile_two_compatible() {
+            return Err(TxError::Core(CoreError::IncompatibleApiProfile));
+        }
         self.installed.transact(command)
     }
 }

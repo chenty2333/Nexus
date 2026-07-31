@@ -46,9 +46,9 @@ use ostd::{
 };
 
 use super::core_dma_adapter::{
-    ClaimRole, CoreDmaClaim, CoreDmaClaims, CoreDmaCohort, acknowledge_real_irq,
-    apply_real_iotlb_closure, apply_real_reset_generation, bind_queue_commit, complete_real_irq,
-    publish_real_queue,
+    ClaimRole, CoreDmaClaim, CoreDmaClaims, CoreDmaCohort, CoreReuseReservation,
+    acknowledge_real_irq, apply_real_iotlb_closure, apply_real_reset_generation, bind_queue_commit,
+    complete_real_irq, publish_real_queue,
 };
 use super::core_runtime::OstdCserRuntime;
 
@@ -96,7 +96,7 @@ type DmaRuntime = OstdCserRuntime<VolatileDmaDurability>;
 
 fn new_dma_runtime() -> DmaRuntime {
     OstdCserRuntime::from_engine(
-        Engine::new(
+        Engine::new_legacy_compatibility(
             standard_catalog(),
             CoreLimits::bounded_default(),
             Freshness::new(
@@ -401,7 +401,15 @@ fn run_dma_recovery_slice() {
     ] {
         let permit = match output(
             &core,
-            cohort1.reserve_reuse(role, effect2, successor2, 3, claim.claim(), claim.units()),
+            cohort1.reserve_reuse(CoreReuseReservation::new(
+                role,
+                effect2,
+                successor2,
+                3,
+                claim.claim(),
+                claim.units(),
+                digest(0xda),
+            )),
         ) {
             TransitionOutput::ReusePermit(permit) => permit,
             other => panic!("expected resource reuse permit, got {other:?}"),
@@ -518,6 +526,7 @@ fn run_dma_recovery_slice() {
         "CSER_CORE_DMA_OSTD_QEMU PASS death=real-task-reap fence=immediate-manager \
          second_crash=true post_mortem_owner=kernel-manager reply_registry=false \
          legacy_registry=false portal_glue=false live_dual_write=false \
+         historical_profile=1 production_profile=false \
          journal=volatile-dev-only durable_provider=separate-suite qemu=true physical_hardware=false"
     );
     poweroff(ExitCode::Success);

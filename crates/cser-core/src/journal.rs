@@ -5,17 +5,22 @@ use alloc::vec::Vec;
 use sha2::{Digest as _, Sha256};
 
 use crate::{
-    BootGeneration, DeviceGeneration, Digest, JournalGeneration, RegistryInstance,
+    BootGeneration, CSER_CORE_API_PROFILE_VERSION, DeviceGeneration, Digest, JournalGeneration,
+    RegistryInstance,
     engine::{CommandDecodeError, CommandKind},
 };
 
 /// Magic prefix of every CSER journal record.
-pub const JOURNAL_MAGIC: [u8; 8] = *b"CSERJR5\0";
-/// Frozen journal schema for CSER core semantic API profile 1.
-pub const JOURNAL_SCHEMA_VERSION: u16 = 5;
+pub const JOURNAL_MAGIC: [u8; 8] = *b"CSERJR6\0";
+/// Frozen journal schema for CSER core semantic API profile 2.
+pub const JOURNAL_SCHEMA_VERSION: u16 = 6;
+/// Semantic core API profile explicitly bound in every schema-6 envelope.
+pub const JOURNAL_CORE_API_PROFILE: u16 = CSER_CORE_API_PROFILE_VERSION;
 
-const PREVIOUS_JOURNAL_MAGIC: [u8; 8] = *b"CSERJR4\0";
-const PREVIOUS_JOURNAL_SCHEMA_VERSION: u16 = 4;
+const PROFILE_ONE_JOURNAL_MAGIC: [u8; 8] = *b"CSERJR5\0";
+const PROFILE_ONE_JOURNAL_SCHEMA_VERSION: u16 = 5;
+const LEGACY_JOURNAL_MAGIC: [u8; 8] = *b"CSERJR4\0";
+const LEGACY_JOURNAL_SCHEMA_VERSION: u16 = 4;
 
 const FIXED_WITHOUT_DIGEST: usize = 140;
 const DIGEST_LEN: usize = 32;
@@ -66,7 +71,7 @@ impl JournalRecord {
         let mut bytes = Vec::with_capacity(total_len);
         bytes.extend_from_slice(&JOURNAL_MAGIC);
         bytes.extend_from_slice(&JOURNAL_SCHEMA_VERSION.to_le_bytes());
-        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&JOURNAL_CORE_API_PROFILE.to_le_bytes());
         bytes.extend_from_slice(&total_len_u32.to_le_bytes());
         bytes.extend_from_slice(&base_revision.to_le_bytes());
         bytes.extend_from_slice(&revision.to_le_bytes());
@@ -173,8 +178,11 @@ pub enum JournalDecodeError {
         /// Unsupported version.
         version: u16,
     },
-    /// Reserved envelope bits were non-zero.
-    ReservedBits,
+    /// The record binds a core API profile this decoder cannot execute.
+    UnsupportedApiProfile {
+        /// Unsupported semantic API profile.
+        profile: u16,
+    },
     /// A declared record length is structurally invalid.
     InvalidLength,
     /// A length cannot be represented by the journal format.
@@ -282,6 +290,26 @@ fn scan_journal_inner(
     let mut offset = 0usize;
     while offset < bytes.len() {
         let remaining = &bytes[offset..];
+        if remaining.len() < JOURNAL_MAGIC.len() {
+            return Ok((
+                JournalScan {
+                    records,
+                    torn_tail: Some(offset),
+                    unanchored_suffix: None,
+                },
+                false,
+            ));
+        }
+        if remaining[..8] == PROFILE_ONE_JOURNAL_MAGIC {
+            return Err(JournalDecodeError::UnsupportedVersion {
+                version: PROFILE_ONE_JOURNAL_SCHEMA_VERSION,
+            });
+        }
+        if remaining[..8] == LEGACY_JOURNAL_MAGIC {
+            return Err(JournalDecodeError::UnsupportedVersion {
+                version: LEGACY_JOURNAL_SCHEMA_VERSION,
+            });
+        }
         if remaining.len() < 16 {
             return Ok((
                 JournalScan {
@@ -292,11 +320,6 @@ fn scan_journal_inner(
                 false,
             ));
         }
-        if remaining[..8] == PREVIOUS_JOURNAL_MAGIC {
-            return Err(JournalDecodeError::UnsupportedVersion {
-                version: PREVIOUS_JOURNAL_SCHEMA_VERSION,
-            });
-        }
         if remaining[..8] != JOURNAL_MAGIC {
             return Err(JournalDecodeError::BadMagic { offset });
         }
@@ -304,8 +327,9 @@ fn scan_journal_inner(
         if version != JOURNAL_SCHEMA_VERSION {
             return Err(JournalDecodeError::UnsupportedVersion { version });
         }
-        if read_u16(remaining, 10) != 0 {
-            return Err(JournalDecodeError::ReservedBits);
+        let profile = read_u16(remaining, 10);
+        if profile != JOURNAL_CORE_API_PROFILE {
+            return Err(JournalDecodeError::UnsupportedApiProfile { profile });
         }
         let total_len = read_u32(remaining, 12) as usize;
         if total_len < MIN_RECORD_LEN {

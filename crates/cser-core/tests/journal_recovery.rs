@@ -17,7 +17,7 @@ fn recover(
     minimum_revision: u64,
     expected_head: Digest,
 ) -> Result<cser_core::RecoveryReport, CoreError> {
-    Engine::recover(
+    Engine::recover_legacy_compatibility(
         standard_catalog(),
         CoreLimits::bounded_default(),
         RecoveryAnchor::from_trusted_provider(
@@ -101,7 +101,7 @@ fn record_roundtrip_recovers_the_exact_acknowledged_chain_head() {
         source.journal
     );
 
-    let report = Engine::recover(
+    let report = Engine::recover_legacy_compatibility(
         standard_catalog(),
         CoreLimits::bounded_default(),
         RecoveryAnchor::from_trusted_provider(
@@ -330,7 +330,7 @@ fn trusted_revision_head_and_freshness_anchors_reject_rollback() {
         Err(RecoveryAnchorError::NonAdvancingEpoch)
     );
     assert_eq!(
-        Engine::recover(
+        Engine::recover_legacy_compatibility(
             standard_catalog(),
             CoreLimits::bounded_default(),
             RecoveryAnchor::from_trusted_provider(
@@ -347,7 +347,7 @@ fn trusted_revision_head_and_freshness_anchors_reject_rollback() {
         CoreError::SchemaMismatch
     );
     assert_eq!(
-        Engine::recover(
+        Engine::recover_legacy_compatibility(
             standard_catalog(),
             CoreLimits::bounded_default(),
             RecoveryAnchor::from_trusted_provider(
@@ -488,7 +488,7 @@ fn trusted_genesis_recovers_an_empty_prefix_and_rejects_unanchored_first_append(
         .unwrap()
     };
 
-    let report = Engine::recover(
+    let report = Engine::recover_legacy_compatibility(
         standard_catalog(),
         CoreLimits::bounded_default(),
         genesis_anchor(),
@@ -515,7 +515,7 @@ fn trusted_genesis_recovers_an_empty_prefix_and_rejects_unanchored_first_append(
         .unwrap();
 
     let unanchored_first_append = journal.clone();
-    let report = Engine::recover(
+    let report = Engine::recover_legacy_compatibility(
         standard_catalog(),
         CoreLimits::bounded_default(),
         genesis_anchor(),
@@ -538,11 +538,55 @@ fn trusted_genesis_recovers_an_empty_prefix_and_rejects_unanchored_first_append(
 }
 
 #[test]
+fn trusted_genesis_rejects_profile_one_before_repair_without_reclassifying_residue() {
+    let committed = freshness(1, 1, 1, 1, 1);
+    let target = freshness(2, 1, 1, 1, 2);
+    let genesis_anchor = || {
+        RecoveryAnchor::from_trusted_provider(
+            standard_catalog().digest(),
+            committed,
+            target,
+            0,
+            Digest::ZERO,
+        )
+        .unwrap()
+    };
+
+    for suffix in [&[][..], &b"\xffroots-and-timestamps\x00"[..]] {
+        let mut bytes = Vec::from(*b"CSERJR5\0");
+        bytes.extend_from_slice(suffix);
+        assert!(matches!(
+            Engine::recover(
+                standard_catalog(),
+                CoreLimits::bounded_default(),
+                genesis_anchor(),
+                &bytes,
+            ),
+            Err(CoreError::Journal(JournalDecodeError::UnsupportedVersion {
+                version: 5
+            }))
+        ));
+    }
+
+    let report = Engine::recover(
+        standard_catalog(),
+        CoreLimits::bounded_default(),
+        genesis_anchor(),
+        b"arbitrary failed-write residue",
+    )
+    .unwrap();
+    assert_eq!(
+        report.journal_repair(),
+        Some(JournalRepair::UnanchoredSuffix { offset: 0 })
+    );
+}
+
+#[test]
 fn ambiguous_persistence_failure_latches_the_engine_until_journal_recovery() {
     #[derive(Debug, Eq, PartialEq)]
     struct DiskFull;
 
-    let mut engine = Engine::new(
+    let mut engine = Engine::new_legacy_compatibility(
         standard_catalog(),
         CoreLimits::bounded_default(),
         freshness(1, 1, 1, 1, 1),

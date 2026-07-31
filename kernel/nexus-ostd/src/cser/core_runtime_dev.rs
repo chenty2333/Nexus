@@ -3,10 +3,9 @@
 //! Development-only negative durability probe for the focused reply profile.
 
 use cser_core::{
-    BootGeneration, ChargeAccountId, CommandRequest, CoreLimits, EffectId, Freshness,
-    JournalGeneration, JournalRecord, PrincipalId, PrincipalIncarnation, REPLY_DOMAIN,
-    REPLY_OBLIGATION_PUBLICATION, RegistryInstance, RootId, TransitionDurability, TxError,
-    standard_catalog,
+    AGENT_OPERATION_COMPOSITE, BootGeneration, ChargeAccountId, CommandRequest, CoreLimits,
+    EffectId, Freshness, JournalGeneration, JournalRecord, PrincipalId, PrincipalIncarnation,
+    RegistryInstance, RootId, TransitionDurability, TxError, standard_catalog,
 };
 use ostd::prelude::println;
 
@@ -51,12 +50,11 @@ pub(super) fn run_boot_probe() {
         cser_core::Engine::new(standard_catalog(), CoreLimits::bounded_default(), freshness);
     let runtime = OstdCserRuntime::from_engine(engine, UnavailableJournal);
     let effect = EffectId::new(root, 1).expect("spike effect is non-zero");
-    let command = CommandRequest::CreateEstate {
+    let command = CommandRequest::CreateCompositeEffect {
         effect,
         origin,
         binding_generation: 1,
-        domain: REPLY_DOMAIN,
-        obligation: REPLY_OBLIGATION_PUBLICATION,
+        kind: AGENT_OPERATION_COMPOSITE,
         charge_account: ChargeAccountId::new(1).expect("spike account is non-zero"),
     };
 
@@ -67,7 +65,7 @@ pub(super) fn run_boot_probe() {
     let (revision, estate_absent, recovery_required) = runtime.observe(|engine| {
         (
             engine.revision(),
-            engine.estate(effect).is_none(),
+            engine.composite_effect(effect).is_none(),
             engine.pressure().persistence_recovery_required,
         )
     });

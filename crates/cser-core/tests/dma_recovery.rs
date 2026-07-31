@@ -2,12 +2,12 @@
 mod support;
 
 use cser_core::{
-    AuthorityState, CREDIT_IOVA, CREDIT_PINNED_PAGE, CREDIT_QUEUE_SLOT,
+    AGENT_COMPONENT_DMA, AuthorityState, CREDIT_IOVA, CREDIT_PINNED_PAGE, CREDIT_QUEUE_SLOT,
     Command as AuthorizedCommand, CommandRequest as Command, CommitState, CoreError, CoreLimits,
     DEVICE_CLAIM_IOVA, DEVICE_CLAIM_PINNED_PAGE, DEVICE_CLAIM_QUEUE_SLOT, DEVICE_DOMAIN,
     DEVICE_EVIDENCE_IOTLB, DEVICE_EVIDENCE_IRQ_DRAINED, DEVICE_EVIDENCE_RESET,
-    DEVICE_OBLIGATION_DMA, DeviceGeneration, Engine, ExternalOutcome, Freshness, RecoveryAnchor,
-    RetirementState, TransitionOutput, standard_catalog,
+    DEVICE_OBLIGATION_DMA, DMA_ARENA_REUSE_COMPOSITE, DeviceGeneration, Engine, ExternalOutcome,
+    Freshness, RecoveryAnchor, RetirementState, TransitionOutput, standard_catalog,
 };
 use support::{
     ExactTestVerifier, Harness, TestReceipt, charge, claim, digest, effect, fence_and_rebind,
@@ -59,7 +59,7 @@ fn replay_exposes_exact_retained_claims_without_an_adapter_side_tombstone_index(
         assert!(!projection.retired);
     }
 
-    let report = Engine::recover(
+    let report = Engine::recover_legacy_compatibility(
         standard_catalog(),
         CoreLimits::bounded_default(),
         RecoveryAnchor::from_trusted_provider(
@@ -107,6 +107,19 @@ fn committed_dma(
     cser_core::PrincipalIncarnation,
     Freshness,
 ) {
+    committed_dma_with_resource_offset(harness, root_value, account_value, 0)
+}
+
+fn committed_dma_with_resource_offset(
+    harness: &mut Harness,
+    root_value: u64,
+    account_value: u64,
+    resource_offset: u64,
+) -> (
+    cser_core::EffectId,
+    cser_core::PrincipalIncarnation,
+    Freshness,
+) {
     let effect = effect(root_value, 1);
     let origin = principal(root_value, 1);
     harness
@@ -133,7 +146,7 @@ fn committed_dma(
                 domain: DEVICE_DOMAIN,
                 kind,
                 scope: cser_core::ClaimScope::Device(cser_core::DeviceScopeId::new(1).unwrap()),
-                resource: resource(resource_value),
+                resource: resource(resource_value + resource_offset),
                 resource_generation: cser_core::ResourceGeneration::new(1).unwrap(),
                 units,
             })
@@ -442,6 +455,7 @@ fn device_generation_rejects_late_receipts_without_dropping_claims() {
         resource: resource(QUEUE_RESOURCE),
         expected_generation: cser_core::ResourceGeneration::new(1).unwrap(),
         units: 1,
+        reuse_contract: digest(201),
     }) {
         cser_core::TransitionOutput::ReusePermit(permit) => permit,
         other => panic!("expected reuse permit, got {other:?}"),
@@ -490,6 +504,7 @@ fn pending_reuse_is_reclaimed_only_after_each_explicit_crash_adoption() {
         resource: resource(QUEUE_RESOURCE),
         expected_generation: cser_core::ResourceGeneration::new(1).unwrap(),
         units: 1,
+        reuse_contract: digest(202),
     }) {
         TransitionOutput::ReusePermit(permit) => permit,
         other => panic!("expected first reuse permit, got {other:?}"),
@@ -560,7 +575,7 @@ fn pending_reuse_is_reclaimed_only_after_each_explicit_crash_adoption() {
         1
     );
 
-    let report = Engine::recover(
+    let report = Engine::recover_legacy_compatibility(
         standard_catalog(),
         CoreLimits::bounded_default(),
         RecoveryAnchor::from_trusted_provider(
@@ -591,7 +606,9 @@ fn late_old_generation_receipt_retires_only_its_exact_tombstone() {
         25,
     )
     .unwrap();
-    let (new_effect, _, new_subject) = committed_dma(&mut harness, 26, 26);
+    const NEW_RESOURCE_OFFSET: u64 = 1_000;
+    let (new_effect, _, new_subject) =
+        committed_dma_with_resource_offset(&mut harness, 26, 26, NEW_RESOURCE_OFFSET);
     assert_eq!(old_subject.device().get(), 1);
     assert_eq!(new_subject.device().get(), 2);
 
@@ -607,6 +624,13 @@ fn late_old_generation_receipt_retires_only_its_exact_tombstone() {
     assert_eq!(
         harness.engine.check_reusable(
             resource(QUEUE_RESOURCE),
+            cser_core::ResourceGeneration::new(1).unwrap()
+        ),
+        Ok(())
+    );
+    assert_eq!(
+        harness.engine.check_reusable(
+            resource(QUEUE_RESOURCE + NEW_RESOURCE_OFFSET),
             cser_core::ResourceGeneration::new(1).unwrap()
         ),
         Err(CoreError::ResourceRetained)
@@ -664,7 +688,7 @@ fn late_old_generation_receipt_retires_only_its_exact_tombstone() {
     .unwrap();
     assert_eq!(
         harness.engine.check_reusable(
-            resource(QUEUE_RESOURCE),
+            resource(QUEUE_RESOURCE + NEW_RESOURCE_OFFSET),
             cser_core::ResourceGeneration::new(1).unwrap()
         ),
         Ok(())
@@ -687,7 +711,7 @@ fn journal_replay_preserves_exact_subject_and_ordered_retirement_high_water() {
 
     let acknowledged_revision = before_crash.engine.revision();
     let acknowledged_head = before_crash.engine.head();
-    let report = Engine::recover(
+    let report = Engine::recover_legacy_compatibility(
         standard_catalog(),
         CoreLimits::bounded_default(),
         RecoveryAnchor::from_trusted_provider(
@@ -831,7 +855,7 @@ fn reboot_recovers_device_tombstones_under_quarantine_until_fresh_evidence() {
     let acknowledged_revision = before_crash.engine.revision();
     let acknowledged_head = before_crash.engine.head();
 
-    let report = Engine::recover(
+    let report = Engine::recover_legacy_compatibility(
         standard_catalog(),
         CoreLimits::bounded_default(),
         RecoveryAnchor::from_trusted_provider(
@@ -875,6 +899,12 @@ fn reboot_recovers_device_tombstones_under_quarantine_until_fresh_evidence() {
         })
         .unwrap();
     assert_eq!(
+        recovered
+            .engine
+            .device_generation(cser_core::DeviceScopeId::new(1).unwrap()),
+        DeviceGeneration::new(2).ok()
+    );
+    assert_eq!(
         recovered.engine.check_reusable(
             resource(IOVA_RESOURCE),
             cser_core::ResourceGeneration::new(1).unwrap()
@@ -887,6 +917,11 @@ fn reboot_recovers_device_tombstones_under_quarantine_until_fresh_evidence() {
         .engine
         .evidence_challenge(effect, claim(IOVA_CLAIM), DEVICE_EVIDENCE_RESET)
         .unwrap();
+    assert_eq!(challenge.subject().device(), old_freshness.device());
+    assert_eq!(
+        challenge.current_observation().device(),
+        DeviceGeneration::new(2).unwrap()
+    );
     let wrong_subject = TestReceipt {
         effect,
         claim: claim(IOVA_CLAIM),
@@ -978,6 +1013,7 @@ fn reboot_recovers_device_tombstones_under_quarantine_until_fresh_evidence() {
             resource: resource(resource_value),
             expected_generation: cser_core::ResourceGeneration::new(1).unwrap(),
             units: 1,
+            reuse_contract: digest(203),
         }) {
             cser_core::TransitionOutput::ReusePermit(permit) => permit,
             other => panic!("expected reuse permit, got {other:?}"),
@@ -987,4 +1023,194 @@ fn reboot_recovers_device_tombstones_under_quarantine_until_fresh_evidence() {
         assert_eq!(permit.freshness(), freshness(2, 1, 1, 2, 2));
         recovered.tx(permit.activate()).unwrap();
     }
+}
+
+#[test]
+fn recovery_checkpoint_rejects_a_target_below_any_known_device_scope() {
+    let mut before_crash = Harness::new();
+    let (effect, _origin, subject) = committed_dma(&mut before_crash, 42, 42);
+    submit(
+        &mut before_crash,
+        effect,
+        subject,
+        QUEUE_CLAIM,
+        DEVICE_EVIDENCE_RESET,
+        50,
+    )
+    .unwrap();
+    let scope = cser_core::DeviceScopeId::new(1).unwrap();
+    assert_eq!(
+        before_crash.engine.device_generation(scope),
+        DeviceGeneration::new(2).ok()
+    );
+
+    let report = Engine::recover_legacy_compatibility(
+        standard_catalog(),
+        CoreLimits::bounded_default(),
+        RecoveryAnchor::from_trusted_provider(
+            standard_catalog().digest(),
+            freshness(1, 1, 1, 1, 1),
+            freshness(2, 1, 1, 1, 2),
+            before_crash.engine.revision(),
+            before_crash.engine.head(),
+        )
+        .unwrap(),
+        &before_crash.journal,
+    )
+    .unwrap();
+    let mut recovered = Harness {
+        engine: report.into_engine(),
+        journal: before_crash.journal,
+    };
+    let before = (
+        recovered.engine.revision(),
+        recovered.engine.head(),
+        recovered.engine.projection_digest(),
+        recovered.engine.freshness(),
+        recovered.engine.device_generation(scope),
+        recovered.journal.len(),
+    );
+
+    assert_eq!(
+        recovered.tx(Command::CheckpointRecovery {
+            boot: cser_core::BootGeneration::new(2).unwrap(),
+            journal: cser_core::JournalGeneration::new(2).unwrap(),
+            device: DeviceGeneration::new(1).unwrap(),
+        }),
+        Err(CoreError::FreshnessRollback)
+    );
+    assert_eq!(
+        (
+            recovered.engine.revision(),
+            recovered.engine.head(),
+            recovered.engine.projection_digest(),
+            recovered.engine.freshness(),
+            recovered.engine.device_generation(scope),
+            recovered.journal.len(),
+        ),
+        before
+    );
+    assert!(recovered.engine.pressure().quarantined);
+}
+
+#[test]
+fn recovery_checkpoint_refreshes_a_retired_scope_before_composite_reuse() {
+    let mut before_crash = Harness::new();
+    let (old_effect, _origin, subject) = committed_dma(&mut before_crash, 43, 43);
+    for (claim_value, kind, digest_value) in [
+        (QUEUE_CLAIM, DEVICE_EVIDENCE_RESET, 60),
+        (QUEUE_CLAIM, DEVICE_EVIDENCE_IRQ_DRAINED, 61),
+        (PAGE_CLAIM, DEVICE_EVIDENCE_RESET, 62),
+        (PAGE_CLAIM, DEVICE_EVIDENCE_IOTLB, 63),
+        (IOVA_CLAIM, DEVICE_EVIDENCE_RESET, 64),
+        (IOVA_CLAIM, DEVICE_EVIDENCE_IOTLB, 65),
+    ] {
+        submit(
+            &mut before_crash,
+            old_effect,
+            subject,
+            claim_value,
+            kind,
+            digest_value,
+        )
+        .unwrap();
+    }
+    let scope = cser_core::DeviceScopeId::new(1).unwrap();
+    assert_eq!(before_crash.engine.pressure().retained_claims, 0);
+    assert_eq!(
+        before_crash.engine.device_generation(scope),
+        DeviceGeneration::new(2).ok()
+    );
+
+    let report = Engine::recover_legacy_compatibility(
+        standard_catalog(),
+        CoreLimits::bounded_default(),
+        RecoveryAnchor::from_trusted_provider(
+            standard_catalog().digest(),
+            freshness(1, 1, 1, 1, 1),
+            freshness(2, 1, 1, 3, 2),
+            before_crash.engine.revision(),
+            before_crash.engine.head(),
+        )
+        .unwrap(),
+        &before_crash.journal,
+    )
+    .unwrap();
+    let mut recovered = Harness {
+        engine: report.into_engine(),
+        journal: before_crash.journal,
+    };
+    assert_eq!(
+        recovered.engine.device_generation(scope),
+        DeviceGeneration::new(2).ok()
+    );
+    recovered
+        .tx(Command::CheckpointRecovery {
+            boot: cser_core::BootGeneration::new(2).unwrap(),
+            journal: cser_core::JournalGeneration::new(2).unwrap(),
+            device: DeviceGeneration::new(3).unwrap(),
+        })
+        .unwrap();
+    assert_eq!(
+        recovered.engine.device_generation(scope),
+        DeviceGeneration::new(3).ok()
+    );
+
+    let reuse_effect = effect(44, 1);
+    let reuse_actor = principal(44, 1);
+    recovered
+        .tx(Command::CreateCompositeEffect {
+            effect: reuse_effect,
+            origin: reuse_actor,
+            binding_generation: 1,
+            kind: DMA_ARENA_REUSE_COMPOSITE,
+            charge_account: charge(44),
+        })
+        .unwrap();
+    let permit = match recovered.output(Command::ReserveComponentReuse {
+        effect: reuse_effect,
+        component: AGENT_COMPONENT_DMA,
+        actor: reuse_actor,
+        binding_generation: 1,
+        claim: claim(4401),
+        kind: DEVICE_CLAIM_QUEUE_SLOT,
+        scope: cser_core::ClaimScope::Device(scope),
+        resource: resource(QUEUE_RESOURCE),
+        expected_generation: cser_core::ResourceGeneration::new(1).unwrap(),
+        units: 1,
+        reuse_contract: digest(204),
+    }) {
+        TransitionOutput::ReusePermit(permit) => permit,
+        other => panic!("expected component reuse permit, got {other:?}"),
+    };
+    assert_eq!(permit.component(), Some(AGENT_COMPONENT_DMA));
+    assert_eq!(permit.generation().get(), 2);
+    assert_eq!(permit.freshness(), freshness(2, 1, 1, 3, 2));
+    recovered.tx(permit.activate()).unwrap();
+    recovered
+        .tx(Command::PrepareCompositeEffect {
+            effect: reuse_effect,
+            actor: reuse_actor,
+            binding_generation: 1,
+        })
+        .unwrap();
+    let intent = match recovered.output(Command::RecordComponentCommitIntent {
+        effect: reuse_effect,
+        component: AGENT_COMPONENT_DMA,
+        actor: reuse_actor,
+        binding_generation: 1,
+        operation: digest(66),
+    }) {
+        TransitionOutput::CommitIntent(intent) => intent,
+        other => panic!("expected component commit intent, got {other:?}"),
+    };
+    assert_eq!(
+        recovered
+            .engine
+            .commit_outcome_challenge(&intent)
+            .unwrap()
+            .current_observation()
+            .device(),
+        DeviceGeneration::new(3).unwrap()
+    );
 }

@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use crate::{
-    AdoptionPolicy, ClaimCardinality, ClaimKindId, ClaimScopePolicy, CreditClassId,
-    DeviceGenerationEffect, DomainCatalog, DomainCatalogBuilder, DomainId, EvidenceKindId,
-    EvidenceRule, FreshnessAxes, ObligationKindId, ObligationPolicy, ObligationReceipts,
-    ObligationSpec, ReceiptBinding, ReceiptSchemaId, VerifierId,
+    AdoptionPolicy, ClaimCardinality, ClaimKindId, ClaimScopePolicy, ComponentId,
+    CompositeComponentSpec, CompositeKindId, CreditClassId, DeviceGenerationEffect, DomainCatalog,
+    DomainCatalogBuilder, DomainId, EvidenceKindId, EvidenceRule, FreshnessAxes, ObligationKindId,
+    ObligationPolicy, ObligationReceipts, ObligationSpec, ReceiptBinding, ReceiptSchemaId,
+    VerifierId,
 };
 
 /// Verifier for exact reply-publication acknowledgements.
@@ -127,6 +128,28 @@ pub const DEVICE_EVIDENCE_IRQ_DRAINED: EvidenceKindId = match EvidenceKindId::ne
 };
 /// Typed IOTLB invalidation-completion evidence.
 pub const DEVICE_EVIDENCE_IOTLB: EvidenceKindId = match EvidenceKindId::new(3) {
+    Ok(value) => value,
+    Err(_) => unreachable!(),
+};
+
+/// Standard agent operation whose logical reply and DMA custody share one effect.
+pub const AGENT_OPERATION_COMPOSITE: CompositeKindId = match CompositeKindId::new(1) {
+    Ok(value) => value,
+    Err(_) => unreachable!(),
+};
+/// Logical reply/output component of the standard agent operation.
+pub const AGENT_COMPONENT_REPLY: ComponentId = match ComponentId::new(1) {
+    Ok(value) => value,
+    Err(_) => unreachable!(),
+};
+/// Queue/PFN/IOVA component of the standard agent operation.
+pub const AGENT_COMPONENT_DMA: ComponentId = match ComponentId::new(2) {
+    Ok(value) => value,
+    Err(_) => unreachable!(),
+};
+/// DMA-only composite used to prove resource-local generation reuse after the
+/// original heterogeneous agent operation has discharged its DMA component.
+pub const DMA_ARENA_REUSE_COMPOSITE: CompositeKindId = match CompositeKindId::new(2) {
     Ok(value) => value,
     Err(_) => unreachable!(),
 };
@@ -258,6 +281,31 @@ pub fn standard_catalog() -> DomainCatalog {
             &[device_reset, iotlb_after_reset],
         )
         .expect("standard IOVA claim is valid")
+        .composite(
+            AGENT_OPERATION_COMPOSITE,
+            &[
+                CompositeComponentSpec::new(
+                    AGENT_COMPONENT_REPLY,
+                    REPLY_DOMAIN,
+                    REPLY_OBLIGATION_PUBLICATION,
+                ),
+                CompositeComponentSpec::new(
+                    AGENT_COMPONENT_DMA,
+                    DEVICE_DOMAIN,
+                    DEVICE_OBLIGATION_DMA,
+                ),
+            ],
+        )
+        .expect("standard agent operation composite is valid")
+        .composite(
+            DMA_ARENA_REUSE_COMPOSITE,
+            &[CompositeComponentSpec::new(
+                AGENT_COMPONENT_DMA,
+                DEVICE_DOMAIN,
+                DEVICE_OBLIGATION_DMA,
+            )],
+        )
+        .expect("standard DMA arena reuse composite is valid")
         .build()
         .expect("standard domain catalog is internally complete")
 }

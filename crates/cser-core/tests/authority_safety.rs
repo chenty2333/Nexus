@@ -112,7 +112,7 @@ fn crash_quota_exhaustion_fences_first_and_blocks_automatic_recovery() {
         Err(CoreError::RecoveryExhausted)
     );
 
-    let replayed = Engine::recover(
+    let replayed = Engine::recover_legacy_compatibility(
         standard_catalog(),
         limits,
         RecoveryAnchor::from_trusted_provider(
@@ -154,7 +154,7 @@ fn boot_checkpoint_also_persists_exhausted_fencing() {
 
     let expected_head = harness.engine.head();
     let minimum_revision = harness.engine.revision();
-    let report = Engine::recover(
+    let report = Engine::recover_legacy_compatibility(
         standard_catalog(),
         limits,
         RecoveryAnchor::from_trusted_provider(

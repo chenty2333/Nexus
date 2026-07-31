@@ -11,7 +11,8 @@ boot_protocol = "multiboot2"
 build.features = ["cser-production"]
 qemu.args = """\
     -nodefaults \
-    -machine q35,kernel-irqchip=split,default-bus-bypass-iommu=off \
+    -object memory-backend-file,id=cser-ram,size=1G,mem-path=/work/artifacts/cser-production/ram.raw,offset=0,share=on,discard-data=off,readonly=off \
+    -machine q35,kernel-irqchip=split,default-bus-bypass-iommu=off,memory-backend=cser-ram \
     -accel tcg,thread=single \
     -cpu Icelake-Server,+x2apic \
     -m 1G \
@@ -38,6 +39,8 @@ qemu.args = """\
     -chardev socket,id=chrtpm,path=/work/artifacts/cser-production/swtpm-qemu.sock \
     -tpmdev emulator,id=tpm0,chardev=chrtpm \
     -device tpm-tis,tpmdev=tpm0 \
+    -trace enable=pci_cfg_write \
+    -trace enable=pci_cfg_read \
     -trace enable=virtio_set_status \
     -trace enable=virtio_pci_notify_write \
     -trace enable=virtio_queue_notify \

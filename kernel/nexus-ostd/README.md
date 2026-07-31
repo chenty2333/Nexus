@@ -15,7 +15,8 @@ hardware-general recovery.
 ## Production closure
 
 `cser-core` is a non-optional dependency and the default kernel feature list is
-exactly `cser-production`. During boot, one `ProductionCoreOwner` is installed
+exactly `cser-production`. The installed owner accepts core API profile 2 and
+journal schema 6 only. During boot, one `ProductionCoreOwner` is installed
 behind an `Arc` shared by:
 
 - the stateless `NXP3` portal;
@@ -26,16 +27,19 @@ behind an `Arc` shared by:
 Those adapters do not maintain a second lifecycle ledger. Client requests can
 enter only the untrusted lifecycle prefix; fencing, recovery, adoption,
 settlement, retirement, freshness, and reuse decisions remain trusted core or
-domain transitions. There is no live dual-write or legacy Registry fallback.
+domain transitions. One real operation allocates one parent `EffectId`; reply
+and DMA bind distinct `ComponentId` values under that parent. There is no live
+dual-write, singleton-estate command path, or legacy Registry fallback.
 
 [`cser-production-sources.txt`](cser-production-sources.txt) is the exact
-production source manifest. The static cutover gate requires these twelve
+production source manifest. The static cutover gate requires these thirteen
 files, requires each to be selected once by `cser-production`, and rejects old
 Registry, portal, supervisor, and semantic-mirror sources:
 
 ```text
 core_device_quarantine.rs
 core_dma_adapter.rs
+core_dma_arena_allocator.rs
 core_persistent_runtime.rs
 core_pio_journal.rs
 core_portal_vnext.rs
@@ -49,8 +53,10 @@ core_tpm_anchor.rs
 ```
 
 The `cser-core-reply-recovery` and `cser-core-dma-recovery` OSDK schemes select
-their matching features with default features disabled. They are mutually
-exclusive, test-only evidence profiles: the harness runs their real task,
+their matching features with default features disabled. They explicitly use
+the offline profile-1 compatibility constructor and mark their output as
+historical. They are mutually exclusive, test-only evidence profiles: the
+harness runs their real task,
 rebind, reply, and DMA guest slices before `cser-production`, but neither owns
 the production Registry nor substitutes for the persistent cutover proof. The
 `cser-core-tpm-anchor` feature remains a compile-only development profile. In
@@ -69,23 +75,30 @@ recovery is incomplete.
 The acceptance parser requires the following sequence:
 
 1. Boot 1 installs the single recovered owner, commits a reply through the
-   secondary outbox, publishes one real VirtIO request, and exits with the
-   reply plus queue/page/IOVA claims retained.
+   secondary outbox, publishes one real VirtIO request, and exits the service
+   with one shared operation effect retaining its reply component and its
+   queue/page/IOVA component claims.
 2. Boot 2 advances trusted freshness, replays the same journal, performs
    dynamic snapshot/ready/rebind recovery, persists the reply apply intent,
-   and crashes a second time before acknowledgement. It consumes reset/ISR
-   evidence sufficient to retire only the exact queue claim.
+   and crashes the successor a second time before acknowledgement. Under the
+   same parent effect it accepts exact reset, IRQ-drain, unmap, and IOTLB
+   evidence, retires all generation-1 DMA claims, and leaves the reply claim
+   live.
 3. Boot 3 replays that second crash, claims reconciliation, applies and
-   acknowledges the reply without minting a second intent, then settles and
-   retires the reply obligation.
-4. Boot 4 repeats recovery without duplicating evidence or settlement and
-    demonstrates the stable retained state. Across all four boots, the host
-   oracle requires exact service/binding pairs `1/1` through `4/4`, while boot,
+   acknowledges the reply without minting a second intent, then settles the
+   original effect. It consumes three resource-local permits into a new
+   DMA-only composite and publishes generation 2 at the same guest PFN, guest
+   IOVA, and QEMU RAM-file offset. A stale generation-1 evidence challenge is
+   rejected without changing revision or projection.
+4. Boot 4 retires generation 2 and repeats recovery without duplicating reply
+   intent, settlement, or DMA evidence. Across all four boots, the host oracle
+   requires exact service/binding pairs `1/1` through `4/4`, while boot,
    journal, and device freshness increase strictly.
 
-The pinned-page and IOVA claims remain retained. Activation stays blocked and
-`resource_reuse_authorized=false`, because a boot-global IOTLB observation does
-not prove crash-persistent custody or retirement of those resources.
+This is actual reuse of the declared guest PFN and emulated IOVA coordinates
+inside the QEMU protocol profile. The RAM-file offset is also stable across the
+four processes. None of those observations identifies a host physical page or
+proves physical-hardware DMA drain, power-loss durability, or TPM anti-rollback.
 
 The profile uses an ATA PIO journal with explicit flushes, a separate ATA PIO
 reply outbox, and a TPM2 NV anchor bound to the compiled domain catalog. Early
@@ -140,7 +153,7 @@ The complete backend command set is:
 ```text
 doctor image fmt check clippy build run test
 build-core-persistent-recovery run-core-persistent-recovery
-seal-core-persistent-recovery clean
+seal-core-persistent-recovery test-core-persistent-arena-checker clean
 ```
 
 Both recovery commands require Docker and host `swtpm`. The seal form also
@@ -158,6 +171,14 @@ rebuild.
   `aa160b3c09e0471f85f76a069e327b3df0bc60d5191b2ce3a64cc15cd62038e1`.
 - OSTD overlay: `patches/ostd-0.18.0-cser.patch`, SHA-256
   `6167dc681e8f5e53c20e2ef2ccc40fc1924c722bb9ca37cc4ba4f70ba49b71db`.
+- Ordered OSTD arena overlay:
+  `kernel/nexus-ostd/patches/ostd-0.18.0-cser-arena.patch`, SHA-256
+  `a36a3c857f49640b0e4d5656e4171161b883337df46508ccbd349b3eca0975e0`.
+  It adds `DmaCoherent::from_segment_at(Segment<()>, Daddr)` for the
+  non-CVM coherent path. Exact IOVA conflicts return the unchanged segment
+  before PFN tracking or PTE installation; the allocator cannot return a
+  retired exact IOVA until the existing ownership-carrying unmap observes
+  IOTLB completion.
 - virtio-drivers: `=0.13.0`, crate SHA-256
   `cfdc1c628cdd8ce7c3b9e65a8ed550d0338e9ef9f911e729666f1cce097de2f7`.
 - VirtIO overlay: `patches/virtio-drivers-0.13.0-cser.patch`, SHA-256
@@ -183,17 +204,21 @@ This evidence cannot establish:
   all local state;
 - physical power-loss durability or storage-controller ordering;
 - hardware-general reset, IRQ, IOMMU, or DMA quiescence;
-- crash-persistent PFN/IOVA custody or authorization to reuse retained pages
-  and mappings;
+- host-physical PFN identity or physical-hardware authorization to reuse a page
+  merely because the guest PFN, emulated IOVA, and RAM-file offset recur;
 - multi-queue, multi-device, multi-vCPU, SMP, liveness, or availability
   properties; or
 - production filesystem, network, Linux compatibility, or operator recovery
   completeness.
 
-The early fence, status reset, ISR drain, and global IOTLB command prove the
-continued quarantine observed by this profile. They do not prove that an old
-PFN/IOVA is retired. Historical component logs and released `v0.1.0` receipts
-retain their original source, configuration, and non-claim boundaries.
+The early fence, status reset, ISR drain, and global IOTLB command establish the
+QEMU quarantine protocol before schema-6 replay. The ordered arena overlay and
+four-boot trace together establish exact reservation, retirement, and
+generation-plus-one reuse for the declared guest coordinates. They remain
+separate from any claim about host physical PFN identity or an untested device,
+IOMMU, firmware, reset method, or physical failure mode.
+Historical component logs and released `v0.1.0` receipts retain their original
+source, configuration, and non-claim boundaries.
 
 ## Provenance and license
 

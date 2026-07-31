@@ -8,8 +8,8 @@ use alloc::{
 use sha2::{Digest as _, Sha256};
 
 use crate::{
-    ClaimKindId, CreditClassId, Digest, DomainId, EvidenceKindId, ObligationKindId,
-    ReceiptSchemaId, VerifierId,
+    ClaimKindId, ComponentId, CompositeKindId, CreditClassId, Digest, DomainId, EvidenceKindId,
+    ObligationKindId, ReceiptSchemaId, VerifierId,
 };
 
 /// Whether an explicitly rebound successor may adopt an unfinished effect.
@@ -288,6 +288,71 @@ impl ObligationSpec {
     }
 }
 
+/// One catalog-bound obligation component of a composite effect.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompositeComponentSpec {
+    component: ComponentId,
+    domain: DomainId,
+    obligation: ObligationKindId,
+}
+
+impl CompositeComponentSpec {
+    /// Binds one stable component slot to an exact domain obligation.
+    pub const fn new(
+        component: ComponentId,
+        domain: DomainId,
+        obligation: ObligationKindId,
+    ) -> Self {
+        Self {
+            component,
+            domain,
+            obligation,
+        }
+    }
+
+    /// Returns the stable component slot.
+    pub const fn component(self) -> ComponentId {
+        self.component
+    }
+
+    /// Returns the defining domain.
+    pub const fn domain(self) -> DomainId {
+        self.domain
+    }
+
+    /// Returns the exact obligation class.
+    pub const fn obligation(self) -> ObligationKindId {
+        self.obligation
+    }
+}
+
+/// Catalog-defined product of one or more obligation components.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompositeRule {
+    kind: CompositeKindId,
+    components: Vec<CompositeComponentSpec>,
+}
+
+impl CompositeRule {
+    /// Returns the composite effect class.
+    pub const fn kind(&self) -> CompositeKindId {
+        self.kind
+    }
+
+    /// Returns the complete ordered component schema.
+    pub fn components(&self) -> &[CompositeComponentSpec] {
+        &self.components
+    }
+
+    /// Resolves one stable component slot.
+    pub fn component(&self, component: ComponentId) -> Option<CompositeComponentSpec> {
+        self.components
+            .iter()
+            .copied()
+            .find(|candidate| candidate.component() == component)
+    }
+}
+
 /// Freshness coordinates an evidence class must match.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FreshnessAxes(u8);
@@ -545,6 +610,12 @@ pub enum DomainCatalogError {
     UnknownObligationClaim,
     /// External receipt bindings do not match the selected lifecycle.
     InvalidObligationReceipts,
+    /// A composite effect class already exists.
+    DuplicateComposite,
+    /// A composite repeats a component slot or contains no components.
+    InvalidComposite,
+    /// A composite component names an unknown obligation.
+    UnknownCompositeObligation,
 }
 
 /// Builder for a sealed, digest-bound domain catalog.
@@ -553,6 +624,7 @@ pub struct DomainCatalogBuilder {
     credits: BTreeMap<CreditClassId, CreditRule>,
     obligations: BTreeMap<(DomainId, ObligationKindId), ObligationRule>,
     claims: BTreeMap<(DomainId, ClaimKindId), ClaimRule>,
+    composites: BTreeMap<CompositeKindId, CompositeRule>,
 }
 
 impl DomainCatalogBuilder {
@@ -562,6 +634,7 @@ impl DomainCatalogBuilder {
             credits: BTreeMap::new(),
             obligations: BTreeMap::new(),
             claims: BTreeMap::new(),
+            composites: BTreeMap::new(),
         }
     }
 
@@ -726,6 +799,38 @@ impl DomainCatalogBuilder {
         Ok(self)
     }
 
+    /// Registers an exact non-empty component product.
+    ///
+    /// Components are catalog data rather than adapter callbacks. This keeps
+    /// component identity and cross-domain membership stable across replay.
+    pub fn composite(
+        mut self,
+        kind: CompositeKindId,
+        components: &[CompositeComponentSpec],
+    ) -> Result<Self, DomainCatalogError> {
+        if components.is_empty() {
+            return Err(DomainCatalogError::InvalidComposite);
+        }
+        let mut ids = BTreeSet::new();
+        if components
+            .iter()
+            .any(|component| !ids.insert(component.component()))
+        {
+            return Err(DomainCatalogError::InvalidComposite);
+        }
+        if self.composites.contains_key(&kind) {
+            return Err(DomainCatalogError::DuplicateComposite);
+        }
+        self.composites.insert(
+            kind,
+            CompositeRule {
+                kind,
+                components: components.to_vec(),
+            },
+        );
+        Ok(self)
+    }
+
     /// Seals the catalog and computes its deterministic schema digest.
     pub fn build(self) -> Result<DomainCatalog, DomainCatalogError> {
         for ((domain, _), obligation) in &self.obligations {
@@ -735,11 +840,26 @@ impl DomainCatalogBuilder {
                 }
             }
         }
-        let digest = catalog_digest(&self.credits, &self.obligations, &self.claims);
+        if self.composites.values().any(|composite| {
+            composite.components().iter().any(|component| {
+                !self
+                    .obligations
+                    .contains_key(&(component.domain(), component.obligation()))
+            })
+        }) {
+            return Err(DomainCatalogError::UnknownCompositeObligation);
+        }
+        let digest = catalog_digest(
+            &self.credits,
+            &self.obligations,
+            &self.claims,
+            &self.composites,
+        );
         Ok(DomainCatalog {
             credits: self.credits,
             obligations: self.obligations,
             claims: self.claims,
+            composites: self.composites,
             digest,
         })
     }
@@ -751,6 +871,7 @@ pub struct DomainCatalog {
     credits: BTreeMap<CreditClassId, CreditRule>,
     obligations: BTreeMap<(DomainId, ObligationKindId), ObligationRule>,
     claims: BTreeMap<(DomainId, ClaimKindId), ClaimRule>,
+    composites: BTreeMap<CompositeKindId, CompositeRule>,
     digest: Digest,
 }
 
@@ -772,6 +893,11 @@ impl DomainCatalog {
     /// Returns a claim rule by exact domain and class.
     pub fn claim_rule(&self, domain: DomainId, kind: ClaimKindId) -> Option<&ClaimRule> {
         self.claims.get(&(domain, kind))
+    }
+
+    /// Returns one exact composite effect schema.
+    pub fn composite_rule(&self, kind: CompositeKindId) -> Option<&CompositeRule> {
+        self.composites.get(&kind)
     }
 
     /// Returns one conserved-credit rule.
@@ -803,9 +929,10 @@ fn catalog_digest(
     credits: &BTreeMap<CreditClassId, CreditRule>,
     obligations: &BTreeMap<(DomainId, ObligationKindId), ObligationRule>,
     claims: &BTreeMap<(DomainId, ClaimKindId), ClaimRule>,
+    composites: &BTreeMap<CompositeKindId, CompositeRule>,
 ) -> Digest {
     let mut hasher = Sha256::new();
-    hasher.update(b"nexus.cser.domain-catalog.v4");
+    hasher.update(b"nexus.cser.domain-catalog.v5");
     for (class, rule) in credits {
         hasher.update(class.get().to_le_bytes());
         hasher.update(rule.max_units_per_account().to_le_bytes());
@@ -850,6 +977,16 @@ fn catalog_digest(
                     .unwrap_or(0)
                     .to_le_bytes(),
             );
+        }
+    }
+    hasher.update([0xfd]);
+    for (kind, rule) in composites {
+        hasher.update(kind.get().to_le_bytes());
+        hasher.update((rule.components().len() as u64).to_le_bytes());
+        for component in rule.components() {
+            hasher.update(component.component().get().to_le_bytes());
+            hasher.update(component.domain().get().to_le_bytes());
+            hasher.update(component.obligation().get().to_le_bytes());
         }
     }
     Digest::new(hasher.finalize().into())

@@ -122,6 +122,8 @@ image_key=$(sha256sum \
     "$repo_root/crates/nexus-ostd-virtio/src/pci.rs" \
     "$repo_root/crates/nexus-ostd-virtio/src/production.rs" \
     "$repo_root/patches/ostd-0.18.0-cser.patch" \
+    "$root/patches/ostd-0.18.0-cser-arena.patch" \
+    "$root/patches/assert-ostd-cser-arena-patch.sh" \
     "$repo_root/patches/virtio-drivers-0.13.0-cser.patch" \
     "$repo_root/patches/virtio-drivers-0.13.0-LICENSE-MIT" \
     "$repo_root/patches/cser-cargo-config.toml" \
@@ -196,32 +198,60 @@ ensure_image() {
 }
 
 check_ostd_patch() {
-    container /repo/tools/ostd/assert-cser-patch.sh \
-        /repo/patches/ostd-0.18.0-cser.patch \
-        /opt/nexus-ostd/ostd-0.18.0
+    container /work/patches/assert-ostd-cser-arena-patch.sh \
+        /work/patches/ostd-0.18.0-cser-arena.patch \
+        /opt/nexus-ostd/ostd-0.18.0 \
+        /repo/patches/ostd-0.18.0-cser.patch
     container bash -c '
         set -euo pipefail
         tmp=$(mktemp -d)
         trap '\''rm -rf "$tmp"'\'' EXIT
+        require_mutation() {
+            if cmp -s "$1" "$2"; then
+                echo "OSTD mutation did not apply: $3" >&2
+                exit 1
+            fi
+        }
 
-        cp /repo/patches/ostd-0.18.0-cser.patch "$tmp/mutated.patch"
+        cp /repo/patches/ostd-0.18.0-cser.patch "$tmp/mutated-base.patch"
         sed -i '\''0,/const RTE_LEVEL_TRIGGERED: u32 = 1 << 15;/s//const RTE_LEVEL_TRIGGERED: u32 = 1 << 14;/'\'' \
-            "$tmp/mutated.patch"
-        if /repo/tools/ostd/assert-cser-patch.sh \
-            "$tmp/mutated.patch" /opt/nexus-ostd/ostd-0.18.0 >/dev/null 2>&1; then
-            echo "kernel OSTD gate accepted a mutated canonical patch" >&2
+            "$tmp/mutated-base.patch"
+        require_mutation /repo/patches/ostd-0.18.0-cser.patch \
+            "$tmp/mutated-base.patch" base-patch
+        if /work/patches/assert-ostd-cser-arena-patch.sh \
+            /work/patches/ostd-0.18.0-cser-arena.patch \
+            /opt/nexus-ostd/ostd-0.18.0 \
+            "$tmp/mutated-base.patch" >/dev/null 2>&1; then
+            echo "kernel OSTD arena gate accepted a mutated base patch" >&2
+            exit 1
+        fi
+
+        cp /work/patches/ostd-0.18.0-cser-arena.patch "$tmp/mutated-arena.patch"
+        sed -i '\''0,/\.alloc_specific(&daddr_range)/s//.alloc(daddr_range.len())/'\'' \
+            "$tmp/mutated-arena.patch"
+        require_mutation /work/patches/ostd-0.18.0-cser-arena.patch \
+            "$tmp/mutated-arena.patch" arena-patch
+        if /work/patches/assert-ostd-cser-arena-patch.sh \
+            "$tmp/mutated-arena.patch" \
+            /opt/nexus-ostd/ostd-0.18.0 \
+            /repo/patches/ostd-0.18.0-cser.patch >/dev/null 2>&1; then
+            echo "kernel OSTD arena gate accepted a mutated arena patch" >&2
             exit 1
         fi
 
         cp -a /opt/nexus-ostd/ostd-0.18.0 "$tmp/mutated-source"
-        sed -i '\''s/const RTE_ACTIVE_LOW: u32 = 1 << 13;/const RTE_ACTIVE_LOW: u32 = 1 << 12;/'\'' \
-            "$tmp/mutated-source/src/arch/x86/irq/chip/ioapic.rs"
-        if /repo/tools/ostd/assert-cser-patch.sh \
-            /repo/patches/ostd-0.18.0-cser.patch "$tmp/mutated-source" >/dev/null 2>&1; then
-            echo "kernel OSTD gate accepted a mutated installed source tree" >&2
+        sed -i '\''0,/if !exact_daddr.is_multiple_of(PAGE_SIZE)/s//if !exact_daddr.is_multiple_of(PAGE_SIZE * 2)/'\'' \
+            "$tmp/mutated-source/src/mm/dma/util.rs"
+        require_mutation /opt/nexus-ostd/ostd-0.18.0/src/mm/dma/util.rs \
+            "$tmp/mutated-source/src/mm/dma/util.rs" combined-source
+        if /work/patches/assert-ostd-cser-arena-patch.sh \
+            /work/patches/ostd-0.18.0-cser-arena.patch \
+            "$tmp/mutated-source" \
+            /repo/patches/ostd-0.18.0-cser.patch >/dev/null 2>&1; then
+            echo "kernel OSTD arena gate accepted a mutated installed source tree" >&2
             exit 1
         fi
-        echo "canonical OSTD negative assertions: PASS patch_mutation=rejected source_mutation=rejected"
+        echo "canonical OSTD arena negative assertions: PASS base_patch_mutation=rejected arena_patch_mutation=rejected combined_source_mutation=rejected"
     '
 }
 
@@ -561,8 +591,8 @@ check_virtio_patch() {
 
 doctor() {
     local tool
-    for tool in awk bash chmod cmp cp cut diff dirname find flock git grep head id \
-        mkdir mkfifo mktemp mv rm sed sha256sum sort stat swtpm tail tee timeout \
+    for tool in awk bash chmod cmp cp cut dd diff dirname find flock git grep head id \
+        mkdir mkfifo mktemp mv rm sed sha256sum sort stat swtpm tail tar tee timeout truncate \
         tpm2_flushcontext tpm2_nvincrement tpm2_nvdefine tpm2_nvread \
         tpm2_nvreadpublic tpm2_nvwrite tpm2_policycommandcode \
         tpm2_startauthsession tr wc xxd; do
@@ -592,6 +622,8 @@ doctor() {
         "$root/scripts/provision-cser-tpm-nv.sh" \
         "$repo_root/tests/guest/linux/sources/linux-runtime-fs-smoke/runtime_fs_smoke.S" \
         "$repo_root/patches/ostd-0.18.0-cser.patch" \
+        "$root/patches/ostd-0.18.0-cser-arena.patch" \
+        "$root/patches/assert-ostd-cser-arena-patch.sh" \
         "$repo_root/patches/virtio-drivers-0.13.0-cser.patch" \
         "$repo_root/patches/virtio-drivers-0.13.0-LICENSE-MIT" \
         "$repo_root/patches/cser-cargo-config.toml" \
@@ -628,11 +660,11 @@ doctor() {
 }
 
 format_all() {
-    container cargo fmt --all
+    container cargo fmt --package nexus-kernel
 }
 
 fmt_check() {
-    container cargo fmt --all -- --check
+    container cargo fmt --package nexus-kernel -- --check
 }
 
 kernel_check_complete=false
@@ -719,6 +751,18 @@ core_persistent_socket="$core_persistent_artifact_dir/swtpm-qemu.sock"
 core_persistent_pid_file="$core_persistent_artifact_dir/swtpm.pid"
 core_persistent_journal="$core_persistent_artifact_dir/journal.raw"
 core_persistent_outbox="$core_persistent_artifact_dir/outbox.raw"
+core_persistent_ram="$core_persistent_artifact_dir/ram.raw"
+core_schema5_state_dir="$core_persistent_artifact_dir/schema5-negative-tpmstate"
+core_schema5_journal="$core_persistent_artifact_dir/schema5-negative-journal.raw"
+core_schema5_logical_journal="$core_persistent_artifact_dir/schema5-negative-logical.journal"
+core_schema5_fixture_metadata="$core_persistent_artifact_dir/schema5-negative-fixture.txt"
+core_schema5_tpm_before="$core_persistent_artifact_dir/schema5-negative-tpm-before.txt"
+core_schema5_tpm_after="$core_persistent_artifact_dir/schema5-negative-tpm-after.txt"
+core_schema5_fixture_revision=7c82d0c9f26d77a630faeaeb28e139c36beb5319
+core_schema5_fixture_catalog=f58ad9f2c973e65532b10d6392f0528838bf95c09668f30395743816a58ddf25
+core_schema5_fixture_head=549af79d3fdd982a044f4fc2bc8814bb1230fc71bb34f5e3912478f8821eba31
+core_schema5_fixture_logical_sha=4cfbf103e4f1982d686f7753c9e9ea5aae1b2bbb5e8cb63ca8fbac589ef033c3
+core_schema5_fixture_revision_number=5
 core_persistent_pid=
 core_persistent_seal_requested=false
 
@@ -751,6 +795,24 @@ copy_core_evidence_iso() {
     cp -- "$source" "$destination"
 }
 
+initialize_core_persistent_media() {
+    rm -f -- \
+        "$core_persistent_socket" \
+        "$core_persistent_pid_file" \
+        "$core_persistent_journal" \
+        "$core_persistent_outbox" \
+        "$core_persistent_ram"
+    rm -rf -- "$core_persistent_state_dir"
+    mkdir -p "$core_persistent_state_dir"
+    truncate -s 4M "$core_persistent_journal"
+    truncate -s 4M "$core_persistent_outbox"
+    truncate -s 1G "$core_persistent_ram"
+    chmod 0600 \
+        "$core_persistent_journal" \
+        "$core_persistent_outbox" \
+        "$core_persistent_ram"
+}
+
 prepare_core_persistent_artifacts() {
     mkdir -p "$core_persistent_artifact_dir"
     rm -f \
@@ -762,6 +824,15 @@ prepare_core_persistent_artifacts() {
         "$core_persistent_artifact_dir/boot3-qemu-debug.log" \
         "$core_persistent_artifact_dir/boot4-serial.log" \
         "$core_persistent_artifact_dir/boot4-qemu-debug.log" \
+        "$core_persistent_artifact_dir/schema5-negative-serial.log" \
+        "$core_persistent_artifact_dir/schema5-negative-qemu-debug.log" \
+        "$core_persistent_artifact_dir/schema5-negative-swtpm.log" \
+        "$core_persistent_artifact_dir/schema5-negative-task-entry-debugcon.log" \
+        "$core_schema5_journal" \
+        "$core_schema5_logical_journal" \
+        "$core_schema5_fixture_metadata" \
+        "$core_schema5_tpm_before" \
+        "$core_schema5_tpm_after" \
         "$core_persistent_artifact_dir/reply-evidence-serial.log" \
         "$core_persistent_artifact_dir/reply-evidence-qemu-debug.log" \
         "$core_persistent_artifact_dir/reply-evidence-task-entry-debugcon.log" \
@@ -784,13 +855,578 @@ prepare_core_persistent_artifacts() {
         "$core_persistent_socket" \
         "$core_persistent_pid_file" \
         "$core_persistent_journal" \
-        "$core_persistent_outbox"
-    rm -rf -- "$core_persistent_state_dir"
-    mkdir -p "$core_persistent_state_dir"
-    truncate -s 4M "$core_persistent_journal"
-    truncate -s 4M "$core_persistent_outbox"
-    chmod 0600 "$core_persistent_journal" "$core_persistent_outbox"
+        "$core_persistent_outbox" \
+        "$core_persistent_ram"
+    rm -rf -- "$core_persistent_state_dir" "$core_schema5_state_dir"
+    initialize_core_persistent_media
 }
+
+core_persistent_u64_le_hex() {
+    local value=$1 encoded offset
+    printf -v encoded '%016x' "$value"
+    for ((offset = 14; offset >= 0; offset -= 2)); do
+        printf '%s' "${encoded:offset:2}"
+    done
+}
+
+build_core_schema5_selected_fixture() (
+    set -euo pipefail
+    local source_dir source_relative source_archive source_archive_sha
+    local logical_relative origin_output legacy_catalog logical_len logical_sha
+    local payload_sha logical_len_hex header_prefix_hex header_sha header_file
+    local pio_sha final_head
+    source_dir=$(mktemp -d "$core_persistent_artifact_dir/schema5-source.XXXXXX")
+    trap 'rm -rf -- "$source_dir"' EXIT
+    source_relative=${source_dir#"$root"/}
+    if [[ $source_relative == "$source_dir" || $source_relative == /* ]]; then
+        echo 'schema-5 source fixture escaped the mounted artifact directory' >&2
+        return 1
+    fi
+    source_archive="$source_dir/source.tar"
+    git -C "$repo_root" cat-file -e "$core_schema5_fixture_revision^{commit}"
+    git -C "$repo_root" archive --format=tar \
+        "$core_schema5_fixture_revision" >"$source_archive"
+    source_archive_sha=$(sha256sum "$source_archive" | cut -d ' ' -f1)
+    tar -xf "$source_archive" -C "$source_dir"
+    rm -f -- "$source_archive"
+
+    logical_relative="$source_relative/profile1.journal"
+    origin_output=$(container bash -c '
+        set -euo pipefail
+        readonly cargo_home=/tmp/nexus-schema5-fixture-cargo-home
+        mkdir -p "$cargo_home"
+        ln -s /root/.cargo/registry "$cargo_home/registry"
+        CARGO_HOME="$cargo_home" \
+            CARGO_TARGET_DIR=/tmp/nexus-schema5-fixture-target \
+            cargo run --offline -q --locked \
+                --manifest-path "$1/Cargo.toml" \
+                -p cser-core --features std --bin cser-restart-fixture \
+                -- origin "$2"
+    ' _ "/work/$source_relative" "/work/$logical_relative")
+    legacy_catalog=$(container bash -c '
+        set -euo pipefail
+        readonly cargo_home=/tmp/nexus-schema5-catalog-cargo-home
+        mkdir -p "$cargo_home"
+        ln -s /root/.cargo/registry "$cargo_home/registry"
+        CARGO_HOME="$cargo_home" \
+            CARGO_TARGET_DIR=/tmp/nexus-schema5-catalog-target \
+            cargo run --offline -q --locked \
+                --manifest-path "$1/Cargo.toml" \
+                -p cser-core --features std --bin cser-catalog-digest
+    ' _ "/work/$source_relative")
+    if [[ $origin_output != "$core_schema5_fixture_revision_number $core_schema5_fixture_head" ]] \
+        || [[ $legacy_catalog != "$core_schema5_fixture_catalog" ]]; then
+        echo 'frozen profile-1 encoder returned unexpected semantic coordinates' >&2
+        return 1
+    fi
+
+    logical_len=$(stat -c %s -- "$source_dir/profile1.journal")
+    logical_sha=$(sha256sum "$source_dir/profile1.journal" | cut -d ' ' -f1)
+    final_head=$(tail -c 32 "$source_dir/profile1.journal" | xxd -p -c 32)
+    if [[ $logical_len != 1285 \
+        || $logical_sha != "$core_schema5_fixture_logical_sha" \
+        || $final_head != "$core_schema5_fixture_head" \
+        || $(xxd -p -l 8 "$source_dir/profile1.journal") != 435345524a523500 ]]; then
+        echo 'frozen profile-1 logical journal does not match its pinned fixture' >&2
+        return 1
+    fi
+    cp -- "$source_dir/profile1.journal" "$core_schema5_logical_journal"
+
+    payload_sha=$(sha256sum "$core_schema5_logical_journal" | cut -d ' ' -f1)
+    logical_len_hex=$(core_persistent_u64_le_hex "$logical_len")
+    header_prefix_hex="4353455250494f0001007000000000000100000000000000${logical_len_hex}00000100000000000000000000000000${payload_sha}"
+    header_file="$source_dir/pio-header.bin"
+    printf '%s' "$header_prefix_hex" | xxd -r -p >"$header_file"
+    if [[ $(stat -c %s -- "$header_file") != 80 ]]; then
+        echo 'schema-5 PIO bank header prefix has the wrong length' >&2
+        return 1
+    fi
+    header_sha=$(sha256sum "$header_file" | cut -d ' ' -f1)
+    printf '%s' "$header_sha" | xxd -r -p >>"$header_file"
+    truncate -s 512 "$header_file"
+
+    truncate -s 0 "$core_persistent_journal"
+    truncate -s 4M "$core_persistent_journal"
+    dd if="$header_file" of="$core_persistent_journal" \
+        bs=512 seek=1 conv=notrunc status=none
+    dd if="$core_schema5_logical_journal" of="$core_persistent_journal" \
+        bs=512 seek=2 conv=notrunc status=none
+    chmod 0600 "$core_persistent_journal"
+    cmp "$header_file" <(dd if="$core_persistent_journal" bs=512 skip=1 count=1 status=none)
+    cmp "$core_schema5_logical_journal" \
+        <(dd if="$core_persistent_journal" bs=1 skip=1024 count="$logical_len" status=none)
+    pio_sha=$(sha256sum "$core_persistent_journal" | cut -d ' ' -f1)
+    cp -- "$core_persistent_journal" "$core_schema5_journal"
+    {
+        printf '%s\n' nexus.cser.schema5-selected-fixture.v1
+        printf 'profile1_source_revision=%s\n' "$core_schema5_fixture_revision"
+        printf 'profile1_source_archive_sha256=%s\n' "$source_archive_sha"
+        printf 'profile1_catalog_digest=%s\n' "$legacy_catalog"
+        printf 'selected_revision=%s\n' "$core_schema5_fixture_revision_number"
+        printf 'selected_head=%s\n' "$core_schema5_fixture_head"
+        printf 'logical_journal_bytes=%s\n' "$logical_len"
+        printf 'logical_journal_sha256=%s\n' "$logical_sha"
+        printf 'pio_bank_generation=1\n'
+        printf 'pio_bank_payload_sha256=%s\n' "$payload_sha"
+        printf 'pio_image_sha256=%s\n' "$pio_sha"
+        printf 'fixture_role=offline-profile1-encoder-no-production-decoder\n'
+    } >"$core_schema5_fixture_metadata"
+    echo "CSER_SCHEMA5_SELECTED_FIXTURE PASS source_revision=$core_schema5_fixture_revision revision=$core_schema5_fixture_revision_number head=$core_schema5_fixture_head logical_sha256=$logical_sha pio_sha256=$pio_sha"
+)
+
+assert_core_schema5_post_quarantine_trace() {
+    local trace=$1
+    local marker=$2
+    local empty_isr_reads
+    for field in \
+        'bus_master_disabled=true' \
+        'intx_masked=true' \
+        'reset_status_zero=true' \
+        'observed_isr_bits=0' \
+        'iotlb_used_remapped_iova=true'; do
+        if [[ " $marker " != *" $field "* ]]; then
+            echo "schema-5 quarantine marker lacks $field" >&2
+            return 1
+        fi
+    done
+    core_schema5_marker_decimal_at_least "$marker" isr_reads 2 >/dev/null || return 1
+    empty_isr_reads=$(core_schema5_marker_decimal_at_least \
+        "$marker" consecutive_empty_isr_reads 2) || return 1
+    if [[ $empty_isr_reads != 2 ]]; then
+        echo "schema-5 quarantine marker requires exactly two terminal empty ISR reads, got $empty_isr_reads" >&2
+        return 1
+    fi
+    core_schema5_marker_decimal_at_least \
+        "$marker" iotlb_completed_trigger_pages 1 >/dev/null || return 1
+    awk '
+        function hex_value(value,    i, digit, result, character) {
+            sub(/^0x/, "", value)
+            result = 0
+            for (i = 1; i <= length(value); i++) {
+                character = substr(value, i, 1)
+                if (character >= "0" && character <= "9")
+                    digit = character + 0
+                else if (character >= "a" && character <= "f")
+                    digit = index("abcdef", character) + 9
+                else
+                    return -1
+                result = result * 16 + digit
+            }
+            return result
+        }
+
+        function command_word(value) {
+            value = hex_value(value)
+            return value < 0 ? -1 : value % 65536
+        }
+
+        function bit_is_set(value, divisor) {
+            return int(value / divisor) % 2
+        }
+
+        function boot_fence_command(value) {
+            if (!bit_is_set(value, 2))
+                value += 2
+            if (bit_is_set(value, 4))
+                value -= 4
+            if (!bit_is_set(value, 1024))
+                value += 1024
+            return value
+        }
+
+        function command_is_quarantined(value) {
+            return value >= 0 && !bit_is_set(value, 4) &&
+                   bit_is_set(value, 1024)
+        }
+
+        function abandon_candidate() {
+            fence_write_line = 0
+            fence_command = -1
+            fence_read_line = 0
+            reset_line = 0
+            iotlb_line = 0
+            iotlb_wait_line = 0
+        }
+
+        # QEMU 9.2 reports PCI status and command together on reads, but only
+        # the 16-bit command on writes. Locate the last exact boot-fence
+        # read/write/readback transaction before reset and IOTLB completion.
+        # Firmware activity before that transaction is outside the quarantine
+        # interval. BAR discovery may toggle decode bits afterwards, but may
+        # never restore BUS_MASTER or unmask INTx.
+        $1 == "pci_cfg_read" && $3 == "00:05.0" && $4 == "@0x4" && $5 == "->" {
+            command = command_word($6)
+            if (command < 0) {
+                bad = 1
+                next
+            }
+            if (fence_write_line && !fence_read_line) {
+                if (command == fence_command)
+                    fence_read_line = FNR
+                else
+                    abandon_candidate()
+            } else if (fence_read_line && !command_is_quarantined(command)) {
+                abandon_candidate()
+            }
+            previous_command = command
+            previous_command_line = FNR
+            next
+        }
+
+        $1 == "pci_cfg_write" && $3 == "00:05.0" && $4 == "@0x4" && $5 == "<-" {
+            command = command_word($6)
+            if (command < 0) {
+                bad = 1
+                next
+            }
+            if (iotlb_wait_line) {
+                if (!command_is_quarantined(command))
+                    bad = 1
+                next
+            }
+            if (fence_read_line && !command_is_quarantined(command))
+                abandon_candidate()
+            if (previous_command_line &&
+                command == boot_fence_command(previous_command)) {
+                fence_write_line = FNR
+                fence_command = command
+                fence_read_line = 0
+                reset_line = 0
+                iotlb_line = 0
+                iotlb_wait_line = 0
+            }
+            next
+        }
+
+        fence_read_line && !reset_line && $1 == "virtio_set_status" {
+            if (NF != 5 || $2 != "vdev" || $3 !~ /^0x[0-9a-f]+$/ ||
+                $4 != "val") {
+                bad = 1
+            } else if ($5 == "0") {
+                reset_line = FNR
+            } else {
+                abandon_candidate()
+            }
+            next
+        }
+
+        reset_line && !iotlb_line &&
+            $0 == "vtd_inv_desc_iotlb_global iotlb invalidate global" {
+            iotlb_line = FNR
+            next
+        }
+
+        iotlb_line && !iotlb_wait_line &&
+            $0 == "vtd_inv_desc_wait_irq IM in IECTL_REG is set, new event not generated" {
+            iotlb_wait_line = FNR
+            next
+        }
+
+        $1 == "vtd_dmar_fault" { bad = 1; next }
+        iotlb_line && $1 == "virtio_pci_notify_write" { bad = 1; next }
+        iotlb_line && $1 == "virtio_queue_notify" { bad = 1; next }
+        iotlb_line && $1 == "virtio_notify" { bad = 1; next }
+        iotlb_line && $1 == "vtd_dmar_translate" && $3 == "00:05.00" { bad = 1; next }
+        iotlb_line && $1 == "virtio_set_status" && $4 == "val" && $5 != "0" { bad = 1; next }
+
+        END {
+            exit !(fence_write_line && fence_read_line && reset_line &&
+                   iotlb_line && iotlb_wait_line &&
+                   fence_write_line < fence_read_line &&
+                   fence_read_line < reset_line && reset_line < iotlb_line &&
+                   iotlb_line < iotlb_wait_line && !bad)
+        }
+    ' "$trace"
+}
+
+core_schema5_marker_decimal_at_least() {
+    local marker=$1
+    local field=$2
+    local minimum=$3
+    local token value= count=0
+    for token in $marker; do
+        if [[ $token == "$field="* ]]; then
+            value=${token#*=}
+            ((count += 1))
+        fi
+    done
+    if (( count != 1 )) || [[ ! $value =~ ^(0|[1-9][0-9]*)$ ]]; then
+        echo "schema-5 quarantine marker has invalid $field: $marker" >&2
+        return 1
+    fi
+    if (( ${#value} < ${#minimum} )) \
+        || { (( ${#value} == ${#minimum} )) && [[ $value < $minimum ]]; }; then
+        echo "schema-5 quarantine marker has $field below $minimum: $marker" >&2
+        return 1
+    fi
+    printf '%s\n' "$value"
+}
+
+core_schema5_tpm_snapshot_field() {
+    local snapshot=$1
+    local field=$2
+    local expression=$3
+    local value count
+    value=$(awk -F= -v key="$field" '
+        $1 == key { count += 1; value = $2 }
+        END { if (count == 1) print value; else exit 1 }
+    ' "$snapshot") || return 1
+    if [[ ! $value =~ $expression ]]; then
+        echo "schema-5 TPM snapshot has invalid $field in $snapshot" >&2
+        return 1
+    fi
+    printf '%s\n' "$value"
+}
+
+assert_core_schema5_tpm_nv_snapshot() {
+    local snapshot=$1
+    local tip_counter lease_counter tip_slot lease_slot
+    local tip_index lease_index header expected
+    header=$(head -n 1 "$snapshot")
+    if [[ $header != nexus.cser.schema5-tpm-selected-nv.v1 ]]; then
+        echo "schema-5 TPM snapshot has an invalid header: $snapshot" >&2
+        return 1
+    fi
+    tip_counter=$(core_schema5_tpm_snapshot_field "$snapshot" \
+        tip_counter_hex '^[0-9a-f]{16}$') || return 1
+    lease_counter=$(core_schema5_tpm_snapshot_field "$snapshot" \
+        lease_counter_hex '^[0-9a-f]{16}$') || return 1
+    tip_slot=$(core_schema5_tpm_snapshot_field "$snapshot" \
+        tip_selected_slot '^[01]$') || return 1
+    lease_slot=$(core_schema5_tpm_snapshot_field "$snapshot" \
+        lease_selected_slot '^[01]$') || return 1
+    tip_index=$(core_schema5_tpm_snapshot_field "$snapshot" \
+        tip_selected_slot_index '^0x0180010[12]$') || return 1
+    lease_index=$(core_schema5_tpm_snapshot_field "$snapshot" \
+        lease_selected_slot_index '^0x0180010[45]$') || return 1
+    core_schema5_tpm_snapshot_field "$snapshot" \
+        tip_selected_slot_sha256 '^[0-9a-f]{64}$' >/dev/null || return 1
+    core_schema5_tpm_snapshot_field "$snapshot" \
+        lease_selected_slot_sha256 '^[0-9a-f]{64}$' >/dev/null || return 1
+    core_schema5_tpm_snapshot_field "$snapshot" \
+        selected_coordinate_digest '^[0-9a-f]{64}$' >/dev/null || return 1
+    expected=$((16#${tip_counter: -1} & 1))
+    if (( tip_slot != expected )) || [[ $tip_index != "0x0180010$((tip_slot + 1))" ]]; then
+        echo "schema-5 TPM snapshot has an inconsistent selected tip coordinate: $snapshot" >&2
+        return 1
+    fi
+    expected=$((16#${lease_counter: -1} & 1))
+    if (( lease_slot != expected )) || [[ $lease_index != "0x0180010$((lease_slot + 4))" ]]; then
+        echo "schema-5 TPM snapshot has an inconsistent selected lease coordinate: $snapshot" >&2
+        return 1
+    fi
+}
+
+assert_core_schema5_tpm_nv_unchanged() {
+    local before=$1
+    local after=$2
+    assert_core_schema5_tpm_nv_snapshot "$before" || return 1
+    assert_core_schema5_tpm_nv_snapshot "$after" || return 1
+    if ! cmp -s "$before" "$after"; then
+        echo 'schema-5 negative boot advanced or rewrote selected TPM NV state' >&2
+        return 1
+    fi
+}
+
+capture_core_schema5_tpm_nv_snapshot() (
+    set -euo pipefail
+    local state_dir=$1
+    local output=$2
+    local work_dir socket control_socket pid_file tcti flags capabilities
+    local swtpm_pid= tip_counter_hex lease_counter_hex
+    local tip_slot lease_slot tip_index lease_index selected_digest
+    local lock_key lock_file observed_pid
+    umask 077
+    if [[ ! -d $state_dir ]]; then
+        echo "schema-5 TPM snapshot state directory is missing: $state_dir" >&2
+        return 1
+    fi
+    lock_key=$(printf '%s' "$state_dir" | sha256sum | cut -c1-32)
+    lock_file="/tmp/cser-schema5-tpm-snapshot-$lock_key.lock"
+    exec 9>"$lock_file"
+    if ! flock -n 9; then
+        echo "schema-5 TPM snapshot state directory is already owned: $state_dir" >&2
+        return 1
+    fi
+    # Unix-domain pathname limits are smaller than this artifact directory on
+    # some hosts. Keep only the ephemeral readback socket under /tmp.
+    work_dir=$(mktemp -d /tmp/cser-schema5-tpm-readback.XXXXXX)
+    socket="$work_dir/server.sock"
+    # tpm2-tools derives the control path as "$server_socket.ctrl" from the
+    # swtpm TCTI path, so this must remain coupled to the server name.
+    control_socket="$socket.ctrl"
+    pid_file="$work_dir/swtpm.pid"
+    tcti="swtpm:path=$socket"
+    cleanup_schema5_tpm_snapshot() {
+        local status=$?
+        if [[ -n ${swtpm_pid:-} ]] && kill -0 "$swtpm_pid" 2>/dev/null; then
+            kill -KILL "$swtpm_pid" 2>/dev/null || true
+            wait "$swtpm_pid" 2>/dev/null || true
+        fi
+        rm -rf -- "$work_dir"
+        exit "$status"
+    }
+    trap cleanup_schema5_tpm_snapshot EXIT
+    capabilities=$(swtpm socket --print-capabilities)
+    # This reader has no firmware client to issue TPM2_Startup. startup-clear
+    # initializes only volatile TPM state; the receipt still forbids any NV
+    # counter/slot change across its selected-coordinate snapshots.
+    flags=not-need-init,startup-clear
+    if grep -Fq '"flags-opt-disable-auto-shutdown"' <<<"$capabilities"; then
+        flags+=,disable-auto-shutdown
+    fi
+    swtpm socket \
+        --tpm2 \
+        --tpmstate "dir=$state_dir" \
+        --ctrl "type=unixio,path=$control_socket" \
+        --server "type=unixio,path=$socket" \
+        --flags "$flags" \
+        --pid "file=$pid_file" \
+        --daemon
+    for _ in {1..500}; do
+        observed_pid=
+        [[ -f $pid_file ]] && observed_pid=$(tr -d '\n' <"$pid_file")
+        if [[ $observed_pid =~ ^[1-9][0-9]*$ ]] && [[ -S $socket ]] \
+            && kill -0 "$observed_pid" 2>/dev/null; then
+            swtpm_pid=$observed_pid
+            break
+        fi
+        sleep 0.01
+    done
+    if [[ ! $swtpm_pid =~ ^[1-9][0-9]*$ ]] || [[ ! -S $socket ]] \
+        || ! kill -0 "$swtpm_pid" 2>/dev/null; then
+        echo 'schema-5 TPM snapshot swtpm did not start' >&2
+        return 1
+    fi
+    tpm2_nvread -Q -T "$tcti" -C 0x01800100 -s 8 \
+        -o "$work_dir/tip-counter.bin" 0x01800100
+    tpm2_nvread -Q -T "$tcti" -C 0x01800103 -s 8 \
+        -o "$work_dir/lease-counter.bin" 0x01800103
+    tip_counter_hex=$(xxd -p -c 8 "$work_dir/tip-counter.bin")
+    lease_counter_hex=$(xxd -p -c 8 "$work_dir/lease-counter.bin")
+    if [[ ! $tip_counter_hex =~ ^[0-9a-f]{16}$ ]] \
+        || [[ ! $lease_counter_hex =~ ^[0-9a-f]{16}$ ]]; then
+        echo 'schema-5 TPM snapshot read a malformed counter' >&2
+        return 1
+    fi
+    tip_slot=$((16#${tip_counter_hex: -1} & 1))
+    lease_slot=$((16#${lease_counter_hex: -1} & 1))
+    printf -v tip_index '0x0180010%x' "$((tip_slot + 1))"
+    printf -v lease_index '0x0180010%x' "$((lease_slot + 4))"
+    tpm2_nvread -Q -T "$tcti" -C "$tip_index" -s 180 \
+        -o "$work_dir/tip-selected.bin" "$tip_index"
+    tpm2_nvread -Q -T "$tcti" -C "$lease_index" -s 140 \
+        -o "$work_dir/lease-selected.bin" "$lease_index"
+    selected_digest=$( {
+        printf '%s\n' "$tip_counter_hex" "$tip_slot" "$tip_index"
+        sha256sum "$work_dir/tip-selected.bin" | cut -d ' ' -f1
+        printf '%s\n' "$lease_counter_hex" "$lease_slot" "$lease_index"
+        sha256sum "$work_dir/lease-selected.bin" | cut -d ' ' -f1
+    } | sha256sum | cut -d ' ' -f1)
+    {
+        printf '%s\n' nexus.cser.schema5-tpm-selected-nv.v1
+        printf 'tip_counter_index=0x01800100\n'
+        printf 'tip_counter_hex=%s\n' "$tip_counter_hex"
+        printf 'tip_selected_slot=%s\n' "$tip_slot"
+        printf 'tip_selected_slot_index=%s\n' "$tip_index"
+        printf 'tip_selected_slot_sha256=%s\n' "$(sha256sum "$work_dir/tip-selected.bin" | cut -d ' ' -f1)"
+        printf 'lease_counter_index=0x01800103\n'
+        printf 'lease_counter_hex=%s\n' "$lease_counter_hex"
+        printf 'lease_selected_slot=%s\n' "$lease_slot"
+        printf 'lease_selected_slot_index=%s\n' "$lease_index"
+        printf 'lease_selected_slot_sha256=%s\n' "$(sha256sum "$work_dir/lease-selected.bin" | cut -d ' ' -f1)"
+        printf 'selected_coordinate_digest=%s\n' "$selected_digest"
+    } >"$output"
+    assert_core_schema5_tpm_nv_snapshot "$output"
+)
+
+selftest_core_schema5_negative_oracles() (
+    local tmp valid_trace missing_readback_trace bus_master_trace late_notify_trace
+    local before_snapshot after_snapshot live_state valid_marker
+    tmp=$(mktemp -d)
+    trap 'rm -rf -- "$tmp"' EXIT
+    valid_trace="$tmp/valid.trace"
+    missing_readback_trace="$tmp/missing-readback.trace"
+    bus_master_trace="$tmp/bus-master.trace"
+    late_notify_trace="$tmp/late-notify.trace"
+    before_snapshot="$tmp/before.snapshot"
+    after_snapshot="$tmp/after.snapshot"
+    valid_marker='CSER_CORE_SCHEMA5_MIGRATION_REQUIRED PASS bus_master_disabled=true intx_masked=true reset_status_zero=true observed_isr_bits=0 isr_reads=2 consecutive_empty_isr_reads=2 iotlb_used_remapped_iova=true iotlb_completed_trigger_pages=1'
+    printf '%s\n' \
+        'pci_cfg_write virtio-blk-pci 00:05.0 @0x4 <- 0x7' \
+        'pci_cfg_read virtio-blk-pci 00:05.0 @0x4 -> 0x100007' \
+        'pci_cfg_write virtio-blk-pci 00:05.0 @0x4 <- 0x403' \
+        'pci_cfg_read virtio-blk-pci 00:05.0 @0x4 -> 0x100403' \
+        'virtio_set_status vdev 0x1 val 0' \
+        'vtd_inv_desc_iotlb_global iotlb invalidate global' \
+        'vtd_inv_desc_wait_irq IM in IECTL_REG is set, new event not generated' \
+        >"$valid_trace"
+    if ! assert_core_schema5_post_quarantine_trace \
+        "$valid_trace" "$valid_marker" >/dev/null 2>&1; then
+        echo 'schema-5 quarantine oracle self-test rejected its positive trace' >&2
+        return 1
+    fi
+    grep -Fv 'pci_cfg_read ' "$valid_trace" >"$missing_readback_trace"
+    if assert_core_schema5_post_quarantine_trace \
+        "$missing_readback_trace" "$valid_marker" >/dev/null 2>&1; then
+        echo 'schema-5 quarantine oracle accepted a fence without command readback' >&2
+        return 1
+    fi
+    sed 's/@0x4 <- 0x403/@0x4 <- 0x407/' "$valid_trace" >"$bus_master_trace"
+    if assert_core_schema5_post_quarantine_trace \
+        "$bus_master_trace" "$valid_marker" >/dev/null 2>&1; then
+        echo 'schema-5 quarantine oracle accepted bus mastering after the fence' >&2
+        return 1
+    fi
+    cp "$valid_trace" "$late_notify_trace"
+    printf '%s\n' 'virtio_pci_notify_write 0x0 = 0x0 (2)' >>"$late_notify_trace"
+    if assert_core_schema5_post_quarantine_trace \
+        "$late_notify_trace" "$valid_marker" >/dev/null 2>&1; then
+        echo 'schema-5 quarantine oracle accepted post-IOTLB VirtIO notification' >&2
+        return 1
+    fi
+
+    printf '%s\n' \
+        'nexus.cser.schema5-tpm-selected-nv.v1' \
+        'tip_counter_index=0x01800100' \
+        'tip_counter_hex=0000000000000001' \
+        'tip_selected_slot=1' \
+        'tip_selected_slot_index=0x01800102' \
+        'tip_selected_slot_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
+        'lease_counter_index=0x01800103' \
+        'lease_counter_hex=0000000000000001' \
+        'lease_selected_slot=1' \
+        'lease_selected_slot_index=0x01800105' \
+        'lease_selected_slot_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' \
+        'selected_coordinate_digest=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc' \
+        >"$before_snapshot"
+    cp "$before_snapshot" "$after_snapshot"
+    if ! assert_core_schema5_tpm_nv_unchanged \
+        "$before_snapshot" "$after_snapshot" >/dev/null 2>&1; then
+        echo 'schema-5 TPM snapshot self-test rejected identical selected NV state' >&2
+        return 1
+    fi
+    sed 's/selected_coordinate_digest=cccc/selected_coordinate_digest=dddd/' \
+        "$after_snapshot" >"$tmp/changed.snapshot"
+    if assert_core_schema5_tpm_nv_unchanged \
+        "$before_snapshot" "$tmp/changed.snapshot" >/dev/null 2>&1; then
+        echo 'schema-5 TPM snapshot self-test accepted a changed selected NV digest' >&2
+        return 1
+    fi
+    live_state=$(mktemp -d "$tmp/tpmstate.XXXXXX")
+    bash "$root/scripts/provision-cser-tpm-nv.sh" \
+        "$live_state" "$core_schema5_fixture_catalog" \
+        "$core_schema5_fixture_revision_number" "$core_schema5_fixture_head" \
+        >/dev/null
+    capture_core_schema5_tpm_nv_snapshot "$live_state" "$tmp/live-before.snapshot"
+    capture_core_schema5_tpm_nv_snapshot "$live_state" "$tmp/live-after.snapshot"
+    if ! assert_core_schema5_tpm_nv_unchanged \
+        "$tmp/live-before.snapshot" "$tmp/live-after.snapshot" >/dev/null 2>&1; then
+        echo 'schema-5 TPM snapshot self-test changed real selected NV state' >&2
+        return 1
+    fi
+    echo 'schema-5 negative oracle self-test: PASS fence_readback=rejected_when_missing bus_master=rejected post_iotlb_notify=rejected selected_tpm_nv_change=rejected real_swtpm_readback=unchanged'
+)
 
 run_core_reply_evidence_guest() {
     container bash -c '
@@ -825,6 +1461,8 @@ capture_core_reply_evidence() {
         'real_waiter_wake=true' \
         'precommit_adopt_race=true' \
         'revoke_adopt_orders=2' \
+        'historical_profile=1' \
+        'production_profile=false' \
         'legacy_runtime=false' \
         'live_dual_write=false'
     echo 'CSER_CORE_REPLY_EVIDENCE_QEMU PASS runtime=real-task-reap reply=physical settlement=claimed second_crash=reconciled production_registry=false'
@@ -874,6 +1512,8 @@ capture_core_dma_evidence() {
         'CSER_CORE_DMA_OSTD_QEMU PASS' \
         'death=real-task-reap' \
         'second_crash=true' \
+        'historical_profile=1' \
+        'production_profile=false' \
         'legacy_registry=false' \
         'portal_glue=false' \
         'live_dual_write=false'
@@ -892,7 +1532,7 @@ capture_core_dma_evidence() {
 }
 
 start_core_persistent_swtpm() {
-    local capabilities flags
+    local capabilities flags observed_pid
     if ! command -v swtpm >/dev/null 2>&1; then
         echo "run-core-persistent-recovery requires host swtpm" >&2
         return 1
@@ -919,15 +1559,26 @@ start_core_persistent_swtpm() {
         --ctrl "type=unixio,path=$core_persistent_socket" \
         --flags "$flags" \
         --log "file=$core_persistent_artifact_dir/swtpm.log,level=20" \
-        --pid "file=$core_persistent_pid_file" \
-        --daemon
-    core_persistent_pid=$(tr -d '\n' <"$core_persistent_pid_file")
-    if [[ ! $core_persistent_pid =~ ^[1-9][0-9]*$ ]] \
-        || [[ ! -S $core_persistent_socket ]] \
-        || ! kill -0 "$core_persistent_pid" 2>/dev/null; then
-        echo "swtpm did not create the persistent-profile socket" >&2
-        return 1
-    fi
+        --pid "file=$core_persistent_pid_file" &
+    core_persistent_pid=$!
+    for _ in {1..500}; do
+        observed_pid=
+        if [[ -f $core_persistent_pid_file ]]; then
+            observed_pid=$(tr -d '\n' <"$core_persistent_pid_file")
+        fi
+        if [[ $observed_pid == "$core_persistent_pid" ]] \
+            && [[ -S $core_persistent_socket ]] \
+            && kill -0 "$core_persistent_pid" 2>/dev/null; then
+            return 0
+        fi
+        if ! kill -0 "$core_persistent_pid" 2>/dev/null; then
+            break
+        fi
+        sleep 0.01
+    done
+    echo "swtpm did not create the persistent-profile socket" >&2
+    stop_core_persistent_swtpm
+    return 1
 }
 
 stop_core_persistent_swtpm() {
@@ -974,16 +1625,116 @@ capture_core_persistent_boot() (
     local serial=$1
     local debug=$2
     local capture_status=0
-    start_core_persistent_swtpm
     trap 'stop_core_persistent_swtpm || exit 1' EXIT
+    start_core_persistent_swtpm
     # shellcheck source=scripts/qemu-stream-capture.sh
     source "$capture_helper"
-    capture_qemu_streams "$serial" "$debug" run_core_persistent_guest \
-        || capture_status=$?
+    set +e
+    capture_qemu_streams "$serial" "$debug" run_core_persistent_guest
+    capture_status=$?
+    set -e
     stop_core_persistent_swtpm
     trap - EXIT
     return "$capture_status"
 )
+
+capture_core_schema5_negative_boot() {
+    local catalog_digest=$1 migration_count fail_count
+    local tpm_coordinate_digest tip_counter lease_counter tip_slot lease_slot
+    local migration_marker
+    build_core_schema5_selected_fixture
+    bash "$root/scripts/provision-cser-tpm-nv.sh" \
+        "$core_persistent_state_dir" \
+        "$core_schema5_fixture_catalog" \
+        "$core_schema5_fixture_revision_number" \
+        "$core_schema5_fixture_head"
+    capture_core_schema5_tpm_nv_snapshot \
+        "$core_persistent_state_dir" "$core_schema5_tpm_before"
+    capture_core_persistent_boot \
+        "$core_persistent_artifact_dir/schema5-negative-serial.log" \
+        "$core_persistent_artifact_dir/schema5-negative-qemu-debug.log"
+
+    capture_core_schema5_tpm_nv_snapshot \
+        "$core_persistent_state_dir" "$core_schema5_tpm_after"
+    assert_core_schema5_tpm_nv_unchanged \
+        "$core_schema5_tpm_before" "$core_schema5_tpm_after"
+    tpm_coordinate_digest=$(core_schema5_tpm_snapshot_field \
+        "$core_schema5_tpm_after" selected_coordinate_digest '^[0-9a-f]{64}$')
+    tip_counter=$(core_schema5_tpm_snapshot_field \
+        "$core_schema5_tpm_after" tip_counter_hex '^[0-9a-f]{16}$')
+    lease_counter=$(core_schema5_tpm_snapshot_field \
+        "$core_schema5_tpm_after" lease_counter_hex '^[0-9a-f]{16}$')
+    tip_slot=$(core_schema5_tpm_snapshot_field \
+        "$core_schema5_tpm_after" tip_selected_slot '^[01]$')
+    lease_slot=$(core_schema5_tpm_snapshot_field \
+        "$core_schema5_tpm_after" lease_selected_slot '^[01]$')
+    cmp "$core_schema5_journal" "$core_persistent_journal"
+    require_core_persistent_marker \
+        "$core_persistent_artifact_dir/schema5-negative-serial.log" \
+        'CSER_CORE_SCHEMA5_MIGRATION_REQUIRED PASS' \
+        'trusted_tpm_candidate_selected=true' \
+        'profile2_binding_authorized=false' \
+        "selected_revision=$core_schema5_fixture_revision_number" \
+        "selected_head=$core_schema5_fixture_head" \
+        "selected_catalog=$core_schema5_fixture_catalog" \
+        "expected_catalog=$catalog_digest" \
+        'anchor_binding_match=false' \
+        'journal_schema=5' \
+        'typed_error=migration-required' \
+        'semantic_replay=false' \
+        'inferred_pairing=false' \
+        'pre_replay_quarantine=true' \
+        'bus_master_disabled=true' \
+        'intx_masked=true' \
+        'reset_status_zero=true' \
+        'iotlb_used_remapped_iova=true' \
+        'device_guard_retained=true' \
+        'production_registry=false' \
+        'device_activation=false' \
+        'arena_withheld=true' \
+        'queue_republish=false' \
+        'page_iova_reuse=false'
+    require_core_persistent_marker \
+        "$core_persistent_artifact_dir/schema5-negative-serial.log" \
+        'CSER_CORE_PERSISTENT_FAIL_CLOSED' \
+        'reason=schema5-migration-required' \
+        'activation=blocked' \
+        'queue_republish=false' \
+        'page_iova_reuse=false'
+    migration_count=$(tr -d '\r' \
+        <"$core_persistent_artifact_dir/schema5-negative-serial.log" \
+        | awk 'index($0, "CSER_CORE_SCHEMA5_MIGRATION_REQUIRED PASS") { count += 1 } END { print count + 0 }')
+    fail_count=$(tr -d '\r' \
+        <"$core_persistent_artifact_dir/schema5-negative-serial.log" \
+        | awk 'index($0, "CSER_CORE_PERSISTENT_FAIL_CLOSED") { count += 1 } END { print count + 0 }')
+    if [[ $migration_count != 1 || $fail_count != 1 ]] \
+        || grep -Eq 'CSER_CORE_PERSISTENT_BOOT[1-4] PASS|production_registry=single' \
+            "$core_persistent_artifact_dir/schema5-negative-serial.log"; then
+        echo 'schema-5 negative boot published or duplicated a production result' >&2
+        return 1
+    fi
+    migration_marker=$(tr -d '\r' \
+        <"$core_persistent_artifact_dir/schema5-negative-serial.log" \
+        | grep -F 'CSER_CORE_SCHEMA5_MIGRATION_REQUIRED PASS' | tail -n 1)
+    assert_core_schema5_post_quarantine_trace \
+        "$core_persistent_artifact_dir/schema5-negative-qemu-debug.log" \
+        "$migration_marker"
+
+    if [[ -f $core_persistent_artifact_dir/swtpm.log ]]; then
+        cp -- "$core_persistent_artifact_dir/swtpm.log" \
+            "$core_persistent_artifact_dir/schema5-negative-swtpm.log"
+    fi
+    if [[ -f $core_persistent_artifact_dir/task-entry-debugcon.log ]]; then
+        cp -- "$core_persistent_artifact_dir/task-entry-debugcon.log" \
+            "$core_persistent_artifact_dir/schema5-negative-task-entry-debugcon.log"
+    fi
+    mv -- "$core_persistent_state_dir" "$core_schema5_state_dir"
+    rm -f -- \
+        "$core_persistent_artifact_dir/swtpm.log" \
+        "$core_persistent_artifact_dir/task-entry-debugcon.log"
+    initialize_core_persistent_media
+    echo "CSER_CORE_SCHEMA5_QEMU_NEGATIVE PASS selected_revision=$core_schema5_fixture_revision_number selected_head=$core_schema5_fixture_head selected_catalog=$core_schema5_fixture_catalog expected_catalog=$catalog_digest trusted_tpm_candidate_selected=true profile2_binding_authorized=false typed_error=migration-required registry_publication=false post_quarantine_activation=false device_quarantined=true device_guard_retained=true arena_withheld=true pci_bus_master_fence_readback=true isr_drain=two-empty-reads iotlb_completion=true tpm_selected_nv_unchanged=true tpm_selected_coordinate_digest=$tpm_coordinate_digest tpm_tip_counter_hex=$tip_counter tpm_tip_selected_slot=$tip_slot tpm_lease_counter_hex=$lease_counter tpm_lease_selected_slot=$lease_slot"
+}
 
 require_core_persistent_marker() {
     local serial=$1
@@ -1018,6 +1769,238 @@ core_persistent_marker_u64() {
     fi
     printf '%s\n' "$value"
 }
+
+core_persistent_marker_digest() {
+    local line=$1
+    local field=$2
+    local token value= count=0
+    for token in $line; do
+        if [[ $token == "$field="* ]]; then
+            value=${token#*=}
+            ((count += 1))
+        fi
+    done
+    if (( count != 1 )) || [[ ! $value =~ ^[0-9a-f]{64}$ ]]; then
+        echo "persistent recovery marker has an invalid $field digest: $line" >&2
+        return 1
+    fi
+    printf '%s\n' "$value"
+}
+
+assert_core_persistent_semantic_coordinates() {
+    local expected_catalog=$1
+    shift
+    local -a markers=("$@") projections=()
+    local marker observed_catalog projection arena_boot1 arena_boot3
+    local -A distinct_projections=()
+    if (( ${#markers[@]} != 4 )); then
+        echo 'persistent semantic-coordinate proof requires exactly four markers' >&2
+        return 1
+    fi
+    for marker in "${markers[@]}"; do
+        observed_catalog=$(core_persistent_marker_digest \
+            "$marker" catalog_digest) || return 1
+        if [[ $observed_catalog != "$expected_catalog" ]]; then
+            echo 'guest catalog digest differs from the pinned host catalog digest' >&2
+            return 1
+        fi
+        projection=$(core_persistent_marker_digest \
+            "$marker" projection_digest) || return 1
+        projections+=("$projection")
+        distinct_projections["$projection"]=1
+    done
+    if (( ${#distinct_projections[@]} != 4 )); then
+        echo 'persistent recovery did not expose four distinct boot projections' >&2
+        return 1
+    fi
+    arena_boot1=$(core_persistent_marker_digest \
+        "${markers[0]}" arena_contract_digest) || return 1
+    arena_boot3=$(core_persistent_marker_digest \
+        "${markers[2]}" arena_contract_digest) || return 1
+    if [[ $arena_boot1 != "$arena_boot3" ]]; then
+        echo 'persistent DMA arena provider contract changed across generation reuse' >&2
+        return 1
+    fi
+    printf 'catalog_digest=%s projection_digests=%s arena_contract_digest=%s\n' \
+        "$expected_catalog" \
+        "$(IFS=,; echo "${projections[*]}")" \
+        "$arena_boot1"
+}
+
+core_persistent_marker_bounded_decimal() {
+    local line=$1
+    local field=$2
+    local maximum=$3
+    local LC_ALL=C
+    local token value= count=0
+    for token in $line; do
+        if [[ $token == "$field="* ]]; then
+            value=${token#*=}
+            ((count += 1))
+        fi
+    done
+    if (( count != 1 )) || [[ ! $value =~ ^[1-9][0-9]*$ ]]; then
+        echo "persistent recovery marker has an invalid $field decimal: $line" >&2
+        return 1
+    fi
+    if (( ${#value} > ${#maximum} )) \
+        || { (( ${#value} == ${#maximum} )) && [[ $value > $maximum ]]; }; then
+        echo "persistent recovery marker exceeds the $field bound $maximum: $line" >&2
+        return 1
+    fi
+    printf '%s\n' "$value"
+}
+
+core_persistent_trace_has_exact_dma_mapping() {
+    local trace=$1
+    local iova=$2
+    local expected=$3
+    awk -v target_iova="$iova" -v expected="$expected" '
+        $1 == "vtd_dmar_translate" \
+            && $2 == "dev" \
+            && $3 == "00:05.00" \
+            && $4 == "iova" \
+            && $5 == target_iova {
+                seen += 1
+                if ($0 != expected) {
+                    conflicting += 1
+                }
+            }
+        END {
+            exit !(seen > 0 && conflicting == 0)
+        }
+    ' "$trace"
+}
+
+assert_core_persistent_dma_arena_reuse() {
+    local boot1_marker=$1
+    local boot3_marker=$2
+    local boot1_trace=$3
+    local boot3_trace=$4
+    local boot1_generation boot3_generation
+    local boot1_guest boot1_iova boot1_offset
+    local boot3_guest boot3_iova boot3_offset
+    local page_size=4096 arena_pages=3 ram_size=1073741824
+    local max_offset max_guest_pfn
+    local max_iova=9223372036854767615
+    max_offset=$((ram_size - arena_pages * page_size))
+    max_guest_pfn=$((max_offset / page_size))
+    boot1_generation=$(core_persistent_marker_u64 \
+        "$boot1_marker" resource_generation) || return 1
+    boot3_generation=$(core_persistent_marker_u64 \
+        "$boot3_marker" resource_generation) || return 1
+    if [[ $boot1_generation != 1 || $boot3_generation != 2 ]]; then
+        echo 'persistent DMA arena did not advance from generation 1 to 2' >&2
+        return 1
+    fi
+    boot1_guest=$(core_persistent_marker_bounded_decimal \
+        "$boot1_marker" guest_pfn_base "$max_guest_pfn") || return 1
+    boot1_iova=$(core_persistent_marker_bounded_decimal \
+        "$boot1_marker" emulated_iova_base "$max_iova") || return 1
+    boot1_offset=$(core_persistent_marker_bounded_decimal \
+        "$boot1_marker" host_backing_offset "$max_offset") || return 1
+    boot3_guest=$(core_persistent_marker_bounded_decimal \
+        "$boot3_marker" guest_pfn_base "$max_guest_pfn") || return 1
+    boot3_iova=$(core_persistent_marker_bounded_decimal \
+        "$boot3_marker" emulated_iova_base "$max_iova") || return 1
+    boot3_offset=$(core_persistent_marker_bounded_decimal \
+        "$boot3_marker" host_backing_offset "$max_offset") || return 1
+    if [[ $boot1_guest != "$boot3_guest" \
+        || $boot1_iova != "$boot3_iova" \
+        || $boot1_offset != "$boot3_offset" ]]; then
+        echo 'persistent DMA arena coordinates changed between generations' >&2
+        return 1
+    fi
+    if (( boot1_offset / page_size != boot1_guest \
+        || boot3_offset / page_size != boot3_guest \
+        || boot1_iova % page_size != 0 \
+        || boot1_offset % page_size != 0 \
+        || boot1_offset > ram_size - arena_pages * page_size )); then
+        echo 'persistent DMA arena coordinates do not identify an aligned PFN-backed range' >&2
+        return 1
+    fi
+    local trace page iova gpa iova_token mapping
+    for trace in "$boot1_trace" "$boot3_trace"; do
+        for page in 0 1 2; do
+            iova=$((boot1_iova + page * page_size))
+            gpa=$((boot1_offset + page * page_size))
+            printf -v iova_token '0x%x' "$iova"
+            printf -v mapping \
+                'vtd_dmar_translate dev 00:05.00 iova 0x%x -> gpa 0x%x mask 0xfff' \
+                "$iova" "$gpa"
+            if ! core_persistent_trace_has_exact_dma_mapping \
+                "$trace" "$iova_token" "$mapping"; then
+                echo "persistent DMA arena has a missing or conflicting VT-d mapping '$mapping' in $trace" >&2
+                return 1
+            fi
+        done
+    done
+    printf 'resource_generation=1->2 guest_pfn_base=%s emulated_iova_base=%s host_backing_offset=%s\n' \
+        "$boot1_guest" "$boot1_iova" "$boot1_offset"
+}
+
+selftest_core_persistent_dma_arena_reuse() (
+    local tmp valid_trace conflicting_trace wide_mask_trace
+    local boot1_marker boot3_marker
+    local overflow_boot1 overflow_boot3 generation_boot1 generation_boot3
+    tmp=$(mktemp -d)
+    trap 'rm -rf -- "$tmp"' EXIT
+    valid_trace="$tmp/valid.trace"
+    conflicting_trace="$tmp/conflicting-gpa.trace"
+    wide_mask_trace="$tmp/wide-mask.trace"
+    boot1_marker='CSER_CORE_PERSISTENT_BOOT1 PASS resource_generation=1 guest_pfn_base=196608 emulated_iova_base=1073741824 host_backing_offset=805306368'
+    boot3_marker='CSER_CORE_PERSISTENT_BOOT3 PASS resource_generation=2 prior_resource_generation=1 guest_pfn_base=196608 emulated_iova_base=1073741824 host_backing_offset=805306368'
+    printf '%s\n' \
+        'vtd_dmar_translate dev 00:05.00 iova 0x40000000 -> gpa 0x30000000 mask 0xfff' \
+        'vtd_dmar_translate dev 00:05.00 iova 0x40001000 -> gpa 0x30001000 mask 0xfff' \
+        'vtd_dmar_translate dev 00:05.00 iova 0x40002000 -> gpa 0x30002000 mask 0xfff' \
+        >"$valid_trace"
+    if ! assert_core_persistent_dma_arena_reuse \
+        "$boot1_marker" "$boot3_marker" "$valid_trace" "$valid_trace" \
+        >/dev/null 2>&1; then
+        echo 'persistent DMA arena checker self-test rejected its positive fixture' >&2
+        return 1
+    fi
+
+    cp "$valid_trace" "$conflicting_trace"
+    printf '%s\n' \
+        'vtd_dmar_translate dev 00:05.00 iova 0x40000000 -> gpa 0x30001000 mask 0xfff' \
+        >>"$conflicting_trace"
+    if assert_core_persistent_dma_arena_reuse \
+        "$boot1_marker" "$boot3_marker" "$conflicting_trace" "$valid_trace" \
+        >/dev/null 2>&1; then
+        echo 'persistent DMA arena checker accepted a conflicting GPA' >&2
+        return 1
+    fi
+
+    sed '0,/mask 0xfff/s//mask 0xffff/' "$valid_trace" >"$wide_mask_trace"
+    if assert_core_persistent_dma_arena_reuse \
+        "$boot1_marker" "$boot3_marker" "$wide_mask_trace" "$valid_trace" \
+        >/dev/null 2>&1; then
+        echo 'persistent DMA arena checker accepted mask 0xffff' >&2
+        return 1
+    fi
+
+    overflow_boot1=${boot1_marker/guest_pfn_base=196608/guest_pfn_base=4503599627567104}
+    overflow_boot3=${boot3_marker/guest_pfn_base=196608/guest_pfn_base=4503599627567104}
+    if assert_core_persistent_dma_arena_reuse \
+        "$overflow_boot1" "$overflow_boot3" "$valid_trace" "$valid_trace" \
+        >/dev/null 2>&1; then
+        echo 'persistent DMA arena checker accepted a wrapping PFN' >&2
+        return 1
+    fi
+
+    generation_boot1=${boot1_marker/resource_generation=1/resource_generation=18446744073709551617}
+    generation_boot3=${boot3_marker/resource_generation=2/resource_generation=18446744073709551618}
+    if assert_core_persistent_dma_arena_reuse \
+        "$generation_boot1" "$generation_boot3" "$valid_trace" "$valid_trace" \
+        >/dev/null 2>&1; then
+        echo 'persistent DMA arena checker accepted wrapping generations' >&2
+        return 1
+    fi
+
+    echo 'persistent DMA arena checker self-test: PASS positive=accepted conflicting_gpa=rejected mask_0xffff=rejected pfn_overflow=rejected generation_overflow=rejected'
+)
 
 assert_core_persistent_freshness_progression() {
     local -a markers=("$@")
@@ -1109,10 +2092,20 @@ hash_core_persistent_tree() {
 }
 
 capture_core_persistent_run() {
+    if [[ ! -f $core_persistent_ram || -L $core_persistent_ram ]]; then
+        echo "persistent RAM backend is missing or unsafe: $core_persistent_ram" >&2
+        return 1
+    fi
+    local ram_backing_size ram_backing_identity
+    if [[ $(stat -c %s -- "$core_persistent_ram") != 1073741824 ]]; then
+        echo 'persistent RAM backend is not exactly 1 GiB' >&2
+        return 1
+    fi
     build_core_persistent_recovery_kernel
     copy_core_evidence_iso \
         "$core_persistent_artifact_dir/production-kernel.iso"
-    local catalog_digest image_source_proof core_api_profile journal_schema
+    local catalog_digest image_source_proof core_api_profile catalog_version
+    local projection_version snapshot_version journal_schema
     local -a image_source_proof_lines
     catalog_digest=$(container bash -c '
         set -euo pipefail
@@ -1132,11 +2125,24 @@ capture_core_persistent_run() {
     core_api_profile=$(sed -n \
         's/^pub const CSER_CORE_API_PROFILE_VERSION: u16 = \([0-9][0-9]*\);$/\1/p' \
         "$repo_root/crates/cser-core/src/lib.rs")
+    catalog_version=$(sed -n \
+        's/^pub const STANDARD_CATALOG_VERSION: u16 = \([0-9][0-9]*\);$/\1/p' \
+        "$repo_root/crates/cser-core/src/lib.rs")
+    projection_version=$(sed -n \
+        's/^pub const PROJECTION_VERSION: u16 = \([0-9][0-9]*\);$/\1/p' \
+        "$repo_root/crates/cser-core/src/lib.rs")
+    snapshot_version=$(sed -n \
+        's/^pub const RECOVERY_SNAPSHOT_VERSION: u16 = \([0-9][0-9]*\);$/\1/p' \
+        "$repo_root/crates/cser-core/src/lib.rs")
     journal_schema=$(sed -n \
         's/^pub const JOURNAL_SCHEMA_VERSION: u16 = \([0-9][0-9]*\);$/\1/p' \
         "$repo_root/crates/cser-core/src/journal.rs")
-    if [[ $core_api_profile != 1 || $journal_schema != 5 ]]; then
-        echo "unfrozen core API/journal profile: api=$core_api_profile journal=$journal_schema" >&2
+    if [[ $core_api_profile != 2 \
+        || $catalog_version != 5 \
+        || $projection_version != 6 \
+        || $snapshot_version != 2 \
+        || $journal_schema != 6 ]]; then
+        echo "unfrozen CSER coordinates: api=$core_api_profile catalog=$catalog_version projection=$projection_version snapshot=$snapshot_version journal=$journal_schema" >&2
         return 1
     fi
     image_source_proof=$(container cat /nexus-cser-verified)
@@ -1147,6 +2153,9 @@ capture_core_persistent_run() {
         echo 'pinned image returned an invalid CSER source proof' >&2
         return 1
     fi
+    capture_core_schema5_negative_boot "$catalog_digest"
+    ram_backing_size=$(stat -c %s -- "$core_persistent_ram")
+    ram_backing_identity=$(stat -c '%d:%i' -- "$core_persistent_ram")
     bash "$root/scripts/provision-cser-tpm-nv.sh" \
         "$core_persistent_state_dir" "$catalog_digest"
 
@@ -1167,21 +2176,32 @@ capture_core_persistent_run() {
         "$core_persistent_artifact_dir/boot1-serial.log" \
         'CSER_CORE_PERSISTENT_BOOT1 PASS' \
         'production_registry=single' \
+        'profile=2' \
+        'composite_effect=true' \
+        'effect_identity=shared' \
+        'component_ids=reply+dma' \
+        'api_profile=2' \
+        'catalog_version=5' \
+        'projection_version=6' \
+        'snapshot_version=2' \
+        'journal_schema=6' \
+        'operation_effect_root=50433' \
+        'operation_effect_sequence=1' \
+        'reply_component_id=1' \
+        'dma_component_id=2' \
         'portal=nxp3' \
         'supervisor=core-v1' \
         'reply=committed-unsettled' \
         'dma=queue-published-retained' \
         'retained=4' \
         'dma_retained=3' \
+        'resource_generation=1' \
         'resumed_prefix=false' \
         'service_principal_generation=1' \
         'binding_generation=1' \
-        'reply_service_task=true' \
-        'reply_service_death=task-return' \
-        'reply_exact_reap=true' \
-        'dma_service_task=true' \
-        'dma_service_death=task-return' \
-        'dma_exact_reap=true' \
+        'production_service_tasks=1' \
+        'service_death=task-return' \
+        'exact_reap=true' \
         'ingress_latch=closed' \
         'closed_ingress_rejected=true' \
         'production_rebind=initial'
@@ -1189,20 +2209,31 @@ capture_core_persistent_run() {
         "$core_persistent_artifact_dir/boot2-serial.log" \
         'CSER_CORE_PERSISTENT_BOOT2 PASS' \
         'production_registry=single' \
+        'api_profile=2' \
+        'catalog_version=5' \
+        'projection_version=6' \
+        'snapshot_version=2' \
+        'journal_schema=6' \
+        'operation_effect_root=50433' \
+        'operation_effect_sequence=1' \
+        'reply_component_id=1' \
+        'dma_component_id=2' \
         'portal=nxp3' \
         'supervisor=core-v1' \
-        'reply=apply-intent-durable' \
+        'reply=reconciliation-required' \
+        'pre_fence_reply=apply-intent-durable' \
+        'core_apply_intent_durable=true' \
         'second_crash=service-exact-reap' \
+        'external_apply_durable=false' \
         'no_external_apply=true' \
         'dma_queue=retired' \
-        'dma_queue_resource=scope-quarantined' \
-        'dma_pages_iova=retained' \
-        'retained=3' \
-        'dma_retained=2' \
-        'activation=blocked' \
-        'resource_reuse_authorized=false' \
+        'retained=1' \
+        'dma_retained=0' \
+        'activation=deferred' \
+        'resource_reuse_authorized=true' \
         'reset_submitted=3' \
         'irq_submitted=1' \
+        'iotlb_submitted=2' \
         'service_principal_generation=2' \
         'successor_generation=2' \
         'binding_generation=2' \
@@ -1217,20 +2248,28 @@ capture_core_persistent_run() {
         "$core_persistent_artifact_dir/boot3-serial.log" \
         'CSER_CORE_PERSISTENT_BOOT3 PASS' \
         'production_registry=single' \
+        'api_profile=2' \
+        'catalog_version=5' \
+        'projection_version=6' \
+        'snapshot_version=2' \
+        'journal_schema=6' \
+        'operation_effect_root=50433' \
+        'operation_effect_sequence=1' \
+        'reply_component_id=1' \
+        'dma_component_id=2' \
+        'reuse_effect_root=50433' \
+        'reuse_effect_sequence=2' \
         'portal=nxp3' \
         'supervisor=core-v1' \
         'reply=settled-after-second-crash' \
         'reconciliation=true' \
         'second_apply_intent=false' \
-        'dma_queue=retired' \
-        'dma_queue_resource=scope-quarantined' \
-        'dma_pages_iova=retained' \
-        'retained=2' \
-        'dma_retained=2' \
-        'activation=blocked' \
-        'resource_reuse_authorized=false' \
-        'reset_submitted=0' \
-        'irq_submitted=0' \
+        'retained=3' \
+        'dma_retained=3' \
+        'activation=active' \
+        'resource_generation=2' \
+        'prior_resource_generation=1' \
+        'stale_old_generation_evidence=rejected_without_mutation' \
         'service_principal_generation=3' \
         'successor_generation=3' \
         'binding_generation=3' \
@@ -1239,11 +2278,22 @@ capture_core_persistent_run() {
         'production_rebind=true' \
         'service_state=live' \
         'ingress_latch=open' \
-        'prior_service_fence=boot-checkpoint'
+        'prior_service_fence=same-boot-exact-reap'
     require_core_persistent_marker \
         "$core_persistent_artifact_dir/boot4-serial.log" \
         'CSER_CORE_PERSISTENT_BOOT4 PASS' \
         'production_registry=single' \
+        'api_profile=2' \
+        'catalog_version=5' \
+        'projection_version=6' \
+        'snapshot_version=2' \
+        'journal_schema=6' \
+        'operation_effect_root=50433' \
+        'operation_effect_sequence=1' \
+        'reply_component_id=1' \
+        'dma_component_id=2' \
+        'reuse_effect_root=50433' \
+        'reuse_effect_sequence=2' \
         'portal=nxp3' \
         'supervisor=core-v1' \
         'reply=settled' \
@@ -1251,14 +2301,13 @@ capture_core_persistent_run() {
         'duplicate_apply_intent=false' \
         'duplicate_dma_evidence=false' \
         'dma_queue=retired' \
-        'dma_queue_resource=scope-quarantined' \
-        'dma_pages_iova=retained' \
-        'retained=2' \
-        'dma_retained=2' \
-        'activation=blocked' \
-        'resource_reuse_authorized=false' \
-        'reset_submitted=0' \
-        'irq_submitted=0' \
+        'retained=0' \
+        'dma_retained=0' \
+        'activation=deferred' \
+        'resource_reuse_authorized=true' \
+        'reset_submitted=3' \
+        'irq_submitted=1' \
+        'iotlb_submitted=2' \
         'service_principal_generation=4' \
         'successor_generation=4' \
         'binding_generation=4' \
@@ -1277,6 +2326,8 @@ capture_core_persistent_run() {
     grep -F 'vtd_inv_desc_iotlb_global' \
         "$core_persistent_artifact_dir/boot4-qemu-debug.log" >/dev/null
     local boot1_notify_count boot2_notify_count boot3_notify_count boot4_notify_count
+    local boot1_pci_notify_count boot2_pci_notify_count
+    local boot3_pci_notify_count boot4_pci_notify_count
     local boot1_read_count boot2_read_count boot3_read_count boot4_read_count
     local boot1_dma_translation_count boot2_dma_translation_count
     local boot3_dma_translation_count boot4_dma_translation_count
@@ -1288,6 +2339,14 @@ capture_core_persistent_run() {
         "$core_persistent_artifact_dir/boot3-qemu-debug.log" 'virtio_queue_notify ')
     boot4_notify_count=$(core_persistent_qemu_event_count \
         "$core_persistent_artifact_dir/boot4-qemu-debug.log" 'virtio_queue_notify ')
+    boot1_pci_notify_count=$(core_persistent_qemu_event_count \
+        "$core_persistent_artifact_dir/boot1-qemu-debug.log" 'virtio_pci_notify_write ')
+    boot2_pci_notify_count=$(core_persistent_qemu_event_count \
+        "$core_persistent_artifact_dir/boot2-qemu-debug.log" 'virtio_pci_notify_write ')
+    boot3_pci_notify_count=$(core_persistent_qemu_event_count \
+        "$core_persistent_artifact_dir/boot3-qemu-debug.log" 'virtio_pci_notify_write ')
+    boot4_pci_notify_count=$(core_persistent_qemu_event_count \
+        "$core_persistent_artifact_dir/boot4-qemu-debug.log" 'virtio_pci_notify_write ')
     boot1_read_count=$(core_persistent_qemu_event_count \
         "$core_persistent_artifact_dir/boot1-qemu-debug.log" 'virtio_blk_handle_read ')
     boot2_read_count=$(core_persistent_qemu_event_count \
@@ -1309,24 +2368,28 @@ capture_core_persistent_run() {
         "$core_persistent_artifact_dir/boot4-qemu-debug.log" \
         'vtd_dmar_translate dev 00:05.00 ')
     if (( boot2_notify_count == 0 \
-        || boot2_notify_count != boot3_notify_count \
         || boot2_notify_count != boot4_notify_count \
+        || boot2_pci_notify_count == 0 \
+        || boot2_pci_notify_count != boot4_pci_notify_count \
         || boot2_read_count == 0 \
-        || boot2_read_count != boot3_read_count \
         || boot2_read_count != boot4_read_count )); then
         echo 'persistent recovery has an unstable shared boot-time VirtIO baseline' >&2
         return 1
     fi
     if (( boot1_notify_count != boot2_notify_count + 1 \
+        || boot1_pci_notify_count != boot2_pci_notify_count + 1 \
         || boot1_read_count != boot2_read_count + 1 \
-        || boot1_dma_translation_count == 0 )); then
-        echo 'boot one lacks exactly one IOMMU-backed production DMA publication' >&2
+        || boot3_notify_count != boot2_notify_count + 1 \
+        || boot3_pci_notify_count != boot2_pci_notify_count + 1 \
+        || boot3_read_count != boot2_read_count + 1 \
+        || boot1_dma_translation_count == 0 \
+        || boot3_dma_translation_count == 0 )); then
+        echo 'boots one and three do not each contain exactly one IOMMU-backed DMA publication' >&2
         return 1
     fi
     if (( boot2_dma_translation_count != 0 \
-        || boot3_dma_translation_count != 0 \
         || boot4_dma_translation_count != 0 )); then
-        echo 'persistent recovery republished an IOMMU-backed DMA request after boot one' >&2
+        echo 'a recovery-only boot emitted a new IOMMU-backed DMA request' >&2
         return 1
     fi
     if grep -F 'vtd_dmar_fault' "$core_persistent_artifact_dir"/*-qemu-debug.log \
@@ -1337,10 +2400,17 @@ capture_core_persistent_run() {
     local combined_receipt receipt_basename receipt_checksum_basename
     local receipt_header receipt_sha256 seal_failure=false
     local boot1_marker boot2_marker boot3_marker boot4_marker
-    local freshness_progression service_identity_progression
+    local freshness_progression service_identity_progression dma_arena_reuse
+    local semantic_coordinates
     local docker_image_id git_revision
-    local reply_evidence_marker dma_hardware_marker dma_runtime_marker
+    local reply_evidence_marker dma_hardware_marker dma_runtime_marker schema5_negative_marker
     local source_status source_tree_clean=true tracked_tree_clean=true tpm_state_sha256
+    local schema5_tpm_state_sha256 schema5_tpm_coordinate_digest
+    local schema5_tpm_tip_counter schema5_tpm_lease_counter
+    local schema5_tpm_tip_slot schema5_tpm_lease_slot
+    schema5_negative_marker=$(tr -d '\r' \
+        <"$core_persistent_artifact_dir/schema5-negative-serial.log" \
+        | grep -F 'CSER_CORE_SCHEMA5_MIGRATION_REQUIRED PASS' | tail -n 1)
     boot1_marker=$(tr -d '\r' \
         <"$core_persistent_artifact_dir/boot1-serial.log" \
         | grep -F 'CSER_CORE_PERSISTENT_BOOT1 PASS' | tail -n 1)
@@ -1365,6 +2435,18 @@ capture_core_persistent_run() {
         "$boot1_marker" "$boot2_marker" "$boot3_marker" "$boot4_marker")
     service_identity_progression=$(assert_core_persistent_service_identity_progression \
         "$boot1_marker" "$boot2_marker" "$boot3_marker" "$boot4_marker")
+    semantic_coordinates=$(assert_core_persistent_semantic_coordinates \
+        "$catalog_digest" \
+        "$boot1_marker" "$boot2_marker" "$boot3_marker" "$boot4_marker")
+    dma_arena_reuse=$(assert_core_persistent_dma_arena_reuse \
+        "$boot1_marker" "$boot3_marker" \
+        "$core_persistent_artifact_dir/boot1-qemu-debug.log" \
+        "$core_persistent_artifact_dir/boot3-qemu-debug.log")
+    if [[ $(stat -c %s -- "$core_persistent_ram") != "$ram_backing_size" ]] \
+        || [[ $(stat -c '%d:%i' -- "$core_persistent_ram") != "$ram_backing_identity" ]]; then
+        echo 'persistent RAM backend was replaced or resized across the four boots' >&2
+        return 1
+    fi
     reply_evidence_marker=$(tr -d '\r' \
         <"$core_persistent_artifact_dir/reply-evidence-serial.log" \
         | grep -F 'CSER_CORE_OSTD_TASK_RECOVERY PASS' | tail -n 1)
@@ -1391,8 +2473,22 @@ capture_core_persistent_run() {
         return 1
     fi
     tpm_state_sha256=$(hash_core_persistent_tree "$core_persistent_state_dir")
+    schema5_tpm_state_sha256=$(hash_core_persistent_tree "$core_schema5_state_dir")
+    assert_core_schema5_tpm_nv_unchanged \
+        "$core_schema5_tpm_before" "$core_schema5_tpm_after"
+    schema5_tpm_coordinate_digest=$(core_schema5_tpm_snapshot_field \
+        "$core_schema5_tpm_after" selected_coordinate_digest '^[0-9a-f]{64}$')
+    schema5_tpm_tip_counter=$(core_schema5_tpm_snapshot_field \
+        "$core_schema5_tpm_after" tip_counter_hex '^[0-9a-f]{16}$')
+    schema5_tpm_lease_counter=$(core_schema5_tpm_snapshot_field \
+        "$core_schema5_tpm_after" lease_counter_hex '^[0-9a-f]{16}$')
+    schema5_tpm_tip_slot=$(core_schema5_tpm_snapshot_field \
+        "$core_schema5_tpm_after" tip_selected_slot '^[01]$')
+    schema5_tpm_lease_slot=$(core_schema5_tpm_snapshot_field \
+        "$core_schema5_tpm_after" lease_selected_slot '^[01]$')
 
-    combined_receipt='CSER_CORE_PERSISTENT_QEMU_RESTART PASS boots=4 shared_runtime=true evidence_schemes=reply+dma production_registry=single portal=nxp3 supervisor=core-v1 journal=ata-pio outbox=ata-pio-secondary anchor=tpm2-nv quarantine=pre-replay-virtio+vtd reply=committed-then-intent-crash-then-settled second_crash=after-durable-apply-intent reconciliation=without-second-intent stable_recovery=true freshness=strictly-increasing service_principal_generations=1,2,3,4 binding_generations=1,2,3,4 boot1_reply_dma_task_death_exact_reap=true boot1_ingress_closed_rejected=true boot2_fresh_ready_rebind_death_exact_reap=true boot2_ingress_closed_rejected=true boot3_fresh_ready_rebind_live_open=true boot4_fresh_ready_rebind_live_open=true prior_service_fence=boot-checkpoint dma_queue=retired dma_queue_resource=scope-quarantined dma_pages_iova=retained retained=2 activation=blocked resource_reuse_authorized=false qemu=true physical_hardware=false physical_antirollback=false physical_powerloss=false physical_dma_custody=false'
+    combined_receipt="CSER_CORE_PERSISTENT_QEMU_RESTART PASS boots=4 schema5_negative_boot=true schema5_selected_revision=5 schema5_selected_catalog=$core_schema5_fixture_catalog schema5_expected_catalog=$catalog_digest schema5_trusted_tpm_candidate_selected=true schema5_profile2_binding_authorized=false schema5_anchor_binding_match=false schema5_typed_rejection=migration-required schema5_semantic_replay=false schema5_pairing_inference=false schema5_registry_publication=false schema5_device_activation=false schema5_device_guard_retained=true schema5_arena_withheld=true schema5_bus_master_disabled=true schema5_intx_masked=true schema5_reset_status_zero=true schema5_observed_isr_bits=0 schema5_isr_reads_at_least=2 schema5_consecutive_empty_isr_reads=2 schema5_iotlb_used_remapped_iova=true schema5_iotlb_completed_trigger_pages_at_least=1 schema5_pci_bus_master_fence_readback=true schema5_iotlb_completion=true schema5_tpm_selected_nv_unchanged=true schema5_tpm_selected_coordinate_digest=$schema5_tpm_coordinate_digest schema5_tpm_tip_counter_hex=$schema5_tpm_tip_counter schema5_tpm_tip_selected_slot=$schema5_tpm_tip_slot schema5_tpm_lease_counter_hex=$schema5_tpm_lease_counter schema5_tpm_lease_selected_slot=$schema5_tpm_lease_slot shared_runtime=true shared_media=journal+swtpm+ram api_profile=2 catalog_version=5 projection_version=6 snapshot_version=2 journal_schema=6 composite_effect=shared operation_effect=50433:1 component_ids=1,2 evidence_schemes=reply+dma production_registry=single portal=nxp3 supervisor=core-v1 journal=ata-pio outbox=ata-pio-secondary ram_backend=memory-backend-file ram_backend_offset=0 qemu_ram_mapping=guest-paddr-equals-file-offset anchor=tpm2-nv quarantine=pre-replay-virtio+vtd reply=committed-then-intent-crash-then-settled second_crash=after-durable-apply-intent reconciliation=without-second-intent stable_recovery=true freshness=strictly-increasing projection_sequence=boot-distinct service_principal_generations=1,2,3,4 binding_generations=1,2,3,4 boot1_composite_task_death_exact_reap=true boot1_ingress_closed_rejected=true boot2_fresh_ready_rebind_death_exact_reap=true boot2_ingress_closed_rejected=true boot3_fresh_ready_rebind_live_open=true boot4_fresh_ready_rebind_live_open=true boot3_prior_service_fence=same-boot-exact-reap boot4_prior_service_fence=boot-checkpoint dma_generation_reuse=1->2 dma_generation1_retired=true dma_generation2_retired=true dma_queue=retired retained=0 resource_reuse_authorized=true arena_provider_contract=stable guest_pfn_reuse=true emulated_iova_reuse=true host_backing_file_offset_reuse=true qemu=true physical_hardware=false host_physical_pfn_identity=false physical_dma_drain=false physical_antirollback=false physical_powerloss=false"
+    combined_receipt+=" focused_test_profiles=profile1-historical focused_test_profiles_are_production=false"
     receipt_header=nexus.cser.production-receipt.v1
     receipt_basename=combined-receipt.txt
     receipt_checksum_basename=combined-receipt.sha256
@@ -1426,6 +2522,9 @@ capture_core_persistent_run() {
             "${image_source_proof_lines[1]}"
         printf 'catalog_digest=%s\n' "$catalog_digest"
         printf 'core_api_profile=%s\n' "$core_api_profile"
+        printf 'catalog_version=%s\n' "$catalog_version"
+        printf 'projection_version=%s\n' "$projection_version"
+        printf 'recovery_snapshot_version=%s\n' "$snapshot_version"
         printf 'journal_schema=%s\n' "$journal_schema"
         printf 'production_kernel_iso_sha256=%s\n' "$(sha256sum \
             "$core_persistent_artifact_dir/production-kernel.iso" \
@@ -1451,6 +2550,34 @@ capture_core_persistent_run() {
             "$root/OSDK.toml" | cut -d ' ' -f1)"
         printf 'fixture_sha256=%s\n' \
             9357413ed9a96a23af1750cc304265dd7dd1835eb58eb1fb50119cd80d0bc8ca
+        printf 'schema5_negative_marker=%s\n' "$schema5_negative_marker"
+        printf 'schema5_fixture_source_revision=%s\n' \
+            "$core_schema5_fixture_revision"
+        printf 'schema5_fixture_metadata_sha256=%s\n' "$(sha256sum \
+            "$core_schema5_fixture_metadata" | cut -d ' ' -f1)"
+        printf 'schema5_logical_journal_sha256=%s\n' "$(sha256sum \
+            "$core_schema5_logical_journal" | cut -d ' ' -f1)"
+        printf 'schema5_pio_image_sha256=%s\n' "$(sha256sum \
+            "$core_schema5_journal" | cut -d ' ' -f1)"
+        printf 'schema5_negative_serial_sha256=%s\n' "$(sha256sum \
+            "$core_persistent_artifact_dir/schema5-negative-serial.log" \
+            | cut -d ' ' -f1)"
+        printf 'schema5_negative_qemu_debug_sha256=%s\n' "$(sha256sum \
+            "$core_persistent_artifact_dir/schema5-negative-qemu-debug.log" \
+            | cut -d ' ' -f1)"
+        printf 'schema5_tpm_selected_nv_unchanged=%s\n' true
+        printf 'schema5_tpm_selected_coordinate_digest=%s\n' \
+            "$schema5_tpm_coordinate_digest"
+        printf 'schema5_tpm_tip_counter_hex=%s\n' "$schema5_tpm_tip_counter"
+        printf 'schema5_tpm_tip_selected_slot=%s\n' "$schema5_tpm_tip_slot"
+        printf 'schema5_tpm_lease_counter_hex=%s\n' "$schema5_tpm_lease_counter"
+        printf 'schema5_tpm_lease_selected_slot=%s\n' "$schema5_tpm_lease_slot"
+        printf 'schema5_tpm_nv_before_sha256=%s\n' "$(sha256sum \
+            "$core_schema5_tpm_before" | cut -d ' ' -f1)"
+        printf 'schema5_tpm_nv_after_sha256=%s\n' "$(sha256sum \
+            "$core_schema5_tpm_after" | cut -d ' ' -f1)"
+        printf 'schema5_negative_tpm_state_sha256=%s\n' \
+            "$schema5_tpm_state_sha256"
         printf 'reply_evidence_marker=%s\n' "$reply_evidence_marker"
         printf 'dma_hardware_marker=%s\n' "$dma_hardware_marker"
         printf 'dma_runtime_marker=%s\n' "$dma_runtime_marker"
@@ -1483,11 +2610,26 @@ capture_core_persistent_run() {
         printf 'freshness_progression=%s\n' "$freshness_progression"
         printf 'service_identity_progression=%s\n' \
             "$service_identity_progression"
+        printf 'semantic_coordinates=%s\n' "$semantic_coordinates"
+        printf 'dma_arena_reuse_coordinates=%s\n' "$dma_arena_reuse"
+        printf 'ram_backing_path=%s\n' ram.raw
+        printf 'ram_backing_size_bytes=%s\n' "$ram_backing_size"
+        printf 'ram_backing_identity=%s\n' "$ram_backing_identity"
         printf 'shared_boot_virtio_notify_baseline=%s\n' "$boot2_notify_count"
+        printf 'shared_boot_virtio_pci_notify_baseline=%s\n' "$boot2_pci_notify_count"
         printf 'shared_boot_virtio_read_baseline=%s\n' "$boot2_read_count"
         printf 'boot1_runtime_notify_delta=%s\n' "$((boot1_notify_count - boot2_notify_count))"
+        printf 'boot1_runtime_pci_notify_delta=%s\n' \
+            "$((boot1_pci_notify_count - boot2_pci_notify_count))"
         printf 'boot1_runtime_read_delta=%s\n' "$((boot1_read_count - boot2_read_count))"
+        printf 'boot3_runtime_notify_delta=%s\n' "$((boot3_notify_count - boot2_notify_count))"
+        printf 'boot3_runtime_pci_notify_delta=%s\n' \
+            "$((boot3_pci_notify_count - boot2_pci_notify_count))"
+        printf 'boot3_runtime_read_delta=%s\n' "$((boot3_read_count - boot2_read_count))"
         printf 'boot1_dma_translation_events=%s\n' "$boot1_dma_translation_count"
+        printf 'boot3_dma_translation_events=%s\n' "$boot3_dma_translation_count"
+        printf 'recovery_only_dma_translation_events=%s\n' \
+            "$((boot2_dma_translation_count + boot4_dma_translation_count))"
         printf 'post_boot1_dma_translation_events=%s\n' \
             "$((boot2_dma_translation_count + boot3_dma_translation_count + boot4_dma_translation_count))"
         printf 'boot1_serial_sha256=%s\n' "$(sha256sum \
@@ -1514,6 +2656,8 @@ capture_core_persistent_run() {
             "$core_persistent_journal" | cut -d ' ' -f1)"
         printf 'outbox_sha256=%s\n' "$(sha256sum \
             "$core_persistent_outbox" | cut -d ' ' -f1)"
+        printf 'ram_backing_sha256=%s\n' "$(sha256sum \
+            "$core_persistent_ram" | cut -d ' ' -f1)"
         printf 'tpm_state_sha256=%s\n' "$tpm_state_sha256"
     } >"$core_persistent_artifact_dir/$receipt_basename"
     receipt_sha256=$(sha256sum \
@@ -1584,15 +2728,26 @@ case "$command" in
         check_virtio_patch
         run_production_recovery
         ;;
+    test-core-persistent-arena-checker)
+        selftest_core_persistent_dma_arena_reuse
+        ;;
+    test-core-schema5-negative-oracles)
+        selftest_core_schema5_negative_oracles
+        ;;
+    test-core-schema5-fixture)
+        ensure_image
+        prepare_core_persistent_artifacts
+        build_core_schema5_selected_fixture
+        ;;
     clean)
         # Keep cleanup independent of Docker and scoped to generated kernel data.
         rm -rf "$root/target" "$root/artifacts"
         ;;
     -h|--help|help)
-        echo "usage: ./x {doctor|image|fmt|check|clippy|build|run|test|build-core-persistent-recovery|run-core-persistent-recovery|seal-core-persistent-recovery|clean}"
+        echo "usage: ./x {doctor|image|fmt|check|clippy|build|run|test|build-core-persistent-recovery|run-core-persistent-recovery|seal-core-persistent-recovery|test-core-persistent-arena-checker|test-core-schema5-negative-oracles|test-core-schema5-fixture|clean}"
         ;;
     *)
-        echo "usage: ./x {doctor|image|fmt|check|clippy|build|run|test|build-core-persistent-recovery|run-core-persistent-recovery|seal-core-persistent-recovery|clean}" >&2
+        echo "usage: ./x {doctor|image|fmt|check|clippy|build|run|test|build-core-persistent-recovery|run-core-persistent-recovery|seal-core-persistent-recovery|test-core-persistent-arena-checker|test-core-schema5-negative-oracles|test-core-schema5-fixture|clean}" >&2
         exit 2
         ;;
 esac

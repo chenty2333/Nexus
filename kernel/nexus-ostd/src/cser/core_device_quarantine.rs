@@ -6,15 +6,18 @@
 //! its linear guard and trusted device generation to the recovery coordinator.
 
 use cser_core::{
-    ClaimProjection, ClaimScope, DEVICE_DOMAIN, DEVICE_EVIDENCE_IRQ_DRAINED, DEVICE_EVIDENCE_RESET,
-    DEVICE_RECEIPT_SCHEMA, DEVICE_VERIFIER, DeviceGeneration, Digest, EvidenceChallenge,
-    ReceiptVerifier, VerificationError, VerifiedObservation, VerifierIdentity,
+    ClaimProjection, ClaimScope, ComponentClaimProjection, ComponentId, DEVICE_CLAIM_IOVA,
+    DEVICE_CLAIM_PINNED_PAGE, DEVICE_DOMAIN, DEVICE_EVIDENCE_IOTLB, DEVICE_EVIDENCE_IRQ_DRAINED,
+    DEVICE_EVIDENCE_RESET, DEVICE_RECEIPT_SCHEMA, DEVICE_VERIFIER, DeviceGeneration, Digest,
+    EffectId, EvidenceChallenge, Freshness, ReceiptVerifier, ResourceGeneration, ResourceId,
+    VerificationError, VerifiedObservation, VerifierIdentity,
 };
 use nexus_ostd_virtio::{
     ActivatedBootDevice, BootClaimCoordinateError, BootClaimCoordinates,
-    BootClaimQuarantineReceipts, BootDeviceScope, BootQuarantineFailure, BootQuarantineGuard,
-    BootQuarantineRequest, BootReceiptBindingError, BootVirtioIsrEmptyReceipt,
-    BootVirtioStatusResetReceipt, ProductionDeviceClaimError, quarantine_production_device,
+    BootClaimQuarantineReceipts, BootDeviceScope, BootGlobalIotlbInvalidationReceipt,
+    BootQuarantineFailure, BootQuarantineGuard, BootQuarantineRequest, BootReceiptBindingError,
+    BootVirtioIsrEmptyReceipt, BootVirtioStatusResetReceipt, PersistentDmaArenaLayout,
+    ProductionDeviceClaimError, quarantine_production_device,
 };
 use sha2::{Digest as _, Sha256};
 
@@ -103,15 +106,116 @@ pub(crate) fn project_replayed_claim(
         .map_err(OstdBootClaimBindingError::Hardware)
 }
 
+/// Projects whole-device quarantine observations onto one component-local
+/// replayed claim, preserving the component coordinate in every receipt.
+pub(crate) fn project_replayed_component_claim(
+    guard: &BootQuarantineGuard,
+    claim: ComponentClaimProjection,
+) -> Result<BootClaimQuarantineReceipts, OstdBootClaimBindingError> {
+    let ClaimScope::Device(scope) = claim.scope else {
+        return Err(OstdBootClaimBindingError::LogicalClaim);
+    };
+    let scope = BootDeviceScope::new(scope.get()).map_err(OstdBootClaimBindingError::Coordinate)?;
+    let coordinates = BootClaimCoordinates::new_component(
+        scope,
+        claim.effect.root().get(),
+        claim.effect.sequence(),
+        claim.component.get(),
+        claim.claim.get(),
+        claim.kind.get(),
+        claim.resource.get(),
+        claim.resource_generation.get(),
+        claim.units,
+        claim.enrolled_freshness.device().get(),
+    )
+    .map_err(OstdBootClaimBindingError::Coordinate)?;
+    guard
+        .project_claim_quarantine(coordinates)
+        .map_err(OstdBootClaimBindingError::Hardware)
+}
+
+#[derive(Clone, Copy)]
+struct ReplayedClaim {
+    effect: EffectId,
+    component: Option<ComponentId>,
+    claim: cser_core::ClaimId,
+    kind: cser_core::ClaimKindId,
+    scope: ClaimScope,
+    resource: ResourceId,
+    resource_generation: ResourceGeneration,
+    units: u64,
+    enrolled_freshness: Freshness,
+}
+
+impl From<ClaimProjection> for ReplayedClaim {
+    fn from(claim: ClaimProjection) -> Self {
+        Self {
+            effect: claim.effect,
+            component: None,
+            claim: claim.claim,
+            kind: claim.kind,
+            scope: claim.scope,
+            resource: claim.resource,
+            resource_generation: claim.resource_generation,
+            units: claim.units,
+            enrolled_freshness: claim.enrolled_freshness,
+        }
+    }
+}
+
+impl From<ComponentClaimProjection> for ReplayedClaim {
+    fn from(claim: ComponentClaimProjection) -> Self {
+        Self {
+            effect: claim.effect,
+            component: Some(claim.component),
+            claim: claim.claim,
+            kind: claim.kind,
+            scope: claim.scope,
+            resource: claim.resource,
+            resource_generation: claim.resource_generation,
+            units: claim.units,
+            enrolled_freshness: claim.enrolled_freshness,
+        }
+    }
+}
+
 /// Exact replay projection expected by a boot-quarantine verifier.
 #[derive(Clone, Copy)]
 pub(crate) struct OstdBootClaimVerifier {
-    claim: ClaimProjection,
+    claim: ReplayedClaim,
 }
 
 impl OstdBootClaimVerifier {
     pub(crate) const fn new(claim: ClaimProjection) -> Self {
-        Self { claim }
+        Self {
+            claim: ReplayedClaim {
+                effect: claim.effect,
+                component: None,
+                claim: claim.claim,
+                kind: claim.kind,
+                scope: claim.scope,
+                resource: claim.resource,
+                resource_generation: claim.resource_generation,
+                units: claim.units,
+                enrolled_freshness: claim.enrolled_freshness,
+            },
+        }
+    }
+
+    pub(crate) const fn new_component(claim: ComponentClaimProjection) -> Self {
+        Self {
+            claim: ReplayedClaim {
+                effect: claim.effect,
+                component: Some(claim.component),
+                claim: claim.claim,
+                kind: claim.kind,
+                scope: claim.scope,
+                resource: claim.resource,
+                resource_generation: claim.resource_generation,
+                units: claim.units,
+                enrolled_freshness: claim.enrolled_freshness,
+            },
+        }
     }
 
     fn challenge_matches(
@@ -124,6 +228,7 @@ impl OstdBootClaimVerifier {
             return false;
         };
         challenge.effect() == self.claim.effect
+            && challenge.component() == self.claim.component
             && challenge.claim() == self.claim.claim
             && challenge.domain() == DEVICE_DOMAIN
             && challenge.kind() == expected_kind
@@ -134,6 +239,7 @@ impl OstdBootClaimVerifier {
             && coordinates.scope().get() == scope.get()
             && coordinates.effect_root() == self.claim.effect.root().get()
             && coordinates.effect_sequence() == self.claim.effect.sequence()
+            && coordinates.component() == self.claim.component.map(ComponentId::get)
             && coordinates.claim() == self.claim.claim.get()
             && coordinates.claim_kind() == self.claim.kind.get()
             && coordinates.resource() == self.claim.resource.get()
@@ -180,12 +286,20 @@ impl ReceiptVerifier for OstdBootClaimVerifier {
 
 /// Verifier for the distinct ISR drain observation after reset was accepted.
 pub(crate) struct OstdBootIrqVerifier {
-    claim: ClaimProjection,
+    claim: ReplayedClaim,
 }
 
 impl OstdBootIrqVerifier {
     pub(crate) const fn new(claim: ClaimProjection) -> Self {
-        Self { claim }
+        Self {
+            claim: OstdBootClaimVerifier::new(claim).claim,
+        }
+    }
+
+    pub(crate) const fn new_component(claim: ComponentClaimProjection) -> Self {
+        Self {
+            claim: OstdBootClaimVerifier::new_component(claim).claim,
+        }
     }
 }
 
@@ -203,7 +317,7 @@ impl ReceiptVerifier for OstdBootIrqVerifier {
         receipt: &Self::Receipt,
     ) -> Result<VerifiedObservation, VerificationError> {
         let coordinates = receipt.claim();
-        let reset_verifier = OstdBootClaimVerifier::new(self.claim);
+        let reset_verifier = OstdBootClaimVerifier { claim: self.claim };
         if !reset_verifier.challenge_matches(challenge, coordinates, DEVICE_EVIDENCE_IRQ_DRAINED)
             || !receipt.intx_masked()
             || receipt.isr_reads() < 2
@@ -216,6 +330,84 @@ impl ReceiptVerifier for OstdBootIrqVerifier {
             challenge.subject(),
             challenge.current_observation(),
             irq_digest(receipt),
+        ))
+    }
+}
+
+/// QEMU restart-protocol verifier which combines the global invalidation with
+/// an independently withheld, journal-bound PFN/IOVA arena.
+///
+/// This verifier deliberately rejects physical hardware. QEMU process
+/// termination supplies the transaction-drain boundary that the current OSTD
+/// VT-d API cannot observe as DWD/DRD descriptor bits on a real machine.
+pub(crate) struct QemuArenaIotlbVerifier {
+    claim: ReplayedClaim,
+    layout: PersistentDmaArenaLayout,
+    layout_digest: Digest,
+    component_commit_operation: Option<Digest>,
+    arena_withheld: bool,
+    qemu_detected: bool,
+}
+
+impl QemuArenaIotlbVerifier {
+    pub(crate) const fn new_component(
+        claim: ComponentClaimProjection,
+        layout: PersistentDmaArenaLayout,
+        layout_digest: Digest,
+        component_commit_operation: Option<Digest>,
+        arena_withheld: bool,
+        qemu_detected: bool,
+    ) -> Self {
+        Self {
+            claim: OstdBootClaimVerifier::new_component(claim).claim,
+            layout,
+            layout_digest,
+            component_commit_operation,
+            arena_withheld,
+            qemu_detected,
+        }
+    }
+}
+
+impl ReceiptVerifier for QemuArenaIotlbVerifier {
+    type Receipt = BootGlobalIotlbInvalidationReceipt;
+
+    fn identity(&self) -> VerifierIdentity {
+        VerifierIdentity::new(DEVICE_VERIFIER, 1, DEVICE_RECEIPT_SCHEMA)
+            .expect("standard device verifier identity is valid")
+    }
+
+    fn verify(
+        &self,
+        challenge: &EvidenceChallenge,
+        receipt: &Self::Receipt,
+    ) -> Result<VerifiedObservation, VerificationError> {
+        let reset_verifier = OstdBootClaimVerifier { claim: self.claim };
+        let arena_claim = matches!(
+            self.claim.kind,
+            DEVICE_CLAIM_PINNED_PAGE | DEVICE_CLAIM_IOVA
+        ) && self.claim.units == self.layout.page_count() as u64;
+        if !reset_verifier.challenge_matches(challenge, receipt.claim(), DEVICE_EVIDENCE_IOTLB)
+            || !arena_claim
+            || !self.qemu_detected
+            || !self.arena_withheld
+            || self.layout_digest.is_zero()
+            || self.component_commit_operation != Some(self.layout_digest)
+            || receipt.old_generation() != challenge.subject().device().get()
+            || receipt.successor_generation() != challenge.current_observation().device().get()
+            || !receipt.used_remapped_iova()
+            || receipt.completed_trigger_pages() == 0
+            || !receipt.global_invalidation()
+            || !receipt.shared_second_stage_source_contract()
+            || receipt.dma_transaction_drain_observed()
+            || receipt.resource_reuse_authorized()
+        {
+            return Err(VerificationError::Rejected);
+        }
+        Ok(VerifiedObservation::new(
+            challenge.subject(),
+            challenge.current_observation(),
+            qemu_arena_iotlb_digest(receipt, self.layout, self.layout_digest),
         ))
     }
 }
@@ -250,10 +442,43 @@ fn irq_digest(receipt: &BootVirtioIsrEmptyReceipt) -> Digest {
     Digest::new(hasher.finalize().into())
 }
 
+fn qemu_arena_iotlb_digest(
+    receipt: &BootGlobalIotlbInvalidationReceipt,
+    layout: PersistentDmaArenaLayout,
+    layout_digest: Digest,
+) -> Digest {
+    let mut hasher = Sha256::new();
+    hasher.update(b"nexus-cser-qemu-arena-iotlb-v1");
+    hash_coordinates(&mut hasher, receipt.claim());
+    let bdf = receipt.device_bdf();
+    hasher.update([bdf.bus(), bdf.device(), bdf.function()]);
+    hasher.update(receipt.old_generation().to_le_bytes());
+    hasher.update(receipt.successor_generation().to_le_bytes());
+    hasher.update(layout.version().to_le_bytes());
+    hasher.update((layout.page_count() as u64).to_le_bytes());
+    hasher.update((layout.paddr_base() as u64).to_le_bytes());
+    hasher.update((layout.daddr_base() as u64).to_le_bytes());
+    hasher.update(layout_digest.bytes());
+    hasher.update([
+        receipt.used_remapped_iova() as u8,
+        receipt.global_invalidation() as u8,
+        receipt.shared_second_stage_source_contract() as u8,
+        1, // QEMU process-restart protocol, never physical hardware.
+    ]);
+    Digest::new(hasher.finalize().into())
+}
+
 fn hash_coordinates(hasher: &mut Sha256, coordinates: BootClaimCoordinates) {
     hasher.update(coordinates.scope().get().to_le_bytes());
     hasher.update(coordinates.effect_root().to_le_bytes());
     hasher.update(coordinates.effect_sequence().to_le_bytes());
+    match coordinates.component() {
+        Some(component) => {
+            hasher.update([1]);
+            hasher.update(component.to_le_bytes());
+        }
+        None => hasher.update([0]),
+    }
     hasher.update(coordinates.claim().to_le_bytes());
     hasher.update(coordinates.claim_kind().to_le_bytes());
     hasher.update(coordinates.resource().to_le_bytes());

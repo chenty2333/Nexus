@@ -6,8 +6,9 @@ use core::{ptr, ptr::NonNull};
 
 use ostd::{
     mm::{
-        HasDaddr, HasPaddr, HasSize, PAGE_SIZE,
+        HasDaddr, HasPaddr, HasSize, PAGE_SIZE, Segment,
         dma::{DmaCoherent, PendingDmaUnmap},
+        io::util::HasVmReaderWriter,
     },
     sync::SpinLock,
 };
@@ -23,6 +24,93 @@ const RESPONSE_OFFSET: usize = DATA_OFFSET + DATA_LEN;
 const RESPONSE_LEN: usize = 1;
 const RESPONSE_NOT_READY: u8 = 3;
 const OWNER_COUNT: usize = 3;
+const PERSISTENT_ARENA_IOVA_BASE: usize = 0x4000_0000;
+
+/// Versioned, deterministic physical/device-address layout of the recovery
+/// arena. The kernel frame allocator owns the PFN reservation; this value only
+/// describes how those frames are mapped for the fixed VirtIO fixture.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PersistentDmaArenaLayout {
+    version: u16,
+    paddr_base: usize,
+    daddr_base: usize,
+}
+
+impl PersistentDmaArenaLayout {
+    const VERSION: u16 = 1;
+
+    fn new(paddr_base: usize) -> Result<Self, PersistentDmaArenaError> {
+        if !paddr_base.is_multiple_of(PAGE_SIZE)
+            || paddr_base.checked_add(OWNER_COUNT * PAGE_SIZE).is_none()
+            || PERSISTENT_ARENA_IOVA_BASE
+                .checked_add(OWNER_COUNT * PAGE_SIZE)
+                .is_none()
+        {
+            return Err(PersistentDmaArenaError::InvalidLayout);
+        }
+        Ok(Self {
+            version: Self::VERSION,
+            paddr_base,
+            daddr_base: PERSISTENT_ARENA_IOVA_BASE,
+        })
+    }
+
+    pub const fn version(self) -> u16 {
+        self.version
+    }
+
+    pub const fn page_count(self) -> usize {
+        OWNER_COUNT
+    }
+
+    pub const fn paddr_base(self) -> usize {
+        self.paddr_base
+    }
+
+    pub const fn daddr_base(self) -> usize {
+        self.daddr_base
+    }
+
+    pub const fn paddr(self, kind: OwnerKind) -> usize {
+        self.paddr_base + kind.slot() * PAGE_SIZE
+    }
+
+    pub const fn daddr(self, kind: OwnerKind) -> usize {
+        self.daddr_base + kind.slot() * PAGE_SIZE
+    }
+
+    /// The QEMU memory-backend-file maps guest physical byte N to file offset
+    /// N. This is an address calculation, not a physical-host-PFN claim.
+    pub const fn qemu_backing_offset(self, kind: OwnerKind) -> usize {
+        self.paddr(kind)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PersistentDmaArenaError {
+    InvalidLayout,
+    GenerationLive,
+    AlreadyConfiguredDifferently,
+}
+
+/// Exact live mapping observation used by the outer recovery harness. All
+/// three values come from retained `DmaCoherent` owners, not from the desired
+/// layout alone.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PersistentDmaArenaObservation {
+    generation: u64,
+    layout: PersistentDmaArenaLayout,
+}
+
+impl PersistentDmaArenaObservation {
+    pub const fn generation(self) -> u64 {
+        self.generation
+    }
+
+    pub const fn layout(self) -> PersistentDmaArenaLayout {
+        self.layout
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OwnerKind {
@@ -125,6 +213,7 @@ struct DmaLedger {
     generation: u64,
     device_exposed: bool,
     reset_acked: bool,
+    persistent_arena: Option<PersistentDmaArenaLayout>,
     owners: [Option<DmaOwner>; OWNER_COUNT],
 }
 
@@ -134,12 +223,76 @@ impl DmaLedger {
             generation: 0,
             device_exposed: false,
             reset_acked: false,
+            persistent_arena: None,
             owners: [const { None }; OWNER_COUNT],
         }
     }
 }
 
 static DMA_LEDGER: SpinLock<DmaLedger> = SpinLock::new(DmaLedger::new());
+
+/// Installs the exact PFN range which the kernel global allocator withheld
+/// before ordinary frame allocation began.
+pub fn install_persistent_dma_arena(
+    paddr_base: usize,
+) -> Result<PersistentDmaArenaLayout, PersistentDmaArenaError> {
+    let layout = PersistentDmaArenaLayout::new(paddr_base)?;
+    let mut ledger = DMA_LEDGER.lock();
+    if ledger.generation != 0 || !ledger.owners.iter().all(Option::is_none) {
+        return Err(PersistentDmaArenaError::GenerationLive);
+    }
+    match ledger.persistent_arena {
+        Some(installed) if installed == layout => Ok(installed),
+        Some(_) => Err(PersistentDmaArenaError::AlreadyConfiguredDifferently),
+        None => {
+            ledger.persistent_arena = Some(layout);
+            Ok(layout)
+        }
+    }
+}
+
+pub fn persistent_dma_arena_layout() -> Option<PersistentDmaArenaLayout> {
+    DMA_LEDGER.lock().persistent_arena
+}
+
+/// Returns a live owner-backed observation only when every slot is mapped at
+/// the exact configured PFN and IOVA for the requested generation.
+pub fn persistent_dma_arena_observation(generation: u64) -> Option<PersistentDmaArenaObservation> {
+    let ledger = DMA_LEDGER.lock();
+    let layout = ledger.persistent_arena?;
+    if ledger.generation != generation
+        || ![
+            OwnerKind::QueueDriver,
+            OwnerKind::QueueDevice,
+            OwnerKind::Request,
+        ]
+        .into_iter()
+        .all(|kind| {
+            ledger.owners[kind.slot()].as_ref().is_some_and(|owner| {
+                owner.generation == generation
+                    && owner.paddr == layout.paddr(kind)
+                    && owner.daddr == layout.daddr(kind)
+            })
+        })
+    {
+        return None;
+    }
+    Some(PersistentDmaArenaObservation { generation, layout })
+}
+
+/// Detects the two hypervisor signatures accepted by the QEMU-only persistent
+/// arena protocol. A physical platform and an unknown hypervisor both fail
+/// closed; this helper does not identify host physical memory.
+pub fn qemu_hypervisor_detected() -> bool {
+    // CPUID leaf 0x4000_0000 is a read-only query. Unknown leaves are rejected
+    // by the exact signature match.
+    let result = core::arch::x86_64::__cpuid_count(0x4000_0000, 0);
+    let mut signature = [0; 12];
+    signature[0..4].copy_from_slice(&result.ebx.to_ne_bytes());
+    signature[4..8].copy_from_slice(&result.ecx.to_ne_bytes());
+    signature[8..12].copy_from_slice(&result.edx.to_ne_bytes());
+    matches!(&signature, b"TCGTCGTCGTCG" | b"KVMKVMKVM\0\0\0")
+}
 
 /// Failure before a boot-time global IOTLB barrier owns a pending invalidation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -314,7 +467,7 @@ pub fn mark_queue_exposed(generation: u64) {
 }
 
 pub(crate) fn try_arm_request_bounce(generation: u64) -> Option<(usize, usize)> {
-    let dma = DmaCoherent::alloc(1, true).ok()?;
+    let dma = allocate_owner_dma(OwnerKind::Request)?;
     let mut owner = DmaOwner::try_new(OwnerKind::Request, generation, dma).ok()?;
     // The status output must start at NOT_READY. If the device fails to write
     // it, completion cannot be mistaken for success merely because DMA pages
@@ -470,7 +623,7 @@ fn allocate_queue_owner(pages: usize, direction: BufferDirection) -> (PhysAddr, 
         BufferDirection::Both => return (0, NonNull::dangling()),
     };
 
-    let Ok(dma) = DmaCoherent::alloc(pages, true) else {
+    let Some(dma) = allocate_owner_dma(kind) else {
         return (0, NonNull::dangling());
     };
     let mut ledger = DMA_LEDGER.lock();
@@ -485,6 +638,19 @@ fn allocate_queue_owner(pages: usize, direction: BufferDirection) -> (PhysAddr, 
     let vaddr = owner.vaddr;
     ledger.owners[slot] = Some(owner);
     (daddr, vaddr)
+}
+
+fn allocate_owner_dma(kind: OwnerKind) -> Option<DmaCoherent> {
+    let layout = DMA_LEDGER.lock().persistent_arena;
+    let Some(layout) = layout else {
+        return DmaCoherent::alloc(1, true).ok();
+    };
+    let paddr = layout.paddr(kind);
+    let end = paddr.checked_add(PAGE_SIZE)?;
+    let segment = Segment::<()>::from_unused(paddr..end, |_| ()).ok()?;
+    let dma = DmaCoherent::from_segment_at(segment, layout.daddr(kind)).ok()?;
+    dma.writer().fill_zeros(PAGE_SIZE);
+    Some(dma)
 }
 
 fn retire_queue_owner(device_address: PhysAddr, vaddr: NonNull<u8>, pages: usize) -> i32 {

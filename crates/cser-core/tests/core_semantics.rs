@@ -395,23 +395,23 @@ fn indeterminate_is_a_live_reconciliation_object_even_after_physical_retirement(
 }
 
 #[test]
-fn resource_reverse_index_is_order_independent() {
-    let mut harness = Harness::new();
-    for root_value in [106, 105] {
-        let effect = effect(root_value, 1);
-        let origin = principal(root_value, 1);
-        harness
-            .tx(Command::CreateEstate {
-                effect,
-                origin,
-                binding_generation: 1,
-                domain: cser_core::DEVICE_DOMAIN,
-                obligation: DEVICE_OBLIGATION_DMA,
-                charge_account: charge(root_value),
-            })
-            .unwrap();
-        harness
-            .tx(Command::AddClaim {
+fn resource_reverse_index_rejects_a_second_live_owner_in_either_order() {
+    for roots in [[106, 105], [105, 106]] {
+        let mut harness = Harness::new();
+        for (index, root_value) in roots.into_iter().enumerate() {
+            let effect = effect(root_value, 1);
+            let origin = principal(root_value, 1);
+            harness
+                .tx(Command::CreateEstate {
+                    effect,
+                    origin,
+                    binding_generation: 1,
+                    domain: cser_core::DEVICE_DOMAIN,
+                    obligation: DEVICE_OBLIGATION_DMA,
+                    charge_account: charge(root_value),
+                })
+                .unwrap();
+            let command = Command::AddClaim {
                 effect,
                 actor: origin,
                 binding_generation: 1,
@@ -422,15 +422,33 @@ fn resource_reverse_index_is_order_independent() {
                 resource: resource(500),
                 resource_generation: cser_core::ResourceGeneration::new(1).unwrap(),
                 units: 1,
-            })
-            .unwrap();
+            };
+            if index == 0 {
+                harness.tx(command).unwrap();
+            } else {
+                let before = (
+                    harness.engine.revision(),
+                    harness.engine.head(),
+                    harness.engine.projection_digest(),
+                );
+                assert_eq!(harness.tx(command), Err(CoreError::ResourceRetained));
+                assert_eq!(
+                    (
+                        harness.engine.revision(),
+                        harness.engine.head(),
+                        harness.engine.projection_digest(),
+                    ),
+                    before
+                );
+            }
+        }
+        assert_eq!(harness.engine.pressure().retained_claims, 1);
     }
-    assert_eq!(harness.engine.pressure().retained_claims, 2);
 }
 
 #[test]
 fn journal_records_and_recovery_preserve_nondefault_binding_freshness() {
-    let mut engine = Engine::new(
+    let mut engine = Engine::new_legacy_compatibility(
         standard_catalog(),
         cser_core::CoreLimits::bounded_default(),
         freshness(1, 1, 7, 1, 1),
@@ -454,7 +472,7 @@ fn journal_records_and_recovery_preserve_nondefault_binding_freshness() {
         .unwrap();
     let scan = cser_core::scan_journal(&journal).unwrap();
     assert_eq!(scan.records()[0].binding(), 7);
-    let recovered = Engine::recover(
+    let recovered = Engine::recover_legacy_compatibility(
         standard_catalog(),
         cser_core::CoreLimits::bounded_default(),
         RecoveryAnchor::from_trusted_provider(

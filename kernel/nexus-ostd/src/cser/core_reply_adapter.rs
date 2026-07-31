@@ -12,7 +12,7 @@ use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU8, Ordering};
 
 use cser_core::{
-    ClaimId, ClaimScope, CoreError, Digest, EffectFactChallenge, EffectFactKind,
+    ClaimId, ClaimScope, ComponentId, CoreError, Digest, EffectFactChallenge, EffectFactKind,
     EffectReceiptVerifier, Engine, EvidenceChallenge, REPLY_APPLY_RECEIPT_SCHEMA, REPLY_DOMAIN,
     REPLY_EVIDENCE_PUBLICATION_ACK, REPLY_OBLIGATION_PUBLICATION, REPLY_RECEIPT_SCHEMA,
     REPLY_SETTLEMENT_RECEIPT_SCHEMA, REPLY_VERIFIER, ReceiptVerifier, ResourceGeneration,
@@ -33,6 +33,7 @@ const REPLY_INDETERMINATE: u8 = 4;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ReplyCoordinate {
     effect: cser_core::EffectId,
+    component: Option<ComponentId>,
     claim: ClaimId,
     resource: ResourceId,
     resource_generation: ResourceGeneration,
@@ -47,10 +48,47 @@ impl ReplyCoordinate {
     ) -> Self {
         Self {
             effect,
+            component: None,
             claim,
             resource,
             resource_generation,
         }
+    }
+
+    pub(crate) const fn new_component(
+        effect: cser_core::EffectId,
+        component: ComponentId,
+        claim: ClaimId,
+        resource: ResourceId,
+        resource_generation: ResourceGeneration,
+    ) -> Self {
+        Self {
+            effect,
+            component: Some(component),
+            claim,
+            resource,
+            resource_generation,
+        }
+    }
+
+    pub(crate) const fn effect(self) -> cser_core::EffectId {
+        self.effect
+    }
+
+    pub(crate) const fn component(self) -> Option<ComponentId> {
+        self.component
+    }
+
+    pub(crate) const fn claim(self) -> ClaimId {
+        self.claim
+    }
+
+    pub(crate) const fn resource(self) -> ResourceId {
+        self.resource
+    }
+
+    pub(crate) const fn resource_generation(self) -> ResourceGeneration {
+        self.resource_generation
     }
 }
 
@@ -76,11 +114,31 @@ impl ReplyPlan {
         self.value
     }
 
+    pub(crate) const fn coordinate(self) -> ReplyCoordinate {
+        self.coordinate
+    }
+
+    pub(crate) const fn publication_sequence(self) -> u64 {
+        self.publication_sequence
+    }
+
     /// Returns the exact payload identity committed by a durable reply
     /// outbox before the physical waiter publication is reconciled.
     #[cfg(feature = "cser-production")]
     pub(crate) const fn payload_digest(self) -> Digest {
         self.payload_digest
+    }
+
+    pub(crate) fn apply_receipt_digest(self) -> Digest {
+        apply_digest(self)
+    }
+
+    pub(crate) fn acknowledgement_digest(self) -> Digest {
+        ack_digest(self)
+    }
+
+    pub(crate) fn retirement_receipt_digest(self) -> Digest {
+        retirement_digest(self)
     }
 }
 
@@ -214,6 +272,7 @@ impl ReplyCustody {
         if plan.coordinate != self.coordinate
             || challenge.kind() != EffectFactKind::ApplyCompleted
             || challenge.effect() != self.coordinate.effect
+            || challenge.component() != self.coordinate.component
             || challenge.domain() != REPLY_DOMAIN
             || challenge.obligation() != REPLY_OBLIGATION_PUBLICATION
             || challenge.operation() != plan.intent_digest
@@ -246,6 +305,56 @@ impl ReplyCustody {
                 }
             }
             Err(REPLY_PUBLISHED | REPLY_ACKNOWLEDGED) => self.observe_apply(plan),
+            Err(REPLY_APPLYING) => Err(ReplyApplyError::ApplyInProgress),
+            Err(REPLY_INDETERMINATE) => Err(ReplyApplyError::Indeterminate),
+            Err(_) => Err(ReplyApplyError::Indeterminate),
+        }
+    }
+
+    /// Re-delivers one source-exact reply whose durable apply record survived
+    /// an executor or machine restart.
+    ///
+    /// The caller must first validate that record through the persistent reply
+    /// provider. This physical operation remains idempotent for the fresh
+    /// endpoint and carries no core settlement authority.
+    pub(crate) fn redeliver_durable(
+        &self,
+        plan: ReplyPlan,
+        durable_apply_digest: Digest,
+    ) -> Result<(), ReplyApplyError> {
+        if plan.coordinate != self.coordinate
+            || durable_apply_digest != apply_digest(plan)
+            || durable_apply_digest.is_zero()
+        {
+            return Err(ReplyApplyError::WrongCoordinate);
+        }
+        match self.state.phase.compare_exchange(
+            REPLY_ARMED,
+            REPLY_APPLYING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                *self.state.published.lock() = Some(PublishedReply { plan });
+                self.state.phase.store(REPLY_PUBLISHED, Ordering::Release);
+                if self.state.waker.wake_up() {
+                    Ok(())
+                } else {
+                    match self.state.phase.compare_exchange(
+                        REPLY_PUBLISHED,
+                        REPLY_INDETERMINATE,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                        Err(REPLY_ACKNOWLEDGED) => Ok(()),
+                        Ok(_) | Err(_) => Err(ReplyApplyError::Indeterminate),
+                    }
+                }
+            }
+            Err(REPLY_PUBLISHED | REPLY_ACKNOWLEDGED) => self
+                .observe_apply(plan)
+                .map(|_| ())
+                .map_err(|_| ReplyApplyError::Indeterminate),
             Err(REPLY_APPLYING) => Err(ReplyApplyError::ApplyInProgress),
             Err(REPLY_INDETERMINATE) => Err(ReplyApplyError::Indeterminate),
             Err(_) => Err(ReplyApplyError::Indeterminate),
@@ -325,13 +434,23 @@ impl ReplyCustody {
         engine: &Engine,
         observation: &ReplyAckObservation,
     ) -> Result<VerifiedRetirementEvidence, CoreError> {
-        engine.verify_retirement_evidence(
-            self.coordinate.effect,
-            self.coordinate.claim,
-            REPLY_EVIDENCE_PUBLICATION_ACK,
-            &ReplyRetirementVerifier { custody: self },
-            observation,
-        )
+        match self.coordinate.component {
+            Some(component) => engine.verify_component_retirement_evidence(
+                self.coordinate.effect,
+                component,
+                self.coordinate.claim,
+                REPLY_EVIDENCE_PUBLICATION_ACK,
+                &ReplyRetirementVerifier { custody: self },
+                observation,
+            ),
+            None => engine.verify_retirement_evidence(
+                self.coordinate.effect,
+                self.coordinate.claim,
+                REPLY_EVIDENCE_PUBLICATION_ACK,
+                &ReplyRetirementVerifier { custody: self },
+                observation,
+            ),
+        }
     }
 }
 
@@ -382,6 +501,7 @@ impl EffectReceiptVerifier for ReplyEffectVerifier<'_> {
         let phase = self.custody.state.phase.load(Ordering::Acquire);
         if challenge.kind() != EffectFactKind::ApplyCompleted
             || challenge.effect() != self.custody.coordinate.effect
+            || challenge.component() != self.custody.coordinate.component
             || challenge.domain() != REPLY_DOMAIN
             || challenge.obligation() != REPLY_OBLIGATION_PUBLICATION
             || challenge.operation() != receipt.plan.intent_digest
@@ -414,6 +534,7 @@ impl EffectReceiptVerifier for ReplyAckVerifier<'_> {
     ) -> Result<VerifiedEffectObservation, VerificationError> {
         if challenge.kind() != EffectFactKind::SettlementAcknowledged
             || challenge.effect() != self.custody.coordinate.effect
+            || challenge.component() != self.custody.coordinate.component
             || challenge.domain() != REPLY_DOMAIN
             || challenge.obligation() != REPLY_OBLIGATION_PUBLICATION
             || challenge.operation() != receipt.plan.intent_digest
@@ -454,6 +575,7 @@ impl ReceiptVerifier for ReplyRetirementVerifier<'_> {
         receipt: &Self::Receipt,
     ) -> Result<VerifiedObservation, VerificationError> {
         if challenge.effect() != self.custody.coordinate.effect
+            || challenge.component() != self.custody.coordinate.component
             || challenge.claim() != self.custody.coordinate.claim
             || challenge.domain() != REPLY_DOMAIN
             || challenge.kind() != REPLY_EVIDENCE_PUBLICATION_ACK
@@ -529,6 +651,13 @@ fn hash_plan(
 fn hash_coordinate(hasher: &mut Sha256, coordinate: ReplyCoordinate) {
     hasher.update(coordinate.effect.root().get().to_le_bytes());
     hasher.update(coordinate.effect.sequence().to_le_bytes());
+    match coordinate.component {
+        Some(component) => {
+            hasher.update([1]);
+            hasher.update(component.get().to_le_bytes());
+        }
+        None => hasher.update([0]),
+    }
     hasher.update(coordinate.claim.get().to_le_bytes());
     hasher.update(coordinate.resource.get().to_le_bytes());
     hasher.update(coordinate.resource_generation.get().to_le_bytes());

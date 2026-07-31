@@ -539,6 +539,7 @@ fn run_task_recovery_slice() {
          revoke_adopt_orders=2 legacy_runtime=false live_dual_write=false \
          rebind=task-bound-core production_rebind=false \
          receipt_provider=commit-probe+physical-reply real_reply=true \
+         historical_profile=1 production_profile=false \
          journal=same-boot-memory durability_boundary=transition-trait \
          reboot_persistence=false"
     );
@@ -554,7 +555,11 @@ fn cser_engine() -> cser_core::Engine {
         JournalGeneration::new(1).expect("probe journal generation is valid"),
     )
     .expect("probe freshness is complete");
-    cser_core::Engine::new(standard_catalog(), CoreLimits::bounded_default(), freshness)
+    cser_core::Engine::new_legacy_compatibility(
+        standard_catalog(),
+        CoreLimits::bounded_default(),
+        freshness,
+    )
 }
 
 fn wait_for_reap(inbox: &ReapInbox) -> ReapObservation {

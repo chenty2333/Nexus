@@ -28,6 +28,7 @@
 //! reused.
 
 use alloc::{boxed::Box, vec::Vec};
+use core::convert::Infallible;
 
 use cser_core::{
     Command, CommandRequest, CoordinatedPersistence, CoordinatedPersistenceError, CoreError,
@@ -86,6 +87,35 @@ pub(crate) trait BootDeviceQuarantine: Sized {
     /// interrupt delivery, retain DMA owners, and establish a reset-domain
     /// generation before returning.
     fn quarantine_all(self) -> Result<Self::Guard, Self::Error>;
+}
+
+/// Linear adapter for a device guard established before recovery coordination.
+///
+/// This lets boot code inspect trusted freshness, physically quarantine the
+/// device, and validate a deployment binding while retaining that exact guard.
+/// Passing the adapter to [`recover_quarantined_boot`] consumes it once and
+/// cannot perform a second quarantine or manufacture another guard.
+pub(crate) struct AlreadyQuarantined<G> {
+    guard: G,
+}
+
+impl<G> AlreadyQuarantined<G> {
+    /// Wraps the sole existing quarantine guard for one recovery attempt.
+    pub(crate) const fn new(guard: G) -> Self {
+        Self { guard }
+    }
+}
+
+impl<G> BootDeviceQuarantine for AlreadyQuarantined<G>
+where
+    G: BootDeviceQuarantineGuard,
+{
+    type Error = Infallible;
+    type Guard = G;
+
+    fn quarantine_all(self) -> Result<Self::Guard, Self::Error> {
+        Ok(self.guard)
+    }
 }
 
 /// Trusted-provider contract violation detected after a freshness reservation.
@@ -408,9 +438,9 @@ mod tests {
     use alloc::vec;
     use cser_core::{
         BootGeneration, ChargeAccountId, ClaimId, ClaimScope, DEVICE_CLAIM_QUEUE_SLOT,
-        DEVICE_DOMAIN, DEVICE_OBLIGATION_DMA, DeviceScopeId, Digest, EffectId, Freshness,
-        JournalGeneration, PrincipalId, PrincipalIncarnation, RegistryInstance, ResourceGeneration,
-        ResourceId, RootId, TrustedAnchorSnapshot, standard_catalog,
+        DMA_ARENA_REUSE_COMPOSITE, DeviceScopeId, Digest, EffectId, Freshness, JournalGeneration,
+        PrincipalId, PrincipalIncarnation, RegistryInstance, ResourceGeneration, ResourceId,
+        RootId, TrustedAnchorSnapshot, standard_catalog,
     };
     use ostd::prelude::ktest;
 
@@ -618,20 +648,19 @@ mod tests {
         let effect = EffectId::new(root, 1).unwrap();
         let actor = PrincipalIncarnation::new(PrincipalId::new(5).unwrap(), 1).unwrap();
         for command in [
-            CommandRequest::CreateEstate {
+            CommandRequest::CreateCompositeEffect {
                 effect,
                 origin: actor,
                 binding_generation: 23,
-                domain: DEVICE_DOMAIN,
-                obligation: DEVICE_OBLIGATION_DMA,
+                kind: DMA_ARENA_REUSE_COMPOSITE,
                 charge_account: ChargeAccountId::new(7).unwrap(),
             },
-            CommandRequest::AddClaim {
+            CommandRequest::AddComponentClaim {
                 effect,
+                component: cser_core::AGENT_COMPONENT_DMA,
                 actor,
                 binding_generation: 23,
                 claim: ClaimId::new(1).unwrap(),
-                domain: DEVICE_DOMAIN,
                 kind: DEVICE_CLAIM_QUEUE_SLOT,
                 scope: ClaimScope::Device(DeviceScopeId::new(11).unwrap()),
                 resource: ResourceId::new(31).unwrap(),
@@ -661,6 +690,20 @@ mod tests {
                 reservations: 0,
             },
         )
+    }
+
+    #[ktest]
+    fn already_quarantined_consumes_the_existing_guard_once() {
+        let observed = DeviceGeneration::new(2).unwrap();
+        let guard = AlreadyQuarantined::new(MockGuard {
+            observed,
+            reject_activation: false,
+        })
+        .quarantine_all()
+        .unwrap();
+
+        assert_eq!(guard.observed_generation(), observed);
+        assert!(guard.try_activate().is_ok());
     }
 
     #[ktest]
