@@ -4429,6 +4429,39 @@ impl Engine {
         self.state.roots.get(&root).map(|record| record.state)
     }
 
+    /// Returns the exact component commit intents which remain durable but
+    /// unacknowledged for one composite effect.
+    ///
+    /// This is deliberately a recovery projection, not a constructor: callers
+    /// can only obtain nonces and operations already durably recorded by
+    /// [`CommandRequest::RecordCompositeCommitIntents`].  It lets a successor
+    /// complete a crash-interrupted acknowledgement cohort without attempting
+    /// to record a second cohort over non-`Prepared` components.
+    pub fn outstanding_component_commit_intents(
+        &self,
+        effect: EffectId,
+    ) -> Result<Vec<CommitIntent>, CoreError> {
+        let composite = self
+            .state
+            .composite_effects
+            .get(&effect)
+            .ok_or(CoreError::UnknownEstate)?;
+        Ok(composite
+            .components
+            .iter()
+            .filter_map(|(component, record)| {
+                (record.commit == CommitState::CommitIntentDurable)
+                    .then_some(record.commit_nonce)
+                    .flatten()
+                    .map(|nonce| CommitIntent {
+                        effect,
+                        component: Some(*component),
+                        nonce,
+                    })
+            })
+            .collect())
+    }
+
     /// Generates an exact, ordered and non-authorizing recovery cohort for one
     /// fenced root. The caller may inspect the cohort before consuming it into
     /// [`RecoverySnapshot::record`].

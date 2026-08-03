@@ -324,6 +324,79 @@ fn recovery_checkpoint_preserves_an_already_durable_same_boot_fence() {
 }
 
 #[test]
+fn outstanding_component_commit_intents_track_acknowledgements_across_cold_recovery() {
+    let mut harness = Harness::new_profile_two();
+    let (operation, origin, _, _) = create_precommit_agent(&mut harness, 0xc504);
+    let unknown = effect(0xc505, 1);
+
+    assert_eq!(
+        harness.engine.outstanding_component_commit_intents(unknown),
+        Err(CoreError::UnknownEstate)
+    );
+
+    arm_agent_components(&mut harness, operation, origin, 1, 10, 11);
+    let outstanding = harness
+        .engine
+        .outstanding_component_commit_intents(operation)
+        .unwrap();
+    assert_eq!(outstanding.len(), 2);
+    assert_eq!(outstanding[0].effect(), operation);
+    assert_eq!(outstanding[0].component(), Some(AGENT_COMPONENT_REPLY));
+    assert_eq!(outstanding[1].effect(), operation);
+    assert_eq!(outstanding[1].component(), Some(AGENT_COMPONENT_DMA));
+
+    let reply_intent = outstanding
+        .into_iter()
+        .find(|intent| intent.component() == Some(AGENT_COMPONENT_REPLY))
+        .expect("reply intent must be outstanding");
+    acknowledge_component(
+        &mut harness,
+        reply_intent,
+        12,
+        REPLY_VERIFIER,
+        REPLY_COMMIT_RECEIPT_SCHEMA,
+    );
+
+    let outstanding = harness
+        .engine
+        .outstanding_component_commit_intents(operation)
+        .unwrap();
+    assert_eq!(outstanding.len(), 1);
+    assert_eq!(outstanding[0].effect(), operation);
+    assert_eq!(outstanding[0].component(), Some(AGENT_COMPONENT_DMA));
+
+    let recovered = replay_profile_two_prefix(&harness, "outstanding component commit intents");
+    let outstanding = recovered
+        .outstanding_component_commit_intents(operation)
+        .unwrap();
+    assert_eq!(outstanding.len(), 1);
+    assert_eq!(outstanding[0].effect(), operation);
+    assert_eq!(outstanding[0].component(), Some(AGENT_COMPONENT_DMA));
+
+    let dma_intent = harness
+        .engine
+        .outstanding_component_commit_intents(operation)
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("DMA intent must remain outstanding");
+    acknowledge_component(
+        &mut harness,
+        dma_intent,
+        13,
+        DEVICE_VERIFIER,
+        DEVICE_COMMIT_RECEIPT_SCHEMA,
+    );
+    assert!(
+        harness
+            .engine
+            .outstanding_component_commit_intents(operation)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
 fn profile2_rejects_legacy_commands_before_transition_and_replay() {
     let legacy_command = Command::CreateEstate {
         effect: effect(MAIN_ROOT + 10, 1),
