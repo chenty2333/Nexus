@@ -3058,3 +3058,115 @@ proptest! {
         prop_assert!(rejected);
     }
 }
+
+/// Custody must not be released before the fact that releases it is durable.
+///
+/// The dangerous direction is release, not retention: if the kernel treats a
+/// coordinate as free while the acceptance that freed it is still only in
+/// volatile state, a crash reopens it for reuse while the device may still be
+/// writing. This drives the terminal quiescence acceptance to a failing
+/// journal and asserts the coordinate stays held.
+#[test]
+fn custody_release_is_not_observable_before_its_evidence_is_durable() {
+    #[derive(Debug, Eq, PartialEq)]
+    struct DiskFull;
+
+    let mut harness = Harness::new_profile_two();
+    let queue = seed_retired_queue(&mut harness);
+    assert_eq!(
+        harness.engine.check_reusable(queue, resource_generation(1)),
+        Ok(())
+    );
+
+    let heir = effect(MAIN_ROOT, 1);
+    let heir_origin = principal(MAIN_ROOT, 1);
+    let heir_claim = claim(1);
+    harness
+        .tx(Command::CreateCompositeEffect {
+            effect: heir,
+            origin: heir_origin,
+            binding_generation: 1,
+            kind: DMA_ARENA_REUSE_COMPOSITE,
+            charge_account: charge(MAIN_ROOT),
+        })
+        .unwrap();
+
+    let before_projection = harness.engine.projection_digest();
+    let before_revision = harness.engine.revision();
+    let before_head = harness.engine.head();
+
+    // Reserving reuse is where custody crosses the trust boundary: it mints a
+    // one-shot permit authorizing a successor to touch the coordinate. If the
+    // permit were observable before its record were durable, a crash would
+    // leave a successor believing it holds authority the journal never granted.
+    let error = harness
+        .engine
+        .transact(
+            AuthorizedCommand::from(Command::ReserveComponentReuse {
+                effect: heir,
+                component: AGENT_COMPONENT_DMA,
+                actor: heir_origin,
+                binding_generation: 1,
+                claim: heir_claim,
+                kind: DEVICE_CLAIM_QUEUE_SLOT,
+                scope: ClaimScope::Device(device_scope()),
+                resource: queue,
+                expected_generation: resource_generation(1),
+                units: 1,
+                reuse_contract: digest(9),
+            }),
+            |_| Err(DiskFull),
+        )
+        .unwrap_err();
+    assert_eq!(error, TxError::Persist(DiskFull));
+
+    // No permit escaped, and the coordinate is exactly as it was.
+    assert_eq!(harness.engine.projection_digest(), before_projection);
+    assert_eq!(harness.engine.revision(), before_revision);
+    assert_eq!(harness.engine.head(), before_head);
+    assert!(harness.engine.persistence_recovery_required());
+}
+
+/// Guards the negative test above against passing for the wrong reason.
+///
+/// If the reservation were rejected on its own merits rather than by the
+/// failing journal, the durability assertion would be vacuous. This runs the
+/// identical command with a succeeding journal and requires a permit.
+#[test]
+fn the_same_reservation_succeeds_when_its_record_reaches_the_journal() {
+    let mut harness = Harness::new_profile_two();
+    let queue = seed_retired_queue(&mut harness);
+
+    let heir = effect(MAIN_ROOT, 1);
+    let heir_origin = principal(MAIN_ROOT, 1);
+    let heir_claim = claim(1);
+    harness
+        .tx(Command::CreateCompositeEffect {
+            effect: heir,
+            origin: heir_origin,
+            binding_generation: 1,
+            kind: DMA_ARENA_REUSE_COMPOSITE,
+            charge_account: charge(MAIN_ROOT),
+        })
+        .unwrap();
+
+    let output = harness.output(Command::ReserveComponentReuse {
+        effect: heir,
+        component: AGENT_COMPONENT_DMA,
+        actor: heir_origin,
+        binding_generation: 1,
+        claim: heir_claim,
+        kind: DEVICE_CLAIM_QUEUE_SLOT,
+        scope: ClaimScope::Device(device_scope()),
+        resource: queue,
+        expected_generation: resource_generation(1),
+        units: 1,
+        reuse_contract: digest(9),
+    });
+    let permit = match output {
+        TransitionOutput::ReusePermit(permit) => permit,
+        other => panic!("expected a reuse permit, got {other:?}"),
+    };
+    assert_eq!(permit.resource(), queue);
+    assert_eq!(permit.generation(), resource_generation(2));
+}
