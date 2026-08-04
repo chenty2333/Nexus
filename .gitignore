@@ -6,6 +6,8 @@
 **/mutants.out*/
 **/fuzz/corpus/
 **/fuzz/artifacts/
+**/__pycache__/
+**/*.pyc
 
 # OSDK/QEMU outputs
 kernel/nexus-ostd/artifacts/

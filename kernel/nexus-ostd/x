@@ -152,6 +152,7 @@ build_image() {
 container() {
     local -a cpu_args=()
     local -a security_args=()
+    local -a cid_args=()
     if [[ -n ${NEXUS_CONTAINER_CPUSET:-} ]]; then
         cpu_args=(--cpuset-cpus "$NEXUS_CONTAINER_CPUSET")
     fi
@@ -169,10 +170,25 @@ container() {
             security_args+=(--security-opt apparmor=unconfined)
         fi
     fi
+    if [[ ${NEXUS_CONTAINER_RECORD_CID:-0} == 1 ]]; then
+        local cid_file=${CSER_EXPERIMENT_CID_FILE:-}
+        if [[ -z $cid_file || $cid_file != /* || -e $cid_file || -L $cid_file ]]; then
+            echo "experiment container cid path must be a new absolute path: $cid_file" >&2
+            return 1
+        fi
+        local cid_parent
+        cid_parent=$(/usr/bin/dirname -- "$cid_file")
+        if [[ ! -d $cid_parent || -L $cid_parent ]]; then
+            echo "experiment container cid parent must be an existing directory: $cid_parent" >&2
+            return 1
+        fi
+        cid_args=(--cidfile "$cid_file")
+    fi
     command "$docker_bin" run --rm \
         --init \
         "${cpu_args[@]}" \
         "${security_args[@]}" \
+        "${cid_args[@]}" \
         --platform linux/amd64 \
         --network none \
         --user "$(id -u):$(id -g)" \
@@ -744,6 +760,108 @@ build_core_dma_recovery_kernel() {
     container cargo osdk build --scheme cser-core-dma-recovery
     assert_runner_base
 }
+
+# Compile-only gate for the two comparable tool-plus-DMA experiment profiles.
+#
+# This deliberately stops before `cargo osdk run`: the experiment matrix owns
+# host services, crash cutpoints, and QEMU lifecycle separately.  Keeping this
+# gate build-only makes it safe to run while those orchestration pieces evolve.
+build_tool_dma_experiments() {
+    local feature
+    for feature in cser-tool-dma-experiment cser-tool-dma-baseline-experiment; do
+        container cargo check --locked --offline --target x86_64-unknown-none \
+            --no-default-features --features "$feature"
+    done
+
+    prepare_runner_base
+    container cargo osdk build --scheme tool-dma-cser
+    assert_runner_base
+
+    prepare_runner_base
+    container cargo osdk build --scheme tool-dma-baseline
+    assert_runner_base
+}
+
+# One boot of the host-owned tool-plus-DMA experiment envelope.  The matching
+# matrix controller stages unique media before invoking this command and kills
+# its process group at the authenticated COM3 target barrier.  This helper
+# deliberately has no success oracle: recovery acceptance belongs to the
+# guest's serial terminal receipt, parsed by tools/cser-experiment.
+tool_dma_swtpm_pid=
+start_tool_dma_swtpm() {
+    local artifact_dir=$1 socket pid_file capabilities flags observed_pid
+    artifact_dir=$(realpath -e -- "$artifact_dir")
+    socket="$artifact_dir/swtpm-qemu.sock"
+    pid_file="$artifact_dir/swtpm.pid"
+    command -v swtpm >/dev/null 2>&1 || {
+        echo 'tool-DMA QEMU boot requires host swtpm' >&2
+        return 1
+    }
+    capabilities=$(swtpm socket --print-capabilities) || return 1
+    flags=not-need-init,startup-none
+    if grep -Fq '"flags-opt-disable-auto-shutdown"' <<<"$capabilities"; then
+        flags+=,disable-auto-shutdown
+    fi
+    rm -f -- "$socket" "$pid_file"
+    mkdir -p "$artifact_dir/tpmstate"
+    swtpm socket --tpm2 --tpmstate "dir=$artifact_dir/tpmstate" \
+        --ctrl "type=unixio,path=$socket" --flags "$flags" \
+        --log "file=$artifact_dir/swtpm.log,level=20" --pid "file=$pid_file" &
+    tool_dma_swtpm_pid=$!
+    for _ in {1..500}; do
+        observed_pid=
+        [[ -f $pid_file ]] && observed_pid=$(tr -d '\n' <"$pid_file")
+        if [[ $observed_pid == "$tool_dma_swtpm_pid" && -S $socket ]] \
+            && kill -0 "$tool_dma_swtpm_pid" 2>/dev/null; then
+            return 0
+        fi
+        kill -0 "$tool_dma_swtpm_pid" 2>/dev/null || break
+        sleep .01
+    done
+    echo 'tool-DMA swtpm did not become ready' >&2
+    stop_tool_dma_swtpm
+    return 1
+}
+
+stop_tool_dma_swtpm() {
+    local pid=${tool_dma_swtpm_pid:-}
+    [[ -n $pid ]] || return 0
+    if kill -0 "$pid" 2>/dev/null; then
+        kill -KILL "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+    fi
+    tool_dma_swtpm_pid=
+}
+
+run_tool_dma_boot() (
+    local scheme=$1 artifact_dir status=0
+    local record_cid=0
+    case "$scheme" in
+        tool-dma-cser) artifact_dir="$root/artifacts/tool-dma-cser" ;;
+        tool-dma-baseline) artifact_dir="$root/artifacts/tool-dma-baseline" ;;
+        *) echo "invalid tool-DMA scheme: $scheme" >&2; return 2 ;;
+    esac
+    for medium in journal.raw outbox.raw ram.raw; do
+        [[ -f $artifact_dir/$medium ]] || {
+            echo "tool-DMA boot requires staged medium: $artifact_dir/$medium" >&2
+            return 2
+        }
+    done
+    trap 'stop_tool_dma_swtpm' EXIT INT TERM
+    start_tool_dma_swtpm "$artifact_dir"
+    if [[ ${CSER_EXPERIMENT_PHASE:-initial} == initial \
+        && -n ${CSER_EXPERIMENT_CID_FILE:-} ]]; then
+        record_cid=1
+    fi
+    NEXUS_CONTAINER_HOST_UNIX_SOCKET=1 NEXUS_CONTAINER_RECORD_CID=$record_cid container bash -c "
+        set -euo pipefail
+        cp /root/ovmf/release/OVMF_VARS.fd \"\$HOME/OVMF_VARS.fd\"
+        exec timeout --signal=TERM --kill-after=2s 90s cargo osdk run --scheme $scheme
+    " || status=$?
+    stop_tool_dma_swtpm
+    trap - EXIT INT TERM
+    return "$status"
+)
 
 core_persistent_artifact_dir="$root/artifacts/cser-production"
 core_persistent_state_dir="$core_persistent_artifact_dir/tpmstate"
@@ -2138,7 +2256,7 @@ capture_core_persistent_run() {
         's/^pub const JOURNAL_SCHEMA_VERSION: u16 = \([0-9][0-9]*\);$/\1/p' \
         "$repo_root/crates/cser-core/src/journal.rs")
     if [[ $core_api_profile != 2 \
-        || $catalog_version != 5 \
+        || $catalog_version != 6 \
         || $projection_version != 6 \
         || $snapshot_version != 2 \
         || $journal_schema != 6 ]]; then
@@ -2181,7 +2299,7 @@ capture_core_persistent_run() {
         'effect_identity=shared' \
         'component_ids=reply+dma' \
         'api_profile=2' \
-        'catalog_version=5' \
+        'catalog_version=6' \
         'projection_version=6' \
         'snapshot_version=2' \
         'journal_schema=6' \
@@ -2210,7 +2328,7 @@ capture_core_persistent_run() {
         'CSER_CORE_PERSISTENT_BOOT2 PASS' \
         'production_registry=single' \
         'api_profile=2' \
-        'catalog_version=5' \
+        'catalog_version=6' \
         'projection_version=6' \
         'snapshot_version=2' \
         'journal_schema=6' \
@@ -2249,7 +2367,7 @@ capture_core_persistent_run() {
         'CSER_CORE_PERSISTENT_BOOT3 PASS' \
         'production_registry=single' \
         'api_profile=2' \
-        'catalog_version=5' \
+        'catalog_version=6' \
         'projection_version=6' \
         'snapshot_version=2' \
         'journal_schema=6' \
@@ -2284,7 +2402,7 @@ capture_core_persistent_run() {
         'CSER_CORE_PERSISTENT_BOOT4 PASS' \
         'production_registry=single' \
         'api_profile=2' \
-        'catalog_version=5' \
+        'catalog_version=6' \
         'projection_version=6' \
         'snapshot_version=2' \
         'journal_schema=6' \
@@ -2487,7 +2605,7 @@ capture_core_persistent_run() {
     schema5_tpm_lease_slot=$(core_schema5_tpm_snapshot_field \
         "$core_schema5_tpm_after" lease_selected_slot '^[01]$')
 
-    combined_receipt="CSER_CORE_PERSISTENT_QEMU_RESTART PASS boots=4 schema5_negative_boot=true schema5_selected_revision=5 schema5_selected_catalog=$core_schema5_fixture_catalog schema5_expected_catalog=$catalog_digest schema5_trusted_tpm_candidate_selected=true schema5_profile2_binding_authorized=false schema5_anchor_binding_match=false schema5_typed_rejection=migration-required schema5_semantic_replay=false schema5_pairing_inference=false schema5_registry_publication=false schema5_device_activation=false schema5_device_guard_retained=true schema5_arena_withheld=true schema5_bus_master_disabled=true schema5_intx_masked=true schema5_reset_status_zero=true schema5_observed_isr_bits=0 schema5_isr_reads_at_least=2 schema5_consecutive_empty_isr_reads=2 schema5_iotlb_used_remapped_iova=true schema5_iotlb_completed_trigger_pages_at_least=1 schema5_pci_bus_master_fence_readback=true schema5_iotlb_completion=true schema5_tpm_selected_nv_unchanged=true schema5_tpm_selected_coordinate_digest=$schema5_tpm_coordinate_digest schema5_tpm_tip_counter_hex=$schema5_tpm_tip_counter schema5_tpm_tip_selected_slot=$schema5_tpm_tip_slot schema5_tpm_lease_counter_hex=$schema5_tpm_lease_counter schema5_tpm_lease_selected_slot=$schema5_tpm_lease_slot shared_runtime=true shared_media=journal+swtpm+ram api_profile=2 catalog_version=5 projection_version=6 snapshot_version=2 journal_schema=6 composite_effect=shared operation_effect=50433:1 component_ids=1,2 evidence_schemes=reply+dma production_registry=single portal=nxp3 supervisor=core-v1 journal=ata-pio outbox=ata-pio-secondary ram_backend=memory-backend-file ram_backend_offset=0 qemu_ram_mapping=guest-paddr-equals-file-offset anchor=tpm2-nv quarantine=pre-replay-virtio+vtd reply=committed-then-intent-crash-then-settled second_crash=after-durable-apply-intent reconciliation=without-second-intent stable_recovery=true freshness=strictly-increasing projection_sequence=boot-distinct service_principal_generations=1,2,3,4 binding_generations=1,2,3,4 boot1_composite_task_death_exact_reap=true boot1_ingress_closed_rejected=true boot2_fresh_ready_rebind_death_exact_reap=true boot2_ingress_closed_rejected=true boot3_fresh_ready_rebind_live_open=true boot4_fresh_ready_rebind_live_open=true boot3_prior_service_fence=same-boot-exact-reap boot4_prior_service_fence=boot-checkpoint dma_generation_reuse=1->2 dma_generation1_retired=true dma_generation2_retired=true dma_queue=retired retained=0 resource_reuse_authorized=true arena_provider_contract=stable guest_pfn_reuse=true emulated_iova_reuse=true host_backing_file_offset_reuse=true qemu=true physical_hardware=false host_physical_pfn_identity=false physical_dma_drain=false physical_antirollback=false physical_powerloss=false"
+    combined_receipt="CSER_CORE_PERSISTENT_QEMU_RESTART PASS boots=4 schema5_negative_boot=true schema5_selected_revision=5 schema5_selected_catalog=$core_schema5_fixture_catalog schema5_expected_catalog=$catalog_digest schema5_trusted_tpm_candidate_selected=true schema5_profile2_binding_authorized=false schema5_anchor_binding_match=false schema5_typed_rejection=migration-required schema5_semantic_replay=false schema5_pairing_inference=false schema5_registry_publication=false schema5_device_activation=false schema5_device_guard_retained=true schema5_arena_withheld=true schema5_bus_master_disabled=true schema5_intx_masked=true schema5_reset_status_zero=true schema5_observed_isr_bits=0 schema5_isr_reads_at_least=2 schema5_consecutive_empty_isr_reads=2 schema5_iotlb_used_remapped_iova=true schema5_iotlb_completed_trigger_pages_at_least=1 schema5_pci_bus_master_fence_readback=true schema5_iotlb_completion=true schema5_tpm_selected_nv_unchanged=true schema5_tpm_selected_coordinate_digest=$schema5_tpm_coordinate_digest schema5_tpm_tip_counter_hex=$schema5_tpm_tip_counter schema5_tpm_tip_selected_slot=$schema5_tpm_tip_slot schema5_tpm_lease_counter_hex=$schema5_tpm_lease_counter schema5_tpm_lease_selected_slot=$schema5_tpm_lease_slot shared_runtime=true shared_media=journal+swtpm+ram api_profile=2 catalog_version=$catalog_version projection_version=6 snapshot_version=2 journal_schema=6 composite_effect=shared operation_effect=50433:1 component_ids=1,2 evidence_schemes=reply+dma production_registry=single portal=nxp3 supervisor=core-v1 journal=ata-pio outbox=ata-pio-secondary ram_backend=memory-backend-file ram_backend_offset=0 qemu_ram_mapping=guest-paddr-equals-file-offset anchor=tpm2-nv quarantine=pre-replay-virtio+vtd reply=committed-then-intent-crash-then-settled second_crash=after-durable-apply-intent reconciliation=without-second-intent stable_recovery=true freshness=strictly-increasing projection_sequence=boot-distinct service_principal_generations=1,2,3,4 binding_generations=1,2,3,4 boot1_composite_task_death_exact_reap=true boot1_ingress_closed_rejected=true boot2_fresh_ready_rebind_death_exact_reap=true boot2_ingress_closed_rejected=true boot3_fresh_ready_rebind_live_open=true boot4_fresh_ready_rebind_live_open=true boot3_prior_service_fence=same-boot-exact-reap boot4_prior_service_fence=boot-checkpoint dma_generation_reuse=1->2 dma_generation1_retired=true dma_generation2_retired=true dma_queue=retired retained=0 resource_reuse_authorized=true arena_provider_contract=stable guest_pfn_reuse=true emulated_iova_reuse=true host_backing_file_offset_reuse=true qemu=true physical_hardware=false host_physical_pfn_identity=false physical_dma_drain=false physical_antirollback=false physical_powerloss=false"
     combined_receipt+=" focused_test_profiles=profile1-historical focused_test_profiles_are_production=false"
     receipt_header=nexus.cser.production-receipt.v1
     receipt_basename=combined-receipt.txt
@@ -2714,6 +2832,15 @@ case "$command" in
         bash "$root/scripts/assert-cser-core-production-cutover.sh" "$repo_root"
         build_core_persistent_recovery_kernel
         ;;
+    build-tool-dma-experiments)
+        ensure_image
+        build_tool_dma_experiments
+        ;;
+    run-tool-dma-boot)
+        [[ $# == 2 ]] || { echo 'usage: ./x run-tool-dma-boot {tool-dma-cser|tool-dma-baseline}' >&2; exit 2; }
+        ensure_image
+        run_tool_dma_boot "$2"
+        ;;
     run|test|run-core-persistent-recovery)
         ensure_image
         check_ostd_patch
@@ -2744,10 +2871,10 @@ case "$command" in
         rm -rf "$root/target" "$root/artifacts"
         ;;
     -h|--help|help)
-        echo "usage: ./x {doctor|image|fmt|check|clippy|build|run|test|build-core-persistent-recovery|run-core-persistent-recovery|seal-core-persistent-recovery|test-core-persistent-arena-checker|test-core-schema5-negative-oracles|test-core-schema5-fixture|clean}"
+        echo "usage: ./x {doctor|image|fmt|check|clippy|build|run|test|build-core-persistent-recovery|build-tool-dma-experiments|run-tool-dma-boot|run-core-persistent-recovery|seal-core-persistent-recovery|test-core-persistent-arena-checker|test-core-schema5-negative-oracles|test-core-schema5-fixture|clean}"
         ;;
     *)
-        echo "usage: ./x {doctor|image|fmt|check|clippy|build|run|test|build-core-persistent-recovery|run-core-persistent-recovery|seal-core-persistent-recovery|test-core-persistent-arena-checker|test-core-schema5-negative-oracles|test-core-schema5-fixture|clean}" >&2
+        echo "usage: ./x {doctor|image|fmt|check|clippy|build|run|test|build-core-persistent-recovery|build-tool-dma-experiments|run-tool-dma-boot|run-core-persistent-recovery|seal-core-persistent-recovery|test-core-persistent-arena-checker|test-core-schema5-negative-oracles|test-core-schema5-fixture|clean}" >&2
         exit 2
         ;;
 esac

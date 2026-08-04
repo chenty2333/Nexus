@@ -8,8 +8,14 @@
 
 set -euo pipefail
 
-if (($# < 1 || $# > 4)); then
-    echo "usage: $0 STATE_DIR [CATALOG_SHA256_HEX [TIP_REVISION TIP_HEAD_SHA256_HEX]]" >&2
+mode=cser
+if [[ ${1:-} == --experiment-blank ]]; then
+    mode=experiment-blank
+    shift
+fi
+if { [[ $mode == cser ]] && (($# < 1 || $# > 4)); } \
+    || { [[ $mode == experiment-blank ]] && (($# != 1)); }; then
+    echo "usage: $0 [--experiment-blank] STATE_DIR [CATALOG_SHA256_HEX [TIP_REVISION TIP_HEAD_SHA256_HEX]]" >&2
     exit 2
 fi
 
@@ -23,33 +29,34 @@ for command in swtpm tpm2_nvdefine tpm2_nvreadpublic tpm2_nvread \
     fi
 done
 
+readonly mode
 state_dir=$1
 catalog_hex=${2:-}
 tip_revision=${3:-0}
 tip_head_hex=${4:-}
-if [[ -z $catalog_hex ]]; then
+if [[ $mode == cser && -z $catalog_hex ]]; then
     for _ in {1..32}; do
         catalog_hex+=42
     done
 fi
-if [[ ! $catalog_hex =~ ^[[:xdigit:]]{64}$ ]]; then
+if [[ $mode == cser && ! $catalog_hex =~ ^[[:xdigit:]]{64}$ ]]; then
     echo "catalog digest must be exactly 64 hexadecimal characters" >&2
     exit 2
 fi
 catalog_hex=${catalog_hex,,}
-if [[ ! $tip_revision =~ ^(0|[1-9][0-9]*)$ ]] \
+if [[ $mode == cser ]] && { ! [[ $tip_revision =~ ^(0|[1-9][0-9]*)$ ]] \
     || (( ${#tip_revision} > 20 )) \
     || { (( ${#tip_revision} == 20 )) \
-        && [[ $tip_revision > 18446744073709551615 ]]; }; then
+        && [[ $tip_revision > 18446744073709551615 ]]; }; }; then
     echo "tip revision must be an unsigned 64-bit decimal" >&2
     exit 2
 fi
-if [[ -z $tip_head_hex ]]; then
+if [[ $mode == cser && -z $tip_head_hex ]]; then
     for _ in {1..32}; do
         tip_head_hex+=00
     done
 fi
-if [[ ! $tip_head_hex =~ ^[[:xdigit:]]{64}$ ]]; then
+if [[ $mode == cser && ! $tip_head_hex =~ ^[[:xdigit:]]{64}$ ]]; then
     echo "tip head must be exactly 64 hexadecimal characters" >&2
     exit 2
 fi
@@ -58,8 +65,8 @@ zero_head_hex=
 for _ in {1..32}; do
     zero_head_hex+=00
 done
-if { [[ $tip_revision == 0 ]] && [[ $tip_head_hex != "$zero_head_hex" ]]; } \
-    || { [[ $tip_revision != 0 ]] && [[ $tip_head_hex == "$zero_head_hex" ]]; }; then
+if [[ $mode == cser ]] && { { [[ $tip_revision == 0 ]] && [[ $tip_head_hex != "$zero_head_hex" ]]; } \
+    || { [[ $tip_revision != 0 ]] && [[ $tip_head_hex == "$zero_head_hex" ]]; }; }; then
     echo "tip revision and head must name genesis together or a non-genesis tip together" >&2
     exit 2
 fi
@@ -186,12 +193,14 @@ tpm2_nvdefine -Q -T "$tcti" "$TIP_SLOT_0" -C p -s "$TIP_SIZE" \
     -a "$SLOT_ATTRIBUTES" -L "$work_dir/delete-policy.bin"
 tpm2_nvdefine -Q -T "$tcti" "$TIP_SLOT_1" -C p -s "$TIP_SIZE" \
     -a "$SLOT_ATTRIBUTES" -L "$work_dir/delete-policy.bin"
-tpm2_nvdefine -Q -T "$tcti" "$LEASE_COUNTER" -C p -s 8 \
-    -a "$COUNTER_ATTRIBUTES" -L "$work_dir/delete-policy.bin"
-tpm2_nvdefine -Q -T "$tcti" "$LEASE_SLOT_0" -C p -s "$LEASE_SIZE" \
-    -a "$SLOT_ATTRIBUTES" -L "$work_dir/delete-policy.bin"
-tpm2_nvdefine -Q -T "$tcti" "$LEASE_SLOT_1" -C p -s "$LEASE_SIZE" \
-    -a "$SLOT_ATTRIBUTES" -L "$work_dir/delete-policy.bin"
+if [[ $mode == cser ]]; then
+    tpm2_nvdefine -Q -T "$tcti" "$LEASE_COUNTER" -C p -s 8 \
+        -a "$COUNTER_ATTRIBUTES" -L "$work_dir/delete-policy.bin"
+    tpm2_nvdefine -Q -T "$tcti" "$LEASE_SLOT_0" -C p -s "$LEASE_SIZE" \
+        -a "$SLOT_ATTRIBUTES" -L "$work_dir/delete-policy.bin"
+    tpm2_nvdefine -Q -T "$tcti" "$LEASE_SLOT_1" -C p -s "$LEASE_SIZE" \
+        -a "$SLOT_ATTRIBUTES" -L "$work_dir/delete-policy.bin"
+fi
 
 readonly one=0000000000000001
 readonly zero=0000000000000000
@@ -217,24 +226,53 @@ make_slot() {
     fi
 }
 
-make_slot "$tip_body_hex" "$TIP_SIZE" "$work_dir/tip-genesis.bin"
-make_slot "$lease_body_hex" "$LEASE_SIZE" "$work_dir/lease-genesis.bin"
+if [[ $mode == cser ]]; then
+    make_slot "$tip_body_hex" "$TIP_SIZE" "$work_dir/tip-genesis.bin"
+    make_slot "$lease_body_hex" "$LEASE_SIZE" "$work_dir/lease-genesis.bin"
 
-# Sequence one selects slot one for each independent protocol.
-tpm2_nvwrite -Q -T "$tcti" -C "$TIP_SLOT_1" \
-    -i "$work_dir/tip-genesis.bin" "$TIP_SLOT_1"
-tpm2_nvwrite -Q -T "$tcti" -C "$LEASE_SLOT_1" \
-    -i "$work_dir/lease-genesis.bin" "$LEASE_SLOT_1"
-tpm2_nvincrement -Q -T "$tcti" -C "$TIP_COUNTER" "$TIP_COUNTER"
-tpm2_nvincrement -Q -T "$tcti" -C "$LEASE_COUNTER" "$LEASE_COUNTER"
+    # Sequence one selects slot one for each independent protocol.
+    tpm2_nvwrite -Q -T "$tcti" -C "$TIP_SLOT_1" \
+        -i "$work_dir/tip-genesis.bin" "$TIP_SLOT_1"
+    tpm2_nvwrite -Q -T "$tcti" -C "$LEASE_SLOT_1" \
+        -i "$work_dir/lease-genesis.bin" "$LEASE_SLOT_1"
+    tpm2_nvincrement -Q -T "$tcti" -C "$TIP_COUNTER" "$TIP_COUNTER"
+    tpm2_nvincrement -Q -T "$tcti" -C "$LEASE_COUNTER" "$LEASE_COUNTER"
+else
+    # TPM counters cannot be read while still NV-uninitialized. Give the
+    # independent baseline an authenticated revision-zero selector instead of
+    # asking the guest to infer blankness from that provider error.
+    readonly experiment_magic=4e45584558504e31
+    readonly experiment_version=0001
+    readonly experiment_reserved=000000000000
+    readonly experiment_body_hex="${experiment_magic}${experiment_version}${experiment_reserved}${one}${zero}${zero_head_hex}"
+    printf '%s' "$experiment_body_hex" | xxd -r -p >"$work_dir/experiment-body.bin"
+    experiment_checksum=$(sha256sum "$work_dir/experiment-body.bin" | cut -d ' ' -f1)
+    experiment_padding=
+    for _ in {1..84}; do experiment_padding+=00; done
+    printf '%s%s%s' "$experiment_body_hex" "$experiment_checksum" "$experiment_padding" \
+        | xxd -r -p >"$work_dir/experiment-genesis.bin"
+    if [[ $(stat -c %s "$work_dir/experiment-genesis.bin") != "$TIP_SIZE" ]]; then
+        echo "encoded experiment genesis has wrong size" >&2
+        exit 1
+    fi
+    tpm2_nvwrite -Q -T "$tcti" -C "$TIP_SLOT_1" \
+        -i "$work_dir/experiment-genesis.bin" "$TIP_SLOT_1"
+    tpm2_nvincrement -Q -T "$tcti" -C "$TIP_COUNTER" "$TIP_COUNTER"
+fi
 
-for specification in \
+specifications=(
     "$TIP_COUNTER:$COUNTER_ATTRIBUTES:8" \
-    "$LEASE_COUNTER:$COUNTER_ATTRIBUTES:8" \
     "$TIP_SLOT_0:$SLOT_ATTRIBUTES:$TIP_SIZE" \
-    "$TIP_SLOT_1:$SLOT_ATTRIBUTES:$TIP_SIZE" \
-    "$LEASE_SLOT_0:$SLOT_ATTRIBUTES:$LEASE_SIZE" \
-    "$LEASE_SLOT_1:$SLOT_ATTRIBUTES:$LEASE_SIZE"; do
+    "$TIP_SLOT_1:$SLOT_ATTRIBUTES:$TIP_SIZE"
+)
+if [[ $mode == cser ]]; then
+    specifications+=(
+        "$LEASE_COUNTER:$COUNTER_ATTRIBUTES:8"
+        "$LEASE_SLOT_0:$SLOT_ATTRIBUTES:$LEASE_SIZE"
+        "$LEASE_SLOT_1:$SLOT_ATTRIBUTES:$LEASE_SIZE"
+    )
+fi
+for specification in "${specifications[@]}"; do
     IFS=: read -r index attributes size <<<"$specification"
     public=$(tpm2_nvreadpublic -T "$tcti" "$index")
     observed_attributes=$(awk '
@@ -252,6 +290,7 @@ for specification in \
     grep -qi "$DELETE_POLICY_SHA256" <<<"$public"
 done
 
+if [[ $mode == cser ]]; then
 for counter in "$TIP_COUNTER" "$LEASE_COUNTER"; do
     tpm2_nvread -Q -T "$tcti" -C "$counter" -s 8 \
         -o "$work_dir/counter.bin" "$counter"
@@ -266,10 +305,26 @@ tpm2_nvread -Q -T "$tcti" -C "$LEASE_SLOT_1" -s "$LEASE_SIZE" \
     -o "$work_dir/lease-readback.bin" "$LEASE_SLOT_1"
 cmp "$work_dir/tip-genesis.bin" "$work_dir/tip-readback.bin"
 cmp "$work_dir/lease-genesis.bin" "$work_dir/lease-readback.bin"
+else
+    tpm2_nvread -Q -T "$tcti" -C "$TIP_COUNTER" -s 8 \
+        -o "$work_dir/counter.bin" "$TIP_COUNTER"
+    if [[ $(xxd -p -c 8 "$work_dir/counter.bin") != "$one" ]]; then
+        echo "experiment genesis counter is not one" >&2
+        exit 1
+    fi
+    tpm2_nvread -Q -T "$tcti" -C "$TIP_SLOT_1" -s "$TIP_SIZE" \
+        -o "$work_dir/experiment-readback.bin" "$TIP_SLOT_1"
+    cmp "$work_dir/experiment-genesis.bin" "$work_dir/experiment-readback.bin"
+fi
 
 # Stop without TPM2_Shutdown. ORDERLY is clear on every index, so successful
 # writes and increments must already be in the NV version.
 stop_swtpm
 
-echo \
-    "CSER_TPM_NV_PROVISION PASS indices=6 selectors=tip+lease sequence=1 tip_revision=$tip_revision tip_head=$tip_head_hex platform_created=true policy_delete=true writeall=true orderly=false fixture_auth=empty swtpm_state_rollbackable=true physical_antirollback=false"
+if [[ $mode == cser ]]; then
+    echo \
+        "CSER_TPM_NV_PROVISION PASS indices=6 selectors=tip+lease sequence=1 tip_revision=$tip_revision tip_head=$tip_head_hex platform_created=true policy_delete=true writeall=true orderly=false fixture_auth=empty swtpm_state_rollbackable=true physical_antirollback=false"
+else
+    echo \
+        "EXPERIMENT_TPM_NV_PROVISION PASS indices=3 selector=tip sequence=1 revision=0 genesis_authenticated=true platform_created=true policy_delete=true writeall=true orderly=false fixture_auth=empty swtpm_state_rollbackable=true physical_antirollback=false"
+fi

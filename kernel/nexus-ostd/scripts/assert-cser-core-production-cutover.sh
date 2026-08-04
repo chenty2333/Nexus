@@ -102,8 +102,8 @@ done
 
 grep -Fxq 'pub const CSER_CORE_API_PROFILE_VERSION: u16 = 2;' "$core_lib" \
     || fail 'portable core API profile 2 is not frozen at the cutover'
-grep -Fxq 'pub const STANDARD_CATALOG_VERSION: u16 = 5;' "$core_lib" \
-    || fail 'portable standard catalog v5 is not frozen at the cutover'
+grep -Fxq 'pub const STANDARD_CATALOG_VERSION: u16 = 6;' "$core_lib" \
+    || fail 'portable standard catalog v6 is not frozen at the cutover'
 grep -Fxq 'pub const PROJECTION_VERSION: u16 = 6;' "$core_lib" \
     || fail 'portable projection v6 is not frozen at the cutover'
 grep -Fxq 'pub const RECOVERY_SNAPSHOT_VERSION: u16 = 2;' "$core_lib" \
@@ -160,6 +160,7 @@ required_sources=(
     core_pio_journal.rs
     core_portal_vnext.rs
     core_production_registry.rs
+    core_qemu_persistent_boot.rs
     core_reboot.rs
     core_reply_adapter.rs
     core_reply_outbox.rs
@@ -597,7 +598,7 @@ require_ordered_tokens "$first_publication" 'first-boot composite publication' \
     'AGENT_COMPONENT_DMA,' \
     'ensure_composite_prepared(' \
     'let arena = persistent_dma_arena_layout().ok_or("dma-arena-layout-absent")?;' \
-    'let arena_digest = dma_arena_digest(arena);' \
+    'let arena_digest = persistent_dma_arena_digest(arena);' \
     'arm_initial_component_commits(portal, owner, actor, binding_generation, arena_digest)?;' \
     'ensure_reply_component_committed(owner, &mut outbox, Some(reply_intent))?;' \
     'component.commit != CommitState::CommitIntentDurable' \
@@ -726,7 +727,7 @@ require_ordered_tokens "$reuse_publication" 'generation+1 DMA reuse publication'
     '.prepare_read_sector0(&mut root)' \
     'CoreDmaCohort::bind_component(' \
     'reused_dma_claims(),' \
-    'cohort.record_commit_intent(dma_arena_digest(arena))' \
+    'cohort.record_commit_intent(persistent_dma_arena_digest(arena))' \
     'publish_real_queue(' \
     'published.verify_commit(engine)'
 reuse_permit_count=$(grep -Fc 'CommandRequest::ReserveComponentReuse {' \
@@ -1049,12 +1050,16 @@ declare -A scheme_header_counts=(
     ['[scheme."cser-production"]']=0
     ['[scheme."cser-core-reply-recovery"]']=0
     ['[scheme."cser-core-dma-recovery"]']=0
+    ['[scheme."tool-dma-cser"]']=0
+    ['[scheme."tool-dma-baseline"]']=0
 )
 while IFS= read -r scheme_header; do
     case "$scheme_header" in
         '[scheme."cser-production"]'|\
         '[scheme."cser-core-reply-recovery"]'|\
-        '[scheme."cser-core-dma-recovery"]')
+        '[scheme."cser-core-dma-recovery"]'|\
+        '[scheme."tool-dma-cser"]'|\
+        '[scheme."tool-dma-baseline"]')
             ;;
         *)
             fail "OSDK manifest exposes a noncanonical scheme table: $scheme_header"
@@ -1099,6 +1104,21 @@ for profile in reply dma; do
     grep -Fxq "build.features = [\"$scheme\"]" <<<"$scheme_block" \
         || fail "evidence scheme does not select its exact feature: $scheme"
 done
+for specification in \
+    'tool-dma-cser:cser-tool-dma-experiment' \
+    'tool-dma-baseline:cser-tool-dma-baseline-experiment'; do
+    scheme=${specification%%:*}
+    feature=${specification#*:}
+    scheme_block=$(awk -v header="[scheme.\"$scheme\"]" '
+        $0 == header { in_scheme = 1; next }
+        in_scheme && /^\[/ { exit }
+        in_scheme { print }
+    ' "$osdk_manifest")
+    grep -Fxq 'build.no_default_features = true' <<<"$scheme_block" \
+        || fail "tool-DMA scheme does not disable the production default: $scheme"
+    grep -Fxq "build.features = [\"$feature\"]" <<<"$scheme_block" \
+        || fail "tool-DMA scheme does not select its exact feature: $scheme"
+done
 
 persistent_run=$(awk '
     /^capture_core_persistent_run\(\)[[:space:]]*\{/ { in_function = 1 }
@@ -1111,22 +1131,20 @@ runtime_recovery=$(extract_rust_item \
     "$persistent_runtime") \
     || fail 'cannot isolate production persistent recovery entry'
 require_ordered_tokens "$runtime_recovery" 'production trusted-state recovery order' \
-    'let candidate = match TpmNvTrustedAnchor::inspect(' \
-    'let guard = match OstdVirtioBootQuarantine::new(observed_generation).quarantine_all() {' \
-    'let selected_bytes = match journal.read_all() {' \
-    'scan_journal(&selected_bytes),' \
-    'let anchor = match candidate.bind(binding) {' \
-    'let boot = match recover_quarantined_boot('
+    'let mut prepared = match PreparedQemuPersistentBoot::acquire() {' \
+    'let selected_tip = prepared.candidate().committed();' \
+    'let selected_bytes = match prepared.journal_bytes() {' \
+    'if is_legacy_schema5(&selected_bytes) {' \
+    'let boot = match prepared.recover(catalog, CoreLimits::bounded_default(), binding) {'
 for schema5_fail_closed_token in \
-    'Err(JournalDecodeError::UnsupportedVersion { version: 5 })' \
+    'if is_legacy_schema5(&selected_bytes)' \
     'selected_tip.revision() == 0 || selected_tip.head().is_zero()' \
     'trusted_tpm_candidate_selected=true' \
     'profile2_binding_authorized=false' \
     'typed_error=migration-required' \
     'semantic_replay=false inferred_pairing=false pre_replay_quarantine=true' \
     'device_guard_retained=true production_registry=false device_activation=false' \
-    '"schema5-migration-required",' \
-    '(arena, candidate, guard, journal),'; do
+    'fail_closed("schema5-migration-required", prepared)'; do
     grep -Fq "$schema5_fail_closed_token" <<<"$runtime_recovery" \
         || fail "production schema-5 rejection lacks retained authority token: $schema5_fail_closed_token"
 done
@@ -1276,8 +1294,10 @@ require_ordered_tokens "$schema5_negative" 'authentic schema-5 negative boot' \
 if grep -Fq '"$catalog_digest" \' <<<"$schema5_negative"; then
     fail 'schema-5 negative boot provisions TPM authority with the profile-2 catalog'
 fi
-[[ $(grep -Fc 'NEXUS_CONTAINER_HOST_UNIX_SOCKET' "$kernel_workflow") == 2 ]] \
-    || fail 'host Unix socket policy must have one declaration and one TPM fixture caller'
+[[ $(grep -Fc 'NEXUS_CONTAINER_HOST_UNIX_SOCKET' <<<"$container_function") == 1 ]] \
+    || fail 'container runner must declare the host Unix socket policy once'
+[[ $(grep -Fc 'NEXUS_CONTAINER_HOST_UNIX_SOCKET' <<<"$persistent_guest") == 1 ]] \
+    || fail 'persistent production capture must select the host Unix socket policy once'
 grep -Fq 'NEXUS_CONTAINER_HOST_UNIX_SOCKET=1 container bash -c' \
     <<<"$persistent_guest" \
     || fail 'persistent production guest does not select the host Unix socket policy'
@@ -1296,4 +1316,4 @@ for forbidden_container_option in --privileged --cap-add --device; do
     fi
 done
 
-echo "CSER_CORE_PRODUCTION_CUTOVER PASS manifest_sources=${#closure_sources[@]} portable_core=nonoptional api_profile=2 catalog_version=5 projection_version=6 snapshot_version=2 journal_schema=6 default=cser-production registry=single operation_effect=shared component_custody=reply+dma production_service_tasks=1 legacy_runtime_estates=false task_bound_ingress=true post_exit_fence=true production_rebind=true vnext_portal=true vnext_supervisor=true volatile_transitions=false evidence_schemes=reply+dma boots=4 shared_media=true tpm_fixture_policy=scoped"
+echo "CSER_CORE_PRODUCTION_CUTOVER PASS manifest_sources=${#closure_sources[@]} portable_core=nonoptional api_profile=2 catalog_version=6 projection_version=6 snapshot_version=2 journal_schema=6 default=cser-production registry=single operation_effect=shared component_custody=reply+dma production_service_tasks=1 legacy_runtime_estates=false task_bound_ingress=true post_exit_fence=true production_rebind=true vnext_portal=true vnext_supervisor=true volatile_transitions=false evidence_schemes=reply+dma boots=4 shared_media=true tpm_fixture_policy=scoped"
