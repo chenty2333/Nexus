@@ -48,8 +48,9 @@ pub mod std_support;
 
 pub use domain::{
     AdoptionPolicy, ClaimCardinality, ClaimRule, ClaimScopePolicy, CompositeComponentSpec,
-    CompositeRule, CreditRule, DeviceGenerationEffect, DomainCatalog, DomainCatalogBuilder,
-    DomainCatalogError, EvidenceCapability, EvidenceRecovery, EvidenceRule, EvidenceSubjectBinding,
+    CompositeRule, ConflictMode, CreditRule, DeviceGenerationEffect, DomainCatalog,
+    DomainCatalogBuilder, DomainCatalogError, EvidenceCapability, EvidenceRecovery, EvidenceRule,
+    EvidenceSubjectBinding,
     FreshnessAxes, ObligationPolicy, ObligationReceipts, ObligationRule, ObligationSpec,
     ReceiptBinding,
 };

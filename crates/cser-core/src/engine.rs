@@ -4570,6 +4570,62 @@ impl Engine {
         }
     }
 
+    /// Reports whether one further claim may be enrolled against a live
+    /// resource coordinate under the catalog's admission algebra.
+    ///
+    /// This is a read-only precheck and never authority. It answers the
+    /// question exclusion asks — may another custodian join — which
+    /// [`Engine::check_reusable`] does not, because reuse is refused for any
+    /// live coordinate regardless of whether custody is shared.
+    pub fn check_co_claimable(
+        &self,
+        catalog: &DomainCatalog,
+        domain: DomainId,
+        kind: ClaimKindId,
+        resource: ResourceId,
+        expected_generation: ResourceGeneration,
+    ) -> Result<(), CoreError> {
+        if self.state.recovery_target.is_some() {
+            return Err(CoreError::RecoveryPending);
+        }
+        let rule = catalog
+            .claim_rule(domain, kind)
+            .ok_or(CoreError::UnknownClaimClass)?;
+        match self.state.resources.get(&resource) {
+            None => Ok(()),
+            Some(ResourceRecord { generation, .. }) if *generation != expected_generation => {
+                Err(CoreError::StaleResourceGeneration)
+            }
+            Some(ResourceRecord { scope, .. }) if scope_is_quarantined(&self.state, *scope) => {
+                Err(CoreError::Quarantined)
+            }
+            Some(ResourceRecord {
+                phase: ResourcePhase::Retired,
+                ..
+            })
+            | Some(ResourceRecord {
+                phase:
+                    ResourcePhase::Claimed {
+                        pending_reuse: Some(_),
+                    },
+                ..
+            }) => Err(CoreError::ResourceReuseRequired),
+            Some(ResourceRecord {
+                phase:
+                    ResourcePhase::Claimed {
+                        pending_reuse: None,
+                    },
+                ..
+            }) => {
+                if rule.conflict().excludes_additional_claim() {
+                    Err(CoreError::ResourceRetained)
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+
     /// Builds a linear reissue request for a reuse reservation whose previous
     /// bearer died with an earlier estate authority epoch.
     ///
@@ -6472,6 +6528,12 @@ fn enroll_claim(
         ) => {
             return Err(CoreError::ResourceReuseRequired);
         }
+        // The coordinate is live with no reuse pending. Scope agreement and
+        // exact generation equality were already checked by the guards above,
+        // so the only remaining question is the catalog's admission algebra.
+        // An exclusive class refuses the second custodian; a shared class
+        // admits it, and the retirement path already withholds the coordinate
+        // until the last custodian discharges.
         (
             Some(ResourceRecord {
                 phase:
@@ -6482,7 +6544,9 @@ fn enroll_claim(
             }),
             None,
         ) => {
-            return Err(CoreError::ResourceRetained);
+            if rule.conflict().excludes_additional_claim() {
+                return Err(CoreError::ResourceRetained);
+            }
         }
         (Some(ResourceRecord { .. }), Some(_)) | (None, Some(_)) => {
             return Err(CoreError::StaleReusePermit);
@@ -6727,6 +6791,10 @@ fn enroll_component_claim(
             }),
             None,
         ) => return Err(CoreError::ResourceReuseRequired),
+        // Same admission algebra as the single-obligation path. A shared
+        // coordinate may be co-held across components of one composite, or
+        // across separate effects; the retirement reference count spans both
+        // indexes, so neither can strand the other.
         (
             Some(ResourceRecord {
                 phase:
@@ -6736,7 +6804,11 @@ fn enroll_component_claim(
                 ..
             }),
             None,
-        ) => return Err(CoreError::ResourceRetained),
+        ) => {
+            if rule.conflict().excludes_additional_claim() {
+                return Err(CoreError::ResourceRetained);
+            }
+        }
         (Some(ResourceRecord { .. }), Some(_)) | (None, Some(_)) => {
             return Err(CoreError::StaleReusePermit);
         }
@@ -11615,8 +11687,8 @@ mod projection_v6_tests {
         assert_eq!(
             golden.bytes(),
             [
-                178, 64, 195, 105, 175, 189, 118, 204, 142, 69, 151, 116, 166, 68, 91, 66, 224,
-                194, 202, 189, 184, 135, 132, 221, 110, 216, 97, 86, 193, 173, 215, 225,
+                36, 9, 68, 25, 102, 214, 186, 160, 160, 156, 105, 226, 227, 109, 204, 239, 227,
+                63, 116, 34, 125, 85, 222, 6, 196, 194, 29, 52, 51, 251, 58, 40,
             ]
         );
 

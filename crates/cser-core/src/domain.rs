@@ -90,6 +90,56 @@ impl ClaimScopePolicy {
     }
 }
 
+/// How two live claims naming one resource coordinate interact.
+///
+/// This is the admission algebra of a claim class. It is declared by the
+/// domain, not inferred by the engine, because whether concurrent custody of a
+/// resource is safe is a property of the provider that backs it, and the engine
+/// cannot observe that property.
+///
+/// The algebra is deliberately small. It records only what the engine can
+/// enforce with exact identifier equality: whether a second live claim on the
+/// same coordinate may exist at all. It says nothing about whether two
+/// *different* coordinates alias one physical extent; that remains a separate
+/// hardware gate, as it must, since a `ResourceId` is opaque to the engine.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConflictMode {
+    /// At most one live claim may name the coordinate.
+    ///
+    /// A second enrollment is refused while the first is unretired. Retirement
+    /// of that single claim retires the coordinate and makes it eligible for a
+    /// generation-bound reuse permit.
+    Exclusive,
+    /// Any number of live claims may name the coordinate concurrently.
+    ///
+    /// The coordinate is retired only when the last live claim retires, so a
+    /// reuse permit is never issued while a custodian remains. Every sharer
+    /// must still discharge its own evidence conjunction: sharing weakens the
+    /// admission test, never the retirement obligation.
+    Shared,
+}
+
+impl ConflictMode {
+    /// Returns whether an existing live claim forbids a further enrollment.
+    ///
+    /// This is the whole admission algebra. It is a method rather than an
+    /// inline match so that the gate in the engine and the precheck exposed to
+    /// callers cannot drift apart.
+    pub const fn excludes_additional_claim(self) -> bool {
+        match self {
+            Self::Exclusive => true,
+            Self::Shared => false,
+        }
+    }
+
+    pub(crate) const fn tag(self) -> u8 {
+        match self {
+            Self::Exclusive => 1,
+            Self::Shared => 2,
+        }
+    }
+}
+
 /// Typed conserved-credit policy shared by compatible claim classes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CreditRule {
@@ -658,6 +708,7 @@ pub struct ClaimRule {
     kind: ClaimKindId,
     credit_class: CreditClassId,
     scope: ClaimScopePolicy,
+    conflict: ConflictMode,
     evidence: Vec<EvidenceRule>,
 }
 
@@ -680,6 +731,11 @@ impl ClaimRule {
     /// Returns whether instances must name a device scope.
     pub const fn scope(&self) -> ClaimScopePolicy {
         self.scope
+    }
+
+    /// Returns how concurrent claims on one resource coordinate interact.
+    pub const fn conflict(&self) -> ConflictMode {
+        self.conflict
     }
 
     /// Returns the complete evidence conjunction.
@@ -730,6 +786,14 @@ pub enum DomainCatalogError {
     /// Such a claim cannot guarantee retirement, so the catalog refuses it
     /// rather than admitting an obligation with no durable path to discharge.
     UnrecoverableRetirementEvidence,
+    /// A shared claim class declares evidence which advances a device
+    /// generation.
+    ///
+    /// Sharers retire independently against a generation each enrolled
+    /// against. A scope-wide advance performed by one sharer would strand the
+    /// others at a generation they can no longer prove quiescent, so the two
+    /// declarations cannot be combined.
+    SharedClaimAdvancesGeneration,
     /// Verifier observations omit the mandatory boot/Registry/journal floor.
     InsufficientObservationFreshness,
     /// A claim names an unregistered conserved credit class.
@@ -854,13 +918,38 @@ impl DomainCatalogBuilder {
         Ok(self)
     }
 
-    /// Registers one claim class and its evidence conjunction.
+    /// Registers one exclusively held claim class and its evidence conjunction.
+    ///
+    /// Exclusion is the default because it is the conservative admission rule:
+    /// a class which is in fact safe to share is merely over-restricted, while a
+    /// class wrongly declared shareable admits concurrent custody of a resource
+    /// whose provider cannot tolerate it.
     pub fn claim(
+        self,
+        domain: DomainId,
+        kind: ClaimKindId,
+        credit_class: CreditClassId,
+        scope: ClaimScopePolicy,
+        evidence: &[EvidenceRule],
+    ) -> Result<Self, DomainCatalogError> {
+        self.claim_with_conflict(
+            domain,
+            kind,
+            credit_class,
+            scope,
+            ConflictMode::Exclusive,
+            evidence,
+        )
+    }
+
+    /// Registers one claim class with an explicit admission algebra.
+    pub fn claim_with_conflict(
         mut self,
         domain: DomainId,
         kind: ClaimKindId,
         credit_class: CreditClassId,
         scope: ClaimScopePolicy,
+        conflict: ConflictMode,
         evidence: &[EvidenceRule],
     ) -> Result<Self, DomainCatalogError> {
         if evidence.is_empty() {
@@ -927,6 +1016,19 @@ impl DomainCatalogBuilder {
         {
             return Err(DomainCatalogError::MissingQuiescenceEvidence);
         }
+        // Advancing a device generation is a scope-wide effect, but sharers
+        // retire independently and each holds an enrollment snapshot of that
+        // same generation. If one sharer's retirement advanced the generation,
+        // every remaining sharer's snapshot would become stale through no act
+        // of its own, and its evidence could never match. Shared custody and
+        // scope-wide generation advance are therefore mutually exclusive.
+        if conflict == ConflictMode::Shared
+            && evidence
+                .iter()
+                .any(|rule| rule.device_generation() == DeviceGenerationEffect::AdvanceOne)
+        {
+            return Err(DomainCatalogError::SharedClaimAdvancesGeneration);
+        }
         for rule in evidence {
             if let Some(prerequisite) = rule.prerequisite()
                 && !kinds.contains(&prerequisite)
@@ -956,6 +1058,7 @@ impl DomainCatalogBuilder {
                 kind,
                 credit_class,
                 scope,
+                conflict,
                 evidence: evidence.to_vec(),
             },
         );
@@ -1123,6 +1226,7 @@ fn catalog_digest(
         hasher.update(kind.get().to_le_bytes());
         hasher.update(rule.credit_class().get().to_le_bytes());
         hasher.update([rule.scope().tag()]);
+        hasher.update([rule.conflict().tag()]);
         hasher.update((rule.evidence.len() as u64).to_le_bytes());
         for evidence in &rule.evidence {
             hasher.update(evidence.kind().get().to_le_bytes());

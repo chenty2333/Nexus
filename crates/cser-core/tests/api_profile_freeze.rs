@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use cser_core::{
-    AGENT_COMPONENT_DMA, AGENT_COMPONENT_REPLY, AGENT_OPERATION_COMPOSITE,
-    CSER_CORE_API_PROFILE_VERSION, DEVICE_CLAIM_PINNED_PAGE, DEVICE_DOMAIN,
-    DMA_ARENA_REUSE_COMPOSITE, EvidenceCapability, EvidenceRecovery, JOURNAL_CORE_API_PROFILE,
-    JOURNAL_MAGIC, JOURNAL_SCHEMA_VERSION, NORMALIZED_TRACE_VERSION, PROJECTION_VERSION,
-    RECOVERY_SNAPSHOT_VERSION, REPLY_CLAIM_PUBLICATION_SLOT, REPLY_DOMAIN,
-    STANDARD_CATALOG_VERSION, standard_catalog,
+    AGENT_COMPONENT_DMA, AGENT_COMPONENT_REPLY, AGENT_OPERATION_COMPOSITE, ConflictMode,
+    CSER_CORE_API_PROFILE_VERSION, DEVICE_CLAIM_IOVA, DEVICE_CLAIM_PINNED_PAGE,
+    DEVICE_CLAIM_QUEUE_SLOT, DEVICE_DOMAIN, DMA_ARENA_REUSE_COMPOSITE, EvidenceCapability,
+    EvidenceRecovery, JOURNAL_CORE_API_PROFILE, JOURNAL_MAGIC, JOURNAL_SCHEMA_VERSION,
+    NORMALIZED_TRACE_VERSION, PROJECTION_VERSION, RECOVERY_SNAPSHOT_VERSION,
+    REPLY_CLAIM_PUBLICATION_SLOT, REPLY_DOMAIN, STANDARD_CATALOG_VERSION, standard_catalog,
 };
 
 #[test]
@@ -40,11 +40,35 @@ fn semantic_api_profile_two_freezes_journal_and_domain_catalog() {
     assert_eq!(
         catalog.digest().bytes(),
         [
-            0x5d, 0xb1, 0xd6, 0x89, 0x66, 0xf8, 0x22, 0x7e, 0x26, 0xaf, 0x6a, 0xbc, 0x06, 0x98,
-            0x43, 0xfd, 0xe3, 0x58, 0x2b, 0x12, 0x9a, 0x0f, 0xec, 0x67, 0x22, 0x81, 0xf8, 0x8d,
-            0x72, 0x8f, 0x53, 0xd8,
+            0x20, 0x32, 0x90, 0xd2, 0x13, 0x54, 0xb4, 0x1c, 0x40, 0xe6, 0x78, 0x15, 0x9d, 0x97,
+            0x7e, 0xe7, 0xbc, 0x81, 0x17, 0x5b, 0xd2, 0x72, 0x64, 0x85, 0x04, 0x92, 0x53, 0x8e,
+            0xc9, 0xa9, 0x4b, 0x5c,
         ]
     );
+}
+
+/// Every standard claim class must declare exclusive conflict, because each one
+/// names a coordinate a single custodian may hold: a reply publication slot, one
+/// queue slot, one pinned page, one IOVA mapping. Shared custody exists in the
+/// admission algebra for domains that need it, but silence in the standard
+/// profile must continue to mean exclusion.
+#[test]
+fn semantic_api_profile_two_freezes_exclusive_conflict_for_every_standard_class() {
+    let catalog = standard_catalog();
+    for (domain, kind) in [
+        (REPLY_DOMAIN, REPLY_CLAIM_PUBLICATION_SLOT),
+        (DEVICE_DOMAIN, DEVICE_CLAIM_QUEUE_SLOT),
+        (DEVICE_DOMAIN, DEVICE_CLAIM_PINNED_PAGE),
+        (DEVICE_DOMAIN, DEVICE_CLAIM_IOVA),
+    ] {
+        assert_eq!(
+            catalog
+                .claim_rule(domain, kind)
+                .expect("every standard claim class must remain catalog-bound")
+                .conflict(),
+            ConflictMode::Exclusive,
+        );
+    }
 }
 
 /// The evidence capability classification is part of the frozen catalog contract,
