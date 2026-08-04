@@ -410,6 +410,91 @@ impl EvidenceSubjectBinding {
     }
 }
 
+/// Which custody question one evidence kind can answer.
+///
+/// The two capabilities are independent, and neither implies the other. Device
+/// reset, IRQ drain, and IOTLB invalidation establish that a provider will not
+/// touch a resource again while saying nothing about whether an earlier DMA
+/// write succeeded. An idempotency-keyed remote receipt establishes the
+/// external outcome while establishing no quiescence, because the endpoint may
+/// still retry.
+///
+/// This is a property of one (claim class, evidence kind) pair under a declared
+/// failure model, not a label on an endpoint: the same endpoint may expose
+/// different capabilities for different operations, and the evidence may
+/// originate from the endpoint, a kernel custodian, a device reset protocol, or
+/// a third-party verifier.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EvidenceCapability {
+    /// Establishes what the external operation did, not that access has ceased.
+    ///
+    /// Sufficient to settle a logical obligation. Never sufficient on its own
+    /// to permit conflicting reuse of a physical resource.
+    Outcome,
+    /// Establishes that the provider will not access the resource again.
+    ///
+    /// Sufficient to retire a physical claim and permit generation reuse. Never
+    /// sufficient on its own to decide the logical outcome.
+    Quiescence,
+}
+
+impl EvidenceCapability {
+    pub(crate) const fn tag(self) -> u8 {
+        match self {
+            Self::Outcome => 1,
+            Self::Quiescence => 2,
+        }
+    }
+
+    /// Returns whether this capability can retire a physical claim.
+    pub const fn permits_reuse(self) -> bool {
+        matches!(self, Self::Quiescence)
+    }
+
+    /// Returns whether this capability can settle a logical obligation.
+    pub const fn settles_outcome(self) -> bool {
+        matches!(self, Self::Outcome)
+    }
+}
+
+/// Whether evidence remains obtainable after every admitted crash window.
+///
+/// A claim whose only evidence is lost when the observer dies can never retire,
+/// so this is a safety-relevant catalog property rather than a quality of
+/// service. The distinction is recoverable obtainability, not the transport:
+/// a one-shot push that the sender persists and retransmits until durable
+/// acknowledgement is recoverable, while a queryable endpoint that forgets the
+/// operation across its own restart is not.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EvidenceRecovery {
+    /// The verifier can re-obtain the fact after any admitted crash.
+    ///
+    /// Queryable by durable operation identity, retransmitted by the sender
+    /// until durable acknowledgement, or reconstructible from local durable
+    /// state.
+    Recoverable,
+    /// The fact is observable at most once and is lost if that window is missed.
+    ///
+    /// A claim resting only on ephemeral evidence must declare a conservative
+    /// disposition, because a crash inside the observation window leaves no
+    /// path to retirement.
+    Ephemeral,
+}
+
+impl EvidenceRecovery {
+    pub(crate) const fn tag(self) -> u8 {
+        match self {
+            Self::Recoverable => 1,
+            Self::Ephemeral => 2,
+        }
+    }
+
+    /// Returns whether the fact survives an admitted crash window.
+    pub const fn survives_crash(self) -> bool {
+        matches!(self, Self::Recoverable)
+    }
+}
+
 /// Whether accepting a receipt may advance one device generation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DeviceGenerationEffect {
@@ -439,6 +524,8 @@ pub struct EvidenceRule {
     strictly_advanced: FreshnessAxes,
     device_generation: DeviceGenerationEffect,
     prerequisite: Option<EvidenceKindId>,
+    capability: EvidenceCapability,
+    recovery: EvidenceRecovery,
 }
 
 impl EvidenceRule {
@@ -461,7 +548,19 @@ impl EvidenceRule {
             strictly_advanced: FreshnessAxes::NONE,
             device_generation: DeviceGenerationEffect::None,
             prerequisite: None,
+            capability: EvidenceCapability::Outcome,
+            recovery: EvidenceRecovery::Recoverable,
         }
+    }
+
+    /// Declares that this logical evidence is observable at most once.
+    ///
+    /// A claim class whose evidence is ephemeral cannot guarantee retirement
+    /// across a crash inside the observation window, so the catalog records the
+    /// weaker capability rather than letting the failure model stay implicit.
+    pub const fn ephemeral(mut self) -> Self {
+        self.recovery = EvidenceRecovery::Ephemeral;
+        self
     }
 
     /// Creates a retirement requirement for an exactly enrolled subject.
@@ -491,6 +590,8 @@ impl EvidenceRule {
             strictly_advanced,
             device_generation,
             prerequisite,
+            capability: EvidenceCapability::Quiescence,
+            recovery: EvidenceRecovery::Recoverable,
         }
     }
 
@@ -537,6 +638,16 @@ impl EvidenceRule {
     /// Returns the evidence class which must already be accepted.
     pub const fn prerequisite(self) -> Option<EvidenceKindId> {
         self.prerequisite
+    }
+
+    /// Returns which custody question this evidence class can answer.
+    pub const fn capability(self) -> EvidenceCapability {
+        self.capability
+    }
+
+    /// Returns whether the fact survives an admitted crash window.
+    pub const fn recovery(self) -> EvidenceRecovery {
+        self.recovery
     }
 }
 
@@ -600,6 +711,25 @@ pub enum DomainCatalogError {
     InvalidFreshnessRelation,
     /// A device-generation advance is not exact or not device-scoped.
     InvalidDeviceGenerationEffect,
+    /// An evidence capability contradicts its subject binding.
+    ///
+    /// Quiescence must be bound to an exactly enrolled physical generation,
+    /// because permitting reuse requires knowing which incarnation of the
+    /// resource has fallen silent. Outcome evidence must be bound to the
+    /// logical effect, because settlement is a fact about the operation rather
+    /// than about a resource generation.
+    InvalidEvidenceCapability,
+    /// A claim class admits reuse but declares no quiescence evidence.
+    ///
+    /// Outcome evidence alone never establishes that a provider has stopped
+    /// touching a resource, so a reusable physical claim resting only on
+    /// outcome evidence would permit conflicting reuse without custody.
+    MissingQuiescenceEvidence,
+    /// A physical claim class rests on evidence lost across a crash window.
+    ///
+    /// Such a claim cannot guarantee retirement, so the catalog refuses it
+    /// rather than admitting an obligation with no durable path to discharge.
+    UnrecoverableRetirementEvidence,
     /// Verifier observations omit the mandatory boot/Registry/journal floor.
     InsufficientObservationFreshness,
     /// A claim names an unregistered conserved credit class.
@@ -763,6 +893,39 @@ impl DomainCatalogBuilder {
             {
                 return Err(DomainCatalogError::InvalidDeviceGenerationEffect);
             }
+            // Capability and subject binding are two views of one fact: reuse
+            // admission needs the exact retired generation, while settlement
+            // needs the logical effect. A rule which mixes them would let one
+            // custody question be answered with evidence about the other.
+            let capability_matches_subject = match rule.subject() {
+                EvidenceSubjectBinding::LogicalEffect => {
+                    rule.capability() == EvidenceCapability::Outcome
+                }
+                EvidenceSubjectBinding::EnrolledGeneration(_) => {
+                    rule.capability() == EvidenceCapability::Quiescence
+                }
+            };
+            if !capability_matches_subject {
+                return Err(DomainCatalogError::InvalidEvidenceCapability);
+            }
+            // A physical claim whose only evidence is observable once has no
+            // path to retirement if the observer dies inside that window. The
+            // claim would be conserved forever, so the catalog refuses it.
+            if rule.capability() == EvidenceCapability::Quiescence
+                && !rule.recovery().survives_crash()
+            {
+                return Err(DomainCatalogError::UnrecoverableRetirementEvidence);
+            }
+        }
+        // A device-scoped claim names a physical resource whose reuse must be
+        // gated, so its evidence conjunction must contain at least one
+        // quiescence fact. Outcome evidence cannot substitute.
+        if scope == ClaimScopePolicy::Device
+            && !evidence
+                .iter()
+                .any(|rule| rule.capability().permits_reuse())
+        {
+            return Err(DomainCatalogError::MissingQuiescenceEvidence);
         }
         for rule in evidence {
             if let Some(prerequisite) = rule.prerequisite()
@@ -977,6 +1140,8 @@ fn catalog_digest(
                     .unwrap_or(0)
                     .to_le_bytes(),
             );
+            hasher.update([evidence.capability().tag()]);
+            hasher.update([evidence.recovery().tag()]);
         }
     }
     hasher.update([0xfd]);

@@ -25,7 +25,7 @@ extern crate std;
 pub const CSER_CORE_API_PROFILE_VERSION: u16 = 2;
 
 /// Frozen standard catalog format used by semantic API profile 2.
-pub const STANDARD_CATALOG_VERSION: u16 = 5;
+pub const STANDARD_CATALOG_VERSION: u16 = 6;
 
 /// Frozen deterministic projection format used by semantic API profile 2.
 pub const PROJECTION_VERSION: u16 = 6;
@@ -49,8 +49,9 @@ pub mod std_support;
 pub use domain::{
     AdoptionPolicy, ClaimCardinality, ClaimRule, ClaimScopePolicy, CompositeComponentSpec,
     CompositeRule, CreditRule, DeviceGenerationEffect, DomainCatalog, DomainCatalogBuilder,
-    DomainCatalogError, EvidenceRule, EvidenceSubjectBinding, FreshnessAxes, ObligationPolicy,
-    ObligationReceipts, ObligationRule, ObligationSpec, ReceiptBinding,
+    DomainCatalogError, EvidenceCapability, EvidenceRecovery, EvidenceRule, EvidenceSubjectBinding,
+    FreshnessAxes, ObligationPolicy, ObligationReceipts, ObligationRule, ObligationSpec,
+    ReceiptBinding,
 };
 pub use engine::{
     AuthorityState, ChargeProjection, ClaimCustodian, ClaimProjection, ClaimScope, ClaimUseError,
