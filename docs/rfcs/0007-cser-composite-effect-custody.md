@@ -1,10 +1,11 @@
 # RFC 0007: CSER composite effect custody
 
-- Status: **Accepted and clean-sealed for profile-2 software and the bounded
-  QEMU protocol at candidate `e8190f4`; physical hardware remains open**
+- Status: **Historical accepted catalog-v5 baseline, clean-sealed at candidate
+  `e8190f4`; catalog semantics are amended by RFC 0008**
 - Decision date: 2026-07-30
 - Evidence update: 2026-07-31
 - Predecessor: [RFC 0006](0006-cser-core-semantic-rebaseline.md)
+- Successor amendment: [RFC 0008](0008-cser-catalog-v6-evidence-and-conflict-amendment.md)
 - Frozen predecessor coordinates: **core profile 1, journal schema 5,
   standard catalog v4, and projection v5**
 - New coordinates: **core profile 2, journal schema 6, standard catalog v5,
@@ -129,7 +130,7 @@ The current software evidence establishes:
 - the static production cutover gate finds one profile-2 Registry and no live
   profile-1 fallback, merge, or dual-write path.
 
-The current QEMU evidence separately establishes:
+The RFC 0007 catalog-v5 QEMU evidence separately established:
 
 - a negative boot in which the trusted TPM candidate selects the pinned
   schema-5 journal, pre-replay quarantine completes, and recovery returns typed
@@ -181,9 +182,10 @@ the separate C4/H-01..H-06 hardware gate.
   been discharged.
 - **Reuse permit**: a one-shot, generation-bound authorization to activate a
   new resource generation after the exact prior generation is locally safe.
-  It binds the successor claim, catalog, old-generation retirement digest, and
-  the kernel/provider contract which gives the opaque resource physical
-  meaning.
+  Its authority is the durable pending-reuse reservation and exact activation
+  match, not possession of an in-memory token alone. It binds the successor
+  claim, catalog, old-generation retirement digest, and the kernel/provider
+  contract which gives the opaque resource physical meaning.
 - **Persistent DMA arena**: a boot-reserved fixed guest-coordinate arena whose
   CSER claim generations can be reconstructed before general allocation or
   device activation.
@@ -344,9 +346,18 @@ state.
 
 ## Claim conservation and partial discharge
 
-A claim belongs to exactly one `(EffectId, ComponentId, ClaimId)` and one
-resource generation. For a given generation it is created once, moved between
-declared custodians without copying, and discharged once.
+A claim belongs to exactly one `(EffectId, ComponentId, ClaimId)` and names one
+opaque `(ResourceId, ResourceGeneration)` coordinate. For a given claim it is
+created once, moved between declared custodians without copying, and discharged
+once. The current custodian is explicit and may change only through such a
+custody transition.
+
+Conflict is evaluated only among live claims naming the same opaque coordinate.
+Different `ResourceId` values are not presumed non-aliasing by the core; their
+physical-overlap exclusion belongs to the provider or hardware gate. `Shared`
+is compatible only with `Shared` at that coordinate; `Exclusive` excludes every
+additional custodian. Credits intentionally count each live custody obligation,
+including every sharer, rather than deduplicating physical occupancy.
 
 ```text
 ClaimState =
@@ -363,6 +374,15 @@ parent effect and non-terminal components remain discoverable. Discharging a
 claim releases its conserved capacity only after its domain rule and the active
 production profile's custody boundary are satisfied; it does not delete the old
 identity or generation high-water.
+
+Evidence-backed retirement and pre-escape abort share this last-custodian
+conservation rule but are not the same terminal operation. Retirement removes
+the exact estate or component reverse-index entry and makes a coordinate
+reusable only when both index populations are empty. A composite abort before
+any component escapes instead cleans up uncommitted enrollment: it may remove
+an original generation-one coordinate or roll a pending reuse reservation back
+to the prior retired generation. Abort is not evidence-backed retirement and
+does not imply that an escaped external effect has been settled.
 
 For the initial reply-plus-DMA composite profile, the intended progression is
 permitted but not forced:
@@ -406,7 +426,7 @@ For resource `r` and old generation `g`, profile 2 may durably reserve generatio
 CoreReuseAllowed(r, g, g + 1) :=
     ExactClaim(r, g).state in { Discharged, Tombstone }
     and RequiredEvidenceAccepted(ExactClaim(r, g))
-    and NoLiveClaimForResourceId(r)
+    and NoLiveClaimForCoordinate(r, g)
     and ResourceHighWater(r) == g
     and RecoveryCheckpointComplete
     and ScopeNotQuarantined(r)
@@ -415,12 +435,14 @@ CoreReuseAllowed(r, g, g + 1) :=
 ```
 
 Generation arithmetic never wraps or skips. The portable core's reverse index
-prevents two live claims for the same opaque `ResourceId`; it does not infer
-whether two different identifiers alias one physical extent. The current QEMU
-profile avoids that stronger problem by using one fixed, globally withheld
-arena layout. Physical alias exclusion is a separate hardware gate.
+enforces the catalog's `Shared`/`Exclusive` compatibility rule among live
+claims at one opaque `(ResourceId, ResourceGeneration)` coordinate; it does
+not infer whether two different identifiers alias one physical extent. The
+current QEMU profile avoids that stronger problem by using one fixed, globally
+withheld arena layout. Physical alias exclusion is a separate hardware gate.
 
-The durable reservation and its linear `ReusePermit` jointly bind:
+The durable `PendingReuse` reservation is the authoritative one-shot state.
+Activation must exactly match it and the presented `ReusePermit` on:
 
 ```text
 effect and component
@@ -433,7 +455,10 @@ catalog-bound digest of all accepted old-generation retirement evidence
 kernel/provider reuse-contract digest for the concrete resource interpretation
 ```
 
-The permit is consumed once by reserve/activate. Failed activation leaves the
+The public permit is non-cloneable and consumed by move, which prevents ordinary
+caller mistakes. That type property is not the authority boundary: a forged,
+stale, duplicated, or mismatched value still fails unless the durable
+`PendingReuse` reservation matches every field. Failed activation leaves the
 new generation reserved or quarantined; it never reactivates the old
 generation. An old-generation command or evidence value cannot mutate or
 authorize generation `g + 1`.
@@ -825,7 +850,7 @@ quiescence.
 
 ### C0: specification and independent model
 
-Current status: **accepted at clean candidate C**.
+Historical RFC 0007 status: **accepted at clean candidate C**.
 
 - accept this RFC and the profile-2 acceptance matrix;
 - define the composite catalog and stable oracle/core projection mapping;
@@ -838,7 +863,7 @@ not authorize a production or physical-resource claim.
 
 ### C1: portable profile-2 core and schema 6
 
-Current status: **accepted at clean candidate C**.
+Historical RFC 0007 status: **accepted at clean candidate C**.
 
 - implement the parent/component state model and reverse indexes;
 - implement resource-local discharge, tombstones, and reuse permits;
@@ -853,7 +878,7 @@ pairing.
 
 ### C2: one-effect production reply and DMA
 
-Current status: **accepted at clean candidate C**.
+Historical RFC 0007 status: **accepted at clean candidate C**.
 
 - create one effect from one real operation;
 - bind reply outbox and queue/DMA work to separate components of that effect;
@@ -867,7 +892,7 @@ remains.
 
 ### C3: persistent arena and QEMU generation reuse
 
-Current status: **accepted for the bounded QEMU protocol at clean candidate
+Historical RFC 0007 status: **accepted for the bounded QEMU protocol at clean candidate
 C**.
 
 - reserve and recover exact guest PFN/IOVA leases before normal allocation;

@@ -3,11 +3,14 @@
 This is the short technical statement of the accepted `v0.1.0` Causally Scoped
 Effect Revocation (CSER) work. The release claims and evidence below remain
 immutable historical material. For current engineering semantics,
-[RFC 0006](rfcs/0006-cser-core-semantic-rebaseline.md) is authoritative;
-conflicting roadmap, phase, Registry, and compatibility statements in this
-page, [VISION.md](../VISION.md), [NARRATIVE.md](../NARRATIVE.md), and
-[ARCHITECTURE.md](../ARCHITECTURE.md) are **Superseded**. Those documents do
-not override RFC 0006 or describe the current production closure.
+[RFC 0006](rfcs/0006-cser-core-semantic-rebaseline.md), as amended by
+[RFC 0008](rfcs/0008-cser-catalog-v6-evidence-and-conflict-amendment.md), is
+authoritative. [RFC 0007](rfcs/0007-cser-composite-effect-custody.md) is the
+historical catalog-v5 composite-custody baseline. Conflicting roadmap, phase,
+Registry, and compatibility statements in this page, [VISION.md](../VISION.md),
+[NARRATIVE.md](../NARRATIVE.md), and [ARCHITECTURE.md](../ARCHITECTURE.md) are
+**Superseded**. Those documents do not override RFC 0006 plus RFC 0008 or
+describe the current production closure.
 
 ## The problem
 
@@ -96,6 +99,8 @@ The complete claim ledger, including every explicit non-claim, is
 
 RFC 0001, RFC 0005, and their phase numbering are historical inputs to
 [RFC 0006](rfcs/0006-cser-core-semantic-rebaseline.md), not the active roadmap.
+RFC 0007 records the historical catalog-v5 composite-custody baseline; RFC
+0008 is the active catalog-v6 amendment.
 The implemented rebaseline uses `cser-core` as the portable semantic owner,
 an independent safe-Rust oracle, domain-defined reply and DMA obligations and
 claims, a versioned journal, ATA PIO journal/outbox providers, TPM2 NV

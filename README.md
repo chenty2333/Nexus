@@ -72,7 +72,7 @@ kernel, service, resource, and device map is
 | Track | Status | Meaning |
 | --- | --- | --- |
 | `v0.1.0` | Published, archived research artifact | Bounded CSER composition with reproducible models, implementation slices, and receipts |
-| Current `main` | CSER Core Rebaseline sealed | Portable core, persistent recovery, reply/DMA recovery, and the single production Registry cutover are bound to C3 `16e87b0` by clean local and exact-C3 CI four-boot receipts recorded in the release ledger |
+| Current development branch | Catalog-v6 development result | RFC 0006's portable core and RFC 0008's evidence/conflict amendment are exercised by a four-boot QEMU development proof; the current dirty-tree receipt is explicitly non-sealable, not a release seal |
 | Production system | Not established | The `cser-production` profile is a bounded QEMU research path, not a hardware-general, SMP, availability, or production-readiness result |
 | Paper | None peer reviewed | `NARRATIVE.md` is a technical research account; the Zenodo object is software and reproducibility evidence |
 
@@ -99,8 +99,10 @@ complete evidence and non-claim ledger is [NARRATIVE.md](NARRATIVE.md).
 
 ### Current research line
 
-Post-release work now follows
-[RFC 0006](docs/rfcs/0006-cser-core-semantic-rebaseline.md). The live kernel
+Post-release work follows [RFC 0006](docs/rfcs/0006-cser-core-semantic-rebaseline.md),
+as amended by [RFC 0008](docs/rfcs/0008-cser-catalog-v6-evidence-and-conflict-amendment.md).
+[RFC 0007](docs/rfcs/0007-cser-composite-effect-custody.md) is the historical
+catalog-v5 composite-custody baseline. The live kernel
 default is the single `cser-production` profile: one recovered portable-core
 owner is shared by the stateless `NXP3` portal, the `core-v1` supervisor, and
 the reply and DMA adapters. The old live Registry, portal glue, supervisor
@@ -119,16 +121,26 @@ reply outbox, and swtpm state, with device quarantine established before
 replay. Those focused schemes provide domain evidence; they are not alternate
 production Registries and do not introduce live dual-write.
 
-The final C3 clean local and exact-C3 CI receipts show initial commit and
-retained claims, a second service crash after durable reply apply intent,
-reconciliation without a second intent and final settlement, a stable
-repeated-recovery boot, service/binding generations `1/1` through `4/4`, and
-increasing boot, journal, and device freshness. Earlier exact-CI candidates
-exposed two swtpm 0.7.3 capability gaps and loss of QEMU's Unix ancillary data
-socket before the first production guest. C3 limits the label/AppArmor opt-out
-to the caller-UID/GID, network-none persistent QEMU guest-run container; host
-swtpm remains outside it, and the exact-C3 runner used a non-root caller. Both
-C3 seals passed and their exact records are retained in the release ledger.
+The current catalog-v6 development receipt records four fresh QEMU boots, exact
+generation `1 -> 2` reuse, stable repeated recovery, and zero retained claims
+at boot 4. It is deliberately `NONSEALABLE` because it binds the dirty
+development tree rather than a committed release revision; it is an execution
+result, not a release seal. Earlier C3 clean local and exact-C3 CI receipts,
+including their swtpm and Docker/AppArmor negative records, remain historical
+release evidence in the ledger.
+
+A separate tool-plus-DMA experiment now pairs a durable, idempotency-keyed host
+tool endpoint with the real guest VirtIO/IRQ/IOMMU path. The same seven semantic
+crash cutpoints run against CSER and a strongest workload-specific baseline of
+two independent durable finalizers. Both arms recover all seven rows to two
+evidence retirements and zero terminal retained claims. This bounded result does
+not show a safety advantage over that baseline; it establishes the adapter and
+comparison method. Elapsed reconciliation delay, contention-driven gate
+rejections, permanent retention, and administrative disposition remain
+unmeasured rather than being reported as zero. The endpoint capability census
+is [docs/research/cser-endpoint-evidence-census.md](docs/research/cser-endpoint-evidence-census.md),
+and the runner contract is
+[kernel/nexus-ostd/tools/cser-experiment/README.md](kernel/nexus-ostd/tools/cser-experiment/README.md).
 
 Every such receipt remains bounded to one-vCPU QEMU/TCG and swtpm. It does not
 establish physical TPM anti-rollback, physical power-loss behavior,

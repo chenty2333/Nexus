@@ -100,8 +100,10 @@ otherwise act.
 - **Causal estate**: a kernel-owned post-mortem owner for obligations whose
   originating incarnation can no longer act.
 - **Resource claim**: typed ownership and accounting for a concrete resource
-  such as a queue slot, reply slot, pinned page, DMA mapping, IOVA, or device
-  generation.
+  coordinate `(ResourceId, ResourceGeneration)`, such as a queue slot, reply
+  slot, pinned page, DMA mapping, IOVA, or device generation. `ResourceId` is
+  opaque: deciding whether two different identifiers alias one physical extent
+  remains a provider or hardware gate.
 - **Custodian**: the kernel or adapter that physically holds or controls a
   claimed resource. Custody does not change causal or charge ownership.
 - **Charge owner**: the scope or estate against which retained capacity and
@@ -139,9 +141,11 @@ Every implementation profile must preserve all of the following:
 6. **SingleDisposition**: each obligation has at most one accepted terminal
    disposition, including across duplicate calls, stale replies, revoke races,
    repeated crashes, and replay.
-7. **ClaimConservation**: typed resource claims are moved, split only according
-   to their declared class, retained, or released; they are never copied or
-   returned before retirement.
+7. **ClaimConservation**: every live typed claim remains bound to one exact
+   resource generation and one current custodian. Custody may move through an
+   explicit transition, but a claim is never copied or returned before its
+   required retirement. `Shared` coordinates intentionally charge each live
+   custodian's obligation; credit is not deduplicated physical occupancy.
 8. **EvidenceBeforeReuse**: reset acknowledgement, IRQ drain, IOTLB completion,
    and any domain-specific retirement proof happen before the protected
    hardware generation, IOVA, page, or queue slot can be reused.
@@ -275,7 +279,10 @@ Registry.
 Domains may define obligation and claim classes without defining an alternate
 lifecycle. Each class definition has a stable `class_id`, a schema version, its
 legal claim set, conservation rule, commit point, allowed settlement actions,
-required retirement evidence, and conservative unknown-evidence disposition.
+and required retirement evidence. Evidence rules declare whether they establish
+logical outcome or physical quiescence, and whether they remain recoverable
+after an admitted crash; those declarations are digest-bound catalog input, not
+an alternate runtime outcome state machine.
 
 Examples include:
 
@@ -301,9 +308,13 @@ The portable interface must not expose any of the following escape hatches:
 - a domain-specific recovery path that bypasses the same gates used by normal
   execution.
 
-A domain verifier converts exact external receipts into typed retirement
-evidence. Unsupported or unknown evidence keeps the corresponding claims
-retained and applies quota/backpressure. It never defaults to success.
+A domain verifier converts exact external receipts into typed evidence. In v6,
+unsupported or unknown evidence is a core-wide fail-closed condition: it keeps
+the corresponding claims and charges retained, cannot authorize reuse, and
+never defaults to success. Automatic claim retirement requires recoverable
+quiescence evidence. Ephemeral evidence can classify an endpoint, but cannot
+create an automatic safe-release fallback; contracts without such a path are
+rejected or remain outside automatic CSER retirement.
 
 ## Adapter, persistence, and oracle boundaries
 
