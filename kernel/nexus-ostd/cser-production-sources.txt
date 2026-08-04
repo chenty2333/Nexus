@@ -5,6 +5,7 @@ core_persistent_runtime.rs
 core_pio_journal.rs
 core_portal_vnext.rs
 core_production_registry.rs
+core_qemu_persistent_boot.rs
 core_reboot.rs
 core_reply_adapter.rs
 core_reply_outbox.rs

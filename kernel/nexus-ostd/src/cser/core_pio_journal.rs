@@ -627,6 +627,39 @@ struct ActiveImage {
     bytes: Vec<u8>,
 }
 
+/// A self-contained durable record selected by the ATA double-bank protocol.
+///
+/// This is intentionally not a CSER journal record.  Experiments can use the
+/// exact same PIO, flush, and readback path to persist a small independent
+/// state machine without acquiring `Engine` or `JournalRecord` authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AtaDoubleBankSnapshot {
+    revision: u64,
+    digest: [u8; 32],
+    bytes: Vec<u8>,
+}
+
+impl AtaDoubleBankSnapshot {
+    pub(crate) const fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub(crate) const fn digest(&self) -> [u8; 32] {
+        self.digest
+    }
+
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+/// Error from the experiment-only raw-record durability facade.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum AtaDoubleBankError<E> {
+    Banked(BankedJournalError<E>),
+    RevisionMismatch { expected: u64, supplied: u64 },
+}
+
 #[derive(Debug)]
 struct BankedJournal<B> {
     backend: B,
@@ -794,6 +827,41 @@ where
         }
     }
 
+    /// Like `read_active`, but treats a malformed lone bank as corruption
+    /// rather than an uninitialized medium.  A valid old bank plus a torn
+    /// inactive update remains recoverable, which is the double-bank crash
+    /// contract; a blank peer gives no such recovery authority.
+    fn read_active_strict(&mut self) -> Result<ActiveImage, BankedJournalError<B::Error>> {
+        let first = self.inspect_bank(0)?;
+        let second = self.inspect_bank(1)?;
+        match (first, second) {
+            (BankInspection::Valid(left), BankInspection::Valid(right)) => {
+                if left.generation > right.generation {
+                    Ok(left)
+                } else if right.generation > left.generation {
+                    Ok(right)
+                } else if left.bytes == right.bytes {
+                    Ok(left)
+                } else {
+                    Err(BankedJournalError::ConflictingGeneration {
+                        generation: left.generation,
+                    })
+                }
+            }
+            (BankInspection::Valid(image), _) | (_, BankInspection::Valid(image)) => Ok(image),
+            (BankInspection::Blank, BankInspection::Blank) => Ok(ActiveImage {
+                bank: None,
+                generation: 0,
+                bytes: Vec::new(),
+            }),
+            (BankInspection::Blank, BankInspection::Invalid)
+            | (BankInspection::Invalid, BankInspection::Blank)
+            | (BankInspection::Invalid, BankInspection::Invalid) => {
+                Err(BankedJournalError::CorruptBankMetadata)
+            }
+        }
+    }
+
     fn inspect_bank(&mut self, bank: u32) -> Result<BankInspection, BankedJournalError<B::Error>> {
         let mut header_sector = [0u8; SECTOR_BYTES];
         self.backend
@@ -910,6 +978,94 @@ impl OstdBootJournal for AtaPioJournal {
 
     fn repair_and_sync(&mut self, repair: JournalRepair) -> Result<(), Self::RecoveryError> {
         self.journal.repair_exact(repair)
+    }
+}
+
+/// Dedicated ATA two-bank cell for experiment state outside the CSER journal.
+///
+/// It owns the selected ATA fixture linearly and publishes `revision` only
+/// after the entire record has been written, flushed, header-published,
+/// flushed, and read back.  The caller supplies an independently calculated
+/// digest; this facade verifies it before and after publication.  A TPM anchor
+/// can therefore compare the same `(revision, digest)` without importing any
+/// CSER journal format.
+#[derive(Debug)]
+pub(crate) struct AtaDoubleBank {
+    banks: BankedJournal<AtaPioDisk>,
+}
+
+impl AtaDoubleBank {
+    pub(crate) fn acquire(
+        fixture: AtaJournalFixture,
+    ) -> Result<Self, AtaDoubleBankError<AtaPioError>> {
+        let disk = AtaPioDisk::acquire(fixture)
+            .map_err(|error| AtaDoubleBankError::Banked(BankedJournalError::Storage(error)))?;
+        let banks = BankedJournal::open(disk).map_err(AtaDoubleBankError::Banked)?;
+        Ok(Self { banks })
+    }
+
+    /// Reads the authoritative record, rejecting a corrupt unpaired bank.
+    pub(crate) fn load(
+        &mut self,
+    ) -> Result<Option<AtaDoubleBankSnapshot>, AtaDoubleBankError<AtaPioError>> {
+        let active = self
+            .banks
+            .read_active_strict()
+            .map_err(AtaDoubleBankError::Banked)?;
+        if active.bank.is_none() {
+            return Ok(None);
+        }
+        let digest: [u8; 32] = Sha256::digest(&active.bytes).into();
+        Ok(Some(AtaDoubleBankSnapshot {
+            revision: active.generation,
+            digest,
+            bytes: active.bytes,
+        }))
+    }
+
+    /// Persists exactly one next revision.  Rollback and skipped revisions are
+    /// rejected locally; an external TPM anchor may additionally reject a raw
+    /// ATA image rolled back to an older, otherwise valid revision.
+    pub(crate) fn publish(
+        &mut self,
+        revision: u64,
+        digest: [u8; 32],
+        bytes: &[u8],
+    ) -> Result<AtaDoubleBankSnapshot, AtaDoubleBankError<AtaPioError>> {
+        let actual_digest: [u8; 32] = Sha256::digest(bytes).into();
+        if actual_digest != digest {
+            return Err(AtaDoubleBankError::Banked(
+                BankedJournalError::ReadbackMismatch,
+            ));
+        }
+        let active = self
+            .banks
+            .read_active_strict()
+            .map_err(AtaDoubleBankError::Banked)?;
+        let expected = active
+            .generation
+            .checked_add(1)
+            .ok_or(AtaDoubleBankError::Banked(
+                BankedJournalError::GenerationExhausted,
+            ))?;
+        if revision != expected {
+            return Err(AtaDoubleBankError::RevisionMismatch {
+                expected,
+                supplied: revision,
+            });
+        }
+        self.banks
+            .publish_next(active.bank, active.generation, bytes)
+            .map_err(AtaDoubleBankError::Banked)?;
+        let snapshot = self.load()?.ok_or(AtaDoubleBankError::Banked(
+            BankedJournalError::ReadbackMismatch,
+        ))?;
+        if snapshot.revision != revision || snapshot.digest != digest || snapshot.bytes != bytes {
+            return Err(AtaDoubleBankError::Banked(
+                BankedJournalError::ReadbackMismatch,
+            ));
+        }
+        Ok(snapshot)
     }
 }
 
@@ -1054,6 +1210,44 @@ mod tests {
             .expect("inject torn header");
 
         assert_eq!(journal.read_all_image().expect("fall back"), b"committed");
+    }
+
+    #[ktest]
+    fn strict_double_bank_rejects_a_lone_corrupt_bank() {
+        let mut journal = journal();
+        let mut corrupt = [0u8; SECTOR_BYTES];
+        corrupt[..8].copy_from_slice(b"not-a-bank");
+        journal
+            .backend_mut()
+            .write_sector(bank_header_lba(0), &corrupt)
+            .expect("inject malformed lone header");
+
+        assert_eq!(
+            journal.read_active_strict(),
+            Err(BankedJournalError::CorruptBankMetadata)
+        );
+    }
+
+    #[ktest]
+    fn strict_double_bank_keeps_a_valid_predecessor_after_torn_successor() {
+        let mut journal = journal();
+        journal
+            .append_exact(b"committed")
+            .expect("publish predecessor");
+        let mut corrupt = [0u8; SECTOR_BYTES];
+        corrupt[..8].copy_from_slice(b"not-a-bank");
+        journal
+            .backend_mut()
+            .write_sector(bank_header_lba(1), &corrupt)
+            .expect("inject malformed inactive header");
+
+        assert_eq!(
+            journal
+                .read_active_strict()
+                .expect("valid predecessor remains authoritative")
+                .bytes,
+            b"committed"
+        );
     }
 
     #[ktest]

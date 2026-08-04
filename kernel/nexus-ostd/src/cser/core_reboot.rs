@@ -782,11 +782,11 @@ mod tests {
         .unwrap();
 
         let active = boot.try_activate().unwrap();
-        let (engine, mut persistence, _devices) = active.into_parts();
+        let (engine, persistence, _devices) = active.into_parts();
         assert_eq!(engine.freshness().boot().get(), 3);
         assert_eq!(engine.freshness().journal().get(), 3);
         assert_eq!(persistence.journal().repairs, 1);
-        assert_eq!(persistence.anchor_mut().reservations, 2);
+        assert_eq!(persistence.anchor().reservations, 2);
     }
 
     #[ktest]

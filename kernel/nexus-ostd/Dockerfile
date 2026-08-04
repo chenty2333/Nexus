@@ -79,6 +79,7 @@ COPY kernel/nexus-ostd/src/cser/core_device_quarantine.rs \
     kernel/nexus-ostd/src/cser/core_pio_journal.rs \
     kernel/nexus-ostd/src/cser/core_portal_vnext.rs \
     kernel/nexus-ostd/src/cser/core_production_registry.rs \
+    kernel/nexus-ostd/src/cser/core_qemu_persistent_boot.rs \
     kernel/nexus-ostd/src/cser/core_reboot.rs \
     kernel/nexus-ostd/src/cser/core_reply_adapter.rs \
     kernel/nexus-ostd/src/cser/core_reply_outbox.rs \
@@ -188,7 +189,10 @@ WORKDIR /work
 
 # Audit the immutable build-stage snapshot with a fresh pinned toolchain. No
 # repository-controlled build step executes in this stage, and both the
-# candidate root and source context are mounted read-only.
+# candidate root and source context are mounted read-only. The manifest is a
+# production-closure allowlist checked by the static cutover assertion; other
+# feature-gated experiment modules may coexist in src/cser without entering
+# this proof digest.
 FROM ${OSDK_IMAGE} AS cser-verifier
 RUN --network=none \
     --mount=type=bind,from=build,source=/,target=/candidate-root,readonly \
@@ -204,13 +208,6 @@ RUN --network=none \
     test ! -L /candidate-root/kernel/nexus-ostd/cser-production-sources.txt; \
     /usr/bin/cmp /expected-kernel/cser-production-sources.txt \
         /candidate-root/kernel/nexus-ostd/cser-production-sources.txt; \
-    /usr/bin/awk -F/ '{ path=""; for (i=1; i<NF; i++) { path=(path=="" ? $i : path "/" $i); print "d " path } print "f " $0 }' \
-        /candidate-root/kernel/nexus-ostd/cser-production-sources.txt \
-        | LC_ALL=C /usr/bin/sort -u > /tmp/nexus-cser-expected; \
-    /usr/bin/find /candidate-root/kernel/nexus-ostd/src/cser \
-        -mindepth 1 -printf '%y %P\n' \
-        | LC_ALL=C /usr/bin/sort > /tmp/nexus-cser-candidate; \
-    /usr/bin/cmp /tmp/nexus-cser-expected /tmp/nexus-cser-candidate; \
     { \
         printf '%s\n' nexus.cser.image-source-proof.v1; \
         /usr/bin/sha256sum \

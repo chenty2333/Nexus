@@ -306,6 +306,344 @@ pub(crate) enum TpmNvAnchorError<E> {
     Protocol(PersistenceProtocolError),
 }
 
+/// The narrow non-CSER selector layout used by the independent baseline.
+///
+/// It intentionally reuses only the tip selector pair from the QEMU fixture;
+/// the experiment and CSER profiles have separate swtpm state directories and
+/// never open this layout concurrently.  It carries no Registry, catalog,
+/// journal, or `Engine` authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ExperimentNvLayout {
+    counter: u32,
+    slots: [u32; 2],
+}
+
+impl ExperimentNvLayout {
+    pub(crate) const fn qemu_fixture() -> Self {
+        Self {
+            counter: 0x0180_0100,
+            slots: [0x0180_0101, 0x0180_0102],
+        }
+    }
+}
+
+/// A durable `(revision, digest)` tip independent of the CSER journal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ExperimentAnchorSnapshot {
+    revision: u64,
+    digest: [u8; 32],
+}
+
+impl ExperimentAnchorSnapshot {
+    pub(crate) const fn new(revision: u64, digest: [u8; 32]) -> Self {
+        Self { revision, digest }
+    }
+
+    pub(crate) const fn revision(self) -> u64 {
+        self.revision
+    }
+
+    pub(crate) const fn digest(self) -> [u8; 32] {
+        self.digest
+    }
+}
+
+/// Failure from the baseline's independent TPM selector protocol.
+#[derive(Debug)]
+pub(crate) enum ExperimentNvAnchorError<E> {
+    Transport(E),
+    ProviderAlreadyOpen,
+    UnexpectedIndexPublic {
+        index: u32,
+        observed_attributes: u32,
+        observed_size: u16,
+    },
+    CounterOverflow {
+        index: u32,
+    },
+    CounterDidNotAdvance {
+        index: u32,
+        expected: u64,
+        observed: u64,
+    },
+    CorruptSelectedSlot {
+        index: u32,
+    },
+    StaleSnapshot,
+}
+
+const EXPERIMENT_SLOT_MAGIC: [u8; 8] = *b"NEXEXPN1";
+const EXPERIMENT_SLOT_VERSION: u16 = 1;
+const EXPERIMENT_SLOT_LEN: usize = TIP_SLOT_LEN;
+const EXPERIMENT_SLOT_BODY_LEN: usize = 64;
+
+/// Single-writer TPM NV anchor for an independent experiment record.
+///
+/// The two slots and counter provide exactly the same write/readback/increment
+/// crash ordering as the CSER provider, but the payload is only a revision and
+/// digest.  In particular, this type never implements `TrustedAnchorBackend`.
+pub(crate) struct ExperimentNvAnchor<T> {
+    transport: Option<T>,
+    layout: ExperimentNvLayout,
+    auth: TpmNvIndexAuth,
+    selector_sequence: u64,
+    snapshot: ExperimentAnchorSnapshot,
+    _exclusive: ExclusiveProviderLease,
+}
+
+impl<T> ExperimentNvAnchor<T>
+where
+    T: TpmNvTransport,
+{
+    /// Opens an existing experiment selector.  This path is deliberately
+    /// strict: a malformed selected slot is damage, never an invitation to
+    /// overwrite the TPM tip as though the medium were blank.
+    pub(crate) fn open(
+        mut transport: T,
+        layout: ExperimentNvLayout,
+        auth: TpmNvIndexAuth,
+    ) -> Result<Self, ExperimentNvAnchorError<T::Error>> {
+        TPM_NV_PROVIDER_OWNED
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .map_err(|_| ExperimentNvAnchorError::ProviderAlreadyOpen)?;
+        let exclusive = ExclusiveProviderLease;
+        validate_experiment_index_publics(&mut transport, layout)?;
+        let sequence = read_counter(&mut transport, layout.counter, &auth)
+            .map_err(map_experiment_tpm_error)?;
+        let selected = layout.slots[(sequence & 1) as usize];
+        let mut bytes = vec![0; EXPERIMENT_SLOT_LEN];
+        transport
+            .read_exact(selected, &auth, &mut bytes)
+            .map_err(ExperimentNvAnchorError::Transport)?;
+        let snapshot = decode_experiment_slot(&bytes, sequence)
+            .ok_or(ExperimentNvAnchorError::CorruptSelectedSlot { index: selected })?;
+        Ok(Self {
+            transport: Some(transport),
+            layout,
+            auth,
+            selector_sequence: sequence,
+            snapshot,
+            _exclusive: exclusive,
+        })
+    }
+
+    /// Initializes an explicitly blank experiment TPM medium.
+    ///
+    /// This is intentionally separate from [`Self::open`].  It accepts only
+    /// selector sequence zero with both slots still unwritten, publishes the
+    /// exact genesis snapshot to the selected slot, and reads it back.  Any
+    /// partially initialized, foreign, or damaged state fails closed.
+    pub(crate) fn initialize_blank(
+        mut transport: T,
+        layout: ExperimentNvLayout,
+        auth: TpmNvIndexAuth,
+        initial: ExperimentAnchorSnapshot,
+    ) -> Result<Self, ExperimentNvAnchorError<T::Error>> {
+        TPM_NV_PROVIDER_OWNED
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .map_err(|_| ExperimentNvAnchorError::ProviderAlreadyOpen)?;
+        let exclusive = ExclusiveProviderLease;
+        validate_experiment_index_publics(&mut transport, layout)?;
+        let sequence = read_counter(&mut transport, layout.counter, &auth)
+            .map_err(map_experiment_tpm_error)?;
+        if sequence != 0 {
+            return Err(ExperimentNvAnchorError::CorruptSelectedSlot {
+                index: layout.slots[(sequence & 1) as usize],
+            });
+        }
+        for slot in layout.slots {
+            let public = transport
+                .read_public(slot)
+                .map_err(ExperimentNvAnchorError::Transport)?;
+            if public.attributes & TPMA_NV_WRITTEN != 0 {
+                return Err(ExperimentNvAnchorError::CorruptSelectedSlot { index: slot });
+            }
+        }
+        let selected = layout.slots[0];
+        let encoded = encode_experiment_slot(sequence, initial);
+        transport
+            .write_exact(selected, &auth, &encoded)
+            .map_err(ExperimentNvAnchorError::Transport)?;
+        let mut observed = vec![0; EXPERIMENT_SLOT_LEN];
+        transport
+            .read_exact(selected, &auth, &mut observed)
+            .map_err(ExperimentNvAnchorError::Transport)?;
+        if observed != encoded {
+            return Err(ExperimentNvAnchorError::CorruptSelectedSlot { index: selected });
+        }
+        Ok(Self {
+            transport: Some(transport),
+            layout,
+            auth,
+            selector_sequence: sequence,
+            snapshot: initial,
+            _exclusive: exclusive,
+        })
+    }
+
+    pub(crate) const fn snapshot(&self) -> ExperimentAnchorSnapshot {
+        self.snapshot
+    }
+
+    #[cfg(ktest)]
+    fn into_transport(mut self) -> T {
+        self.transport
+            .take()
+            .expect("live experiment TPM anchor retains its transport")
+    }
+
+    /// Advances exactly one independent durable revision.
+    pub(crate) fn compare_and_advance(
+        &mut self,
+        expected: ExperimentAnchorSnapshot,
+        replacement: ExperimentAnchorSnapshot,
+    ) -> Result<(), ExperimentNvAnchorError<T::Error>> {
+        if expected != self.snapshot
+            || replacement.revision
+                != expected.revision.checked_add(1).ok_or(
+                    ExperimentNvAnchorError::CounterOverflow {
+                        index: self.layout.counter,
+                    },
+                )?
+        {
+            return Err(ExperimentNvAnchorError::StaleSnapshot);
+        }
+        let next_sequence = self.selector_sequence.checked_add(1).ok_or(
+            ExperimentNvAnchorError::CounterOverflow {
+                index: self.layout.counter,
+            },
+        )?;
+        let slot = self.layout.slots[(next_sequence & 1) as usize];
+        let encoded = encode_experiment_slot(next_sequence, replacement);
+        let transport = self
+            .transport
+            .as_mut()
+            .expect("live experiment TPM anchor retains its transport");
+        transport
+            .write_exact(slot, &self.auth, &encoded)
+            .map_err(ExperimentNvAnchorError::Transport)?;
+        let mut observed = vec![0; EXPERIMENT_SLOT_LEN];
+        transport
+            .read_exact(slot, &self.auth, &mut observed)
+            .map_err(ExperimentNvAnchorError::Transport)?;
+        if observed != encoded {
+            return Err(ExperimentNvAnchorError::CorruptSelectedSlot { index: slot });
+        }
+        transport
+            .increment(self.layout.counter, &self.auth)
+            .map_err(ExperimentNvAnchorError::Transport)?;
+        let observed_sequence = read_counter(transport, self.layout.counter, &self.auth)
+            .map_err(map_experiment_tpm_error)?;
+        if observed_sequence != next_sequence {
+            return Err(ExperimentNvAnchorError::CounterDidNotAdvance {
+                index: self.layout.counter,
+                expected: next_sequence,
+                observed: observed_sequence,
+            });
+        }
+        self.selector_sequence = next_sequence;
+        self.snapshot = replacement;
+        Ok(())
+    }
+}
+
+fn map_experiment_tpm_error<E>(error: TpmNvAnchorError<E>) -> ExperimentNvAnchorError<E> {
+    match error {
+        TpmNvAnchorError::Transport(error) => ExperimentNvAnchorError::Transport(error),
+        TpmNvAnchorError::CounterDidNotAdvance {
+            index,
+            expected,
+            observed,
+        } => ExperimentNvAnchorError::CounterDidNotAdvance {
+            index,
+            expected,
+            observed,
+        },
+        TpmNvAnchorError::CounterOverflow { index } => {
+            ExperimentNvAnchorError::CounterOverflow { index }
+        }
+        _ => ExperimentNvAnchorError::CorruptSelectedSlot { index: 0 },
+    }
+}
+
+fn validate_experiment_index_publics<T>(
+    transport: &mut T,
+    layout: ExperimentNvLayout,
+) -> Result<(), ExperimentNvAnchorError<T::Error>>
+where
+    T: TpmNvTransport,
+{
+    for (index, attributes, size) in [
+        (layout.counter, COUNTER_ATTRIBUTES, 8),
+        (
+            layout.slots[0],
+            SLOT_ATTRIBUTES,
+            u16::try_from(EXPERIMENT_SLOT_LEN).expect("experiment slot length fits u16"),
+        ),
+        (
+            layout.slots[1],
+            SLOT_ATTRIBUTES,
+            u16::try_from(EXPERIMENT_SLOT_LEN).expect("experiment slot length fits u16"),
+        ),
+    ] {
+        let public = transport
+            .read_public(index)
+            .map_err(ExperimentNvAnchorError::Transport)?;
+        if public.index != index
+            || public.name_algorithm != TPM_ALG_SHA256
+            || public.attributes & !TPMA_NV_WRITTEN != attributes
+            || public.authorization_policy != IMMUTABLE_DELETE_POLICY
+            || public.data_size != size
+            || public.attributes & (TPMA_NV_ORDERLY | TPMA_NV_WRITELOCKED | TPMA_NV_READLOCKED) != 0
+        {
+            return Err(ExperimentNvAnchorError::UnexpectedIndexPublic {
+                index,
+                observed_attributes: public.attributes,
+                observed_size: public.data_size,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn encode_experiment_slot(
+    selector_sequence: u64,
+    snapshot: ExperimentAnchorSnapshot,
+) -> [u8; EXPERIMENT_SLOT_LEN] {
+    let mut bytes = [0; EXPERIMENT_SLOT_LEN];
+    bytes[..8].copy_from_slice(&EXPERIMENT_SLOT_MAGIC);
+    bytes[8..10].copy_from_slice(&EXPERIMENT_SLOT_VERSION.to_be_bytes());
+    bytes[16..24].copy_from_slice(&selector_sequence.to_be_bytes());
+    bytes[24..32].copy_from_slice(&snapshot.revision.to_be_bytes());
+    bytes[32..64].copy_from_slice(&snapshot.digest);
+    let checksum: [u8; 32] = Sha256::digest(&bytes[..EXPERIMENT_SLOT_BODY_LEN]).into();
+    bytes[64..96].copy_from_slice(&checksum);
+    bytes
+}
+
+fn decode_experiment_slot(
+    bytes: &[u8],
+    expected_sequence: u64,
+) -> Option<ExperimentAnchorSnapshot> {
+    if bytes.len() != EXPERIMENT_SLOT_LEN
+        || bytes[..8] != EXPERIMENT_SLOT_MAGIC
+        || u16::from_be_bytes(bytes[8..10].try_into().ok()?) != EXPERIMENT_SLOT_VERSION
+        || u64::from_be_bytes(bytes[16..24].try_into().ok()?) != expected_sequence
+        || bytes[10..16].iter().any(|byte| *byte != 0)
+        || bytes[96..].iter().any(|byte| *byte != 0)
+    {
+        return None;
+    }
+    let checksum: [u8; 32] = Sha256::digest(&bytes[..EXPERIMENT_SLOT_BODY_LEN]).into();
+    if bytes[64..96] != checksum {
+        return None;
+    }
+    let revision = u64::from_be_bytes(bytes[24..32].try_into().ok()?);
+    let mut digest = [0; 32];
+    digest.copy_from_slice(&bytes[32..64]);
+    Some(ExperimentAnchorSnapshot { revision, digest })
+}
+
 impl<E> From<PersistenceProtocolError> for TpmNvAnchorError<E> {
     fn from(error: PersistenceProtocolError) -> Self {
         Self::Protocol(error)
@@ -1612,6 +1950,21 @@ mod tests {
                 fail_after_increment: false,
             }
         }
+
+        fn blank_experiment(layout: ExperimentNvLayout) -> Self {
+            let cser_layout = TpmNvLayout::qemu_fixture();
+            let mut value = Self::provision(cser_layout, 0, binding(), freshness(1, 1, 1));
+            let counter = value.entries.get_mut(&layout.counter).unwrap();
+            counter.bytes.copy_from_slice(&0u64.to_be_bytes());
+            counter.initialized = true;
+            for slot in layout.slots {
+                let entry = value.entries.get_mut(&slot).unwrap();
+                entry.bytes.fill(0);
+                entry.initialized = false;
+                entry.public.attributes &= !TPMA_NV_WRITTEN;
+            }
+            value
+        }
     }
 
     impl TpmNvTransport for MockNv {
@@ -1907,5 +2260,58 @@ mod tests {
         let reopened =
             TpmNvTrustedAnchor::open(reopened_transport, layout, auth(), binding()).unwrap();
         assert_eq!(reopened.committed().revision(), 0);
+    }
+
+    #[ktest]
+    fn experiment_anchor_slot_binds_exact_revision_and_digest() {
+        let snapshot = ExperimentAnchorSnapshot::new(7, [0x5a; 32]);
+        let encoded = encode_experiment_slot(19, snapshot);
+        assert_eq!(decode_experiment_slot(&encoded, 19), Some(snapshot));
+        assert_eq!(decode_experiment_slot(&encoded, 18), None);
+    }
+
+    #[ktest]
+    fn experiment_anchor_slot_rejects_torn_payload() {
+        let snapshot = ExperimentAnchorSnapshot::new(7, [0x5a; 32]);
+        let mut encoded = encode_experiment_slot(19, snapshot);
+        encoded[40] ^= 0xff;
+        assert_eq!(decode_experiment_slot(&encoded, 19), None);
+    }
+
+    #[ktest]
+    fn experiment_anchor_recovers_its_independent_revision_and_digest() {
+        let layout = ExperimentNvLayout::qemu_fixture();
+        let transport = MockNv::blank_experiment(layout);
+        let initial = ExperimentAnchorSnapshot::new(0, [0; 32]);
+        let mut anchor = ExperimentNvAnchor::initialize_blank(transport, layout, auth(), initial)
+            .expect("explicit blank experiment fixture initializes the independent tip");
+        assert_eq!(anchor.snapshot(), initial);
+        let replacement = ExperimentAnchorSnapshot::new(1, [0x33; 32]);
+        anchor
+            .compare_and_advance(initial, replacement)
+            .expect("experiment selector advances after write/readback");
+
+        let reopened = ExperimentNvAnchor::open(anchor.into_transport(), layout, auth())
+            .expect("selected experiment slot reopens");
+        assert_eq!(reopened.snapshot(), replacement);
+    }
+
+    #[ktest]
+    fn experiment_anchor_does_not_treat_damaged_media_as_blank() {
+        let layout = ExperimentNvLayout::qemu_fixture();
+        let mut transport = MockNv::blank_experiment(layout);
+        let slot = &mut transport.entries.get_mut(&layout.slots[0]).unwrap();
+        slot.bytes[0] = 0x5a;
+        slot.initialized = true;
+        slot.public.attributes |= TPMA_NV_WRITTEN;
+        assert!(matches!(
+            ExperimentNvAnchor::initialize_blank(
+                transport,
+                layout,
+                auth(),
+                ExperimentAnchorSnapshot::new(0, [0; 32]),
+            ),
+            Err(ExperimentNvAnchorError::CorruptSelectedSlot { .. })
+        ));
     }
 }

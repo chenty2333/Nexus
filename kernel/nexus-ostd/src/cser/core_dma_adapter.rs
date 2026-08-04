@@ -28,12 +28,153 @@ use cser_core::{
     VerifierIdentity,
 };
 use nexus_ostd_virtio::{
-    DeviceSessionIdentity, InterruptCause, InterruptCompletionProgress, InterruptReceipt,
-    NotificationDisposition, PreparationPublishFailure, ProductionClosureProgress,
-    ProductionClosureReceipt, ProductionDevice, ProductionIotlbBeginFailure, ProductionResetAck,
-    PublishedRequest, ReceiptedPreparedRequest,
+    BootQuarantineGuard, DeviceBdf, DeviceSessionIdentity, InterruptCause,
+    InterruptCompletionProgress, InterruptReceipt, NotificationDisposition,
+    PreparationPublishFailure, ProductionClosureProgress, ProductionClosureReceipt,
+    ProductionDevice, ProductionIotlbBeginFailure, ProductionResetAck, PublishedRequest,
+    ReceiptedPreparedRequest,
 };
 use sha2::{Digest as _, Sha256};
+
+/// One experiment-owned device resource coordinate.
+///
+/// This is deliberately raw and independent of `cser_core::ResourceId`: the
+/// baseline can persist and compare exactly the same coordinate without
+/// importing a CSER claim or engine authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ExperimentDmaResource {
+    resource: u64,
+    generation: u64,
+}
+
+impl ExperimentDmaResource {
+    pub(crate) const fn new(resource: u64, generation: u64) -> Option<Self> {
+        if resource == 0 || generation == 0 {
+            None
+        } else {
+            Some(Self {
+                resource,
+                generation,
+            })
+        }
+    }
+
+    pub(crate) const fn resource(self) -> u64 {
+        self.resource
+    }
+
+    pub(crate) const fn generation(self) -> u64 {
+        self.generation
+    }
+}
+
+/// Completed physical quarantine bound to one experiment resource coordinate.
+///
+/// There is intentionally no public constructor.  The only constructor below
+/// consumes observations from a live `BootQuarantineGuard`, whose creation
+/// performed the real PCI fence, status-zero reset, two empty ISR reads, and
+/// completed remapped-IOTLB invalidation.  This is descriptive evidence only:
+/// it grants no queue, DMA, device activation, or CSER retirement authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ExperimentDmaQuiescence {
+    bdf: DeviceBdf,
+    device_scope: u64,
+    resource: ExperimentDmaResource,
+    successor_generation: u64,
+    isr_reads: usize,
+    completed_iotlb_pages: usize,
+}
+
+impl ExperimentDmaQuiescence {
+    pub(crate) const fn device_bdf(self) -> DeviceBdf {
+        self.bdf
+    }
+
+    pub(crate) const fn device_scope(self) -> u64 {
+        self.device_scope
+    }
+
+    pub(crate) const fn resource(self) -> ExperimentDmaResource {
+        self.resource
+    }
+
+    pub(crate) const fn successor_generation(self) -> u64 {
+        self.successor_generation
+    }
+
+    pub(crate) const fn isr_reads(self) -> usize {
+        self.isr_reads
+    }
+
+    pub(crate) const fn completed_iotlb_pages(self) -> usize {
+        self.completed_iotlb_pages
+    }
+}
+
+/// Why a boot-quarantine observation cannot become experiment evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ExperimentDmaQuiescenceError {
+    NonOlderResourceGeneration {
+        resource_generation: u64,
+        successor_generation: u64,
+    },
+    ResetNotObserved,
+    IrqDrainIncomplete,
+    IotlbIncomplete,
+}
+
+/// Binds completed real boot quarantine to one raw experiment resource.
+///
+/// The guard stays retained by the caller, so constructing this receipt cannot
+/// release the device or manufacture ordinary production-device authority.
+pub(crate) fn run_experiment_quiescence(
+    guard: &BootQuarantineGuard,
+    resource: ExperimentDmaResource,
+) -> Result<ExperimentDmaQuiescence, ExperimentDmaQuiescenceError> {
+    let observation = guard.observation();
+    validate_experiment_quiescence(
+        resource.generation,
+        guard.observed_generation(),
+        observation.reset_status_zero(),
+        observation.consecutive_empty_isr_reads(),
+        observation.iotlb_used_remapped_iova(),
+        observation.iotlb_completed_trigger_pages(),
+    )?;
+    Ok(ExperimentDmaQuiescence {
+        bdf: guard.device_bdf(),
+        device_scope: guard.device_scope().get(),
+        resource,
+        successor_generation: guard.observed_generation(),
+        isr_reads: observation.isr_reads(),
+        completed_iotlb_pages: observation.iotlb_completed_trigger_pages(),
+    })
+}
+
+fn validate_experiment_quiescence(
+    resource_generation: u64,
+    successor_generation: u64,
+    reset_status_zero: bool,
+    consecutive_empty_isr_reads: usize,
+    remapped_iotlb: bool,
+    completed_iotlb_pages: usize,
+) -> Result<(), ExperimentDmaQuiescenceError> {
+    if resource_generation >= successor_generation {
+        return Err(ExperimentDmaQuiescenceError::NonOlderResourceGeneration {
+            resource_generation,
+            successor_generation,
+        });
+    }
+    if !reset_status_zero {
+        return Err(ExperimentDmaQuiescenceError::ResetNotObserved);
+    }
+    if consecutive_empty_isr_reads < 2 {
+        return Err(ExperimentDmaQuiescenceError::IrqDrainIncomplete);
+    }
+    if !remapped_iotlb || completed_iotlb_pages == 0 {
+        return Err(ExperimentDmaQuiescenceError::IotlbIncomplete);
+    }
+    Ok(())
+}
 
 /// One durable claim/resource coordinate in a hardware cohort.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1236,7 +1377,6 @@ mod tests {
         JournalGeneration, PrincipalId, REPLY_CLAIM_PUBLICATION_SLOT, RegistryInstance, RootId,
         SnapshotId, TransitionOutput, TransitionReceipt, TxError, standard_catalog,
     };
-    use nexus_ostd_virtio::DeviceBdf;
     use ostd::prelude::ktest;
 
     struct Harness {
@@ -1878,6 +2018,39 @@ mod tests {
         let mut bytes = [0; 32];
         bytes[0] = value;
         Digest::new(bytes)
+    }
+
+    #[ktest]
+    fn experiment_quiescence_rejects_each_missing_hardware_fact() {
+        assert_eq!(
+            validate_experiment_quiescence(1, 2, false, 2, true, 1),
+            Err(ExperimentDmaQuiescenceError::ResetNotObserved)
+        );
+        assert_eq!(
+            validate_experiment_quiescence(1, 2, true, 1, true, 1),
+            Err(ExperimentDmaQuiescenceError::IrqDrainIncomplete)
+        );
+        assert_eq!(
+            validate_experiment_quiescence(1, 2, true, 2, false, 1),
+            Err(ExperimentDmaQuiescenceError::IotlbIncomplete)
+        );
+        assert_eq!(
+            validate_experiment_quiescence(2, 2, true, 2, true, 1),
+            Err(ExperimentDmaQuiescenceError::NonOlderResourceGeneration {
+                resource_generation: 2,
+                successor_generation: 2,
+            })
+        );
+    }
+
+    #[ktest]
+    fn experiment_quiescence_accepts_exact_completed_facts() {
+        assert_eq!(
+            validate_experiment_quiescence(4, 5, true, 2, true, 1),
+            Ok(())
+        );
+        assert_eq!(ExperimentDmaResource::new(0, 1), None);
+        assert_eq!(ExperimentDmaResource::new(1, 0), None);
     }
 
     trait NonZeroId: Sized {

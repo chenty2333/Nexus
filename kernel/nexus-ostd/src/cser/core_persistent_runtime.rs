@@ -32,19 +32,18 @@ use cser_core::{
     ComponentProjection, CompositeEffectProjection, CoordinatedPersistence, CoreError, CoreLimits,
     CustodyState, DEVICE_CLAIM_IOVA, DEVICE_CLAIM_PINNED_PAGE, DEVICE_CLAIM_QUEUE_SLOT,
     DEVICE_DOMAIN, DEVICE_EVIDENCE_IOTLB, DEVICE_EVIDENCE_IRQ_DRAINED, DEVICE_EVIDENCE_RESET,
-    DEVICE_OBLIGATION_DMA, DMA_ARENA_REUSE_COMPOSITE, DeviceGeneration, Digest, EffectEscapeState,
-    EffectId, Engine, JOURNAL_SCHEMA_VERSION, JournalDecodeError, OutcomeState, PROJECTION_VERSION,
-    PrincipalId, PrincipalIncarnation, RECOVERY_SNAPSHOT_VERSION, REPLY_CLAIM_PUBLICATION_SLOT,
-    REPLY_DOMAIN, REPLY_EVIDENCE_PUBLICATION_ACK, REPLY_OBLIGATION_PUBLICATION, RecoveryBinding,
+    DEVICE_OBLIGATION_DMA, DMA_ARENA_REUSE_COMPOSITE, Digest, EffectEscapeState, EffectId, Engine,
+    JOURNAL_SCHEMA_VERSION, OutcomeState, PROJECTION_VERSION, PrincipalId, PrincipalIncarnation,
+    RECOVERY_SNAPSHOT_VERSION, REPLY_CLAIM_PUBLICATION_SLOT, REPLY_DOMAIN,
+    REPLY_EVIDENCE_PUBLICATION_ACK, REPLY_OBLIGATION_PUBLICATION, RecoveryBinding,
     RegistryInstance, ResourceGeneration, ResourceId, RetirementState, ReusePermit, RootId,
     RootRecoveryState, STANDARD_CATALOG_VERSION, SettlementClaim, SettlementState, SnapshotId,
-    TransitionDurability, TransitionOutput, TransitionReceipt, TxError, scan_journal,
-    standard_catalog,
+    TransitionDurability, TransitionOutput, TransitionReceipt, TxError, standard_catalog,
 };
 use nexus_ostd_virtio::{
     BootQuarantineGuard, MaskedIntx, OwnerKind, PersistentDmaArenaLayout, ProductionDevice,
-    PublishedRequest, Root, install_persistent_dma_arena, persistent_dma_arena_layout,
-    persistent_dma_arena_observation, qemu_hypervisor_detected,
+    PublishedRequest, Root, persistent_dma_arena_layout, persistent_dma_arena_observation,
+    qemu_hypervisor_detected,
 };
 use ostd::{
     mm::PAGE_SIZE,
@@ -53,19 +52,18 @@ use ostd::{
     sync::{Mutex, SpinLock},
     task::{Task, TaskOptions, inject_post_task_exit_handler},
 };
-use sha2::{Digest as _, Sha256};
 
 use super::{
     core_device_quarantine::{
-        OstdBootClaimVerifier, OstdBootIrqVerifier, OstdVirtioBootQuarantine,
-        QemuArenaIotlbVerifier, project_replayed_component_claim,
+        OstdBootClaimVerifier, OstdBootIrqVerifier, QemuArenaIotlbVerifier,
+        project_replayed_component_claim,
     },
     core_dma_adapter::{
         ClaimRole, CoreDmaClaim, CoreDmaClaims, CoreDmaCohort, bind_queue_commit,
         publish_real_queue,
     },
-    core_dma_arena_allocator::{persistent_dma_arena_base, persistent_dma_arena_ready},
-    core_pio_journal::{AtaJournalFixture, AtaPioJournal},
+    core_dma_arena_allocator::persistent_dma_arena_ready,
+    core_pio_journal::AtaPioJournal,
     core_portal_vnext::{
         CorePortalVNext, CoreRegistry, CoreTransitionView, PortalDispatchError, PortalRequest,
         PortalResponseBody,
@@ -74,10 +72,11 @@ use super::{
         InstalledCore, ProductionCoreOwner, ProductionIngressError, ProductionIngressExitObserver,
         ProductionIngressIdentity, ProductionIngressTaskData, ProductionRegistryError,
     },
-    core_reboot::{
-        AlreadyQuarantined, BootActivationBlock, BootActivationFailure, BootDeviceQuarantine,
-        OstdBootJournal, QuarantinedRecoveredBoot, recover_quarantined_boot,
+    core_qemu_persistent_boot::{
+        PreparedQemuPersistentBoot, QemuPersistentAnchor, QemuPersistentBootError,
+        is_legacy_schema5, persistent_dma_arena_digest,
     },
+    core_reboot::{BootActivationBlock, BootActivationFailure, QuarantinedRecoveredBoot},
     core_reply_adapter::{
         ReplyAckError, ReplyCoordinate, ReplyCustody, ReplyPlan, reply_pair, reply_plan,
     },
@@ -89,10 +88,9 @@ use super::{
     },
     core_runtime::OstdCserRuntime,
     core_supervisor_vnext::{CORE_SUPERVISOR_PROTOCOL, CoreSupervisorVNext},
-    core_tpm_anchor::{QemuTisTpm2, TpmNvIndexAuth, TpmNvLayout, TpmNvTrustedAnchor},
 };
 
-type PersistentAnchor = TpmNvTrustedAnchor<QemuTisTpm2>;
+type PersistentAnchor = QemuPersistentAnchor;
 type PersistentDurability = CoordinatedPersistence<AtaPioJournal, PersistentAnchor>;
 type PersistentRuntime = OstdCserRuntime<PersistentDurability>;
 type PersistentBoot =
@@ -904,20 +902,6 @@ pub(crate) fn launch() -> ! {
 }
 
 fn run_persistent_recovery() {
-    if !persistent_dma_arena_ready() {
-        fail_closed("dma-arena-not-withheld", ());
-    }
-    let arena = match install_persistent_dma_arena(persistent_dma_arena_base()) {
-        Ok(layout) => layout,
-        Err(error) => fail_closed("dma-arena-install", error),
-    };
-    if arena.paddr_base() != persistent_dma_arena_base()
-        || arena.page_count() != 3
-        || !qemu_hypervisor_detected()
-    {
-        fail_closed("qemu-dma-arena-profile", arena);
-    }
-
     let catalog = standard_catalog();
     let binding = RecoveryBinding::new(
         catalog.digest(),
@@ -925,61 +909,20 @@ fn run_persistent_recovery() {
         1,
     )
     .expect("persistent recovery binding is valid");
-
-    let transport = match QemuTisTpm2::acquire_qemu_fixture() {
-        Ok(transport) => transport,
-        Err(error) => fail_closed("tpm2-transport-unavailable", error),
+    let mut prepared = match PreparedQemuPersistentBoot::acquire() {
+        Ok(prepared) => prepared,
+        Err(error) => fail_closed(qemu_boot_failure_reason(error), ()),
     };
-    let auth = match TpmNvIndexAuth::new(&[]) {
-        Ok(auth) => auth,
-        Err(error) => fail_closed("tpm2-index-auth-invalid", error),
-    };
-    let candidate = match TpmNvTrustedAnchor::inspect(transport, TpmNvLayout::qemu_fixture(), auth)
-    {
-        Ok(candidate) => candidate,
-        Err(error) => fail_closed("tpm2-anchor-inspect", error),
-    };
-    let trusted_device_high_water = candidate
-        .committed()
-        .committed_freshness()
-        .device()
-        .get()
-        .max(candidate.issued().device().get());
-    let Some(next_device_generation) = trusted_device_high_water.checked_add(1) else {
-        fail_closed("device-generation-overflow", candidate);
-    };
-    let observed_generation = match DeviceGeneration::new(next_device_generation) {
-        Ok(generation) => generation,
-        Err(error) => fail_closed("device-generation-invalid", (candidate, error)),
-    };
-
-    let guard = match OstdVirtioBootQuarantine::new(observed_generation).quarantine_all() {
-        Ok(guard) => guard,
-        Err(error) => fail_closed("device-quarantine", (arena, candidate, error)),
-    };
-    let selected_tip = candidate.committed();
-    let mut journal = match AtaPioJournal::acquire(AtaJournalFixture::PrimaryMaster) {
-        Ok(journal) => journal,
-        Err(error) => fail_closed("ata-journal-unavailable", (arena, candidate, guard, error)),
-    };
-    let selected_bytes = match journal.read_all() {
+    let selected_tip = prepared.candidate().committed();
+    let selected_bytes = match prepared.journal_bytes() {
         Ok(bytes) => bytes,
-        Err(error) => fail_closed(
-            "ata-journal-read",
-            (arena, candidate, guard, journal, error),
-        ),
+        Err(error) => fail_closed(qemu_boot_failure_reason(error), prepared),
     };
-    if matches!(
-        scan_journal(&selected_bytes),
-        Err(JournalDecodeError::UnsupportedVersion { version: 5 })
-    ) {
+    if is_legacy_schema5(&selected_bytes) {
         if selected_tip.revision() == 0 || selected_tip.head().is_zero() {
-            fail_closed(
-                "unanchored-schema5-journal",
-                (arena, candidate, guard, journal),
-            );
+            fail_closed("unanchored-schema5-journal", prepared);
         }
-        let quarantine = guard.observation();
+        let quarantine = prepared.quarantine_observation();
         println!(
             "CSER_CORE_SCHEMA5_MIGRATION_REQUIRED PASS trusted_tpm_candidate_selected=true \
              profile2_binding_authorized=false \
@@ -1006,31 +949,11 @@ fn run_persistent_recovery() {
             quarantine.iotlb_used_remapped_iova(),
             quarantine.iotlb_completed_trigger_pages(),
         );
-        fail_closed(
-            "schema5-migration-required",
-            (arena, candidate, guard, journal),
-        )
+        fail_closed("schema5-migration-required", prepared)
     }
-    let anchor = match candidate.bind(binding) {
-        Ok(anchor) => anchor,
-        Err(rejected) => {
-            let (candidate, error) = *rejected;
-            fail_closed(
-                "tpm2-anchor-binding",
-                (arena, candidate, guard, journal, error),
-            )
-        }
-    };
-    let boot = match recover_quarantined_boot(
-        catalog,
-        CoreLimits::bounded_default(),
-        binding,
-        journal,
-        anchor,
-        AlreadyQuarantined::new(guard),
-    ) {
+    let boot = match prepared.recover(catalog, CoreLimits::bounded_default(), binding) {
         Ok(boot) => boot,
-        Err(error) => fail_closed("anchored-replay", (arena, error)),
+        Err(error) => fail_closed(qemu_boot_failure_reason(error), ()),
     };
 
     if boot.observe(|engine| engine.profile_one_estate_count() != 0) {
@@ -1047,6 +970,28 @@ fn run_persistent_recovery() {
         run_activation_boot(boot)
     } else {
         run_quarantined_boot(boot)
+    }
+}
+
+/// Preserves the production profile's fail-closed categories while the shared
+/// QEMU envelope keeps the device and durability acquisition reusable by the
+/// experiment profiles.
+const fn qemu_boot_failure_reason(error: QemuPersistentBootError) -> &'static str {
+    match error {
+        QemuPersistentBootError::ArenaNotWithheld => "dma-arena-not-withheld",
+        QemuPersistentBootError::ArenaInstall => "dma-arena-install",
+        QemuPersistentBootError::UnsupportedQemuProfile => "qemu-dma-arena-profile",
+        QemuPersistentBootError::TpmTransport => "tpm2-transport-unavailable",
+        QemuPersistentBootError::TpmAuth => "tpm2-index-auth-invalid",
+        QemuPersistentBootError::TpmInspect => "tpm2-anchor-inspect",
+        QemuPersistentBootError::DeviceGenerationOverflow => "device-generation-overflow",
+        QemuPersistentBootError::DeviceGenerationInvalid => "device-generation-invalid",
+        QemuPersistentBootError::DeviceQuarantine => "device-quarantine",
+        QemuPersistentBootError::AtaJournalUnavailable => "ata-journal-unavailable",
+        QemuPersistentBootError::AtaJournalRead => "ata-journal-read",
+        QemuPersistentBootError::CatalogBindingMismatch => "recovery-catalog-binding",
+        QemuPersistentBootError::AnchorBinding => "tpm2-anchor-binding",
+        QemuPersistentBootError::Recovery => "anchored-replay",
     }
 }
 
@@ -1287,7 +1232,7 @@ fn run_activation_boot(boot: PersistentBoot) -> ! {
         operation_effect().sequence(),
         AGENT_COMPONENT_REPLY.get(),
         AGENT_COMPONENT_DMA.get(),
-        HexDigest(dma_arena_digest(arena)),
+        HexDigest(persistent_dma_arena_digest(arena)),
         retained,
         resumed_prefix,
         resource_generation.expect("boot1 generation was checked"),
@@ -1635,7 +1580,7 @@ fn run_reuse_activation_boot(
         AGENT_COMPONENT_DMA.get(),
         reuse_effect().root().get(),
         reuse_effect().sequence(),
-        HexDigest(dma_arena_digest(arena)),
+        HexDigest(persistent_dma_arena_digest(arena)),
         retained,
         resource_generation.expect("boot3 generation was checked"),
         old_resource_generation.expect("boot3 prior generation was checked"),
@@ -1769,7 +1714,7 @@ fn publish_reused_dma(
                     resource: old.resource(),
                     expected_generation: old.generation(),
                     units: new.units(),
-                    reuse_contract: dma_arena_digest(arena),
+                    reuse_contract: persistent_dma_arena_digest(arena),
                 })?)?;
             let permit = validate_reuse_permit(permit, old, new, arena)?;
             expect_no_output_checked(ingress.transact(permit.activate())?)?;
@@ -1821,7 +1766,7 @@ fn publish_reused_dma(
         return Err("dma-reuse-device-scope");
     }
     let intent = commit_intent_checked(
-        ingress.transact(cohort.record_commit_intent(dma_arena_digest(arena)))?,
+        ingress.transact(cohort.record_commit_intent(persistent_dma_arena_digest(arena)))?,
     )?;
     let authority = ingress
         .observe(move |engine| bind_queue_commit(engine, intent, cohort))?
@@ -2139,7 +2084,7 @@ fn publish_first_boot_operation(
     let resumed_prefix =
         ensure_composite_prepared(portal, supervisor, owner, actor, binding_generation, cohort)?;
     let arena = persistent_dma_arena_layout().ok_or("dma-arena-layout-absent")?;
-    let arena_digest = dma_arena_digest(arena);
+    let arena_digest = persistent_dma_arena_digest(arena);
     let (reply_intent, dma_intent) =
         arm_initial_component_commits(portal, owner, actor, binding_generation, arena_digest)?;
     let reply_checksum = ensure_reply_component_committed(owner, &mut outbox, Some(reply_intent))?;
@@ -2924,7 +2869,7 @@ fn reconcile_dma_tombstones(
     expected: CoreDmaClaims,
 ) -> Result<DmaRecoveryReport, &'static str> {
     let layout = persistent_dma_arena_layout().ok_or("dma-arena-layout-absent")?;
-    let layout_digest = dma_arena_digest(layout);
+    let layout_digest = persistent_dma_arena_digest(layout);
     let component = owner
         .observe_engine(|engine| engine.component(effect, AGENT_COMPONENT_DMA))
         .ok_or("dma-component-absent")?;
@@ -3575,7 +3520,7 @@ fn validate_dma_component_for(
     let Some(arena) = persistent_dma_arena_layout() else {
         return false;
     };
-    let operation = dma_arena_digest(arena);
+    let operation = persistent_dma_arena_digest(arena);
     if composite.effect != effect
         || composite.kind != composite_kind
         || composite.charge_owner != operation_charge_account()
@@ -3779,7 +3724,7 @@ fn validate_reuse_permit(
         || permit.generation() != new.generation()
         || permit.catalog_digest() != cser_core::standard_catalog().digest()
         || permit.retirement_digest().is_zero()
-        || permit.reuse_contract() != dma_arena_digest(arena)
+        || permit.reuse_contract() != persistent_dma_arena_digest(arena)
     {
         return Err("dma-reuse-permit-coordinate");
     }
@@ -3913,25 +3858,6 @@ fn digest(tag: u8) -> Digest {
     let mut bytes = [0; 32];
     bytes[0] = tag;
     Digest::new(bytes)
-}
-
-fn dma_arena_digest(layout: PersistentDmaArenaLayout) -> Digest {
-    let mut hasher = Sha256::new();
-    hasher.update(b"nexus-cser-persistent-dma-arena-v1");
-    hasher.update(layout.version().to_le_bytes());
-    hasher.update((layout.page_count() as u64).to_le_bytes());
-    hasher.update((layout.paddr_base() as u64).to_le_bytes());
-    hasher.update((layout.daddr_base() as u64).to_le_bytes());
-    for kind in [
-        OwnerKind::QueueDriver,
-        OwnerKind::QueueDevice,
-        OwnerKind::Request,
-    ] {
-        hasher.update((layout.paddr(kind) as u64).to_le_bytes());
-        hasher.update((layout.daddr(kind) as u64).to_le_bytes());
-        hasher.update((layout.qemu_backing_offset(kind) as u64).to_le_bytes());
-    }
-    Digest::new(hasher.finalize().into())
 }
 
 fn poweroff_retaining<T>(_owners: T) -> ! {

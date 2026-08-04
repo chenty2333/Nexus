@@ -1,0 +1,850 @@
+// SPDX-License-Identifier: MPL-2.0
+
+//! Concrete first-boot composition for the CSER tool-plus-DMA experiment.
+//!
+//! This module is intentionally narrow: it is the only place where the
+//! catalog-parametric QEMU recovery envelope, the real VirtIO publication
+//! facade, and the COM2/COM3 experiment transports meet.  It never treats a
+//! UART reply as completion and it never re-arms a composite recovered from
+//! ATA/TPM state.  A non-empty recovered projection is retained for the
+//! recovery closer; until that closer accepts endpoint and quarantine
+//! evidence, this module emits no terminal result.
+
+use alloc::sync::Arc;
+use cser_core::{
+    ChargeAccountId, ClaimId, CommandRequest, CoreLimits, DEVICE_DOMAIN, DEVICE_EVIDENCE_IOTLB,
+    DEVICE_EVIDENCE_IRQ_DRAINED, DEVICE_EVIDENCE_RESET, DeviceScopeId, EffectId, PrincipalId,
+    PrincipalIncarnation, RecoveryBinding, RegistryInstance, ResourceGeneration, ResourceId,
+    RootId, TOOL_DMA_COMPONENT_DMA, TOOL_DMA_COMPONENT_TOOL, TransitionOutput, tool_dma_catalog,
+};
+use nexus_ostd_virtio::{
+    CompletedRequest, InterruptCompletionProgress, InterruptReceipt, MaskedIntx,
+    ProductionClosureProgress, ProductionDevice, ProductionResetRetryError, PublishedRequest, Root,
+};
+use ostd::{
+    arch::irq::IRQ_CHIP,
+    irq::IrqLine,
+    power::{ExitCode, poweroff},
+    prelude::println,
+    sync::SpinLock,
+    task::Task,
+};
+
+use super::{
+    core_crash_probe::{CrashCutpoint, CrashProbe, CrashProbeError, CrashRunId},
+    core_cser_tool_experiment::{
+        ToolDmaBarrier, ToolDmaBarrierHook, ToolDmaCoordinates, ToolDmaCoreOwner,
+        ToolDmaResumeState, arm_tool_dma, resume_tool_dma, tool_dma_metrics, tool_dma_terminal,
+    },
+    core_device_quarantine::{
+        OstdBootClaimVerifier, OstdBootIrqVerifier, QemuArenaIotlbVerifier,
+        project_replayed_component_claim,
+    },
+    core_experiment_dma_flow::{CserResetLiveDma, prepare_live_irq, probe_reset_once},
+    core_qemu_persistent_boot::{PreparedQemuPersistentBoot, persistent_dma_arena_digest},
+    core_runtime::OstdCserRuntime,
+    core_tool_adapter::{ToolOperationPlan, ToolTransportError, UartToolEndpoint},
+    core_tool_dma_runtime::ToolDmaRuntime,
+    core_tool_uart::ToolUart,
+};
+
+const RUN: [u8; 16] = [0x42; 16];
+const EFFECT_ROOT: u64 = 0x544f_4f4c;
+const EFFECT_SEQUENCE: u64 = 1;
+const CLAIM_TOOL: u64 = 0x5101;
+const CLAIM_QUEUE: u64 = 0x5102;
+const CLAIM_PAGES: u64 = 0x5103;
+const CLAIM_IOVA: u64 = 0x5104;
+const RESOURCE_TOOL: u64 = 0x6101;
+const RESOURCE_QUEUE: u64 = 0x6102;
+const RESOURCE_PAGES: u64 = 0x6103;
+const RESOURCE_IOVA: u64 = 0x6104;
+const MAX_DEVICE_TURNS: usize = 16_384;
+const MAX_IRQ_SPINS: usize = 20_000_000;
+
+/// Runs exactly one fixed first-boot prefix.  Every marker follows a durable
+/// transition or a real endpoint/device action.  The matrix may kill QEMU at
+/// any marker; lack of a terminal marker is deliberately not success.
+pub(crate) fn run() {
+    let catalog = tool_dma_catalog();
+    let binding = RecoveryBinding::new(
+        catalog.digest(),
+        RegistryInstance::new(1).expect("non-zero experiment registry"),
+        1,
+    )
+    .expect("valid experiment binding");
+    let prepared = PreparedQemuPersistentBoot::acquire()
+        .unwrap_or_else(|_| panic!("TOOL_DMA_FAIL stage=qemu-persistent-boot"));
+    let arena = prepared.arena();
+    let boot = prepared
+        .recover(catalog, CoreLimits::bounded_default(), binding)
+        .unwrap_or_else(|_| panic!("TOOL_DMA_FAIL stage=anchored-tool-catalog-recovery"));
+    let effect = fixed_effect();
+
+    let resume = resume_tool_dma(&boot, effect)
+        .unwrap_or_else(|_| panic!("TOOL_DMA_FAIL stage=resume-projection"));
+    match resume.state() {
+        ToolDmaResumeState::Absent => run_initial(boot, effect, arena),
+        state => {
+            let retry_after_checkpoint =
+                resume.allows_tool_idempotent_retry(fixed_tool_plan(effect).operation_digest());
+            run_recovery(boot, effect, arena, state, retry_after_checkpoint)
+        }
+    }
+}
+
+/// Closes a replayed prefix while the original device remains under the boot
+/// guard.  This path deliberately has no COM3 hook: the host has already
+/// killed the first boot at its selected cut and only accepts the unique
+/// terminal receipt from this successor.
+fn run_recovery(
+    mut boot: super::core_qemu_persistent_boot::QemuPersistentBoot,
+    effect: EffectId,
+    arena: nexus_ostd_virtio::PersistentDmaArenaLayout,
+    state: ToolDmaResumeState,
+    retry_after_checkpoint: bool,
+) {
+    // A successor always queries the independently durable endpoint record
+    // before it claims any settlement authority. A retry POST is permitted
+    // only when that GET says absent *and* the exact durable intent still
+    // exists; it is the same idempotency key, never a fresh operation.
+    let plan = fixed_tool_plan(effect);
+    let tool = ToolDmaRuntime::new(plan, 1).expect("fixed tool verifier epoch");
+    let mut observation = {
+        let mut uart = ToolUart::acquire().expect("experiment owns COM2");
+        let mut endpoint = UartToolEndpoint::new(&mut uart);
+        match tool.recover(&mut endpoint) {
+            Ok(observation) => Some(observation),
+            Err(ToolTransportError::NoTerminalRecord { status: 404 }) => None,
+            Err(error) => {
+                panic!("TOOL_DMA_FAIL stage=recovery-endpoint-get state={state:?} error={error:?}")
+            }
+        }
+    };
+
+    // Cut seven has already retired both component sets. GET remains a
+    // consistency check on the endpoint record, but no fence or transition is
+    // legal (nor necessary) once the replay projection is terminal.
+    if state == ToolDmaResumeState::Terminal {
+        assert!(
+            observation.is_some(),
+            "TOOL_DMA_FAIL stage=terminal-endpoint-record"
+        );
+        let metrics = tool_dma_metrics(&boot, effect);
+        assert!(
+            tool_dma_terminal(metrics),
+            "TOOL_DMA_FAIL stage=terminal-projection"
+        );
+        finish_recovery(boot, metrics);
+    }
+
+    // Consume an existing tool intent before fencing: fencing intentionally
+    // converts it to an indeterminate committed fact. If GET was absent this
+    // is the one narrow point at which its stable operation key may POST.
+    if matches!(
+        state,
+        ToolDmaResumeState::OutstandingCommits { tool: true, dma: _ }
+    ) {
+        let resumed = resume_tool_dma(&boot, effect).expect("outstanding projection");
+        let (intent, _) = resumed.into_outstanding_intents();
+        let intent = intent.expect("tool intent retained in projection");
+        let endpoint_observation = match observation {
+            Some(value) => value,
+            None => post_same_tool_plan(tool),
+        };
+        let command = boot
+            .observe(|engine| tool.acknowledge_commit(engine, intent, &endpoint_observation))
+            .unwrap_or_else(|_| panic!("TOOL_DMA_FAIL stage=recovery-tool-commit-verify"));
+        expect_none(boot.recovery_transact(command), "recovery-tool-commit-ack");
+        observation = Some(endpoint_observation);
+    }
+    if observation.is_none() && retry_after_checkpoint {
+        observation = Some(post_same_tool_plan(tool));
+    }
+    let successor = snapshot_ready_rebind(&mut boot, effect, state);
+    if state == ToolDmaResumeState::Prepared {
+        // The seven-cut campaign publishes the real queue and records its
+        // local acknowledgement before *any* observable marker, so this
+        // prefix is deliberately outside that campaign rather than being
+        // repaired by inventing a pre-publication device owner.
+        panic!("TOOL_DMA_FAIL stage=unsupported-prepublication-recovery");
+    }
+    let observation = observation
+        .unwrap_or_else(|| panic!("TOOL_DMA_FAIL stage=recovery-endpoint-get state={state:?}"));
+    // A fence turns the interrupted claim into a new reconciliation generation;
+    // do not consume post-fence intents here, because none remain authoritative.
+    if matches!(
+        state,
+        ToolDmaResumeState::OutstandingCommits { tool: false, .. }
+    ) {
+        panic!("TOOL_DMA_FAIL stage=missing-tool-intent");
+    }
+    reconcile_tool(&mut boot, effect, successor, tool, observation, || {});
+    reconcile_boot_dma(&mut boot, effect, arena);
+
+    let metrics = tool_dma_metrics(&boot, effect);
+    assert!(
+        tool_dma_terminal(metrics),
+        "recovery left CSER claims retained"
+    );
+    finish_recovery(boot, metrics);
+}
+
+fn finish_recovery(
+    boot: super::core_qemu_persistent_boot::QemuPersistentBoot,
+    metrics: super::core_cser_tool_experiment::ToolDmaMetrics,
+) -> ! {
+    let activated = boot
+        .try_activate()
+        .unwrap_or_else(|_| panic!("TOOL_DMA_FAIL stage=recovery-activation"));
+    // Activation is the final gate observation: printing before it would turn
+    // a merely replayed terminal projection into a false reuse claim.
+    let _ = activated;
+    println!(
+        "TOOL_DMA_RECOVERY_METRICS {{\"variant\":\"cser\",\"run_id\":\"42424242424242424242424242424242\",\"terminal\":true,\"invariants_ok\":true,\"retired_by_evidence\":{},\"retained_claims\":{},\"gate_rejections\":null,\"reconciliation_delay_ms\":null,\"reconciliation_steps\":{},\"reconciliation_delay_unit\":\"unmeasured\",\"topology_registered\":true,\"tool_finalized\":true,\"dma_finalized\":true,\"reuse_authorized\":false}}",
+        metrics.retired_components, metrics.retained_claims, metrics.reconciliation_steps,
+    );
+    poweroff(ExitCode::Success)
+}
+
+fn fixed_tool_plan(effect: EffectId) -> ToolOperationPlan {
+    ToolOperationPlan::new(
+        RUN,
+        effect,
+        TOOL_DMA_COMPONENT_TOOL,
+        nz(CLAIM_TOOL),
+        nz(RESOURCE_TOOL),
+        nz(1),
+        b"tool-dma-e2e",
+    )
+    .expect("fixed tool plan")
+}
+
+fn fixed_tool_runtime(effect: EffectId) -> ToolDmaRuntime {
+    ToolDmaRuntime::new(fixed_tool_plan(effect), 1).expect("fixed tool verifier epoch")
+}
+
+fn post_same_tool_plan(tool: ToolDmaRuntime) -> super::core_tool_adapter::DurableToolObservation {
+    let mut uart = ToolUart::acquire().expect("experiment owns COM2 for idempotent retry");
+    let mut endpoint = UartToolEndpoint::new(&mut uart);
+    tool.submit(&mut endpoint)
+        .unwrap_or_else(|_| panic!("TOOL_DMA_FAIL stage=recovery-idempotent-post"))
+}
+
+fn reconcile_tool<O: ToolDmaCoreOwner>(
+    runtime: &mut O,
+    effect: EffectId,
+    claimant: PrincipalIncarnation,
+    tool: ToolDmaRuntime,
+    observation: super::core_tool_adapter::DurableToolObservation,
+    after_apply_intent: impl FnOnce(),
+) {
+    let receipt = runtime
+        .transact(
+            CommandRequest::ClaimComponentSettlement {
+                effect,
+                component: TOOL_DMA_COMPONENT_TOOL,
+                claimant,
+            }
+            .into(),
+        )
+        .unwrap_or_else(|_| panic!("TOOL_DMA_FAIL stage=tool-settlement-claim"));
+    let claim = match receipt.into_output() {
+        TransitionOutput::SettlementClaim(claim) => claim,
+        _ => panic!("TOOL_DMA_FAIL stage=tool-settlement-claim-output"),
+    };
+    let claim = match tool.record_reconciliation(claim) {
+        Ok(command) => {
+            let receipt = runtime
+                .transact(command)
+                .unwrap_or_else(|_| panic!("TOOL_DMA_FAIL stage=tool-apply-intent-durable"));
+            match receipt.into_output() {
+                TransitionOutput::SettlementClaim(claim) => claim,
+                _ => panic!("TOOL_DMA_FAIL stage=tool-apply-intent-output"),
+            }
+        }
+        Err(failure) if failure.error() == &cser_core::CoreError::WrongSettlementStage => {
+            // Recovery checkpointing converts an interrupted durable apply
+            // intent into ReconciliationRequired. The newly claimed linear
+            // authority already names that stage; recording a second intent
+            // is forbidden, but the claim can verify the same endpoint fact.
+            failure.into_claim()
+        }
+        Err(_) => panic!("TOOL_DMA_FAIL stage=tool-apply-intent"),
+    };
+    // This is the exact recovery cut: a crash here leaves a durable apply
+    // intent but no fabricated outcome/retirement state.
+    after_apply_intent();
+    let command = runtime
+        .observe(|engine| tool.record_reconciled(engine, claim, &observation))
+        .unwrap_or_else(|_| panic!("TOOL_DMA_FAIL stage=tool-apply-verify"));
+    let receipt = runtime
+        .transact(command)
+        .unwrap_or_else(|_| panic!("TOOL_DMA_FAIL stage=tool-applied-durable"));
+    let claim = match receipt.into_output() {
+        TransitionOutput::SettlementClaim(claim) => claim,
+        _ => panic!("TOOL_DMA_FAIL stage=tool-applied-output"),
+    };
+    let command = runtime
+        .observe(|engine| tool.settle(engine, claim, &observation))
+        .unwrap_or_else(|_| panic!("TOOL_DMA_FAIL stage=tool-settle-verify"));
+    expect_none(runtime.transact(command), "tool-settle-durable");
+    let command = runtime
+        .observe(|engine| tool.retire_outcome(engine, &observation))
+        .unwrap_or_else(|_| panic!("TOOL_DMA_FAIL stage=tool-retirement-verify"));
+    expect_none(runtime.transact(command), "tool-retirement-durable");
+}
+
+fn reconcile_boot_dma(
+    boot: &mut super::core_qemu_persistent_boot::QemuPersistentBoot,
+    effect: EffectId,
+    arena: nexus_ostd_virtio::PersistentDmaArenaLayout,
+) {
+    let layout_digest = persistent_dma_arena_digest(arena);
+    let component = boot
+        .observe(|engine| engine.component(effect, TOOL_DMA_COMPONENT_DMA))
+        .expect("recovered DMA component");
+    assert_eq!(component.commit_operation, Some(layout_digest));
+    let claims = boot.observe(|engine| {
+        engine
+            .retained_component_claims()
+            .into_iter()
+            .filter(|claim| {
+                claim.effect == effect
+                    && claim.component == TOOL_DMA_COMPONENT_DMA
+                    && claim.domain == DEVICE_DOMAIN
+            })
+            .collect::<alloc::vec::Vec<_>>()
+    });
+    for claim in claims {
+        let receipts = boot
+            .inspect_with_guard(|_, guard| project_replayed_component_claim(guard, claim))
+            .unwrap_or_else(|_| panic!("TOOL_DMA_FAIL stage=boot-claim-projection"));
+        let (reset, irq, iotlb) = receipts.into_parts();
+        let reset_command = boot
+            .observe(|engine| {
+                engine.verify_component_retirement_evidence(
+                    claim.effect,
+                    claim.component,
+                    claim.claim,
+                    DEVICE_EVIDENCE_RESET,
+                    &OstdBootClaimVerifier::new_component(claim),
+                    &reset,
+                )
+            })
+            .unwrap_or_else(|_| panic!("TOOL_DMA_FAIL stage=boot-reset-verify"))
+            .submit();
+        expect_none(boot.recovery_transact(reset_command), "boot-reset-durable");
+        if claim.kind == cser_core::DEVICE_CLAIM_QUEUE_SLOT {
+            let command = boot
+                .observe(|engine| {
+                    engine.verify_component_retirement_evidence(
+                        claim.effect,
+                        claim.component,
+                        claim.claim,
+                        DEVICE_EVIDENCE_IRQ_DRAINED,
+                        &OstdBootIrqVerifier::new_component(claim),
+                        &irq,
+                    )
+                })
+                .unwrap_or_else(|_| panic!("TOOL_DMA_FAIL stage=boot-irq-verify"))
+                .submit();
+            expect_none(boot.recovery_transact(command), "boot-irq-durable");
+        } else {
+            let verifier = QemuArenaIotlbVerifier::new_component(
+                claim,
+                arena,
+                layout_digest,
+                component.commit_operation,
+                true,
+                true,
+            );
+            let command = boot
+                .observe(|engine| {
+                    engine.verify_component_retirement_evidence(
+                        claim.effect,
+                        claim.component,
+                        claim.claim,
+                        DEVICE_EVIDENCE_IOTLB,
+                        &verifier,
+                        &iotlb,
+                    )
+                })
+                .unwrap_or_else(|_| panic!("TOOL_DMA_FAIL stage=boot-iotlb-verify"))
+                .submit();
+            expect_none(boot.recovery_transact(command), "boot-iotlb-durable");
+        }
+    }
+}
+
+fn expect_none<E>(
+    result: Result<cser_core::TransitionReceipt, cser_core::TxError<E>>,
+    stage: &str,
+) {
+    let receipt = result.unwrap_or_else(|_| panic!("TOOL_DMA_FAIL stage={stage}"));
+    assert!(
+        matches!(receipt.into_output(), TransitionOutput::None),
+        "TOOL_DMA_FAIL stage={stage}-output"
+    );
+}
+
+fn run_initial(
+    boot: super::core_qemu_persistent_boot::QemuPersistentBoot,
+    effect: EffectId,
+    arena: nexus_ostd_virtio::PersistentDmaArenaLayout,
+) {
+    let activated = boot
+        .try_activate()
+        .unwrap_or_else(|_| panic!("TOOL_DMA_FAIL stage=empty-boot-activation"));
+    let (engine, persistence, devices) = activated.into_parts();
+    let mut runtime = OstdCserRuntime::from_engine(engine, persistence);
+    let (root, masked_intx, device) = devices.into_parts();
+    let mut live = LiveCserDma::new(root, masked_intx, device);
+    let prepared = prepare_live_irq(&mut live.device, &mut live.root)
+        .unwrap_or_else(|_| panic!("TOOL_DMA_FAIL stage=real-virtio-prepare"));
+    let identity = prepared.identity();
+    let coordinates = coordinates(effect, identity.device_bdf());
+    let mut barriers = QemuBarriers::acquire();
+    let mut deferred = DeferredBarriers;
+    let mut armed = arm_tool_dma(
+        &mut runtime,
+        coordinates,
+        RUN,
+        b"tool-dma-e2e",
+        persistent_dma_arena_digest(arena),
+        &mut deferred,
+    )
+    .unwrap_or_else(|error| panic!("TOOL_DMA_FAIL stage=durable-composite-arm error={error:?}"));
+
+    let dma_intent = armed
+        .take_dma_intent()
+        .unwrap_or_else(|_| panic!("TOOL_DMA_FAIL stage=dma-intent"));
+    let cohort = super::core_dma_adapter::CoreDmaCohort::bind_component(
+        effect,
+        TOOL_DMA_COMPONENT_DMA,
+        fixed_actor(),
+        1,
+        nz::<ChargeAccountId>(0x7101),
+        identity,
+        super::core_dma_adapter::CoreDmaClaims::new(
+            super::core_dma_adapter::CoreDmaClaim::new(
+                nz(CLAIM_QUEUE),
+                nz(RESOURCE_QUEUE),
+                nz(1),
+                1,
+            ),
+            super::core_dma_adapter::CoreDmaClaim::new(
+                nz(CLAIM_PAGES),
+                nz(RESOURCE_PAGES),
+                nz(1),
+                3,
+            ),
+            super::core_dma_adapter::CoreDmaClaim::new(nz(CLAIM_IOVA), nz(RESOURCE_IOVA), nz(1), 3),
+        ),
+    )
+    .expect("real identity binds fixed tool-DMA cohort");
+    let published = runtime
+        .observe(|engine| prepared.publish_cser(engine, dma_intent, cohort, &live.device))
+        .unwrap_or_else(|_| panic!("TOOL_DMA_FAIL stage=real-virtio-publish"));
+    let committed = runtime
+        .observe(|engine| published.verify_commit(engine))
+        .unwrap_or_else(|_| panic!("TOOL_DMA_FAIL stage=real-dma-commit-verify"));
+    let (request, dma_acknowledgement) = committed.into_parts();
+    runtime
+        .transact(dma_acknowledgement)
+        .unwrap_or_else(|_| panic!("TOOL_DMA_FAIL stage=durable-dma-commit-ack"));
+    // Both early cut numbers intentionally observe the same first prefix:
+    // it already contains a real DMA publication plus its durable local ack,
+    // so recovery never has to invent a lost queue owner.
+    barriers
+        .reached(ToolDmaBarrier::TopologyPrepared)
+        .unwrap_or_else(|_| panic!("TOOL_DMA_FAIL stage=barrier-1"));
+    barriers
+        .reached(ToolDmaBarrier::CommitIntentsDurable)
+        .unwrap_or_else(|_| panic!("TOOL_DMA_FAIL stage=barrier-2"));
+    let mut uart = ToolUart::acquire().expect("experiment owns COM2");
+    let observation = {
+        let mut endpoint = UartToolEndpoint::new(&mut uart);
+        armed
+            .post_tool(&mut endpoint)
+            .unwrap_or_else(|_| panic!("TOOL_DMA_FAIL stage=durable-tool-post"))
+    };
+    barriers
+        .reached(ToolDmaBarrier::ToolEndpointApplied)
+        .unwrap_or_else(|_| panic!("TOOL_DMA_FAIL stage=barrier-3"));
+    // Cutpoint four deliberately includes the local durable commit
+    // acknowledgement.  A bare device-visible `avail.idx` has no replayable
+    // publication receipt after QEMU is killed; advertising that earlier
+    // window as a recoverable matrix cut would force recovery to invent one.
+    barriers
+        .reached(ToolDmaBarrier::DmaQueuePublished)
+        .unwrap_or_else(|_| panic!("TOOL_DMA_FAIL stage=barrier-4"));
+    armed
+        .acknowledge_tool_commit(&mut runtime, &observation)
+        .unwrap_or_else(|_| panic!("TOOL_DMA_FAIL stage=durable-tool-commit-ack"));
+    barriers
+        .reached(ToolDmaBarrier::ToolCommitAcknowledged)
+        .unwrap_or_else(|_| panic!("TOOL_DMA_FAIL stage=barrier-5"));
+
+    reconcile_tool(
+        &mut runtime,
+        effect,
+        fixed_actor(),
+        fixed_tool_runtime(effect),
+        observation,
+        || {
+            barriers
+                .reached(ToolDmaBarrier::ToolApplyIntentDurable)
+                .unwrap_or_else(|_| panic!("TOOL_DMA_FAIL stage=barrier-6"));
+        },
+    );
+    live.close_real(&mut runtime, request, cohort);
+    let metrics = tool_dma_metrics(&runtime, effect);
+    assert!(
+        tool_dma_terminal(metrics),
+        "live closure left CSER claims retained"
+    );
+    barriers
+        .reached(ToolDmaBarrier::ComponentsRetired)
+        .unwrap_or_else(|_| panic!("TOOL_DMA_FAIL stage=barrier-7"));
+    println!(
+        "TOOL_DMA_RECOVERY_METRICS {{\"variant\":\"cser\",\"run_id\":\"42424242424242424242424242424242\",\"terminal\":true,\"invariants_ok\":true,\"retired_by_evidence\":{},\"retained_claims\":{},\"gate_rejections\":null,\"reconciliation_delay_ms\":null,\"reconciliation_steps\":{},\"reconciliation_delay_unit\":\"unmeasured\",\"topology_registered\":true,\"tool_finalized\":true,\"dma_finalized\":true,\"reuse_authorized\":false}}",
+        metrics.retired_components, metrics.retained_claims, metrics.reconciliation_steps,
+    );
+    poweroff(ExitCode::Success)
+}
+
+/// The live half deliberately owns the IRQ receipt, the completed request and
+/// the reset/IOTLB tombstones linearly.  The CSER commands below are therefore
+/// derived from the same real VirtIO closure as the baseline, rather than from
+/// a synthetic `quiescent=true` flag.
+struct LiveCserDma {
+    root: Root,
+    masked: Option<MaskedIntx>,
+    device: ProductionDevice,
+    irq: Arc<LiveIrqActor>,
+}
+
+struct LiveIrqActor {
+    state: SpinLock<LiveIrqState>,
+}
+
+struct LiveIrqState {
+    request: Option<PublishedRequest>,
+    receipt: Option<InterruptReceipt>,
+}
+
+impl LiveIrqActor {
+    const fn new() -> Self {
+        Self {
+            state: SpinLock::new(LiveIrqState {
+                request: None,
+                receipt: None,
+            }),
+        }
+    }
+
+    fn install(&self, request: PublishedRequest) {
+        let mut state = self.state.lock();
+        assert!(state.request.is_none());
+        assert!(state.receipt.is_none());
+        state.request = Some(request);
+    }
+
+    fn acknowledge(&self) {
+        let mut state = self.state.lock();
+        if state.receipt.is_some() {
+            return;
+        }
+        let receipt = state
+            .request
+            .as_mut()
+            .expect("CSER IRQ actor owns published request")
+            .ack_interrupt();
+        state.receipt = Some(receipt);
+    }
+
+    fn ready(&self) -> bool {
+        self.state.lock().receipt.is_some()
+    }
+
+    fn take(&self) -> (PublishedRequest, InterruptReceipt) {
+        let mut state = self.state.lock();
+        let request = state.request.take().expect("CSER IRQ request");
+        let receipt = state.receipt.take().expect("CSER IRQ receipt");
+        (request, receipt)
+    }
+}
+
+impl LiveCserDma {
+    fn new(root: Root, masked: MaskedIntx, device: ProductionDevice) -> Self {
+        let route = masked.route();
+        let irq = Arc::new(LiveIrqActor::new());
+        let callback = Arc::clone(&irq);
+        let mut line = IrqLine::alloc().expect("CSER allocates VirtIO IRQ line");
+        line.on_active(move |_| callback.acknowledge());
+        let mapped = IRQ_CHIP
+            .get()
+            .expect("OSTD IRQ chip initialized")
+            .map_gsi_pin_to(line, u32::from(route.line()))
+            .expect("CSER maps fixed VirtIO INTx route");
+        core::mem::forget(mapped);
+        Self {
+            root,
+            masked: Some(masked),
+            device,
+            irq,
+        }
+    }
+
+    fn complete(&mut self, mut request: PublishedRequest) -> (CompletedRequest, InterruptReceipt) {
+        for _ in 0..MAX_DEVICE_TURNS {
+            self.irq.install(request);
+            let masked = self.masked.take().expect("CSER INTx mask owner");
+            let unmasked = self
+                .root
+                .unmask_intx(masked)
+                .unwrap_or_else(|_| panic!("TOOL_DMA_FAIL stage=live-intx-unmask"));
+            let mut spins = 0;
+            while !self.irq.ready() && spins < MAX_IRQ_SPINS {
+                spins += 1;
+                core::hint::spin_loop();
+            }
+            let masked = self
+                .root
+                .mask_intx(unmasked)
+                .unwrap_or_else(|_| panic!("TOOL_DMA_FAIL stage=live-intx-remask"));
+            self.masked = Some(masked);
+            assert!(self.irq.ready(), "CSER IRQ timeout");
+            let (returned, receipt) = self.irq.take();
+            match returned.complete_after_interrupt(receipt) {
+                InterruptCompletionProgress::Complete(completed) => return (completed, receipt),
+                InterruptCompletionProgress::NotReady {
+                    request: retained, ..
+                } => {
+                    request = retained;
+                    Task::yield_now();
+                }
+                InterruptCompletionProgress::Failed(_) => panic!("TOOL_DMA_FAIL stage=live-irq"),
+            }
+        }
+        panic!("TOOL_DMA_FAIL stage=live-irq-turn-limit")
+    }
+
+    fn close_real(
+        &mut self,
+        runtime: &mut OstdCserRuntime<super::core_qemu_persistent_boot::QemuPersistentDurability>,
+        request: super::core_experiment_dma_flow::BaselineLiveDma,
+        cohort: super::core_dma_adapter::CoreDmaCohort,
+    ) {
+        let (completed, irq) = self.complete(request.into_published_request());
+        let identity = completed.identity();
+        let intent = completed
+            .preflight_reset(identity)
+            .unwrap_or_else(|_| panic!("TOOL_DMA_FAIL stage=live-reset-preflight"));
+        let mut tombstone = intent.apply_reset(false);
+        let reset = loop {
+            match probe_reset_once(tombstone, &mut self.root, irq) {
+                Ok(reset) => break reset,
+                Err(failure) if failure.error() == ProductionResetRetryError::Pending => {
+                    tombstone = failure.into_tombstone();
+                    Task::yield_now();
+                }
+                Err(_) => panic!("TOOL_DMA_FAIL stage=live-reset"),
+            }
+        };
+        let reset = reset
+            .bind_cser(&mut self.device, cohort)
+            .unwrap_or_else(|_| panic!("TOOL_DMA_FAIL stage=live-reset-bind"));
+        self.retire_real(runtime, reset, cohort);
+    }
+
+    fn retire_real(
+        &mut self,
+        runtime: &mut OstdCserRuntime<super::core_qemu_persistent_boot::QemuPersistentDurability>,
+        reset: CserResetLiveDma,
+        cohort: super::core_dma_adapter::CoreDmaCohort,
+    ) {
+        for command in runtime
+            .observe(|engine| reset.reset_commands(engine))
+            .unwrap_or_else(|_| panic!("TOOL_DMA_FAIL stage=live-reset-verify"))
+        {
+            expect_none(runtime.transact(command), "live-reset-durable");
+        }
+        let command = runtime
+            .observe(|engine| reset.irq_drain_command(engine))
+            .unwrap_or_else(|_| panic!("TOOL_DMA_FAIL stage=live-irq-drain-verify"));
+        expect_none(runtime.transact(command), "live-irq-drain-durable");
+        let progress = runtime
+            .observe(|engine| reset.begin_iotlb(engine, &self.device, false))
+            .unwrap_or_else(|_| panic!("TOOL_DMA_FAIL stage=live-iotlb-begin"));
+        let closure = match progress {
+            ProductionClosureProgress::Complete(closure) => closure,
+            ProductionClosureProgress::Pending(tombstone) => {
+                match tombstone.retry(MAX_DEVICE_TURNS) {
+                    Ok(ProductionClosureProgress::Complete(closure)) => closure,
+                    _ => panic!("TOOL_DMA_FAIL stage=live-iotlb-retry"),
+                }
+            }
+        };
+        let iotlb = CserResetLiveDma::bind_iotlb(&mut self.device, closure, cohort)
+            .unwrap_or_else(|_| panic!("TOOL_DMA_FAIL stage=live-iotlb-bind"));
+        for command in runtime
+            .observe(|engine| iotlb.retirement_commands(engine, cohort))
+            .unwrap_or_else(|_| panic!("TOOL_DMA_FAIL stage=live-iotlb-verify"))
+        {
+            expect_none(runtime.transact(command), "live-iotlb-durable");
+        }
+    }
+}
+
+struct QemuBarriers {
+    probe: CrashProbe,
+}
+
+struct DeferredBarriers;
+
+impl ToolDmaBarrierHook for DeferredBarriers {
+    type Error = core::convert::Infallible;
+
+    fn reached(&mut self, _barrier: ToolDmaBarrier) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
+impl QemuBarriers {
+    fn acquire() -> Self {
+        Self {
+            probe: CrashProbe::acquire().expect("experiment owns COM3"),
+        }
+    }
+}
+
+impl ToolDmaBarrierHook for QemuBarriers {
+    type Error = CrashProbeError;
+
+    fn reached(&mut self, barrier: ToolDmaBarrier) -> Result<(), Self::Error> {
+        self.probe
+            .barrier(CrashRunId::new(RUN), CrashCutpoint::new(barrier.wire_id()))
+    }
+}
+
+fn fixed_effect() -> EffectId {
+    EffectId::new(nz::<RootId>(EFFECT_ROOT), EFFECT_SEQUENCE).expect("fixed effect")
+}
+
+fn fixed_actor() -> PrincipalIncarnation {
+    PrincipalIncarnation::new(nz::<PrincipalId>(EFFECT_ROOT), 1).expect("fixed actor")
+}
+
+/// Re-establishes successor custody before a replayed settlement is claimed.
+/// `CheckpointRecovery` already fenced every root before the boot owner was
+/// returned, including conversion of interrupted commit/apply authority into
+/// conservative indeterminate/reconciliation state. Repeating that fence here
+/// would be a stale-principal transition.
+fn snapshot_ready_rebind(
+    boot: &mut super::core_qemu_persistent_boot::QemuPersistentBoot,
+    effect: EffectId,
+    state: ToolDmaResumeState,
+) -> PrincipalIncarnation {
+    let root = effect.root();
+    let successor = PrincipalIncarnation::new(nz::<PrincipalId>(EFFECT_ROOT), 2)
+        .expect("fixed recovery successor");
+    let snapshot = cser_core::SnapshotId::new(1).expect("fixed recovery snapshot");
+    let command = boot
+        .observe(|engine| engine.snapshot_root(root, snapshot))
+        .unwrap_or_else(|_| panic!("TOOL_DMA_FAIL stage=recovery-snapshot-build"))
+        .record();
+    expect_none(boot.recovery_transact(command), "recovery-snapshot");
+    expect_none(
+        boot.recovery_transact(CommandRequest::Ready {
+            root,
+            snapshot,
+            successor,
+        }),
+        "recovery-ready",
+    );
+    expect_none(
+        boot.recovery_transact(CommandRequest::Rebind {
+            root,
+            snapshot,
+            successor,
+            binding_generation: 2,
+        }),
+        "recovery-rebind",
+    );
+    if state == ToolDmaResumeState::Prepared {
+        expect_none(
+            boot.recovery_transact(CommandRequest::AdoptEffect {
+                effect,
+                successor,
+                binding_generation: 2,
+            }),
+            "recovery-adopt-precommit",
+        );
+        expect_none(
+            boot.recovery_transact(CommandRequest::RebaseCompositePrecommitClaims {
+                effect,
+                actor: successor,
+                binding_generation: 2,
+            }),
+            "recovery-rebase-precommit",
+        );
+    }
+    successor
+}
+
+fn coordinates(effect: EffectId, bdf: nexus_ostd_virtio::DeviceBdf) -> ToolDmaCoordinates {
+    let packed =
+        (u64::from(bdf.bus()) << 16) | (u64::from(bdf.device()) << 8) | u64::from(bdf.function());
+    ToolDmaCoordinates::new(
+        effect,
+        fixed_actor(),
+        1,
+        nz::<ChargeAccountId>(0x7101),
+        nz(CLAIM_TOOL),
+        nz(RESOURCE_TOOL),
+        nz(1),
+        nz(CLAIM_QUEUE),
+        nz(RESOURCE_QUEUE),
+        nz(CLAIM_PAGES),
+        nz(RESOURCE_PAGES),
+        nz(CLAIM_IOVA),
+        nz(RESOURCE_IOVA),
+        DeviceScopeId::new(packed + 1).expect("PCI scope"),
+        // This is the CSER allocation generation of three newly enrolled
+        // resource coordinates, not the independently advancing hardware
+        // session generation carried by `DeviceSessionIdentity` and evidence
+        // freshness. Every first enrollment is generation one even when boot
+        // quarantine has already advanced the emulated device to session two.
+        ResourceGeneration::new(1).expect("initial resource generation"),
+    )
+    .expect("fixed coordinates")
+}
+
+trait NonZeroId: Sized {
+    fn from_nonzero(value: u64) -> Self;
+}
+
+macro_rules! impl_nonzero_id {
+    ($($type:ty),+ $(,)?) => {$(
+        impl NonZeroId for $type {
+            fn from_nonzero(value: u64) -> Self {
+                <$type>::new(value).expect("fixed non-zero experiment id")
+            }
+        }
+    )+};
+}
+
+impl_nonzero_id!(
+    ChargeAccountId,
+    ClaimId,
+    PrincipalId,
+    ResourceGeneration,
+    ResourceId,
+    RootId,
+);
+
+fn nz<T: NonZeroId>(value: u64) -> T {
+    T::from_nonzero(value)
+}

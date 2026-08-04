@@ -10,9 +10,17 @@ publish = false
 [features]
 default = ["cser-production"]
 cser-production = ["dep:nexus-ostd-virtio", "dep:osdk-frame-allocator"]
-cser-core-reply-recovery = []
-cser-core-dma-recovery = ["dep:nexus-ostd-virtio"]
+# Historical, non-production recovery probes intentionally use the core's
+# in-memory legacy fixtures. Keep that capability absent from the production
+# and tool-plus-DMA profiles.
+cser-core-reply-recovery = ["cser-core/test-support"]
+cser-core-dma-recovery = ["dep:nexus-ostd-virtio", "cser-core/test-support"]
 cser-core-tpm-anchor = []
+# These are deliberately separate from `cser-production`: the experiment
+# profiles may evolve their UART/crash harness without changing the sealed
+# production profile or its source closure.
+cser-tool-dma-experiment = ["dep:nexus-ostd-virtio", "dep:osdk-frame-allocator"]
+cser-tool-dma-baseline-experiment = ["dep:nexus-ostd-virtio", "dep:osdk-frame-allocator"]
 
 [dependencies]
 cser-core = { path = "../../crates/cser-core", default-features = false }
