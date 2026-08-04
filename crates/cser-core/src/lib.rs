@@ -19,9 +19,12 @@ extern crate std;
 /// Frozen semantic API profile established after the reply and DMA domain
 /// slices both passed without an adapter-owned semantic escape hatch.
 ///
-/// This is a source and durable-semantics compatibility coordinate, not a Rust
-/// ABI promise. An incompatible public contract change must advance this value
-/// and use a new journal schema or an explicit, tested migration.
+/// This is the transition/journal semantic compatibility coordinate, not a
+/// Rust ABI promise. An incompatible transition or journal contract change
+/// must advance this value and use a new journal schema or an explicit, tested
+/// migration. Standard catalog grammar and validation evolve under the
+/// separate [`STANDARD_CATALOG_VERSION`] coordinate and exact catalog digest;
+/// recovery never reinterprets a journal bound to an older catalog digest.
 pub const CSER_CORE_API_PROFILE_VERSION: u16 = 2;
 
 /// Frozen standard catalog format used by semantic API profile 2.
@@ -50,9 +53,8 @@ pub use domain::{
     AdoptionPolicy, ClaimCardinality, ClaimRule, ClaimScopePolicy, CompositeComponentSpec,
     CompositeRule, ConflictMode, CreditRule, DeviceGenerationEffect, DomainCatalog,
     DomainCatalogBuilder, DomainCatalogError, EvidenceCapability, EvidenceRecovery, EvidenceRule,
-    EvidenceSubjectBinding,
-    FreshnessAxes, ObligationPolicy, ObligationReceipts, ObligationRule, ObligationSpec,
-    ReceiptBinding,
+    EvidenceSubjectBinding, FreshnessAxes, ObligationPolicy, ObligationReceipts, ObligationRule,
+    ObligationSpec, ReceiptBinding,
 };
 pub use engine::{
     AuthorityState, ChargeProjection, ClaimCustodian, ClaimProjection, ClaimScope, ClaimUseError,
@@ -87,11 +89,16 @@ pub use persistence::{
 };
 pub use profiles::{
     AGENT_COMPONENT_DMA, AGENT_COMPONENT_REPLY, AGENT_OPERATION_COMPOSITE, CREDIT_IOVA,
-    CREDIT_PINNED_PAGE, CREDIT_QUEUE_SLOT, CREDIT_REPLY_SLOT, DEVICE_CLAIM_IOVA,
-    DEVICE_CLAIM_PINNED_PAGE, DEVICE_CLAIM_QUEUE_SLOT, DEVICE_COMMIT_RECEIPT_SCHEMA, DEVICE_DOMAIN,
-    DEVICE_EVIDENCE_IOTLB, DEVICE_EVIDENCE_IRQ_DRAINED, DEVICE_EVIDENCE_RESET,
-    DEVICE_OBLIGATION_DMA, DEVICE_RECEIPT_SCHEMA, DEVICE_VERIFIER, DMA_ARENA_REUSE_COMPOSITE,
-    REPLY_APPLY_RECEIPT_SCHEMA, REPLY_CLAIM_PUBLICATION_SLOT, REPLY_COMMIT_RECEIPT_SCHEMA,
-    REPLY_DOMAIN, REPLY_EVIDENCE_PUBLICATION_ACK, REPLY_OBLIGATION_PUBLICATION,
-    REPLY_RECEIPT_SCHEMA, REPLY_SETTLEMENT_RECEIPT_SCHEMA, REPLY_VERIFIER, standard_catalog,
+    CREDIT_PINNED_PAGE, CREDIT_QUEUE_SLOT, CREDIT_REPLY_SLOT, CREDIT_TOOL_OUTCOME_SLOT,
+    DEVICE_CLAIM_IOVA, DEVICE_CLAIM_PINNED_PAGE, DEVICE_CLAIM_QUEUE_SLOT,
+    DEVICE_COMMIT_RECEIPT_SCHEMA, DEVICE_DOMAIN, DEVICE_EVIDENCE_IOTLB,
+    DEVICE_EVIDENCE_IRQ_DRAINED, DEVICE_EVIDENCE_RESET, DEVICE_OBLIGATION_DMA,
+    DEVICE_RECEIPT_SCHEMA, DEVICE_VERIFIER, DMA_ARENA_REUSE_COMPOSITE, REPLY_APPLY_RECEIPT_SCHEMA,
+    REPLY_CLAIM_PUBLICATION_SLOT, REPLY_COMMIT_RECEIPT_SCHEMA, REPLY_DOMAIN,
+    REPLY_EVIDENCE_PUBLICATION_ACK, REPLY_OBLIGATION_PUBLICATION, REPLY_RECEIPT_SCHEMA,
+    REPLY_SETTLEMENT_RECEIPT_SCHEMA, REPLY_VERIFIER, TOOL_APPLY_RECEIPT_SCHEMA,
+    TOOL_CLAIM_OUTCOME_SLOT, TOOL_COMMIT_RECEIPT_SCHEMA, TOOL_DMA_COMPONENT_DMA,
+    TOOL_DMA_COMPONENT_TOOL, TOOL_DMA_OPERATION_COMPOSITE, TOOL_DOMAIN, TOOL_EVIDENCE_OUTCOME_ACK,
+    TOOL_OBLIGATION_INVOCATION, TOOL_RECEIPT_SCHEMA, TOOL_SETTLEMENT_RECEIPT_SCHEMA, TOOL_VERIFIER,
+    standard_catalog, tool_dma_catalog,
 };

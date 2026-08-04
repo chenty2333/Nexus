@@ -6,7 +6,10 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     process::Command as ProcessCommand,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use cser_core::{
@@ -70,10 +73,69 @@ fn open_anchor(path: &Path) -> HostFileTrustedAnchor {
     HostFileTrustedAnchor::open_or_initialize(path, binding(), freshness(1, 1, 1, 1, 1)).unwrap()
 }
 
+/// A test-only controller injects a storage failure without borrowing the
+/// coordinator's backend. Production code receives no mutable backend escape
+/// hatch from `CoordinatedPersistence`.
+#[derive(Clone, Debug)]
+struct AnchorFailpointController(Arc<Mutex<HostAnchorFailpoint>>);
+
+impl AnchorFailpointController {
+    fn new() -> Self {
+        Self(Arc::new(Mutex::new(HostAnchorFailpoint::None)))
+    }
+
+    fn arm(&self, failpoint: HostAnchorFailpoint) {
+        *self.0.lock().unwrap() = failpoint;
+    }
+
+    fn take(&self) -> HostAnchorFailpoint {
+        core::mem::replace(&mut *self.0.lock().unwrap(), HostAnchorFailpoint::None)
+    }
+}
+
+#[derive(Debug)]
+struct ControlledHostAnchor {
+    inner: HostFileTrustedAnchor,
+    controller: AnchorFailpointController,
+}
+
+impl ControlledHostAnchor {
+    fn new(inner: HostFileTrustedAnchor, controller: AnchorFailpointController) -> Self {
+        Self { inner, controller }
+    }
+
+    fn inject(&mut self) {
+        self.inner.set_failpoint(self.controller.take());
+    }
+}
+
+impl TrustedAnchorBackend for ControlledHostAnchor {
+    type Error = cser_core::std_support::HostAnchorError;
+
+    fn reserve_recovery_epoch(
+        &mut self,
+        binding: RecoveryBinding,
+        observed_device: DeviceGeneration,
+    ) -> Result<RecoveryLease, Self::Error> {
+        self.inject();
+        self.inner.reserve_recovery_epoch(binding, observed_device)
+    }
+
+    fn compare_and_advance(
+        &mut self,
+        expected: TrustedAnchorSnapshot,
+        replacement: TrustedAnchorSnapshot,
+    ) -> Result<(), Self::Error> {
+        self.inject();
+        self.inner.compare_and_advance(expected, replacement)
+    }
+}
+
 #[derive(Debug)]
 struct Reopened {
     engine: Engine,
-    persistence: CoordinatedPersistence<FileJournal, HostFileTrustedAnchor>,
+    persistence: CoordinatedPersistence<FileJournal, ControlledHostAnchor>,
+    anchor_failpoint: AnchorFailpointController,
     target: Freshness,
     observed_repair: Option<JournalRepair>,
 }
@@ -81,7 +143,8 @@ struct Reopened {
 fn cold_reopen(directory: &Path, observed_device: u64) -> Result<Reopened, CoreError> {
     let anchor_path = directory.join("anchor.bin");
     let journal_path = directory.join("journal.bin");
-    let mut anchor = open_anchor(&anchor_path);
+    let anchor_failpoint = AnchorFailpointController::new();
+    let mut anchor = ControlledHostAnchor::new(open_anchor(&anchor_path), anchor_failpoint.clone());
     let lease = anchor
         .reserve_recovery_epoch(binding(), DeviceGeneration::new(observed_device).unwrap())
         .unwrap();
@@ -112,6 +175,7 @@ fn cold_reopen(directory: &Path, observed_device: u64) -> Result<Reopened, CoreE
     Ok(Reopened {
         engine,
         persistence,
+        anchor_failpoint,
         target,
         observed_repair,
     })
@@ -342,9 +406,8 @@ fn crash_windows_reconcile_to_the_exact_trusted_prefix() {
     let mut opened = cold_reopen(&suffix.directory, 1).unwrap();
     checkpoint(&mut opened);
     opened
-        .persistence
-        .anchor_mut()
-        .set_failpoint(HostAnchorFailpoint::BeforeAtomicReplace);
+        .anchor_failpoint
+        .arm(HostAnchorFailpoint::BeforeAtomicReplace);
     let result = opened
         .engine
         .transact_durable(create_reply_command(102), &mut opened.persistence);
@@ -363,9 +426,8 @@ fn crash_windows_reconcile_to_the_exact_trusted_prefix() {
     let mut opened = cold_reopen(&lost_ack.directory, 1).unwrap();
     checkpoint(&mut opened);
     opened
-        .persistence
-        .anchor_mut()
-        .set_failpoint(HostAnchorFailpoint::AfterAtomicReplaceBeforeReturn);
+        .anchor_failpoint
+        .arm(HostAnchorFailpoint::AfterAtomicReplaceBeforeReturn);
     let result = opened
         .engine
         .transact_durable(create_reply_command(103), &mut opened.persistence);

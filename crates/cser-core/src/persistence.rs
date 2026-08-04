@@ -295,21 +295,6 @@ impl<J, A> CoordinatedPersistence<J, A> {
         &self.journal
     }
 
-    /// Returns mutable access to the journal backend.
-    ///
-    /// Callers must not use this access to bypass [`TransitionDurability`].
-    pub fn journal_mut(&mut self) -> &mut J {
-        &mut self.journal
-    }
-
-    /// Returns mutable access to the trusted-anchor backend.
-    ///
-    /// This is intended for platform lifecycle control and failpoint testing;
-    /// semantic tip updates must still go through [`TransitionDurability`].
-    pub fn anchor_mut(&mut self) -> &mut A {
-        &mut self.anchor
-    }
-
     /// Consumes the coordinator into its backends.
     pub fn into_backends(self) -> (J, A) {
         (self.journal, self.anchor)

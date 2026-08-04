@@ -3,23 +3,23 @@ mod support;
 
 use cser_core::{
     AGENT_COMPONENT_DMA, AGENT_COMPONENT_REPLY, AGENT_OPERATION_COMPOSITE, AdoptionPolicy,
-    AuthorityState, CREDIT_QUEUE_SLOT, CREDIT_REPLY_SLOT, ClaimCardinality, ClaimCustodian, ClaimId, ClaimScope,
-    ClaimScopePolicy, Command as AuthorizedCommand, CommandRequest as Command, CommitIntent,
-    CommitState, ComponentCommitOperation, ComponentId, CompositeComponentSpec, CompositeKindId,
-    CoreError, CoreLimits, CustodyState, DEVICE_CLAIM_IOVA, DEVICE_CLAIM_PINNED_PAGE,
-    DEVICE_CLAIM_QUEUE_SLOT, DEVICE_COMMIT_RECEIPT_SCHEMA, DEVICE_DOMAIN, DEVICE_EVIDENCE_IOTLB,
-    DEVICE_EVIDENCE_IRQ_DRAINED, DEVICE_EVIDENCE_RESET, DEVICE_OBLIGATION_DMA,
-    DEVICE_RECEIPT_SCHEMA, DEVICE_VERIFIER, DMA_ARENA_REUSE_COMPOSITE, DeviceScopeId,
-    DomainCatalogBuilder, EffectEscapeState, EffectId, Engine, EvidenceKindId, EvidenceRule,
-    ExternalOutcome, Freshness, FreshnessAxes, JOURNAL_CORE_API_PROFILE, JOURNAL_SCHEMA_VERSION,
-    JournalDecodeError, NORMALIZED_TRACE_VERSION, ObligationKindId, ObligationPolicy,
-    ObligationReceipts, ObligationSpec, PROJECTION_VERSION, RECOVERY_SNAPSHOT_VERSION,
-    REPLY_APPLY_RECEIPT_SCHEMA, REPLY_CLAIM_PUBLICATION_SLOT, REPLY_COMMIT_RECEIPT_SCHEMA,
-    REPLY_DOMAIN, REPLY_EVIDENCE_PUBLICATION_ACK, REPLY_RECEIPT_SCHEMA,
-    REPLY_SETTLEMENT_RECEIPT_SCHEMA, REPLY_VERIFIER, ReceiptBinding, ReceiptSchemaId,
-    RecoveryAnchor, ResourceId, RetirementState, RootRecoveryState, SettlementState,
-    TransitionEvent, TransitionOutput, TransitionResult, TxError, VerifierId, scan_journal,
-    standard_catalog,
+    AuthorityState, CREDIT_QUEUE_SLOT, CREDIT_REPLY_SLOT, ClaimCardinality, ClaimCustodian,
+    ClaimId, ClaimScope, ClaimScopePolicy, Command as AuthorizedCommand, CommandRequest as Command,
+    CommitIntent, CommitState, ComponentCommitOperation, ComponentId, CompositeComponentSpec,
+    CompositeKindId, CoreError, CoreLimits, CustodyState, DEVICE_CLAIM_IOVA,
+    DEVICE_CLAIM_PINNED_PAGE, DEVICE_CLAIM_QUEUE_SLOT, DEVICE_COMMIT_RECEIPT_SCHEMA, DEVICE_DOMAIN,
+    DEVICE_EVIDENCE_IOTLB, DEVICE_EVIDENCE_IRQ_DRAINED, DEVICE_EVIDENCE_RESET,
+    DEVICE_OBLIGATION_DMA, DEVICE_RECEIPT_SCHEMA, DEVICE_VERIFIER, DMA_ARENA_REUSE_COMPOSITE,
+    DeviceScopeId, DomainCatalogBuilder, EffectEscapeState, EffectId, Engine, EvidenceKindId,
+    EvidenceRule, ExternalOutcome, Freshness, FreshnessAxes, JOURNAL_CORE_API_PROFILE,
+    JOURNAL_SCHEMA_VERSION, JournalDecodeError, NORMALIZED_TRACE_VERSION, ObligationKindId,
+    ObligationPolicy, ObligationReceipts, ObligationSpec, PROJECTION_VERSION,
+    RECOVERY_SNAPSHOT_VERSION, REPLY_APPLY_RECEIPT_SCHEMA, REPLY_CLAIM_PUBLICATION_SLOT,
+    REPLY_COMMIT_RECEIPT_SCHEMA, REPLY_DOMAIN, REPLY_EVIDENCE_PUBLICATION_ACK,
+    REPLY_RECEIPT_SCHEMA, REPLY_SETTLEMENT_RECEIPT_SCHEMA, REPLY_VERIFIER, ReceiptBinding,
+    ReceiptSchemaId, RecoveryAnchor, ResourceId, RetirementState, RootRecoveryState,
+    SettlementState, TransitionDurability, TransitionEvent, TransitionOutput, TransitionResult,
+    TxError, VerifierId, scan_journal, standard_catalog,
 };
 use proptest::prelude::*;
 use support::{
@@ -813,7 +813,7 @@ fn retire_dma_claim(
     claim: ClaimId,
     terminal_evidence: EvidenceKindId,
     marker: u8,
-) {
+) -> cser_core::TransitionReceipt {
     reset_component_claim(harness, effect, claim, marker);
     let evidence = current_component_evidence_command(
         harness,
@@ -824,7 +824,7 @@ fn retire_dma_claim(
         ReceiptBinding::new(DEVICE_VERIFIER, DEVICE_RECEIPT_SCHEMA),
         digest(marker + 1),
     );
-    harness.tx(evidence).unwrap();
+    harness.tx(evidence).unwrap()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1094,6 +1094,76 @@ fn seed_retired_queue(harness: &mut Harness) -> ResourceId {
         })
         .unwrap();
     queue
+}
+
+/// Builds a committed DMA component with reset accepted but its final IRQ-drain
+/// quiescence evidence still pending.  The returned command is the transition
+/// which releases the resource coordinate when it becomes durable.
+fn pending_dma_quiescence_release(
+    harness: &mut Harness,
+) -> (
+    EffectId,
+    cser_core::PrincipalIncarnation,
+    ClaimId,
+    ResourceId,
+    AuthorizedCommand,
+) {
+    let effect = effect(MAIN_ROOT, 1);
+    let origin = principal(MAIN_ROOT, 1);
+    let claim_id = claim(1);
+    let queue = resource(0x7011);
+    harness
+        .tx(Command::CreateCompositeEffect {
+            effect,
+            origin,
+            binding_generation: 1,
+            kind: DMA_ARENA_REUSE_COMPOSITE,
+            charge_account: charge(MAIN_ROOT),
+        })
+        .unwrap();
+    harness
+        .tx(Command::AddComponentClaim {
+            effect,
+            component: AGENT_COMPONENT_DMA,
+            actor: origin,
+            binding_generation: 1,
+            claim: claim_id,
+            kind: DEVICE_CLAIM_QUEUE_SLOT,
+            scope: ClaimScope::Device(device_scope()),
+            resource: queue,
+            resource_generation: resource_generation(1),
+            units: 1,
+        })
+        .unwrap();
+    harness
+        .tx(Command::PrepareCompositeEffect {
+            effect,
+            actor: origin,
+            binding_generation: 1,
+        })
+        .unwrap();
+    commit_component(
+        harness,
+        effect,
+        AGENT_COMPONENT_DMA,
+        origin,
+        1,
+        0x51,
+        0x52,
+        DEVICE_VERIFIER,
+        DEVICE_COMMIT_RECEIPT_SCHEMA,
+    );
+    reset_component_claim(harness, effect, claim_id, 0x53);
+    let final_evidence = current_component_evidence_command(
+        harness,
+        effect,
+        AGENT_COMPONENT_DMA,
+        claim_id,
+        DEVICE_EVIDENCE_IRQ_DRAINED,
+        ReceiptBinding::new(DEVICE_VERIFIER, DEVICE_RECEIPT_SCHEMA),
+        digest(0x54),
+    );
+    (effect, origin, claim_id, queue, final_evidence)
 }
 
 #[test]
@@ -1497,6 +1567,27 @@ fn composite_profile2_reuses_one_resource_and_replays_the_complete_projection() 
         4,
         3,
     );
+    // This is a deterministic occupancy measurement, not elapsed time.  The
+    // durable journal revision at which the final DMA claim retires gives a
+    // stable lower endpoint for the interval during which a flat parent gate
+    // would have retained the DMA credits along with the still-live reply.
+    let dma_live_claims = harness
+        .engine
+        .component_claims(effect, AGENT_COMPONENT_DMA)
+        .unwrap()
+        .into_iter()
+        .filter(|claim| !claim.retired)
+        .collect::<Vec<_>>();
+    let dma_withheld_credit_units = dma_live_claims.iter().map(|claim| claim.units).sum::<u64>();
+    assert_eq!(dma_withheld_credit_units, 3);
+    let claim_units = |claim_id| {
+        dma_live_claims
+            .iter()
+            .find(|claim| claim.claim == claim_id)
+            .expect("measured DMA claim must be live before discharge")
+            .units
+    };
+
     let late_irq = current_component_evidence_command(
         &harness,
         effect,
@@ -1517,9 +1608,11 @@ fn composite_profile2_reuses_one_resource_and_replays_the_complete_projection() 
         ReceiptBinding::new(DEVICE_VERIFIER, DEVICE_RECEIPT_SCHEMA),
         digest(32),
     );
-    harness.tx(current_irq).unwrap();
-    retire_dma_claim(&mut harness, effect, page_claim, DEVICE_EVIDENCE_IOTLB, 33);
-    retire_dma_claim(&mut harness, effect, iova_claim, DEVICE_EVIDENCE_IOTLB, 35);
+    let queue_retirement_revision = harness.tx(current_irq).unwrap().revision();
+    let page_retirement_revision =
+        retire_dma_claim(&mut harness, effect, page_claim, DEVICE_EVIDENCE_IOTLB, 33).revision();
+    let iova_retirement_revision =
+        retire_dma_claim(&mut harness, effect, iova_claim, DEVICE_EVIDENCE_IOTLB, 35).revision();
 
     let dma = harness
         .engine
@@ -1628,7 +1721,32 @@ fn composite_profile2_reuses_one_resource_and_replays_the_complete_projection() 
         ReceiptBinding::new(REPLY_VERIFIER, REPLY_RECEIPT_SCHEMA),
         digest(44),
     );
-    harness.tx(reply_retirement).unwrap();
+    let reply_retirement_revision = harness.tx(reply_retirement).unwrap().revision();
+
+    // `revision` is a durable semantic-transition coordinate, not a clock.
+    // The sum is therefore a counterfactual flat-parent occupancy measure in
+    // credit-unit revisions: each DMA credit is counted from its own local
+    // discharge until reply discharge. It is deliberately not wall-clock time.
+    let partial_discharge_revision_window = reply_retirement_revision
+        .checked_sub(iova_retirement_revision)
+        .expect("reply retirement must follow DMA retirement");
+    let counterfactual_flat_parent_saved_claim_revision_units = [
+        (queue_retirement_revision, claim_units(reused_queue_claim)),
+        (page_retirement_revision, claim_units(page_claim)),
+        (iova_retirement_revision, claim_units(iova_claim)),
+    ]
+    .into_iter()
+    .map(|(retirement_revision, units)| {
+        reply_retirement_revision
+            .checked_sub(retirement_revision)
+            .expect("every DMA claim must retire before the reply")
+            .checked_mul(units)
+            .expect("bounded claim occupancy must not overflow")
+    })
+    .try_fold(0u64, |total, window| total.checked_add(window))
+    .expect("bounded test measurement must not overflow");
+    assert_eq!(partial_discharge_revision_window, 10);
+    assert_eq!(counterfactual_flat_parent_saved_claim_revision_units, 36);
 
     assert_eq!(
         harness
@@ -1806,6 +1924,49 @@ fn dma_only_profile2_operation_reuses_a_retired_composite_resource() {
         })
         .unwrap();
     commit_agent_components(&mut harness, original, origin, 1, 50, 51, 52, 53);
+
+    // A real reservation command, rather than a read-only projection, proves
+    // that the retained claim closes the admission gate.  The failed command
+    // is deliberately retried unchanged after exact retirement below.
+    harness
+        .tx(Command::CreateCompositeEffect {
+            effect: reuse,
+            origin,
+            binding_generation: 1,
+            kind: DMA_ARENA_REUSE_COMPOSITE,
+            charge_account: charge(MAIN_ROOT),
+        })
+        .unwrap();
+    let before_retained_reuse_probe = (
+        harness.engine.revision(),
+        harness.engine.head(),
+        harness.engine.projection_digest(),
+    );
+    assert_eq!(
+        harness.tx(Command::ReserveComponentReuse {
+            effect: reuse,
+            component: AGENT_COMPONENT_DMA,
+            actor: origin,
+            binding_generation: 1,
+            claim: reused_queue_claim,
+            kind: DEVICE_CLAIM_QUEUE_SLOT,
+            scope: ClaimScope::Device(device_scope()),
+            resource: queue_resource,
+            expected_generation: resource_generation(1),
+            units: 1,
+            reuse_contract: digest(202),
+        }),
+        Err(CoreError::ResourceRetained)
+    );
+    assert_eq!(
+        (
+            harness.engine.revision(),
+            harness.engine.head(),
+            harness.engine.projection_digest(),
+        ),
+        before_retained_reuse_probe
+    );
+
     retire_dma_claim(
         &mut harness,
         original,
@@ -1828,15 +1989,6 @@ fn dma_only_profile2_operation_reuses_a_retired_composite_resource() {
         1
     );
 
-    harness
-        .tx(Command::CreateCompositeEffect {
-            effect: reuse,
-            origin,
-            binding_generation: 1,
-            kind: DMA_ARENA_REUSE_COMPOSITE,
-            charge_account: charge(MAIN_ROOT),
-        })
-        .unwrap();
     let before_invalid_contract = (
         harness.engine.revision(),
         harness.engine.head(),
@@ -3059,116 +3211,241 @@ proptest! {
     }
 }
 
-/// Custody must not be released before the fact that releases it is durable.
-///
-/// The dangerous direction is release, not retention: if the kernel treats a
-/// coordinate as free while the acceptance that freed it is still only in
-/// volatile state, a crash reopens it for reuse while the device may still be
-/// writing. This drives the terminal quiescence acceptance to a failing
-/// journal and asserts the coordinate stays held.
+#[derive(Debug, Eq, PartialEq)]
+struct DiskFull;
+
+/// Minimal durability provider used to exercise the production-shaped
+/// `transact_durable` boundary.  Its successful return represents completion
+/// of the provider's durability barrier.
+struct TestDurability {
+    fail: bool,
+    calls: usize,
+}
+
+impl TransitionDurability for TestDurability {
+    type Error = DiskFull;
+
+    fn persist_transition(
+        &mut self,
+        _: &cser_core::JournalRecord,
+        _: Freshness,
+    ) -> Result<(), Self::Error> {
+        self.calls += 1;
+        if self.fail { Err(DiskFull) } else { Ok(()) }
+    }
+}
+
+/// Custody must not be released before the terminal quiescence evidence which
+/// releases it reaches the durability boundary.
 #[test]
 fn custody_release_is_not_observable_before_its_evidence_is_durable() {
-    #[derive(Debug, Eq, PartialEq)]
-    struct DiskFull;
-
     let mut harness = Harness::new_profile_two();
-    let queue = seed_retired_queue(&mut harness);
+    let (effect, origin, claim_id, queue, final_evidence) =
+        pending_dma_quiescence_release(&mut harness);
     assert_eq!(
         harness.engine.check_reusable(queue, resource_generation(1)),
-        Ok(())
+        Err(CoreError::ResourceRetained)
     );
-
-    let heir = effect(MAIN_ROOT, 1);
-    let heir_origin = principal(MAIN_ROOT, 1);
-    let heir_claim = claim(1);
-    harness
-        .tx(Command::CreateCompositeEffect {
-            effect: heir,
-            origin: heir_origin,
-            binding_generation: 1,
-            kind: DMA_ARENA_REUSE_COMPOSITE,
-            charge_account: charge(MAIN_ROOT),
-        })
+    let before_claim = harness
+        .engine
+        .component_claims(effect, AGENT_COMPONENT_DMA)
         .unwrap();
-
+    let before_reset = harness
+        .engine
+        .component_retirement_evidence_accepted(
+            effect,
+            AGENT_COMPONENT_DMA,
+            claim_id,
+            DEVICE_EVIDENCE_RESET,
+        )
+        .unwrap();
+    let before_irq = harness
+        .engine
+        .component_retirement_evidence_accepted(
+            effect,
+            AGENT_COMPONENT_DMA,
+            claim_id,
+            DEVICE_EVIDENCE_IRQ_DRAINED,
+        )
+        .unwrap();
+    let before_charge = harness.engine.charge(charge(MAIN_ROOT), CREDIT_QUEUE_SLOT);
     let before_projection = harness.engine.projection_digest();
     let before_revision = harness.engine.revision();
     let before_head = harness.engine.head();
 
-    // Reserving reuse is where custody crosses the trust boundary: it mints a
-    // one-shot permit authorizing a successor to touch the coordinate. If the
-    // permit were observable before its record were durable, a crash would
-    // leave a successor believing it holds authority the journal never granted.
+    // This is the final IRQ-drain evidence: accepting it would retire the
+    // claim, release its charge, and make generation 1 reusable.  A failed
+    // durability barrier must leave all of those facts unobservable.
+    let mut persistence = TestDurability {
+        fail: true,
+        calls: 0,
+    };
     let error = harness
         .engine
-        .transact(
-            AuthorizedCommand::from(Command::ReserveComponentReuse {
-                effect: heir,
+        .transact_durable(final_evidence, &mut persistence)
+        .unwrap_err();
+    assert_eq!(error, TxError::Persist(DiskFull));
+    assert_eq!(persistence.calls, 1);
+
+    // The pending evidence, live claim, retention charge, and resource gate
+    // all remain unchanged; no transition receipt (and therefore no permit)
+    // escaped the failed durability boundary.
+    assert_eq!(
+        harness
+            .engine
+            .component_claims(effect, AGENT_COMPONENT_DMA)
+            .unwrap(),
+        before_claim
+    );
+    assert_eq!(
+        harness
+            .engine
+            .component_retirement_evidence_accepted(
+                effect,
+                AGENT_COMPONENT_DMA,
+                claim_id,
+                DEVICE_EVIDENCE_RESET,
+            )
+            .unwrap(),
+        before_reset
+    );
+    assert_eq!(
+        harness
+            .engine
+            .component_retirement_evidence_accepted(
+                effect,
+                AGENT_COMPONENT_DMA,
+                claim_id,
+                DEVICE_EVIDENCE_IRQ_DRAINED,
+            )
+            .unwrap(),
+        before_irq
+    );
+    assert_eq!(
+        harness.engine.charge(charge(MAIN_ROOT), CREDIT_QUEUE_SLOT),
+        before_charge
+    );
+    assert_eq!(
+        harness.engine.check_reusable(queue, resource_generation(1)),
+        Err(CoreError::ResourceRetained)
+    );
+    assert_eq!(harness.engine.projection_digest(), before_projection);
+    assert_eq!(harness.engine.revision(), before_revision);
+    assert_eq!(harness.engine.head(), before_head);
+    assert!(harness.engine.persistence_recovery_required());
+    assert_eq!(
+        harness.engine.transact(
+            Command::ReserveComponentReuse {
+                effect,
                 component: AGENT_COMPONENT_DMA,
-                actor: heir_origin,
+                actor: origin,
                 binding_generation: 1,
-                claim: heir_claim,
+                claim: claim(2),
                 kind: DEVICE_CLAIM_QUEUE_SLOT,
                 scope: ClaimScope::Device(device_scope()),
                 resource: queue,
                 expected_generation: resource_generation(1),
                 units: 1,
-                reuse_contract: digest(9),
-            }),
-            |_| Err(DiskFull),
-        )
-        .unwrap_err();
-    assert_eq!(error, TxError::Persist(DiskFull));
+                reuse_contract: digest(0x55),
+            },
+            |_| Ok::<(), DiskFull>(()),
+        ),
+        Err(TxError::Core(CoreError::PersistenceRecoveryRequired))
+    );
+}
 
-    // No permit escaped, and the coordinate is exactly as it was.
+/// The closure API has the same publication rule as the typed provider API:
+/// final quiescence evidence cannot release custody when its persistence
+/// callback fails.
+#[test]
+fn closure_persistence_failure_keeps_final_quiescence_release_unobservable() {
+    let mut harness = Harness::new_profile_two();
+    let (effect, _, _, queue, final_evidence) = pending_dma_quiescence_release(&mut harness);
+    let before_claims = harness.engine.retained_component_claims();
+    let before_charge = harness.engine.charge(charge(MAIN_ROOT), CREDIT_QUEUE_SLOT);
+    let before_projection = harness.engine.projection_digest();
+    let before_revision = harness.engine.revision();
+    let before_head = harness.engine.head();
+
+    assert_eq!(
+        harness.engine.transact(final_evidence, |_| Err(DiskFull)),
+        Err(TxError::Persist(DiskFull))
+    );
+    assert_eq!(harness.engine.retained_component_claims(), before_claims);
+    assert_eq!(
+        harness.engine.charge(charge(MAIN_ROOT), CREDIT_QUEUE_SLOT),
+        before_charge
+    );
     assert_eq!(harness.engine.projection_digest(), before_projection);
     assert_eq!(harness.engine.revision(), before_revision);
     assert_eq!(harness.engine.head(), before_head);
+    assert_eq!(
+        harness.engine.check_reusable(queue, resource_generation(1)),
+        Err(CoreError::ResourceRetained)
+    );
     assert!(harness.engine.persistence_recovery_required());
+    assert_eq!(
+        harness
+            .engine
+            .component_claims(effect, AGENT_COMPONENT_DMA)
+            .unwrap()
+            .into_iter()
+            .find(|claim| claim.resource == queue)
+            .unwrap()
+            .retired,
+        false
+    );
 }
 
-/// Guards the negative test above against passing for the wrong reason.
-///
-/// If the reservation were rejected on its own merits rather than by the
-/// failing journal, the durability assertion would be vacuous. This runs the
-/// identical command with a succeeding journal and requires a permit.
+/// Guards the negative test above against passing because the final evidence
+/// was invalid: the same final evidence releases the claim after durable
+/// success.
 #[test]
-fn the_same_reservation_succeeds_when_its_record_reaches_the_journal() {
+fn final_quiescence_evidence_releases_custody_after_durable_success() {
     let mut harness = Harness::new_profile_two();
-    let queue = seed_retired_queue(&mut harness);
-
-    let heir = effect(MAIN_ROOT, 1);
-    let heir_origin = principal(MAIN_ROOT, 1);
-    let heir_claim = claim(1);
-    harness
-        .tx(Command::CreateCompositeEffect {
-            effect: heir,
-            origin: heir_origin,
-            binding_generation: 1,
-            kind: DMA_ARENA_REUSE_COMPOSITE,
-            charge_account: charge(MAIN_ROOT),
-        })
-        .unwrap();
-
-    let output = harness.output(Command::ReserveComponentReuse {
-        effect: heir,
-        component: AGENT_COMPONENT_DMA,
-        actor: heir_origin,
-        binding_generation: 1,
-        claim: heir_claim,
-        kind: DEVICE_CLAIM_QUEUE_SLOT,
-        scope: ClaimScope::Device(device_scope()),
-        resource: queue,
-        expected_generation: resource_generation(1),
-        units: 1,
-        reuse_contract: digest(9),
-    });
-    let permit = match output {
-        TransitionOutput::ReusePermit(permit) => permit,
-        other => panic!("expected a reuse permit, got {other:?}"),
+    let (effect, _, claim_id, queue, final_evidence) = pending_dma_quiescence_release(&mut harness);
+    let mut persistence = TestDurability {
+        fail: false,
+        calls: 0,
     };
-    assert_eq!(permit.resource(), queue);
-    assert_eq!(permit.generation(), resource_generation(2));
+    let receipt = harness
+        .engine
+        .transact_durable(final_evidence, &mut persistence)
+        .unwrap();
+    assert_eq!(persistence.calls, 1);
+    assert_eq!(receipt.into_output(), TransitionOutput::None);
+    assert!(
+        harness
+            .engine
+            .component_claims(effect, AGENT_COMPONENT_DMA)
+            .unwrap()
+            .into_iter()
+            .find(|claim| claim.claim == claim_id)
+            .unwrap()
+            .retired
+    );
+    assert!(
+        harness
+            .engine
+            .component_retirement_evidence_accepted(
+                effect,
+                AGENT_COMPONENT_DMA,
+                claim_id,
+                DEVICE_EVIDENCE_IRQ_DRAINED,
+            )
+            .unwrap()
+    );
+    assert_eq!(
+        harness
+            .engine
+            .charge(charge(MAIN_ROOT), CREDIT_QUEUE_SLOT)
+            .retained_units,
+        0
+    );
+    assert_eq!(
+        harness.engine.check_reusable(queue, resource_generation(1)),
+        Ok(())
+    );
 }
 
 /// Credit pressure inside a sealed composite is per component obligation's
@@ -3238,6 +3515,50 @@ fn a_saturated_component_does_not_backpressure_its_sibling() {
         Err(CoreError::Backpressure)
     );
     assert_eq!(harness.engine.projection_digest(), before);
+    assert_eq!(
+        harness
+            .engine
+            .charge(charge(0xc5b0), CREDIT_QUEUE_SLOT)
+            .retained_units,
+        3,
+        "a refused component admission must leave its live claim charged",
+    );
+
+    // A second composite reaches the same component admission path with the
+    // same class and units, but a distinct account. Thus a class-global quota
+    // key cannot pass this test merely because the sibling uses another class.
+    let unrelated = effect(0xc5b1, 1);
+    let unrelated_origin = principal(0xc5b1, 1);
+    harness
+        .tx(Command::CreateCompositeEffect {
+            effect: unrelated,
+            origin: unrelated_origin,
+            binding_generation: 1,
+            kind: AGENT_OPERATION_COMPOSITE,
+            charge_account: charge(0xc5b1),
+        })
+        .unwrap();
+    harness
+        .tx(Command::AddComponentClaim {
+            effect: unrelated,
+            component: AGENT_COMPONENT_DMA,
+            actor: unrelated_origin,
+            binding_generation: 1,
+            claim: claim(4),
+            kind: DEVICE_CLAIM_QUEUE_SLOT,
+            scope: ClaimScope::Device(scope),
+            resource: resource(0xc5b1_0001),
+            resource_generation: resource_generation(1),
+            units: 3,
+        })
+        .expect("a second account must not inherit a component's queue ceiling");
+    assert_eq!(
+        harness
+            .engine
+            .charge(charge(0xc5b1), CREDIT_QUEUE_SLOT)
+            .retained_units,
+        3
+    );
 
     // The sibling component's own credit class is untouched.
     harness
@@ -3260,5 +3581,45 @@ fn a_saturated_component_does_not_backpressure_its_sibling() {
             .charge(charge(0xc5b0), CREDIT_REPLY_SLOT)
             .retained_units,
         1
+    );
+
+    // Paired headroom control for the rejected second queue claim. This keeps
+    // the effect, account, component, class, and claim shape fixed while only
+    // increasing the unit ceiling.
+    let mut headroom =
+        Harness::profile_two_with_limits(CoreLimits::new(8, 8, 16, 16, 8, 4, 8).unwrap());
+    let operation = effect(0xc5b2, 1);
+    let origin = principal(0xc5b2, 1);
+    headroom
+        .tx(Command::CreateCompositeEffect {
+            effect: operation,
+            origin,
+            binding_generation: 1,
+            kind: AGENT_OPERATION_COMPOSITE,
+            charge_account: charge(0xc5b2),
+        })
+        .unwrap();
+    for (claim_value, resource_value, units) in [(1, 0xc5b2_0001, 3), (2, 0xc5b2_0002, 1)] {
+        headroom
+            .tx(Command::AddComponentClaim {
+                effect: operation,
+                component: AGENT_COMPONENT_DMA,
+                actor: origin,
+                binding_generation: 1,
+                claim: claim(claim_value),
+                kind: DEVICE_CLAIM_QUEUE_SLOT,
+                scope: ClaimScope::Device(scope),
+                resource: resource(resource_value),
+                resource_generation: resource_generation(1),
+                units,
+            })
+            .expect("raising only the unit ceiling must admit the same queue shape");
+    }
+    assert_eq!(
+        headroom
+            .engine
+            .charge(charge(0xc5b2), CREDIT_QUEUE_SLOT)
+            .retained_units,
+        4
     );
 }

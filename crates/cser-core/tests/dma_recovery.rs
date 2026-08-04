@@ -6,8 +6,9 @@ use cser_core::{
     Command as AuthorizedCommand, CommandRequest as Command, CommitState, CoreError, CoreLimits,
     DEVICE_CLAIM_IOVA, DEVICE_CLAIM_PINNED_PAGE, DEVICE_CLAIM_QUEUE_SLOT, DEVICE_DOMAIN,
     DEVICE_EVIDENCE_IOTLB, DEVICE_EVIDENCE_IRQ_DRAINED, DEVICE_EVIDENCE_RESET,
-    DEVICE_OBLIGATION_DMA, DMA_ARENA_REUSE_COMPOSITE, DeviceGeneration, Engine, ExternalOutcome,
-    Freshness, RecoveryAnchor, RetirementState, TransitionOutput, standard_catalog,
+    DEVICE_OBLIGATION_DMA, DEVICE_RECEIPT_SCHEMA, DEVICE_VERIFIER, DMA_ARENA_REUSE_COMPOSITE,
+    DeviceGeneration, Engine, EvidenceKindId, ExternalOutcome, Freshness, RecoveryAnchor,
+    RetirementState, TransitionOutput, standard_catalog,
 };
 use support::{
     ExactTestVerifier, Harness, TestReceipt, charge, claim, digest, effect, fence_and_rebind,
@@ -375,6 +376,70 @@ fn queue_page_and_iova_require_their_exact_retirement_conjunctions() {
     assert_eq!(
         harness.engine.estate(effect).unwrap().retirement,
         RetirementState::Retired
+    );
+}
+
+/// Unknown evidence cannot become a retirement command, so the verified
+/// ingress fails before it can change any custody state. This is deliberately
+/// one global fail-closed rule rather than a per-class disposition hook.
+#[test]
+fn unsupported_retirement_evidence_is_failure_atomic_and_retains_the_resource() {
+    let mut harness = Harness::new();
+    let (effect, _origin, subject) = committed_dma(&mut harness, 61, 61);
+    let unsupported = EvidenceKindId::new(999).unwrap();
+    let before = (
+        harness.engine.revision(),
+        harness.engine.head(),
+        harness.engine.projection_digest(),
+        harness.engine.claims(effect).unwrap(),
+        harness
+            .engine
+            .charge(charge(61), CREDIT_IOVA)
+            .retained_units,
+        harness.engine.check_reusable(
+            resource(IOVA_RESOURCE),
+            cser_core::ResourceGeneration::new(1).unwrap(),
+        ),
+    );
+    let verifier = ExactTestVerifier::new(DEVICE_VERIFIER, DEVICE_RECEIPT_SCHEMA);
+    let receipt = TestReceipt {
+        effect,
+        claim: claim(IOVA_CLAIM),
+        kind: unsupported,
+        resource: resource(IOVA_RESOURCE),
+        resource_generation: cser_core::ResourceGeneration::new(1).unwrap(),
+        subject,
+        observation: subject,
+        digest: digest(61),
+    };
+
+    assert_eq!(
+        harness.engine.verify_retirement_evidence(
+            effect,
+            claim(IOVA_CLAIM),
+            unsupported,
+            &verifier,
+            &receipt,
+        ),
+        Err(CoreError::UnexpectedEvidence)
+    );
+
+    assert_eq!(
+        (
+            harness.engine.revision(),
+            harness.engine.head(),
+            harness.engine.projection_digest(),
+            harness.engine.claims(effect).unwrap(),
+            harness
+                .engine
+                .charge(charge(61), CREDIT_IOVA)
+                .retained_units,
+            harness.engine.check_reusable(
+                resource(IOVA_RESOURCE),
+                cser_core::ResourceGeneration::new(1).unwrap(),
+            ),
+        ),
+        before
     );
 }
 
@@ -1314,13 +1379,61 @@ fn an_exhausted_account_does_not_freeze_the_same_credit_class_elsewhere() {
         }),
         Err(CoreError::Backpressure)
     );
+    assert_eq!(
+        harness
+            .engine
+            .charge(charge(40), CREDIT_IOVA)
+            .retained_units,
+        3,
+        "a refused admission must leave the live claim charged",
+    );
+
+    // This is the paired headroom control for the negative assertion above.
+    // It uses the same account/class/claim shape under a higher limit, so the
+    // refusal is pinned to the configured ceiling rather than another gate.
+    let mut headroom = Harness::with_limits(CoreLimits::new(8, 8, 16, 16, 8, 4, 8).unwrap());
+    let admitted = effect(42, 1);
+    let admitted_origin = principal(42, 1);
+    headroom
+        .tx(Command::CreateEstate {
+            effect: admitted,
+            origin: admitted_origin,
+            binding_generation: 1,
+            domain: DEVICE_DOMAIN,
+            obligation: DEVICE_OBLIGATION_DMA,
+            charge_account: charge(42),
+        })
+        .unwrap();
+    for (claim_value, resource_value, units) in [(421, 421, 3), (422, 422, 1)] {
+        headroom
+            .tx(Command::AddClaim {
+                effect: admitted,
+                actor: admitted_origin,
+                binding_generation: 1,
+                claim: claim(claim_value),
+                domain: DEVICE_DOMAIN,
+                kind: DEVICE_CLAIM_IOVA,
+                scope: cser_core::ClaimScope::Device(cser_core::DeviceScopeId::new(3).unwrap()),
+                resource: resource(resource_value),
+                resource_generation: cser_core::ResourceGeneration::new(1).unwrap(),
+                units,
+            })
+            .expect("raising only the unit ceiling must admit the same IOVA shape");
+    }
+    assert_eq!(
+        headroom
+            .engine
+            .charge(charge(42), CREDIT_IOVA)
+            .retained_units,
+        4
+    );
 }
 
 /// Retention pressure must be transient, released by evidence rather than by
 /// time.
 ///
-/// This is what licenses measuring cost in retained claim-seconds at all: the
-/// integral is finite because discharging a claim returns its units. The two
+/// This is what licenses measuring bounded retention occupancy at all: the
+/// claim-revision integral is finite because discharge returns its units. The two
 /// halves are pinned separately elsewhere -- that a ceiling rejects, and that
 /// retirement zeroes a charge -- but never composed, so nothing would catch a
 /// regression where retirement decremented the counter while an admission gate
@@ -1341,18 +1454,11 @@ fn evidence_backed_retirement_readmits_what_backpressure_refused() {
         2
     );
 
-    fence_and_rebind(
-        &mut harness,
-        retained,
-        origin,
-        principal(50, 2),
-        1,
-        2,
-        50,
-    );
+    fence_and_rebind(&mut harness, retained, origin, principal(50, 2), 1, 2, 50);
 
-    // Saturated: the coordinate is held by the device provider, so a further
-    // IOVA claim on this account is refused.
+    // Saturated: this account's IOVA credit class retains two units, so the
+    // three-unit claim below exceeds its four-unit ceiling. Its resource
+    // coordinate is new; this is a quota gate, not a resource-conflict gate.
     let successor = effect(50, 2);
     harness
         .tx(Command::CreateEstate {
@@ -1429,5 +1535,43 @@ fn evidence_backed_retirement_readmits_what_backpressure_refused() {
             .charge(charge(50), CREDIT_IOVA)
             .retained_units,
         3
+    );
+
+    // Paired headroom control: preserve the committed retained claim and the
+    // successor's request, changing only the per-account unit ceiling.
+    let mut headroom = Harness::with_limits(CoreLimits::new(8, 8, 16, 16, 8, 5, 8).unwrap());
+    let (retained, origin, _) = committed_dma(&mut headroom, 51, 51);
+    fence_and_rebind(&mut headroom, retained, origin, principal(51, 2), 1, 2, 51);
+    let successor = effect(51, 2);
+    headroom
+        .tx(Command::CreateEstate {
+            effect: successor,
+            origin: principal(51, 2),
+            binding_generation: 2,
+            domain: DEVICE_DOMAIN,
+            obligation: DEVICE_OBLIGATION_DMA,
+            charge_account: charge(51),
+        })
+        .unwrap();
+    headroom
+        .tx(Command::AddClaim {
+            effect: successor,
+            actor: principal(51, 2),
+            binding_generation: 2,
+            claim: claim(513),
+            domain: DEVICE_DOMAIN,
+            kind: DEVICE_CLAIM_IOVA,
+            scope: cser_core::ClaimScope::Device(cser_core::DeviceScopeId::new(1).unwrap()),
+            resource: resource(513),
+            resource_generation: cser_core::ResourceGeneration::new(1).unwrap(),
+            units: 3,
+        })
+        .expect("raising only the unit ceiling must admit the previously refused request");
+    assert_eq!(
+        headroom
+            .engine
+            .charge(charge(51), CREDIT_IOVA)
+            .retained_units,
+        5
     );
 }

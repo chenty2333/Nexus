@@ -6,6 +6,7 @@ use cser_core::{
     JournalDecodeError, JournalRepair, OutcomeState, RecoveryAnchor, RecoveryAnchorError,
     SettlementState, TransitionOutput, TxError, scan_journal, standard_catalog,
 };
+use sha2::{Digest as _, Sha256};
 use support::{
     Harness, charge, claim, digest, effect, freshness, principal, resource, resource_generation,
 };
@@ -123,6 +124,48 @@ fn record_roundtrip_recovers_the_exact_acknowledged_chain_head() {
         CommitState::Prepared
     );
     assert_eq!(replay.estate(effect(20, 1)).unwrap().retained_claims, 1);
+}
+
+#[test]
+fn current_recovery_rejects_a_schema_six_journal_bound_to_the_frozen_v5_catalog() {
+    // This is the catalog digest recorded by the accepted RFC-0007 v5 profile.
+    // The envelope remains schema 6: a catalog evolution must therefore fail
+    // closed by binding, rather than being mistaken for a legacy journal schema.
+    let v5_catalog = Digest::new([
+        0xf6, 0xa4, 0xb0, 0x7c, 0x1e, 0x17, 0x36, 0x1a, 0xa6, 0x2b, 0xbc, 0xa2, 0xc6, 0x57, 0x9b,
+        0x38, 0x0f, 0xde, 0x43, 0xbe, 0x44, 0xf3, 0x88, 0x24, 0xa3, 0xdb, 0x42, 0xe8, 0x28, 0x55,
+        0xc1, 0x73,
+    ]);
+    let mut source = Harness::new();
+    source.tx(create_estate(20)).unwrap();
+
+    let mut legacy_catalog_journal = source.journal.clone();
+    assert_eq!(&legacy_catalog_journal[..8], b"CSERJR6\0");
+    legacy_catalog_journal[72..104].copy_from_slice(&v5_catalog.bytes());
+    let checksum_start = legacy_catalog_journal.len() - 32;
+    let checksum = Sha256::digest(&legacy_catalog_journal[..checksum_start]);
+    legacy_catalog_journal[checksum_start..].copy_from_slice(&checksum);
+    let old_head = Digest::new(checksum.into());
+    assert!(scan_journal(&legacy_catalog_journal).is_ok());
+
+    let anchor = RecoveryAnchor::from_trusted_provider(
+        v5_catalog,
+        freshness(1, 1, 1, 1, 1),
+        freshness(2, 1, 1, 1, 2),
+        1,
+        old_head,
+    )
+    .unwrap();
+    assert_eq!(
+        Engine::recover(
+            standard_catalog(),
+            CoreLimits::bounded_default(),
+            anchor,
+            &legacy_catalog_journal,
+        )
+        .unwrap_err(),
+        CoreError::SchemaMismatch
+    );
 }
 
 #[test]

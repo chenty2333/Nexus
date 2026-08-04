@@ -120,16 +120,13 @@ pub enum ConflictMode {
 }
 
 impl ConflictMode {
-    /// Returns whether an existing live claim forbids a further enrollment.
+    /// Returns whether two live claims may coexist on one exact coordinate.
     ///
-    /// This is the whole admission algebra. It is a method rather than an
-    /// inline match so that the gate in the engine and the precheck exposed to
-    /// callers cannot drift apart.
-    pub const fn excludes_additional_claim(self) -> bool {
-        match self {
-            Self::Exclusive => true,
-            Self::Shared => false,
-        }
+    /// Compatibility is symmetric: either class may permit sharing only when
+    /// the other does too. Keeping both operands here prevents a caller from
+    /// accidentally treating the candidate's declaration as authoritative.
+    pub const fn compatible_with(self, other: Self) -> bool {
+        matches!((self, other), (Self::Shared, Self::Shared))
     }
 
     pub(crate) const fn tag(self) -> u8 {
@@ -478,8 +475,9 @@ impl EvidenceSubjectBinding {
 pub enum EvidenceCapability {
     /// Establishes what the external operation did, not that access has ceased.
     ///
-    /// Sufficient to settle a logical obligation. Never sufficient on its own
-    /// to permit conflicting reuse of a physical resource.
+    /// Never sufficient on its own to permit conflicting reuse of a physical
+    /// resource. Logical outcome state advances only through the separately
+    /// verified effect-fact and settlement paths.
     Outcome,
     /// Establishes that the provider will not access the resource again.
     ///
@@ -499,11 +497,6 @@ impl EvidenceCapability {
     /// Returns whether this capability can retire a physical claim.
     pub const fn permits_reuse(self) -> bool {
         matches!(self, Self::Quiescence)
-    }
-
-    /// Returns whether this capability can settle a logical obligation.
-    pub const fn settles_outcome(self) -> bool {
-        matches!(self, Self::Outcome)
     }
 }
 
@@ -525,9 +518,9 @@ pub enum EvidenceRecovery {
     Recoverable,
     /// The fact is observable at most once and is lost if that window is missed.
     ///
-    /// A claim resting only on ephemeral evidence must declare a conservative
-    /// disposition, because a crash inside the observation window leaves no
-    /// path to retirement.
+    /// This is endpoint classification only. It cannot support automatic
+    /// CSER retirement: a crash inside the observation window leaves no
+    /// recoverable path to release a claim.
     Ephemeral,
 }
 
@@ -775,16 +768,28 @@ pub enum DomainCatalogError {
     /// logical effect, because settlement is a fact about the operation rather
     /// than about a resource generation.
     InvalidEvidenceCapability,
-    /// A claim class admits reuse but declares no quiescence evidence.
+    /// A device-scoped claim declares no quiescence evidence.
     ///
     /// Outcome evidence alone never establishes that a provider has stopped
     /// touching a resource, so a reusable physical claim resting only on
     /// outcome evidence would permit conflicting reuse without custody.
     MissingQuiescenceEvidence,
-    /// A physical claim class rests on evidence lost across a crash window.
+    /// A retirement-only obligation references a claim which is not a
+    /// crash-recoverable physical-quiescence claim.
     ///
-    /// Such a claim cannot guarantee retirement, so the catalog refuses it
-    /// rather than admitting an obligation with no durable path to discharge.
+    /// Every claim class permitted by a retirement-only lifecycle, including a
+    /// cardinality-zero optional class, must be device-scoped, must carry a
+    /// quiescence path, and must make every evidence requirement recoverable.
+    /// Otherwise a legal enrollment could release a resource on outcome-only
+    /// evidence or strand forever after a crash misses one conjunct.
+    InvalidRetirementEvidenceClaim,
+    /// A device claim's evidence conjunction includes a fact lost across a
+    /// crash window.
+    ///
+    /// Every requirement must be re-obtainable: the core retires a claim only
+    /// after its complete conjunction has been accepted. An ephemeral outcome
+    /// requirement can therefore strand physical custody just as surely as
+    /// ephemeral quiescence evidence can.
     UnrecoverableRetirementEvidence,
     /// A shared claim class declares evidence which advances a device
     /// generation.
@@ -997,12 +1002,12 @@ impl DomainCatalogBuilder {
             if !capability_matches_subject {
                 return Err(DomainCatalogError::InvalidEvidenceCapability);
             }
-            // A physical claim whose only evidence is observable once has no
-            // path to retirement if the observer dies inside that window. The
-            // claim would be conserved forever, so the catalog refuses it.
-            if rule.capability() == EvidenceCapability::Quiescence
-                && !rule.recovery().survives_crash()
-            {
+            // The core retires a claim only after every requirement in its
+            // conjunction has been accepted. Any one-shot fact can disappear
+            // across a crash and strand that automatic-retirement contract.
+            // This applies equally to logical and physical custody: the
+            // latter additionally needs a quiescence fact below.
+            if !rule.recovery().survives_crash() {
                 return Err(DomainCatalogError::UnrecoverableRetirementEvidence);
             }
         }
@@ -1101,8 +1106,30 @@ impl DomainCatalogBuilder {
     pub fn build(self) -> Result<DomainCatalog, DomainCatalogError> {
         for ((domain, _), obligation) in &self.obligations {
             for claim in obligation.claims() {
-                if !self.claims.contains_key(&(*domain, claim.kind())) {
+                let Some(rule) = self.claims.get(&(*domain, claim.kind())) else {
                     return Err(DomainCatalogError::UnknownObligationClaim);
+                };
+                // Every legal claim class, including one with minimum
+                // cardinality zero, can be enrolled by a retirement-only
+                // obligation and subsequently released. It must therefore be
+                // a physical device claim with a quiescence path. Because all
+                // declared requirements must be accepted before retirement,
+                // every conjunct must also survive a crash window; one
+                // ephemeral outcome or quiescence fact can otherwise strand
+                // the claim forever. Validating only ClaimScopePolicy::Device
+                // would let an outcome-only logical claim bypass the contract.
+                if obligation.policy() == ObligationPolicy::RetirementEvidence
+                    && (rule.scope() != ClaimScopePolicy::Device
+                        || !rule
+                            .evidence()
+                            .iter()
+                            .any(|evidence| evidence.capability().permits_reuse())
+                        || rule
+                            .evidence()
+                            .iter()
+                            .any(|evidence| !evidence.recovery().survives_crash()))
+                {
+                    return Err(DomainCatalogError::InvalidRetirementEvidenceClaim);
                 }
             }
         }
@@ -1198,7 +1225,7 @@ fn catalog_digest(
     composites: &BTreeMap<CompositeKindId, CompositeRule>,
 ) -> Digest {
     let mut hasher = Sha256::new();
-    hasher.update(b"nexus.cser.domain-catalog.v5");
+    hasher.update(b"nexus.cser.domain-catalog.v6");
     for (class, rule) in credits {
         hasher.update(class.get().to_le_bytes());
         hasher.update(rule.max_units_per_account().to_le_bytes());

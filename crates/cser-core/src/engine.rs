@@ -4,17 +4,19 @@ use alloc::{
     collections::{BTreeMap, BTreeSet},
     vec::Vec,
 };
+#[cfg(feature = "test-support")]
 use core::convert::Infallible;
 
 use sha2::{Digest as _, Sha256};
 
 use crate::{
     BootGeneration, ChargeAccountId, ClaimId, ClaimKindId, ClaimScopePolicy, ComponentId,
-    CompositeKindId, CreditClassId, DeviceGeneration, DeviceGenerationEffect, DeviceScopeId,
-    Digest, DomainCatalog, DomainId, EffectId, EvidenceKindId, Freshness, FreshnessAxes,
-    JournalDecodeError, JournalGeneration, JournalRecord, JournalRepair, ObligationKindId,
-    ObligationPolicy, PrincipalIncarnation, ReceiptSchemaId, RegistryInstance, ResourceGeneration,
-    ResourceId, RootId, SnapshotId, VerifierId, scan_journal, scan_journal_to_head,
+    CompositeKindId, ConflictMode, CreditClassId, DeviceGeneration, DeviceGenerationEffect,
+    DeviceScopeId, Digest, DomainCatalog, DomainId, EffectId, EvidenceKindId, Freshness,
+    FreshnessAxes, JournalDecodeError, JournalGeneration, JournalRecord, JournalRepair,
+    ObligationKindId, ObligationPolicy, PrincipalIncarnation, ReceiptSchemaId, RegistryInstance,
+    ResourceGeneration, ResourceId, RootId, SnapshotId, VerifierId, scan_journal,
+    scan_journal_to_head,
 };
 
 /// Forces recognized predecessor journals through typed schema rejection even
@@ -2135,7 +2137,12 @@ impl SettlementClaim {
     }
 }
 
-/// Non-cloneable bearer for one durably retained resource-generation reservation.
+/// Non-cloneable handle for one durably retained resource-generation reservation.
+///
+/// Moving this value prevents ordinary caller reuse, but is not the authority
+/// boundary. Activation succeeds only while the engine retains a matching
+/// [`PendingReuse`] record and every actor, epoch, claim, generation, digest,
+/// contract, freshness, and nonce field matches that durable reservation.
 #[derive(Debug, Eq, PartialEq)]
 pub struct ReusePermit {
     effect: EffectId,
@@ -3002,6 +3009,10 @@ pub enum CoreError {
     /// A commit intent does not match the authoritative state.
     StaleCommitIntent,
     /// The evidence class is not required by the claim.
+    ///
+    /// Unsupported evidence is rejected before it can mint a retirement
+    /// command. This is core-wide fail-closed: the live claim, its charge,
+    /// and its resource-reuse gate remain unchanged.
     UnexpectedEvidence,
     /// The evidence was already accepted.
     DuplicateEvidence,
@@ -3122,6 +3133,11 @@ struct ClaimRecord {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Authoritative durable state for one-shot resource reuse.
+///
+/// A presented [`ReusePermit`] is only a convenient handle to this record; the
+/// activation transition compares the complete retained tuple before enrolling
+/// the next resource generation.
 struct PendingReuse {
     effect: EffectId,
     component: Option<ComponentId>,
@@ -3245,6 +3261,7 @@ pub struct Engine {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum EngineApiMode {
     ProfileTwo,
+    #[cfg(feature = "test-support")]
     LegacyCompatibility,
 }
 
@@ -3258,6 +3275,7 @@ impl Engine {
     ///
     /// Records produced by this mode are intentionally rejected by
     /// [`Self::recover`]. It must not be installed as a production Registry.
+    #[cfg(feature = "test-support")]
     #[doc(hidden)]
     pub fn new_legacy_compatibility(
         catalog: DomainCatalog,
@@ -4070,7 +4088,12 @@ impl Engine {
         })
     }
 
-    /// Executes an in-memory transition for non-durable profiles.
+    /// Executes an in-memory transition for test and model profiles.
+    ///
+    /// This API is deliberately absent from production builds. A production
+    /// embedding must use [`Self::transact_durable`] so a successful core
+    /// transition cannot become visible before its journal and anchor update.
+    #[cfg(feature = "test-support")]
     pub fn transact_volatile<C: Into<Command>>(
         &mut self,
         command: C,
@@ -4101,6 +4124,7 @@ impl Engine {
     ///
     /// Production boot paths must use [`Self::recover`], which rejects the
     /// predecessor singleton grammar before applying any record.
+    #[cfg(feature = "test-support")]
     #[doc(hidden)]
     pub fn recover_legacy_compatibility(
         catalog: DomainCatalog,
@@ -4573,29 +4597,45 @@ impl Engine {
     /// Reports whether one further claim may be enrolled against a live
     /// resource coordinate under the catalog's admission algebra.
     ///
-    /// This is a read-only precheck and never authority. It answers the
-    /// question exclusion asks — may another custodian join — which
-    /// [`Engine::check_reusable`] does not, because reuse is refused for any
-    /// live coordinate regardless of whether custody is shared.
+    /// This read-only precheck is never authority. It evaluates only the
+    /// catalog-bound scope, generation, quarantine, and conflict conditions;
+    /// callers must still transact enrollment to check authority, cardinality,
+    /// credit, and races. Unlike [`Engine::check_reusable`], it asks whether a
+    /// custodian may join a live coordinate rather than whether reuse is safe.
     pub fn check_co_claimable(
         &self,
-        catalog: &DomainCatalog,
         domain: DomainId,
         kind: ClaimKindId,
+        scope: ClaimScope,
         resource: ResourceId,
         expected_generation: ResourceGeneration,
     ) -> Result<(), CoreError> {
         if self.state.recovery_target.is_some() {
             return Err(CoreError::RecoveryPending);
         }
-        let rule = catalog
+        let rule = self
+            .catalog
             .claim_rule(domain, kind)
             .ok_or(CoreError::UnknownClaimClass)?;
+        if !matches!(
+            (rule.scope(), scope),
+            (ClaimScopePolicy::Logical, ClaimScope::Logical)
+                | (ClaimScopePolicy::Device, ClaimScope::Device(_))
+        ) {
+            return Err(CoreError::WrongClaimScope);
+        }
+        if scope_is_quarantined(&self.state, scope) {
+            return Err(CoreError::Quarantined);
+        }
         match self.state.resources.get(&resource) {
-            None => Ok(()),
+            None if expected_generation.get() == 1 => Ok(()),
+            None => Err(CoreError::StaleResourceGeneration),
             Some(ResourceRecord { generation, .. }) if *generation != expected_generation => {
                 Err(CoreError::StaleResourceGeneration)
             }
+            Some(ResourceRecord {
+                scope: existing, ..
+            }) if *existing != scope => Err(CoreError::WrongClaimScope),
             Some(ResourceRecord { scope, .. }) if scope_is_quarantined(&self.state, *scope) => {
                 Err(CoreError::Quarantined)
             }
@@ -4617,7 +4657,13 @@ impl Engine {
                     },
                 ..
             }) => {
-                if rule.conflict().excludes_additional_claim() {
+                if !resource_allows_additional_custodian(
+                    &self.catalog,
+                    &self.state,
+                    resource,
+                    expected_generation,
+                    rule.conflict(),
+                )? {
                     Err(CoreError::ResourceRetained)
                 } else {
                     Ok(())
@@ -6432,6 +6478,75 @@ fn apply_command(
     }
 }
 
+/// Summarizes the modes of every live custodian at one exact resource
+/// generation. The resource record stores the coordinate state, while the two
+/// reverse indexes identify its estate and composite custodians; admission must
+/// consult both rather than treating the incoming class as the whole algebra.
+fn live_resource_conflict_summary(
+    catalog: &DomainCatalog,
+    state: &State,
+    resource: ResourceId,
+    generation: ResourceGeneration,
+    candidate: ConflictMode,
+) -> Result<(usize, bool), CoreError> {
+    let mut custodians = 0usize;
+    let mut compatible = true;
+    let mut inspect = |claim: &ClaimRecord| -> Result<(), CoreError> {
+        if claim.retired || claim.resource != resource || claim.resource_generation != generation {
+            return Err(CoreError::InvariantViolation);
+        }
+        let rule = catalog
+            .claim_rule(claim.domain, claim.kind)
+            .ok_or(CoreError::InvariantViolation)?;
+        custodians = custodians
+            .checked_add(1)
+            .ok_or(CoreError::InvariantViolation)?;
+        compatible &= candidate.compatible_with(rule.conflict());
+        Ok(())
+    };
+
+    if let Some(entries) = state.resource_index.get(&resource) {
+        for (effect, claim_id) in entries {
+            let claim = state
+                .estates
+                .get(effect)
+                .and_then(|estate| estate.claims.get(claim_id))
+                .ok_or(CoreError::InvariantViolation)?;
+            inspect(claim)?;
+        }
+    }
+    if let Some(entries) = state.composite_resource_index.get(&resource) {
+        for (effect, component, claim_id) in entries {
+            let claim = state
+                .composite_effects
+                .get(effect)
+                .and_then(|composite| composite.components.get(component))
+                .and_then(|component| component.claims.get(claim_id))
+                .ok_or(CoreError::InvariantViolation)?;
+            inspect(claim)?;
+        }
+    }
+    Ok((custodians, compatible))
+}
+
+/// Returns whether an incoming class may join a live coordinate. Compatibility
+/// is symmetric: every incumbent and the incoming claim must explicitly opt
+/// into shared custody.
+fn resource_allows_additional_custodian(
+    catalog: &DomainCatalog,
+    state: &State,
+    resource: ResourceId,
+    generation: ResourceGeneration,
+    incoming: ConflictMode,
+) -> Result<bool, CoreError> {
+    let (custodians, compatible) =
+        live_resource_conflict_summary(catalog, state, resource, generation, incoming)?;
+    if custodians == 0 {
+        return Err(CoreError::InvariantViolation);
+    }
+    Ok(compatible)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn enroll_claim(
     catalog: &DomainCatalog,
@@ -6544,7 +6659,13 @@ fn enroll_claim(
             }),
             None,
         ) => {
-            if rule.conflict().excludes_additional_claim() {
+            if !resource_allows_additional_custodian(
+                catalog,
+                state,
+                resource,
+                resource_generation,
+                rule.conflict(),
+            )? {
                 return Err(CoreError::ResourceRetained);
             }
         }
@@ -6805,7 +6926,13 @@ fn enroll_component_claim(
             }),
             None,
         ) => {
-            if rule.conflict().excludes_additional_claim() {
+            if !resource_allows_additional_custodian(
+                catalog,
+                state,
+                resource,
+                resource_generation,
+                rule.conflict(),
+            )? {
                 return Err(CoreError::ResourceRetained);
             }
         }
@@ -9870,6 +9997,16 @@ fn check_invariants(
     for (resource, record) in &state.resources {
         match record.phase {
             ResourcePhase::Claimed { pending_reuse } => {
+                let (custodians, all_shared) = live_resource_conflict_summary(
+                    catalog,
+                    state,
+                    *resource,
+                    record.generation,
+                    ConflictMode::Shared,
+                )?;
+                if custodians == 0 || (custodians > 1 && !all_shared) {
+                    return Err(CoreError::InvariantViolation);
+                }
                 let pending_is_invalid = pending_reuse.is_some_and(|pending| {
                     pending.nonce == 0
                         || pending.binding_generation == 0
@@ -11687,8 +11824,8 @@ mod projection_v6_tests {
         assert_eq!(
             golden.bytes(),
             [
-                36, 9, 68, 25, 102, 214, 186, 160, 160, 156, 105, 226, 227, 109, 204, 239, 227,
-                63, 116, 34, 125, 85, 222, 6, 196, 194, 29, 52, 51, 251, 58, 40,
+                134, 219, 36, 242, 222, 33, 63, 35, 76, 188, 129, 105, 210, 69, 192, 57, 152, 249,
+                187, 31, 109, 155, 154, 253, 164, 12, 243, 213, 192, 124, 172, 137,
             ]
         );
 
