@@ -160,12 +160,12 @@ impl Harness {
     }
 
     pub fn new_profile_two() -> Self {
+        Self::profile_two_with_limits(CoreLimits::bounded_default())
+    }
+
+    pub fn profile_two_with_limits(limits: CoreLimits) -> Self {
         Self {
-            engine: Engine::new(
-                standard_catalog(),
-                CoreLimits::bounded_default(),
-                freshness(1, 1, 1, 1, 1),
-            ),
+            engine: Engine::new(standard_catalog(), limits, freshness(1, 1, 1, 1, 1)),
             journal: Vec::new(),
         }
     }

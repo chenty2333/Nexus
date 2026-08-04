@@ -1214,3 +1214,220 @@ fn recovery_checkpoint_refreshes_a_retired_scope_before_composite_reuse() {
         DeviceGeneration::new(3).unwrap()
     );
 }
+
+/// Backpressure must be scoped to the charge account, not to the credit class
+/// globally.
+///
+/// The paper's falsification criterion is that a design "safe only by globally
+/// freezing all resources is not an adequate custody abstraction." The
+/// neighbouring test exercises a second account at a *different* credit class,
+/// so it would still pass if the ceiling were keyed on class alone. This drives
+/// one account to its ceiling and then requires a second account to admit a
+/// claim of the very same class.
+#[test]
+fn an_exhausted_account_does_not_freeze_the_same_credit_class_elsewhere() {
+    let limits = CoreLimits::new(8, 8, 16, 16, 8, 3, 8).unwrap();
+    let mut harness = Harness::with_limits(limits);
+
+    let saturated = effect(40, 1);
+    harness
+        .tx(Command::CreateEstate {
+            effect: saturated,
+            origin: principal(40, 1),
+            binding_generation: 1,
+            domain: DEVICE_DOMAIN,
+            obligation: DEVICE_OBLIGATION_DMA,
+            charge_account: charge(40),
+        })
+        .unwrap();
+    harness
+        .tx(Command::AddClaim {
+            effect: saturated,
+            actor: principal(40, 1),
+            binding_generation: 1,
+            claim: claim(401),
+            domain: DEVICE_DOMAIN,
+            kind: DEVICE_CLAIM_IOVA,
+            scope: cser_core::ClaimScope::Device(cser_core::DeviceScopeId::new(1).unwrap()),
+            resource: resource(401),
+            resource_generation: cser_core::ResourceGeneration::new(1).unwrap(),
+            units: 3,
+        })
+        .unwrap();
+    assert_eq!(
+        harness
+            .engine
+            .charge(charge(40), CREDIT_IOVA)
+            .retained_units,
+        3
+    );
+
+    // Same class, same units, different account: admission must not consult a
+    // neighbour's retention.
+    let unrelated = effect(41, 1);
+    harness
+        .tx(Command::CreateEstate {
+            effect: unrelated,
+            origin: principal(41, 1),
+            binding_generation: 1,
+            domain: DEVICE_DOMAIN,
+            obligation: DEVICE_OBLIGATION_DMA,
+            charge_account: charge(41),
+        })
+        .unwrap();
+    harness
+        .tx(Command::AddClaim {
+            effect: unrelated,
+            actor: principal(41, 1),
+            binding_generation: 1,
+            claim: claim(411),
+            domain: DEVICE_DOMAIN,
+            kind: DEVICE_CLAIM_IOVA,
+            scope: cser_core::ClaimScope::Device(cser_core::DeviceScopeId::new(2).unwrap()),
+            resource: resource(411),
+            resource_generation: cser_core::ResourceGeneration::new(1).unwrap(),
+            units: 3,
+        })
+        .expect("an unrelated account must not inherit a neighbour's ceiling");
+
+    assert_eq!(
+        harness
+            .engine
+            .charge(charge(41), CREDIT_IOVA)
+            .retained_units,
+        3
+    );
+    // The saturated account is still saturated: relief came from scoping, not
+    // from raising the ceiling.
+    assert_eq!(
+        harness.tx(Command::AddClaim {
+            effect: saturated,
+            actor: principal(40, 1),
+            binding_generation: 1,
+            claim: claim(402),
+            domain: DEVICE_DOMAIN,
+            kind: DEVICE_CLAIM_IOVA,
+            scope: cser_core::ClaimScope::Device(cser_core::DeviceScopeId::new(1).unwrap()),
+            resource: resource(402),
+            resource_generation: cser_core::ResourceGeneration::new(1).unwrap(),
+            units: 1,
+        }),
+        Err(CoreError::Backpressure)
+    );
+}
+
+/// Retention pressure must be transient, released by evidence rather than by
+/// time.
+///
+/// This is what licenses measuring cost in retained claim-seconds at all: the
+/// integral is finite because discharging a claim returns its units. The two
+/// halves are pinned separately elsewhere -- that a ceiling rejects, and that
+/// retirement zeroes a charge -- but never composed, so nothing would catch a
+/// regression where retirement decremented the counter while an admission gate
+/// stayed latched.
+#[test]
+fn evidence_backed_retirement_readmits_what_backpressure_refused() {
+    // `max_units_per_account` is a single ceiling applied per (account, class),
+    // so 4 admits committed_dma's page claim (4 units) exactly while leaving
+    // the IOVA class holding 2 of its 4.
+    let limits = CoreLimits::new(8, 8, 16, 16, 8, 4, 8).unwrap();
+    let mut harness = Harness::with_limits(limits);
+    let (retained, origin, subject) = committed_dma(&mut harness, 50, 50);
+    assert_eq!(
+        harness
+            .engine
+            .charge(charge(50), CREDIT_IOVA)
+            .retained_units,
+        2
+    );
+
+    fence_and_rebind(
+        &mut harness,
+        retained,
+        origin,
+        principal(50, 2),
+        1,
+        2,
+        50,
+    );
+
+    // Saturated: the coordinate is held by the device provider, so a further
+    // IOVA claim on this account is refused.
+    let successor = effect(50, 2);
+    harness
+        .tx(Command::CreateEstate {
+            effect: successor,
+            origin: principal(50, 2),
+            binding_generation: 2,
+            domain: DEVICE_DOMAIN,
+            obligation: DEVICE_OBLIGATION_DMA,
+            charge_account: charge(50),
+        })
+        .unwrap();
+    let refused = Command::AddClaim {
+        effect: successor,
+        actor: principal(50, 2),
+        binding_generation: 2,
+        claim: claim(503),
+        domain: DEVICE_DOMAIN,
+        kind: DEVICE_CLAIM_IOVA,
+        scope: cser_core::ClaimScope::Device(cser_core::DeviceScopeId::new(1).unwrap()),
+        resource: resource(503),
+        resource_generation: cser_core::ResourceGeneration::new(1).unwrap(),
+        units: 3,
+    };
+    let before = harness.engine.projection_digest();
+    assert_eq!(harness.tx(refused), Err(CoreError::Backpressure));
+    assert_eq!(harness.engine.projection_digest(), before);
+
+    // Discharge the retained IOVA claim with its exact evidence conjunction.
+    submit(
+        &mut harness,
+        retained,
+        subject,
+        IOVA_CLAIM,
+        DEVICE_EVIDENCE_RESET,
+        51,
+    )
+    .unwrap();
+    submit(
+        &mut harness,
+        retained,
+        subject,
+        IOVA_CLAIM,
+        DEVICE_EVIDENCE_IOTLB,
+        52,
+    )
+    .unwrap();
+    assert_eq!(
+        harness
+            .engine
+            .charge(charge(50), CREDIT_IOVA)
+            .retained_units,
+        0,
+        "discharging the claim must return its conserved units",
+    );
+
+    // The identical command now admits. Nothing about the ceiling changed.
+    harness
+        .tx(Command::AddClaim {
+            effect: successor,
+            actor: principal(50, 2),
+            binding_generation: 2,
+            claim: claim(503),
+            domain: DEVICE_DOMAIN,
+            kind: DEVICE_CLAIM_IOVA,
+            scope: cser_core::ClaimScope::Device(cser_core::DeviceScopeId::new(1).unwrap()),
+            resource: resource(503),
+            resource_generation: cser_core::ResourceGeneration::new(1).unwrap(),
+            units: 3,
+        })
+        .expect("evidence-backed release must readmit the refused claim");
+    assert_eq!(
+        harness
+            .engine
+            .charge(charge(50), CREDIT_IOVA)
+            .retained_units,
+        3
+    );
+}

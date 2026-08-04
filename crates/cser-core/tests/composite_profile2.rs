@@ -3,7 +3,7 @@ mod support;
 
 use cser_core::{
     AGENT_COMPONENT_DMA, AGENT_COMPONENT_REPLY, AGENT_OPERATION_COMPOSITE, AdoptionPolicy,
-    AuthorityState, CREDIT_REPLY_SLOT, ClaimCardinality, ClaimCustodian, ClaimId, ClaimScope,
+    AuthorityState, CREDIT_QUEUE_SLOT, CREDIT_REPLY_SLOT, ClaimCardinality, ClaimCustodian, ClaimId, ClaimScope,
     ClaimScopePolicy, Command as AuthorizedCommand, CommandRequest as Command, CommitIntent,
     CommitState, ComponentCommitOperation, ComponentId, CompositeComponentSpec, CompositeKindId,
     CoreError, CoreLimits, CustodyState, DEVICE_CLAIM_IOVA, DEVICE_CLAIM_PINNED_PAGE,
@@ -3169,4 +3169,96 @@ fn the_same_reservation_succeeds_when_its_record_reaches_the_journal() {
     };
     assert_eq!(permit.resource(), queue);
     assert_eq!(permit.generation(), resource_generation(2));
+}
+
+/// Credit pressure inside a sealed composite is per component obligation's
+/// credit class, not per composite.
+///
+/// The composite admission gate is a second, independent enforcement site from
+/// the simple-estate one, and the paper's custody claims all live on composite
+/// effects. This drives the DMA component's queue-slot class to its ceiling and
+/// requires that the reply component -- inside the same sealed topology, on the
+/// same charge account -- still admits its publication slot.
+#[test]
+fn a_saturated_component_does_not_backpressure_its_sibling() {
+    let limits = CoreLimits::new(8, 8, 16, 16, 8, 3, 8).unwrap();
+    let mut harness = Harness::profile_two_with_limits(limits);
+    let operation = effect(0xc5b0, 1);
+    let origin = principal(0xc5b0, 1);
+    let scope = device_scope();
+
+    harness
+        .tx(Command::CreateCompositeEffect {
+            effect: operation,
+            origin,
+            binding_generation: 1,
+            kind: AGENT_OPERATION_COMPOSITE,
+            charge_account: charge(0xc5b0),
+        })
+        .unwrap();
+
+    // Saturate the DMA component's queue-slot credit class exactly.
+    harness
+        .tx(Command::AddComponentClaim {
+            effect: operation,
+            component: AGENT_COMPONENT_DMA,
+            actor: origin,
+            binding_generation: 1,
+            claim: claim(1),
+            kind: DEVICE_CLAIM_QUEUE_SLOT,
+            scope: ClaimScope::Device(scope),
+            resource: resource(0xc5b0_0001),
+            resource_generation: resource_generation(1),
+            units: 3,
+        })
+        .unwrap();
+    assert_eq!(
+        harness
+            .engine
+            .charge(charge(0xc5b0), CREDIT_QUEUE_SLOT)
+            .retained_units,
+        3
+    );
+
+    // Same account, same composite, same actor: a further queue slot is refused.
+    let before = harness.engine.projection_digest();
+    assert_eq!(
+        harness.tx(Command::AddComponentClaim {
+            effect: operation,
+            component: AGENT_COMPONENT_DMA,
+            actor: origin,
+            binding_generation: 1,
+            claim: claim(2),
+            kind: DEVICE_CLAIM_QUEUE_SLOT,
+            scope: ClaimScope::Device(scope),
+            resource: resource(0xc5b0_0002),
+            resource_generation: resource_generation(1),
+            units: 1,
+        }),
+        Err(CoreError::Backpressure)
+    );
+    assert_eq!(harness.engine.projection_digest(), before);
+
+    // The sibling component's own credit class is untouched.
+    harness
+        .tx(Command::AddComponentClaim {
+            effect: operation,
+            component: AGENT_COMPONENT_REPLY,
+            actor: origin,
+            binding_generation: 1,
+            claim: claim(3),
+            kind: REPLY_CLAIM_PUBLICATION_SLOT,
+            scope: ClaimScope::Logical,
+            resource: resource(0xc5b0_0003),
+            resource_generation: resource_generation(1),
+            units: 1,
+        })
+        .expect("a saturated sibling must not freeze the reply component");
+    assert_eq!(
+        harness
+            .engine
+            .charge(charge(0xc5b0), CREDIT_REPLY_SLOT)
+            .retained_units,
+        1
+    );
 }
