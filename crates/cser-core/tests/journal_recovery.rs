@@ -129,8 +129,9 @@ fn record_roundtrip_recovers_the_exact_acknowledged_chain_head() {
 #[test]
 fn current_recovery_rejects_a_schema_six_journal_bound_to_the_frozen_v5_catalog() {
     // This is the catalog digest recorded by the accepted RFC-0007 v5 profile.
-    // The envelope remains schema 6: a catalog evolution must therefore fail
-    // closed by binding, rather than being mistaken for a legacy journal schema.
+    // This historical envelope remains schema 6: a catalog evolution must
+    // therefore fail closed by binding rather than be mistaken for an
+    // unrecognized journal prefix.
     let v5_catalog = Digest::new([
         0xf6, 0xa4, 0xb0, 0x7c, 0x1e, 0x17, 0x36, 0x1a, 0xa6, 0x2b, 0xbc, 0xa2, 0xc6, 0x57, 0x9b,
         0x38, 0x0f, 0xde, 0x43, 0xbe, 0x44, 0xf3, 0x88, 0x24, 0xa3, 0xdb, 0x42, 0xe8, 0x28, 0x55,
@@ -140,7 +141,7 @@ fn current_recovery_rejects_a_schema_six_journal_bound_to_the_frozen_v5_catalog(
     source.tx(create_estate(20)).unwrap();
 
     let mut legacy_catalog_journal = source.journal.clone();
-    assert_eq!(&legacy_catalog_journal[..8], b"CSERJR6\0");
+    assert_eq!(&legacy_catalog_journal[..8], b"CSERJR7\0");
     legacy_catalog_journal[72..104].copy_from_slice(&v5_catalog.bytes());
     let checksum_start = legacy_catalog_journal.len() - 32;
     let checksum = Sha256::digest(&legacy_catalog_journal[..checksum_start]);

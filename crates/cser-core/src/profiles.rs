@@ -225,6 +225,26 @@ pub const TOOL_DMA_COMPONENT_DMA: ComponentId = match ComponentId::new(4) {
     Ok(value) => value,
     Err(_) => unreachable!(),
 };
+/// Sole logical child component of the explicit profile-two handoff pilot.
+pub const TOOL_HANDOFF_COMPONENT: ComponentId = match ComponentId::new(5) {
+    Ok(value) => value,
+    Err(_) => unreachable!(),
+};
+/// Independent logical source component of the bounded handoff pilot.
+pub const TOOL_HANDOFF_SOURCE_COMPONENT: ComponentId = match ComponentId::new(6) {
+    Ok(value) => value,
+    Err(_) => unreachable!(),
+};
+/// One-component queryable-tool source used only by the experimental handoff profile.
+pub const TOOL_HANDOFF_SOURCE_COMPOSITE: CompositeKindId = match CompositeKindId::new(4) {
+    Ok(value) => value,
+    Err(_) => unreachable!(),
+};
+/// Catalog-defined one-component child admitted by the handoff guard.
+pub const TOOL_HANDOFF_CHILD_COMPOSITE: CompositeKindId = match CompositeKindId::new(5) {
+    Ok(value) => value,
+    Err(_) => unreachable!(),
+};
 
 /// Returns the built-in reply and DMA catalog.
 ///
@@ -528,6 +548,26 @@ pub fn tool_dma_catalog() -> DomainCatalog {
             ],
         )
         .expect("tool DMA composite is valid")
+        .composite(
+            TOOL_HANDOFF_SOURCE_COMPOSITE,
+            &[CompositeComponentSpec::new(
+                TOOL_HANDOFF_SOURCE_COMPONENT,
+                TOOL_DOMAIN,
+                TOOL_OBLIGATION_INVOCATION,
+            )],
+        )
+        .expect("tool handoff source composite is valid")
+        .composite(
+            TOOL_HANDOFF_CHILD_COMPOSITE,
+            &[CompositeComponentSpec::new(
+                TOOL_HANDOFF_COMPONENT,
+                TOOL_DOMAIN,
+                TOOL_OBLIGATION_INVOCATION,
+            )],
+        )
+        .expect("tool handoff child composite is valid")
+        .single_hop_handoff(TOOL_HANDOFF_SOURCE_COMPOSITE, TOOL_HANDOFF_CHILD_COMPOSITE)
+        .expect("tool handoff relation is valid")
         .build()
         .expect("tool DMA domain catalog is internally complete")
 }

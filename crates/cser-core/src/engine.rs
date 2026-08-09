@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use alloc::{
+    boxed::Box,
     collections::{BTreeMap, BTreeSet},
     vec::Vec,
 };
@@ -26,7 +27,10 @@ use crate::{
 pub(crate) fn reject_recognized_legacy_journal_prefix(
     bytes: &[u8],
 ) -> Result<(), JournalDecodeError> {
-    if bytes.starts_with(b"CSERJR5\0") || bytes.starts_with(b"CSERJR4\0") {
+    if bytes.starts_with(b"CSERJR6\0")
+        || bytes.starts_with(b"CSERJR5\0")
+        || bytes.starts_with(b"CSERJR4\0")
+    {
         scan_journal(bytes)?;
     }
     Ok(())
@@ -39,6 +43,200 @@ pub enum ClaimScope {
     Logical,
     /// Resource belonging to one exact reset/quarantine domain.
     Device(DeviceScopeId),
+}
+
+/// Canonical, version-one description of the only child admitted by the
+/// profile-two handoff guard.  It is data, not authority: live installation
+/// requires a [`VerifiedChildDescriptor`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ChildDescriptorV1 {
+    /// Fixed descriptor grammar version.
+    pub schema: u16,
+    /// Fixed child sequence below the parent's root.
+    pub sequence: u64,
+    /// The retired source composite.
+    pub parent: EffectId,
+    /// The successful source component.
+    pub parent_component: ComponentId,
+    /// Canonical route coordinate.
+    pub route_digest: Digest,
+    /// Catalog-defined one-component child product.
+    pub child_kind: CompositeKindId,
+    /// The sole child component.
+    pub child_component: ComponentId,
+    /// Exact child claim identity and class.
+    pub claim: ClaimId,
+    /// Catalog-defined class of the child claim.
+    pub claim_kind: ClaimKindId,
+    /// Exact logical or device scope of the child claim.
+    pub scope: ClaimScope,
+    /// Exact resource retained by the child claim.
+    pub resource: ResourceId,
+    /// Exact allocation generation retained by the child claim.
+    pub resource_generation: ResourceGeneration,
+    /// Conserved units retained by the child claim.
+    pub units: u64,
+    /// Digest of the verified handoff input.
+    pub input_digest: Digest,
+    /// Exact catalog under which the descriptor was verified.
+    pub catalog_digest: Digest,
+}
+
+/// Exact fixed width of a version-one child descriptor wire record.
+///
+/// The eight-byte magic is part of the canonical preimage.  Keeping the
+/// logical scope's zero device field on wire makes the grammar fixed-width and
+/// prevents a device descriptor from being reinterpreted as a logical one by
+/// a permissive decoder.
+pub const CHILD_DESCRIPTOR_V1_WIRE_LEN: usize = 187;
+const CHILD_DESCRIPTOR_V1_MAGIC: &[u8; 8] = b"NXSCHD03";
+
+/// A malformed or non-canonical child descriptor wire record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChildDescriptorDecodeError {
+    /// The record has the wrong length, magic, identity, scope encoding, or
+    /// fixed grammar version.
+    InvalidEncoding,
+}
+
+impl ChildDescriptorV1 {
+    /// Returns the unique fixed-width canonical representation used at every
+    /// adapter boundary and as the descriptor hash preimage.
+    pub fn encode_wire(self) -> [u8; CHILD_DESCRIPTOR_V1_WIRE_LEN] {
+        let mut bytes = [0; CHILD_DESCRIPTOR_V1_WIRE_LEN];
+        bytes[..8].copy_from_slice(CHILD_DESCRIPTOR_V1_MAGIC);
+        let mut at = 8;
+        child_wire_put_u16(&mut bytes, &mut at, self.schema);
+        child_wire_put_u64(&mut bytes, &mut at, self.sequence);
+        child_wire_put_u64(&mut bytes, &mut at, self.parent.root().get());
+        child_wire_put_u64(&mut bytes, &mut at, self.parent.sequence());
+        child_wire_put_u32(&mut bytes, &mut at, self.parent_component.get());
+        child_wire_put_digest(&mut bytes, &mut at, self.route_digest);
+        child_wire_put_u32(&mut bytes, &mut at, self.child_kind.get());
+        child_wire_put_u32(&mut bytes, &mut at, self.child_component.get());
+        child_wire_put_u64(&mut bytes, &mut at, self.claim.get());
+        child_wire_put_u32(&mut bytes, &mut at, self.claim_kind.get());
+        match self.scope {
+            ClaimScope::Logical => {
+                child_wire_put_u8(&mut bytes, &mut at, 0);
+                child_wire_put_u64(&mut bytes, &mut at, 0);
+            }
+            ClaimScope::Device(scope) => {
+                child_wire_put_u8(&mut bytes, &mut at, 1);
+                child_wire_put_u64(&mut bytes, &mut at, scope.get());
+            }
+        }
+        child_wire_put_u64(&mut bytes, &mut at, self.resource.get());
+        child_wire_put_u64(&mut bytes, &mut at, self.resource_generation.get());
+        child_wire_put_u64(&mut bytes, &mut at, self.units);
+        child_wire_put_digest(&mut bytes, &mut at, self.input_digest);
+        child_wire_put_digest(&mut bytes, &mut at, self.catalog_digest);
+        debug_assert_eq!(at, CHILD_DESCRIPTOR_V1_WIRE_LEN);
+        bytes
+    }
+
+    /// Strictly decodes the canonical fixed-width child descriptor grammar.
+    pub fn decode_wire(bytes: &[u8]) -> Result<Self, ChildDescriptorDecodeError> {
+        if bytes.len() != CHILD_DESCRIPTOR_V1_WIRE_LEN || bytes[..8] != *CHILD_DESCRIPTOR_V1_MAGIC {
+            return Err(ChildDescriptorDecodeError::InvalidEncoding);
+        }
+        let mut at = 8;
+        let schema = child_wire_u16(bytes, &mut at)?;
+        if schema != 1 {
+            return Err(ChildDescriptorDecodeError::InvalidEncoding);
+        }
+        let sequence = child_wire_u64(bytes, &mut at)?;
+        let parent = EffectId::new(
+            RootId::new(child_wire_u64(bytes, &mut at)?)
+                .map_err(|_| ChildDescriptorDecodeError::InvalidEncoding)?,
+            child_wire_u64(bytes, &mut at)?,
+        )
+        .map_err(|_| ChildDescriptorDecodeError::InvalidEncoding)?;
+        let parent_component = ComponentId::new(child_wire_u32(bytes, &mut at)?)
+            .map_err(|_| ChildDescriptorDecodeError::InvalidEncoding)?;
+        let route_digest = child_wire_digest(bytes, &mut at)?;
+        let child_kind = CompositeKindId::new(child_wire_u32(bytes, &mut at)?)
+            .map_err(|_| ChildDescriptorDecodeError::InvalidEncoding)?;
+        let child_component = ComponentId::new(child_wire_u32(bytes, &mut at)?)
+            .map_err(|_| ChildDescriptorDecodeError::InvalidEncoding)?;
+        let claim = ClaimId::new(child_wire_u64(bytes, &mut at)?)
+            .map_err(|_| ChildDescriptorDecodeError::InvalidEncoding)?;
+        let claim_kind = ClaimKindId::new(child_wire_u32(bytes, &mut at)?)
+            .map_err(|_| ChildDescriptorDecodeError::InvalidEncoding)?;
+        let scope_tag = child_wire_u8(bytes, &mut at)?;
+        let scope_id = child_wire_u64(bytes, &mut at)?;
+        let scope = match (scope_tag, scope_id) {
+            (0, 0) => ClaimScope::Logical,
+            (1, id) => ClaimScope::Device(
+                DeviceScopeId::new(id).map_err(|_| ChildDescriptorDecodeError::InvalidEncoding)?,
+            ),
+            _ => return Err(ChildDescriptorDecodeError::InvalidEncoding),
+        };
+        let resource = ResourceId::new(child_wire_u64(bytes, &mut at)?)
+            .map_err(|_| ChildDescriptorDecodeError::InvalidEncoding)?;
+        let resource_generation = ResourceGeneration::new(child_wire_u64(bytes, &mut at)?)
+            .map_err(|_| ChildDescriptorDecodeError::InvalidEncoding)?;
+        let units = child_wire_u64(bytes, &mut at)?;
+        let input_digest = child_wire_digest(bytes, &mut at)?;
+        let catalog_digest = child_wire_digest(bytes, &mut at)?;
+        if at != bytes.len() {
+            return Err(ChildDescriptorDecodeError::InvalidEncoding);
+        }
+        Ok(Self {
+            schema,
+            sequence,
+            parent,
+            parent_component,
+            route_digest,
+            child_kind,
+            child_component,
+            claim,
+            claim_kind,
+            scope,
+            resource,
+            resource_generation,
+            units,
+            input_digest,
+            catalog_digest,
+        })
+    }
+
+    /// The deterministic child identity.  Callers must treat a collision as a
+    /// fail-closed handoff rejection rather than selecting another sequence.
+    pub fn child_effect(self) -> Result<EffectId, CoreError> {
+        if self.schema != 1 || self.sequence != 1 {
+            return Err(CoreError::InvalidPayload);
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(b"CSER3-single-hop-child-effect-v1");
+        hasher.update(handoff_descriptor_digest(self).bytes());
+        let bytes: [u8; 32] = hasher.finalize().into();
+        let mut sequence = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+        if sequence == 0 {
+            sequence = 1;
+        }
+        EffectId::new(self.parent.root(), sequence).map_err(|_| CoreError::InvalidPayload)
+    }
+}
+
+/// Opaque verifier-minted authority to use a child descriptor at handoff
+/// ingress.  There is intentionally no `CommandRequest` equivalent.
+#[derive(Debug, Eq, PartialEq)]
+pub struct VerifiedChildDescriptor {
+    descriptor: ChildDescriptorV1,
+    receipt_digest: Digest,
+}
+
+/// Trust boundary for a platform verifier of canonical child descriptors.
+pub trait ChildDescriptorVerifier {
+    /// Opaque receipt supplied by the platform verifier.
+    type Receipt;
+    /// Validates the descriptor and returns the digest of its canonical receipt.
+    fn verify_child_descriptor(
+        &self,
+        descriptor: ChildDescriptorV1,
+        receipt: &Self::Receipt,
+    ) -> Result<Digest, VerificationError>;
 }
 
 /// Authority state of one effect.
@@ -736,6 +934,44 @@ impl VerifiedRetirementEvidence {
     }
 }
 
+impl VerifiedChildDescriptor {
+    /// Returns the verified canonical descriptor without granting a raw command
+    /// construction path.
+    pub const fn descriptor(&self) -> ChildDescriptorV1 {
+        self.descriptor
+    }
+
+    /// Consumes the verifier-minted descriptor into the atomic child install.
+    pub fn install(
+        self,
+        origin: PrincipalIncarnation,
+        binding_generation: u64,
+        charge_account: ChargeAccountId,
+    ) -> Command {
+        Command(CommandKind::InstallHandoffChild {
+            descriptor: self.descriptor,
+            origin,
+            binding_generation,
+            charge_account,
+        })
+    }
+
+    /// Creates the sole atomic source-release/target-intent command.
+    pub fn release_source_and_record_target_intent(
+        self,
+        actor: PrincipalIncarnation,
+        binding_generation: u64,
+        operation: Digest,
+    ) -> Command {
+        Command(CommandKind::ReleaseHandoffSourceAndRecordTargetIntent {
+            descriptor: self.descriptor,
+            actor,
+            binding_generation,
+            operation,
+        })
+    }
+}
+
 /// Opaque authorized semantic command.
 ///
 /// Sensitive commands are minted only by linear core descriptors, and the
@@ -1201,6 +1437,26 @@ pub(crate) enum CommandKind {
     },
     /// Internal canonical primary-state checkpoint; no public ingress exists.
     WholeStateCheckpointV1 { state: Vec<u8>, projection: Digest },
+    /// Evidence-bound acknowledgement that opens the one permitted handoff.
+    AcknowledgeHandoffParent {
+        fact: VerifiedEffectFact,
+        descriptor: ChildDescriptorV1,
+        descriptor_receipt_digest: Digest,
+    },
+    /// Atomically creates, claims, and prepares the canonical child.
+    InstallHandoffChild {
+        descriptor: ChildDescriptorV1,
+        origin: PrincipalIncarnation,
+        binding_generation: u64,
+        charge_account: ChargeAccountId,
+    },
+    /// Atomically releases the terminal source and arms the sole target intent.
+    ReleaseHandoffSourceAndRecordTargetIntent {
+        descriptor: ChildDescriptorV1,
+        actor: PrincipalIncarnation,
+        binding_generation: u64,
+        operation: Digest,
+    },
 }
 
 impl CommandKind {
@@ -1240,7 +1496,10 @@ impl CommandKind {
             | Self::CheckpointRecovery { .. }
             | Self::ReleaseCompositeEffect { .. }
             | Self::ReserveComponentReuse { .. } => true,
-            Self::WholeStateCheckpointV1 { .. } => true,
+            Self::WholeStateCheckpointV1 { .. }
+            | Self::AcknowledgeHandoffParent { .. }
+            | Self::InstallHandoffChild { .. }
+            | Self::ReleaseHandoffSourceAndRecordTargetIntent { .. } => true,
         }
     }
 
@@ -1329,6 +1588,24 @@ impl CommandKind {
             Self::CheckpointRecovery { .. } | Self::WholeStateCheckpointV1 { .. } => {
                 (None, None, None, None)
             }
+            Self::AcknowledgeHandoffParent { fact, .. } => (
+                Some(fact.effect.root()),
+                Some(fact.effect),
+                fact.component,
+                None,
+            ),
+            Self::InstallHandoffChild { descriptor, .. } => (
+                Some(descriptor.parent.root()),
+                Some(descriptor.parent),
+                None,
+                Some(descriptor.claim),
+            ),
+            Self::ReleaseHandoffSourceAndRecordTargetIntent { descriptor, .. } => (
+                Some(descriptor.parent.root()),
+                Some(descriptor.parent),
+                Some(descriptor.parent_component),
+                None,
+            ),
         };
         TransitionCoordinates::new(root, effect, component, claim)
     }
@@ -1962,6 +2239,33 @@ impl CommitIntent {
         }
         Ok(Command(CommandKind::AcknowledgeCommit { fact }))
     }
+
+    /// Consumes a successful parent-component outcome and an independently
+    /// verified descriptor into the sole source-opening acknowledgement.
+    pub fn acknowledge_handoff_parent_success(
+        self,
+        outcome: VerifiedCommitOutcome,
+        descriptor: VerifiedChildDescriptor,
+    ) -> Result<Command, CommitUseError> {
+        let fact = outcome.0;
+        if fact.kind != EffectFactKind::CommitOutcome
+            || fact.effect != self.effect
+            || fact.component != self.component
+            || fact.nonce != self.nonce
+            || fact.outcome != Some(ExternalOutcome::Success)
+        {
+            return Err(CommitUseError {
+                error: CoreError::StaleCommitIntent,
+                intent: self,
+            });
+        }
+        let _receipt_digest = descriptor.receipt_digest;
+        Ok(Command(CommandKind::AcknowledgeHandoffParent {
+            fact,
+            descriptor: descriptor.descriptor,
+            descriptor_receipt_digest: descriptor.receipt_digest,
+        }))
+    }
 }
 
 /// A rejected local commit acknowledgement which preserves the linear intent.
@@ -2506,7 +2810,7 @@ pub struct ClaimProjection {
 }
 
 /// Public projection of one composite effect sharing a single authority gate.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompositeEffectProjection {
     /// Stable escaped-effect identity shared by every component.
     pub effect: EffectId,
@@ -2528,6 +2832,41 @@ pub struct CompositeEffectProjection {
     pub component_count: usize,
     /// Claims still retaining an old resource generation.
     pub retained_claims: usize,
+    /// Durable, non-authorizing state of the only catalog-defined handoff
+    /// relation involving this composite.
+    pub handoff: SingleHopHandoffProjection,
+}
+
+/// Public recovery-only view of a bounded single-hop handoff.
+///
+/// The descriptor is deliberately visible after replay so a successor can ask
+/// its platform verifier to re-establish the same evidence.  This value is not
+/// a [`VerifiedChildDescriptor`] and cannot install or release anything by
+/// itself.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SingleHopHandoffProjection {
+    /// No handoff state is attached to this composite.
+    None,
+    /// A successful source has durably bound its exact descriptor and terminal
+    /// receipt; `child_installed` says whether the child was atomically
+    /// enrolled and prepared before a crash.
+    Source {
+        /// Exact child descriptor that must be independently re-verified.
+        descriptor: Box<ChildDescriptorV1>,
+        /// Receipt proving the parent component's successful terminal outcome.
+        terminal_receipt_digest: Digest,
+        /// Receipt proving the descriptor's binding at handoff ingress.
+        descriptor_receipt_digest: Digest,
+        /// Whether the exact target was durably created, claimed, and prepared.
+        child_installed: bool,
+    },
+    /// A prepared child is bound to the exact parent and descriptor digest.
+    Target {
+        /// Exact source composite that authorized this child.
+        parent: EffectId,
+        /// Canonical digest of the source-bound descriptor.
+        descriptor_digest: Digest,
+    },
 }
 
 /// Public projection of one obligation component in a composite effect.
@@ -2698,6 +3037,9 @@ pub struct CompositeRecoveryItem {
     /// Every retained claim and its partial evidence state, ordered by component
     /// and claim identity.
     pub retained_claims: Vec<ComponentClaimRecoveryItem>,
+    /// Durable non-authorizing handoff information needed to re-verify a
+    /// crash-interrupted source or target relationship.
+    pub handoff: SingleHopHandoffProjection,
 }
 
 /// Exact, non-authorizing recovery cohort generated from core state.
@@ -2964,6 +3306,8 @@ impl RecoveryReport {
 pub enum CoreError {
     /// A profile-1 singleton command or recovered estate reached profile 2.
     IncompatibleApiProfile,
+    /// A guarded profile-two handoff must use its dedicated transition.
+    HandoffGuardRequired,
     /// At least one limit is zero.
     InvalidLimits,
     /// A generation or nonce overflowed.
@@ -3237,7 +3581,22 @@ struct CompositeEffectRecord {
     charge_owner: ChargeAccountId,
     authority: AuthorityState,
     authority_epoch: u64,
+    handoff: SingleHopRole,
     components: BTreeMap<ComponentId, ComponentRecord>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SingleHopRole {
+    None,
+    Source {
+        descriptor: Box<ChildDescriptorV1>,
+        terminal_receipt_digest: Digest,
+        descriptor_receipt_digest: Digest,
+    },
+    Target {
+        parent: EffectId,
+        descriptor_digest: Digest,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3706,6 +4065,33 @@ impl Engine {
             .map(VerifiedCommitOutcome)
     }
 
+    /// Verifies a canonical profile-two child descriptor at the embedding's
+    /// trust boundary.  The resulting value is opaque and cannot be recreated
+    /// from a raw command request or external output bytes.
+    pub fn verify_child_descriptor<V: ChildDescriptorVerifier>(
+        &self,
+        descriptor: ChildDescriptorV1,
+        verifier: &V,
+        receipt: &V::Receipt,
+    ) -> Result<VerifiedChildDescriptor, CoreError> {
+        if descriptor.catalog_digest != self.catalog.digest()
+            || descriptor.route_digest.is_zero()
+            || descriptor.input_digest.is_zero()
+            || descriptor.units == 0
+            || descriptor.child_effect().is_err()
+        {
+            return Err(CoreError::InvalidPayload);
+        }
+        let receipt_digest = verifier
+            .verify_child_descriptor(descriptor, receipt)
+            .map_err(|_| CoreError::VerificationFailed)?;
+        require_digest(receipt_digest)?;
+        Ok(VerifiedChildDescriptor {
+            descriptor,
+            receipt_digest,
+        })
+    }
+
     /// Builds the exact challenge for externally completing a durable
     /// settlement apply intent.
     pub fn apply_completion_challenge(
@@ -4042,11 +4428,6 @@ impl Engine {
     {
         if self.state.recovery_target.is_some() {
             return Err(TxError::Core(CoreError::RecoveryPending));
-        }
-        // V1 intentionally excludes the predecessor singleton profile.  The
-        // composite codec below is authoritative for profile-2 state.
-        if !self.state.estates.is_empty() {
-            return Err(TxError::Core(CoreError::UnsupportedCheckpointState));
         }
         let state = encode_whole_state_checkpoint(&self.state);
         if state.len() > MAX_JOURNAL_CHECKPOINT_IMAGE_BYTES {
@@ -4415,7 +4796,7 @@ impl Engine {
         self.state
             .composite_effects
             .get(&effect)
-            .map(project_composite_effect)
+            .map(|composite| project_composite_effect(composite, &self.state))
     }
 
     /// Returns one component-local obligation projection.
@@ -5155,6 +5536,200 @@ fn apply_command(
     command: &CommandKind,
 ) -> Result<AppliedOutput, CoreError> {
     match command.clone() {
+        CommandKind::AcknowledgeHandoffParent {
+            fact,
+            descriptor,
+            descriptor_receipt_digest,
+        } => {
+            let source_kind = state
+                .composite_effects
+                .get(&fact.effect)
+                .ok_or(CoreError::UnknownEstate)?
+                .kind;
+            if descriptor.parent != fact.effect
+                || Some(descriptor.parent_component) != fact.component
+                || descriptor.catalog_digest != catalog.digest()
+                || descriptor.child_effect().is_err()
+                || !matches!(catalog.single_hop_handoff_rule(source_kind), Some(rule) if rule.target() == descriptor.child_kind)
+            {
+                return Err(CoreError::InvalidPayload);
+            }
+            acknowledge_component_commit(
+                catalog,
+                state,
+                fact.effect,
+                descriptor.parent_component,
+                fact,
+            )?;
+            let composite = state
+                .composite_effects
+                .get_mut(&descriptor.parent)
+                .ok_or(CoreError::UnknownEstate)?;
+            let component = composite
+                .components
+                .get(&descriptor.parent_component)
+                .ok_or(CoreError::UnknownObligationClass)?;
+            let OutcomeState::KnownSuccess(receipt) = component.outcome else {
+                return Err(CoreError::VerificationFailed);
+            };
+            if !matches!(composite.handoff, SingleHopRole::None) {
+                return Err(CoreError::HandoffGuardRequired);
+            }
+            composite.handoff = SingleHopRole::Source {
+                descriptor: Box::new(descriptor),
+                terminal_receipt_digest: receipt,
+                descriptor_receipt_digest,
+            };
+            Ok(AppliedOutput::none(TransitionEvent::EffectCommitted))
+        }
+        CommandKind::InstallHandoffChild {
+            descriptor,
+            origin,
+            binding_generation,
+            charge_account,
+        } => {
+            let child = descriptor.child_effect()?;
+            if descriptor.catalog_digest != catalog.digest() || child == descriptor.parent {
+                return Err(CoreError::InvalidPayload);
+            }
+            let source = state
+                .composite_effects
+                .get(&descriptor.parent)
+                .ok_or(CoreError::UnknownEstate)?;
+            if !matches!(catalog.single_hop_handoff_rule(source.kind), Some(rule) if rule.target() == descriptor.child_kind)
+            {
+                return Err(CoreError::HandoffGuardRequired);
+            }
+            if !matches!(&source.handoff, SingleHopRole::Source { descriptor: saved, .. } if **saved == descriptor)
+            {
+                return Err(CoreError::HandoffGuardRequired);
+            }
+            let schema = catalog
+                .composite_rule(descriptor.child_kind)
+                .ok_or(CoreError::UnknownObligationClass)?;
+            if schema.components().len() != 1
+                || schema.components()[0].component() != descriptor.child_component
+            {
+                return Err(CoreError::InvalidPayload);
+            }
+            apply_command(
+                catalog,
+                limits,
+                state,
+                &CommandKind::CreateCompositeEffect {
+                    effect: child,
+                    origin,
+                    binding_generation,
+                    kind: descriptor.child_kind,
+                    charge_account,
+                },
+            )?;
+            apply_command(
+                catalog,
+                limits,
+                state,
+                &CommandKind::AddComponentClaim {
+                    effect: child,
+                    component: descriptor.child_component,
+                    actor: origin,
+                    binding_generation,
+                    claim: descriptor.claim,
+                    kind: descriptor.claim_kind,
+                    scope: descriptor.scope,
+                    resource: descriptor.resource,
+                    resource_generation: descriptor.resource_generation,
+                    units: descriptor.units,
+                },
+            )?;
+            apply_command(
+                catalog,
+                limits,
+                state,
+                &CommandKind::PrepareCompositeEffect {
+                    effect: child,
+                    actor: origin,
+                    binding_generation,
+                },
+            )?;
+            state
+                .composite_effects
+                .get_mut(&child)
+                .expect("created child")
+                .handoff = SingleHopRole::Target {
+                parent: descriptor.parent,
+                descriptor_digest: handoff_descriptor_digest(descriptor),
+            };
+            Ok(AppliedOutput::none(TransitionEvent::EffectPrepared))
+        }
+        CommandKind::ReleaseHandoffSourceAndRecordTargetIntent {
+            descriptor,
+            actor,
+            binding_generation,
+            operation,
+        } => {
+            let child = descriptor.child_effect()?;
+            let descriptor_digest = handoff_descriptor_digest(descriptor);
+            {
+                let source = state
+                    .composite_effects
+                    .get(&descriptor.parent)
+                    .ok_or(CoreError::UnknownEstate)?;
+                if !matches!(&source.handoff, SingleHopRole::Source { descriptor: saved, .. } if **saved == descriptor)
+                {
+                    return Err(CoreError::HandoffGuardRequired);
+                }
+                let target = state
+                    .composite_effects
+                    .get(&child)
+                    .ok_or(CoreError::UnknownEstate)?;
+                if !matches!(target.handoff, SingleHopRole::Target { parent, descriptor_digest: saved } if parent == descriptor.parent && saved == descriptor_digest)
+                {
+                    return Err(CoreError::HandoffGuardRequired);
+                }
+            }
+            // The generic component command deliberately rejects a Target;
+            // temporarily remove only the in-memory guard while executing the
+            // same state-machine transition, then restore it before the
+            // candidate can be committed.
+            let target_role = state
+                .composite_effects
+                .get(&child)
+                .expect("validated target")
+                .handoff
+                .clone();
+            state
+                .composite_effects
+                .get_mut(&child)
+                .expect("validated target")
+                .handoff = SingleHopRole::None;
+            let intent = apply_command(
+                catalog,
+                limits,
+                state,
+                &CommandKind::RecordComponentCommitIntent {
+                    effect: child,
+                    component: descriptor.child_component,
+                    actor,
+                    binding_generation,
+                    operation,
+                },
+            )?;
+            state
+                .composite_effects
+                .get_mut(&child)
+                .expect("validated target")
+                .handoff = target_role;
+            let source = state
+                .composite_effects
+                .get_mut(&descriptor.parent)
+                .expect("validated source");
+            source.custodian = CustodyState::Released;
+            source.authority = AuthorityState::Revoked;
+            for component in source.components.values_mut() {
+                component.retirement = RetirementState::Released;
+            }
+            Ok(intent)
+        }
         CommandKind::CreateEstate {
             effect,
             origin,
@@ -5344,6 +5919,7 @@ fn apply_command(
                     charge_owner: charge_account,
                     authority: AuthorityState::Active,
                     authority_epoch: 1,
+                    handoff: SingleHopRole::None,
                     components,
                 },
             );
@@ -5500,6 +6076,9 @@ fn apply_command(
                 .composite_effects
                 .get_mut(&effect)
                 .ok_or(CoreError::UnknownEstate)?;
+            if matches!(composite.handoff, SingleHopRole::Target { .. }) {
+                return Err(CoreError::HandoffGuardRequired);
+            }
             if composite.components.len() != 1 {
                 return Err(CoreError::WrongCommitState);
             }
@@ -6697,6 +7276,9 @@ fn apply_command(
                 .composite_effects
                 .get_mut(&effect)
                 .ok_or(CoreError::UnknownEstate)?;
+            if matches!(composite.handoff, SingleHopRole::Source { .. }) {
+                return Err(CoreError::HandoffGuardRequired);
+            }
             if composite_escape_state(composite) != EffectEscapeState::Retired {
                 return Err(CoreError::EstateNotReleasable);
             }
@@ -9264,7 +9846,10 @@ fn project_estate(estate: &EstateRecord) -> EstateProjection {
     }
 }
 
-fn project_composite_effect(composite: &CompositeEffectRecord) -> CompositeEffectProjection {
+fn project_composite_effect(
+    composite: &CompositeEffectRecord,
+    state: &State,
+) -> CompositeEffectProjection {
     CompositeEffectProjection {
         effect: composite.effect,
         kind: composite.kind,
@@ -9281,6 +9866,34 @@ fn project_composite_effect(composite: &CompositeEffectRecord) -> CompositeEffec
             .flat_map(|component| component.claims.values())
             .filter(|claim| !claim.retired)
             .count(),
+        handoff: project_single_hop_handoff(composite, Some(state)),
+    }
+}
+
+fn project_single_hop_handoff(
+    composite: &CompositeEffectRecord,
+    state: Option<&State>,
+) -> SingleHopHandoffProjection {
+    match &composite.handoff {
+        SingleHopRole::None => SingleHopHandoffProjection::None,
+        SingleHopRole::Source {
+            descriptor,
+            terminal_receipt_digest,
+            descriptor_receipt_digest,
+        } => SingleHopHandoffProjection::Source {
+            descriptor: descriptor.clone(),
+            terminal_receipt_digest: *terminal_receipt_digest,
+            descriptor_receipt_digest: *descriptor_receipt_digest,
+            child_installed: state.is_some_and(|state| {
+                descriptor.child_effect().ok().and_then(|child| state.composite_effects.get(&child)).is_some_and(|child| {
+                    matches!(child.handoff, SingleHopRole::Target { parent, descriptor_digest } if parent == composite.effect && descriptor_digest == handoff_descriptor_digest(**descriptor))
+                })
+            }),
+        },
+        SingleHopRole::Target { parent, descriptor_digest } => SingleHopHandoffProjection::Target {
+            parent: *parent,
+            descriptor_digest: *descriptor_digest,
+        },
     }
 }
 
@@ -9476,9 +10089,10 @@ fn build_recovery_snapshot(
             charge_owner: composite.charge_owner,
             authority: composite.authority,
             authority_epoch: composite.authority_epoch,
-            escape: project_composite_effect(composite).escape,
+            escape: composite_escape_state(composite),
             components,
             retained_claims,
+            handoff: project_single_hop_handoff(composite, Some(state)),
         });
     }
     let mut hasher = Sha256::new();
@@ -9519,6 +10133,7 @@ fn build_recovery_snapshot(
         hasher.update([authority_tag(composite.authority)]);
         hasher.update(composite.authority_epoch.to_le_bytes());
         hasher.update([effect_escape_tag(composite.escape)]);
+        hash_single_hop_handoff_projection(&mut hasher, composite.handoff.clone());
         hasher.update((composite.components.len() as u64).to_le_bytes());
         for item in &composite.components {
             hasher.update(item.component.get().to_le_bytes());
@@ -9928,6 +10543,40 @@ fn check_invariants(
                 .all(|component| component.retirement == RetirementState::Released)
         {
             return Err(CoreError::InvariantViolation);
+        }
+        match &composite.handoff {
+            SingleHopRole::None => {}
+            SingleHopRole::Source {
+                descriptor,
+                terminal_receipt_digest,
+                descriptor_receipt_digest,
+            } => {
+                if descriptor.parent != composite.effect
+                    || descriptor.catalog_digest != catalog.digest()
+                    || descriptor.child_effect().is_err()
+                    || !matches!(catalog.single_hop_handoff_rule(composite.kind), Some(rule) if rule.target() == descriptor.child_kind)
+                    || terminal_receipt_digest.is_zero()
+                    || descriptor_receipt_digest.is_zero()
+                    || !matches!(
+                        composite.components.get(&descriptor.parent_component).map(|component| component.outcome),
+                        Some(OutcomeState::KnownSuccess(receipt)) if receipt == *terminal_receipt_digest
+                    )
+                {
+                    return Err(CoreError::InvariantViolation);
+                }
+            }
+            SingleHopRole::Target {
+                parent,
+                descriptor_digest,
+            } => {
+                if parent.root() != composite.effect.root()
+                    || descriptor_digest.is_zero()
+                    || composite.components.len() != 1
+                    || !matches!(state.composite_effects.get(parent).map(|source| (&source.handoff, source.kind)), Some((SingleHopRole::Source { descriptor, .. }, source_kind)) if catalog.single_hop_handoff_rule(source_kind).is_some_and(|rule| rule.target() == composite.kind) && handoff_descriptor_digest(**descriptor) == *descriptor_digest)
+                {
+                    return Err(CoreError::InvariantViolation);
+                }
+            }
         }
         let mut claim_ids = BTreeSet::new();
         for component in composite.components.values() {
@@ -10497,6 +11146,28 @@ fn projection_digest(state: &State, catalog: Digest) -> Digest {
             effect_escape_tag(composite_escape_state(composite)),
         ]);
         hasher.update(composite.authority_epoch.to_le_bytes());
+        match &composite.handoff {
+            SingleHopRole::None => hasher.update([0]),
+            SingleHopRole::Source {
+                descriptor,
+                terminal_receipt_digest,
+                descriptor_receipt_digest,
+            } => {
+                hasher.update([1]);
+                hasher.update(handoff_descriptor_digest(**descriptor).bytes());
+                hasher.update(terminal_receipt_digest.bytes());
+                hasher.update(descriptor_receipt_digest.bytes());
+            }
+            SingleHopRole::Target {
+                parent,
+                descriptor_digest,
+            } => {
+                hasher.update([2]);
+                hasher.update(parent.root().get().to_le_bytes());
+                hasher.update(parent.sequence().to_le_bytes());
+                hasher.update(descriptor_digest.bytes());
+            }
+        }
         for (component_id, component) in &composite.components {
             hasher.update(component_id.get().to_le_bytes());
             hasher.update(component.domain.get().to_le_bytes());
@@ -10817,6 +11488,121 @@ fn hash_optional_digest(hasher: &mut Sha256, value: Option<Digest>) {
     if let Some(value) = value {
         hasher.update(value.bytes());
     }
+}
+
+fn handoff_descriptor_digest(descriptor: ChildDescriptorV1) -> Digest {
+    let mut hasher = Sha256::new();
+    hasher.update(descriptor.encode_wire());
+    Digest::new(hasher.finalize().into())
+}
+
+fn hash_single_hop_handoff_projection(hasher: &mut Sha256, handoff: SingleHopHandoffProjection) {
+    match handoff {
+        SingleHopHandoffProjection::None => hasher.update([0]),
+        SingleHopHandoffProjection::Source {
+            descriptor,
+            terminal_receipt_digest,
+            descriptor_receipt_digest,
+            child_installed,
+        } => {
+            hasher.update([1]);
+            hasher.update(handoff_descriptor_digest(*descriptor).bytes());
+            hasher.update(terminal_receipt_digest.bytes());
+            hasher.update(descriptor_receipt_digest.bytes());
+            hasher.update([u8::from(child_installed)]);
+        }
+        SingleHopHandoffProjection::Target {
+            parent,
+            descriptor_digest,
+        } => {
+            hasher.update([2]);
+            hasher.update(parent.root().get().to_le_bytes());
+            hasher.update(parent.sequence().to_le_bytes());
+            hasher.update(descriptor_digest.bytes());
+        }
+    }
+}
+
+fn child_wire_put_u8(bytes: &mut [u8], at: &mut usize, value: u8) {
+    bytes[*at] = value;
+    *at += 1;
+}
+fn child_wire_put_u16(bytes: &mut [u8], at: &mut usize, value: u16) {
+    bytes[*at..*at + 2].copy_from_slice(&value.to_le_bytes());
+    *at += 2;
+}
+fn child_wire_put_u32(bytes: &mut [u8], at: &mut usize, value: u32) {
+    bytes[*at..*at + 4].copy_from_slice(&value.to_le_bytes());
+    *at += 4;
+}
+fn child_wire_put_u64(bytes: &mut [u8], at: &mut usize, value: u64) {
+    bytes[*at..*at + 8].copy_from_slice(&value.to_le_bytes());
+    *at += 8;
+}
+fn child_wire_put_digest(bytes: &mut [u8], at: &mut usize, value: Digest) {
+    bytes[*at..*at + 32].copy_from_slice(&value.bytes());
+    *at += 32;
+}
+fn child_wire_u8(bytes: &[u8], at: &mut usize) -> Result<u8, ChildDescriptorDecodeError> {
+    let value = *bytes
+        .get(*at)
+        .ok_or(ChildDescriptorDecodeError::InvalidEncoding)?;
+    *at += 1;
+    Ok(value)
+}
+fn child_wire_u16(bytes: &[u8], at: &mut usize) -> Result<u16, ChildDescriptorDecodeError> {
+    let end = at
+        .checked_add(2)
+        .ok_or(ChildDescriptorDecodeError::InvalidEncoding)?;
+    let value = u16::from_le_bytes(
+        bytes
+            .get(*at..end)
+            .ok_or(ChildDescriptorDecodeError::InvalidEncoding)?
+            .try_into()
+            .map_err(|_| ChildDescriptorDecodeError::InvalidEncoding)?,
+    );
+    *at = end;
+    Ok(value)
+}
+fn child_wire_u32(bytes: &[u8], at: &mut usize) -> Result<u32, ChildDescriptorDecodeError> {
+    let end = at
+        .checked_add(4)
+        .ok_or(ChildDescriptorDecodeError::InvalidEncoding)?;
+    let value = u32::from_le_bytes(
+        bytes
+            .get(*at..end)
+            .ok_or(ChildDescriptorDecodeError::InvalidEncoding)?
+            .try_into()
+            .map_err(|_| ChildDescriptorDecodeError::InvalidEncoding)?,
+    );
+    *at = end;
+    Ok(value)
+}
+fn child_wire_u64(bytes: &[u8], at: &mut usize) -> Result<u64, ChildDescriptorDecodeError> {
+    let end = at
+        .checked_add(8)
+        .ok_or(ChildDescriptorDecodeError::InvalidEncoding)?;
+    let value = u64::from_le_bytes(
+        bytes
+            .get(*at..end)
+            .ok_or(ChildDescriptorDecodeError::InvalidEncoding)?
+            .try_into()
+            .map_err(|_| ChildDescriptorDecodeError::InvalidEncoding)?,
+    );
+    *at = end;
+    Ok(value)
+}
+fn child_wire_digest(bytes: &[u8], at: &mut usize) -> Result<Digest, ChildDescriptorDecodeError> {
+    let end = at
+        .checked_add(32)
+        .ok_or(ChildDescriptorDecodeError::InvalidEncoding)?;
+    let value: [u8; 32] = bytes
+        .get(*at..end)
+        .ok_or(ChildDescriptorDecodeError::InvalidEncoding)?
+        .try_into()
+        .map_err(|_| ChildDescriptorDecodeError::InvalidEncoding)?;
+    *at = end;
+    Ok(Digest::new(value))
 }
 
 const fn authority_tag(state: AuthorityState) -> u8 {
@@ -11335,6 +12121,40 @@ impl CommandKind {
                 put_u32(&mut bytes, state.len() as u32);
                 bytes.extend_from_slice(&state);
             }
+            Self::AcknowledgeHandoffParent {
+                fact,
+                descriptor,
+                descriptor_receipt_digest,
+            } => {
+                put_u8(&mut bytes, 38);
+                put_effect_fact(&mut bytes, fact);
+                put_child_descriptor(&mut bytes, descriptor);
+                put_digest(&mut bytes, descriptor_receipt_digest);
+            }
+            Self::InstallHandoffChild {
+                descriptor,
+                origin,
+                binding_generation,
+                charge_account,
+            } => {
+                put_u8(&mut bytes, 39);
+                put_child_descriptor(&mut bytes, descriptor);
+                put_incarnation(&mut bytes, origin);
+                put_u64(&mut bytes, binding_generation);
+                put_u64(&mut bytes, charge_account.get());
+            }
+            Self::ReleaseHandoffSourceAndRecordTargetIntent {
+                descriptor,
+                actor,
+                binding_generation,
+                operation,
+            } => {
+                put_u8(&mut bytes, 40);
+                put_child_descriptor(&mut bytes, descriptor);
+                put_incarnation(&mut bytes, actor);
+                put_u64(&mut bytes, binding_generation);
+                put_digest(&mut bytes, operation);
+            }
         }
         bytes
     }
@@ -11677,6 +12497,24 @@ impl CommandKind {
                 let state = cursor.take(len)?.to_vec();
                 Self::WholeStateCheckpointV1 { state, projection }
             }
+            38 => Self::AcknowledgeHandoffParent {
+                fact: cursor.effect_fact()?,
+                descriptor: cursor.child_descriptor()?,
+                descriptor_receipt_digest: cursor.digest()?,
+            },
+            39 => Self::InstallHandoffChild {
+                descriptor: cursor.child_descriptor()?,
+                origin: cursor.incarnation()?,
+                binding_generation: cursor.nonzero_u64()?,
+                charge_account: ChargeAccountId::new(cursor.u64()?)
+                    .map_err(|_| CommandDecodeError::InvalidIdentity)?,
+            },
+            40 => Self::ReleaseHandoffSourceAndRecordTargetIntent {
+                descriptor: cursor.child_descriptor()?,
+                actor: cursor.incarnation()?,
+                binding_generation: cursor.nonzero_u64()?,
+                operation: cursor.digest()?,
+            },
             _ => return Err(CommandDecodeError::InvalidTag),
         };
         cursor.finish()?;
@@ -11709,10 +12547,10 @@ fn encode_whole_state_checkpoint(state: &State) -> Vec<u8> {
     for (id, root) in &state.roots {
         checkpoint_put_root(&mut bytes, *id, root);
     }
-    // V1 is intentionally the standard composite Profile-2 codec.  Legacy
-    // singleton estates have a different static schema and are rejected by
-    // the caller rather than silently checkpointed incompletely.
     put_u32(&mut bytes, state.estates.len() as u32);
+    for (effect, estate) in &state.estates {
+        checkpoint_put_estate(&mut bytes, *effect, estate);
+    }
     put_u32(&mut bytes, state.composite_effects.len() as u32);
     for (effect, composite) in &state.composite_effects {
         checkpoint_put_composite(&mut bytes, *effect, composite);
@@ -11763,16 +12601,23 @@ fn decode_whole_state_checkpoint(
         return Err(CoreError::InvariantViolation);
     }
     let roots = checkpoint_read_roots_count(&mut cursor, root_count)?;
-    let estates = cursor.u32().map_err(|_| CoreError::InvariantViolation)?;
-    if estates != 0 {
-        return Err(CoreError::UnsupportedCheckpointState);
+    let estate_count = cursor.u32().map_err(|_| CoreError::InvariantViolation)? as usize;
+    if estate_count > limits.max_estates {
+        return Err(CoreError::InvariantViolation);
     }
+    let (estates, estate_claims) =
+        checkpoint_read_estates(&mut cursor, catalog, estate_count, limits)?;
     let composite_count = cursor.u32().map_err(|_| CoreError::InvariantViolation)? as usize;
     if composite_count > limits.max_estates {
         return Err(CoreError::InvariantViolation);
     }
-    let composites =
-        checkpoint_read_composites_count(&mut cursor, catalog, composite_count, limits)?;
+    let composites = checkpoint_read_composites_count(
+        &mut cursor,
+        catalog,
+        composite_count,
+        limits,
+        estate_claims,
+    )?;
     let resource_count = cursor.u32().map_err(|_| CoreError::InvariantViolation)? as usize;
     if resource_count > limits.max_resource_records {
         return Err(CoreError::InvariantViolation);
@@ -11836,7 +12681,7 @@ fn decode_whole_state_checkpoint(
     }
     let mut state = State {
         roots,
-        estates: BTreeMap::new(),
+        estates,
         composite_effects: composites,
         resource_index: BTreeMap::new(),
         composite_resource_index: BTreeMap::new(),
@@ -11864,9 +12709,205 @@ fn checkpoint_put_composite(bytes: &mut Vec<u8>, effect: EffectId, record: &Comp
     put_u64(bytes, record.charge_owner.get());
     put_u8(bytes, authority_tag(record.authority));
     put_u64(bytes, record.authority_epoch);
+    checkpoint_put_handoff(bytes, record.handoff.clone());
     put_u32(bytes, record.components.len() as u32);
     for component in record.components.values() {
         checkpoint_put_component(bytes, component);
+    }
+}
+
+fn checkpoint_put_estate(bytes: &mut Vec<u8>, effect: EffectId, estate: &EstateRecord) {
+    put_effect(bytes, effect);
+    put_incarnation(bytes, estate.causal_owner);
+    checkpoint_put_custody(bytes, estate.custodian);
+    put_u64(bytes, estate.charge_owner.get());
+    put_u32(bytes, estate.domain.get());
+    put_u32(bytes, estate.obligation.get());
+    put_u8(bytes, authority_tag(estate.authority));
+    put_u64(bytes, estate.authority_epoch);
+    checkpoint_put_estate_dynamic(bytes, estate);
+}
+
+fn checkpoint_put_estate_dynamic(bytes: &mut Vec<u8>, estate: &EstateRecord) {
+    put_u8(bytes, commit_tag(estate.commit));
+    checkpoint_put_option_u64(bytes, estate.commit_nonce);
+    checkpoint_put_option_digest(bytes, estate.commit_operation);
+    checkpoint_put_option_fact(bytes, estate.commit_fact);
+    checkpoint_put_outcome(bytes, estate.outcome);
+    checkpoint_put_settlement(bytes, estate.settlement);
+    checkpoint_put_option_u64(bytes, estate.settlement_nonce);
+    checkpoint_put_option_stage(bytes, estate.claim_stage);
+    checkpoint_put_option_digest(bytes, estate.settlement_intent);
+    checkpoint_put_option_fact(bytes, estate.applied_fact);
+    checkpoint_put_option_fact(bytes, estate.settlement_fact);
+    put_u8(bytes, retirement_tag(estate.retirement));
+    put_u32(bytes, estate.claims.len() as u32);
+    for claim in estate.claims.values() {
+        checkpoint_put_claim(bytes, claim);
+    }
+}
+
+fn checkpoint_read_estates(
+    cursor: &mut Cursor<'_>,
+    catalog: &DomainCatalog,
+    count: usize,
+    limits: CoreLimits,
+) -> Result<(BTreeMap<EffectId, EstateRecord>, usize), CoreError> {
+    let mut estates = BTreeMap::new();
+    let mut total_claims = 0usize;
+    for _ in 0..count {
+        let effect = cursor.effect().map_err(|_| CoreError::InvariantViolation)?;
+        let causal_owner = cursor
+            .incarnation()
+            .map_err(|_| CoreError::InvariantViolation)?;
+        let custodian = checkpoint_read_custody(cursor)?;
+        let charge_owner =
+            ChargeAccountId::new(cursor.u64().map_err(|_| CoreError::InvariantViolation)?)
+                .map_err(|_| CoreError::InvariantViolation)?;
+        let domain = DomainId::new(cursor.u32().map_err(|_| CoreError::InvariantViolation)?)
+            .map_err(|_| CoreError::InvariantViolation)?;
+        let obligation =
+            ObligationKindId::new(cursor.u32().map_err(|_| CoreError::InvariantViolation)?)
+                .map_err(|_| CoreError::InvariantViolation)?;
+        let obligation_policy = catalog
+            .obligation_rule(domain, obligation)
+            .ok_or(CoreError::SchemaMismatch)?
+            .policy();
+        let authority = checkpoint_read_authority(cursor)?;
+        let authority_epoch = cursor
+            .nonzero_u64()
+            .map_err(|_| CoreError::InvariantViolation)?;
+        let estate = checkpoint_read_estate_dynamic(
+            cursor,
+            effect,
+            causal_owner,
+            custodian,
+            charge_owner,
+            domain,
+            obligation,
+            obligation_policy,
+            authority,
+            authority_epoch,
+            catalog,
+            limits,
+        )?;
+        total_claims = total_claims
+            .checked_add(estate.claims.len())
+            .ok_or(CoreError::InvariantViolation)?;
+        if total_claims > limits.max_total_claims || estates.insert(effect, estate).is_some() {
+            return Err(CoreError::InvariantViolation);
+        }
+    }
+    Ok((estates, total_claims))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn checkpoint_read_estate_dynamic(
+    cursor: &mut Cursor<'_>,
+    effect: EffectId,
+    causal_owner: PrincipalIncarnation,
+    custody: CustodyState,
+    charge_owner: ChargeAccountId,
+    domain: DomainId,
+    obligation: ObligationKindId,
+    obligation_policy: ObligationPolicy,
+    authority: AuthorityState,
+    authority_epoch: u64,
+    catalog: &DomainCatalog,
+    limits: CoreLimits,
+) -> Result<EstateRecord, CoreError> {
+    let commit = checkpoint_read_commit(cursor)?;
+    let commit_nonce = checkpoint_read_option_u64(cursor)?;
+    let commit_operation = checkpoint_read_option_digest(cursor)?;
+    let commit_fact = checkpoint_read_option_fact(cursor)?;
+    let outcome = checkpoint_read_outcome(cursor)?;
+    let settlement = checkpoint_read_settlement(cursor)?;
+    let settlement_nonce = checkpoint_read_option_u64(cursor)?;
+    let claim_stage = checkpoint_read_option_stage(cursor)?;
+    let settlement_intent = checkpoint_read_option_digest(cursor)?;
+    let applied_fact = checkpoint_read_option_fact(cursor)?;
+    let settlement_fact = checkpoint_read_option_fact(cursor)?;
+    let retirement = checkpoint_read_retirement(cursor)?;
+    let count = cursor.u32().map_err(|_| CoreError::InvariantViolation)? as usize;
+    if count > limits.max_claims_per_estate {
+        return Err(CoreError::InvariantViolation);
+    }
+    let mut claims = BTreeMap::new();
+    for _ in 0..count {
+        let claim = checkpoint_read_claim(cursor, domain, catalog)?;
+        if claims.insert(claim.id, claim).is_some() {
+            return Err(CoreError::InvariantViolation);
+        }
+    }
+    Ok(EstateRecord {
+        effect,
+        causal_owner,
+        custodian: custody,
+        charge_owner,
+        domain,
+        obligation,
+        obligation_policy,
+        authority,
+        authority_epoch,
+        commit,
+        commit_nonce,
+        commit_operation,
+        commit_fact,
+        outcome,
+        settlement,
+        settlement_nonce,
+        claim_stage,
+        settlement_intent,
+        applied_fact,
+        settlement_fact,
+        retirement,
+        claims,
+    })
+}
+
+fn checkpoint_put_handoff(bytes: &mut Vec<u8>, handoff: SingleHopRole) {
+    match handoff {
+        SingleHopRole::None => put_u8(bytes, 0),
+        SingleHopRole::Source {
+            descriptor,
+            terminal_receipt_digest,
+            descriptor_receipt_digest,
+        } => {
+            put_u8(bytes, 1);
+            put_child_descriptor(bytes, *descriptor);
+            put_digest(bytes, terminal_receipt_digest);
+            put_digest(bytes, descriptor_receipt_digest);
+        }
+        SingleHopRole::Target {
+            parent,
+            descriptor_digest,
+        } => {
+            put_u8(bytes, 2);
+            put_effect(bytes, parent);
+            put_digest(bytes, descriptor_digest);
+        }
+    }
+}
+
+fn checkpoint_read_handoff(cursor: &mut Cursor<'_>) -> Result<SingleHopRole, CoreError> {
+    match cursor.u8().map_err(|_| CoreError::InvariantViolation)? {
+        0 => Ok(SingleHopRole::None),
+        1 => Ok(SingleHopRole::Source {
+            descriptor: Box::new(
+                cursor
+                    .child_descriptor()
+                    .map_err(|_| CoreError::InvariantViolation)?,
+            ),
+            terminal_receipt_digest: cursor.digest().map_err(|_| CoreError::InvariantViolation)?,
+            descriptor_receipt_digest: cursor
+                .digest()
+                .map_err(|_| CoreError::InvariantViolation)?,
+        }),
+        2 => Ok(SingleHopRole::Target {
+            parent: cursor.effect().map_err(|_| CoreError::InvariantViolation)?,
+            descriptor_digest: cursor.digest().map_err(|_| CoreError::InvariantViolation)?,
+        }),
+        _ => Err(CoreError::InvariantViolation),
     }
 }
 
@@ -11875,9 +12916,9 @@ fn checkpoint_read_composites_count(
     catalog: &DomainCatalog,
     count: usize,
     limits: CoreLimits,
+    mut total_claims: usize,
 ) -> Result<BTreeMap<EffectId, CompositeEffectRecord>, CoreError> {
     let mut composites = BTreeMap::new();
-    let mut total_claims = 0usize;
     for _ in 0..count {
         let effect = cursor.effect().map_err(|_| CoreError::InvariantViolation)?;
         let kind = CompositeKindId::new(cursor.u32().map_err(|_| CoreError::InvariantViolation)?)
@@ -11893,6 +12934,7 @@ fn checkpoint_read_composites_count(
         let authority_epoch = cursor
             .nonzero_u64()
             .map_err(|_| CoreError::InvariantViolation)?;
+        let handoff = checkpoint_read_handoff(cursor)?;
         let component_count = cursor.u32().map_err(|_| CoreError::InvariantViolation)? as usize;
         let schema = catalog
             .composite_rule(kind)
@@ -11921,6 +12963,7 @@ fn checkpoint_read_composites_count(
             charge_owner,
             authority,
             authority_epoch,
+            handoff,
             components,
         };
         if composites.insert(effect, record).is_some() {
@@ -12211,6 +13254,27 @@ fn checkpoint_read_pending_reuse(cursor: &mut Cursor<'_>) -> Result<PendingReuse
 }
 
 fn checkpoint_rebuild_derived(state: &mut State) -> Result<(), CoreError> {
+    for (effect, estate) in &state.estates {
+        for claim in estate.claims.values() {
+            if !claim.retired {
+                state
+                    .resource_index
+                    .entry(claim.resource)
+                    .or_default()
+                    .push((*effect, claim.id));
+                *state
+                    .charges
+                    .entry((estate.charge_owner, claim.credit_class))
+                    .or_insert(0) = state
+                    .charges
+                    .get(&(estate.charge_owner, claim.credit_class))
+                    .copied()
+                    .unwrap_or(0)
+                    .checked_add(claim.units)
+                    .ok_or(CoreError::InvariantViolation)?;
+            }
+        }
+    }
     for (effect, composite) in &state.composite_effects {
         for (component_id, component) in &composite.components {
             for claim in component.claims.values() {
@@ -12235,6 +13299,9 @@ fn checkpoint_rebuild_derived(state: &mut State) -> Result<(), CoreError> {
         }
     }
     for entries in state.composite_resource_index.values_mut() {
+        entries.sort_unstable();
+    }
+    for entries in state.resource_index.values_mut() {
         entries.sort_unstable();
     }
     Ok(())
@@ -12683,6 +13750,24 @@ fn put_effect(bytes: &mut Vec<u8>, effect: EffectId) {
     put_u64(bytes, effect.sequence());
 }
 
+fn put_child_descriptor(bytes: &mut Vec<u8>, value: ChildDescriptorV1) {
+    put_u16(bytes, value.schema);
+    put_u64(bytes, value.sequence);
+    put_effect(bytes, value.parent);
+    put_u32(bytes, value.parent_component.get());
+    put_digest(bytes, value.route_digest);
+    put_u32(bytes, value.child_kind.get());
+    put_u32(bytes, value.child_component.get());
+    put_u64(bytes, value.claim.get());
+    put_u32(bytes, value.claim_kind.get());
+    put_claim_scope(bytes, value.scope);
+    put_u64(bytes, value.resource.get());
+    put_u64(bytes, value.resource_generation.get());
+    put_u64(bytes, value.units);
+    put_digest(bytes, value.input_digest);
+    put_digest(bytes, value.catalog_digest);
+}
+
 fn put_optional_component(bytes: &mut Vec<u8>, component: Option<ComponentId>) {
     put_u32(bytes, component.map(ComponentId::get).unwrap_or(0));
 }
@@ -12743,6 +13828,31 @@ struct Cursor<'a> {
 }
 
 impl<'a> Cursor<'a> {
+    fn child_descriptor(&mut self) -> Result<ChildDescriptorV1, CommandDecodeError> {
+        Ok(ChildDescriptorV1 {
+            schema: self.u16()?,
+            sequence: self.nonzero_u64()?,
+            parent: self.effect()?,
+            parent_component: ComponentId::new(self.u32()?)
+                .map_err(|_| CommandDecodeError::InvalidIdentity)?,
+            route_digest: self.digest()?,
+            child_kind: CompositeKindId::new(self.u32()?)
+                .map_err(|_| CommandDecodeError::InvalidIdentity)?,
+            child_component: ComponentId::new(self.u32()?)
+                .map_err(|_| CommandDecodeError::InvalidIdentity)?,
+            claim: ClaimId::new(self.u64()?).map_err(|_| CommandDecodeError::InvalidIdentity)?,
+            claim_kind: ClaimKindId::new(self.u32()?)
+                .map_err(|_| CommandDecodeError::InvalidIdentity)?,
+            scope: self.claim_scope()?,
+            resource: ResourceId::new(self.u64()?)
+                .map_err(|_| CommandDecodeError::InvalidIdentity)?,
+            resource_generation: ResourceGeneration::new(self.u64()?)
+                .map_err(|_| CommandDecodeError::InvalidIdentity)?,
+            units: self.nonzero_u64()?,
+            input_digest: self.digest()?,
+            catalog_digest: self.digest()?,
+        })
+    }
     const fn new(bytes: &'a [u8]) -> Self {
         Self { bytes, position: 0 }
     }
@@ -13113,6 +14223,68 @@ mod whole_state_checkpoint_tests {
         assert!(decode_whole_state_checkpoint(&image, &engine.catalog, engine.limits).is_err());
     }
 
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn mixed_estate_and_composite_checkpoint_roundtrip() {
+        let mut engine = Engine::new_legacy_compatibility(
+            standard_catalog(),
+            CoreLimits::bounded_default(),
+            freshness(),
+        );
+        let effect = EffectId::new(RootId::new(92).unwrap(), 1).unwrap();
+        let actor = PrincipalIncarnation::new(crate::PrincipalId::new(9).unwrap(), 1).unwrap();
+        engine
+            .transact(
+                CommandRequest::CreateEstate {
+                    effect,
+                    origin: actor,
+                    binding_generation: 1,
+                    domain: crate::REPLY_DOMAIN,
+                    obligation: crate::REPLY_OBLIGATION_PUBLICATION,
+                    charge_account: ChargeAccountId::new(2).unwrap(),
+                },
+                |_| Ok::<(), ()>(()),
+            )
+            .unwrap();
+        engine
+            .transact(
+                CommandRequest::AddClaim {
+                    effect,
+                    actor,
+                    binding_generation: 1,
+                    claim: ClaimId::new(9).unwrap(),
+                    domain: crate::REPLY_DOMAIN,
+                    kind: REPLY_CLAIM_PUBLICATION_SLOT,
+                    scope: ClaimScope::Logical,
+                    resource: ResourceId::new(9).unwrap(),
+                    resource_generation: ResourceGeneration::new(1).unwrap(),
+                    units: 1,
+                },
+                |_| Ok::<(), ()>(()),
+            )
+            .unwrap();
+        let composite_effect = EffectId::new(RootId::new(93).unwrap(), 1).unwrap();
+        engine
+            .transact(
+                CommandRequest::CreateCompositeEffect {
+                    effect: composite_effect,
+                    origin: actor,
+                    binding_generation: 1,
+                    kind: AGENT_OPERATION_COMPOSITE,
+                    charge_account: ChargeAccountId::new(3).unwrap(),
+                },
+                |_| Ok::<(), ()>(()),
+            )
+            .unwrap();
+        let decoded = decode_whole_state_checkpoint(
+            &encode_whole_state_checkpoint(&engine.state),
+            &engine.catalog,
+            engine.limits,
+        )
+        .unwrap();
+        assert_eq!(decoded, engine.state);
+    }
+
     #[test]
     fn checkpoint_rejects_noncanonical_acceptance_and_oversized_counts() {
         assert!(checkpoint_read_option_accepted(&mut Cursor::new(&[2])).is_err());
@@ -13142,6 +14314,502 @@ mod whole_state_checkpoint_tests {
             CommandKind::decode_payload(&payload),
             Err(CommandDecodeError::UnexpectedEof)
         ));
+    }
+}
+
+#[cfg(test)]
+mod handoff_guard_tests {
+    use super::*;
+    use crate::{
+        TOOL_CLAIM_OUTCOME_SLOT, TOOL_COMMIT_RECEIPT_SCHEMA, TOOL_HANDOFF_CHILD_COMPOSITE,
+        TOOL_HANDOFF_COMPONENT, TOOL_HANDOFF_SOURCE_COMPONENT, TOOL_HANDOFF_SOURCE_COMPOSITE,
+        TOOL_VERIFIER, tool_dma_catalog,
+    };
+
+    fn freshness() -> Freshness {
+        Freshness::new(
+            BootGeneration::new(1).unwrap(),
+            RegistryInstance::new(1).unwrap(),
+            1,
+            DeviceGeneration::new(1).unwrap(),
+            JournalGeneration::new(1).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn transact(engine: &mut Engine, command: impl Into<Command>) -> TransitionReceipt {
+        engine.transact(command, |_| Ok::<(), ()>(())).unwrap()
+    }
+
+    fn recover_at_checkpoint(engine: &mut Engine) -> Engine {
+        let mut journal = Vec::new();
+        let checkpoint = Command(CommandKind::WholeStateCheckpointV1 {
+            state: encode_whole_state_checkpoint(&engine.state),
+            projection: engine.projection_digest(),
+        });
+        engine
+            .transact(checkpoint, |record| {
+                journal.extend_from_slice(record.bytes());
+                Ok::<(), ()>(())
+            })
+            .unwrap();
+        let target = Freshness::new(
+            BootGeneration::new(2).unwrap(),
+            RegistryInstance::new(1).unwrap(),
+            1,
+            DeviceGeneration::new(1).unwrap(),
+            JournalGeneration::new(2).unwrap(),
+        )
+        .unwrap();
+        let anchor = RecoveryAnchor::from_trusted_provider(
+            engine.catalog.digest(),
+            engine.state.freshness,
+            target,
+            engine.state.revision,
+            engine.state.head,
+        )
+        .unwrap();
+        Engine::recover(engine.catalog.clone(), engine.limits, anchor, &journal)
+            .unwrap()
+            .into_engine()
+    }
+
+    fn setup() -> (Engine, EffectId, PrincipalIncarnation, ChildDescriptorV1) {
+        let mut engine = Engine::new(
+            tool_dma_catalog(),
+            CoreLimits::bounded_default(),
+            freshness(),
+        );
+        let parent = EffectId::new(RootId::new(77).unwrap(), 2).unwrap();
+        let actor = PrincipalIncarnation::new(crate::PrincipalId::new(7).unwrap(), 1).unwrap();
+        transact(
+            &mut engine,
+            CommandRequest::CreateCompositeEffect {
+                effect: parent,
+                origin: actor,
+                binding_generation: 1,
+                kind: TOOL_HANDOFF_SOURCE_COMPOSITE,
+                charge_account: ChargeAccountId::new(1).unwrap(),
+            },
+        );
+        transact(
+            &mut engine,
+            CommandRequest::AddComponentClaim {
+                effect: parent,
+                component: TOOL_HANDOFF_SOURCE_COMPONENT,
+                actor,
+                binding_generation: 1,
+                claim: ClaimId::new(1).unwrap(),
+                kind: TOOL_CLAIM_OUTCOME_SLOT,
+                scope: ClaimScope::Logical,
+                resource: ResourceId::new(10).unwrap(),
+                resource_generation: ResourceGeneration::new(1).unwrap(),
+                units: 1,
+            },
+        );
+        transact(
+            &mut engine,
+            CommandRequest::PrepareCompositeEffect {
+                effect: parent,
+                actor,
+                binding_generation: 1,
+            },
+        );
+        let receipt = transact(
+            &mut engine,
+            CommandRequest::RecordComponentCommitIntent {
+                effect: parent,
+                component: TOOL_HANDOFF_SOURCE_COMPONENT,
+                actor,
+                binding_generation: 1,
+                operation: Digest::new([9; 32]),
+            },
+        );
+        let TransitionOutput::CommitIntent(intent) = receipt.output else {
+            panic!("commit intent");
+        };
+        let descriptor = ChildDescriptorV1 {
+            schema: 1,
+            sequence: 1,
+            parent,
+            parent_component: TOOL_HANDOFF_SOURCE_COMPONENT,
+            route_digest: Digest::new([1; 32]),
+            child_kind: TOOL_HANDOFF_CHILD_COMPOSITE,
+            child_component: TOOL_HANDOFF_COMPONENT,
+            claim: ClaimId::new(9).unwrap(),
+            claim_kind: TOOL_CLAIM_OUTCOME_SLOT,
+            scope: ClaimScope::Logical,
+            resource: ResourceId::new(99).unwrap(),
+            resource_generation: ResourceGeneration::new(1).unwrap(),
+            units: 1,
+            input_digest: Digest::new([2; 32]),
+            catalog_digest: engine.catalog.digest(),
+        };
+        let fact = VerifiedEffectFact {
+            kind: EffectFactKind::CommitOutcome,
+            effect: parent,
+            component: Some(TOOL_HANDOFF_SOURCE_COMPONENT),
+            actor,
+            generation: 1,
+            nonce: intent.nonce,
+            operation: Digest::new([9; 32]),
+            predecessor: None,
+            freshness: engine.state.freshness,
+            stamp: VerifierStamp {
+                identity: VerifierIdentity {
+                    verifier: TOOL_VERIFIER,
+                    epoch: 1,
+                    receipt_schema: TOOL_COMMIT_RECEIPT_SCHEMA,
+                },
+                receipt_digest: Digest::new([3; 32]),
+            },
+            outcome: Some(ExternalOutcome::Success),
+        };
+        transact(
+            &mut engine,
+            Command(CommandKind::AcknowledgeHandoffParent {
+                fact,
+                descriptor,
+                descriptor_receipt_digest: Digest::new([16; 32]),
+            }),
+        );
+        (engine, parent, actor, descriptor)
+    }
+
+    #[test]
+    fn handoff_descriptor_tamper_and_generic_bypasses_fail_closed() {
+        let (mut engine, parent, actor, descriptor) = setup();
+        let mut tampered = descriptor;
+        tampered.input_digest = Digest::new([4; 32]);
+        assert_eq!(
+            engine
+                .transact(
+                    Command(CommandKind::InstallHandoffChild {
+                        descriptor: tampered,
+                        origin: actor,
+                        binding_generation: 1,
+                        charge_account: ChargeAccountId::new(1).unwrap()
+                    }),
+                    |_| Ok::<(), ()>(())
+                )
+                .unwrap_err(),
+            TxError::Core(CoreError::HandoffGuardRequired)
+        );
+        transact(
+            &mut engine,
+            Command(CommandKind::InstallHandoffChild {
+                descriptor,
+                origin: actor,
+                binding_generation: 1,
+                charge_account: ChargeAccountId::new(1).unwrap(),
+            }),
+        );
+        let child = descriptor.child_effect().unwrap();
+        assert_eq!(engine.composite_effect(child).unwrap().component_count, 1);
+        assert_eq!(
+            engine
+                .transact(
+                    CommandRequest::RecordComponentCommitIntent {
+                        effect: child,
+                        component: TOOL_HANDOFF_COMPONENT,
+                        actor,
+                        binding_generation: 1,
+                        operation: Digest::new([8; 32])
+                    },
+                    |_| Ok::<(), ()>(())
+                )
+                .unwrap_err(),
+            TxError::Core(CoreError::HandoffGuardRequired)
+        );
+        assert_eq!(
+            engine
+                .transact(
+                    CommandRequest::ReleaseCompositeEffect { effect: parent },
+                    |_| Ok::<(), ()>(())
+                )
+                .unwrap_err(),
+            TxError::Core(CoreError::HandoffGuardRequired)
+        );
+    }
+
+    #[test]
+    fn handoff_install_is_atomic_and_checkpoint_binds_role() {
+        let (mut engine, _parent, actor, descriptor) = setup();
+        let mut invalid = descriptor;
+        invalid.claim_kind = ClaimKindId::new(99).unwrap();
+        let before = engine.projection_digest();
+        assert!(
+            engine
+                .transact(
+                    Command(CommandKind::InstallHandoffChild {
+                        descriptor: invalid,
+                        origin: actor,
+                        binding_generation: 1,
+                        charge_account: ChargeAccountId::new(1).unwrap()
+                    }),
+                    |_| Ok::<(), ()>(())
+                )
+                .is_err()
+        );
+        assert_eq!(engine.projection_digest(), before);
+        let image = encode_whole_state_checkpoint(&engine.state);
+        let decoded =
+            decode_whole_state_checkpoint(&image, &engine.catalog, engine.limits).unwrap();
+        assert_eq!(
+            projection_digest(&decoded, engine.catalog.digest()),
+            engine.projection_digest()
+        );
+        let mut tampered = image;
+        *tampered.last_mut().unwrap() ^= 1;
+        assert!(decode_whole_state_checkpoint(&tampered, &engine.catalog, engine.limits).is_err());
+    }
+
+    #[test]
+    fn child_descriptor_wire_is_fixed_width_canonical_for_logical_and_device_scopes() {
+        let (_, _, _, logical) = setup();
+        let logical_wire = logical.encode_wire();
+        assert_eq!(logical_wire.len(), CHILD_DESCRIPTOR_V1_WIRE_LEN);
+        assert_eq!(&logical_wire[..8], b"NXSCHD03");
+        // scope tag then its always-present zero scope id
+        assert_eq!(logical_wire[90], 0);
+        assert_eq!(&logical_wire[91..99], &[0; 8]);
+        assert_eq!(
+            ChildDescriptorV1::decode_wire(&logical_wire).unwrap(),
+            logical
+        );
+
+        let mut device = logical;
+        device.scope = ClaimScope::Device(DeviceScopeId::new(9).unwrap());
+        let device_wire = device.encode_wire();
+        assert_eq!(device_wire.len(), CHILD_DESCRIPTOR_V1_WIRE_LEN);
+        assert_eq!(&device_wire[..8], b"NXSCHD03");
+        assert_eq!(device_wire[90], 1);
+        assert_eq!(&device_wire[91..99], &9_u64.to_le_bytes());
+        assert_eq!(
+            ChildDescriptorV1::decode_wire(&device_wire).unwrap(),
+            device
+        );
+        assert_ne!(
+            handoff_descriptor_digest(logical),
+            handoff_descriptor_digest(device)
+        );
+    }
+
+    #[test]
+    fn child_descriptor_wire_rejects_truncation_trailing_and_noncanonical_scope() {
+        let (_, _, _, descriptor) = setup();
+        let wire = descriptor.encode_wire();
+        assert_eq!(
+            ChildDescriptorV1::decode_wire(&wire[..wire.len() - 1]),
+            Err(ChildDescriptorDecodeError::InvalidEncoding)
+        );
+        let mut trailing = wire.to_vec();
+        trailing.push(0);
+        assert_eq!(
+            ChildDescriptorV1::decode_wire(&trailing),
+            Err(ChildDescriptorDecodeError::InvalidEncoding)
+        );
+        let mut noncanonical = wire;
+        noncanonical[91] = 1;
+        assert_eq!(
+            ChildDescriptorV1::decode_wire(&noncanonical),
+            Err(ChildDescriptorDecodeError::InvalidEncoding)
+        );
+    }
+
+    #[test]
+    fn handoff_release_atomically_releases_source_and_arms_child() {
+        let mut engine = Engine::new(
+            tool_dma_catalog(),
+            CoreLimits::bounded_default(),
+            freshness(),
+        );
+        let parent = EffectId::new(RootId::new(88).unwrap(), 2).unwrap();
+        let actor = PrincipalIncarnation::new(crate::PrincipalId::new(8).unwrap(), 1).unwrap();
+        transact(
+            &mut engine,
+            CommandRequest::CreateCompositeEffect {
+                effect: parent,
+                origin: actor,
+                binding_generation: 1,
+                kind: TOOL_HANDOFF_SOURCE_COMPOSITE,
+                charge_account: ChargeAccountId::new(1).unwrap(),
+            },
+        );
+        transact(
+            &mut engine,
+            CommandRequest::AddComponentClaim {
+                effect: parent,
+                component: crate::TOOL_HANDOFF_SOURCE_COMPONENT,
+                actor,
+                binding_generation: 1,
+                claim: ClaimId::new(39).unwrap(),
+                kind: TOOL_CLAIM_OUTCOME_SLOT,
+                scope: ClaimScope::Logical,
+                resource: ResourceId::new(399).unwrap(),
+                resource_generation: ResourceGeneration::new(1).unwrap(),
+                units: 1,
+            },
+        );
+        transact(
+            &mut engine,
+            CommandRequest::PrepareCompositeEffect {
+                effect: parent,
+                actor,
+                binding_generation: 1,
+            },
+        );
+        let receipt = transact(
+            &mut engine,
+            CommandRequest::RecordComponentCommitIntent {
+                effect: parent,
+                component: crate::TOOL_HANDOFF_SOURCE_COMPONENT,
+                actor,
+                binding_generation: 1,
+                operation: Digest::new([10; 32]),
+            },
+        );
+        let TransitionOutput::CommitIntent(intent) = receipt.output else {
+            panic!("commit intent");
+        };
+        let descriptor = ChildDescriptorV1 {
+            schema: 1,
+            sequence: 1,
+            parent,
+            parent_component: crate::TOOL_HANDOFF_SOURCE_COMPONENT,
+            route_digest: Digest::new([11; 32]),
+            child_kind: TOOL_HANDOFF_CHILD_COMPOSITE,
+            child_component: TOOL_HANDOFF_COMPONENT,
+            claim: ClaimId::new(40).unwrap(),
+            claim_kind: TOOL_CLAIM_OUTCOME_SLOT,
+            scope: ClaimScope::Logical,
+            resource: ResourceId::new(400).unwrap(),
+            resource_generation: ResourceGeneration::new(1).unwrap(),
+            units: 1,
+            input_digest: Digest::new([12; 32]),
+            catalog_digest: engine.catalog.digest(),
+        };
+        let fact = VerifiedEffectFact {
+            kind: EffectFactKind::CommitOutcome,
+            effect: parent,
+            component: Some(crate::TOOL_HANDOFF_SOURCE_COMPONENT),
+            actor,
+            generation: 1,
+            nonce: intent.nonce,
+            operation: Digest::new([10; 32]),
+            predecessor: None,
+            freshness: engine.state.freshness,
+            stamp: VerifierStamp {
+                identity: VerifierIdentity {
+                    verifier: TOOL_VERIFIER,
+                    epoch: 1,
+                    receipt_schema: TOOL_COMMIT_RECEIPT_SCHEMA,
+                },
+                receipt_digest: Digest::new([13; 32]),
+            },
+            outcome: Some(ExternalOutcome::Success),
+        };
+        transact(
+            &mut engine,
+            Command(CommandKind::AcknowledgeHandoffParent {
+                fact,
+                descriptor,
+                descriptor_receipt_digest: Digest::new([16; 32]),
+            }),
+        );
+        transact(
+            &mut engine,
+            Command(CommandKind::InstallHandoffChild {
+                descriptor,
+                origin: actor,
+                binding_generation: 1,
+                charge_account: ChargeAccountId::new(1).unwrap(),
+            }),
+        );
+        let receipt = transact(
+            &mut engine,
+            Command(CommandKind::ReleaseHandoffSourceAndRecordTargetIntent {
+                descriptor,
+                actor,
+                binding_generation: 1,
+                operation: Digest::new([14; 32]),
+            }),
+        );
+        let TransitionOutput::CommitIntent(child_intent) = receipt.output else {
+            panic!("child intent");
+        };
+        assert_eq!(child_intent.effect(), descriptor.child_effect().unwrap());
+        assert_eq!(child_intent.component(), Some(TOOL_HANDOFF_COMPONENT));
+        assert_eq!(
+            engine.composite_effect(parent).unwrap().custodian,
+            CustodyState::Released
+        );
+        assert_eq!(
+            engine
+                .component(descriptor.child_effect().unwrap(), TOOL_HANDOFF_COMPONENT)
+                .unwrap()
+                .commit,
+            CommitState::CommitIntentDurable
+        );
+    }
+
+    #[test]
+    fn handoff_ack_install_and_release_each_survive_checkpoint_recovery() {
+        let (mut engine, parent, actor, descriptor) = setup();
+        let recovered_ack = recover_at_checkpoint(&mut engine);
+        assert!(matches!(
+            recovered_ack.composite_effect(parent).unwrap().handoff,
+            SingleHopHandoffProjection::Source { child_installed: false, descriptor: ref saved, .. }
+                if **saved == descriptor
+        ));
+
+        transact(
+            &mut engine,
+            Command(CommandKind::InstallHandoffChild {
+                descriptor,
+                origin: actor,
+                binding_generation: 1,
+                charge_account: ChargeAccountId::new(1).unwrap(),
+            }),
+        );
+        let child = descriptor.child_effect().unwrap();
+        let recovered_install = recover_at_checkpoint(&mut engine);
+        assert!(matches!(
+            recovered_install.composite_effect(parent).unwrap().handoff,
+            SingleHopHandoffProjection::Source {
+                child_installed: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            recovered_install.composite_effect(child).unwrap().handoff,
+            SingleHopHandoffProjection::Target { parent: saved, .. } if saved == parent
+        ));
+
+        transact(
+            &mut engine,
+            Command(CommandKind::ReleaseHandoffSourceAndRecordTargetIntent {
+                descriptor,
+                actor,
+                binding_generation: 1,
+                operation: Digest::new([0x88; 32]),
+            }),
+        );
+        let recovered_release = recover_at_checkpoint(&mut engine);
+        assert_eq!(
+            recovered_release
+                .composite_effect(parent)
+                .unwrap()
+                .custodian,
+            CustodyState::Released
+        );
+        assert_eq!(
+            recovered_release
+                .component(child, TOOL_HANDOFF_COMPONENT)
+                .unwrap()
+                .commit,
+            CommitState::CommitIntentDurable
+        );
     }
 }
 
@@ -13252,6 +14920,7 @@ mod projection_v6_tests {
                 charge_owner: ChargeAccountId::new(31).unwrap(),
                 authority: AuthorityState::Active,
                 authority_epoch: 1,
+                handoff: SingleHopRole::None,
                 components,
             },
         );
@@ -13284,8 +14953,8 @@ mod projection_v6_tests {
         assert_eq!(
             golden.bytes(),
             [
-                134, 219, 36, 242, 222, 33, 63, 35, 76, 188, 129, 105, 210, 69, 192, 57, 152, 249,
-                187, 31, 109, 155, 154, 253, 164, 12, 243, 213, 192, 124, 172, 137,
+                147, 17, 219, 145, 179, 177, 86, 218, 40, 167, 207, 136, 250, 86, 117, 206, 169,
+                162, 167, 31, 243, 157, 244, 100, 159, 253, 152, 125, 38, 101, 228, 225,
             ]
         );
 

@@ -25,18 +25,18 @@ extern crate std;
 /// migration. Standard catalog grammar and validation evolve under the
 /// separate [`STANDARD_CATALOG_VERSION`] coordinate and exact catalog digest;
 /// recovery never reinterprets a journal bound to an older catalog digest.
-pub const CSER_CORE_API_PROFILE_VERSION: u16 = 2;
+pub const CSER_CORE_API_PROFILE_VERSION: u16 = 3;
 
-/// Frozen standard catalog format used by semantic API profile 2.
-pub const STANDARD_CATALOG_VERSION: u16 = 6;
+/// Frozen standard catalog format used by semantic API profile 3.
+pub const STANDARD_CATALOG_VERSION: u16 = 7;
 
-/// Frozen deterministic projection format used by semantic API profile 2.
-pub const PROJECTION_VERSION: u16 = 6;
+/// Frozen deterministic projection format used by semantic API profile 3.
+pub const PROJECTION_VERSION: u16 = 7;
 
-/// Frozen recovery snapshot format used by semantic API profile 2.
-pub const RECOVERY_SNAPSHOT_VERSION: u16 = 2;
+/// Frozen recovery snapshot format used by semantic API profile 3.
+pub const RECOVERY_SNAPSHOT_VERSION: u16 = 3;
 
-/// Frozen normalized transition trace format used by semantic API profile 2.
+/// Frozen normalized transition trace format used by semantic API profile 3.
 pub const NORMALIZED_TRACE_VERSION: u16 = 2;
 
 mod domain;
@@ -54,11 +54,13 @@ pub use domain::{
     CompositeRule, ConflictMode, CreditRule, DeviceGenerationEffect, DomainCatalog,
     DomainCatalogBuilder, DomainCatalogError, EvidenceCapability, EvidenceRecovery, EvidenceRule,
     EvidenceSubjectBinding, FreshnessAxes, ObligationPolicy, ObligationReceipts, ObligationRule,
-    ObligationSpec, ReceiptBinding,
+    ObligationSpec, ReceiptBinding, SingleHopHandoffRule,
 };
+pub use engine::CHILD_DESCRIPTOR_V1_WIRE_LEN;
 pub use engine::{
-    AuthorityState, ChargeProjection, ClaimCustodian, ClaimProjection, ClaimScope, ClaimUseError,
-    Command, CommandDecodeError, CommandRequest, CommitIntent, CommitState, CommitUseError,
+    AuthorityState, ChargeProjection, ChildDescriptorDecodeError, ChildDescriptorV1,
+    ChildDescriptorVerifier, ClaimCustodian, ClaimProjection, ClaimScope, ClaimUseError, Command,
+    CommandDecodeError, CommandRequest, CommitIntent, CommitState, CommitUseError,
     ComponentClaimProjection, ComponentClaimRecoveryItem, ComponentCommitOperation,
     ComponentProjection, ComponentRecoveryItem, CompositeEffectProjection, CompositeRecoveryItem,
     CoreError, CoreLimits, CustodyState, EffectEscapeState, EffectFactChallenge, EffectFactKind,
@@ -66,10 +68,10 @@ pub use engine::{
     JournalFailure, OutcomeState, PressureProjection, ReceiptVerifier, RecoveryAnchor,
     RecoveryAnchorError, RecoveryEvidenceItem, RecoveryItem, RecoveryReport, RecoverySnapshot,
     RetirementState, ReusePermit, RootRecoveryState, SettlementClaim, SettlementState,
-    TransitionCoordinates, TransitionEvent, TransitionOutput, TransitionReceipt, TransitionResult,
-    TxError, VerificationError, VerifiedApplyReceipt, VerifiedCommitOutcome,
-    VerifiedEffectObservation, VerifiedObservation, VerifiedRetirementEvidence,
-    VerifiedSettlementAck, VerifierIdentity, VerifierStamp,
+    SingleHopHandoffProjection, TransitionCoordinates, TransitionEvent, TransitionOutput,
+    TransitionReceipt, TransitionResult, TxError, VerificationError, VerifiedApplyReceipt,
+    VerifiedChildDescriptor, VerifiedCommitOutcome, VerifiedEffectObservation, VerifiedObservation,
+    VerifiedRetirementEvidence, VerifiedSettlementAck, VerifierIdentity, VerifierStamp,
 };
 pub use identity::{
     BootGeneration, ChargeAccountId, ClaimId, ClaimKindId, ComponentId, CompositeKindId,
@@ -85,9 +87,9 @@ pub use journal::{
     MAX_JOURNAL_CHECKPOINT_IMAGE_BYTES, scan_journal, scan_journal_to_head,
 };
 pub use persistence::{
-    CoordinatedPersistence, CoordinatedPersistenceError, DurableJournalBackend,
-    PersistenceProtocolError, RecoveryBinding, RecoveryLease, TransitionDurability,
-    TrustedAnchorBackend, TrustedAnchorSnapshot,
+    CompactingJournalBackend, CoordinatedPersistence, CoordinatedPersistenceError,
+    DurableJournalBackend, PersistenceProtocolError, RecoveryBinding, RecoveryLease,
+    TransitionDurability, TrustedAnchorBackend, TrustedAnchorSnapshot,
 };
 pub use profiles::{
     AGENT_COMPONENT_DMA, AGENT_COMPONENT_REPLY, AGENT_OPERATION_COMPOSITE, CREDIT_IOVA,
@@ -101,6 +103,7 @@ pub use profiles::{
     REPLY_SETTLEMENT_RECEIPT_SCHEMA, REPLY_VERIFIER, TOOL_APPLY_RECEIPT_SCHEMA,
     TOOL_CLAIM_OUTCOME_SLOT, TOOL_COMMIT_RECEIPT_SCHEMA, TOOL_DMA_COMPONENT_DMA,
     TOOL_DMA_COMPONENT_TOOL, TOOL_DMA_OPERATION_COMPOSITE, TOOL_DOMAIN, TOOL_EVIDENCE_OUTCOME_ACK,
-    TOOL_OBLIGATION_INVOCATION, TOOL_RECEIPT_SCHEMA, TOOL_SETTLEMENT_RECEIPT_SCHEMA, TOOL_VERIFIER,
-    standard_catalog, tool_dma_catalog,
+    TOOL_HANDOFF_CHILD_COMPOSITE, TOOL_HANDOFF_COMPONENT, TOOL_HANDOFF_SOURCE_COMPONENT,
+    TOOL_HANDOFF_SOURCE_COMPOSITE, TOOL_OBLIGATION_INVOCATION, TOOL_RECEIPT_SCHEMA,
+    TOOL_SETTLEMENT_RECEIPT_SCHEMA, TOOL_VERIFIER, standard_catalog, tool_dma_catalog,
 };

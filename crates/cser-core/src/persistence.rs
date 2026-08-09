@@ -179,6 +179,10 @@ pub enum PersistenceProtocolError {
     StaleJournalHead,
     /// Resulting freshness is stale or was not reserved for this recovery.
     StaleFreshness,
+    /// No whole-state checkpoint is currently eligible to replace the replay image.
+    NoCommittedCheckpoint,
+    /// The committed checkpoint exceeds this backend's replacement capacity.
+    CheckpointTooLarge,
     /// This coordinator observed an ambiguous failure and must be reopened.
     RecoveryRequired,
     /// The core rejected construction of the corresponding recovery anchor.
@@ -196,6 +200,24 @@ pub trait DurableJournalBackend {
     /// durable. The caller will not issue another append until anchored
     /// recovery and suffix repair complete.
     fn append_and_sync(&mut self, record: &JournalRecord) -> Result<(), Self::Error>;
+}
+
+/// Durable journal backend that can atomically replace its replay image with
+/// one already-committed whole-state checkpoint record.
+///
+/// This capability is intentionally separate from [`DurableJournalBackend`].
+/// A legacy append-only implementation must not claim that a normal record is
+/// sufficient authority to discard its prefix.
+pub trait CompactingJournalBackend: DurableJournalBackend {
+    /// Returns the largest exact checkpoint image this backend can replace.
+    fn checkpoint_capacity_bytes(&self) -> usize;
+
+    /// Replaces the durable replay image with `checkpoint.bytes()` exactly.
+    ///
+    /// The caller has already made this record authoritative through the
+    /// trusted anchor. An error is ambiguous: the replacement may have become
+    /// durable before its acknowledgement was lost.
+    fn replace_with_checkpoint(&mut self, checkpoint: &JournalRecord) -> Result<(), Self::Error>;
 }
 
 /// Atomic trusted-anchor backend supplied by the platform.
@@ -262,6 +284,7 @@ pub struct CoordinatedPersistence<J, A> {
     anchor: A,
     committed: TrustedAnchorSnapshot,
     reserved_recovery: Option<Freshness>,
+    committed_checkpoint: Option<JournalRecord>,
     recovery_required: bool,
 }
 
@@ -276,6 +299,7 @@ impl<J, A> CoordinatedPersistence<J, A> {
             anchor,
             committed: lease.committed(),
             reserved_recovery: Some(lease.next_freshness()),
+            committed_checkpoint: None,
             recovery_required: false,
         }
     }
@@ -295,9 +319,75 @@ impl<J, A> CoordinatedPersistence<J, A> {
         &self.journal
     }
 
+    /// Returns shared access to the trusted-anchor backend for diagnostics.
+    ///
+    /// This does not expose either mutable epoch reservation or tip
+    /// advancement; those remain ordered through this coordinator.
+    pub const fn anchor(&self) -> &A {
+        &self.anchor
+    }
+
+    /// Runs one bounded, caller-supplied observation while the coordinator is
+    /// already exclusively borrowed.  Kernel embeddings use this only for
+    /// diagnostics around a compaction boundary; it is not an authority to
+    /// publish a transition outside [`TransitionDurability`].
+    pub fn inspect_journal<R>(&mut self, inspect: impl FnOnce(&mut J) -> R) -> R {
+        inspect(&mut self.journal)
+    }
+
     /// Consumes the coordinator into its backends.
     pub fn into_backends(self) -> (J, A) {
         (self.journal, self.anchor)
+    }
+}
+
+impl<J, A> CoordinatedPersistence<J, A>
+where
+    J: CompactingJournalBackend,
+    A: TrustedAnchorBackend,
+{
+    /// Replaces the durable replay image with the most recently anchored
+    /// whole-state checkpoint, without advancing the trusted anchor.
+    ///
+    /// Only [`Self::persist_transition`] can populate the cached record, and
+    /// it does so after the anchor acknowledges the checkpoint. Any later
+    /// ordinary transition clears the cache, so this can never compact a
+    /// suffix that is no longer the trusted tip.
+    pub fn replace_last_committed_checkpoint(
+        &mut self,
+    ) -> Result<(), CoordinatedPersistenceError<J::Error, A::Error>> {
+        if self.recovery_required {
+            return Err(CoordinatedPersistenceError::Protocol(
+                PersistenceProtocolError::RecoveryRequired,
+            ));
+        }
+        let checkpoint =
+            self.committed_checkpoint
+                .as_ref()
+                .ok_or(CoordinatedPersistenceError::Protocol(
+                    PersistenceProtocolError::NoCommittedCheckpoint,
+                ))?;
+        if checkpoint.bytes().len() > self.journal.checkpoint_capacity_bytes() {
+            return Err(CoordinatedPersistenceError::Protocol(
+                PersistenceProtocolError::CheckpointTooLarge,
+            ));
+        }
+        if checkpoint.revision() != self.committed.revision()
+            || checkpoint.digest() != self.committed.head()
+            || !checkpoint.is_whole_state_checkpoint()
+        {
+            return Err(CoordinatedPersistenceError::Protocol(
+                PersistenceProtocolError::StaleJournalHead,
+            ));
+        }
+
+        self.recovery_required = true;
+        self.journal
+            .replace_with_checkpoint(checkpoint)
+            .map_err(CoordinatedPersistenceError::Journal)?;
+        self.committed_checkpoint = None;
+        self.recovery_required = false;
+        Ok(())
     }
 }
 
@@ -355,10 +445,241 @@ where
             .compare_and_advance(self.committed, replacement)
             .map_err(CoordinatedPersistenceError::Anchor)?;
         self.committed = replacement;
+        self.committed_checkpoint = record.is_whole_state_checkpoint().then(|| record.clone());
         if self.reserved_recovery == Some(resulting_freshness) {
             self.reserved_recovery = None;
         }
         self.recovery_required = false;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::vec::Vec;
+
+    use crate::{
+        BootGeneration, CoreLimits, DeviceGeneration, Engine, JournalGeneration, RegistryInstance,
+        standard_catalog,
+    };
+
+    use super::*;
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum TestError {
+        Replace,
+        Anchor,
+    }
+
+    #[derive(Debug)]
+    struct TestJournal {
+        records: Vec<JournalRecord>,
+        replacements: usize,
+        fail_replacement: bool,
+        checkpoint_capacity: usize,
+    }
+
+    impl DurableJournalBackend for TestJournal {
+        type Error = TestError;
+
+        fn append_and_sync(&mut self, record: &JournalRecord) -> Result<(), Self::Error> {
+            self.records.push(record.clone());
+            Ok(())
+        }
+    }
+
+    impl CompactingJournalBackend for TestJournal {
+        fn checkpoint_capacity_bytes(&self) -> usize {
+            self.checkpoint_capacity
+        }
+
+        fn replace_with_checkpoint(
+            &mut self,
+            checkpoint: &JournalRecord,
+        ) -> Result<(), Self::Error> {
+            self.replacements += 1;
+            if self.fail_replacement {
+                return Err(TestError::Replace);
+            }
+            self.records.clear();
+            self.records.push(checkpoint.clone());
+            Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestAnchor {
+        committed: TrustedAnchorSnapshot,
+    }
+
+    impl TrustedAnchorBackend for TestAnchor {
+        type Error = TestError;
+
+        fn reserve_recovery_epoch(
+            &mut self,
+            _binding: RecoveryBinding,
+            _observed_device: crate::DeviceGeneration,
+        ) -> Result<RecoveryLease, Self::Error> {
+            Err(TestError::Anchor)
+        }
+
+        fn compare_and_advance(
+            &mut self,
+            expected: TrustedAnchorSnapshot,
+            replacement: TrustedAnchorSnapshot,
+        ) -> Result<(), Self::Error> {
+            if expected != self.committed {
+                return Err(TestError::Anchor);
+            }
+            self.committed = replacement;
+            Ok(())
+        }
+    }
+
+    fn freshness(boot: u64) -> Freshness {
+        Freshness::new(
+            BootGeneration::new(boot).unwrap(),
+            RegistryInstance::new(1).unwrap(),
+            1,
+            DeviceGeneration::new(1).unwrap(),
+            JournalGeneration::new(boot).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn coordinator(
+        fail_replacement: bool,
+    ) -> (Engine, CoordinatedPersistence<TestJournal, TestAnchor>) {
+        let catalog = standard_catalog();
+        let binding =
+            RecoveryBinding::new(catalog.digest(), RegistryInstance::new(1).unwrap(), 1).unwrap();
+        let committed =
+            TrustedAnchorSnapshot::from_trusted_backend(binding, freshness(1), 0, Digest::ZERO)
+                .unwrap();
+        let lease = RecoveryLease::from_trusted_backend(committed, freshness(2)).unwrap();
+        let persistence = CoordinatedPersistence::from_recovery_lease(
+            TestJournal {
+                records: Vec::new(),
+                replacements: 0,
+                fail_replacement,
+                checkpoint_capacity: usize::MAX,
+            },
+            TestAnchor { committed },
+            &lease,
+        );
+        (
+            Engine::new(catalog, CoreLimits::bounded_default(), freshness(1)),
+            persistence,
+        )
+    }
+
+    #[test]
+    fn anchored_checkpoint_replaces_only_after_journal_and_anchor_commit() {
+        let (mut engine, mut persistence) = coordinator(false);
+        let receipt = engine.compact_checkpoint_durable(&mut persistence).unwrap();
+        assert_eq!(persistence.journal.records.len(), 1);
+        assert_eq!(persistence.committed.revision(), receipt.revision());
+        assert_eq!(persistence.committed.head(), receipt.head());
+
+        persistence.replace_last_committed_checkpoint().unwrap();
+        assert_eq!(persistence.journal.replacements, 1);
+        assert_eq!(persistence.journal.records.len(), 1);
+        assert_eq!(persistence.journal.records[0].digest(), receipt.head());
+        assert!(!persistence.recovery_required());
+    }
+
+    #[test]
+    fn ordinary_or_missing_checkpoint_cannot_replace_the_replay_image() {
+        let (_engine, mut persistence) = coordinator(false);
+        assert_eq!(
+            persistence.replace_last_committed_checkpoint(),
+            Err(CoordinatedPersistenceError::Protocol(
+                PersistenceProtocolError::NoCommittedCheckpoint
+            ))
+        );
+        assert_eq!(persistence.journal.replacements, 0);
+        assert!(!persistence.recovery_required());
+    }
+
+    #[test]
+    fn stale_cached_checkpoint_is_rejected_before_replacement_mutates_storage() {
+        let (mut engine, mut persistence) = coordinator(false);
+        engine.compact_checkpoint_durable(&mut persistence).unwrap();
+        persistence.committed = TrustedAnchorSnapshot::from_trusted_backend(
+            persistence.committed.binding(),
+            persistence.committed.committed_freshness(),
+            persistence.committed.revision() + 1,
+            Digest::new([7; 32]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            persistence.replace_last_committed_checkpoint(),
+            Err(CoordinatedPersistenceError::Protocol(
+                PersistenceProtocolError::StaleJournalHead
+            ))
+        );
+        assert_eq!(persistence.journal.replacements, 0);
+        assert!(!persistence.recovery_required());
+    }
+
+    #[test]
+    fn oversized_checkpoint_is_rejected_before_replacement_mutates_storage() {
+        let (mut engine, mut persistence) = coordinator(false);
+        engine.compact_checkpoint_durable(&mut persistence).unwrap();
+        persistence.journal.checkpoint_capacity = 0;
+
+        assert_eq!(
+            persistence.replace_last_committed_checkpoint(),
+            Err(CoordinatedPersistenceError::Protocol(
+                PersistenceProtocolError::CheckpointTooLarge
+            ))
+        );
+        assert_eq!(persistence.journal.replacements, 0);
+        assert!(!persistence.recovery_required());
+    }
+
+    #[test]
+    fn replacement_failure_latches_recovery_required() {
+        let (mut engine, mut persistence) = coordinator(true);
+        let receipt = engine.compact_checkpoint_durable(&mut persistence).unwrap();
+        assert_eq!(
+            persistence.replace_last_committed_checkpoint(),
+            Err(CoordinatedPersistenceError::Journal(TestError::Replace))
+        );
+        assert!(persistence.recovery_required());
+        assert_eq!(persistence.journal.replacements, 1);
+        assert_eq!(
+            persistence.replace_last_committed_checkpoint(),
+            Err(CoordinatedPersistenceError::Protocol(
+                PersistenceProtocolError::RecoveryRequired
+            ))
+        );
+        assert_eq!(persistence.journal.replacements, 1);
+
+        // The failed acknowledgement is ambiguous, but this fixture leaves
+        // the anchored checkpoint append intact. A fresh coordinator must be
+        // able to reopen that trusted prefix rather than continue in-place.
+        let (journal, anchor) = persistence.into_backends();
+        let mut bytes = Vec::new();
+        for record in journal.records {
+            bytes.extend_from_slice(record.bytes());
+        }
+        let recovered = Engine::recover(
+            standard_catalog(),
+            CoreLimits::bounded_default(),
+            RecoveryAnchor::from_trusted_provider(
+                anchor.committed.binding().catalog_digest(),
+                anchor.committed.committed_freshness(),
+                freshness(2),
+                anchor.committed.revision(),
+                anchor.committed.head(),
+            )
+            .unwrap(),
+            &bytes,
+        )
+        .expect("anchored checkpoint reopens after replacement failure");
+        assert_eq!(recovered.acknowledged_revision(), receipt.revision());
+        assert_eq!(recovered.acknowledged_head(), receipt.head());
     }
 }

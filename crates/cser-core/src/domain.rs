@@ -400,6 +400,34 @@ impl CompositeRule {
     }
 }
 
+/// One explicitly catalog-authorized, single-hop composite custody transfer.
+///
+/// This is deliberately a relation between sealed composite products rather
+/// than an adapter callback.  A source can have only one target, so replay
+/// never has to select a successor topology.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SingleHopHandoffRule {
+    source: CompositeKindId,
+    target: CompositeKindId,
+}
+
+impl SingleHopHandoffRule {
+    /// Declares the only target kind allowed for `source`.
+    pub const fn new(source: CompositeKindId, target: CompositeKindId) -> Self {
+        Self { source, target }
+    }
+
+    /// Returns the source composite kind.
+    pub const fn source(self) -> CompositeKindId {
+        self.source
+    }
+
+    /// Returns the target composite kind.
+    pub const fn target(self) -> CompositeKindId {
+        self.target
+    }
+}
+
 /// Freshness coordinates an evidence class must match.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FreshnessAxes(u8);
@@ -815,6 +843,14 @@ pub enum DomainCatalogError {
     InvalidComposite,
     /// A composite component names an unknown obligation.
     UnknownCompositeObligation,
+    /// A single-hop handoff repeats a source relation.
+    DuplicateSingleHopHandoff,
+    /// A single-hop handoff loops to its own composite kind.
+    SelfSingleHopHandoff,
+    /// A single-hop handoff names a composite absent from this catalog.
+    UnknownSingleHopHandoffComposite,
+    /// A single-hop handoff endpoint is not a one-component product.
+    NonSingletonSingleHopHandoff,
 }
 
 /// Builder for a sealed, digest-bound domain catalog.
@@ -824,6 +860,7 @@ pub struct DomainCatalogBuilder {
     obligations: BTreeMap<(DomainId, ObligationKindId), ObligationRule>,
     claims: BTreeMap<(DomainId, ClaimKindId), ClaimRule>,
     composites: BTreeMap<CompositeKindId, CompositeRule>,
+    handoffs: BTreeMap<CompositeKindId, SingleHopHandoffRule>,
 }
 
 impl DomainCatalogBuilder {
@@ -834,6 +871,7 @@ impl DomainCatalogBuilder {
             obligations: BTreeMap::new(),
             claims: BTreeMap::new(),
             composites: BTreeMap::new(),
+            handoffs: BTreeMap::new(),
         }
     }
 
@@ -1102,6 +1140,23 @@ impl DomainCatalogBuilder {
         Ok(self)
     }
 
+    /// Registers one exact, catalog-defined single-hop handoff relation.
+    pub fn single_hop_handoff(
+        mut self,
+        source: CompositeKindId,
+        target: CompositeKindId,
+    ) -> Result<Self, DomainCatalogError> {
+        if source == target {
+            return Err(DomainCatalogError::SelfSingleHopHandoff);
+        }
+        if self.handoffs.contains_key(&source) {
+            return Err(DomainCatalogError::DuplicateSingleHopHandoff);
+        }
+        self.handoffs
+            .insert(source, SingleHopHandoffRule::new(source, target));
+        Ok(self)
+    }
+
     /// Seals the catalog and computes its deterministic schema digest.
     pub fn build(self) -> Result<DomainCatalog, DomainCatalogError> {
         for ((domain, _), obligation) in &self.obligations {
@@ -1142,17 +1197,30 @@ impl DomainCatalogBuilder {
         }) {
             return Err(DomainCatalogError::UnknownCompositeObligation);
         }
+        for handoff in self.handoffs.values() {
+            let Some(source) = self.composites.get(&handoff.source()) else {
+                return Err(DomainCatalogError::UnknownSingleHopHandoffComposite);
+            };
+            let Some(target) = self.composites.get(&handoff.target()) else {
+                return Err(DomainCatalogError::UnknownSingleHopHandoffComposite);
+            };
+            if source.components().len() != 1 || target.components().len() != 1 {
+                return Err(DomainCatalogError::NonSingletonSingleHopHandoff);
+            }
+        }
         let digest = catalog_digest(
             &self.credits,
             &self.obligations,
             &self.claims,
             &self.composites,
+            &self.handoffs,
         );
         Ok(DomainCatalog {
             credits: self.credits,
             obligations: self.obligations,
             claims: self.claims,
             composites: self.composites,
+            handoffs: self.handoffs,
             digest,
         })
     }
@@ -1165,6 +1233,7 @@ pub struct DomainCatalog {
     obligations: BTreeMap<(DomainId, ObligationKindId), ObligationRule>,
     claims: BTreeMap<(DomainId, ClaimKindId), ClaimRule>,
     composites: BTreeMap<CompositeKindId, CompositeRule>,
+    handoffs: BTreeMap<CompositeKindId, SingleHopHandoffRule>,
     digest: Digest,
 }
 
@@ -1191,6 +1260,11 @@ impl DomainCatalog {
     /// Returns one exact composite effect schema.
     pub fn composite_rule(&self, kind: CompositeKindId) -> Option<&CompositeRule> {
         self.composites.get(&kind)
+    }
+
+    /// Returns the exact target relation authorized for a source composite.
+    pub fn single_hop_handoff_rule(&self, source: CompositeKindId) -> Option<SingleHopHandoffRule> {
+        self.handoffs.get(&source).copied()
     }
 
     /// Returns one conserved-credit rule.
@@ -1223,6 +1297,7 @@ fn catalog_digest(
     obligations: &BTreeMap<(DomainId, ObligationKindId), ObligationRule>,
     claims: &BTreeMap<(DomainId, ClaimKindId), ClaimRule>,
     composites: &BTreeMap<CompositeKindId, CompositeRule>,
+    handoffs: &BTreeMap<CompositeKindId, SingleHopHandoffRule>,
 ) -> Digest {
     let mut hasher = Sha256::new();
     hasher.update(b"nexus.cser.domain-catalog.v6");
@@ -1285,6 +1360,11 @@ fn catalog_digest(
             hasher.update(component.obligation().get().to_le_bytes());
         }
     }
+    hasher.update([0xfc]);
+    for rule in handoffs.values() {
+        hasher.update(rule.source().get().to_le_bytes());
+        hasher.update(rule.target().get().to_le_bytes());
+    }
     Digest::new(hasher.finalize().into())
 }
 
@@ -1293,5 +1373,67 @@ fn hash_receipt_binding(hasher: &mut Sha256, binding: Option<ReceiptBinding>) {
     if let Some(binding) = binding {
         hasher.update(binding.verifier().get().to_le_bytes());
         hasher.update(binding.receipt_schema().get().to_le_bytes());
+    }
+}
+
+#[cfg(test)]
+mod handoff_rule_tests {
+    use super::*;
+
+    fn composite(value: u32) -> CompositeKindId {
+        CompositeKindId::new(value).unwrap()
+    }
+
+    #[test]
+    fn single_hop_rules_reject_self_duplicate_unknown_and_non_singleton_endpoints() {
+        assert_eq!(
+            DomainCatalogBuilder::new()
+                .single_hop_handoff(composite(1), composite(1))
+                .unwrap_err(),
+            DomainCatalogError::SelfSingleHopHandoff
+        );
+        assert_eq!(
+            DomainCatalogBuilder::new()
+                .single_hop_handoff(composite(1), composite(2))
+                .unwrap()
+                .single_hop_handoff(composite(1), composite(3))
+                .unwrap_err(),
+            DomainCatalogError::DuplicateSingleHopHandoff
+        );
+        assert_eq!(
+            DomainCatalogBuilder::new()
+                .single_hop_handoff(composite(1), composite(2))
+                .unwrap()
+                .build()
+                .unwrap_err(),
+            DomainCatalogError::UnknownSingleHopHandoffComposite
+        );
+
+        // Construction normally rejects an empty composite at insertion time.
+        // Exercise the sealed-catalog guard too, so a future bulk loader cannot
+        // create a handoff endpoint with a non-singleton topology.
+        let mut builder = DomainCatalogBuilder::new();
+        builder.composites.insert(
+            composite(1),
+            CompositeRule {
+                kind: composite(1),
+                components: Vec::new(),
+            },
+        );
+        builder.composites.insert(
+            composite(2),
+            CompositeRule {
+                kind: composite(2),
+                components: Vec::new(),
+            },
+        );
+        builder.handoffs.insert(
+            composite(1),
+            SingleHopHandoffRule::new(composite(1), composite(2)),
+        );
+        assert_eq!(
+            builder.build().unwrap_err(),
+            DomainCatalogError::NonSingletonSingleHopHandoff
+        );
     }
 }

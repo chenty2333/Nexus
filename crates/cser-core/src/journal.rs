@@ -11,10 +11,10 @@ use crate::{
 };
 
 /// Magic prefix of every CSER journal record.
-pub const JOURNAL_MAGIC: [u8; 8] = *b"CSERJR6\0";
-/// Frozen journal schema for CSER core semantic API profile 2.
-pub const JOURNAL_SCHEMA_VERSION: u16 = 6;
-/// Semantic core API profile explicitly bound in every schema-6 envelope.
+pub const JOURNAL_MAGIC: [u8; 8] = *b"CSERJR7\0";
+/// Frozen journal schema for CSER core semantic API profile 3.
+pub const JOURNAL_SCHEMA_VERSION: u16 = 7;
+/// Semantic core API profile explicitly bound in every schema-7 envelope.
 pub const JOURNAL_CORE_API_PROFILE: u16 = CSER_CORE_API_PROFILE_VERSION;
 
 /// Magic prefix of a portable exact-replay checkpoint envelope.
@@ -505,6 +505,12 @@ impl JournalRecord {
 
     pub(crate) const fn command(&self) -> &CommandKind {
         &self.command
+    }
+
+    /// Returns whether this record is the internal whole-state checkpoint
+    /// representation eligible for physical journal replacement.
+    pub(crate) const fn is_whole_state_checkpoint(&self) -> bool {
+        matches!(self.command, CommandKind::WholeStateCheckpointV1 { .. })
     }
 
     /// Returns this record's digest.

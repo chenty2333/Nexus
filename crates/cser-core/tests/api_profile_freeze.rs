@@ -16,14 +16,14 @@ use cser_core::{
 };
 
 #[test]
-fn semantic_api_profile_two_freezes_journal_and_domain_catalog() {
-    assert_eq!(CSER_CORE_API_PROFILE_VERSION, 2);
-    assert_eq!(JOURNAL_MAGIC, *b"CSERJR6\0");
-    assert_eq!(JOURNAL_SCHEMA_VERSION, 6);
-    assert_eq!(JOURNAL_CORE_API_PROFILE, 2);
-    assert_eq!(STANDARD_CATALOG_VERSION, 6);
-    assert_eq!(PROJECTION_VERSION, 6);
-    assert_eq!(RECOVERY_SNAPSHOT_VERSION, 2);
+fn semantic_api_profile_three_freezes_journal_and_domain_catalog() {
+    assert_eq!(CSER_CORE_API_PROFILE_VERSION, 3);
+    assert_eq!(JOURNAL_MAGIC, *b"CSERJR7\0");
+    assert_eq!(JOURNAL_SCHEMA_VERSION, 7);
+    assert_eq!(JOURNAL_CORE_API_PROFILE, 3);
+    assert_eq!(STANDARD_CATALOG_VERSION, 7);
+    assert_eq!(PROJECTION_VERSION, 7);
+    assert_eq!(RECOVERY_SNAPSHOT_VERSION, 3);
     assert_eq!(NORMALIZED_TRACE_VERSION, 2);
     let catalog = standard_catalog();
     let agent_operation = catalog
@@ -46,9 +46,9 @@ fn semantic_api_profile_two_freezes_journal_and_domain_catalog() {
     assert_eq!(
         catalog.digest().bytes(),
         [
-            0x79, 0xd9, 0xf1, 0xad, 0x61, 0x90, 0x5b, 0x76, 0xb1, 0xe4, 0xe6, 0x5c, 0x00, 0x77,
-            0x0d, 0xc2, 0x8d, 0xdb, 0x34, 0xbf, 0xc1, 0x94, 0xf3, 0x3c, 0x98, 0x62, 0x3f, 0x8b,
-            0x4c, 0x76, 0x5a, 0xf1,
+            0xc5, 0x10, 0x69, 0x59, 0x85, 0xb0, 0xde, 0x45, 0x92, 0x24, 0x2d, 0xcf, 0xca, 0x36,
+            0xfb, 0x52, 0xea, 0xfc, 0x0e, 0x0c, 0x53, 0xfb, 0xd2, 0x14, 0xe9, 0xdd, 0x46, 0x79,
+            0x94, 0x64, 0x42, 0x4b,
         ]
     );
 }
