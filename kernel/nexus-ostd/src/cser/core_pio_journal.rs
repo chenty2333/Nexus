@@ -2838,7 +2838,7 @@ mod tests {
         pio_journal_reopen_revalidates_corrupted_cached_bank();
         pio_journal_repair_updates_cache_only_after_readback();
         pio_vnext_appends_without_rewriting_the_prefix_and_reports_io();
-        pio_vnext_torn_record_uses_the_other_committed_header_copy();
+        pio_vnext_unpublished_replacement_keeps_the_manifest_selected_prefix();
         pio_vnext_torn_header_copy_keeps_the_other_committed_copy();
         pio_vnext_manifest_selects_the_committed_endpoint_and_rejects_a_tie();
         pio_vnext_interrupted_checkpoint_keeps_the_old_chain();
