@@ -5,9 +5,8 @@ use cser_core::{
     DEVICE_CLAIM_IOVA, DEVICE_CLAIM_PINNED_PAGE, DEVICE_CLAIM_QUEUE_SLOT, DEVICE_DOMAIN,
     DEVICE_OBLIGATION_DMA, EvidenceCapability, EvidenceRecovery, TOOL_CLAIM_OUTCOME_SLOT,
     TOOL_DMA_COMPONENT_DMA, TOOL_DMA_COMPONENT_TOOL, TOOL_DMA_OPERATION_COMPOSITE, TOOL_DOMAIN,
-    TOOL_HANDOFF_CHILD_COMPOSITE, TOOL_HANDOFF_COMPONENT, TOOL_HANDOFF_SOURCE_COMPOSITE,
-    TOOL_HANDOFF_SOURCE_COMPONENT, TOOL_OBLIGATION_INVOCATION,
-    standard_catalog, tool_dma_catalog,
+    TOOL_HANDOFF_CHILD_COMPOSITE, TOOL_HANDOFF_COMPONENT, TOOL_HANDOFF_SOURCE_COMPONENT,
+    TOOL_HANDOFF_SOURCE_COMPOSITE, TOOL_OBLIGATION_INVOCATION, standard_catalog, tool_dma_catalog,
 };
 
 /// The tool/DMA experiment is an independent catalog, so adding it cannot
@@ -68,7 +67,10 @@ fn tool_dma_catalog_binds_explicit_one_component_handoff_topology() {
         .composite_rule(TOOL_HANDOFF_SOURCE_COMPOSITE)
         .expect("the handoff source must be catalog-bound");
     assert_eq!(source.components().len(), 1);
-    assert_eq!(source.components()[0].component(), TOOL_HANDOFF_SOURCE_COMPONENT);
+    assert_eq!(
+        source.components()[0].component(),
+        TOOL_HANDOFF_SOURCE_COMPONENT
+    );
     assert_eq!(source.components()[0].domain(), TOOL_DOMAIN);
     assert_eq!(
         source.components()[0].obligation(),
