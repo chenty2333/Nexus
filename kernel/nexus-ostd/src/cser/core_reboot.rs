@@ -785,8 +785,9 @@ mod tests {
         let (engine, persistence, _devices) = active.into_parts();
         assert_eq!(engine.freshness().boot().get(), 3);
         assert_eq!(engine.freshness().journal().get(), 3);
-        assert_eq!(persistence.journal().repairs, 1);
-        assert_eq!(persistence.anchor().reservations, 2);
+        let (journal, anchor) = persistence.into_backends();
+        assert_eq!(journal.repairs, 1);
+        assert_eq!(anchor.reservations, 2);
     }
 
     #[ktest]

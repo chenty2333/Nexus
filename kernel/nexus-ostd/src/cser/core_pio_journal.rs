@@ -620,11 +620,39 @@ enum BankInspection {
     Valid(ActiveImage),
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct ActiveImage {
     bank: Option<u32>,
     generation: u64,
     bytes: Vec<u8>,
+}
+
+/// Default-off, operation-level accounting for the bounded journal.
+///
+/// Counters are updated at the provider boundary, so they describe the sector
+/// transfers, flushes, and payload hashes actually requested by this layer.
+/// They intentionally do not turn ATA completion into a byte-accurate device
+/// claim.  The x86 TSC values are diagnostic phase stamps only; they are not
+/// wall-clock measurements and remain zero on non-x86 targets.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct JournalIoTelemetry {
+    pub(crate) sectors_read: u64,
+    pub(crate) sectors_written: u64,
+    pub(crate) flushes: u64,
+    pub(crate) hash_bytes: u64,
+    pub(crate) phase_tsc: [u64; 6],
+}
+
+/// Publication phases indexed by [`JournalIoTelemetry::phase_tsc`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(usize)]
+pub(crate) enum JournalIoPhase {
+    PayloadWritten = 0,
+    PayloadFlushed = 1,
+    HeaderWritten = 2,
+    HeaderFlushed = 3,
+    ReadbackValidated = 4,
+    CacheUpdated = 5,
 }
 
 /// A self-contained durable record selected by the ATA double-bank protocol.
@@ -663,6 +691,14 @@ pub(crate) enum AtaDoubleBankError<E> {
 #[derive(Debug)]
 struct BankedJournal<B> {
     backend: B,
+    // The provider owns its dedicated fixture exclusively.  No other writer
+    // may mutate the two banks while this object is live; reopening validates
+    // both banks again before establishing a new cache.
+    active: ActiveImage,
+    // Disabled in production unless an owner explicitly opts in.  Keeping the
+    // field absent from the default path avoids changing the measurement
+    // envelope that the journal is intended to observe.
+    telemetry: Option<JournalIoTelemetry>,
 }
 
 impl<B> BankedJournal<B>
@@ -670,6 +706,14 @@ where
     B: SectorBackend,
 {
     fn open(backend: B) -> Result<Self, BankedJournalError<B::Error>> {
+        Self::open_validated(backend, false)
+    }
+
+    fn open_strict(backend: B) -> Result<Self, BankedJournalError<B::Error>> {
+        Self::open_validated(backend, true)
+    }
+
+    fn open_validated(backend: B, strict: bool) -> Result<Self, BankedJournalError<B::Error>> {
         let sectors = backend.sector_count();
         if sectors < REQUIRED_SECTORS {
             return Err(BankedJournalError::DeviceTooSmall {
@@ -677,15 +721,32 @@ where
                 required: REQUIRED_SECTORS,
             });
         }
-        Ok(Self { backend })
+        let mut journal = Self {
+            backend,
+            active: ActiveImage {
+                bank: None,
+                generation: 0,
+                bytes: Vec::new(),
+            },
+            telemetry: None,
+        };
+        // Validate both banks once before trusting a cache.  Subsequent
+        // operations retain exclusive ownership and update it only after a
+        // complete new-bank readback succeeds.
+        journal.active = if strict {
+            journal.read_active_strict()?
+        } else {
+            journal.read_active()?
+        };
+        Ok(journal)
     }
 
     fn read_all_image(&mut self) -> Result<Vec<u8>, BankedJournalError<B::Error>> {
-        Ok(self.read_active()?.bytes)
+        Ok(self.active.bytes.clone())
     }
 
     fn append_exact(&mut self, suffix: &[u8]) -> Result<(), BankedJournalError<B::Error>> {
-        let mut active = self.read_active()?;
+        let mut active = self.active.clone();
         let resulting_len = active.bytes.len().checked_add(suffix.len()).ok_or(
             BankedJournalError::JournalFull {
                 current: active.bytes.len(),
@@ -706,11 +767,14 @@ where
             }
         })?;
         active.bytes.extend_from_slice(suffix);
-        self.publish_next(active.bank, active.generation, &active.bytes)
+        let published = self.publish_next(active.bank, active.generation, &active.bytes)?;
+        self.active = published;
+        self.mark_phase(JournalIoPhase::CacheUpdated);
+        Ok(())
     }
 
     fn repair_exact(&mut self, repair: JournalRepair) -> Result<(), BankedJournalError<B::Error>> {
-        let mut active = self.read_active()?;
+        let mut active = self.active.clone();
         let offset = repair.offset();
         if offset > active.bytes.len() {
             return Err(BankedJournalError::InvalidRepairOffset {
@@ -721,10 +785,13 @@ where
         if offset == active.bytes.len() {
             // There is no suffix to rewrite, but the recovery contract still
             // asks this provider to complete a durability barrier.
-            return self.backend.flush().map_err(BankedJournalError::Storage);
+            return self.flush();
         }
         active.bytes.truncate(offset);
-        self.publish_next(active.bank, active.generation, &active.bytes)
+        let published = self.publish_next(active.bank, active.generation, &active.bytes)?;
+        self.active = published;
+        self.mark_phase(JournalIoPhase::CacheUpdated);
+        Ok(())
     }
 
     fn publish_next(
@@ -732,7 +799,7 @@ where
         active_bank: Option<u32>,
         generation: u64,
         bytes: &[u8],
-    ) -> Result<(), BankedJournalError<B::Error>> {
+    ) -> Result<ActiveImage, BankedJournalError<B::Error>> {
         if bytes.len() > JOURNAL_CAPACITY {
             return Err(BankedJournalError::JournalFull {
                 current: 0,
@@ -745,25 +812,28 @@ where
             .ok_or(BankedJournalError::GenerationExhausted)?;
         let target_bank = active_bank.map_or(0, |bank| bank ^ 1);
         self.write_payload(target_bank, bytes)?;
-        self.backend.flush().map_err(BankedJournalError::Storage)?;
+        self.mark_phase(JournalIoPhase::PayloadWritten);
+        self.flush()?;
+        self.mark_phase(JournalIoPhase::PayloadFlushed);
 
         let header = BankHeader {
             bank: target_bank,
             generation: next_generation,
             logical_len: bytes.len(),
-            payload_digest: Sha256::digest(bytes).into(),
+            payload_digest: self.hash(bytes),
         }
         .encode();
-        self.backend
-            .write_sector(bank_header_lba(target_bank), &header)
-            .map_err(BankedJournalError::Storage)?;
-        self.backend.flush().map_err(BankedJournalError::Storage)?;
+        self.write_sector(bank_header_lba(target_bank), &header)?;
+        self.mark_phase(JournalIoPhase::HeaderWritten);
+        self.flush()?;
+        self.mark_phase(JournalIoPhase::HeaderFlushed);
 
         match self.inspect_bank(target_bank)? {
             BankInspection::Valid(image)
                 if image.generation == next_generation && image.bytes == bytes =>
             {
-                Ok(())
+                self.mark_phase(JournalIoPhase::ReadbackValidated);
+                Ok(image)
             }
             BankInspection::Blank | BankInspection::Invalid | BankInspection::Valid(_) => {
                 Err(BankedJournalError::ReadbackMismatch)
@@ -779,19 +849,15 @@ where
         for (sector_index, chunk) in bytes.chunks(SECTOR_BYTES).enumerate() {
             let mut sector = [0u8; SECTOR_BYTES];
             sector[..chunk.len()].copy_from_slice(chunk);
-            self.backend
-                .write_sector(
-                    bank_data_lba(bank)
-                        + u32::try_from(sector_index).map_err(|_| {
-                            BankedJournalError::JournalFull {
-                                current: 0,
-                                additional: bytes.len(),
-                                capacity: JOURNAL_CAPACITY,
-                            }
-                        })?,
-                    &sector,
-                )
-                .map_err(BankedJournalError::Storage)?;
+            self.write_sector(
+                bank_data_lba(bank)
+                    + u32::try_from(sector_index).map_err(|_| BankedJournalError::JournalFull {
+                        current: 0,
+                        additional: bytes.len(),
+                        capacity: JOURNAL_CAPACITY,
+                    })?,
+                &sector,
+            )?;
         }
         Ok(())
     }
@@ -864,9 +930,7 @@ where
 
     fn inspect_bank(&mut self, bank: u32) -> Result<BankInspection, BankedJournalError<B::Error>> {
         let mut header_sector = [0u8; SECTOR_BYTES];
-        self.backend
-            .read_sector(bank_header_lba(bank), &mut header_sector)
-            .map_err(BankedJournalError::Storage)?;
+        self.read_sector(bank_header_lba(bank), &mut header_sector)?;
         let HeaderInspection::Valid(header) = BankHeader::decode(bank, &header_sector) else {
             return Ok(match BankHeader::decode(bank, &header_sector) {
                 HeaderInspection::Blank => BankInspection::Blank,
@@ -884,17 +948,15 @@ where
         bytes.resize(header.logical_len, 0);
         for (sector_index, chunk) in bytes.chunks_mut(SECTOR_BYTES).enumerate() {
             let mut sector = [0u8; SECTOR_BYTES];
-            self.backend
-                .read_sector(
-                    bank_data_lba(bank)
-                        + u32::try_from(sector_index)
-                            .map_err(|_| BankedJournalError::CorruptBankMetadata)?,
-                    &mut sector,
-                )
-                .map_err(BankedJournalError::Storage)?;
+            self.read_sector(
+                bank_data_lba(bank)
+                    + u32::try_from(sector_index)
+                        .map_err(|_| BankedJournalError::CorruptBankMetadata)?,
+                &mut sector,
+            )?;
             chunk.copy_from_slice(&sector[..chunk.len()]);
         }
-        let actual_digest: [u8; 32] = Sha256::digest(&bytes).into();
+        let actual_digest = self.hash(&bytes);
         if actual_digest != header.payload_digest {
             return Ok(BankInspection::Invalid);
         }
@@ -909,6 +971,76 @@ where
     fn backend_mut(&mut self) -> &mut B {
         &mut self.backend
     }
+
+    #[cfg(ktest)]
+    fn into_backend(self) -> B {
+        self.backend
+    }
+
+    #[cfg(ktest)]
+    fn enable_telemetry(&mut self) {
+        self.telemetry = Some(JournalIoTelemetry::default());
+    }
+
+    #[cfg(ktest)]
+    fn telemetry(&self) -> Option<JournalIoTelemetry> {
+        self.telemetry
+    }
+
+    fn read_sector(
+        &mut self,
+        lba: u32,
+        output: &mut [u8; SECTOR_BYTES],
+    ) -> Result<(), BankedJournalError<B::Error>> {
+        self.backend
+            .read_sector(lba, output)
+            .map_err(BankedJournalError::Storage)?;
+        if let Some(telemetry) = &mut self.telemetry {
+            telemetry.sectors_read = telemetry.sectors_read.saturating_add(1);
+        }
+        Ok(())
+    }
+
+    fn write_sector(
+        &mut self,
+        lba: u32,
+        input: &[u8; SECTOR_BYTES],
+    ) -> Result<(), BankedJournalError<B::Error>> {
+        self.backend
+            .write_sector(lba, input)
+            .map_err(BankedJournalError::Storage)?;
+        if let Some(telemetry) = &mut self.telemetry {
+            telemetry.sectors_written = telemetry.sectors_written.saturating_add(1);
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<(), BankedJournalError<B::Error>> {
+        self.backend.flush().map_err(BankedJournalError::Storage)?;
+        if let Some(telemetry) = &mut self.telemetry {
+            telemetry.flushes = telemetry.flushes.saturating_add(1);
+        }
+        Ok(())
+    }
+
+    fn hash(&mut self, bytes: &[u8]) -> [u8; 32] {
+        if let Some(telemetry) = &mut self.telemetry {
+            telemetry.hash_bytes = telemetry.hash_bytes.saturating_add(bytes.len() as u64);
+        }
+        Sha256::digest(bytes).into()
+    }
+
+    fn mark_phase(&mut self, phase: JournalIoPhase) {
+        if let Some(telemetry) = &mut self.telemetry {
+            telemetry.phase_tsc[phase as usize] = diagnostic_tsc();
+        }
+    }
+}
+
+fn diagnostic_tsc() -> u64 {
+    // Only called when telemetry is enabled; callers must not infer elapsed
+    // time across CPUs, migration, frequency changes, or virtualization.
+    ostd::arch::read_tsc()
 }
 
 const fn bank_header_lba(bank: u32) -> u32 {
@@ -1000,7 +1132,7 @@ impl AtaDoubleBank {
     ) -> Result<Self, AtaDoubleBankError<AtaPioError>> {
         let disk = AtaPioDisk::acquire(fixture)
             .map_err(|error| AtaDoubleBankError::Banked(BankedJournalError::Storage(error)))?;
-        let banks = BankedJournal::open(disk).map_err(AtaDoubleBankError::Banked)?;
+        let banks = BankedJournal::open_strict(disk).map_err(AtaDoubleBankError::Banked)?;
         Ok(Self { banks })
     }
 
@@ -1008,10 +1140,7 @@ impl AtaDoubleBank {
     pub(crate) fn load(
         &mut self,
     ) -> Result<Option<AtaDoubleBankSnapshot>, AtaDoubleBankError<AtaPioError>> {
-        let active = self
-            .banks
-            .read_active_strict()
-            .map_err(AtaDoubleBankError::Banked)?;
+        let active = self.banks.active.clone();
         if active.bank.is_none() {
             return Ok(None);
         }
@@ -1054,9 +1183,11 @@ impl AtaDoubleBank {
                 supplied: revision,
             });
         }
-        self.banks
+        let published = self
+            .banks
             .publish_next(active.bank, active.generation, bytes)
             .map_err(AtaDoubleBankError::Banked)?;
+        self.banks.active = published;
         let snapshot = self.load()?.ok_or(AtaDoubleBankError::Banked(
             BankedJournalError::ReadbackMismatch,
         ))?;
@@ -1080,12 +1211,14 @@ mod tests {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum MemoryError {
         Bounds,
+        InjectedWriteFailure,
     }
 
     #[derive(Debug)]
     struct MemoryDisk {
         sectors: Vec<[u8; SECTOR_BYTES]>,
         flushes: u32,
+        fail_writes_after: Option<u32>,
     }
 
     impl MemoryDisk {
@@ -1093,6 +1226,7 @@ mod tests {
             Self {
                 sectors: vec![[0u8; SECTOR_BYTES]; REQUIRED_SECTORS as usize],
                 flushes: 0,
+                fail_writes_after: None,
             }
         }
     }
@@ -1118,6 +1252,12 @@ mod tests {
             lba: u32,
             input: &[u8; SECTOR_BYTES],
         ) -> Result<(), Self::Error> {
+            if let Some(remaining) = self.fail_writes_after.as_mut() {
+                if *remaining == 0 {
+                    return Err(MemoryError::InjectedWriteFailure);
+                }
+                *remaining -= 1;
+            }
             *self
                 .sectors
                 .get_mut(lba as usize)
@@ -1178,7 +1318,8 @@ mod tests {
             .write_sector(bank_header_lba(1), &header)
             .expect("publish header over torn payload");
 
-        assert_eq!(journal.read_all_image().expect("fall back"), b"committed");
+        let mut reopened = BankedJournal::open(journal.into_backend()).expect("reopen fixture");
+        assert_eq!(reopened.read_all_image().expect("fall back"), b"committed");
     }
 
     #[ktest]
@@ -1209,23 +1350,24 @@ mod tests {
             .write_sector(bank_header_lba(1), &torn_header)
             .expect("inject torn header");
 
-        assert_eq!(journal.read_all_image().expect("fall back"), b"committed");
+        let mut reopened = BankedJournal::open(journal.into_backend()).expect("reopen fixture");
+        assert_eq!(reopened.read_all_image().expect("fall back"), b"committed");
     }
 
     #[ktest]
     fn strict_double_bank_rejects_a_lone_corrupt_bank() {
         let mut journal = journal();
         let mut corrupt = [0u8; SECTOR_BYTES];
-        corrupt[..8].copy_from_slice(b"not-a-bank");
+        corrupt[..10].copy_from_slice(b"not-a-bank");
         journal
             .backend_mut()
             .write_sector(bank_header_lba(0), &corrupt)
             .expect("inject malformed lone header");
 
-        assert_eq!(
+        assert!(matches!(
             journal.read_active_strict(),
             Err(BankedJournalError::CorruptBankMetadata)
-        );
+        ));
     }
 
     #[ktest]
@@ -1235,7 +1377,7 @@ mod tests {
             .append_exact(b"committed")
             .expect("publish predecessor");
         let mut corrupt = [0u8; SECTOR_BYTES];
-        corrupt[..8].copy_from_slice(b"not-a-bank");
+        corrupt[..10].copy_from_slice(b"not-a-bank");
         journal
             .backend_mut()
             .write_sector(bank_header_lba(1), &corrupt)
@@ -1286,5 +1428,123 @@ mod tests {
             }
         );
         assert_eq!(journal.read_all_image().expect("full image retained"), full);
+    }
+
+    #[ktest]
+    fn pio_journal_cache_avoids_revalidating_banks_between_appends() {
+        let mut journal = journal();
+        journal.enable_telemetry();
+
+        // A deterministic fill profile makes the full-bank rewrite visible:
+        // committing the first 64 KiB in 512-byte records writes and reads
+        // 8,384 sectors each, for 65.5x the logical payload in writes alone.
+        for record in 1..=BANK_DATA_SECTORS {
+            journal
+                .append_exact(&vec![record as u8; SECTOR_BYTES])
+                .expect("publish fill record");
+        }
+
+        let telemetry = journal.telemetry().expect("telemetry enabled");
+        assert_eq!(telemetry.sectors_written, 8_384);
+        assert_eq!(telemetry.sectors_read, 8_384);
+        assert_eq!(telemetry.flushes, 256);
+        assert_eq!(telemetry.hash_bytes, 8_454_144);
+        assert_ne!(
+            telemetry.phase_tsc[JournalIoPhase::ReadbackValidated as usize],
+            0
+        );
+        assert_ne!(
+            telemetry.phase_tsc[JournalIoPhase::CacheUpdated as usize],
+            0
+        );
+    }
+
+    #[ktest]
+    fn pio_journal_failed_append_keeps_the_validated_cache() {
+        let mut journal = journal();
+        journal
+            .append_exact(b"committed")
+            .expect("publish baseline");
+        journal.backend_mut().fail_writes_after = Some(0);
+
+        assert_eq!(
+            journal.append_exact(b"-new"),
+            Err(BankedJournalError::Storage(
+                MemoryError::InjectedWriteFailure
+            ))
+        );
+        assert_eq!(
+            journal.read_all_image().expect("cache remains valid"),
+            b"committed"
+        );
+    }
+
+    #[ktest]
+    fn pio_journal_failed_repair_keeps_the_validated_cache() {
+        let mut journal = journal();
+        journal
+            .append_exact(b"anchored-unanchored")
+            .expect("publish image");
+        journal.backend_mut().fail_writes_after = Some(0);
+
+        assert_eq!(
+            journal.repair_exact(JournalRepair::UnanchoredSuffix { offset: 8 }),
+            Err(BankedJournalError::Storage(
+                MemoryError::InjectedWriteFailure
+            ))
+        );
+        assert_eq!(
+            journal.read_all_image().expect("cache remains valid"),
+            b"anchored-unanchored"
+        );
+    }
+
+    #[ktest]
+    fn pio_journal_reopen_revalidates_corrupted_cached_bank() {
+        let mut journal = journal();
+        journal
+            .append_exact(b"committed")
+            .expect("publish baseline");
+        let active_bank = journal.active.bank.expect("published bank");
+        journal.backend_mut().sectors[bank_header_lba(active_bank) as usize][0] ^= 0xff;
+
+        let reopened = BankedJournal::open(journal.into_backend()).expect("reopen fixture");
+        assert!(reopened.active.bank.is_none());
+        assert!(reopened.active.bytes.is_empty());
+    }
+
+    #[ktest]
+    fn pio_journal_repair_updates_cache_only_after_readback() {
+        let mut journal = journal();
+        journal
+            .append_exact(b"anchored-unanchored")
+            .expect("publish image");
+        journal
+            .repair_exact(JournalRepair::UnanchoredSuffix { offset: 8 })
+            .expect("publish repair");
+        assert_eq!(
+            journal.read_all_image().expect("cached repair"),
+            b"anchored"
+        );
+    }
+
+    /// Stable public OSDK gate. Cargo-OSDK 0.18 filters test names by exact
+    /// path suffix despite documenting substring matching, so one named gate
+    /// invokes the complete journal-specific regression set and yields an
+    /// unambiguous non-zero execution receipt.
+    #[ktest]
+    fn cser_pio_journal_gate() {
+        pio_journal_format_appends_exact_bytes_and_uses_two_barriers();
+        pio_journal_torn_data_falls_back_to_last_committed_bank();
+        pio_journal_torn_header_falls_back_to_last_committed_bank();
+        strict_double_bank_rejects_a_lone_corrupt_bank();
+        strict_double_bank_keeps_a_valid_predecessor_after_torn_successor();
+        pio_journal_repair_publishes_the_exact_prefix();
+        pio_journal_capacity_is_explicit_backpressure();
+        pio_journal_cache_avoids_revalidating_banks_between_appends();
+        pio_journal_failed_append_keeps_the_validated_cache();
+        pio_journal_failed_repair_keeps_the_validated_cache();
+        pio_journal_reopen_revalidates_corrupted_cached_bank();
+        pio_journal_repair_updates_cache_only_after_readback();
     }
 }

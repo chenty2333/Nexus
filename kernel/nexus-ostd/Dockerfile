@@ -13,6 +13,10 @@ ARG OSTD_CRATE_SHA256=aa160b3c09e0471f85f76a069e327b3df0bc60d5191b2ce3a64cc15cd6
 ARG OSTD_CRATE_URL=https://static.crates.io/crates/ostd/ostd-0.18.0.crate
 ARG VIRTIO_DRIVERS_CRATE_SHA256=cfdc1c628cdd8ce7c3b9e65a8ed550d0338e9ef9f911e729666f1cce097de2f7
 ARG VIRTIO_DRIVERS_CRATE_URL=https://static.crates.io/crates/virtio-drivers/virtio-drivers-0.13.0.crate
+ARG SPIN_CRATE_SHA256=6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67
+ARG SPIN_CRATE_URL=https://static.crates.io/crates/spin/spin-0.9.8.crate
+ARG OSDK_TEST_KERNEL_CRATE_SHA256=275faff80a915be872fdf0bfbe94bc6e4a80debbd4706123be55b72d3f30de25
+ARG OSDK_TEST_KERNEL_CRATE_URL=https://static.crates.io/crates/osdk-test-kernel/osdk-test-kernel-0.18.0.crate
 COPY patches/ostd-0.18.0-cser.patch /tmp/nexus-patches/ostd-0.18.0-cser.patch
 COPY kernel/nexus-ostd/patches/ostd-0.18.0-cser-arena.patch \
     /tmp/nexus-patches/ostd-0.18.0-cser-arena.patch
@@ -27,7 +31,8 @@ COPY tools/virtio/assert-cser-patch.sh /usr/local/bin/assert-virtio-cser-patch
 COPY tools/virtio/assert-production-substrate.sh \
     /usr/local/bin/assert-production-virtio-substrate
 RUN set -eu; \
-    mkdir -p /opt/nexus-source /opt/nexus-ostd /opt/nexus-virtio; \
+    mkdir -p /opt/nexus-source /opt/nexus-ostd /opt/nexus-virtio /opt/nexus-spin \
+        /opt/nexus-osdk-test-kernel; \
     archive=/opt/nexus-source/ostd-0.18.0.crate; \
     curl --fail --silent --show-error --location "$OSTD_CRATE_URL" --output "$archive"; \
     echo "${OSTD_CRATE_SHA256}  ${archive}" | sha256sum -c -; \
@@ -49,12 +54,24 @@ RUN set -eu; \
         --output "$virtio_archive"; \
     echo "${VIRTIO_DRIVERS_CRATE_SHA256}  ${virtio_archive}" | sha256sum -c -; \
     tar -xzf "$virtio_archive" -C /opt/nexus-virtio; \
+    spin_archive=/opt/nexus-source/spin-0.9.8.crate; \
+    curl --fail --silent --show-error --location "$SPIN_CRATE_URL" \
+        --output "$spin_archive"; \
+    echo "${SPIN_CRATE_SHA256}  ${spin_archive}" | sha256sum -c -; \
+    tar -xzf "$spin_archive" -C /opt/nexus-spin; \
+    osdk_test_kernel_archive=/opt/nexus-source/osdk-test-kernel-0.18.0.crate; \
+    curl --fail --silent --show-error --location "$OSDK_TEST_KERNEL_CRATE_URL" \
+        --output "$osdk_test_kernel_archive"; \
+    echo "${OSDK_TEST_KERNEL_CRATE_SHA256}  ${osdk_test_kernel_archive}" \
+        | sha256sum -c -; \
+    tar -xzf "$osdk_test_kernel_archive" -C /opt/nexus-osdk-test-kernel; \
     patch --batch --forward -d /opt/nexus-virtio/virtio-drivers-0.13.0 -p1 \
         < /tmp/nexus-patches/virtio-drivers-0.13.0-cser.patch; \
     patch --batch --dry-run --reverse \
         -d /opt/nexus-virtio/virtio-drivers-0.13.0 -p1 \
         < /tmp/nexus-patches/virtio-drivers-0.13.0-cser.patch; \
-    chmod -R a+rX /opt/nexus-source /opt/nexus-ostd /opt/nexus-virtio; \
+    chmod -R a+rX /opt/nexus-source /opt/nexus-ostd /opt/nexus-virtio \
+        /opt/nexus-spin /opt/nexus-osdk-test-kernel; \
     /usr/local/bin/assert-ostd-cser-arena-patch \
         /tmp/nexus-patches/ostd-0.18.0-cser-arena.patch \
         /opt/nexus-ostd/ostd-0.18.0 \
@@ -68,6 +85,12 @@ RUN set -eu; \
         /crates/nexus-ostd-virtio/src/lib.rs \
         /crates/nexus-ostd-virtio/src/pci.rs
 COPY patches/cser-cargo-config.toml /root/.cargo/config.toml
+COPY kernel/nexus-ostd/patches/osdk-test-kernel-fetch.toml \
+    /tmp/nexus-osdk-test-kernel-fetch/Cargo.toml
+COPY kernel/nexus-ostd/patches/osdk-test-kernel-fetch.rs \
+    /tmp/nexus-osdk-test-kernel-fetch/src/lib.rs
+RUN cargo fetch --manifest-path /tmp/nexus-osdk-test-kernel-fetch/Cargo.toml \
+    && rm -rf /tmp/nexus-osdk-test-kernel-fetch
 RUN cargo test --manifest-path /opt/nexus-virtio/virtio-drivers-0.13.0/Cargo.toml \
         --lib --no-default-features \
     && rm -rf /opt/nexus-virtio/virtio-drivers-0.13.0/target

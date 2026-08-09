@@ -701,6 +701,8 @@ check_kernel() {
         --no-default-features --features cser-core-dma-recovery
     container cargo check --locked --offline --target x86_64-unknown-none \
         --no-default-features --features cser-core-tpm-anchor
+    container cargo check --locked --offline --target x86_64-unknown-none \
+        --no-default-features --features cser-smp-smoke
     container cargo osdk check --locked
     kernel_check_complete=true
 }
@@ -759,6 +761,36 @@ build_core_dma_recovery_kernel() {
     prepare_runner_base
     container cargo osdk build --scheme cser-core-dma-recovery
     assert_runner_base
+}
+
+build_cser_smp_smoke_kernel() {
+    check_kernel
+    prepare_runner_base
+    container cargo osdk build --scheme cser-smp-smoke
+    assert_runner_base
+}
+
+# Executes the in-kernel MemoryDisk journal cache/failure regressions through
+# OSTD's real kernel test runner.  This is deliberately separate from the
+# persistent-media recovery run: the assertions need no ATA fixture, TPM, or
+# host service and produce a bounded, repeatable QEMU test receipt.
+test_pio_journal() {
+    check_kernel
+    prepare_runner_base
+    container bash -c '
+        set -euo pipefail
+        cp /root/ovmf/release/OVMF_VARS.fd "$HOME/OVMF_VARS.fd"
+        receipt=$(mktemp)
+        trap '\''rm -f "$receipt"'\'' EXIT
+        timeout --signal=TERM --kill-after=2s 90s \
+            cargo osdk test --scheme cser-pio-journal-ktest \
+                cser_pio_journal_gate 2>&1 | tee "$receipt"
+        grep -F "test nexus_kernel::core_pio_journal::tests::cser_pio_journal_gate" \
+            "$receipt" >/dev/null
+        grep -F "1 passed; 0 failed" "$receipt" >/dev/null
+    '
+    assert_runner_base
+    echo 'CSER_PIO_JOURNAL_KTEST PASS cache=failure=corruption=repair=fill-profile'
 }
 
 # Compile-only gate for the two comparable tool-plus-DMA experiment profiles.
@@ -1647,6 +1679,48 @@ capture_core_dma_evidence() {
         return 1
     fi
     echo 'CSER_CORE_DMA_EVIDENCE_QEMU PASS queue=real-virtio completion=real-irq reset=real-device iotlb=real-vtd production_registry=false qemu=true physical_hardware=false'
+}
+
+run_cser_smp_smoke_guest() {
+    container bash -c '
+        set -euo pipefail
+        cp /root/ovmf/release/OVMF_VARS.fd "$HOME/OVMF_VARS.fd"
+        exec timeout --signal=TERM --kill-after=2s 60s \
+            cargo osdk run --scheme cser-smp-smoke
+    '
+    assert_runner_base
+}
+
+capture_cser_smp_smoke() {
+    local artifact_dir="$root/artifacts/cser-smp-smoke"
+    local smp_marker_line metric
+    mkdir -p "$artifact_dir"
+    rm -f "$artifact_dir/serial.log" "$artifact_dir/qemu-debug.log" \
+        "$artifact_dir/kernel.iso"
+    build_cser_smp_smoke_kernel
+    # shellcheck source=scripts/qemu-stream-capture.sh
+    source "$capture_helper"
+    capture_qemu_streams "$artifact_dir/serial.log" "$artifact_dir/qemu-debug.log" \
+        run_cser_smp_smoke_guest
+    copy_core_evidence_iso "$artifact_dir/kernel.iso"
+    require_core_persistent_marker "$artifact_dir/serial.log" \
+        'CSER_SMP_IPI PASS' \
+        'cpus=2' \
+        'cpu1=1' \
+        'scheduler=bsp-only' \
+        'cross_cpu_transactions=false' \
+        'persistence=fail-closed' \
+        'transactions=1' \
+        'tcg=multi'
+    smp_marker_line=$(tr -d '\r' <"$artifact_dir/serial.log" \
+        | grep -F 'CSER_SMP_IPI PASS' | tail -n 1)
+    for metric in lock_wait_cycles lock_hold_cycles; do
+        if [[ ! $smp_marker_line =~ (^|[[:space:]])${metric}=[0-9]+($|[[:space:]]) ]]; then
+            echo "CSER SMP marker lacks numeric $metric: $smp_marker_line" >&2
+            return 1
+        fi
+    done
+    echo 'CSER_SMP_QEMU PASS vcpus=2 accel=tcg,thread=multi ipi=cpu1 scheduler=bsp-only cross_cpu_transactions=false persistence=fail-closed transactions=1 telemetry=lock-wait+hold-cycles'
 }
 
 start_core_persistent_swtpm() {
@@ -2836,6 +2910,21 @@ case "$command" in
         ensure_image
         build_tool_dma_experiments
         ;;
+    build-cser-smp-smoke)
+        ensure_image
+        build_cser_smp_smoke_kernel
+        ;;
+    test-pio-journal)
+        ensure_image
+        check_ostd_patch
+        check_virtio_patch
+        test_pio_journal
+        ;;
+    run-cser-smp-smoke)
+        ensure_image
+        bash "$root/scripts/assert-cser-smp-boundary.sh" "$root"
+        capture_cser_smp_smoke
+        ;;
     run-tool-dma-boot)
         [[ $# == 2 ]] || { echo 'usage: ./x run-tool-dma-boot {tool-dma-cser|tool-dma-baseline}' >&2; exit 2; }
         ensure_image
@@ -2871,10 +2960,10 @@ case "$command" in
         rm -rf "$root/target" "$root/artifacts"
         ;;
     -h|--help|help)
-        echo "usage: ./x {doctor|image|fmt|check|clippy|build|run|test|build-core-persistent-recovery|build-tool-dma-experiments|run-tool-dma-boot|run-core-persistent-recovery|seal-core-persistent-recovery|test-core-persistent-arena-checker|test-core-schema5-negative-oracles|test-core-schema5-fixture|clean}"
+        echo "usage: ./x {doctor|image|fmt|check|clippy|build|run|test|build-core-persistent-recovery|build-tool-dma-experiments|build-cser-smp-smoke|run-cser-smp-smoke|test-pio-journal|run-tool-dma-boot|run-core-persistent-recovery|seal-core-persistent-recovery|test-core-persistent-arena-checker|test-core-schema5-negative-oracles|test-core-schema5-fixture|clean}"
         ;;
     *)
-        echo "usage: ./x {doctor|image|fmt|check|clippy|build|run|test|build-core-persistent-recovery|build-tool-dma-experiments|run-tool-dma-boot|run-core-persistent-recovery|seal-core-persistent-recovery|test-core-persistent-arena-checker|test-core-schema5-negative-oracles|test-core-schema5-fixture|clean}" >&2
+        echo "usage: ./x {doctor|image|fmt|check|clippy|build|run|test|build-core-persistent-recovery|build-tool-dma-experiments|build-cser-smp-smoke|run-cser-smp-smoke|test-pio-journal|run-tool-dma-boot|run-core-persistent-recovery|seal-core-persistent-recovery|test-core-persistent-arena-checker|test-core-schema5-negative-oracles|test-core-schema5-fixture|clean}" >&2
         exit 2
         ;;
 esac

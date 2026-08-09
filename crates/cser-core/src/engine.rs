@@ -11880,3 +11880,262 @@ mod projection_v6_tests {
         });
     }
 }
+
+// This is deliberately an ignored, std-only measurement rather than a normal
+// test or a production instrumentation surface.  It profiles the three whole
+// state operations on the durable transition path without making timing a
+// correctness assertion.  Run with:
+//
+// cargo test -p cser-core --release --features std --lib \
+//   portable_core_state_work_profile -- --ignored --nocapture
+//
+// The fixture is assembled from one catalog-valid composite and then copied
+// structurally.  `check_invariants` remains the canonical oracle for every
+// size, so the profile cannot accidentally benchmark an invalid shortcut.
+#[cfg(all(test, feature = "std"))]
+mod performance_profile_tests {
+    use std::{hint::black_box, time::Instant};
+
+    use super::*;
+    use crate::{
+        AGENT_COMPONENT_DMA, AGENT_COMPONENT_REPLY, AGENT_OPERATION_COMPOSITE, DEVICE_CLAIM_IOVA,
+        DEVICE_CLAIM_PINNED_PAGE, DEVICE_CLAIM_QUEUE_SLOT, DeviceScopeId,
+        REPLY_CLAIM_PUBLICATION_SLOT, REPLY_DOMAIN, REPLY_OBLIGATION_PUBLICATION, standard_catalog,
+    };
+
+    const SIZES: [usize; 5] = [1, 8, 64, 512, 4096];
+    const WARMUPS: usize = 3;
+    const SAMPLES: usize = 11;
+
+    fn freshness() -> Freshness {
+        Freshness::new(
+            BootGeneration::new(1).unwrap(),
+            RegistryInstance::new(1).unwrap(),
+            1,
+            DeviceGeneration::new(1).unwrap(),
+            JournalGeneration::new(1).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn transact(engine: &mut Engine, request: CommandRequest) {
+        engine.transact(request, |_| Ok::<(), ()>(())).unwrap();
+    }
+
+    fn seed_one_composite() -> Engine {
+        let limits = CoreLimits::new(1, 1024, 4096, 4096, 64, 1 << 20, 1).unwrap();
+        let mut engine = Engine::new(standard_catalog(), limits, freshness());
+        let root = RootId::new(1).unwrap();
+        let effect = EffectId::new(root, 1).unwrap();
+        let actor = PrincipalIncarnation::new(crate::PrincipalId::new(1).unwrap(), 1).unwrap();
+        let account = ChargeAccountId::new(1).unwrap();
+        let generation = ResourceGeneration::new(1).unwrap();
+        let device_scope = ClaimScope::Device(DeviceScopeId::new(1).unwrap());
+        transact(
+            &mut engine,
+            CommandRequest::CreateCompositeEffect {
+                effect,
+                origin: actor,
+                binding_generation: 1,
+                kind: AGENT_OPERATION_COMPOSITE,
+                charge_account: account,
+            },
+        );
+        for (component, claim, kind, scope, resource) in [
+            (
+                AGENT_COMPONENT_REPLY,
+                ClaimId::new(1).unwrap(),
+                REPLY_CLAIM_PUBLICATION_SLOT,
+                ClaimScope::Logical,
+                ResourceId::new(1).unwrap(),
+            ),
+            (
+                AGENT_COMPONENT_DMA,
+                ClaimId::new(2).unwrap(),
+                DEVICE_CLAIM_QUEUE_SLOT,
+                device_scope,
+                ResourceId::new(2).unwrap(),
+            ),
+            (
+                AGENT_COMPONENT_DMA,
+                ClaimId::new(3).unwrap(),
+                DEVICE_CLAIM_PINNED_PAGE,
+                device_scope,
+                ResourceId::new(3).unwrap(),
+            ),
+            (
+                AGENT_COMPONENT_DMA,
+                ClaimId::new(4).unwrap(),
+                DEVICE_CLAIM_IOVA,
+                device_scope,
+                ResourceId::new(4).unwrap(),
+            ),
+        ] {
+            transact(
+                &mut engine,
+                CommandRequest::AddComponentClaim {
+                    effect,
+                    component,
+                    actor,
+                    binding_generation: 1,
+                    claim,
+                    kind,
+                    scope,
+                    resource,
+                    resource_generation: generation,
+                    units: 1,
+                },
+            );
+        }
+        transact(
+            &mut engine,
+            CommandRequest::PrepareCompositeEffect {
+                effect,
+                actor,
+                binding_generation: 1,
+            },
+        );
+        check_invariants(&engine.catalog, engine.limits, &engine.state).unwrap();
+        engine
+    }
+
+    fn seed_one_estate() -> Engine {
+        let limits = CoreLimits::new(1, 1024, 4096, 4096, 64, 1 << 20, 1).unwrap();
+        let mut engine = Engine::new_legacy_compatibility(standard_catalog(), limits, freshness());
+        let effect = EffectId::new(RootId::new(1).unwrap(), 1).unwrap();
+        let actor = PrincipalIncarnation::new(crate::PrincipalId::new(1).unwrap(), 1).unwrap();
+        transact(
+            &mut engine,
+            CommandRequest::CreateEstate {
+                effect,
+                origin: actor,
+                binding_generation: 1,
+                domain: REPLY_DOMAIN,
+                obligation: REPLY_OBLIGATION_PUBLICATION,
+                charge_account: ChargeAccountId::new(1).unwrap(),
+            },
+        );
+        transact(
+            &mut engine,
+            CommandRequest::AddClaim {
+                effect,
+                actor,
+                binding_generation: 1,
+                claim: ClaimId::new(1).unwrap(),
+                domain: REPLY_DOMAIN,
+                kind: REPLY_CLAIM_PUBLICATION_SLOT,
+                scope: ClaimScope::Logical,
+                resource: ResourceId::new(1).unwrap(),
+                resource_generation: ResourceGeneration::new(1).unwrap(),
+                units: 1,
+            },
+        );
+        check_invariants(&engine.catalog, engine.limits, &engine.state).unwrap();
+        engine
+    }
+
+    fn fixture(live_claims: usize) -> Engine {
+        assert!(SIZES.contains(&live_claims));
+        if live_claims == 1 {
+            return seed_one_estate();
+        }
+        assert_eq!(live_claims % 4, 0, "composite fixture has four claims");
+        let mut engine = seed_one_composite();
+        let composite_template = engine
+            .state
+            .composite_effects
+            .values()
+            .next()
+            .unwrap()
+            .clone();
+        let resource_template = engine.state.resources.clone();
+        let index_template = engine
+            .state
+            .composite_resource_index
+            .values()
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
+        let composites = live_claims / 4;
+        for sequence in 2..=u64::try_from(composites).unwrap() {
+            let effect = EffectId::new(RootId::new(1).unwrap(), sequence).unwrap();
+            let mut composite = composite_template.clone();
+            composite.effect = effect;
+            for component in composite.components.values_mut() {
+                for claim in component.claims.values_mut() {
+                    let offset = (sequence - 1) * 4;
+                    claim.resource = ResourceId::new(claim.resource.get() + offset).unwrap();
+                }
+            }
+            engine.state.composite_effects.insert(effect, composite);
+            for (base_resource, record) in &resource_template {
+                let resource = ResourceId::new(base_resource.get() + (sequence - 1) * 4).unwrap();
+                engine.state.resources.insert(resource, *record);
+            }
+            for (_, component, claim) in &index_template {
+                let resource = engine
+                    .state
+                    .composite_effects
+                    .get(&effect)
+                    .unwrap()
+                    .components
+                    .get(component)
+                    .unwrap()
+                    .claims
+                    .get(claim)
+                    .unwrap()
+                    .resource;
+                engine
+                    .state
+                    .composite_resource_index
+                    .insert(resource, vec![(effect, *component, *claim)]);
+            }
+        }
+        for amount in engine.state.charges.values_mut() {
+            *amount *= u64::try_from(composites).unwrap();
+        }
+        check_invariants(&engine.catalog, engine.limits, &engine.state).unwrap();
+        engine
+    }
+
+    fn median_ns(mut values: Vec<u128>) -> u128 {
+        values.sort_unstable();
+        values[values.len() / 2]
+    }
+
+    fn measure(mut operation: impl FnMut()) -> u128 {
+        for _ in 0..WARMUPS {
+            operation();
+        }
+        let mut values = Vec::with_capacity(SAMPLES);
+        for _ in 0..SAMPLES {
+            let started = Instant::now();
+            operation();
+            values.push(started.elapsed().as_nanos());
+        }
+        median_ns(values)
+    }
+
+    #[test]
+    #[ignore = "manual portable-core performance profile; timing is not a correctness assertion"]
+    fn portable_core_state_work_profile() {
+        for live_claims in SIZES {
+            let engine = fixture(live_claims);
+            let clone_ns = measure(|| {
+                let state = black_box(engine.state.clone());
+                black_box(state);
+            });
+            let invariant_ns = measure(|| {
+                black_box(check_invariants(&engine.catalog, engine.limits, &engine.state).unwrap());
+            });
+            let digest_ns = measure(|| {
+                black_box(projection_digest(&engine.state, engine.catalog.digest()));
+            });
+            println!(
+                "CSER_CORE_STATE_PROFILE {{\"live_claims\":{live_claims},\"clone_median_ns\":{clone_ns},\"invariant_median_ns\":{invariant_ns},\"projection_digest_median_ns\":{digest_ns},\"warmups\":{WARMUPS},\"samples\":{SAMPLES}}}"
+            );
+        }
+        // Keep a non-timing semantic assertion at the end of the manual run.
+        assert_eq!(fixture(4096).state.composite_effects.len(), 1024);
+    }
+}

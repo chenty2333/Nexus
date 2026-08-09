@@ -77,6 +77,26 @@ qemu.args = """\
     -drive if=pflash,format=raw,unit=1,file=/tmp/nexus-home/OVMF_VARS.fd \
 """
 
+[scheme."cser-pio-journal-ktest"]
+build.no_default_features = true
+build.features = ["cser-pio-journal-ktest"]
+qemu.args = """\
+    -nodefaults \
+    -machine q35,kernel-irqchip=split \
+    -accel tcg,thread=single \
+    -cpu Icelake-Server,+x2apic \
+    -m 1G \
+    -smp 1 \
+    -no-reboot \
+    -display none \
+    -monitor none \
+    -chardev stdio,id=serial0,signal=off \
+    -serial chardev:serial0 \
+    -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
+    -drive if=pflash,format=raw,unit=0,readonly=on,file=/root/ovmf/release/OVMF.fd \
+    -drive if=pflash,format=raw,unit=1,file=/tmp/nexus-home/OVMF_VARS.fd \
+"""
+
 [scheme."cser-core-dma-recovery"]
 build.no_default_features = true
 build.features = ["cser-core-dma-recovery"]
@@ -109,6 +129,30 @@ qemu.args = """\
     -trace enable=vtd_dmar_fault \
     -trace enable=vtd_inv_desc_iotlb_global \
     -trace enable=vtd_inv_desc_wait_irq \
+    -drive if=pflash,format=raw,unit=0,readonly=on,file=/root/ovmf/release/OVMF.fd \
+    -drive if=pflash,format=raw,unit=1,file=/tmp/nexus-home/OVMF_VARS.fd \
+"""
+
+# Separate from the five one-vCPU evidence/comparison schemes: this profile
+# executes a bounded CPU1 IPI under multi-threaded TCG.
+[scheme."cser-smp-smoke"]
+build.no_default_features = true
+build.features = ["cser-smp-smoke"]
+qemu.args = """\
+    -nodefaults \
+    -machine q35,kernel-irqchip=split \
+    -accel tcg,thread=multi \
+    -cpu Icelake-Server,+x2apic \
+    -m 1G \
+    -smp 2 \
+    -no-reboot \
+    -display none \
+    -monitor none \
+    -chardev stdio,id=serial0,signal=off \
+    -serial chardev:serial0 \
+    -chardev file,id=entry-debugcon,path=/work/artifacts/cser-production/smp-smoke-task-entry-debugcon.log \
+    -device isa-debugcon,iobase=0xe9,chardev=entry-debugcon \
+    -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
     -drive if=pflash,format=raw,unit=0,readonly=on,file=/root/ovmf/release/OVMF.fd \
     -drive if=pflash,format=raw,unit=1,file=/tmp/nexus-home/OVMF_VARS.fd \
 """

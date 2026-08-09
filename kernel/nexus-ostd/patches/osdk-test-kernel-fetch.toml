@@ -1,0 +1,8 @@
+[package]
+name = "nexus-osdk-test-kernel-fetch"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+osdk-test-kernel = "=0.18.0"

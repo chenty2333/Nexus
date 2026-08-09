@@ -1,3 +1,4 @@
 [patch.crates-io]
 ostd = { path = "/opt/nexus-ostd/ostd-0.18.0" }
+spin = { path = "/opt/nexus-spin/spin-0.9.8" }
 virtio-drivers = { path = "/opt/nexus-virtio/virtio-drivers-0.13.0" }

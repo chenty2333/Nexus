@@ -10,6 +10,8 @@ extern crate alloc;
     feature = "cser-core-reply-recovery",
     feature = "cser-core-dma-recovery",
     feature = "cser-core-tpm-anchor",
+    feature = "cser-smp-smoke",
+    feature = "cser-pio-journal-ktest",
     feature = "cser-tool-dma-experiment",
     feature = "cser-tool-dma-baseline-experiment",
 )))]
@@ -25,6 +27,26 @@ compile_error!("one CSER core runtime profile must be selected");
     ),
     all(feature = "cser-core-reply-recovery", feature = "cser-core-tpm-anchor"),
     all(feature = "cser-core-dma-recovery", feature = "cser-core-tpm-anchor"),
+    all(feature = "cser-production", feature = "cser-smp-smoke"),
+    all(feature = "cser-core-reply-recovery", feature = "cser-smp-smoke"),
+    all(feature = "cser-core-dma-recovery", feature = "cser-smp-smoke"),
+    all(feature = "cser-core-tpm-anchor", feature = "cser-smp-smoke"),
+    all(feature = "cser-production", feature = "cser-pio-journal-ktest"),
+    all(
+        feature = "cser-core-reply-recovery",
+        feature = "cser-pio-journal-ktest"
+    ),
+    all(feature = "cser-core-dma-recovery", feature = "cser-pio-journal-ktest"),
+    all(feature = "cser-core-tpm-anchor", feature = "cser-pio-journal-ktest"),
+    all(feature = "cser-smp-smoke", feature = "cser-pio-journal-ktest"),
+    all(
+        feature = "cser-pio-journal-ktest",
+        feature = "cser-tool-dma-experiment"
+    ),
+    all(
+        feature = "cser-pio-journal-ktest",
+        feature = "cser-tool-dma-baseline-experiment"
+    ),
     all(feature = "cser-production", feature = "cser-tool-dma-experiment"),
     all(
         feature = "cser-production",
@@ -55,6 +77,11 @@ compile_error!("one CSER core runtime profile must be selected");
         feature = "cser-tool-dma-experiment",
         feature = "cser-tool-dma-baseline-experiment"
     ),
+    all(feature = "cser-smp-smoke", feature = "cser-tool-dma-experiment"),
+    all(
+        feature = "cser-smp-smoke",
+        feature = "cser-tool-dma-baseline-experiment"
+    ),
 ))]
 compile_error!("CSER runtime profiles are mutually exclusive");
 
@@ -66,6 +93,7 @@ mod core_reply_adapter;
     feature = "cser-production",
     feature = "cser-core-reply-recovery",
     feature = "cser-core-dma-recovery",
+    feature = "cser-smp-smoke",
     feature = "cser-tool-dma-experiment"
 ))]
 #[path = "cser/core_runtime.rs"]
@@ -74,6 +102,10 @@ mod core_runtime;
 #[cfg(feature = "cser-core-reply-recovery")]
 #[path = "cser/core_runtime_slice.rs"]
 mod core_runtime_slice;
+
+#[cfg(feature = "cser-smp-smoke")]
+#[path = "cser/core_smp_smoke.rs"]
+mod core_smp_smoke;
 
 #[cfg(feature = "cser-production")]
 #[path = "cser/core_portal_vnext.rs"]
@@ -91,6 +123,7 @@ mod core_supervisor_vnext;
     feature = "cser-production",
     feature = "cser-tool-dma-experiment",
     feature = "cser-tool-dma-baseline-experiment",
+    feature = "cser-pio-journal-ktest",
 ))]
 #[path = "cser/core_reboot.rs"]
 mod core_reboot;
@@ -128,6 +161,7 @@ mod core_tpm_anchor;
     feature = "cser-production",
     feature = "cser-tool-dma-experiment",
     feature = "cser-tool-dma-baseline-experiment",
+    feature = "cser-pio-journal-ktest",
 ))]
 #[path = "cser/core_pio_journal.rs"]
 mod core_pio_journal;
@@ -223,6 +257,12 @@ fn kernel_main() {
 #[ostd::main]
 fn kernel_main() {
     core_runtime_slice::launch()
+}
+
+#[cfg(feature = "cser-smp-smoke")]
+#[ostd::main]
+fn kernel_main() {
+    core_smp_smoke::launch()
 }
 
 #[cfg(feature = "cser-core-dma-recovery")]

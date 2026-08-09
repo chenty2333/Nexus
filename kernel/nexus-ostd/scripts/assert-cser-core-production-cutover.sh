@@ -1049,7 +1049,9 @@ osdk_manifest=$repo_root/kernel/nexus-ostd/OSDK.toml
 declare -A scheme_header_counts=(
     ['[scheme."cser-production"]']=0
     ['[scheme."cser-core-reply-recovery"]']=0
+    ['[scheme."cser-pio-journal-ktest"]']=0
     ['[scheme."cser-core-dma-recovery"]']=0
+    ['[scheme."cser-smp-smoke"]']=0
     ['[scheme."tool-dma-cser"]']=0
     ['[scheme."tool-dma-baseline"]']=0
 )
@@ -1057,7 +1059,9 @@ while IFS= read -r scheme_header; do
     case "$scheme_header" in
         '[scheme."cser-production"]'|\
         '[scheme."cser-core-reply-recovery"]'|\
+        '[scheme."cser-pio-journal-ktest"]'|\
         '[scheme."cser-core-dma-recovery"]'|\
+        '[scheme."cser-smp-smoke"]'|\
         '[scheme."tool-dma-cser"]'|\
         '[scheme."tool-dma-baseline"]')
             ;;
