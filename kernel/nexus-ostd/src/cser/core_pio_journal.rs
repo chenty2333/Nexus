@@ -1457,14 +1457,14 @@ where
             .map_or(0, |header| header.generation);
         let mut previous_head = [0; 32];
         let mut endpoint = None;
-        for index in 0..needed {
+        for (index, &segment) in free.iter().enumerate().take(needed) {
             generation = generation
                 .checked_add(1)
                 .ok_or(BankedJournalError::GenerationExhausted)?;
             let begin = index * VNEXT_SEGMENT_CAPACITY;
             let end = (begin + VNEXT_SEGMENT_CAPACITY).min(image.len());
             let header = self.publish_segment(
-                free[index],
+                segment,
                 generation,
                 generation,
                 previous_head,
