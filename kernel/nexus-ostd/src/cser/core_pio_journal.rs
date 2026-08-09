@@ -29,7 +29,7 @@
 use alloc::vec::Vec;
 use core::{hint::spin_loop, mem::size_of};
 
-use cser_core::{DurableJournalBackend, JournalRecord, JournalRepair};
+use cser_core::{CompactingJournalBackend, DurableJournalBackend, JournalRecord, JournalRepair};
 use ostd::{arch::device::io_port::ReadWriteAccess, io::IoPort};
 use sha2::{Digest as _, Sha256};
 
@@ -670,6 +670,18 @@ pub(crate) struct JournalIoTelemetry {
     pub(crate) phase_tsc: [u64; 6],
 }
 
+/// Read-only snapshot of an explicitly enabled ATA journal measurement.
+///
+/// `image_bytes` is the currently replayable image, not physical device
+/// occupancy.  Phase TSC values are diagnostic/un-calibrated guest samples;
+/// callers must not treat them as wall-clock latency.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct JournalIoSnapshot {
+    pub(crate) counters: JournalIoTelemetry,
+    pub(crate) image_bytes: u64,
+    pub(crate) capacity_bytes: u64,
+}
+
 /// Publication phases indexed by [`JournalIoTelemetry::phase_tsc`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(usize)]
@@ -1004,14 +1016,17 @@ where
         self.backend
     }
 
-    #[cfg(ktest)]
-    fn enable_telemetry(&mut self) {
-        self.telemetry = Some(JournalIoTelemetry::default());
+    fn set_telemetry(&mut self, enabled: bool) {
+        self.telemetry = enabled.then(JournalIoTelemetry::default);
+    }
+
+    fn telemetry(&self) -> Option<JournalIoTelemetry> {
+        self.telemetry
     }
 
     #[cfg(ktest)]
-    fn telemetry(&self) -> Option<JournalIoTelemetry> {
-        self.telemetry
+    fn enable_telemetry(&mut self) {
+        self.set_telemetry(true);
     }
 
     fn read_sector(
@@ -1832,14 +1847,17 @@ where
         self.backend
     }
 
-    #[cfg(ktest)]
-    fn enable_telemetry(&mut self) {
-        self.telemetry = Some(JournalIoTelemetry::default());
+    fn set_telemetry(&mut self, enabled: bool) {
+        self.telemetry = enabled.then(JournalIoTelemetry::default);
+    }
+
+    fn telemetry(&self) -> Option<JournalIoTelemetry> {
+        self.telemetry
     }
 
     #[cfg(ktest)]
-    fn telemetry(&self) -> Option<JournalIoTelemetry> {
-        self.telemetry
+    fn enable_telemetry(&mut self) {
+        self.set_telemetry(true);
     }
 
     fn segment_head(&mut self, previous: [u8; 32], bytes: &[u8]) -> [u8; 32] {
@@ -2018,6 +2036,23 @@ impl AtaPioJournal {
             journal: BankedJournal::open(disk)?,
         })
     }
+
+    /// Enables or disables default-off ATA I/O diagnostics.
+    ///
+    /// This only resets in-memory counters; it never changes journal bytes or
+    /// recovery semantics.
+    pub(crate) fn set_telemetry(&mut self, enabled: bool) {
+        self.journal.set_telemetry(enabled);
+    }
+
+    /// Returns the enabled journal counters and current replay-image usage.
+    pub(crate) fn telemetry(&self) -> Option<JournalIoSnapshot> {
+        self.journal.telemetry().map(|counters| JournalIoSnapshot {
+            counters,
+            image_bytes: self.journal.active.bytes.len() as u64,
+            capacity_bytes: JOURNAL_CAPACITY as u64,
+        })
+    }
 }
 
 impl DurableJournalBackend for AtaPioJournal {
@@ -2060,6 +2095,23 @@ impl AtaPioJournalVNext {
         })
     }
 
+    /// Enables or disables default-off ATA I/O diagnostics.
+    ///
+    /// This only resets in-memory counters; it never changes journal bytes or
+    /// recovery semantics.
+    pub(crate) fn set_telemetry(&mut self, enabled: bool) {
+        self.journal.set_telemetry(enabled);
+    }
+
+    /// Returns the enabled journal counters and current replay-image usage.
+    pub(crate) fn telemetry(&self) -> Option<JournalIoSnapshot> {
+        self.journal.telemetry().map(|counters| JournalIoSnapshot {
+            counters,
+            image_bytes: self.journal.active.bytes.len() as u64,
+            capacity_bytes: VNEXT_CAPACITY as u64,
+        })
+    }
+
     pub(crate) fn append_exact(&mut self, bytes: &[u8]) -> Result<(), AtaPioJournalError> {
         self.journal.append_exact(bytes)
     }
@@ -2078,6 +2130,16 @@ impl DurableJournalBackend for AtaPioJournalVNext {
     type Error = AtaPioJournalError;
     fn append_and_sync(&mut self, record: &JournalRecord) -> Result<(), Self::Error> {
         self.journal.append_exact(record.bytes())
+    }
+}
+
+impl CompactingJournalBackend for AtaPioJournalVNext {
+    fn checkpoint_capacity_bytes(&self) -> usize {
+        VNEXT_CAPACITY
+    }
+
+    fn replace_with_checkpoint(&mut self, checkpoint: &JournalRecord) -> Result<(), Self::Error> {
+        self.journal.checkpoint_exact(checkpoint.bytes())
     }
 }
 
@@ -2738,6 +2800,38 @@ mod tests {
     }
 
     #[ktest]
+    fn pio_vnext_checkpoint_reduces_replay_image_and_survives_second_reopen() {
+        let mut journal = vnext_journal();
+        journal.enable_telemetry();
+        // Leave room for the physical frame header so each append occupies
+        // exactly one segment. Three raw segment-sized payloads would require
+        // a fourth sector-aligned frame fragment and must be rejected by the
+        // up-front physical-capacity check.
+        let payload = vec![0x5a; VNEXT_SEGMENT_CAPACITY - VNEXT_FRAME_HEADER];
+        journal.append_exact(&payload).expect("first segment");
+        journal.append_exact(&payload).expect("second segment");
+        journal.append_exact(&payload).expect("third segment");
+        let before_image = journal.read_all_image().expect("full replay image");
+        let before = journal.telemetry().expect("telemetry enabled");
+
+        journal
+            .checkpoint_exact(b"committed-checkpoint")
+            .expect("compact replacement");
+        let after = journal.telemetry().expect("telemetry enabled");
+        let compacted = journal.read_all_image().expect("compacted replay image");
+        assert_eq!(compacted, b"committed-checkpoint");
+        assert!(compacted.len() < before_image.len());
+        // A replacement writes one alternate segment plus its metadata, not a
+        // second copy of the three-segment replay image it replaces.
+        assert!(after.sectors_written - before.sectors_written < 2 * BANK_DATA_SECTORS as u64);
+
+        let mut once = SegmentedJournalVNext::open(journal.into_backend()).expect("first reopen");
+        assert_eq!(once.read_all_image().expect("first replay"), compacted);
+        let mut twice = SegmentedJournalVNext::open(once.into_backend()).expect("second reopen");
+        assert_eq!(twice.read_all_image().expect("second replay"), compacted);
+    }
+
+    #[ktest]
     fn pio_vnext_spans_segment_boundaries_without_fragmentation() {
         let mut journal = vnext_journal();
         let payload = vec![0x5a; VNEXT_SEGMENT_CAPACITY + 17];
@@ -2847,6 +2941,7 @@ mod tests {
         pio_vnext_corrupt_reopen_fails_closed();
         pio_vnext_rolls_to_segments_then_backpressures_and_recovers_twice();
         pio_vnext_checkpoint_rotates_to_a_single_replayable_replacement();
+        pio_vnext_checkpoint_reduces_replay_image_and_survives_second_reopen();
         pio_vnext_spans_segment_boundaries_without_fragmentation();
         pio_vnext_repair_publishes_early_current_and_zero_prefixes();
         pio_vnext_cow_cut_before_manifest_reopens_old_endpoint();

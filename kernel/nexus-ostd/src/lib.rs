@@ -212,7 +212,10 @@ mod core_crash_probe;
 #[path = "cser/core_tool_uart.rs"]
 mod core_tool_uart;
 
-#[cfg(feature = "cser-tool-dma-experiment")]
+#[cfg(any(
+    feature = "cser-tool-dma-experiment",
+    feature = "cser-tool-dma-baseline-experiment",
+))]
 #[path = "cser/core_tool_adapter.rs"]
 mod core_tool_adapter;
 
@@ -231,6 +234,12 @@ mod core_cser_qemu_runtime;
 #[cfg(feature = "cser-tool-dma-baseline-experiment")]
 #[path = "cser/core_baseline_runtime.rs"]
 mod core_baseline_runtime;
+
+// A deliberately portable, workload-specific upper-bound baseline for the
+// late-bound handoff experiment.  It is not wired to the QEMU baseline.
+#[cfg(feature = "cser-tool-dma-baseline-experiment")]
+#[path = "cser/core_baseline_handoff.rs"]
+mod core_baseline_handoff;
 
 #[cfg(feature = "cser-tool-dma-baseline-experiment")]
 #[path = "cser/core_baseline_experiment.rs"]

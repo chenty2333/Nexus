@@ -793,6 +793,28 @@ test_pio_journal() {
     echo 'CSER_PIO_JOURNAL_KTEST PASS cache=failure=corruption=repair=fill-profile'
 }
 
+# Runs the portable strongest-finalizer handoff upper bound through the same
+# independent baseline feature closure. The selected test name prevents the
+# broader baseline experiment from becoming an accidental test framework.
+test_baseline_handoff() {
+    check_kernel
+    prepare_runner_base
+    container bash -c '
+        set -euo pipefail
+        cp /root/ovmf/release/OVMF_VARS.fd "$HOME/OVMF_VARS.fd"
+        receipt=$(mktemp)
+        trap '\''rm -f "$receipt"'\'' EXIT
+        timeout --signal=TERM --kill-after=2s 90s \
+            cargo osdk test --scheme cser-baseline-handoff-ktest \
+                cser_baseline_handoff_gate 2>&1 | tee "$receipt"
+        grep -F "test nexus_kernel::core_baseline_handoff::tests::cser_baseline_handoff_gate" \
+            "$receipt" >/dev/null
+        grep -F "1 passed; 0 failed" "$receipt" >/dev/null
+    '
+    assert_runner_base
+    echo 'CSER_BASELINE_HANDOFF_KTEST PASS descriptor=receipt=atomic-handoff=exact-coordinate'
+}
+
 # Compile-only gate for the two comparable tool-plus-DMA experiment profiles
 # plus the isolated fresh-media append/checkpoint journal selection.
 #
@@ -2335,11 +2357,11 @@ capture_core_persistent_run() {
     journal_schema=$(sed -n \
         's/^pub const JOURNAL_SCHEMA_VERSION: u16 = \([0-9][0-9]*\);$/\1/p' \
         "$repo_root/crates/cser-core/src/journal.rs")
-    if [[ $core_api_profile != 2 \
-        || $catalog_version != 6 \
-        || $projection_version != 6 \
-        || $snapshot_version != 2 \
-        || $journal_schema != 6 ]]; then
+    if [[ $core_api_profile != 3 \
+        || $catalog_version != 7 \
+        || $projection_version != 7 \
+        || $snapshot_version != 3 \
+        || $journal_schema != 7 ]]; then
         echo "unfrozen CSER coordinates: api=$core_api_profile catalog=$catalog_version projection=$projection_version snapshot=$snapshot_version journal=$journal_schema" >&2
         return 1
     fi
@@ -2378,11 +2400,11 @@ capture_core_persistent_run() {
         'composite_effect=true' \
         'effect_identity=shared' \
         'component_ids=reply+dma' \
-        'api_profile=2' \
-        'catalog_version=6' \
-        'projection_version=6' \
-        'snapshot_version=2' \
-        'journal_schema=6' \
+        'api_profile=3' \
+        'catalog_version=7' \
+        'projection_version=7' \
+        'snapshot_version=3' \
+        'journal_schema=7' \
         'operation_effect_root=50433' \
         'operation_effect_sequence=1' \
         'reply_component_id=1' \
@@ -2407,11 +2429,11 @@ capture_core_persistent_run() {
         "$core_persistent_artifact_dir/boot2-serial.log" \
         'CSER_CORE_PERSISTENT_BOOT2 PASS' \
         'production_registry=single' \
-        'api_profile=2' \
-        'catalog_version=6' \
-        'projection_version=6' \
-        'snapshot_version=2' \
-        'journal_schema=6' \
+        'api_profile=3' \
+        'catalog_version=7' \
+        'projection_version=7' \
+        'snapshot_version=3' \
+        'journal_schema=7' \
         'operation_effect_root=50433' \
         'operation_effect_sequence=1' \
         'reply_component_id=1' \
@@ -2446,11 +2468,11 @@ capture_core_persistent_run() {
         "$core_persistent_artifact_dir/boot3-serial.log" \
         'CSER_CORE_PERSISTENT_BOOT3 PASS' \
         'production_registry=single' \
-        'api_profile=2' \
-        'catalog_version=6' \
-        'projection_version=6' \
-        'snapshot_version=2' \
-        'journal_schema=6' \
+        'api_profile=3' \
+        'catalog_version=7' \
+        'projection_version=7' \
+        'snapshot_version=3' \
+        'journal_schema=7' \
         'operation_effect_root=50433' \
         'operation_effect_sequence=1' \
         'reply_component_id=1' \
@@ -2481,11 +2503,11 @@ capture_core_persistent_run() {
         "$core_persistent_artifact_dir/boot4-serial.log" \
         'CSER_CORE_PERSISTENT_BOOT4 PASS' \
         'production_registry=single' \
-        'api_profile=2' \
-        'catalog_version=6' \
-        'projection_version=6' \
-        'snapshot_version=2' \
-        'journal_schema=6' \
+        'api_profile=3' \
+        'catalog_version=7' \
+        'projection_version=7' \
+        'snapshot_version=3' \
+        'journal_schema=7' \
         'operation_effect_root=50433' \
         'operation_effect_sequence=1' \
         'reply_component_id=1' \
@@ -2685,7 +2707,7 @@ capture_core_persistent_run() {
     schema5_tpm_lease_slot=$(core_schema5_tpm_snapshot_field \
         "$core_schema5_tpm_after" lease_selected_slot '^[01]$')
 
-    combined_receipt="CSER_CORE_PERSISTENT_QEMU_RESTART PASS boots=4 schema5_negative_boot=true schema5_selected_revision=5 schema5_selected_catalog=$core_schema5_fixture_catalog schema5_expected_catalog=$catalog_digest schema5_trusted_tpm_candidate_selected=true schema5_profile2_binding_authorized=false schema5_anchor_binding_match=false schema5_typed_rejection=migration-required schema5_semantic_replay=false schema5_pairing_inference=false schema5_registry_publication=false schema5_device_activation=false schema5_device_guard_retained=true schema5_arena_withheld=true schema5_bus_master_disabled=true schema5_intx_masked=true schema5_reset_status_zero=true schema5_observed_isr_bits=0 schema5_isr_reads_at_least=2 schema5_consecutive_empty_isr_reads=2 schema5_iotlb_used_remapped_iova=true schema5_iotlb_completed_trigger_pages_at_least=1 schema5_pci_bus_master_fence_readback=true schema5_iotlb_completion=true schema5_tpm_selected_nv_unchanged=true schema5_tpm_selected_coordinate_digest=$schema5_tpm_coordinate_digest schema5_tpm_tip_counter_hex=$schema5_tpm_tip_counter schema5_tpm_tip_selected_slot=$schema5_tpm_tip_slot schema5_tpm_lease_counter_hex=$schema5_tpm_lease_counter schema5_tpm_lease_selected_slot=$schema5_tpm_lease_slot shared_runtime=true shared_media=journal+swtpm+ram api_profile=2 catalog_version=$catalog_version projection_version=6 snapshot_version=2 journal_schema=6 composite_effect=shared operation_effect=50433:1 component_ids=1,2 evidence_schemes=reply+dma production_registry=single portal=nxp3 supervisor=core-v1 journal=ata-pio outbox=ata-pio-secondary ram_backend=memory-backend-file ram_backend_offset=0 qemu_ram_mapping=guest-paddr-equals-file-offset anchor=tpm2-nv quarantine=pre-replay-virtio+vtd reply=committed-then-intent-crash-then-settled second_crash=after-durable-apply-intent reconciliation=without-second-intent stable_recovery=true freshness=strictly-increasing projection_sequence=boot-distinct service_principal_generations=1,2,3,4 binding_generations=1,2,3,4 boot1_composite_task_death_exact_reap=true boot1_ingress_closed_rejected=true boot2_fresh_ready_rebind_death_exact_reap=true boot2_ingress_closed_rejected=true boot3_fresh_ready_rebind_live_open=true boot4_fresh_ready_rebind_live_open=true boot3_prior_service_fence=same-boot-exact-reap boot4_prior_service_fence=boot-checkpoint dma_generation_reuse=1->2 dma_generation1_retired=true dma_generation2_retired=true dma_queue=retired retained=0 resource_reuse_authorized=true arena_provider_contract=stable guest_pfn_reuse=true emulated_iova_reuse=true host_backing_file_offset_reuse=true qemu=true physical_hardware=false host_physical_pfn_identity=false physical_dma_drain=false physical_antirollback=false physical_powerloss=false"
+    combined_receipt="CSER_CORE_PERSISTENT_QEMU_RESTART PASS boots=4 schema5_negative_boot=true schema5_selected_revision=5 schema5_selected_catalog=$core_schema5_fixture_catalog schema5_expected_catalog=$catalog_digest schema5_trusted_tpm_candidate_selected=true schema5_profile2_binding_authorized=false schema5_anchor_binding_match=false schema5_typed_rejection=migration-required schema5_semantic_replay=false schema5_pairing_inference=false schema5_registry_publication=false schema5_device_activation=false schema5_device_guard_retained=true schema5_arena_withheld=true schema5_bus_master_disabled=true schema5_intx_masked=true schema5_reset_status_zero=true schema5_observed_isr_bits=0 schema5_isr_reads_at_least=2 schema5_consecutive_empty_isr_reads=2 schema5_iotlb_used_remapped_iova=true schema5_iotlb_completed_trigger_pages_at_least=1 schema5_pci_bus_master_fence_readback=true schema5_iotlb_completion=true schema5_tpm_selected_nv_unchanged=true schema5_tpm_selected_coordinate_digest=$schema5_tpm_coordinate_digest schema5_tpm_tip_counter_hex=$schema5_tpm_tip_counter schema5_tpm_tip_selected_slot=$schema5_tpm_tip_slot schema5_tpm_lease_counter_hex=$schema5_tpm_lease_counter schema5_tpm_lease_selected_slot=$schema5_tpm_lease_slot shared_runtime=true shared_media=journal+swtpm+ram api_profile=3 catalog_version=$catalog_version projection_version=7 snapshot_version=3 journal_schema=7 composite_effect=shared operation_effect=50433:1 component_ids=1,2 evidence_schemes=reply+dma production_registry=single portal=nxp3 supervisor=core-v1 journal=ata-pio outbox=ata-pio-secondary ram_backend=memory-backend-file ram_backend_offset=0 qemu_ram_mapping=guest-paddr-equals-file-offset anchor=tpm2-nv quarantine=pre-replay-virtio+vtd reply=committed-then-intent-crash-then-settled second_crash=after-durable-apply-intent reconciliation=without-second-intent stable_recovery=true freshness=strictly-increasing projection_sequence=boot-distinct service_principal_generations=1,2,3,4 binding_generations=1,2,3,4 boot1_composite_task_death_exact_reap=true boot1_ingress_closed_rejected=true boot2_fresh_ready_rebind_death_exact_reap=true boot2_ingress_closed_rejected=true boot3_fresh_ready_rebind_live_open=true boot4_fresh_ready_rebind_live_open=true boot3_prior_service_fence=same-boot-exact-reap boot4_prior_service_fence=boot-checkpoint dma_generation_reuse=1->2 dma_generation1_retired=true dma_generation2_retired=true dma_queue=retired retained=0 resource_reuse_authorized=true arena_provider_contract=stable guest_pfn_reuse=true emulated_iova_reuse=true host_backing_file_offset_reuse=true qemu=true physical_hardware=false host_physical_pfn_identity=false physical_dma_drain=false physical_antirollback=false physical_powerloss=false"
     combined_receipt+=" focused_test_profiles=profile1-historical focused_test_profiles_are_production=false"
     receipt_header=nexus.cser.production-receipt.v1
     receipt_basename=combined-receipt.txt
@@ -2926,6 +2948,12 @@ case "$command" in
         check_virtio_patch
         test_pio_journal
         ;;
+    test-baseline-handoff)
+        ensure_image
+        check_ostd_patch
+        check_virtio_patch
+        test_baseline_handoff
+        ;;
     run-cser-smp-smoke)
         ensure_image
         bash "$root/scripts/assert-cser-smp-boundary.sh" "$root"
@@ -2966,10 +2994,10 @@ case "$command" in
         rm -rf "$root/target" "$root/artifacts"
         ;;
     -h|--help|help)
-        echo "usage: ./x {doctor|image|fmt|check|clippy|build|run|test|build-core-persistent-recovery|build-tool-dma-experiments|build-cser-smp-smoke|run-cser-smp-smoke|test-pio-journal|run-tool-dma-boot|run-core-persistent-recovery|seal-core-persistent-recovery|test-core-persistent-arena-checker|test-core-schema5-negative-oracles|test-core-schema5-fixture|clean}"
+        echo "usage: ./x {doctor|image|fmt|check|clippy|build|run|test|build-core-persistent-recovery|build-tool-dma-experiments|build-cser-smp-smoke|run-cser-smp-smoke|test-pio-journal|test-baseline-handoff|run-tool-dma-boot|run-core-persistent-recovery|seal-core-persistent-recovery|test-core-persistent-arena-checker|test-core-schema5-negative-oracles|test-core-schema5-fixture|clean}"
         ;;
     *)
-        echo "usage: ./x {doctor|image|fmt|check|clippy|build|run|test|build-core-persistent-recovery|build-tool-dma-experiments|build-cser-smp-smoke|run-cser-smp-smoke|test-pio-journal|run-tool-dma-boot|run-core-persistent-recovery|seal-core-persistent-recovery|test-core-persistent-arena-checker|test-core-schema5-negative-oracles|test-core-schema5-fixture|clean}" >&2
+        echo "usage: ./x {doctor|image|fmt|check|clippy|build|run|test|build-core-persistent-recovery|build-tool-dma-experiments|build-cser-smp-smoke|run-cser-smp-smoke|test-pio-journal|test-baseline-handoff|run-tool-dma-boot|run-core-persistent-recovery|seal-core-persistent-recovery|test-core-persistent-arena-checker|test-core-schema5-negative-oracles|test-core-schema5-fixture|clean}" >&2
         exit 2
         ;;
 esac

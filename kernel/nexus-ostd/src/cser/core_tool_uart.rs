@@ -62,6 +62,9 @@ const UART_POLL_BATCH: u32 = 1 << 12;
 const MAX_LINE_BYTES: usize = 1536;
 const MAX_OPERATION_KEY_BYTES: usize = 64;
 const MAX_PAYLOAD_BYTES: usize = 576;
+/// CSER3 terminal output is deliberately a small descriptor envelope, not a
+/// second streaming data path over COM2.
+pub(crate) const MAX_TERMINAL_OUTPUT_BYTES: usize = 256;
 const RUN_ID_BYTES: usize = 16;
 const RUN_ID_HEX_BYTES: usize = RUN_ID_BYTES * 2;
 const SHA256_HEX_BYTES: usize = 64;
@@ -199,6 +202,14 @@ pub(crate) struct ToolRequest {
     payload: [u8; MAX_PAYLOAD_BYTES],
     payload_len: u16,
     identity: Option<ToolV2Identity>,
+    wire: ToolWireVersion,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ToolWireVersion {
+    V1,
+    V2,
+    V3,
 }
 
 impl ToolRequest {
@@ -220,6 +231,7 @@ impl ToolRequest {
             payload: stored,
             payload_len: payload.len() as u16,
             identity: None,
+            wire: ToolWireVersion::V1,
         })
     }
 
@@ -231,6 +243,18 @@ impl ToolRequest {
     ) -> Result<Self, ToolProtocolError> {
         let mut request = Self::new(run_id, operation, payload)?;
         request.identity = Some(identity);
+        request.wire = ToolWireVersion::V2;
+        Ok(request)
+    }
+
+    pub(crate) fn new_v3(
+        identity: ToolV2Identity,
+        run_id: ToolRunId,
+        operation: OperationKey,
+        payload: &[u8],
+    ) -> Result<Self, ToolProtocolError> {
+        let mut request = Self::new_v2(identity, run_id, operation, payload)?;
+        request.wire = ToolWireVersion::V3;
         Ok(request)
     }
 
@@ -251,6 +275,7 @@ impl ToolRequest {
             payload: [0; MAX_PAYLOAD_BYTES],
             payload_len: 0,
             identity: None,
+            wire: ToolWireVersion::V1,
         }
     }
 
@@ -262,6 +287,18 @@ impl ToolRequest {
     ) -> Self {
         let mut request = Self::get(run_id, operation, payload_digest);
         request.identity = Some(identity);
+        request.wire = ToolWireVersion::V2;
+        request
+    }
+
+    pub(crate) fn get_v3(
+        identity: ToolV2Identity,
+        run_id: ToolRunId,
+        operation: OperationKey,
+        payload_digest: [u8; 32],
+    ) -> Self {
+        let mut request = Self::get_v2(identity, run_id, operation, payload_digest);
+        request.wire = ToolWireVersion::V3;
         request
     }
 }
@@ -283,6 +320,48 @@ pub(crate) struct ToolTerminalRecord {
     payload_digest: [u8; 32],
     outcome: ToolTerminalOutcome,
     record_digest: [u8; 32],
+    output: ToolTerminalOutput,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ToolTerminalOutputKind {
+    None,
+    ChildDescriptorV1,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ToolTerminalOutput {
+    kind: ToolTerminalOutputKind,
+    bytes: [u8; MAX_TERMINAL_OUTPUT_BYTES],
+    len: u16,
+}
+
+impl ToolTerminalOutput {
+    const fn empty() -> Self {
+        Self {
+            kind: ToolTerminalOutputKind::None,
+            bytes: [0; MAX_TERMINAL_OUTPUT_BYTES],
+            len: 0,
+        }
+    }
+    pub(crate) const fn kind(self) -> ToolTerminalOutputKind {
+        self.kind
+    }
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes[..usize::from(self.len)]
+    }
+    pub(crate) fn child_descriptor(bytes: &[u8]) -> Result<Self, ToolProtocolError> {
+        if bytes.is_empty() || bytes.len() > MAX_TERMINAL_OUTPUT_BYTES {
+            return Err(ToolProtocolError::PayloadTooLong);
+        }
+        let mut stored = [0; MAX_TERMINAL_OUTPUT_BYTES];
+        stored[..bytes.len()].copy_from_slice(bytes);
+        Ok(Self {
+            kind: ToolTerminalOutputKind::ChildDescriptorV1,
+            bytes: stored,
+            len: bytes.len() as u16,
+        })
+    }
 }
 
 impl ToolTerminalRecord {
@@ -300,6 +379,46 @@ impl ToolTerminalRecord {
     }
     pub(crate) const fn record_digest(self) -> [u8; 32] {
         self.record_digest
+    }
+    pub(crate) const fn output(self) -> ToolTerminalOutput {
+        self.output
+    }
+
+    /// Test-only construction path that follows the CSER3 terminal digest
+    /// grammar used by the decoder. It cannot manufacture a descriptor with
+    /// an arbitrary digest or an invalid output shape.
+    #[cfg(ktest)]
+    pub(crate) fn succeeded_with_output_for_test(
+        identity: ToolV2Identity,
+        run_id: ToolRunId,
+        operation: OperationKey,
+        payload: &[u8],
+        output: ToolTerminalOutput,
+    ) -> Result<Self, ToolProtocolError> {
+        if output.kind != ToolTerminalOutputKind::ChildDescriptorV1
+            || output.len == 0
+            || usize::from(output.len) > MAX_TERMINAL_OUTPUT_BYTES
+        {
+            return Err(ToolProtocolError::InvalidTerminalRecord);
+        }
+        let payload_digest: [u8; 32] = Sha256::digest(payload).into();
+        Ok(Self {
+            run_id,
+            operation,
+            payload_digest,
+            outcome: ToolTerminalOutcome::Success,
+            record_digest: canonical_evidence_record_digest_v3(
+                identity,
+                run_id,
+                operation.as_bytes(),
+                &payload_digest,
+                b"succeeded",
+                b"success",
+                output.kind,
+                output.bytes(),
+            ),
+            output,
+        })
     }
 }
 
@@ -322,6 +441,7 @@ pub(crate) fn terminal_record_for_test(
             b"applied",
             b"success",
         ),
+        output: ToolTerminalOutput::empty(),
     }
 }
 
@@ -657,7 +777,10 @@ fn encode_request(
 ) -> Result<usize, ToolProtocolError> {
     let mut writer = LineWriter::new(output);
     if let Some(identity) = request.identity {
-        writer.push(b"CSER2 REQ ")?;
+        writer.push(match request.wire {
+            ToolWireVersion::V3 => b"CSER3 REQ ",
+            _ => b"CSER2 REQ ",
+        })?;
         writer.push(match request.method {
             ToolRequestMethod::Post => b"POST",
             ToolRequestMethod::Get => b"GET",
@@ -705,7 +828,10 @@ pub(crate) fn decode_response(
     }
     let without_newline = &line[..line.len() - 1];
     if request.identity.is_some() {
-        return decode_response_v2(without_newline, request);
+        return match request.wire {
+            ToolWireVersion::V3 => decode_response_v3(without_newline, request),
+            _ => decode_response_v2(without_newline, request),
+        };
     }
     let tokens = split_response_tokens(without_newline)?;
     if tokens[0] != b"CSER1" || tokens[1] != b"RESP" {
@@ -765,6 +891,7 @@ pub(crate) fn decode_response(
                 payload_digest,
                 outcome,
                 record_digest,
+                output: ToolTerminalOutput::empty(),
             })
         }
     };
@@ -877,7 +1004,161 @@ fn decode_response_v2(
             payload_digest: request.payload_digest,
             outcome,
             record_digest,
+            output: ToolTerminalOutput::empty(),
         }),
+    })
+}
+
+/// CSER3 adds a typed, bounded terminal output.  Every nonterminal response
+/// must spell all five output/evidence fields as `-`; this prevents a bridge
+/// progress reply from smuggling discovery data into the handoff policy.
+fn decode_response_v3(
+    line: &[u8],
+    request: &ToolRequest,
+) -> Result<ToolResponse, ToolProtocolError> {
+    let identity = request
+        .identity
+        .ok_or(ToolProtocolError::UnexpectedResponse)?;
+    let tokens = split_v3_response_tokens(line)?;
+    if tokens[0] != b"CSER3" || tokens[1] != b"RESP" {
+        return Err(ToolProtocolError::InvalidFrame);
+    }
+    verify_checksum(line, tokens[17])?;
+    if tokens[3] != identity.namespace()
+        || parse_run_id(tokens[4])? != identity.authority
+        || parse_run_id(tokens[5])? != identity.effect
+        || parse_run_id(tokens[6])? != request.run_id
+        || tokens[7] != request.operation.as_bytes()
+        || parse_digest(tokens[8])? != request.payload_digest
+        || parse_digest(tokens[9])? != identity.catalog_digest
+    {
+        return Err(ToolProtocolError::UnexpectedResponse);
+    }
+    let status = parse_status(tokens[2])?;
+    let state = tokens[10];
+    let result = tokens[11];
+    let output_fields = &tokens[12..17];
+    if state == b"accepted" || state == b"pending" || state == b"expired" || state == b"absent" {
+        let expected = if state == b"accepted" || state == b"pending" {
+            202
+        } else if state == b"expired" {
+            410
+        } else {
+            404
+        };
+        if status != expected
+            || (state == b"absent" && result != b"not_found")
+            || output_fields.iter().any(|field| *field != b"-")
+        {
+            return Err(ToolProtocolError::IncompleteTerminalRecord);
+        }
+        return Ok(ToolResponse {
+            status,
+            terminal: None,
+            state: if state == b"accepted" {
+                ToolResponseState::Accepted
+            } else if state == b"pending" {
+                ToolResponseState::Pending
+            } else if state == b"expired" {
+                ToolResponseState::Expired
+            } else {
+                ToolResponseState::Absent
+            },
+        });
+    }
+    let outcome = match state {
+        b"succeeded" if result == b"success" => ToolTerminalOutcome::Success,
+        b"failed" if !result.is_empty() && result.iter().copied().all(is_operation_key_byte) => {
+            ToolTerminalOutcome::Failure
+        }
+        _ => return Err(ToolProtocolError::InvalidTerminalRecord),
+    };
+    if !matches!(status, 200 | 201 | 409) {
+        return Err(ToolProtocolError::IncompleteTerminalRecord);
+    }
+    let output_kind = match output_fields[0] {
+        b"none" => ToolTerminalOutputKind::None,
+        b"child_descriptor_v1" => ToolTerminalOutputKind::ChildDescriptorV1,
+        _ => return Err(ToolProtocolError::InvalidTerminalRecord),
+    };
+    let output_len = parse_decimal(output_fields[1])?;
+    let (decoded, decoded_len) = decode_base64(output_fields[3])?;
+    if usize::from(decoded_len) != output_len || output_len > MAX_TERMINAL_OUTPUT_BYTES {
+        return Err(ToolProtocolError::InvalidTerminalRecord);
+    }
+    let output = ToolTerminalOutput {
+        kind: output_kind,
+        bytes: decoded[..MAX_TERMINAL_OUTPUT_BYTES]
+            .try_into()
+            .unwrap_or([0; MAX_TERMINAL_OUTPUT_BYTES]),
+        len: decoded_len,
+    };
+    if (output_kind == ToolTerminalOutputKind::None) != (decoded_len == 0)
+        || Sha256::digest(output.bytes()).as_slice() != parse_digest(output_fields[2])?
+    {
+        return Err(ToolProtocolError::RecordDigestMismatch);
+    }
+    let evidence = parse_digest(output_fields[4])?;
+    if evidence
+        != canonical_evidence_record_digest_v3(
+            identity,
+            request.run_id,
+            request.operation.as_bytes(),
+            &request.payload_digest,
+            state,
+            result,
+            output_kind,
+            output.bytes(),
+        )
+    {
+        return Err(ToolProtocolError::RecordDigestMismatch);
+    }
+    Ok(ToolResponse {
+        status,
+        state: ToolResponseState::Terminal,
+        terminal: Some(ToolTerminalRecord {
+            run_id: request.run_id,
+            operation: request.operation,
+            payload_digest: request.payload_digest,
+            outcome,
+            record_digest: evidence,
+            output,
+        }),
+    })
+}
+
+fn split_v3_response_tokens(line: &[u8]) -> Result<[&[u8]; 18], ToolProtocolError> {
+    let mut tokens = [&[][..]; 18];
+    let mut start = 0;
+    let mut count = 0;
+    for (index, byte) in line.iter().copied().enumerate() {
+        if byte == b' ' {
+            if index == start || count == 17 {
+                return Err(ToolProtocolError::InvalidFrame);
+            }
+            tokens[count] = &line[start..index];
+            count += 1;
+            start = index + 1;
+        } else if !byte.is_ascii_graphic() {
+            return Err(ToolProtocolError::InvalidFrame);
+        }
+    }
+    if count != 17 || start >= line.len() {
+        return Err(ToolProtocolError::InvalidFrame);
+    }
+    tokens[17] = &line[start..];
+    Ok(tokens)
+}
+
+fn parse_decimal(token: &[u8]) -> Result<usize, ToolProtocolError> {
+    if token.is_empty() || !token.iter().all(|byte| byte.is_ascii_digit()) {
+        return Err(ToolProtocolError::InvalidFrame);
+    }
+    token.iter().try_fold(0usize, |value, byte| {
+        value
+            .checked_mul(10)
+            .and_then(|v| v.checked_add(usize::from(*byte - b'0')))
+            .ok_or(ToolProtocolError::InvalidFrame)
     })
 }
 
@@ -1040,6 +1321,75 @@ fn canonical_evidence_record_digest(
         hasher.update(field);
     }
     hasher.finalize().into()
+}
+
+fn canonical_evidence_record_digest_v3(
+    identity: ToolV2Identity,
+    run_id: ToolRunId,
+    operation: &[u8],
+    input_digest: &[u8; 32],
+    state: &[u8],
+    result: &[u8],
+    output_kind: ToolTerminalOutputKind,
+    output: &[u8],
+) -> [u8; 32] {
+    let mut authority = [0; RUN_ID_HEX_BYTES];
+    encode_hex(&identity.authority.bytes(), &mut authority);
+    let mut effect = [0; RUN_ID_HEX_BYTES];
+    encode_hex(&identity.effect.bytes(), &mut effect);
+    let mut run = [0; RUN_ID_HEX_BYTES];
+    encode_hex(&run_id.bytes(), &mut run);
+    let mut input = [0; SHA256_HEX_BYTES];
+    encode_hex(input_digest, &mut input);
+    let mut catalog = [0; SHA256_HEX_BYTES];
+    encode_hex(&identity.catalog_digest, &mut catalog);
+    let output_digest: [u8; 32] = Sha256::digest(output).into();
+    let mut output_hex = [0; SHA256_HEX_BYTES];
+    encode_hex(&output_digest, &mut output_hex);
+    let (output_len, output_len_bytes) = decimal_bytes(output.len());
+    let kind = match output_kind {
+        ToolTerminalOutputKind::None => b"none" as &[u8],
+        ToolTerminalOutputKind::ChildDescriptorV1 => b"child_descriptor_v1",
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(b"nexus-cser-local-evidence-record-v3");
+    for field in [
+        &identity.namespace()[..],
+        &authority[..],
+        &effect[..],
+        &run[..],
+        operation,
+        &input[..],
+        &catalog[..],
+        b"3",
+        state,
+        result,
+        kind,
+        &output_len[..output_len_bytes],
+        &output_hex[..],
+    ] {
+        hasher.update((field.len() as u64).to_le_bytes());
+        hasher.update(field);
+    }
+    hasher.finalize().into()
+}
+
+fn decimal_bytes(value: usize) -> ([u8; 3], usize) {
+    debug_assert!(value <= MAX_TERMINAL_OUTPUT_BYTES);
+    if value >= 100 {
+        return (
+            [
+                b'0' + (value / 100) as u8,
+                b'0' + ((value / 10) % 10) as u8,
+                b'0' + (value % 10) as u8,
+            ],
+            3,
+        );
+    }
+    if value >= 10 {
+        return ([b'0' + (value / 10) as u8, b'0' + (value % 10) as u8, 0], 2);
+    }
+    ([b'0' + value as u8, 0, 0], 1)
 }
 
 fn parse_run_id(token: &[u8]) -> Result<ToolRunId, ToolProtocolError> {
@@ -1256,6 +1606,8 @@ fn encode_base64(input: &[u8], output: &mut [u8]) -> Result<usize, ToolProtocolE
 
 #[cfg(ktest)]
 mod tests {
+    use ostd::prelude::ktest;
+
     use super::*;
 
     #[ktest]

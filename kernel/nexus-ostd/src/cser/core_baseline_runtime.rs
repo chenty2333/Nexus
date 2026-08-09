@@ -1143,6 +1143,9 @@ fn checksum(bytes: &[u8]) -> u64 {
 
 #[cfg(any(test, ktest))]
 mod tests {
+    #[cfg(ktest)]
+    use ostd::prelude::ktest;
+
     use super::*;
 
     struct AcceptToolReceipt;
@@ -1275,11 +1278,8 @@ mod tests {
         // exercises semantic, rather than torn-write, validation.
         let flags = read_u16(&bytes, 72) | (1 << 3);
         put_u16(&mut bytes, 72, flags);
-        put_u64(
-            &mut bytes,
-            CHECKSUM_OFFSET,
-            checksum(&bytes[..CHECKSUM_OFFSET]),
-        );
+        let record_checksum = checksum(&bytes[..CHECKSUM_OFFSET]);
+        put_u64(&mut bytes, CHECKSUM_OFFSET, record_checksum);
         assert_eq!(
             decode_baseline_record(&bytes, 1),
             Err(BaselineError::RecordCorrupt)

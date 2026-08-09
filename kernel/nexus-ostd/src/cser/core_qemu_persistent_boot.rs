@@ -86,6 +86,13 @@ impl PreparedQemuPersistentBoot {
     pub(crate) fn acquire() -> Result<Self, QemuPersistentBootError> {
         Self::acquire_with(AtaPioJournal::acquire(AtaJournalFixture::PrimaryMaster))
     }
+
+    /// Enables the experiment-only, default-off provider counters before
+    /// recovery consumes this linear boot envelope.
+    pub(crate) fn set_diagnostic_telemetry(&mut self, enabled: bool) {
+        self.journal.set_telemetry(enabled);
+        self.candidate.set_telemetry(enabled);
+    }
 }
 
 impl PreparedQemuPersistentBootVNext {
@@ -96,6 +103,13 @@ impl PreparedQemuPersistentBootVNext {
         Self::acquire_with(AtaPioJournalVNext::acquire(
             AtaJournalFixture::PrimaryMaster,
         ))
+    }
+
+    /// Enables the experiment-only, default-off provider counters before
+    /// recovery consumes this linear boot envelope.
+    pub(crate) fn set_diagnostic_telemetry(&mut self, enabled: bool) {
+        self.journal.set_telemetry(enabled);
+        self.candidate.set_telemetry(enabled);
     }
 }
 

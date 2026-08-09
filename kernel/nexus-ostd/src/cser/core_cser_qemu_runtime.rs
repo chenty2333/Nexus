@@ -13,10 +13,11 @@
 use alloc::sync::Arc;
 use core::fmt;
 use cser_core::{
-    ChargeAccountId, ClaimId, CommandRequest, CoreLimits, DEVICE_DOMAIN, DEVICE_EVIDENCE_IOTLB,
-    DEVICE_EVIDENCE_IRQ_DRAINED, DEVICE_EVIDENCE_RESET, DeviceScopeId, EffectId, PrincipalId,
-    PrincipalIncarnation, RecoveryBinding, RegistryInstance, ResourceGeneration, ResourceId,
-    RootId, TOOL_DMA_COMPONENT_DMA, TOOL_DMA_COMPONENT_TOOL, TransitionOutput, tool_dma_catalog,
+    ChargeAccountId, ClaimId, CommandRequest, CoordinatedPersistence, CoreLimits, DEVICE_DOMAIN,
+    DEVICE_EVIDENCE_IOTLB, DEVICE_EVIDENCE_IRQ_DRAINED, DEVICE_EVIDENCE_RESET, DeviceScopeId,
+    Digest, EffectId, PrincipalId, PrincipalIncarnation, RecoveryBinding, RegistryInstance,
+    ResourceGeneration, ResourceId, RootId, TOOL_DMA_COMPONENT_DMA, TOOL_DMA_COMPONENT_TOOL,
+    TransitionDurability, TransitionOutput, tool_dma_catalog,
 };
 use nexus_ostd_virtio::{
     CompletedRequest, InterruptCompletionProgress, InterruptReceipt, MaskedIntx,
@@ -37,7 +38,8 @@ use super::{
     },
     core_cser_tool_experiment::{
         ToolDmaBarrier, ToolDmaBarrierHook, ToolDmaCoordinates, ToolDmaCoreOwner,
-        ToolDmaResumeState, arm_tool_dma, resume_tool_dma, tool_dma_metrics, tool_dma_terminal,
+        ToolDmaResumeState, arm_tool_dma, dma_reuse_gate_observation, resume_tool_dma,
+        tool_dma_metrics, tool_dma_terminal,
     },
     core_device_quarantine::{
         OstdBootClaimVerifier, OstdBootIrqVerifier, QemuArenaIotlbVerifier,
@@ -45,8 +47,8 @@ use super::{
     },
     core_experiment_dma_flow::{CserResetLiveDma, prepare_live_irq, probe_reset_once},
     core_qemu_persistent_boot::{
-        PreparedQemuPersistentBoot, PreparedQemuPersistentBootVNext, QemuPersistentBoot,
-        QemuPersistentBootVNext, persistent_dma_arena_digest,
+        PreparedQemuPersistentBoot, PreparedQemuPersistentBootVNext, QemuPersistentAnchor,
+        QemuPersistentBoot, QemuPersistentBootVNext, persistent_dma_arena_digest,
     },
     core_runtime::OstdCserRuntime,
     core_tool_adapter::{
@@ -56,6 +58,11 @@ use super::{
     core_tool_dma_runtime::ToolDmaRuntime,
     core_tool_uart::{ToolRunId, ToolUart, ToolV2Identity},
 };
+
+#[cfg(not(feature = "cser-tool-dma-experiment-vnext"))]
+use super::core_pio_journal::AtaPioJournal;
+#[cfg(feature = "cser-tool-dma-experiment-vnext")]
+use super::core_pio_journal::AtaPioJournalVNext;
 
 const EFFECT_ROOT: u64 = 0x544f_4f4c;
 const EFFECT_SEQUENCE: u64 = 1;
@@ -86,6 +93,165 @@ type ExperimentBoot = QemuPersistentBootVNext;
 #[cfg(not(feature = "cser-tool-dma-experiment-vnext"))]
 type ExperimentBoot = QemuPersistentBoot;
 
+#[cfg(feature = "cser-tool-dma-experiment-vnext")]
+type ExperimentJournal = AtaPioJournalVNext;
+#[cfg(not(feature = "cser-tool-dma-experiment-vnext"))]
+type ExperimentJournal = AtaPioJournal;
+type ExperimentRuntime =
+    OstdCserRuntime<CoordinatedPersistence<ExperimentJournal, QemuPersistentAnchor>>;
+
+#[cfg(feature = "cser-tool-dma-experiment-vnext")]
+type VNextRuntime = ExperimentRuntime;
+
+#[cfg(feature = "cser-tool-dma-experiment-vnext")]
+const EXPERIMENT_JOURNAL_FORMAT: &str = "vnext";
+#[cfg(not(feature = "cser-tool-dma-experiment-vnext"))]
+const EXPERIMENT_JOURNAL_FORMAT: &str = "legacy";
+
+/// Emits bounded, non-authoritative provider and runtime diagnostics. This is
+/// deliberately independent of terminal evidence and reuse receipts.
+fn emit_perf(runtime: &ExperimentRuntime, phase: &'static str, run_id: [u8; 16]) {
+    let serialization = runtime.serialization_metrics();
+    let (journal, tpm) = runtime.observe_persistence(|persistence| {
+        (
+            persistence.journal().telemetry().unwrap_or_default(),
+            persistence.anchor().telemetry(),
+        )
+    });
+    println!(
+        "TOOL_DMA_PERF_V1 {{\"version\":1,\"run_id\":\"{}\",\"phase\":\"{}\",\"clock\":\"guest_tsc\",\"calibrated\":false,\"journal_format\":\"{}\",\"runtime_transactions\":{},\"mutex_wait_cycles\":{},\"mutex_max_wait_cycles\":{},\"mutex_hold_cycles\":{},\"mutex_max_hold_cycles\":{},\"journal_sectors_read\":{},\"journal_sectors_written\":{},\"journal_flushes\":{},\"journal_hash_bytes\":{},\"journal_image_bytes\":{},\"journal_capacity_bytes\":{},\"tpm_lease_advances\":{},\"tpm_tip_advances\":{},\"tpm_lease_cycles\":{},\"tpm_tip_cycles\":{}}}",
+        HexRun(run_id),
+        phase,
+        EXPERIMENT_JOURNAL_FORMAT,
+        serialization.transactions,
+        serialization.lock_wait_cycles,
+        serialization.max_lock_wait_cycles,
+        serialization.lock_hold_cycles,
+        serialization.max_lock_hold_cycles,
+        journal.counters.sectors_read,
+        journal.counters.sectors_written,
+        journal.counters.flushes,
+        journal.counters.hash_bytes,
+        journal.image_bytes,
+        journal.capacity_bytes,
+        tpm.recovery_lease_advances,
+        tpm.tip_compare_and_advances,
+        tpm.recovery_lease_cycles,
+        tpm.tip_compare_and_advance_cycles,
+    );
+}
+
+/// Diagnostic receipt emitted only after a vNext checkpoint has been anchored
+/// and its physical replay image has been replaced.  It is separate from the
+/// experiment's terminal evidence receipt so it cannot upgrade a gate or
+/// effect outcome by formatting accident.
+#[cfg(feature = "cser-tool-dma-experiment-vnext")]
+fn compact_vnext_terminal(runtime: &VNextRuntime, phase: &'static str, run_id: [u8; 16]) {
+    let (revision_before, head_before) =
+        runtime.observe(|engine| (engine.revision(), engine.head()));
+    let mut before_replacement = true;
+    let (checkpoint, (logical_before, io_before), (logical_after, io_after)) = runtime
+        .compact_checkpoint_observed(|journal| {
+            // The preimage must be read before its sample; the postimage must
+            // be read after its sample.  This makes the published deltas cover
+            // exactly checkpoint append + physical replacement, rather than
+            // the diagnostic post-read itself.
+            let (bytes, telemetry) = if before_replacement {
+                before_replacement = false;
+                let bytes = journal.read_all()?;
+                let telemetry = journal
+                    .telemetry()
+                    .expect("TOOL_DMA_FAIL stage=vnext-compaction-telemetry");
+                (bytes, telemetry)
+            } else {
+                let telemetry = journal
+                    .telemetry()
+                    .expect("TOOL_DMA_FAIL stage=vnext-compaction-telemetry");
+                let bytes = journal.read_all()?;
+                (bytes, telemetry)
+            };
+            Ok((bytes.len(), telemetry))
+        })
+        .unwrap_or_else(|error| panic!("TOOL_DMA_FAIL stage=vnext-compaction error={:?}", error));
+    let (revision_after, head_after) = runtime.observe(|engine| (engine.revision(), engine.head()));
+    assert_eq!(
+        checkpoint.revision(),
+        revision_after,
+        "TOOL_DMA_FAIL stage=vnext-compaction-revision"
+    );
+    assert_eq!(
+        checkpoint.head(),
+        head_after,
+        "TOOL_DMA_FAIL stage=vnext-compaction-head"
+    );
+    assert_eq!(
+        revision_after,
+        revision_before + 1,
+        "TOOL_DMA_FAIL stage=vnext-compaction-revision-advance"
+    );
+    assert_ne!(
+        head_after, head_before,
+        "TOOL_DMA_FAIL stage=vnext-compaction-head-advance"
+    );
+    assert!(
+        logical_after < logical_before,
+        "TOOL_DMA_FAIL stage=vnext-compaction-size"
+    );
+    let sectors_read_delta = io_after
+        .counters
+        .sectors_read
+        .checked_sub(io_before.counters.sectors_read)
+        .expect("TOOL_DMA_FAIL stage=vnext-compaction-sector-read-counter");
+    let sectors_written_delta = io_after
+        .counters
+        .sectors_written
+        .checked_sub(io_before.counters.sectors_written)
+        .expect("TOOL_DMA_FAIL stage=vnext-compaction-sector-write-counter");
+    let flushes_delta = io_after
+        .counters
+        .flushes
+        .checked_sub(io_before.counters.flushes)
+        .expect("TOOL_DMA_FAIL stage=vnext-compaction-flush-counter");
+    assert!(
+        sectors_written_delta > 0,
+        "TOOL_DMA_FAIL stage=vnext-compaction-sector-write-io"
+    );
+    assert!(
+        flushes_delta > 0,
+        "TOOL_DMA_FAIL stage=vnext-compaction-flush-io"
+    );
+    println!(
+        "CSER_VNEXT_COMPACTION {{\"version\":1,\"run_id\":\"{}\",\"journal_format\":\"vnext\",\"phase\":\"{}\",\"revision_before\":{},\"head_before\":\"{}\",\"revision_after\":{},\"head_after\":\"{}\",\"logical_bytes_before\":{},\"logical_bytes_after\":{},\"sectors_read_delta\":{},\"sectors_written_delta\":{},\"flushes_delta\":{}}}",
+        HexRun(run_id),
+        phase,
+        revision_before,
+        HexDigest(head_before),
+        revision_after,
+        HexDigest(head_after),
+        logical_before,
+        logical_after,
+        sectors_read_delta,
+        sectors_written_delta,
+        flushes_delta,
+    );
+}
+
+/// Formats the fixed-width core digest without allocating a diagnostic
+/// buffer.  The compaction receipt is deliberately separate from both the
+/// gate and terminal-effect receipts.
+#[cfg(feature = "cser-tool-dma-experiment-vnext")]
+struct HexDigest(Digest);
+
+#[cfg(feature = "cser-tool-dma-experiment-vnext")]
+impl fmt::Display for HexDigest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0.bytes() {
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
 /// Runs exactly one fixed first-boot prefix.  Every marker follows a durable
 /// transition or a real endpoint/device action.  The matrix may kill QEMU at
 /// any marker; lack of a terminal marker is deliberately not success.
@@ -99,8 +265,9 @@ pub(crate) fn run() {
         1,
     )
     .expect("valid experiment binding");
-    let prepared = ExperimentPreparedBoot::acquire()
+    let mut prepared = ExperimentPreparedBoot::acquire()
         .unwrap_or_else(|_| panic!("TOOL_DMA_FAIL stage=qemu-persistent-boot"));
+    prepared.set_diagnostic_telemetry(true);
     let arena = prepared.arena();
     let boot = prepared
         .recover(catalog, CoreLimits::bounded_default(), binding)
@@ -166,7 +333,8 @@ fn run_recovery(
             tool_dma_terminal(metrics),
             "TOOL_DMA_FAIL stage=terminal-projection"
         );
-        finish_recovery(boot, metrics, plan.run_id());
+        let reusable = dma_reuse_gate_observation(&boot, effect, false);
+        finish_recovery(boot, metrics, plan.run_id(), None, reusable);
     }
 
     // Consume an existing tool intent before fencing: fencing intentionally
@@ -217,6 +385,10 @@ fn run_recovery(
     ) {
         panic!("TOOL_DMA_FAIL stage=missing-tool-intent");
     }
+    // This is a real replayed live DMA coordinate, not a synthetic allocator
+    // state.  The read-only gate must reject it before any reset/IRQ/IOTLB
+    // evidence is consumed, preserving the exact journal revision and head.
+    let retained_gate = dma_reuse_gate_observation(&boot, effect, true);
     reconcile_tool(&mut boot, effect, successor, tool, observation, || {});
     reconcile_boot_dma(&mut boot, effect, arena);
 
@@ -225,26 +397,46 @@ fn run_recovery(
         tool_dma_terminal(metrics),
         "recovery left CSER claims retained"
     );
-    finish_recovery(boot, metrics, plan.run_id());
+    let reusable = dma_reuse_gate_observation(&boot, effect, false);
+    finish_recovery(boot, metrics, plan.run_id(), Some(retained_gate), reusable);
 }
 
 fn finish_recovery(
     boot: ExperimentBoot,
     metrics: super::core_cser_tool_experiment::ToolDmaMetrics,
     run_id: [u8; 16],
+    retained_gate: Option<super::core_cser_tool_experiment::DmaReuseGateObservation>,
+    reusable_gate: super::core_cser_tool_experiment::DmaReuseGateObservation,
 ) -> ! {
     let activated = boot
         .try_activate()
         .unwrap_or_else(|_| panic!("TOOL_DMA_FAIL stage=recovery-activation"));
     // Activation is the final gate observation: printing before it would turn
-    // a merely replayed terminal projection into a false reuse claim.
-    let _ = activated;
+    // a merely replayed terminal projection into a false reuse claim.  The
+    // fresh vNext path additionally compacts this terminal state before its
+    // standalone diagnostic receipt; legacy media remains append-only.
+    let (engine, persistence, _devices) = activated.into_parts();
+    let runtime = OstdCserRuntime::from_engine(engine, persistence);
+    runtime.set_serialization_timing(true);
+    #[cfg(feature = "cser-tool-dma-experiment-vnext")]
+    compact_vnext_terminal(&runtime, "recovery", run_id);
+    emit_perf(&runtime, "terminal-recovery", run_id);
     println!(
-        "TOOL_DMA_RECOVERY_METRICS {{\"variant\":\"cser\",\"run_id\":\"{}\",\"terminal\":true,\"invariants_ok\":true,\"retired_by_evidence\":{},\"retained_claims\":{},\"gate_rejections\":null,\"reconciliation_delay_ms\":null,\"reconciliation_steps\":{},\"reconciliation_delay_unit\":\"unmeasured\",\"topology_registered\":true,\"tool_finalized\":true,\"dma_finalized\":true,\"reuse_authorized\":false}}",
+        "TOOL_DMA_RECOVERY_METRICS {{\"variant\":\"cser\",\"run_id\":\"{}\",\"terminal\":true,\"invariants_ok\":true,\"retired_by_evidence\":{},\"retained_claims\":{},\"gate_rejections\":null,\"reconciliation_delay_ms\":null,\"reconciliation_steps\":{},\"reconciliation_delay_unit\":\"unmeasured\",\"topology_registered\":true,\"tool_finalized\":true,\"dma_finalized\":true,\"reuse_authorized\":false,\"dma_retained_gate\":{},\"dma_reusable_gate\":{{\"resource_id_raw\":{},\"generation\":{},\"retained\":{},\"gate_result\":\"{}\",\"revision_unchanged\":{},\"head_unchanged\":{}}}}}",
         HexRun(run_id),
         metrics.retired_components,
         metrics.retained_claims,
         metrics.reconciliation_steps,
+        retained_gate.map_or_else(
+            || "null".into(),
+            |gate| alloc::format!("{{\"resource_id_raw\":{},\"generation\":{},\"retained\":{},\"gate_result\":\"{}\",\"revision_unchanged\":{},\"head_unchanged\":{}}}", gate.resource_id_raw, gate.generation, gate.retained, gate.gate_result, gate.revision_unchanged, gate.head_unchanged),
+        ),
+        reusable_gate.resource_id_raw,
+        reusable_gate.generation,
+        reusable_gate.retained,
+        reusable_gate.gate_result,
+        reusable_gate.revision_unchanged,
+        reusable_gate.head_unchanged,
     );
     poweroff(ExitCode::Success)
 }
@@ -543,6 +735,7 @@ fn run_initial(
         .unwrap_or_else(|_| panic!("TOOL_DMA_FAIL stage=empty-boot-activation"));
     let (engine, persistence, devices) = activated.into_parts();
     let mut runtime = OstdCserRuntime::from_engine(engine, persistence);
+    runtime.set_serialization_timing(true);
     let (root, masked_intx, device) = devices.into_parts();
     let mut live = LiveCserDma::new(root, masked_intx, device);
     let prepared = prepare_live_irq(&mut live.device, &mut live.root)
@@ -598,6 +791,7 @@ fn run_initial(
     runtime
         .transact(dma_acknowledgement)
         .unwrap_or_else(|_| panic!("TOOL_DMA_FAIL stage=durable-dma-commit-ack"));
+    let retained_gate = dma_reuse_gate_observation(&runtime, effect, true);
     // Both early cut numbers intentionally observe the same first prefix:
     // it already contains a real DMA publication plus its durable local ack,
     // so recovery never has to invent a lost queue owner.
@@ -669,12 +863,28 @@ fn run_initial(
     barriers
         .reached(ToolDmaBarrier::ComponentsRetired)
         .unwrap_or_else(|_| panic!("TOOL_DMA_FAIL stage=barrier-7"));
+    let reusable_gate = dma_reuse_gate_observation(&runtime, effect, false);
+    #[cfg(feature = "cser-tool-dma-experiment-vnext")]
+    compact_vnext_terminal(&runtime, "initial", run_id);
+    emit_perf(&runtime, "terminal-initial", run_id);
     println!(
-        "TOOL_DMA_RECOVERY_METRICS {{\"variant\":\"cser\",\"run_id\":\"{}\",\"terminal\":true,\"invariants_ok\":true,\"retired_by_evidence\":{},\"retained_claims\":{},\"gate_rejections\":null,\"reconciliation_delay_ms\":null,\"reconciliation_steps\":{},\"reconciliation_delay_unit\":\"unmeasured\",\"topology_registered\":true,\"tool_finalized\":true,\"dma_finalized\":true,\"reuse_authorized\":false}}",
+        "TOOL_DMA_RECOVERY_METRICS {{\"variant\":\"cser\",\"run_id\":\"{}\",\"terminal\":true,\"invariants_ok\":true,\"retired_by_evidence\":{},\"retained_claims\":{},\"gate_rejections\":null,\"reconciliation_delay_ms\":null,\"reconciliation_steps\":{},\"reconciliation_delay_unit\":\"unmeasured\",\"topology_registered\":true,\"tool_finalized\":true,\"dma_finalized\":true,\"reuse_authorized\":false,\"dma_retained_gate\":{{\"resource_id_raw\":{},\"generation\":{},\"retained\":{},\"gate_result\":\"{}\",\"revision_unchanged\":{},\"head_unchanged\":{}}},\"dma_reusable_gate\":{{\"resource_id_raw\":{},\"generation\":{},\"retained\":{},\"gate_result\":\"{}\",\"revision_unchanged\":{},\"head_unchanged\":{}}}}}",
         HexRun(run_id),
         metrics.retired_components,
         metrics.retained_claims,
         metrics.reconciliation_steps,
+        retained_gate.resource_id_raw,
+        retained_gate.generation,
+        retained_gate.retained,
+        retained_gate.gate_result,
+        retained_gate.revision_unchanged,
+        retained_gate.head_unchanged,
+        reusable_gate.resource_id_raw,
+        reusable_gate.generation,
+        reusable_gate.retained,
+        reusable_gate.gate_result,
+        reusable_gate.revision_unchanged,
+        reusable_gate.head_unchanged,
     );
     poweroff(ExitCode::Success)
 }
@@ -796,9 +1006,9 @@ impl LiveCserDma {
         panic!("TOOL_DMA_FAIL stage=live-irq-turn-limit")
     }
 
-    fn close_real(
+    fn close_real<P: TransitionDurability>(
         &mut self,
-        runtime: &mut OstdCserRuntime<super::core_qemu_persistent_boot::QemuPersistentDurability>,
+        runtime: &mut OstdCserRuntime<P>,
         request: super::core_experiment_dma_flow::BaselineLiveDma,
         cohort: super::core_dma_adapter::CoreDmaCohort,
     ) {
@@ -824,9 +1034,9 @@ impl LiveCserDma {
         self.retire_real(runtime, reset, cohort);
     }
 
-    fn retire_real(
+    fn retire_real<P: TransitionDurability>(
         &mut self,
-        runtime: &mut OstdCserRuntime<super::core_qemu_persistent_boot::QemuPersistentDurability>,
+        runtime: &mut OstdCserRuntime<P>,
         reset: CserResetLiveDma,
         cohort: super::core_dma_adapter::CoreDmaCohort,
     ) {

@@ -97,6 +97,30 @@ qemu.args = """\
     -drive if=pflash,format=raw,unit=1,file=/tmp/nexus-home/OVMF_VARS.fd \
 """
 
+# The portable strongest-finalizer handoff upper bound has no device, UART,
+# media, or TPM dependency. Keep its OSDK gate separate from the full baseline
+# experiment scheme, whose host bridge sockets intentionally wait for a matrix
+# controller.
+[scheme."cser-baseline-handoff-ktest"]
+build.no_default_features = true
+build.features = ["cser-tool-dma-baseline-experiment"]
+qemu.args = """\
+    -nodefaults \
+    -machine q35,kernel-irqchip=split \
+    -accel tcg,thread=single \
+    -cpu Icelake-Server,+x2apic \
+    -m 1G \
+    -smp 1 \
+    -no-reboot \
+    -display none \
+    -monitor none \
+    -chardev stdio,id=serial0,signal=off \
+    -serial chardev:serial0 \
+    -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
+    -drive if=pflash,format=raw,unit=0,readonly=on,file=/root/ovmf/release/OVMF.fd \
+    -drive if=pflash,format=raw,unit=1,file=/tmp/nexus-home/OVMF_VARS.fd \
+"""
+
 [scheme."cser-core-dma-recovery"]
 build.no_default_features = true
 build.features = ["cser-core-dma-recovery"]

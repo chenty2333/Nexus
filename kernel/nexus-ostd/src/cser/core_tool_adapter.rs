@@ -10,9 +10,10 @@
 //! lost response cannot create a new external operation.
 
 use cser_core::{
-    ClaimId, ClaimScope, ComponentId, Digest, EffectFactChallenge, EffectFactKind, EffectId,
-    EffectReceiptVerifier, EvidenceChallenge, ExternalOutcome, ReceiptVerifier, ResourceGeneration,
-    ResourceId, TOOL_APPLY_RECEIPT_SCHEMA, TOOL_COMMIT_RECEIPT_SCHEMA, TOOL_DOMAIN,
+    ChargeAccountId, ClaimId, ClaimScope, CommandRequest, ComponentId, Digest, EffectFactChallenge,
+    EffectFactKind, EffectId, EffectReceiptVerifier, EvidenceChallenge, ExternalOutcome,
+    PrincipalIncarnation, ReceiptVerifier, ResourceGeneration, ResourceId, RootId,
+    TOOL_APPLY_RECEIPT_SCHEMA, TOOL_CLAIM_OUTCOME_SLOT, TOOL_COMMIT_RECEIPT_SCHEMA, TOOL_DOMAIN,
     TOOL_EVIDENCE_OUTCOME_ACK, TOOL_OBLIGATION_INVOCATION, TOOL_RECEIPT_SCHEMA,
     TOOL_SETTLEMENT_RECEIPT_SCHEMA, TOOL_VERIFIER, VerificationError, VerifiedEffectObservation,
     VerifiedObservation, VerifierIdentity,
@@ -21,11 +22,23 @@ use sha2::{Digest as _, Sha256};
 
 use super::core_tool_uart::{
     OperationKey, ToolRequest, ToolResponse, ToolResponseState, ToolRunId, ToolTerminalOutcome,
-    ToolTerminalRecord, ToolUart, ToolUartError, ToolV2Identity,
+    ToolTerminalOutput, ToolTerminalOutputKind, ToolTerminalRecord, ToolUart, ToolUartError,
+    ToolV2Identity,
 };
 
 /// Must remain no larger than the bounded UART transport's payload limit.
 const MAX_TOOL_PAYLOAD_BYTES: usize = 576;
+
+/// SHA-256("nexus-cser-tool-provider-child-route-v1"). This fixed provider
+/// route is part of the descriptor receipt; callers cannot choose it.
+const PROVIDER_CHILD_ROUTE: Digest = Digest::new([
+    0x28, 0x73, 0x2d, 0x53, 0x5f, 0x4e, 0x48, 0xd4, 0x10, 0xef, 0x5b, 0x74, 0x93, 0x24, 0x56, 0x41,
+    0xb3, 0x2d, 0xe7, 0xa5, 0xfa, 0x0d, 0xfa, 0x7b, 0x5d, 0xfc, 0xf0, 0x44, 0xfd, 0x00, 0x16, 0x0c,
+]);
+
+const fn provider_child_route() -> Digest {
+    PROVIDER_CHILD_ROUTE
+}
 
 /// Immutable pre-submit identity of one queryable tool operation.
 ///
@@ -48,6 +61,8 @@ pub(crate) struct ToolOperationPlan {
     payload_len: u16,
     operation_digest: Digest,
     transport_identity: Option<ToolV2Identity>,
+    cser3_output: bool,
+    child_route: Option<Digest>,
 }
 
 impl ToolOperationPlan {
@@ -61,7 +76,77 @@ impl ToolOperationPlan {
         catalog_digest: Digest,
         payload: &[u8],
     ) -> Result<Self, ToolPlanError> {
-        if component != cser_core::TOOL_DMA_COMPONENT_TOOL || payload.is_empty() {
+        if component != cser_core::TOOL_DMA_COMPONENT_TOOL {
+            return Err(ToolPlanError::InvalidCoordinate);
+        }
+        Self::new_restricted(
+            run_id,
+            effect,
+            component,
+            claim,
+            resource,
+            resource_generation,
+            catalog_digest,
+            payload,
+        )
+    }
+
+    /// Source-side CSER3 plan for the catalog-defined handoff provider.
+    pub(crate) fn handoff_source(
+        run_id: [u8; 16],
+        effect: EffectId,
+        claim: ClaimId,
+        resource: ResourceId,
+        resource_generation: ResourceGeneration,
+        catalog_digest: Digest,
+        payload: &[u8],
+    ) -> Result<Self, ToolPlanError> {
+        Self::new_restricted(
+            run_id,
+            effect,
+            cser_core::TOOL_HANDOFF_SOURCE_COMPONENT,
+            claim,
+            resource,
+            resource_generation,
+            catalog_digest,
+            payload,
+        )
+    }
+
+    /// Child-side plan constructor. It never enables CSER3 descriptor ingress:
+    /// that authority belongs exclusively to the source provider above.
+    pub(crate) fn handoff_child(
+        run_id: [u8; 16],
+        effect: EffectId,
+        claim: ClaimId,
+        resource: ResourceId,
+        resource_generation: ResourceGeneration,
+        catalog_digest: Digest,
+        payload: &[u8],
+    ) -> Result<Self, ToolPlanError> {
+        Self::new_restricted(
+            run_id,
+            effect,
+            cser_core::TOOL_HANDOFF_COMPONENT,
+            claim,
+            resource,
+            resource_generation,
+            catalog_digest,
+            payload,
+        )
+    }
+
+    fn new_restricted(
+        run_id: [u8; 16],
+        effect: EffectId,
+        component: ComponentId,
+        claim: ClaimId,
+        resource: ResourceId,
+        resource_generation: ResourceGeneration,
+        catalog_digest: Digest,
+        payload: &[u8],
+    ) -> Result<Self, ToolPlanError> {
+        if payload.is_empty() {
             return Err(ToolPlanError::InvalidCoordinate);
         }
         if payload.len() > MAX_TOOL_PAYLOAD_BYTES {
@@ -104,6 +189,8 @@ impl ToolOperationPlan {
             payload_len: payload.len() as u16,
             operation_digest,
             transport_identity: None,
+            cser3_output: false,
+            child_route: None,
         })
     }
 
@@ -124,6 +211,30 @@ impl ToolOperationPlan {
             ],
         );
         self.transport_identity = Some(identity);
+        self
+    }
+
+    /// Select the output-bearing CSER3 wire contract for a discovered child.
+    /// Existing tool/DMA profiles retain CSER2 and therefore cannot acquire a
+    /// descriptor accidentally.
+    pub(crate) fn bind_cser3(mut self, identity: ToolV2Identity) -> Self {
+        if self.component != cser_core::TOOL_HANDOFF_SOURCE_COMPONENT {
+            return self;
+        }
+        self.transport_identity = Some(identity);
+        self.cser3_output = true;
+        self.child_route = Some(provider_child_route());
+        self.operation_digest = hash_parts(
+            b"nexus-cser-tool-operation-v3",
+            &[
+                &self.operation_digest.bytes(),
+                &identity.request_binding_digest(
+                    ToolRunId::new(self.run_id),
+                    &self.operation_key_hex(),
+                    self.payload_digest.bytes(),
+                ),
+            ],
+        );
         self
     }
 
@@ -171,6 +282,9 @@ impl ToolOperationPlan {
     pub(crate) const fn operation_digest(self) -> Digest {
         self.operation_digest
     }
+    pub(crate) const fn child_route(self) -> Option<Digest> {
+        self.child_route
+    }
 
     /// Stable settlement intent.  It deliberately names the already durable
     /// endpoint record rather than a second external action.
@@ -202,6 +316,7 @@ pub(crate) struct DurableToolObservation {
     plan: ToolOperationPlan,
     outcome: ExternalOutcome,
     endpoint_record_digest: Digest,
+    terminal_output: ToolTerminalOutput,
 }
 
 impl DurableToolObservation {
@@ -224,6 +339,7 @@ impl DurableToolObservation {
             plan,
             outcome,
             endpoint_record_digest,
+            terminal_output: record.output(),
         })
     }
 
@@ -232,6 +348,12 @@ impl DurableToolObservation {
     }
     pub(crate) const fn outcome(self) -> ExternalOutcome {
         self.outcome
+    }
+    pub(crate) const fn terminal_output(self) -> ToolTerminalOutput {
+        self.terminal_output
+    }
+    pub(crate) const fn terminal_record_digest(self) -> Digest {
+        self.endpoint_record_digest
     }
 
     fn receipt_digest(self, label: &[u8]) -> Digest {
@@ -347,6 +469,12 @@ impl ToolEndpoint for UartToolEndpoint<'_> {
 
     fn post(&mut self, plan: ToolOperationPlan) -> Result<ToolEndpointObservation, Self::Error> {
         let request = match plan.transport_identity {
+            Some(identity) if plan.cser3_output => ToolRequest::new_v3(
+                identity,
+                ToolRunId::new(plan.run_id()),
+                Self::operation(plan)?,
+                plan.payload(),
+            ),
             Some(identity) => ToolRequest::new_v2(
                 identity,
                 ToolRunId::new(plan.run_id()),
@@ -369,6 +497,12 @@ impl ToolEndpoint for UartToolEndpoint<'_> {
 
     fn get(&mut self, plan: ToolOperationPlan) -> Result<ToolEndpointObservation, Self::Error> {
         let request = match plan.transport_identity {
+            Some(identity) if plan.cser3_output => ToolRequest::get_v3(
+                identity,
+                ToolRunId::new(plan.run_id()),
+                Self::operation(plan)?,
+                plan.payload_digest().bytes(),
+            ),
             Some(identity) => ToolRequest::get_v2(
                 identity,
                 ToolRunId::new(plan.run_id()),
@@ -575,11 +709,89 @@ fn hash_parts(label: &[u8], parts: &[&[u8]]) -> Digest {
     Digest::new(hasher.finalize().into())
 }
 
+/// Verifies a canonical core descriptor carried by one successful, durable
+/// CSER3 terminal record. The descriptor is data; the resulting core token is
+/// the only authority accepted by guarded handoff commands.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ToolChildDescriptorVerifier {
+    plan: ToolOperationPlan,
+}
+
+impl ToolChildDescriptorVerifier {
+    pub(crate) const fn new(plan: ToolOperationPlan) -> Option<Self> {
+        if plan.cser3_output && plan.child_route.is_some() {
+            Some(Self { plan })
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn decode(
+        &self,
+        observation: DurableToolObservation,
+    ) -> Result<cser_core::ChildDescriptorV1, ToolObservationError> {
+        if observation.plan != self.plan || observation.outcome != ExternalOutcome::Success {
+            return Err(ToolObservationError::PlanRecordMismatch);
+        }
+        decode_core_child_descriptor(observation.terminal_output)
+    }
+}
+
+impl cser_core::ChildDescriptorVerifier for ToolChildDescriptorVerifier {
+    type Receipt = DurableToolObservation;
+
+    fn verify_child_descriptor(
+        &self,
+        descriptor: cser_core::ChildDescriptorV1,
+        observation: &DurableToolObservation,
+    ) -> Result<Digest, VerificationError> {
+        if observation.plan != self.plan
+            || observation.outcome != ExternalOutcome::Success
+            || self
+                .decode(*observation)
+                .map_err(|_| VerificationError::Rejected)?
+                != descriptor
+            || descriptor.parent != self.plan.effect()
+            || descriptor.parent_component != self.plan.component()
+            || descriptor.catalog_digest != self.plan.catalog_digest()
+            || descriptor.route_digest
+                != self.plan.child_route().ok_or(VerificationError::Rejected)?
+            || descriptor.input_digest != self.plan.payload_digest()
+            || descriptor.schema != 1
+            || descriptor.sequence != 1
+        {
+            return Err(VerificationError::Rejected);
+        }
+        Ok(hash_parts(
+            b"nexus-cser-tool-child-descriptor-v1",
+            &[
+                &observation.endpoint_record_digest.bytes(),
+                &descriptor.catalog_digest.bytes(),
+                &descriptor.route_digest.bytes(),
+                &descriptor.input_digest.bytes(),
+            ],
+        ))
+    }
+}
+
+fn decode_core_child_descriptor(
+    output: ToolTerminalOutput,
+) -> Result<cser_core::ChildDescriptorV1, ToolObservationError> {
+    if output.kind() != ToolTerminalOutputKind::ChildDescriptorV1
+        || output.bytes().len() != cser_core::CHILD_DESCRIPTOR_V1_WIRE_LEN
+    {
+        return Err(ToolObservationError::PlanRecordMismatch);
+    }
+    cser_core::ChildDescriptorV1::decode_wire(output.bytes())
+        .map_err(|_| ToolObservationError::PlanRecordMismatch)
+}
+
 #[cfg(ktest)]
 mod tests {
     use super::*;
     use crate::core_tool_uart::{
-        OperationKey, ToolResponse, ToolRunId, ToolV2Identity, terminal_record_for_test,
+        OperationKey, ToolResponse, ToolRunId, ToolTerminalOutput, ToolTerminalRecord,
+        ToolV2Identity, terminal_record_for_test,
     };
     use cser_core::{ClaimId, ComponentId, EffectId, ResourceGeneration, ResourceId, RootId};
 
@@ -704,6 +916,129 @@ mod tests {
         assert_eq!(
             UartToolEndpoint::observation(plan, ToolResponse::missing_terminal_for_test(500)),
             Err(ToolTransportError::NoTerminalRecord { status: 500 }),
+        );
+    }
+
+    #[test]
+    fn canonical_core_child_descriptor_wire_is_the_only_accepted_shape() {
+        let parent = EffectId::new(RootId::new(9).unwrap(), 2).unwrap();
+        let descriptor = cser_core::ChildDescriptorV1 {
+            schema: 1,
+            sequence: 1,
+            parent,
+            parent_component: cser_core::TOOL_HANDOFF_COMPONENT,
+            route_digest: Digest::new([1; 32]),
+            child_kind: cser_core::TOOL_HANDOFF_CHILD_COMPOSITE,
+            child_component: cser_core::TOOL_HANDOFF_COMPONENT,
+            claim: ClaimId::new(7).unwrap(),
+            claim_kind: cser_core::TOOL_CLAIM_OUTCOME_SLOT,
+            scope: cser_core::ClaimScope::Logical,
+            resource: ResourceId::new(8).unwrap(),
+            resource_generation: ResourceGeneration::new(1).unwrap(),
+            units: 1,
+            input_digest: Digest::new([2; 32]),
+            catalog_digest: Digest::new([3; 32]),
+        };
+        let wire = descriptor.encode_wire();
+        assert_eq!(wire.len(), cser_core::CHILD_DESCRIPTOR_V1_WIRE_LEN);
+        let output = ToolTerminalOutput::child_descriptor(&wire).unwrap();
+        assert_eq!(decode_core_child_descriptor(output), Ok(descriptor));
+        let mut altered = wire;
+        altered[0] ^= 1;
+        assert_eq!(
+            decode_core_child_descriptor(ToolTerminalOutput::child_descriptor(&altered).unwrap()),
+            Err(ToolObservationError::PlanRecordMismatch),
+        );
+    }
+
+    #[test]
+    fn child_descriptor_verifier_binds_live_terminal_plan_fields() {
+        let parent = EffectId::new(RootId::new(21).unwrap(), 2).unwrap();
+        let payload = b"handoff-input";
+        let catalog = cser_core::tool_dma_catalog().digest();
+        let identity = ToolV2Identity::new(
+            b"tool",
+            ToolRunId::new([3; 16]),
+            ToolRunId::new([4; 16]),
+            catalog.bytes(),
+        )
+        .unwrap();
+        let route = provider_child_route();
+        let plan = ToolOperationPlan::handoff_source(
+            [6; 16],
+            parent,
+            ClaimId::new(7).unwrap(),
+            ResourceId::new(8).unwrap(),
+            ResourceGeneration::new(1).unwrap(),
+            catalog,
+            payload,
+        )
+        .unwrap()
+        .bind_cser3(identity);
+        let descriptor = cser_core::ChildDescriptorV1 {
+            schema: 1,
+            sequence: 1,
+            parent,
+            parent_component: cser_core::TOOL_HANDOFF_SOURCE_COMPONENT,
+            route_digest: route,
+            child_kind: cser_core::TOOL_HANDOFF_CHILD_COMPOSITE,
+            child_component: cser_core::TOOL_HANDOFF_COMPONENT,
+            claim: ClaimId::new(7).unwrap(),
+            claim_kind: cser_core::TOOL_CLAIM_OUTCOME_SLOT,
+            scope: cser_core::ClaimScope::Logical,
+            resource: ResourceId::new(8).unwrap(),
+            resource_generation: ResourceGeneration::new(1).unwrap(),
+            units: 1,
+            input_digest: plan.payload_digest(),
+            catalog_digest: catalog,
+        };
+        let record = ToolTerminalRecord::succeeded_with_output_for_test(
+            identity,
+            ToolRunId::new([6; 16]),
+            OperationKey::new(&plan.operation_key_hex()).unwrap(),
+            payload,
+            ToolTerminalOutput::child_descriptor(&descriptor.encode_wire()).unwrap(),
+        )
+        .unwrap();
+        let observation = DurableToolObservation::from_terminal_record(plan, record).unwrap();
+        let verifier = ToolChildDescriptorVerifier::new(plan).unwrap();
+        assert!(
+            cser_core::ChildDescriptorVerifier::verify_child_descriptor(
+                &verifier,
+                descriptor,
+                &observation
+            )
+            .is_ok()
+        );
+        let mut wrong_route = descriptor;
+        wrong_route.route_digest = Digest::new([9; 32]);
+        assert!(
+            cser_core::ChildDescriptorVerifier::verify_child_descriptor(
+                &verifier,
+                wrong_route,
+                &observation
+            )
+            .is_err()
+        );
+        let mut wrong_input = descriptor;
+        wrong_input.input_digest = Digest::new([10; 32]);
+        assert!(
+            cser_core::ChildDescriptorVerifier::verify_child_descriptor(
+                &verifier,
+                wrong_input,
+                &observation
+            )
+            .is_err()
+        );
+        let mut wrong_catalog = descriptor;
+        wrong_catalog.catalog_digest = Digest::new([11; 32]);
+        assert!(
+            cser_core::ChildDescriptorVerifier::verify_child_descriptor(
+                &verifier,
+                wrong_catalog,
+                &observation
+            )
+            .is_err()
         );
     }
 }

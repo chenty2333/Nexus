@@ -100,18 +100,18 @@ done
 [[ -d $cser_source_root && ! -L $cser_source_root ]] \
     || fail "CSER source root is not a directory: $cser_source_root"
 
-grep -Fxq 'pub const CSER_CORE_API_PROFILE_VERSION: u16 = 2;' "$core_lib" \
-    || fail 'portable core API profile 2 is not frozen at the cutover'
-grep -Fxq 'pub const STANDARD_CATALOG_VERSION: u16 = 6;' "$core_lib" \
-    || fail 'portable standard catalog v6 is not frozen at the cutover'
-grep -Fxq 'pub const PROJECTION_VERSION: u16 = 6;' "$core_lib" \
-    || fail 'portable projection v6 is not frozen at the cutover'
-grep -Fxq 'pub const RECOVERY_SNAPSHOT_VERSION: u16 = 2;' "$core_lib" \
-    || fail 'portable recovery snapshot v2 is not frozen at the cutover'
-grep -Fxq 'pub const JOURNAL_MAGIC: [u8; 8] = *b"CSERJR6\0";' "$core_journal" \
-    || fail 'portable core journal magic is not bound to schema 6'
-grep -Fxq 'pub const JOURNAL_SCHEMA_VERSION: u16 = 6;' "$core_journal" \
-    || fail 'portable core journal schema 6 is not frozen at the cutover'
+grep -Fxq 'pub const CSER_CORE_API_PROFILE_VERSION: u16 = 3;' "$core_lib" \
+    || fail 'portable core API profile 3 is not frozen at the cutover'
+grep -Fxq 'pub const STANDARD_CATALOG_VERSION: u16 = 7;' "$core_lib" \
+    || fail 'portable standard catalog v7 is not frozen at the cutover'
+grep -Fxq 'pub const PROJECTION_VERSION: u16 = 7;' "$core_lib" \
+    || fail 'portable projection v7 is not frozen at the cutover'
+grep -Fxq 'pub const RECOVERY_SNAPSHOT_VERSION: u16 = 3;' "$core_lib" \
+    || fail 'portable recovery snapshot v3 is not frozen at the cutover'
+grep -Fxq 'pub const JOURNAL_MAGIC: [u8; 8] = *b"CSERJR7\0";' "$core_journal" \
+    || fail 'portable core journal magic is not bound to schema 7'
+grep -Fxq 'pub const JOURNAL_SCHEMA_VERSION: u16 = 7;' "$core_journal" \
+    || fail 'portable core journal schema 7 is not frozen at the cutover'
 for profile2_engine_guard in \
     'Self::new_with_mode(catalog, limits, freshness, EngineApiMode::ProfileTwo)' \
     'if self.api_mode == EngineApiMode::ProfileTwo && !command.is_profile_two_compatible() {' \
@@ -1050,6 +1050,7 @@ declare -A scheme_header_counts=(
     ['[scheme."cser-production"]']=0
     ['[scheme."cser-core-reply-recovery"]']=0
     ['[scheme."cser-pio-journal-ktest"]']=0
+    ['[scheme."cser-baseline-handoff-ktest"]']=0
     ['[scheme."cser-core-dma-recovery"]']=0
     ['[scheme."cser-smp-smoke"]']=0
     ['[scheme."tool-dma-cser"]']=0
@@ -1061,6 +1062,7 @@ while IFS= read -r scheme_header; do
         '[scheme."cser-production"]'|\
         '[scheme."cser-core-reply-recovery"]'|\
         '[scheme."cser-pio-journal-ktest"]'|\
+        '[scheme."cser-baseline-handoff-ktest"]'|\
         '[scheme."cser-core-dma-recovery"]'|\
         '[scheme."cser-smp-smoke"]'|\
         '[scheme."tool-dma-cser"]'|\
@@ -1323,4 +1325,4 @@ for forbidden_container_option in --privileged --cap-add --device; do
     fi
 done
 
-echo "CSER_CORE_PRODUCTION_CUTOVER PASS manifest_sources=${#closure_sources[@]} portable_core=nonoptional api_profile=2 catalog_version=6 projection_version=6 snapshot_version=2 journal_schema=6 default=cser-production registry=single operation_effect=shared component_custody=reply+dma production_service_tasks=1 legacy_runtime_estates=false task_bound_ingress=true post_exit_fence=true production_rebind=true vnext_portal=true vnext_supervisor=true volatile_transitions=false evidence_schemes=reply+dma boots=4 shared_media=true tpm_fixture_policy=scoped"
+echo "CSER_CORE_PRODUCTION_CUTOVER PASS manifest_sources=${#closure_sources[@]} portable_core=nonoptional api_profile=3 catalog_version=7 projection_version=7 snapshot_version=3 journal_schema=7 default=cser-production registry=single operation_effect=shared component_custody=reply+dma production_service_tasks=1 legacy_runtime_estates=false task_bound_ingress=true post_exit_fence=true production_rebind=true vnext_portal=true vnext_supervisor=true volatile_transitions=false evidence_schemes=reply+dma boots=4 shared_media=true tpm_fixture_policy=scoped"

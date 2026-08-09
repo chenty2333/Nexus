@@ -15,8 +15,9 @@
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use cser_core::{
-    Command, CoreError, CoreLimits, Digest, DomainCatalog, Engine, JournalRepair, RecoveryAnchor,
-    TransitionDurability, TransitionReceipt, TxError,
+    Command, CompactingJournalBackend, CoordinatedPersistence, CoordinatedPersistenceError,
+    CoreError, CoreLimits, Digest, DomainCatalog, DurableJournalBackend, Engine, JournalRepair,
+    RecoveryAnchor, TransitionDurability, TransitionReceipt, TrustedAnchorBackend, TxError,
 };
 use ostd::{prelude::*, sync::Mutex};
 
@@ -62,6 +63,31 @@ struct RuntimeState<P> {
     engine: Engine,
     persistence: P,
 }
+
+/// Failure while minting or physically compacting a durable whole-state
+/// checkpoint.
+#[derive(Debug)]
+pub(crate) enum RuntimeCheckpointError<E> {
+    /// The checkpoint transition itself did not become authoritatively durable.
+    Transition(TxError<E>),
+    /// The checkpoint was anchored, but replacement of the physical replay
+    /// image failed ambiguously and the runtime must be recovered.
+    Replacement(E),
+    /// A bounded journal observation failed before or after compaction; no
+    /// terminal receipt may be emitted from that runtime.
+    Observation(E),
+}
+
+type CoordinatedPersistenceFailure<J, A> = CoordinatedPersistenceError<
+    <J as DurableJournalBackend>::Error,
+    <A as TrustedAnchorBackend>::Error,
+>;
+
+type RuntimeCheckpointResult<J, A> =
+    Result<TransitionReceipt, RuntimeCheckpointError<CoordinatedPersistenceFailure<J, A>>>;
+
+type RuntimeCheckpointObservationResult<J, A, R> =
+    Result<(TransitionReceipt, R, R), RuntimeCheckpointError<CoordinatedPersistenceFailure<J, A>>>;
 
 /// Snapshot of optional timing taken around the runtime's writer mutex.
 ///
@@ -288,12 +314,72 @@ impl<P: TransitionDurability> OstdCserRuntime<P> {
     }
 }
 
+impl<J, A> OstdCserRuntime<CoordinatedPersistence<J, A>>
+where
+    J: CompactingJournalBackend,
+    A: TrustedAnchorBackend,
+{
+    /// Mints and anchors a compact whole-state checkpoint, then atomically
+    /// replaces the vNext physical replay image with that exact committed
+    /// record while retaining the checkpoint revision and head.
+    ///
+    /// This method owns both steps under the same authoritative mutex. A
+    /// replacement failure latches the coordinator recovery-required; callers
+    /// must drop and recover this runtime before another mutation.
+    pub(crate) fn compact_checkpoint(&self) -> RuntimeCheckpointResult<J, A> {
+        let mut state = self.state.lock();
+        let RuntimeState {
+            engine,
+            persistence,
+        } = &mut *state;
+        let receipt = engine
+            .compact_checkpoint_durable(persistence)
+            .map_err(RuntimeCheckpointError::Transition)?;
+        persistence
+            .replace_last_committed_checkpoint()
+            .map_err(RuntimeCheckpointError::Replacement)?;
+        Ok(receipt)
+    }
+
+    /// Compacts while recording an exact caller-defined journal observation
+    /// on both sides of the replacement.  The callbacks run under the same
+    /// writer mutex as checkpoint creation and physical replacement.
+    pub(crate) fn compact_checkpoint_observed<R>(
+        &self,
+        mut observe: impl FnMut(&mut J) -> Result<R, J::Error>,
+    ) -> RuntimeCheckpointObservationResult<J, A, R> {
+        let mut state = self.state.lock();
+        let RuntimeState {
+            engine,
+            persistence,
+        } = &mut *state;
+        let before = persistence.inspect_journal(&mut observe).map_err(|error| {
+            RuntimeCheckpointError::Observation(CoordinatedPersistenceError::Journal(error))
+        })?;
+        let receipt = engine
+            .compact_checkpoint_durable(persistence)
+            .map_err(RuntimeCheckpointError::Transition)?;
+        persistence
+            .replace_last_committed_checkpoint()
+            .map_err(RuntimeCheckpointError::Replacement)?;
+        let after = persistence.inspect_journal(&mut observe).map_err(|error| {
+            RuntimeCheckpointError::Observation(CoordinatedPersistenceError::Journal(error))
+        })?;
+        Ok((receipt, before, after))
+    }
+}
+
 #[cfg(any(test, ktest))]
 mod tests {
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU64, Ordering};
+
     use cser_core::{
         AGENT_OPERATION_COMPOSITE, BootGeneration, ChargeAccountId, CommandRequest,
-        DeviceGeneration, EffectId, Freshness, JournalGeneration, JournalRecord, PrincipalId,
-        PrincipalIncarnation, RegistryInstance, RootId, standard_catalog,
+        CompactingJournalBackend, CoordinatedPersistence, DeviceGeneration, EffectId, Freshness,
+        JournalGeneration, JournalRecord, PrincipalId, PrincipalIncarnation, RecoveryBinding,
+        RecoveryLease, RegistryInstance, RootId, TrustedAnchorBackend, TrustedAnchorSnapshot,
+        standard_catalog,
     };
     #[cfg(ktest)]
     use ostd::prelude::ktest;
@@ -312,6 +398,65 @@ mod tests {
             _resulting_freshness: Freshness,
         ) -> Result<(), Self::Error> {
             assert!(!record.bytes().is_empty());
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum CompactingTestError {
+        Anchor,
+    }
+
+    struct CompactingTestJournal {
+        replacements: Arc<AtomicU64>,
+    }
+
+    impl cser_core::DurableJournalBackend for CompactingTestJournal {
+        type Error = CompactingTestError;
+
+        fn append_and_sync(&mut self, _record: &JournalRecord) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    impl CompactingJournalBackend for CompactingTestJournal {
+        fn checkpoint_capacity_bytes(&self) -> usize {
+            usize::MAX
+        }
+
+        fn replace_with_checkpoint(
+            &mut self,
+            _checkpoint: &JournalRecord,
+        ) -> Result<(), Self::Error> {
+            self.replacements.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    struct CompactingTestAnchor {
+        committed: TrustedAnchorSnapshot,
+    }
+
+    impl TrustedAnchorBackend for CompactingTestAnchor {
+        type Error = CompactingTestError;
+
+        fn reserve_recovery_epoch(
+            &mut self,
+            _binding: RecoveryBinding,
+            _observed_device: DeviceGeneration,
+        ) -> Result<RecoveryLease, Self::Error> {
+            Err(CompactingTestError::Anchor)
+        }
+
+        fn compare_and_advance(
+            &mut self,
+            expected: TrustedAnchorSnapshot,
+            replacement: TrustedAnchorSnapshot,
+        ) -> Result<(), Self::Error> {
+            if expected != self.committed {
+                return Err(CompactingTestError::Anchor);
+            }
+            self.committed = replacement;
             Ok(())
         }
     }
@@ -374,5 +519,61 @@ mod tests {
             runtime.serialization_metrics(),
             RuntimeSerializationMetrics::default()
         );
+    }
+
+    #[cfg_attr(ktest, ktest)]
+    #[cfg_attr(test, test)]
+    fn runtime_compacts_only_the_anchored_checkpoint_under_its_mutex() {
+        let catalog = standard_catalog();
+        let freshness = Freshness::new(
+            BootGeneration::new(1).unwrap(),
+            RegistryInstance::new(1).unwrap(),
+            1,
+            DeviceGeneration::new(1).unwrap(),
+            JournalGeneration::new(1).unwrap(),
+        )
+        .unwrap();
+        let next = Freshness::new(
+            BootGeneration::new(2).unwrap(),
+            RegistryInstance::new(1).unwrap(),
+            1,
+            DeviceGeneration::new(1).unwrap(),
+            JournalGeneration::new(2).unwrap(),
+        )
+        .unwrap();
+        let binding =
+            RecoveryBinding::new(catalog.digest(), RegistryInstance::new(1).unwrap(), 1).unwrap();
+        let committed = TrustedAnchorSnapshot::from_trusted_backend(
+            binding,
+            freshness,
+            0,
+            cser_core::Digest::ZERO,
+        )
+        .unwrap();
+        let lease = RecoveryLease::from_trusted_backend(committed, next).unwrap();
+        let replacements = Arc::new(AtomicU64::new(0));
+        let persistence = CoordinatedPersistence::from_recovery_lease(
+            CompactingTestJournal {
+                replacements: replacements.clone(),
+            },
+            CompactingTestAnchor { committed },
+            &lease,
+        );
+        let runtime = OstdCserRuntime::from_engine(
+            Engine::new(catalog, CoreLimits::bounded_default(), freshness),
+            persistence,
+        );
+
+        let receipt = runtime.compact_checkpoint().expect("runtime checkpoint");
+        assert_eq!(replacements.load(Ordering::Relaxed), 1);
+        runtime.observe_persistence(|persistence| {
+            assert!(!persistence.recovery_required());
+            assert_eq!(persistence.committed().revision(), receipt.revision());
+            assert_eq!(persistence.committed().head(), receipt.head());
+        });
+        runtime.observe(|engine| {
+            assert_eq!(engine.revision(), receipt.revision());
+            assert_eq!(engine.head(), receipt.head());
+        });
     }
 }

@@ -874,6 +874,7 @@ impl BaselineToolReceiptVerifier for UartTerminalVerifier {
 #[cfg(ktest)]
 mod tests {
     use alloc::{sync::Arc, vec::Vec};
+    use ostd::prelude::ktest;
     use ostd::sync::SpinLock;
 
     use super::*;

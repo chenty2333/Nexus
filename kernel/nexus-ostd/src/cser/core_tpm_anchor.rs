@@ -42,7 +42,7 @@
 use alloc::{boxed::Box, vec, vec::Vec};
 use core::{
     hint::spin_loop,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use cser_core::{
@@ -151,6 +151,100 @@ const LEASE_SLOT_LEN: usize = LEASE_BODY_LEN + 32;
 // Physical deployments must also keep all raw access to these six indices
 // outside untrusted/runtime principals.
 static TPM_NV_PROVIDER_OWNED: AtomicBool = AtomicBool::new(false);
+
+/// Default-off diagnostic accounting for the trusted-anchor provider.
+///
+/// These samples describe completed selector operations in the guest.  TSC
+/// values are deliberately uncalibrated: they are useful for phase ordering
+/// in the QEMU/TCG experiment, not for wall-clock latency or cross-CPU
+/// comparison.  The fields are not durable and never influence an anchor
+/// decision.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct TpmAnchorTelemetry {
+    /// Successful recovery-lease selector advances.
+    pub(crate) recovery_lease_advances: u64,
+    /// Successful trusted-tip compare-and-advance operations.
+    pub(crate) tip_compare_and_advances: u64,
+    /// Aggregate uncalibrated guest TSC cycles for successful lease advances.
+    pub(crate) recovery_lease_cycles: u64,
+    /// Aggregate uncalibrated guest TSC cycles for successful tip advances.
+    pub(crate) tip_compare_and_advance_cycles: u64,
+}
+
+#[derive(Debug)]
+struct TpmAnchorTelemetryState {
+    enabled: AtomicBool,
+    recovery_lease_advances: AtomicU64,
+    tip_compare_and_advances: AtomicU64,
+    recovery_lease_cycles: AtomicU64,
+    tip_compare_and_advance_cycles: AtomicU64,
+}
+
+impl TpmAnchorTelemetryState {
+    const fn new() -> Self {
+        Self {
+            enabled: AtomicBool::new(false),
+            recovery_lease_advances: AtomicU64::new(0),
+            tip_compare_and_advances: AtomicU64::new(0),
+            recovery_lease_cycles: AtomicU64::new(0),
+            tip_compare_and_advance_cycles: AtomicU64::new(0),
+        }
+    }
+
+    fn set_enabled(&self, enabled: bool) {
+        self.recovery_lease_advances.store(0, Ordering::Relaxed);
+        self.tip_compare_and_advances.store(0, Ordering::Relaxed);
+        self.recovery_lease_cycles.store(0, Ordering::Relaxed);
+        self.tip_compare_and_advance_cycles
+            .store(0, Ordering::Relaxed);
+        self.enabled.store(enabled, Ordering::Release);
+    }
+
+    fn enabled(&self) -> bool {
+        self.enabled.load(Ordering::Acquire)
+    }
+
+    fn record_lease(&self, cycles: u64) {
+        saturating_atomic_add(&self.recovery_lease_advances, 1);
+        saturating_atomic_add(&self.recovery_lease_cycles, cycles);
+    }
+
+    fn record_tip(&self, cycles: u64) {
+        saturating_atomic_add(&self.tip_compare_and_advances, 1);
+        saturating_atomic_add(&self.tip_compare_and_advance_cycles, cycles);
+    }
+
+    fn snapshot(&self) -> TpmAnchorTelemetry {
+        TpmAnchorTelemetry {
+            recovery_lease_advances: self.recovery_lease_advances.load(Ordering::Relaxed),
+            tip_compare_and_advances: self.tip_compare_and_advances.load(Ordering::Relaxed),
+            recovery_lease_cycles: self.recovery_lease_cycles.load(Ordering::Relaxed),
+            tip_compare_and_advance_cycles: self
+                .tip_compare_and_advance_cycles
+                .load(Ordering::Relaxed),
+        }
+    }
+}
+
+fn saturating_atomic_add(counter: &AtomicU64, amount: u64) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_add(amount))
+    });
+}
+
+#[inline]
+fn diagnostic_tsc() -> u64 {
+    // The supported production and experiment profiles are x86_64.  Keep
+    // non-x86 builds honest: operation counts still work, timing is zero.
+    #[cfg(target_arch = "x86_64")]
+    {
+        ostd::arch::read_tsc()
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        0
+    }
+}
 
 struct ExclusiveProviderLease;
 
@@ -665,6 +759,7 @@ pub(crate) struct TpmNvAnchorCandidate<T> {
     lease_sequence: u64,
     committed: TrustedAnchorSnapshot,
     issued: Freshness,
+    telemetry: TpmAnchorTelemetryState,
     _exclusive: ExclusiveProviderLease,
 }
 
@@ -687,6 +782,12 @@ where
     /// lease slot, without asserting a deployment binding.
     pub(crate) const fn issued(&self) -> Freshness {
         self.issued
+    }
+
+    /// Enables default-off diagnostic selector telemetry before catalog-bound
+    /// recovery consumes this candidate.  This does not issue a TPM command.
+    pub(crate) fn set_telemetry(&mut self, enabled: bool) {
+        self.telemetry.set_enabled(enabled);
     }
 
     /// Consumes this candidate only when its internally coherent binding is the
@@ -713,6 +814,7 @@ where
             lease_sequence,
             committed,
             issued,
+            telemetry,
             _exclusive,
         } = self;
         Ok(TpmNvTrustedAnchor {
@@ -724,6 +826,7 @@ where
             lease_sequence,
             committed,
             issued,
+            telemetry,
             _exclusive,
         })
     }
@@ -744,6 +847,7 @@ pub(crate) struct TpmNvTrustedAnchor<T> {
     lease_sequence: u64,
     committed: TrustedAnchorSnapshot,
     issued: Freshness,
+    telemetry: TpmAnchorTelemetryState,
     _exclusive: ExclusiveProviderLease,
 }
 
@@ -773,6 +877,7 @@ where
             lease_sequence,
             committed,
             issued,
+            telemetry: TpmAnchorTelemetryState::new(),
             _exclusive: exclusive,
         })
     }
@@ -804,6 +909,19 @@ where
     /// transition or advance the TPM state.
     pub(crate) const fn issued(&self) -> Freshness {
         self.issued
+    }
+
+    /// Enables or disables default-off diagnostic selector telemetry.
+    ///
+    /// Toggling clears all prior samples and does not issue a TPM command.
+    pub(crate) fn set_telemetry(&mut self, enabled: bool) {
+        self.telemetry.set_enabled(enabled);
+    }
+
+    /// Returns diagnostic TPM selector samples collected since the last
+    /// telemetry toggle. Guest TSC totals are deliberately uncalibrated.
+    pub(crate) fn telemetry(&self) -> TpmAnchorTelemetry {
+        self.telemetry.snapshot()
     }
 
     fn transport_mut(&mut self) -> &mut T {
@@ -897,6 +1015,7 @@ where
         binding: RecoveryBinding,
         observed_device: DeviceGeneration,
     ) -> Result<RecoveryLease, Self::Error> {
+        let telemetry_start = self.telemetry.enabled().then(diagnostic_tsc);
         self.refresh()?;
         if binding != self.expected_binding || binding != self.committed.binding() {
             return Err(PersistenceProtocolError::BindingMismatch.into());
@@ -930,7 +1049,13 @@ where
         self.increment_and_verify(self.layout.lease_counter, next_sequence)?;
         self.lease_sequence = next_sequence;
         self.issued = next;
-        RecoveryLease::from_trusted_backend(self.committed, next).map_err(Into::into)
+        let lease = RecoveryLease::from_trusted_backend(self.committed, next)
+            .map_err(TpmNvAnchorError::Protocol)?;
+        if let Some(start) = telemetry_start {
+            self.telemetry
+                .record_lease(diagnostic_tsc().saturating_sub(start));
+        }
+        Ok(lease)
     }
 
     fn compare_and_advance(
@@ -938,6 +1063,7 @@ where
         expected: TrustedAnchorSnapshot,
         replacement: TrustedAnchorSnapshot,
     ) -> Result<(), Self::Error> {
+        let telemetry_start = self.telemetry.enabled().then(diagnostic_tsc);
         self.refresh()?;
         if expected != self.committed {
             return Err(PersistenceProtocolError::StaleJournalHead.into());
@@ -957,6 +1083,10 @@ where
         self.increment_and_verify(self.layout.tip_counter, next_sequence)?;
         self.tip_sequence = next_sequence;
         self.committed = replacement;
+        if let Some(start) = telemetry_start {
+            self.telemetry
+                .record_tip(diagnostic_tsc().saturating_sub(start));
+        }
         Ok(())
     }
 }
@@ -2143,6 +2273,36 @@ mod tests {
         assert_eq!(reopened.committed(), replacement);
         assert_eq!(reopened.tip_sequence, 2);
         assert_eq!(reopened.lease_sequence, 2);
+    }
+
+    #[ktest]
+    fn selector_telemetry_is_default_off_and_counts_completed_operations() {
+        let layout = TpmNvLayout::qemu_fixture();
+        let transport = MockNv::provision(layout, 1, binding(), freshness(1, 1, 1));
+        let mut anchor = TpmNvTrustedAnchor::open(transport, layout, auth(), binding()).unwrap();
+        let before = anchor.committed();
+        assert_eq!(anchor.telemetry(), TpmAnchorTelemetry::default());
+
+        anchor.set_telemetry(true);
+        let lease = anchor
+            .reserve_recovery_epoch(binding(), DeviceGeneration::new(2).unwrap())
+            .unwrap();
+        let replacement = TrustedAnchorSnapshot::from_trusted_backend(
+            binding(),
+            lease.next_freshness(),
+            before.revision() + 1,
+            digest(14),
+        )
+        .unwrap();
+        anchor
+            .compare_and_advance(lease.committed(), replacement)
+            .unwrap();
+        let telemetry = anchor.telemetry();
+        assert_eq!(telemetry.recovery_lease_advances, 1);
+        assert_eq!(telemetry.tip_compare_and_advances, 1);
+
+        anchor.set_telemetry(false);
+        assert_eq!(anchor.telemetry(), TpmAnchorTelemetry::default());
     }
 
     #[ktest]

@@ -11,13 +11,13 @@
 //! component independently.
 
 use cser_core::{
-    Command, CommitIntent, CoreError, EffectId, Engine, PrincipalIncarnation, SettlementClaim,
-    TOOL_DMA_COMPONENT_TOOL, TOOL_EVIDENCE_OUTCOME_ACK,
+    ChargeAccountId, ChildDescriptorV1, Command, CommitIntent, CoreError, EffectId, Engine,
+    PrincipalIncarnation, SettlementClaim, TOOL_DMA_COMPONENT_TOOL, TOOL_EVIDENCE_OUTCOME_ACK,
 };
 
 use super::core_tool_adapter::{
-    DurableToolObservation, ToolEndpoint, ToolEndpointObservation, ToolFactVerifier,
-    ToolOperationPlan, ToolOutcomeVerifier,
+    DurableToolObservation, ToolChildDescriptorVerifier, ToolEndpoint, ToolEndpointObservation,
+    ToolFactVerifier, ToolOperationPlan, ToolOutcomeVerifier,
 };
 
 /// The component-local tool half of one tool-plus-DMA composite effect.
@@ -96,6 +96,105 @@ impl ToolDmaRuntime {
                 error: failure.error().clone(),
                 intent: failure.into_intent(),
             })
+    }
+
+    /// Evidence-bound source acknowledgement for the narrow CSER3 handoff.
+    /// It consumes the parent component's linear commit intent and is the only
+    /// ingress that can open the durable core handoff guard.
+    pub(crate) fn acknowledge_handoff_parent_success(
+        &self,
+        engine: &Engine,
+        intent: CommitIntent,
+        observation: &DurableToolObservation,
+    ) -> Result<(Command, ChildDescriptorV1), ToolCommitFailure> {
+        if let Err(error) = self.require_handoff_intent(&intent) {
+            return Err(ToolCommitFailure { error, intent });
+        }
+        let verifier = match ToolChildDescriptorVerifier::new(self.plan) {
+            Some(verifier) => verifier,
+            None => {
+                return Err(ToolCommitFailure {
+                    error: CoreError::InvalidPayload,
+                    intent,
+                });
+            }
+        };
+        let descriptor = match verifier.decode(*observation) {
+            Ok(descriptor) => descriptor,
+            Err(_) => {
+                return Err(ToolCommitFailure {
+                    error: CoreError::VerificationFailed,
+                    intent,
+                });
+            }
+        };
+        let verified = match engine.verify_child_descriptor(descriptor, &verifier, observation) {
+            Ok(verified) => verified,
+            Err(error) => return Err(ToolCommitFailure { error, intent }),
+        };
+        let outcome_verifier = match ToolFactVerifier::commit(self.plan, self.verifier_epoch) {
+            Some(verifier) => verifier,
+            None => {
+                return Err(ToolCommitFailure {
+                    error: CoreError::InvalidPayload,
+                    intent,
+                });
+            }
+        };
+        let outcome = match engine.verify_commit_outcome(&intent, &outcome_verifier, observation) {
+            Ok(outcome) => outcome,
+            Err(error) => return Err(ToolCommitFailure { error, intent }),
+        };
+        let command = intent
+            .acknowledge_handoff_parent_success(outcome, verified)
+            .map_err(|failure| ToolCommitFailure {
+                error: failure.error().clone(),
+                intent: failure.into_intent(),
+            })?;
+        Ok((command, descriptor))
+    }
+
+    /// Atomically creates, enrolls, and prepares the single child through the
+    /// core handoff guard. Re-verification on recovery prevents a stale local
+    /// decoder cache from becoming authority.
+    pub(crate) fn install_handoff_child(
+        &self,
+        engine: &Engine,
+        observation: &DurableToolObservation,
+        origin: PrincipalIncarnation,
+        binding_generation: u64,
+        charge_account: ChargeAccountId,
+    ) -> Result<(Command, ChildDescriptorV1), CoreError> {
+        let verifier =
+            ToolChildDescriptorVerifier::new(self.plan).ok_or(CoreError::InvalidPayload)?;
+        let descriptor = verifier
+            .decode(*observation)
+            .map_err(|_| CoreError::VerificationFailed)?;
+        let verified = engine.verify_child_descriptor(descriptor, &verifier, observation)?;
+        Ok((
+            verified.install(origin, binding_generation, charge_account),
+            descriptor,
+        ))
+    }
+
+    /// Atomically releases the fully retired source and records the target's
+    /// first commit intent. The operation is derived from the descriptor's
+    /// complete evidence-bound identity rather than supplied by a caller.
+    pub(crate) fn release_handoff_source_and_record_target_intent(
+        &self,
+        engine: &Engine,
+        observation: &DurableToolObservation,
+        actor: PrincipalIncarnation,
+        binding_generation: u64,
+    ) -> Result<Command, CoreError> {
+        let verifier =
+            ToolChildDescriptorVerifier::new(self.plan).ok_or(CoreError::InvalidPayload)?;
+        let descriptor = verifier
+            .decode(*observation)
+            .map_err(|_| CoreError::VerificationFailed)?;
+        let verified = engine.verify_child_descriptor(descriptor, &verifier, observation)?;
+        let operation = handoff_operation_digest(descriptor, observation.terminal_record_digest());
+        Ok(verified.release_source_and_record_target_intent(actor, binding_generation, operation))
     }
 
     /// Records that later settlement refers to the same durable endpoint
@@ -210,6 +309,16 @@ impl ToolDmaRuntime {
         Ok(())
     }
 
+    fn require_handoff_intent(&self, intent: &CommitIntent) -> Result<(), CoreError> {
+        if self.plan.component() != cser_core::TOOL_HANDOFF_SOURCE_COMPONENT
+            || intent.effect() != self.plan.effect()
+            || intent.component() != Some(self.plan.component())
+        {
+            return Err(CoreError::StaleCommitIntent);
+        }
+        Ok(())
+    }
+
     fn require_tool_claim(&self, claim: &SettlementClaim) -> Result<(), CoreError> {
         if claim.effect() != self.plan.effect()
             || claim.component() != Some(TOOL_DMA_COMPONENT_TOOL)
@@ -218,6 +327,25 @@ impl ToolDmaRuntime {
         }
         Ok(())
     }
+}
+
+fn handoff_operation_digest(
+    descriptor: ChildDescriptorV1,
+    terminal_record: cser_core::Digest,
+) -> cser_core::Digest {
+    use sha2::{Digest as _, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(b"nexus-cser-child-operation-v1");
+    for field in [
+        descriptor.route_digest.bytes(),
+        descriptor.input_digest.bytes(),
+        descriptor.catalog_digest.bytes(),
+        terminal_record.bytes(),
+    ] {
+        hash.update((field.len() as u64).to_le_bytes());
+        hash.update(field);
+    }
+    cser_core::Digest::new(hash.finalize().into())
 }
 
 /// A rejected tool commit acknowledgement which preserves the exact durable

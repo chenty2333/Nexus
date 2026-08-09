@@ -654,6 +654,8 @@ fn hex_value(byte: u8) -> Result<u8, CrashProbeError> {
 
 #[cfg(ktest)]
 mod tests {
+    use ostd::prelude::ktest;
+
     use super::*;
 
     #[ktest]

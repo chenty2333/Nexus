@@ -347,6 +347,62 @@ pub(crate) struct ToolDmaMetrics {
     pub(crate) projection: Digest,
 }
 
+/// One read-only allocator-gate observation for the bounded DMA page
+/// coordinate.  `resource_id_raw` is deliberately the opaque CSER coordinate,
+/// not a PFN or host address; a later exporter may HMAC it without having to
+/// recover identity from formatted diagnostics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DmaReuseGateObservation {
+    pub(crate) resource_id_raw: u64,
+    pub(crate) generation: u64,
+    pub(crate) retained: bool,
+    pub(crate) gate_result: &'static str,
+    pub(crate) revision_unchanged: bool,
+    pub(crate) head_unchanged: bool,
+}
+
+/// Probes the core's exact reuse gate without manufacturing an allocator
+/// allocation or a device-quiescence fact.  The probe is intentionally a
+/// read-only `check_reusable`: a live DMA page must be rejected as retained;
+/// after the existing verified reset/IRQ/IOTLB retirement path it must become
+/// reusable at the same `(ResourceId, generation)` coordinate.
+pub(crate) fn dma_reuse_gate_observation<O: ToolDmaCoreOwner>(
+    runtime: &O,
+    effect: EffectId,
+    expect_retained: bool,
+) -> DmaReuseGateObservation {
+    runtime.observe(|engine| {
+        let claim = engine
+            .component_claims(effect, TOOL_DMA_COMPONENT_DMA)
+            .expect("DMA gate probe requires the sealed DMA component")
+            .into_iter()
+            .find(|claim| claim.kind == DEVICE_CLAIM_PINNED_PAGE)
+            .expect("DMA gate probe requires the pinned-page coordinate");
+        assert_eq!(claim.retired, !expect_retained);
+        let revision = engine.revision();
+        let head = engine.head();
+        let projection = engine.projection_digest();
+        let result = engine.check_reusable(claim.resource, claim.resource_generation);
+        let (retained, gate_result) = match (expect_retained, result) {
+            (true, Err(CoreError::ResourceRetained)) => (true, "rejected_retained"),
+            (false, Ok(())) => (false, "admitted_reusable"),
+            _ => panic!("TOOL_DMA_FAIL stage=dma-reuse-gate"),
+        };
+        let revision_unchanged =
+            engine.revision() == revision && engine.projection_digest() == projection;
+        let head_unchanged = engine.head() == head;
+        assert!(revision_unchanged && head_unchanged);
+        DmaReuseGateObservation {
+            resource_id_raw: claim.resource.get(),
+            generation: claim.resource_generation.get(),
+            retained,
+            gate_result,
+            revision_unchanged,
+            head_unchanged,
+        }
+    })
+}
+
 pub(crate) fn tool_dma_metrics<O: ToolDmaCoreOwner>(
     runtime: &O,
     effect: EffectId,
@@ -584,8 +640,8 @@ impl ToolDmaResume {
         self.state
     }
 
-    pub(crate) const fn parent(&self) -> Option<CompositeEffectProjection> {
-        self.parent
+    pub(crate) fn parent(&self) -> Option<CompositeEffectProjection> {
+        self.parent.clone()
     }
 
     pub(crate) const fn tool(&self) -> Option<ComponentProjection> {

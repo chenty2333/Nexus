@@ -1831,7 +1831,7 @@ where
     }
 
     let projection = composite.ok_or("composite-effect-disappeared")?;
-    if !validate_composite_projection(projection) {
+    if !validate_composite_projection(&projection) {
         return Err("composite-effect-identity");
     }
     ensure_uncommitted_composite_actor(
@@ -3165,7 +3165,7 @@ fn inspect_reply_delivery(
     }
 }
 
-fn validate_composite_projection(composite: CompositeEffectProjection) -> bool {
+fn validate_composite_projection(composite: &CompositeEffectProjection) -> bool {
     composite.effect == operation_effect()
         && composite.kind == AGENT_OPERATION_COMPOSITE
         && composite.causal_owner == operation_origin()
@@ -3185,7 +3185,7 @@ fn validate_composite_identity(engine: &Engine) -> bool {
     let Some(dma) = engine.component(operation_effect(), AGENT_COMPONENT_DMA) else {
         return false;
     };
-    validate_composite_projection(composite)
+    validate_composite_projection(&composite)
         && reply.effect == operation_effect()
         && reply.component == AGENT_COMPONENT_REPLY
         && reply.obligation == (REPLY_DOMAIN, REPLY_OBLIGATION_PUBLICATION)
@@ -3331,7 +3331,7 @@ fn validate_prearm_recovery_candidate(engine: &Engine) -> bool {
     let Some(dma) = engine.component(operation_effect(), AGENT_COMPONENT_DMA) else {
         return false;
     };
-    if !validate_composite_projection(composite)
+    if !validate_composite_projection(&composite)
         || composite.escape != EffectEscapeState::Unescaped
         || !matches!(
             (composite.authority, composite.custodian),
