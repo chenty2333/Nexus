@@ -26,12 +26,18 @@ complete. Further core expansion now needs a compositional workload that can
 distinguish CSER from a strong workload-specific independent finalizer; the
 current fixed tool-plus-DMA experiment does not do so.
 
+The immediate engineering phase is intentionally narrower than full product
+release: complete a trusted-local reference adapter, harden bridge/media/UART
+orchestration, then measure and address demonstrated state-transition,
+journal, and runtime-serialization costs. Remote endpoint authentication,
+multi-provider registries, multi-tenancy, and SDK/platform work are deferred.
+
 ## Current State
 
-The `cser-evidence-capability-and-conflict` branch contains the completed
-catalog-v6 cleanup, tool-plus-DMA adapters, and host-controlled crash matrix in
-reviewable commits layered as core, kernel, experiment harness, and
-documentation. It includes typed
+The local `main` branch contains the completed catalog-v6 cleanup,
+tool-plus-DMA adapters, and host-controlled crash matrix in reviewable commits
+layered as core, kernel, experiment harness, and documentation. It includes
+typed
 Outcome/Quiescence and Recoverable/Ephemeral catalog fields, symmetric
 Shared/Exclusive admission across both reverse indexes, last-custodian
 conservation, global fail-closed unknown evidence, corrected persistence and
@@ -71,10 +77,12 @@ counterfactual revision metric, and QEMU-versus-physical boundary. It builds as
 five pages. RFC 0007 is explicitly the historical v5 baseline and RFC 0008 is
 the current v6 amendment.
 
-Publication remains outstanding. This Nexus branch has no upstream and does
-not exist on `origin`; the sibling `nexus-hotos` checkout has no Git remote.
-Generated QEMU receipts and comparison outputs are intentionally Git-ignored,
-so publishing source commits alone will not publish the research evidence.
+Local integration is complete: `main` was fast-forwarded to the reviewed CSER
+work and is now the development branch. External publication remains
+outstanding because local `main` is ahead of `origin/main`; the sibling
+`nexus-hotos` checkout has no Git remote. Generated QEMU receipts and
+comparison outputs are intentionally Git-ignored, so publishing source commits
+alone will not publish the research evidence.
 
 ## Current Tasks
 
@@ -93,4 +101,13 @@ so publishing source commits alone will not publish the research evidence.
 - [x] Narrow volatile, legacy, and mutable persistence surfaces; repair automatic-retirement evidence contracts and align the README, CSER guide, RFCs, and HotOS paper.
 - [x] Split the work into reviewable core, kernel, experiment, and documentation commits and produce a clean-tree production recovery seal.
 - [x] Remove launcher pipe backpressure, separate nested recovery timeout budgets, clean complete recovery process groups, bound receipt parsing, and place the 27 host regressions on the public quick/full paths.
-- [ ] Publish the local Nexus branch and a small source-bound evidence bundle after external GitHub publication is explicitly authorized; configure a remote for `nexus-hotos` before publishing the paper commit.
+- [x] Fast-forward the completed CSER feature work into the local Nexus `main` branch and make it the continuing development branch.
+- [ ] Complete the trusted-local reference adapter with a versioned durable terminal-state contract, bound persistent identities, fail-closed retention/migration rules, focused crash tests, readiness, diagnostics, and basic metrics.
+- [ ] Supervise bridge/endpoint/UART/QEMU readiness and exits with bounded, stage-specific failure reports.
+- [ ] Make shared base media immutable or lock-protected and digest-checked under parallel baseline/CSER provisioning.
+- [ ] Replace COM2/COM3 busy-spin waits with bounded polling plus yield/backoff and phase timing while preserving fail-closed deadlines.
+- [ ] Run targeted long-duration soak, injected endpoint/bridge/journal/TPM failures, and SMP/concurrency validation after the focused paths stabilize.
+- [ ] Instrument full-state clone/invariant/digest work and replace it with verified incremental or copy-on-write paths only if measurement establishes it as material.
+- [ ] Measure ATA journal growth and, if dominant, implement an append-oriented segment/checkpoint layout without weakening readback, crash atomicity, or journal-before-anchor ordering.
+- [ ] Measure runtime mutex queue/hold time and reduce demonstrated serialization without exposing uncommitted state or effects.
+- [ ] Publish the local Nexus `main` branch and a small source-bound evidence bundle after external GitHub publication is explicitly authorized; configure a remote for `nexus-hotos` before publishing the paper commit.

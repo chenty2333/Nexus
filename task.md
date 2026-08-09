@@ -153,3 +153,107 @@ questions that can change whether CSER is useful:
 - build the smallest agent-tool adapter that exercises the contract;
 - measure how often effects retire through evidence versus retained
   backpressure or operational intervention.
+
+## Approved next phase: reference adapter, stability, and measured performance
+
+### Scope and development location
+
+Continue development on the local `main` branch of
+`/home/ava/Desktop/Nexus`. The completed catalog-v6, tool-plus-DMA, baseline,
+and crash-matrix work is the starting point; it does not need to be copied from
+another directory.
+
+Raise the endpoint work only to a reusable reference-adapter standard in this
+phase. Remote receipt MAC/signatures, key rotation, verifier epochs, mTLS, a
+machine-readable multi-provider registry, a second external endpoint,
+multi-tenancy, quotas, backups, long-running service operations, and SDK work
+remain deliberately deferred.
+
+### 1. Complete the trusted-local reference adapter
+
+1. State the trusted local sidecar threat model explicitly, including which
+   processes and local transport boundary are trusted and why an unauthenticated
+   digest is not evidence across a remote trust boundary.
+2. Version the endpoint contract and implement durable
+   `Accepted`/`Pending`/`Succeeded`/`Failed` states. Define which states are
+   observations, which are terminal outcome evidence, and which cannot retire
+   any physical claim.
+3. Bind each terminal record to its namespace, effect identity, operation and
+   input digest, catalog digest, and schema version so evidence cannot be
+   replayed into a different contract.
+4. Replace the compiled experiment identity with a persistently allocated
+   random identity that survives endpoint and guest recovery.
+5. Cover commit-before-apply, commit-after-apply, lost reply, restart query,
+   and duplicate submit behavior with focused crash/idempotency tests.
+6. Define evidence retention, expiry, database schema migration, and the
+   fail-closed result when an observation can no longer be recovered. Expired
+   or unmigratable evidence must never authorize claim release.
+7. Add endpoint and bridge readiness, structured stage-specific errors, and
+   basic counters/timings needed by the experiment without turning the adapter
+   into a general service platform.
+
+### 2. Harden experiment orchestration
+
+Do these in order:
+
+1. Give the UART-to-HTTP bridge an explicit ready/health signal and supervise
+   endpoint, bridge, UART sink, and QEMU exits. Failures must identify the
+   endpoint-connect, bridge-ready, guest-boot, first-byte, frame-complete,
+   recovery-receipt, or cleanup stage.
+2. Protect shared base-media provisioning with a directory lock or immutable,
+   content-digest-addressed snapshots. Parallel baseline and CSER runs must
+   start from byte-identical media without racing during first creation.
+3. Replace the COM2/COM3 giant busy-spin loops with bounded polling batches and
+   scheduler yield/backoff while preserving fail-closed host deadlines. Record
+   transmit, first-byte, full-frame, and endpoint-response timing.
+4. After the focused paths are stable, run bounded long-duration soak, injected
+   endpoint/bridge/journal/TPM failures, and SMP/concurrency tests. Do not build
+   a new test framework merely to inflate coverage; each case must exercise a
+   concrete failure or race.
+
+### 3. Measure before changing the performance architecture
+
+Treat the following as candidate bottlenecks, not established conclusions.
+Instrument them first with default-off or sampled telemetry and use the same
+workload, storage, TPM, endpoint, and DMA envelope for CSER and the baseline.
+
+Record transition queue/lock wait, candidate-state clone, invariant checking,
+projection digest, journal append/sync/readback, TPM anchor advance, live-state
+size, journal fill, and end-to-end adapter/recovery time. Exercise growing live
+state and journal fill rather than reporting a single small-state number.
+
+#### Full-state transition work
+
+Measure the cost of cloning the complete engine state, running the canonical
+invariant checker, and recomputing the projection digest on each transition.
+If this dominates, introduce copy-on-write or transaction-local state,
+incremental indexes/digests, and affected-region invariant checks. Retain the
+canonical full checker and full digest as a test/debug oracle; a stale cache or
+index must never make an unsafe admission possible.
+
+#### ATA journal growth
+
+Measure bytes and sectors read/written, flushes, readback, and transition
+latency across journal fill ratios. If the current alternating-bank full-log
+rewrite is the dominant growth cost, replace it with an append-oriented
+segment layout plus a small committed header and bounded checkpoint/compaction.
+Preserve failure atomicity, readback validation, and the journal-before-anchor
+ordering at every crash cutpoint.
+
+#### Runtime mutex serialization
+
+Measure queue time and time spent holding the runtime mutex separately from
+journal and TPM latency. Shorten the critical section only where candidate
+work can be revalidated against the committed revision. Do not make state or an
+external effect visible before its durable journal and anchor ordering is
+established. Consider group commit or concurrency only after the single-order
+contract is preserved and measurement shows serialization is material.
+
+### 4. Completion standard for this phase
+
+The phase is complete when the reference adapter's documented state and
+recovery contract matches its implementation; orchestration failures are
+bounded and stage-identifiable; parallel media preparation and delayed UART
+paths are reproducible; soak/fault/SMP runs preserve fail-closed behavior; and
+each performance change has paired measurements demonstrating that it removes
+a measured cost without weakening the existing crash and invariant results.
