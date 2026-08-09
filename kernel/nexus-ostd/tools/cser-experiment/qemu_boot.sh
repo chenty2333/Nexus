@@ -18,6 +18,9 @@ namespace=${CSER_EXPERIMENT_NAMESPACE_ID:?missing CSER_EXPERIMENT_NAMESPACE_ID}
 authority_id=${CSER_EXPERIMENT_AUTHORITY_ID:?missing CSER_EXPERIMENT_AUTHORITY_ID}
 effect_id=${CSER_EXPERIMENT_EFFECT_ID:?missing CSER_EXPERIMENT_EFFECT_ID}
 phase=${CSER_EXPERIMENT_PHASE:-initial}
+provider_delay_ms=${CSER_EXPERIMENT_PROVIDER_DELAY_MS:-0}
+worker_count=${CSER_EXPERIMENT_WORKER_COUNT:-1}
+background_jobs=${CSER_EXPERIMENT_BACKGROUND_JOBS:-0}
 
 case "$variant" in
   cser)
@@ -39,6 +42,9 @@ case "$phase" in initial|recovery) ;; *) echo "qemu_boot: invalid phase: $phase"
 [[ $authority_id =~ ^[0-9a-f]{32}$ ]] || { echo "qemu_boot: invalid authority" >&2; exit 2; }
 [[ $effect_id =~ ^[0-9a-f]{32}$ ]] || { echo "qemu_boot: invalid effect" >&2; exit 2; }
 [[ -d $trial_dir/media ]] || { echo "qemu_boot: trial media is missing" >&2; exit 2; }
+[[ $provider_delay_ms =~ ^[0-9]+$ ]] || { echo "qemu_boot: invalid provider delay" >&2; exit 2; }
+[[ $worker_count =~ ^[1-9][0-9]*$ ]] || { echo "qemu_boot: invalid worker count" >&2; exit 2; }
+[[ $background_jobs =~ ^[0-9]+$ && $background_jobs -le 4096 ]] || { echo "qemu_boot: invalid background job count" >&2; exit 2; }
 
 require_medium() {
   local name=$1 expected_bytes=$2 path="$trial_dir/media/$1"
@@ -106,6 +112,7 @@ rm -f -- "$port_file" "$bridge_ready" "$bridge_status" "$sink_ready" "$sink_stat
 endpoint_pid=
 bridge_pid=
 crash_sink_pid=
+background_pid=
 
 stage_fail() {
   local stage=$1; shift
@@ -174,15 +181,17 @@ cleanup() {
   [[ -z ${crash_sink_pid:-} ]] || kill "$crash_sink_pid" 2>/dev/null || true
   [[ -z ${bridge_pid:-} ]] || kill "$bridge_pid" 2>/dev/null || true
   [[ -z ${endpoint_pid:-} ]] || kill "$endpoint_pid" 2>/dev/null || true
+  [[ -z ${background_pid:-} ]] || kill "$background_pid" 2>/dev/null || true
   wait "${crash_sink_pid:-}" 2>/dev/null || true
   wait "${bridge_pid:-}" 2>/dev/null || true
   wait "${endpoint_pid:-}" 2>/dev/null || true
+  wait "${background_pid:-}" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
 
 python3 "$root/tools/cser-experiment/tool_endpoint.py" \
   --database "$database" --namespace "$namespace" --authority-id "$authority_id" --effect-id "$effect_id" --catalog-digest "$catalog_digest" \
-  --port 0 --port-file "$port_file" 2>>"$endpoint_log" &
+  --port 0 --port-file "$port_file" --provider-delay-ms "$provider_delay_ms" --worker-count "$worker_count" 2>>"$endpoint_log" &
 endpoint_pid=$!
 for _ in {1..100}; do
   if [[ -s $port_file ]]; then break; fi
@@ -204,6 +213,32 @@ PY
 done
 kill -0 "$endpoint_pid" 2>/dev/null || stage_fail endpoint-connect "endpoint exited before accepting TCP; see $endpoint_log"
 [[ $endpoint_ready == true ]] || stage_fail endpoint-connect "endpoint did not accept TCP before deadline; see $endpoint_log"
+
+# The performance lane can submit bounded, distinct host-local provider jobs
+# before boot. These are deliberately not guest effects or CSER claims. They
+# merely keep the endpoint worker queue occupied so the primary guest request
+# has an auditable concurrency overlap in the durable endpoint database.
+if [[ $phase == initial && $background_jobs != 0 ]]; then
+  python3 - "$port" "$namespace" "$authority_id" "$effect_id" "$run_id" "$catalog_digest" "$background_jobs" <<'PY' 2>>"$endpoint_log" &
+import base64, hashlib, http.client, json, sys
+port, namespace, authority, effect, run_id, catalog, count = sys.argv[1:]
+payload = b"perf-background-v1"
+encoded = base64.b64encode(payload).decode("ascii")
+for index in range(int(count)):
+    body = json.dumps({"contract_version": "3", "namespace_id": namespace,
+        "authority_id": authority, "effect_id": effect, "run_id": run_id,
+        "operation_key": f"perf-bg-{index}", "input_digest": hashlib.sha256(payload).hexdigest(),
+        "catalog_digest": catalog, "payload_b64": encoded}, separators=(",", ":")).encode("utf-8")
+    connection = http.client.HTTPConnection("127.0.0.1", int(port), timeout=5)
+    try:
+        connection.request("POST", "/v3/operations", body, {"Content-Type": "application/json"})
+        if connection.getresponse().status != 202:
+            raise SystemExit("background endpoint job was not accepted")
+    finally:
+        connection.close()
+PY
+  background_pid=$!
+fi
 
 bridge_args=(
   --socket "$artifact_dir/com2-tool.sock" --run-id "$run_id" --endpoint-port "$port" --cser2

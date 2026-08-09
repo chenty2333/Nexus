@@ -108,6 +108,20 @@ class MatrixProtocolTests(unittest.TestCase):
             malformed = dict(base); malformed[field] = bad
             with self.assertRaises(ValueError):
                 _recovery_metrics_from_serial((_RECOVERY_METRICS_PREFIX + json.dumps(malformed) + "\n").encode(), variant="cser", run_id="a" * 32)
+        measured = dict(base)
+        measured["dma_retained_gate"] = {"resource_id_raw": 24836, "generation": 1, "retained": True, "gate_result": "rejected_retained", "revision_unchanged": True, "head_unchanged": True}
+        measured["dma_reusable_gate"] = {"resource_id_raw": 24836, "generation": 1, "retained": False, "gate_result": "admitted_reusable", "revision_unchanged": True, "head_unchanged": True}
+        measured["dma_quiescence_evidence"] = {"schema_version": 1, "run_id": "a" * 32, "resource_id_raw": 24836, "generation": 1, "reset": True, "irq_drained": True, "iotlb": True}
+        self.assertEqual(_recovery_metrics_from_serial((_RECOVERY_METRICS_PREFIX + json.dumps(measured) + "\n").encode(), variant="cser", run_id="a" * 32)["dma_retained_gate"]["gate_result"], "rejected_retained")
+        malformed = dict(measured); malformed["dma_retained_gate"] = dict(measured["dma_retained_gate"], head_unchanged=False)
+        with self.assertRaises(ValueError):
+            _recovery_metrics_from_serial((_RECOVERY_METRICS_PREFIX + json.dumps(malformed) + "\n").encode(), variant="cser", run_id="a" * 32)
+        malformed = dict(measured); malformed["dma_reusable_gate"] = dict(measured["dma_reusable_gate"], generation=2)
+        with self.assertRaises(ValueError):
+            _recovery_metrics_from_serial((_RECOVERY_METRICS_PREFIX + json.dumps(malformed) + "\n").encode(), variant="cser", run_id="a" * 32)
+        malformed = dict(measured); malformed["dma_quiescence_evidence"] = dict(measured["dma_quiescence_evidence"], iotlb=False)
+        with self.assertRaises(ValueError):
+            _recovery_metrics_from_serial((_RECOVERY_METRICS_PREFIX + json.dumps(malformed) + "\n").encode(), variant="cser", run_id="a" * 32)
 
     def test_deferred_recovery_is_not_accepted_as_a_terminal_measurement(self) -> None:
         deferred = {
@@ -161,6 +175,26 @@ class MatrixProtocolTests(unittest.TestCase):
         self.assertEqual(summary["measured_trials"]["reconciliation_delay_ms"], 0)
         self.assertIsNone(summary["sums"]["reconciliation_delay_ms"])
         self.assertEqual(summary["measured_trials"]["gate_rejections"], 0)
+        self.assertEqual(summary["dma_gate_observations"], {"retained_rejected": 0, "evidence_retired_reusable": 0})
+
+    def test_summary_rejects_mismatched_dma_gate_coordinates(self) -> None:
+        retained = {"resource_id_raw": 24836, "generation": 1, "retained": True, "gate_result": "rejected_retained", "revision_unchanged": True, "head_unchanged": True}
+        reusable = {"resource_id_raw": 24836, "generation": 1, "retained": False, "gate_result": "admitted_reusable", "revision_unchanged": True, "head_unchanged": True}
+        row = _metric(
+            run_id="a" * 32, variant="cser", trial=1, cutpoint="post_register", cutpoint_id=2,
+            crash_method="pid_sigkill", trial_dir=Path("/trial"), media=[], guest={},
+            recovery={"retired_by_evidence": 1, "retained_claims": 0,
+                      "reconciliation_delay_ms": None, "gate_rejections": None,
+                      "reconciliation_steps": 1, "reconciliation_delay_unit": "unmeasured",
+                      "dma_retained_gate": retained, "dma_reusable_gate": reusable},
+            recovery_metrics_authoritative=True, container_id=None,
+        )
+        row["dma_reusable_gate"]["generation"] = 2
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "metrics.jsonl"
+            path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+            with self.assertRaises(ValueError):
+                load_metrics(path)
 
     def test_summary_rejects_duplicate_rows_and_mismatched_arm_coverage(self) -> None:
         def row(variant: str, cutpoint: str, cutpoint_id: int) -> dict:

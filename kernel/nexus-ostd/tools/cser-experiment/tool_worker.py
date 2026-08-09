@@ -59,7 +59,7 @@ class AsyncWorker:
             if outcome is None:
                 outcome = self.provider.apply(identity, item.input_digest, item.payload)
             if self.store.complete_lease(
-                item, outcome.state, outcome.result, outcome.output_kind, outcome.output
+                item, outcome.state, outcome.result, outcome.output_kind, outcome.output, outcome.applied_at_ns
             ):
                 self._observe("worker_terminal_committed", item, outcome)
             self._failure_streak = 0

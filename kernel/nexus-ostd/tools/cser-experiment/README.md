@@ -76,6 +76,63 @@ unknown layout, missing foreign key, orphan, or terminal work fails startup.
 The adapter deliberately does **not** provide remote MACs,
 mTLS, a remote registry, multi-tenancy, or cross-host trust establishment.
 
+## Bounded CSER3 child handoff boundary
+
+The `/v3` research path adds one terminal-only, digest-bound output kind for a
+fixed 187-byte `NXSCHD03` `ChildDescriptorV1`. A caller submits only
+`discover-child-v1:<parent-root>:<parent-sequence>:<parent-component>`; the
+provider derives the child claim/resource coordinate from the complete durable
+endpoint identity and binds the descriptor to the parent, fixed route, catalog,
+input digest, exact resource generation, and schema. The core accepts it only
+through a verifier-minted token and a catalog-declared one-hop source→child
+rule. A separate workload-specific baseline independently parses the same wire
+record and persists descriptor, child preparation, atomic parent release plus
+child intent, and child terminal phases without calling the CSER engine.
+
+This is intentionally a **partial adapter implementation**, not a QEMU handoff
+result. Core, UART/adapter, provider, and portable-baseline tests cover the
+descriptor and crash/recovery boundaries. The real Tool+DMA QEMU launcher
+still uses CSER2 and does not execute descriptor discovery, parent release,
+child enrollment/publication, or handoff recovery. Therefore the QEMU matrix,
+performance lane, and applicability export below are evidence for the existing
+Tool+DMA path only; they do not establish an end-to-end handoff advantage.
+
+## Small async performance lane
+
+The ordinary endpoint remains `--provider-delay-ms 0 --worker-count 1`.
+`provider_applied_at_ns` is the provider's durable commit boundary; the
+adapter also persists Accepted, Pending, and terminal timestamps, so those
+boundaries survive restart and the apply-before-terminal recovery window.
+`/v1/metrics` reports queue wait/provider intervals and the largest observed
+leased-work count. Endpoint workers dispatch host-local provider work; they
+are not CSER writers.
+
+`run_qemu_performance.py` is a small OFAT wrapper over the reviewed QEMU
+boot/controller/base-media path. It runs control, delayed-endpoint, and
+endpoint-concurrency points, selecting `--journal legacy|vnext`, and writes
+one artifact-derived row per primary QEMU trial to `performance.jsonl` plus
+`summary.json`. Rows contain the Accepted→Pending, Pending→provider-apply,
+provider-apply→terminal, launcher/recovery, and durable max-inflight values.
+Launcher/recovery durations come from controller-written `monotonic_ns` stage
+artifacts, never log file mtimes; duration measurements use `ms` and
+max-inflight uses `count` explicitly.
+The runner also strictly consumes one bounded `TOOL_DMA_PERF_V1` marker from
+each recovery serial log. Its guest-TSC runtime/journal/TPM telemetry is
+diagnostic scope for post-activation and, for vNext, compaction only; host
+stage durations still cover the whole recovery launcher. vNext rows require
+one matching compaction marker with replay-image bytes plus separate sector
+read, sector write, and flush deltas, while legacy rows reject one.
+The concurrency point uses bounded host-local background endpoint jobs and
+fails if their durable timing does not overlap the primary request; they are
+not CSER claims. The summary includes
+`n`, min, p50, p95, and max; p95 is explicitly low resolution when `n < 20`.
+
+```
+python3 tools/cser-experiment/run_qemu_performance.py --variant cser \
+  --output /tmp/cser-performance --base-media-dir /tmp/cser-base --trials 3 \
+  --provider-delay-ms 25 --worker-count 2 --journal legacy
+```
+
 Example:
 
 ```

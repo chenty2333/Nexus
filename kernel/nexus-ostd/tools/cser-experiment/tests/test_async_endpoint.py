@@ -8,7 +8,7 @@ import sys
 import tempfile
 import time
 import unittest
-from base64 import b64encode
+from base64 import b64decode, b64encode
 from concurrent.futures import ThreadPoolExecutor
 from http import HTTPStatus
 from pathlib import Path
@@ -221,14 +221,15 @@ class AsyncEndpointTests(unittest.TestCase):
             endpoint.shutdown(); endpoint.server_close(); thread.join(timeout=5)
 
     def test_cser3_terminal_descriptor_output_is_bounded_and_evidence_bound(self) -> None:
-        descriptor = b"NXSCHD01" + b"x" * 120
-        payload = b"child-descriptor-v1:" + descriptor
+        payload = b"discover-child-v1:0000000000000077:0000000000000002:00000005"
         self.enqueue("descriptor", payload)
         self.assertTrue(AsyncWorker(self.store, self.provider, worker_id="descriptor-worker").run_once())
         record = self.store.get(RUN, "descriptor")
         assert record is not None
         self.assertEqual((record["state"], record["output_kind"], record["output_len"]),
-                         ("succeeded", "child_descriptor_v1", str(len(descriptor))))
+                         ("succeeded", "child_descriptor_v1", "187"))
+        descriptor = b64decode(record["output_b64"])
+        self.assertTrue(descriptor.startswith(b"NXSCHD03"))
         self.assertEqual(record["evidence_record_digest"], evidence_record_digest_v3(
             record["namespace_id"], record["authority_id"], record["effect_id"], record["run_id"],
             record["operation_key"], record["input_digest"], record["catalog_digest"],

@@ -11,6 +11,7 @@ import signal
 import socket
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -31,6 +32,63 @@ _TERMINAL_COUNTER_FIELDS = (
     "retired_by_evidence",
     "retained_claims",
 )
+
+
+def _write_stage_timings(trial_dir: Path, stages: dict[str, int]) -> None:
+    """Persist controller-owned monotonic stage boundaries for one trial."""
+    path = trial_dir / "stage-timings.json"
+    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    temporary.write_text(json.dumps({"schema_version": 1, "clock": "monotonic_ns", "stages": stages}, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def _validate_dma_gate(metrics: dict[str, Any], field: str, *, retained: bool, result: str) -> None:
+    """Validate an optional exact-coordinate, read-only core gate receipt."""
+    value = metrics.get(field)
+    if value is None:
+        return
+    if not isinstance(value, dict) or set(value) != {
+        "resource_id_raw", "generation", "retained", "gate_result",
+        "revision_unchanged", "head_unchanged",
+    }:
+        raise ValueError(f"recovery terminal metric {field} has invalid schema")
+    if any(isinstance(value[name], bool) or not isinstance(value[name], int) or value[name] <= 0
+           for name in ("resource_id_raw", "generation")):
+        raise ValueError(f"recovery terminal metric {field} lacks an exact coordinate")
+    if (value["retained"], value["gate_result"]) != (retained, result):
+        raise ValueError(f"recovery terminal metric {field} contradicts gate state")
+    if value["revision_unchanged"] is not True or value["head_unchanged"] is not True:
+        raise ValueError(f"recovery terminal metric {field} is not read-only")
+
+
+def _validate_dma_gate_pair(metrics: dict[str, Any]) -> None:
+    retained, reusable = metrics.get("dma_retained_gate"), metrics.get("dma_reusable_gate")
+    if retained is not None and reusable is not None and (
+        retained["resource_id_raw"], retained["generation"]
+    ) != (reusable["resource_id_raw"], reusable["generation"]):
+        raise ValueError("DMA gate receipts must bind the same resource coordinate")
+
+
+def _validate_dma_quiescence(metrics: dict[str, Any]) -> None:
+    value = metrics.get("dma_quiescence_evidence")
+    if value is None:
+        return
+    if not isinstance(value, dict) or set(value) != {
+        "schema_version", "run_id", "resource_id_raw", "generation", "reset", "irq_drained", "iotlb",
+    }:
+        raise ValueError("DMA quiescence evidence has invalid schema")
+    if value["schema_version"] != 1 or value["run_id"] != metrics.get("run_id"):
+        raise ValueError("DMA quiescence evidence has invalid version or run binding")
+    if any(isinstance(value[name], bool) or not isinstance(value[name], int) or value[name] <= 0
+           for name in ("resource_id_raw", "generation")):
+        raise ValueError("DMA quiescence evidence lacks an exact coordinate")
+    if any(value[name] is not True for name in ("reset", "irq_drained", "iotlb")):
+        raise ValueError("DMA quiescence evidence lacks a complete verified closure")
+    reusable = metrics.get("dma_reusable_gate")
+    if reusable is None or (value["resource_id_raw"], value["generation"]) != (
+        reusable["resource_id_raw"], reusable["generation"]
+    ):
+        raise ValueError("DMA quiescence evidence must bind the admitted gate coordinate")
 
 
 def _read_one_frame(client: socket.socket) -> bytes:
@@ -222,6 +280,10 @@ def _require_terminal_metrics(metrics: dict[str, Any]) -> None:
         raise ValueError("recovery terminal metric reconciliation_steps must be a non-negative integer")
     if metrics.get("reconciliation_delay_unit") != "unmeasured":
         raise ValueError("recovery terminal metric reconciliation_delay_unit must be unmeasured")
+    _validate_dma_gate(metrics, "dma_retained_gate", retained=True, result="rejected_retained")
+    _validate_dma_gate(metrics, "dma_reusable_gate", retained=False, result="admitted_reusable")
+    _validate_dma_gate_pair(metrics)
+    _validate_dma_quiescence(metrics)
 
 
 def _validate_real_qemu_launcher(args: argparse.Namespace) -> None:
@@ -381,6 +443,8 @@ def _metric(*, run_id: str, variant: str, trial: int, cutpoint: str, cutpoint_id
         "gate_rejections": metric_source.get("gate_rejections"),
         "reconciliation_steps": metric_source.get("reconciliation_steps"),
         "reconciliation_delay_unit": metric_source.get("reconciliation_delay_unit"),
+        "dma_retained_gate": metric_source.get("dma_retained_gate"),
+        "dma_reusable_gate": metric_source.get("dma_reusable_gate"),
         "container_id": container_id, "media": [str(path) for path in media], "guest": guest, "recovery": recovery,
     }
 
@@ -417,6 +481,8 @@ def run_trial(args: argparse.Namespace) -> dict[str, Any]:
         env["CSER_EXPERIMENT_EFFECT_ID"] = args.effect_id
     initial_stdout = (trial_dir / "initial.stdout.log").open("wb")
     initial_stderr = (trial_dir / "initial.stderr.log").open("wb")
+    stage_timings: dict[str, int] = {"initial_start_ns": time.monotonic_ns()}
+    _write_stage_timings(trial_dir, stage_timings)
     try:
         process = subprocess.Popen(
             args.guest,
@@ -447,16 +513,22 @@ def run_trial(args: argparse.Namespace) -> dict[str, Any]:
             _kill_process_group(process)  # kill any launcher outside the container too
         _finish_process_capture(process, initial_stdout, initial_stderr, stage="initial")
         initial_captured = True
+        stage_timings["initial_end_ns"] = time.monotonic_ns()
+        _write_stage_timings(trial_dir, stage_timings)
         recovery = None
         if args.recovery_guest is not None:
             recovery_env = env.copy()
             recovery_env.update({"CSER_EXPERIMENT_PHASE": "recovery", "CSER_EXPERIMENT_RECOVERY_METRICS": str(recovery_metrics_path)})
+            stage_timings["recovery_start_ns"] = time.monotonic_ns()
+            _write_stage_timings(trial_dir, stage_timings)
             recovery_returncode, recovery_stdout_log, recovery_stderr = _run_recovery_launcher(
                 args.recovery_guest,
                 env=recovery_env,
                 trial_dir=trial_dir,
                 timeout_seconds=args.recovery_timeout_seconds,
             )
+            stage_timings["recovery_end_ns"] = time.monotonic_ns()
+            _write_stage_timings(trial_dir, stage_timings)
             if recovery_returncode != 0:
                 raise RuntimeError(
                     f"recovery stage exited {recovery_returncode}: {recovery_stderr}"
@@ -479,6 +551,8 @@ def run_trial(args: argparse.Namespace) -> dict[str, Any]:
         _kill_process_group(process)
         if not initial_captured:
             _finish_process_capture(process, initial_stdout, initial_stderr, stage="initial")
+            stage_timings["initial_end_ns"] = time.monotonic_ns()
+            _write_stage_timings(trial_dir, stage_timings)
         raise
 def append_jsonl(path: Path, metric: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)

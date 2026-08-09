@@ -48,6 +48,7 @@ from tool_worker import AsyncWorker
 _DEFAULT_CATALOG_DIGEST = hashlib.sha256(b"nexus-cser-local-evidence-unbound-v2").hexdigest()
 _DEFAULT_NAMESPACE = "trusted-local"
 _ASYNC_QUEUE_SCHEMA_VERSION = 1
+_PERFORMANCE_TIMING_SCHEMA_VERSION = 1
 
 
 def _valid_id(value: object) -> bool:
@@ -91,6 +92,10 @@ class EndpointRecord:
     created_at_ns: int
     updated_at_ns: int
     expires_at_ns: int
+    accepted_at_ns: int
+    pending_at_ns: int
+    provider_applied_at_ns: int
+    terminal_at_ns: int
 
     def evidence_digest(self) -> str:
         if self.record_schema_version != ENDPOINT_RECORD_SCHEMA_VERSION or not self.state.terminal:
@@ -174,6 +179,8 @@ class EndpointRecord:
             "evidence_record_digest": self.evidence_digest(),
             "created_at_ns": str(self.created_at_ns), "updated_at_ns": str(self.updated_at_ns),
             "expires_at_ns": str(self.expires_at_ns), "replayed": "true" if replayed else "false",
+            "accepted_at_ns": str(self.accepted_at_ns), "pending_at_ns": str(self.pending_at_ns),
+            "provider_applied_at_ns": str(self.provider_applied_at_ns), "terminal_at_ns": str(self.terminal_at_ns),
         }
 
 
@@ -242,6 +249,7 @@ class Store:
                 "submit": 0, "replay": 0, "conflict": 0, "expired": 0, "transition": 0,
                 "infrastructure_retry": 0, "infrastructure_backoff": 0,
             }
+            self._max_inflight = 0
             self._migrate_and_open()
         except BaseException:
             # A corrupt, newer, or unmigratable database is a hard startup
@@ -265,13 +273,23 @@ class Store:
                     "input_digest", "payload", "state", "result", "catalog_digest",
                     "output_kind", "output", "record_schema_version", "created_at_ns", "updated_at_ns", "expires_at_ns",
                 }
+                timing_columns = v3_columns | {"accepted_at_ns", "pending_at_ns", "provider_applied_at_ns", "terminal_at_ns"}
                 v2_columns = v3_columns - {"output_kind", "output"}
                 legacy_columns = {"run_id", "operation_key", "payload_digest", "payload", "status", "result"}
-                if columns and columns not in (v3_columns, v2_columns, legacy_columns):
+                if columns and columns not in (timing_columns, v3_columns, v2_columns, legacy_columns):
                     raise ValueError("endpoint database has an unknown or unmigratable operations schema")
                 if columns == v2_columns:
                     self._connection.execute("ALTER TABLE operations ADD COLUMN output_kind TEXT NOT NULL DEFAULT 'none'")
                     self._connection.execute("ALTER TABLE operations ADD COLUMN output BLOB NOT NULL DEFAULT X''")
+                    columns = v3_columns
+                if columns == v3_columns:
+                    self._connection.execute("ALTER TABLE operations ADD COLUMN accepted_at_ns INTEGER NOT NULL DEFAULT 0")
+                    self._connection.execute("ALTER TABLE operations ADD COLUMN pending_at_ns INTEGER NOT NULL DEFAULT 0")
+                    self._connection.execute("ALTER TABLE operations ADD COLUMN provider_applied_at_ns INTEGER NOT NULL DEFAULT 0")
+                    self._connection.execute("ALTER TABLE operations ADD COLUMN terminal_at_ns INTEGER NOT NULL DEFAULT 0")
+                    # Historical v3 rows did not record these independent
+                    # boundaries.  Zero is an explicit unknown, never an
+                    # inferred timestamp from created/updated time.
                 if columns == legacy_columns:
                     # Preserve the old bytes for diagnosis but make their old,
                     # unbound evidence unavailable after migration.  A caller
@@ -283,12 +301,13 @@ class Store:
                     self._connection.execute(
                         """INSERT INTO operations(namespace_id, authority_id, effect_id, run_id, operation_key,
                            input_digest, payload, state, result, catalog_digest, output_kind, output, record_schema_version,
-                           created_at_ns, updated_at_ns, expires_at_ns)
+                           created_at_ns, updated_at_ns, expires_at_ns, accepted_at_ns, pending_at_ns,
+                           provider_applied_at_ns, terminal_at_ns)
                            SELECT 'legacy', '00000000000000000000000000000000',
                                   '00000000000000000000000000000000', run_id, operation_key,
-                                  payload_digest, payload, 'expired', result, ?, 'none', X'', 1, ?, ?, 0
+                                  payload_digest, payload, 'expired', result, ?, 'none', X'', 1, ?, ?, 0, ?, 0, 0, 0
                            FROM operations_v1_unbound""",
-                        (_DEFAULT_CATALOG_DIGEST, now, now),
+                        (_DEFAULT_CATALOG_DIGEST, now, now, now),
                     )
                     self._connection.execute("DROP TABLE operations_v1_unbound")
                 elif not columns:
@@ -311,6 +330,8 @@ class Store:
                         "catalog_digest": self._catalog_digest,
                         "retention_ns": str(self._retention_ns),
                         "async_queue_schema_version": str(_ASYNC_QUEUE_SCHEMA_VERSION),
+                        "performance_timing_schema_version": str(_PERFORMANCE_TIMING_SCHEMA_VERSION),
+                        "max_inflight": "0",
                         "created_at_ns": str(time.time_ns()),
                     }
                     self._connection.executemany(
@@ -325,6 +346,15 @@ class Store:
                         (str(_ASYNC_QUEUE_SCHEMA_VERSION),),
                     )
                     metadata["async_queue_schema_version"] = str(_ASYNC_QUEUE_SCHEMA_VERSION)
+                if "performance_timing_schema_version" not in metadata:
+                    self._connection.execute(
+                        "INSERT INTO adapter_metadata(key, value) VALUES ('performance_timing_schema_version', ?)",
+                        (str(_PERFORMANCE_TIMING_SCHEMA_VERSION),),
+                    )
+                    metadata["performance_timing_schema_version"] = str(_PERFORMANCE_TIMING_SCHEMA_VERSION)
+                if "max_inflight" not in metadata:
+                    self._connection.execute("INSERT INTO adapter_metadata(key, value) VALUES ('max_inflight', '0')")
+                    metadata["max_inflight"] = "0"
                 if metadata.get("schema_version") == "2":
                     # Adding storage columns is a database migration, not an
                     # evidence migration.  Historical v2 rows retain their
@@ -343,9 +373,17 @@ class Store:
                     "catalog_digest": self._catalog_digest,
                     "retention_ns": str(self._retention_ns),
                     "async_queue_schema_version": str(_ASYNC_QUEUE_SCHEMA_VERSION),
+                    "performance_timing_schema_version": str(_PERFORMANCE_TIMING_SCHEMA_VERSION),
                 }
-                if any(metadata.get(key) != value for key, value in expected.items()):
+                required_metadata_keys = set(expected) | {"authority_id", "effect_id", "created_at_ns", "max_inflight"}
+                if set(metadata) != required_metadata_keys or any(metadata.get(key) != value for key, value in expected.items()):
                     raise ValueError("endpoint database configuration differs from its durable evidence contract")
+                try:
+                    self._max_inflight = int(metadata["max_inflight"])
+                    if self._max_inflight < 0:
+                        raise ValueError
+                except (KeyError, ValueError) as exc:
+                    raise ValueError("endpoint database has invalid durable max inflight") from exc
                 authority = metadata.get("authority_id")
                 effect = metadata.get("effect_id")
                 try:
@@ -391,6 +429,10 @@ class Store:
                    created_at_ns INTEGER NOT NULL,
                    updated_at_ns INTEGER NOT NULL,
                    expires_at_ns INTEGER NOT NULL,
+                   accepted_at_ns INTEGER NOT NULL,
+                   pending_at_ns INTEGER NOT NULL,
+                   provider_applied_at_ns INTEGER NOT NULL,
+                   terminal_at_ns INTEGER NOT NULL,
                    PRIMARY KEY(namespace_id, run_id, operation_key)
                )"""
         )
@@ -460,6 +502,7 @@ class Store:
             operation_key=row[4], input_digest=row[5], state=OperationState(row[6]), result=row[7],
             catalog_digest=row[8], output_kind=row[9], output=row[10], record_schema_version=row[11],
             created_at_ns=row[12], updated_at_ns=row[13], expires_at_ns=row[14],
+            accepted_at_ns=row[15], pending_at_ns=row[16], provider_applied_at_ns=row[17], terminal_at_ns=row[18],
         )
 
     @staticmethod
@@ -470,7 +513,7 @@ class Store:
         row = self._connection.execute(
             """SELECT namespace_id, authority_id, effect_id, run_id, operation_key, input_digest,
                       state, result, catalog_digest, output_kind, output, record_schema_version, created_at_ns, updated_at_ns,
-                      expires_at_ns FROM operations WHERE namespace_id=? AND run_id=? AND operation_key=?""",
+                      expires_at_ns, accepted_at_ns, pending_at_ns, provider_applied_at_ns, terminal_at_ns FROM operations WHERE namespace_id=? AND run_id=? AND operation_key=?""",
             (self._namespace_id, run_id, operation_key),
         ).fetchone()
         # A migrated v1 row deliberately remains an expired tombstone rather
@@ -481,7 +524,7 @@ class Store:
             row = self._connection.execute(
                 """SELECT namespace_id, authority_id, effect_id, run_id, operation_key, input_digest,
                           state, result, catalog_digest, output_kind, output, record_schema_version, created_at_ns, updated_at_ns,
-                          expires_at_ns FROM operations WHERE run_id=? AND operation_key=?""",
+                          expires_at_ns, accepted_at_ns, pending_at_ns, provider_applied_at_ns, terminal_at_ns FROM operations WHERE run_id=? AND operation_key=?""",
                 (run_id, operation_key),
             ).fetchone()
         return None if row is None else self._from_row(row)
@@ -532,11 +575,11 @@ class Store:
                 self._connection.execute(
                     """INSERT INTO operations(namespace_id, authority_id, effect_id, run_id, operation_key,
                        input_digest, payload, state, result, catalog_digest, output_kind, output, record_schema_version,
-                       created_at_ns, updated_at_ns, expires_at_ns)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'none', X'', ?, ?, ?, ?)""",
+                       created_at_ns, updated_at_ns, expires_at_ns, accepted_at_ns, pending_at_ns, provider_applied_at_ns, terminal_at_ns)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'none', X'', ?, ?, ?, ?, ?, 0, 0, ?)""",
                     (self._namespace_id, self._authority_id, self._effect_id, run_id, operation_key,
                      input_digest, payload, initial_state.value, result, self._catalog_digest,
-                     ENDPOINT_RECORD_SCHEMA_VERSION, now, now, expires),
+                     ENDPOINT_RECORD_SCHEMA_VERSION, now, now, expires, now, now),
                 )
                 record = self._select(run_id, operation_key)
                 assert record is not None
@@ -598,10 +641,10 @@ class Store:
                 self._connection.execute(
                     """INSERT INTO operations(namespace_id, authority_id, effect_id, run_id, operation_key,
                        input_digest, payload, state, result, catalog_digest, output_kind, output, record_schema_version,
-                       created_at_ns, updated_at_ns, expires_at_ns)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, 'accepted', 'queued', ?, 'none', X'', ?, ?, ?, 0)""",
+                       created_at_ns, updated_at_ns, expires_at_ns, accepted_at_ns, pending_at_ns, provider_applied_at_ns, terminal_at_ns)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, 'accepted', 'queued', ?, 'none', X'', ?, ?, ?, 0, ?, 0, 0, 0)""",
                     (self._namespace_id, self._authority_id, self._effect_id, run_id, operation_key,
-                     input_digest, payload, self._catalog_digest, ENDPOINT_RECORD_SCHEMA_VERSION, now, now),
+                     input_digest, payload, self._catalog_digest, ENDPOINT_RECORD_SCHEMA_VERSION, now, now, now),
                 )
                 self._connection.execute(
                     "INSERT INTO operation_queue(namespace_id, run_id, operation_key) VALUES (?, ?, ?)",
@@ -652,9 +695,17 @@ class Store:
                     self._connection.execute("COMMIT")
                     return None
                 self._connection.execute(
-                    """UPDATE operations SET state='pending', result='working', updated_at_ns=?
+                    """UPDATE operations SET state='pending', result='working', updated_at_ns=?, pending_at_ns=?
                        WHERE namespace_id=? AND run_id=? AND operation_key=? AND state='accepted'""",
-                    (now, row[0], row[4], row[5]),
+                    (now, now, row[0], row[4], row[5]),
+                )
+                inflight = self._connection.execute(
+                    "SELECT COUNT(*) FROM operation_queue WHERE lease_token IS NOT NULL"
+                ).fetchone()[0]
+                self._max_inflight = max(self._max_inflight, inflight)
+                self._connection.execute(
+                    "UPDATE adapter_metadata SET value=? WHERE key='max_inflight'",
+                    (str(self._max_inflight),),
                 )
                 self._counters["transition"] += 1
                 self._connection.execute("COMMIT")
@@ -663,24 +714,26 @@ class Store:
                 self._connection.execute("ROLLBACK")
                 raise
 
-    def complete_lease(self, item: WorkItem, state: str, result: str, output_kind: str = "none", output: bytes = b"") -> bool:
+    def complete_lease(self, item: WorkItem, state: str, result: str, output_kind: str = "none", output: bytes = b"", provider_applied_at_ns: int = 0) -> bool:
         if (state not in ("succeeded", "failed") or not _valid_id(result)
                 or output_kind not in ("none", "child_descriptor_v1")
                 or (state == "failed" and output_kind != "none")
                 or len(output) > MAX_TERMINAL_OUTPUT_BYTES
-                or (output_kind == "none") != (not output)):
+                or (output_kind == "none") != (not output) or provider_applied_at_ns < 0):
             raise ValueError("invalid provider outcome")
         now = self._now()
+        if provider_applied_at_ns == 0:
+            provider_applied_at_ns = now
         with self._lock:
             self._connection.execute("BEGIN IMMEDIATE")
             try:
                 changed = self._connection.execute(
-                    """UPDATE operations SET state=?, result=?, output_kind=?, output=?, updated_at_ns=?, expires_at_ns=?
+                    """UPDATE operations SET state=?, result=?, output_kind=?, output=?, updated_at_ns=?, expires_at_ns=?, provider_applied_at_ns=?, terminal_at_ns=?
                        WHERE namespace_id=? AND run_id=? AND operation_key=? AND state IN ('accepted','pending')
                          AND EXISTS (SELECT 1 FROM operation_queue q WHERE q.namespace_id=operations.namespace_id
                            AND q.run_id=operations.run_id AND q.operation_key=operations.operation_key
                            AND q.lease_token=?)""",
-                    (state, result, output_kind, output, now, now + self._retention_ns, item.namespace_id, item.run_id,
+                    (state, result, output_kind, output, now, now + self._retention_ns, provider_applied_at_ns, now, item.namespace_id, item.run_id,
                      item.operation_key, item.lease_token),
                 ).rowcount
                 if changed:
@@ -736,8 +789,8 @@ class Store:
                     return record.document(replayed=True)
                 expires = now + self._retention_ns if state.terminal else record.expires_at_ns
                 self._connection.execute(
-                    "UPDATE operations SET state=?, result=?, updated_at_ns=?, expires_at_ns=? WHERE namespace_id=? AND run_id=? AND operation_key=?",
-                    (state.value, result, now, expires, self._namespace_id, run_id, operation_key),
+                    "UPDATE operations SET state=?, result=?, updated_at_ns=?, expires_at_ns=?, pending_at_ns=CASE WHEN ?='pending' THEN ? ELSE pending_at_ns END, terminal_at_ns=CASE WHEN ? IN ('succeeded','failed') THEN ? ELSE terminal_at_ns END WHERE namespace_id=? AND run_id=? AND operation_key=?",
+                    (state.value, result, now, expires, state.value, now, state.value, now, self._namespace_id, run_id, operation_key),
                 )
                 if state.terminal:
                     # Manual/test terminal publication must not leave a queue
@@ -761,6 +814,11 @@ class Store:
             queue = self._connection.execute(
                 "SELECT COUNT(*), COALESCE(SUM(attempts), 0), COALESCE(SUM(lease_token IS NOT NULL), 0) FROM operation_queue"
             ).fetchone()
+            intervals = self._connection.execute(
+                """SELECT COUNT(*), COALESCE(SUM(pending_at_ns-accepted_at_ns),0), COALESCE(MAX(pending_at_ns-accepted_at_ns),0),
+                          COALESCE(SUM(provider_applied_at_ns-pending_at_ns),0), COALESCE(MAX(provider_applied_at_ns-pending_at_ns),0)
+                   FROM operations WHERE pending_at_ns > 0 AND provider_applied_at_ns >= pending_at_ns"""
+            ).fetchone()
             return {
                 "adapter_schema_version": str(ENDPOINT_RECORD_SCHEMA_VERSION),
                 "contract_version": str(ENDPOINT_HTTP_CONTRACT_VERSION),
@@ -772,6 +830,10 @@ class Store:
                 "queue_queued": str(queue[0]),
                 "queue_attempts": str(queue[1]),
                 "queue_leased": str(queue[2]),
+                "queue_provider_interval_samples": str(intervals[0]),
+                "queue_wait_ns_total": str(intervals[1]), "queue_wait_ns_max": str(intervals[2]),
+                "provider_interval_ns_total": str(intervals[3]), "provider_interval_ns_max": str(intervals[4]),
+                "queue_max_inflight": str(self._max_inflight),
                 **{f"requests_{name}": str(value) for name, value in self._counters.items()},
             }
 
@@ -782,7 +844,9 @@ class Store:
 class Endpoint(ThreadingHTTPServer):
     def __init__(self, address: tuple[str, int], store: Store, fault_after_response_commit_once: bool,
                  *, provider_database: Path | None = None, start_worker: bool = False,
-                 provider_fault_after_apply_once: bool = False) -> None:
+                 provider_fault_after_apply_once: bool = False, provider_delay_ms: int = 0, worker_count: int = 1) -> None:
+        if worker_count < 1:
+            raise ValueError("worker count must be positive")
         super().__init__(address, Handler)
         self.store = store
         self.fault_after_response_commit_once = fault_after_response_commit_once
@@ -790,11 +854,14 @@ class Endpoint(ThreadingHTTPServer):
         self.provider = ProviderStore(
             provider_database or store.database.with_suffix(".provider.sqlite"),
             fault_after_apply_once=provider_fault_after_apply_once,
+            delay_ms=provider_delay_ms,
         )
-        self.worker = AsyncWorker(store, self.provider, worker_id="endpoint-worker")
+        self.workers = [AsyncWorker(store, self.provider, worker_id=f"endpoint-worker-{index}") for index in range(worker_count)]
+        self.worker = self.workers[0]  # focused callers retain the singular test hook
         self._async_closed = False
         if start_worker:
-            self.worker.start()
+            for worker in self.workers:
+                worker.start()
 
     def take_lost_response_fault(self) -> bool:
         with self._fault_lock:
@@ -806,7 +873,7 @@ class Endpoint(ThreadingHTTPServer):
     def close_async(self) -> None:
         if self._async_closed:
             return
-        if not self.worker.stop():
+        if not all(worker.stop() for worker in self.workers):
             raise RuntimeError("async worker did not stop before provider close")
         self.provider.close()
         self._async_closed = True
@@ -1019,12 +1086,15 @@ def main() -> None:
     parser.add_argument("--provider-fault-after-apply-once", action="store_true",
                         help="durably apply once in the provider, then leave the adapter Pending")
     parser.add_argument("--provider-database", type=Path)
+    parser.add_argument("--provider-delay-ms", default=0, type=int)
+    parser.add_argument("--worker-count", default=1, type=int)
     args = parser.parse_args()
     endpoint = Endpoint(
         (args.host, args.port),
         Store(args.database, namespace_id=args.namespace, catalog_digest=args.catalog_digest, authority_id=args.authority_id, effect_id=args.effect_id, retention_seconds=args.retention_seconds),
         args.fault_after_response_commit_once, provider_database=args.provider_database, start_worker=True,
         provider_fault_after_apply_once=args.provider_fault_after_apply_once,
+        provider_delay_ms=args.provider_delay_ms, worker_count=args.worker_count,
     )
     if args.port_file is not None:
         args.port_file.write_text(f"{endpoint.server_port}\n", encoding="ascii")

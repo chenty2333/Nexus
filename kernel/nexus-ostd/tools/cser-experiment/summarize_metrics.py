@@ -22,6 +22,38 @@ CUTPOINTS = {
 }
 REQUIRED = frozenset(("schema_version", "run_id", "variant", "trial", "cutpoint", "cutpoint_id", "crash_method", "barrier_observed", "barrier_acknowledged", "completion_state", "retention_horizon", "permanent_retention", "admin_disposition", "admin_disposition_count", "metrics_source", "reconciliation_delay_unit", *METRIC_FIELDS))
 
+
+def _gate(value: Any, *, retained: bool, result: str, number: int, field: str) -> None:
+    if value is None:
+        return
+    if not isinstance(value, dict) or set(value) != {"resource_id_raw", "generation", "retained", "gate_result", "revision_unchanged", "head_unchanged"}:
+        raise ValueError(f"metric {number} has invalid {field}")
+    if any(isinstance(value[name], bool) or not isinstance(value[name], int) or value[name] <= 0 for name in ("resource_id_raw", "generation")):
+        raise ValueError(f"metric {number} has invalid {field} coordinate")
+    if (value["retained"], value["gate_result"], value["revision_unchanged"], value["head_unchanged"]) != (retained, result, True, True):
+        raise ValueError(f"metric {number} has invalid {field} provenance")
+
+def _gate_pair(item: dict[str, Any], number: int) -> None:
+    retained, reusable = item.get("dma_retained_gate"), item.get("dma_reusable_gate")
+    if retained is not None and reusable is not None and (
+        retained["resource_id_raw"], retained["generation"]
+    ) != (reusable["resource_id_raw"], reusable["generation"]):
+        raise ValueError(f"metric {number} has mismatched DMA gate coordinates")
+
+def _quiescence(item: dict[str, Any], number: int) -> None:
+    value = item.get("dma_quiescence_evidence")
+    if value is None:
+        return
+    if not isinstance(value, dict) or set(value) != {"schema_version", "run_id", "resource_id_raw", "generation", "reset", "irq_drained", "iotlb"}:
+        raise ValueError(f"metric {number} has invalid DMA quiescence evidence")
+    if value["schema_version"] != 1 or value["run_id"] != item["run_id"] or any(value[name] is not True for name in ("reset", "irq_drained", "iotlb")):
+        raise ValueError(f"metric {number} has invalid DMA quiescence provenance")
+    if any(isinstance(value[name], bool) or not isinstance(value[name], int) or value[name] <= 0 for name in ("resource_id_raw", "generation")):
+        raise ValueError(f"metric {number} has invalid DMA quiescence coordinate")
+    gate = item.get("dma_reusable_gate")
+    if gate is None or (value["resource_id_raw"], value["generation"]) != (gate["resource_id_raw"], gate["generation"]):
+        raise ValueError(f"metric {number} has DMA quiescence/gate mismatch")
+
 def load_metrics(path: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
@@ -53,6 +85,10 @@ def load_metrics(path: Path) -> list[dict[str, Any]]:
                 raise ValueError(f"metric {number} must leave unmeasured {field} explicitly null")
         if item["metrics_source"] == "recovery_terminal" and item["reconciliation_delay_unit"] != "unmeasured":
             raise ValueError(f"metric {number} has invalid authoritative reconciliation delay unit")
+        _gate(item.get("dma_retained_gate"), retained=True, result="rejected_retained", number=number, field="dma_retained_gate")
+        _gate(item.get("dma_reusable_gate"), retained=False, result="admitted_reusable", number=number, field="dma_reusable_gate")
+        _gate_pair(item, number)
+        _quiescence(item, number)
         rows.append(item)
     return rows
 
@@ -83,6 +119,10 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "metric_sources": dict(sorted(Counter(row["metrics_source"] for row in selected).items())),
             "measured_trials": {key: len(values[key]) for key in METRIC_FIELDS},
             "sums": {key: sum(values[key]) if values[key] else None for key in METRIC_FIELDS},
+            "dma_gate_observations": {
+                "retained_rejected": sum(1 for row in selected if row.get("dma_retained_gate") is not None),
+                "evidence_retired_reusable": sum(1 for row in selected if row.get("dma_reusable_gate") is not None),
+            },
             "reconciliation_delay_units": dict(sorted(Counter(row["reconciliation_delay_unit"] for row in selected if row["reconciliation_delay_unit"] is not None).items())),
         }
     return {"schema_version": SCHEMA_VERSION, "retention_horizon": "bounded_observation", "variants": variants}

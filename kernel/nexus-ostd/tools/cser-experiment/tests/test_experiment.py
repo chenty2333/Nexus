@@ -179,8 +179,7 @@ class BridgeTest(unittest.TestCase):
             server_thread = threading.Thread(target=server.serve_forever, daemon=True)
             server_thread.start()
             identity = (namespace, authority, effect, run, catalog)
-            descriptor = b"NXSCHD01" + b"x" * 120
-            payload = b"child-descriptor-v1:" + descriptor
+            payload = b"discover-child-v1:0000000000000077:0000000000000002:00000005"
 
             def exchange(frame: bytes) -> bytes:
                 host, guest = socket.socketpair()
@@ -215,8 +214,8 @@ class BridgeTest(unittest.TestCase):
                 method="GET", expected_input_digest=digest(payload),
             ))
             self.assertIn(b" RESP 200 ", terminal)
-            self.assertIn(b" child_descriptor_v1 128 ", terminal)
-            self.assertEqual(descriptor, b64decode(terminal.split()[15]))
+            self.assertIn(b" child_descriptor_v1 187 ", terminal)
+            self.assertEqual(b"NXSCHD03", b64decode(terminal.split()[15])[:8])
             server.shutdown(); server.server_close(); store.close()
 
     def test_v2_bridge_post_get_absence_and_expiry(self) -> None:

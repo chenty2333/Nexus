@@ -15,6 +15,15 @@ ENDPOINT_HTTP_CONTRACT_VERSION = 3
 LEGACY_V2_RECORD_SCHEMA_VERSION = 2
 LEGACY_V2_HTTP_CONTRACT_VERSION = 2
 MAX_TERMINAL_OUTPUT_BYTES = 256
+# Canonical output returned by the trusted-local provider for the narrow
+# single-hop handoff experiment.  These are protocol constants rather than
+# adapter input: a caller asks the provider to discover one child; it cannot
+# smuggle a pre-built descriptor through the endpoint.
+CHILD_DESCRIPTOR_V1_WIRE_LEN = 187
+CHILD_DISCOVERY_V1_PREFIX = b"discover-child-v1:"
+CHILD_DESCRIPTOR_V1_ROUTE_DIGEST = hashlib.sha256(
+    b"nexus-cser-tool-provider-child-route-v1"
+).digest()
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _RUN_ID = re.compile(r"^[0-9a-f]{32}$")
