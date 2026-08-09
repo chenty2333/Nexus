@@ -1,6 +1,11 @@
-# CSER v6 Aggressive Semantic Cleanup
+# CSER Research and Evaluation Plan
 
 ## Working stance
+
+The catalog-v6 cleanup and the reference-adapter, stability, and measured-
+performance phase recorded below are complete. They remain here as the
+approved design record. The active phase is the late-bound custody
+falsification pilot at the end of this file.
 
 Nexus and CSER are still in a single-team research and development phase with
 no external users. Breaking API, catalog, journal-adjacent, documentation, and
@@ -257,3 +262,211 @@ bounded and stage-identifiable; parallel media preparation and delayed UART
 paths are reproducible; soak/fault/SMP runs preserve fail-closed behavior; and
 each performance change has paired measurements demonstrating that it removes
 a measured cost without weakening the existing crash and invariant results.
+
+## Approved next phase: late-bound custody falsification pilot
+
+### Decision and scope
+
+Treat late-bound custody as the leading mechanism-falsification experiment,
+not as a preapproved dynamic-workflow product or a promise to expand the core.
+The fixed tool-plus-DMA topology has already produced honest parity between
+CSER and a strong independent finalizer. Repeating that topology with more
+crash points will not establish a CSER advantage.
+
+The pilot must be capable of weakening or falsifying the CSER necessity claim.
+A workload-specific baseline may use correct fsync, durable outbox/inbox
+records, idempotent recovery, provider generation fencing, shared persistence,
+or a purpose-built coordinator. A shared table alone is not grounds for
+renaming the baseline CSER. Semantic convergence may be claimed only if the
+baseline actually needs durable late enrollment, a common fence and allocator
+gate, and evidence-gated independent release.
+
+This phase ends with a recorded Go/No-Go decision. A Go authorizes a separately
+reviewed QEMU experiment plan; it does not automatically authorize a general
+dynamic-component API, a parent/child workflow engine, or full productization.
+
+### 0. Restore factual alignment
+
+Before reporting new results, update the endpoint capability census so it no
+longer describes the current CSER2 adapter as an `applied/success`-only
+prototype. Keep the trusted-local threat boundary and the distinction between
+outcome and quiescence evidence explicit.
+
+Keep publication boundaries honest: the Nexus source is on GitHub, while the
+generated comparison receipts remain Git-ignored, the small source-bound
+evidence bundle is not yet published, and the sibling `nexus-hotos` checkout
+still needs an explicit remote before its paper commit can be published.
+
+### Gate 0: establish a credible late-bound workload
+
+Write one concrete workload card before implementation. It must establish all
+of the following:
+
+1. Service A has durably accepted or produced an externally irreversible fact
+   before the exact service-B identity or resource coordinate becomes known.
+2. A and B belong to distinct persistence, recovery, or atomicity domains.
+3. Executor replacement can race B admission and successor resource reuse.
+4. The exact resource cannot be cheaply predeclared; wildcard reservation is
+   either impossible or has a measurable availability or retention cost.
+5. B has a real first-observation gate: no B call or DMA publication may occur
+   before its authority and exact claim have been durably admitted.
+
+A plausible candidate is an asynchronous planner that durably accepts a job
+and only then selects an accelerator worker, queue, or DMA arena. This is a
+candidate, not an assumed fact. The card must explain why the selection is
+genuinely late-bound rather than a host parameter deliberately hidden from the
+baseline.
+
+If no credible workload satisfies these conditions, record No-Go and pivot to
+endpoint-applicability and missing-evidence retention measurements. Do not
+invent a dynamic graph solely to make CSER appear necessary.
+
+### Gate 1: portable pilot with the existing core contract
+
+Do not begin by adding components to an already prepared composite. The current
+catalog fixes a composite's component product at creation and freezes claim
+enrollment at preparation. First test the strongest handoff expressible by the
+existing contract:
+
+`A retained -> durably create B under the same root -> enroll B's exact claim -> release A -> permit B to escape`.
+
+Use two graph shapes:
+
+- **G0 static control:** A, B, and DMA are known before the first escape. A
+  strong baseline should match CSER here.
+- **G1 true late-bound handoff:** A's durable external result reveals B and its
+  resource only after A may have escaped; B is admitted before its own first
+  external observation.
+
+Model the durable route or child descriptor as external evidence, never as an
+unbound harness flag. In the portable pilot it may be a small modeled receipt;
+a QEMU continuation must later carry it through the real endpoint contract.
+
+#### Baseline ladder and fairness
+
+Allow increasingly strong alternatives rather than choosing a strawman:
+
+1. **Independent finalizers:** durable A outbox and B inbox, idempotent handoff,
+   per-service epochs, correct local recovery, and no deliberately omitted
+   persistence step.
+2. **Provider-native generation fence:** B presents the exact resource
+   generation at its real publication gate, which may reject stale work. This
+   is the most important non-CSER counterexample.
+3. **Wildcard reservation:** reserve every possible B resource before A
+   escapes; evaluate at least 2, 8, and 32 candidates to expose or refute the
+   claimed precision cost.
+4. **Workload-specific coordinator:** if simpler baselines fail, allow a
+   durable shared coordinator as an upper bound. Record exactly which common
+   enrollment, fence, gate, and evidence-release semantics it needs.
+
+All arms receive the same route fact, endpoint and device evidence, resource
+generations, schedules, and recovery opportunities. Code size and number of
+tables may be descriptive engineering evidence, but they are not a safety
+proof or the primary result.
+
+#### Required schedules
+
+Enumerate four critical windows, followed by one second crash during recovery
+for each:
+
+1. B reads the old epoch, then the root is fenced before B's inbox and claim
+   become durable.
+2. B's claim becomes durable, then the system crashes before A records the
+   handoff acknowledgement or releases its retained state.
+3. A releases its handoff state, then the system crashes before B's first
+   external publication.
+4. B publishes DMA, then the system crashes before quiescence evidence and
+   claim discharge while a successor attempts conflicting reuse.
+
+Keep the static G0 control small. Do not turn the pilot into a Cartesian QEMU
+matrix before these schedules establish a semantic difference.
+
+#### Hard properties and cost observations
+
+Every arm must report:
+
+- zero external publication without durable enrollment;
+- zero conflicting reuse while a live claim or provider fence forbids it;
+- zero stale or mixed-generation admission;
+- zero duplicate child adoption or external application;
+- complete recovered custody with a stable second recovery;
+- retained claims or wildcard reservations by resource and generation;
+- gate allow/reject counts;
+- reconciliation steps and, where a real clock exists, delay;
+- permanent-retain or administrative-disposition outcomes under missing
+  outcome or quiescence evidence.
+
+### Pre-registered decision rules
+
+Record No-Go for full QEMU expansion if any of the following occurs:
+
+- CSER admits an unregistered publication, conflicting reuse, stale
+  generation, or unstable second recovery.
+- Independent journals plus an idempotent protocol, or a provider-native
+  generation fence, pass every window without a common linearization gate and
+  without material over-retention. This weakens the common-custody necessity
+  claim and is a valid research result.
+- CSER can pass only after adding a general dynamic-component operation,
+  hidden adapter authority, or a new parent/child core primitive. Stop and
+  review that semantic change separately rather than moving the experiment's
+  goalposts.
+- Wildcard reservation has no material retention or availability cost over 2,
+  8, and 32 candidates.
+- Missing evidence makes permanent retention or administrative disposition
+  operationally dominant for the chosen workload.
+
+Record Go only if CSER satisfies every hard property and the strongest simpler
+baseline either exposes a reproducible custody gap, pays measurable wildcard
+retention, or must introduce the common late-enrollment, fence, allocator-gate,
+and typed evidence-release contract under examination.
+
+The strongest defensible conclusion is workload-bounded: in this late-bound
+handoff and fault matrix, a predeclared independent finalizer either loses
+coverage, retains conservatively, or reconstructs the relevant custody
+contract. Do not claim that state machines, transactions, or independent
+finalizers cannot express the behavior in general.
+
+### Gate 2: conditional real-QEMU continuation
+
+Proceed only after Gate 0 and Gate 1 produce Go. The smallest continuation is:
+
+1. Extend the trusted-local endpoint with a durable, evidence-bound route or
+   child descriptor. It must survive lost replies and restart queries and must
+   not be supplied through COM3 or another host-only shortcut.
+2. Make effect identity row-scoped if the experiment requires distinct A and B
+   effects; keep authority, namespace, catalog, retention policy, and schema
+   sidecar-bound where appropriate.
+3. Give A and B independent durable stores/finalizers and use the same external
+   facts for every comparison arm.
+4. Connect two or more actual resource coordinates to the authoritative guest
+   allocator/device gate so old-live blocks the selected conflict while an
+   unrelated route remains admissible.
+5. Run G0 and G1 across the same semantic crash cuts for CSER and the selected
+   strongest baselines. Add missing/expired endpoint evidence and delayed or
+   absent DMA quiescence without constructing an exhaustive fault product.
+6. Measure selected-resource retention, wildcard over-retention, gate
+   rejection, evidence-to-retirement delay, reconciliation, journal/anchor
+   work, permanent retain, and administrative disposition.
+
+Only if adapter-level create-before-release cannot express the required
+custody after this pilot should a durable parent-to-child edge be proposed.
+Such a proposal must specify replay, conservation, reverse indexing,
+retirement, fencing, and baseline-equivalent authority before implementation.
+
+### Explicit deferrals
+
+Do not pull these into the pilot without a new measured or semantic need:
+
+- general dynamic workflow graphs or arbitrary component insertion;
+- remote receipt signatures, mTLS, provider registries, multi-tenancy, SDKs,
+  or a second cloud-product integration;
+- copy-on-write core state, segmented journals, or runtime-mutex splitting;
+- physical-hardware generalization or cross-CPU CSER transactions;
+- a full QEMU matrix before the portable Go decision.
+
+### Completion standard
+
+This phase is complete when the workload card is credible or explicitly
+rejected, the fair baseline powers and schedules are frozen, the G0/G1
+portable pilot has reproducible safety and retention results, and one explicit
+Go/No-Go record determines whether a real-QEMU continuation is justified.

@@ -29,10 +29,12 @@ current fixed tool-plus-DMA experiment does not do so.
 The trusted-local reference-adapter, orchestration-hardening, and measured-
 performance phase is complete. Remote endpoint authentication, multi-provider
 registries, multi-tenancy, and SDK/platform work remain deliberately deferred.
-The leading next-research candidate is a narrowly gated late-bound custody
-handoff pilot, not further mechanism expansion on the fixed tool-plus-DMA
-topology. Its workload, baseline powers, and falsification criteria still need
-explicit approval before they become active work in `task.md`.
+The active research phase is a narrowly gated late-bound custody handoff
+falsification pilot, not further mechanism expansion on the fixed
+tool-plus-DMA topology. It begins with a credible workload card and a portable
+comparison against independent journals, provider-native generation fencing,
+wildcard reservation, and a workload-specific coordinator. Full QEMU work and
+new dynamic-component semantics require an explicit Go result first.
 
 ## Current State
 
@@ -82,6 +84,13 @@ A prior clean-tree catalog-v6 four-boot seal remains the historical production
 recovery seal; current generated QEMU receipts and comparison outputs are
 Git-ignored evidence, not source-controlled release artifacts.
 
+The current composite mechanism remains sealed-topology: the catalog fixes its
+component product at creation and preparation freezes claim enrollment. The
+next pilot therefore starts with the existing-contract handoff `A retained ->
+create and enroll B -> release A -> B escape`; it does not assume arbitrary
+component insertion. The endpoint capability census still contains one stale
+description of the pre-CSER2 successful-only adapter and needs factual repair.
+
 The HotOS draft now states the I2 evidence layers, exact I3 coordinates,
 retirement/abort distinction, evidence-axis separation, Shared boundary,
 counterfactual revision metric, and QEMU-versus-physical boundary. It builds as
@@ -122,4 +131,10 @@ bundle or publish the paper checkout.
 - [x] Measure ATA journal growth and, if dominant, implement an append-oriented segment/checkpoint layout without weakening readback, crash atomicity, or journal-before-anchor ordering.
 - [x] Measure runtime mutex queue/hold time and reduce demonstrated serialization without exposing uncommitted state or effects.
 - [x] Publish the reviewed local Nexus `main` source branch to GitHub after explicit authorization.
+- [ ] Correct the endpoint capability census so its adapter description matches the current trusted-local CSER2 contract.
+- [ ] Freeze one credible late-bound workload card, including why exact pre-registration is unavailable or measurably conservative.
+- [ ] Freeze the G0/G1 portable oracle, strongest baseline powers, four fence/crash windows, second-recovery schedules, hard properties, and Go/No-Go rules.
+- [ ] Implement the portable handoff pilot using the existing core contract, including independent-finalizer and provider-native generation-fence alternatives without adding dynamic-component semantics.
+- [ ] Measure wildcard reservation at 2, 8, and 32 candidates plus claim retention, gate decisions, reconciliation, and missing-evidence outcomes across the pilot.
+- [ ] Record the evidence-backed Go/No-Go decision; design a real-QEMU continuation only if the pre-registered Go conditions hold.
 - [ ] Publish a small source-bound evidence bundle and configure a remote for `nexus-hotos` before publishing the paper commit.
