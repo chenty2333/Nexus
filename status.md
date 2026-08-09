@@ -21,106 +21,94 @@ logical outcomes remain subject to reconciliation, while missing quiescence
 evidence retains physical claims and refuses reuse. A programmable per-class
 disposition algebra is not in current scope.
 
-The catalog-v6 mechanism cleanup and the first endpoint experiment are
-complete. Further core expansion now needs a compositional workload that can
-distinguish CSER from a strong workload-specific independent finalizer; the
-current fixed tool-plus-DMA experiment does not do so.
+The evidence-driven asynchronous applicability and safe-scaling phase has
+delivered its two primary features: a genuinely asynchronous trusted-local
+reference endpoint and a source-labelled, drop-aware applicability trace. A
+fresh-media vNext journal and whole-state checkpoint path are available behind
+an explicit experimental scheme; the legacy journal remains the default.
 
-The trusted-local reference-adapter, orchestration-hardening, and measured-
-performance phase is complete. Remote endpoint authentication, multi-provider
-registries, multi-tenancy, and SDK/platform work remain deliberately deferred.
-The proposed late-bound custody handoff pilot stopped at Gate 0: Kubernetes
-Job/DRA and NVMe Namespace Management both reveal exact coordinates late, but
-already hold first observation behind a workload-specific or provider-native
-coordinator. No G0/G1 experiment was frozen, and no synthetic portable or QEMU
-pilot is active. The next research input is a real endpoint-applicability trace
-that can show whether an executor/effect custody gap exists outside an existing
-scheduler, provider lease, attachment gate, or workflow database.
+Late-bound composition remains a falsification target rather than a presumed
+CSER advantage. Kubernetes Job/DRA and NVMe Namespace Management were useful
+Gate-0 counterexamples because their provider-native coordination already owns
+first observation. Nexus now has a bounded `ChildDescriptorV1`, catalog-bound
+single-hop core guard, CSER3 adapter verification, and a structurally
+independent portable baseline handoff. This is intentionally partial: the real
+QEMU Tool+DMA launcher still uses CSER2 and does not exercise descriptor
+discovery or a parent-to-child handoff. The next implementation step, if this
+line of research continues, is one matched CSER3 logical handoff lane for CSER
+and the strongest baseline—not a general workflow graph or dynamic component
+API.
+
+Performance changes remain evidence-gated. The current data does not justify
+a core copy-on-write rewrite or splitting the authoritative runtime mutex.
+Remote endpoint authentication, multi-provider registries, multi-tenancy,
+SDK/platform work, physical-hardware generalization, and paper publication are
+deferred.
 
 ## Current State
 
-The local `main` branch contains the catalog-v6 cleanup, tool-plus-DMA adapters,
-strong independent-finalizer baseline, trusted-local CSER2 endpoint contract,
-and host-controlled crash matrix in reviewable commits. The reference adapter
-uses durable `Accepted`/`Pending`/`Succeeded`/`Failed` states and binds terminal
-records to namespace, authority, effect, run, operation, input, catalog, and
-schema. Expired and migrated legacy records remain fail-closed tombstones;
-only exact-identity absence permits one same-key retry. Initial and recovery
-boots share a persisted random identity, and recovery validates that binding
-against durable intent before any endpoint request.
+The core contract coordinates are API profile 3, standard catalog 7,
+projection 7, recovery snapshot 3, and journal schema 7. Whole-state checkpoint
+records encode estates, composites, resources, accepted evidence, and bounded
+single-hop roles; recovery validates the canonical projection and rebuilds
+derived indexes before an anchored vNext replacement can become active. The
+handoff rule is catalog-bound, the verifier receipt digest is durable, and
+recovery exposes only a non-authorizing projection that requires revalidation.
 
-The harness supervises endpoint, bridge, UART sink, and QEMU stages; streams
-bounded logs; separates timeout budgets; cleans process groups; locks and
-digest-checks shared base media; and paces bounded COM2/COM3 frames while the
-guest records poll, first-byte, complete-frame, and endpoint timing points. All
-55 host regressions pass with resource warnings promoted to errors. A bounded
-60-second, 12-worker endpoint soak completed with 64 durable keys, 1,329
-idempotent replays, 111 expected conflicts, and zero errors. Focused endpoint,
-bridge, journal, TPM, Loom, and recovery fault paths also pass.
+The trusted-local endpoint now executes real asynchronous work. POST durably
+creates `Accepted` plus a queue entry; leased workers persist `Pending`, execute
+against an exact-key provider database, and commit immutable `Succeeded` or
+`Failed` evidence. Infrastructure failures remain nonterminal. Recovery queries
+the full identity before any same-key retry, 404 is the sole absence authority,
+and 410 remains a fail-closed tombstone. The guest carries explicit terminal,
+nonterminal, absent, expired, and protocol-failure observations and reports a
+bounded deferred-retained result instead of manufacturing failure evidence.
 
-Fresh strict-CSER2 real-QEMU matrices use the same seven host-controlled crash
-cutpoints and isolated durable ATA, RAM, TPM, and endpoint state for both arms.
-The final baseline and CSER runs each complete 7/7 recoveries with totals of 14
-evidence-retired components, zero retained claims, and seven reconciliation
-steps. This is parity, not a demonstrated CSER safety advantage. Gate-rejection
-counts, wall-clock reconciliation delay, permanent-retention proportion, and
-administrative-disposition proportion remain explicitly unmeasured.
+The CSER3 endpoint can return a bounded, evidence-digested 187-byte
+`ChildDescriptorV1`. The core and adapter verify its parent, route, catalog,
+input, child product, claim class, and exact coordinate. Focused core tests
+cover acknowledgement, child installation, atomic parent release plus child
+intent, descriptor tampering, and checkpoint recovery at all three durable
+handoff states. A separate portable baseline stores and gates the same
+canonical descriptor without calling the CSER engine; its dedicated in-QEMU
+ktest passes. Neither arm is wired into the real QEMU experiment runtime yet,
+so these checks support only the approved partial handoff deliverable.
 
-Measured full-state clone, canonical invariant checking, and projection digest
-cost 4.390 ms total at 4,096 live claims in the current release profile, with a
-comparable observed range of about 4.39--5.13 ms. The cached 64-KiB ATA fill
-still performs 8,384 sector writes, 8,384 reads, and 256 flushes (about 65.5x
-write amplification), while removing the old repeated active-bank validation
-reads. Runtime mutex wait/hold telemetry is present, but the SMP smoke observes
-only one BSP transaction and therefore no contention. These measurements do
-not justify a copy-on-write core, segmented journal, or split authoritative
-mutex yet; those changes require workload-level dominance or contention
-evidence.
+The source-labelled trace pipeline uses per-study HMAC pseudonyms, independent
+source status, bounded event counts, role-checked provenance, dropped-event
+accounting, and right-censoring. A committed bounded sample contains one real
+vNext Tool+DMA recovery: endpoint and provider both report the same durable
+success; the exact DMA coordinate is rejected while live and admitted after
+evidence-backed release; physical quiescence remains right-censored because no
+structured device receipt is available. It is a pipeline/applicability sample,
+not a workload-prevalence claim.
 
-The public quick gate, both experiment builds, the production cutover check,
-the real in-QEMU PIO-journal ktest, and the separate two-vCPU/multi-thread-TCG
-SMP smoke pass. The SMP result proves a CPU1 IPI and CSER persistence smoke in
-one boot while explicitly retaining the current BSP-only transaction boundary.
-A prior clean-tree catalog-v6 four-boot seal remains the historical production
-recovery seal; current generated QEMU receipts and comparison outputs are
-Git-ignored evidence, not source-controlled release artifacts.
+Phase-resolved real-QEMU measurements cover one control, delayed-provider, and
+bounded endpoint-concurrency trial for each journal (`n=1` per point). vNext
+compaction advances revision 24 to 25 and reduces the logical replay image from
+6,673 to 2,615 bytes, costing 44 sector reads, 44 sector writes, and 10 flushes.
+For this small workload its total journal cost is worse than legacy: 359 reads,
+359 writes, and 85 flushes versus 153/153/30. The result supports bounded
+fresh-media replacement and a smaller post-checkpoint image, not a small-log
+performance advantage. Diagnostic TSC values are uncalibrated, and the measured
+recovery scope contains no authoritative runtime transaction, so no mutex
+contention conclusion follows. Core COW/incremental state and mutex splitting
+remain deferred.
 
-The current composite mechanism remains sealed-topology: the catalog fixes its
-component product at creation and preparation freezes claim enrollment. An
-exploratory same-root handoff showed that the existing contract can represent
-`A retained -> create and enroll B -> release A -> B escape`, but its A-to-B
-causal edge lived in test support and no Gate-0 workload justified promoting
-that sequence into project source. The endpoint capability census now matches
-the trusted-local CSER2 identity, terminal evidence, 410 tombstone, and narrow
-404 retry boundary. It also states the remaining layer boundary: the durable
-Store supports Accepted/Pending states, while the current HTTP experiment
-completes POST synchronously rather than exposing an asynchronous job worker.
+The full host discovery suite passes 104 tests with `ResourceWarning` promoted
+to an error. The core all-feature tests and Clippy gate, production cutover
+assertion, all Tool+DMA experiment builds, the real PIO-journal gate, and the
+dedicated portable baseline-handoff gate pass. The prior GitHub quick and
+rebaseline jobs are green. A further checkpoint-only reboot was not claimed:
+the saved trial media lacked its matching TPM state, so combining it with a
+different artifact would not be valid recovery evidence.
 
-Two primary-source workload cards now record a Gate-0 No-Go. Kubernetes DRA
-already coordinates allocation and consumer admission in ResourceClaim state;
-NVMe Create returns a controller-selected NSID late, but keeps the namespace
-unattached and inactive until provider-governed Attach and Linux publication.
-Late knowledge alone is therefore not evidence of an executor/effect custody
-gap. The bounded evidence-availability result remains useful: a Pending Store
-row survives database reopen without terminal evidence, expiry remains a 410
-tombstone, and missing reset/IRQ/IOTLB facts retain their exact physical claims.
-These controlled cases do not measure workload prevalence, permanent-retain or
-administrative-disposition proportions, or wall-clock resource-seconds.
-
-The HotOS draft now states the I2 evidence layers, exact I3 coordinates,
-retirement/abort distinction, evidence-axis separation, Shared boundary,
-counterfactual revision metric, and QEMU-versus-physical boundary. It builds as
-five pages. RFC 0007 is explicitly the historical v5 baseline and RFC 0008 is
-the current v6 amendment.
-
-Local `main` remains the development branch and tracks the published
-`origin/main`. The recent GitHub failures were one real Rust 1.95 Clippy
-`unit_arg` regression in the ignored core performance profile, not stale CI
-semantics; the non-unit black-box fix passes the corresponding local all-target
-Clippy gate. The sibling `nexus-hotos` checkout still has no Git remote.
-Generated QEMU receipts and comparison outputs are intentionally Git-ignored,
-so the current source publication does not yet constitute a small source-bound
-evidence bundle or publish the paper checkout.
+Local `main` is the continuing Nexus development branch. The sanitized evidence
+bundle is source-bound to the clean runtime commit and publishes only
+pseudonyms and raw-input digests; SQLite databases, logs, media, TPM state, raw
+identities, and the HMAC key remain local. Per the current user direction, the
+sibling `nexus-hotos` checkout and HotOS paper are not being configured or
+published.
 
 ## Current Tasks
 
@@ -154,5 +142,10 @@ evidence bundle or publish the paper checkout.
 - [x] Apply the conditional Gate-0 rule before freezing G0/G1: discard the synthetic portable pilot and avoid dynamic-component or real-QEMU expansion when neither candidate establishes a custody gap.
 - [x] Record the bounded evidence-availability result, including Pending Store recovery, terminal/expired/absent distinctions, component-local retirement, and the measurements that remain unavailable.
 - [x] Repair the Rust 1.95 `unit_arg` CI regression and pass the corresponding local all-target Clippy gate.
-- [ ] Obtain a real endpoint-applicability trace that can measure outcome/quiescence availability, existing provider coordination, bounded retained resources, and gate denials without manufacturing workload proportions.
-- [ ] Publish a small source-bound evidence bundle and configure a remote for `nexus-hotos` before publishing the paper commit.
+- [x] Turn the trusted-local endpoint into a genuinely asynchronous Accepted/Pending worker/provider path and make guest recovery preserve nonterminal custody.
+- [x] Implement the source-labelled applicability trace contract and capture one bounded real-QEMU endpoint/provider/gate sample without manufacturing quiescence or prevalence.
+- [x] Add an evidence-bound `ChildDescriptorV1`, catalog-bound single-hop core guard, CSER3 adapter verification, and structurally independent portable baseline handoff tests.
+- [x] Add the fresh-media vNext append/checkpoint path, phase telemetry, and matched legacy/vNext development measurements; record the small-log I/O regression as well as checkpoint shrinkage.
+- [x] Publish a small source-bound, pseudonymized Nexus evidence bundle without raw media, identities, logs, databases, TPM state, or HMAC key.
+- [ ] Wire the CSER3 single-hop handoff into matched real-QEMU CSER and strongest-baseline runtime lanes before making an end-to-end handoff claim.
+- [ ] Configure or publish the sibling `nexus-hotos` remote and paper commit — explicitly deferred by the user; do not perform.

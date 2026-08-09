@@ -1,0 +1,91 @@
+{
+  "schema_version": 1,
+  "source_commit": "59dee4031ead7736275e5314c22a871bcf053aba",
+  "scope": "development_sample_not_product_benchmark",
+  "trials_per_point": 1,
+  "p95_resolution": "not_reported_n_equals_1",
+  "raw_output_digests": {
+    "legacy_performance_jsonl_sha256": "90bf26ebd44d03041386f720c64c6ef75d600251954a9e1c9d643945364bacbd",
+    "legacy_summary_json_sha256": "ac87a01e64f5c785cf1e3fe02ef3a37b4bf28cc4b84b93b9baf0739233988582",
+    "vnext_performance_jsonl_sha256": "a38a7e5799bdbe40d95a1f2c98397588787bedbd462e8b414b7718325c6e0234",
+    "vnext_summary_json_sha256": "feecebfe5ccae2861b291c56bb6886a9a124998821b79fbc2411443fa72f7746"
+  },
+  "journal_totals_per_trial": {
+    "legacy": {
+      "capacity_bytes": 65536,
+      "image_bytes": 6673,
+      "sectors_read": 153,
+      "sectors_written": 153,
+      "flushes": 30,
+      "tpm_tip_advances": 15
+    },
+    "vnext": {
+      "capacity_bytes": 196608,
+      "image_bytes": 3072,
+      "sectors_read": 359,
+      "sectors_written": 359,
+      "flushes": 85,
+      "tpm_tip_advances": 16
+    }
+  },
+  "vnext_compaction_per_trial": {
+    "logical_bytes_before": 6673,
+    "logical_bytes_after": 2615,
+    "revision_before": 24,
+    "revision_after": 25,
+    "sectors_read_delta": 44,
+    "sectors_written_delta": 44,
+    "flushes_delta": 10
+  },
+  "points": {
+    "control": {
+      "legacy": {
+        "pending_to_provider_apply_ms": 0.759858,
+        "provider_apply_to_terminal_ms": 0.077947,
+        "recovery_launcher_ms": 6876.205267,
+        "max_inflight": 1
+      },
+      "vnext": {
+        "pending_to_provider_apply_ms": 0.502461,
+        "provider_apply_to_terminal_ms": 0.097485,
+        "recovery_launcher_ms": 7928.238537,
+        "max_inflight": 1
+      }
+    },
+    "delayed_endpoint": {
+      "legacy": {
+        "pending_to_provider_apply_ms": 25.439568,
+        "provider_apply_to_terminal_ms": 0.15528,
+        "recovery_launcher_ms": 7133.118204,
+        "max_inflight": 1
+      },
+      "vnext": {
+        "pending_to_provider_apply_ms": 26.274196,
+        "provider_apply_to_terminal_ms": 0.183978,
+        "recovery_launcher_ms": 7780.505396,
+        "max_inflight": 1
+      }
+    },
+    "endpoint_concurrency": {
+      "legacy": {
+        "pending_to_provider_apply_ms": 100.187559,
+        "provider_apply_to_terminal_ms": 0.091528,
+        "recovery_launcher_ms": 7080.532012,
+        "max_inflight": 2
+      },
+      "vnext": {
+        "pending_to_provider_apply_ms": 100.354526,
+        "provider_apply_to_terminal_ms": 0.180839,
+        "recovery_launcher_ms": 7729.216927,
+        "max_inflight": 2
+      }
+    }
+  },
+  "interpretation": {
+    "checkpoint": "vnext_reduces_the_post_checkpoint_replay_image",
+    "small_log_io": "vnext_costs_more_io_than_legacy_in_this_trace",
+    "core_optimization": "not_justified_by_this_sample",
+    "mutex_split": "not_justified_no_measured_recovery_scope_transactions",
+    "cycle_clock": "guest_tsc_uncalibrated"
+  }
+}
