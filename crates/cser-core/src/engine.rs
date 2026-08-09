@@ -11882,16 +11882,21 @@ mod projection_v6_tests {
 }
 
 // This is deliberately an ignored, std-only measurement rather than a normal
-// test or a production instrumentation surface.  It profiles the three whole
-// state operations on the durable transition path without making timing a
-// correctness assertion.  Run with:
+// test or a production instrumentation surface. It emits one JSON object per
+// fixed state size, so a development run can be retained as JSONL without
+// turning a host-specific latency into a correctness assertion. Run with:
 //
 // cargo test -p cser-core --release --features std --lib \
 //   portable_core_state_work_profile -- --ignored --nocapture
 //
-// The fixture is assembled from one catalog-valid composite and then copied
-// structurally.  `check_invariants` remains the canonical oracle for every
-// size, so the profile cannot accidentally benchmark an invalid shortcut.
+// `transition_no_persist_median_ns` covers the same candidate construction,
+// command application, canonical invariant check, journal-record construction,
+// and projection digest that `Engine::transact` performs, but deliberately
+// excludes an embedding's journal write/readback/flush and anchor advance.
+// Those boundaries belong to the durable provider and must be measured in its
+// own runtime profile. The fixture is catalog-valid and the canonical full
+// checker/digest remain the oracle for every size, so this profile cannot
+// accidentally benchmark an invalid shortcut.
 #[cfg(all(test, feature = "std"))]
 mod performance_profile_tests {
     use std::{hint::black_box, time::Instant};
@@ -11903,7 +11908,10 @@ mod performance_profile_tests {
         REPLY_CLAIM_PUBLICATION_SLOT, REPLY_DOMAIN, REPLY_OBLIGATION_PUBLICATION, standard_catalog,
     };
 
-    const SIZES: [usize; 5] = [1, 8, 64, 512, 4096];
+    // Stable comparison points, not a capacity promise. The development plan
+    // intentionally keeps these few sizes fixed while allowing repetitions
+    // and workload shape to evolve.
+    const SIZES: [usize; 4] = [1, 64, 512, 4096];
     const WARMUPS: usize = 3;
     const SAMPLES: usize = 11;
 
@@ -12116,11 +12124,119 @@ mod performance_profile_tests {
         median_ns(values)
     }
 
+    fn profile_command() -> CommandKind {
+        CommandKind::FenceIncarnation {
+            root: RootId::new(1).unwrap(),
+            crashed: PrincipalIncarnation::new(crate::PrincipalId::new(1).unwrap(), 1).unwrap(),
+            binding_generation: 1,
+        }
+    }
+
+    /// Measures command application alone. Candidates are intentionally built
+    /// before timing, so this does not silently fold clone cost into command
+    /// work. Each invocation receives a fresh candidate because fencing is a
+    /// state-changing operation.
+    fn measure_candidate_apply(engine: &Engine, command: &CommandKind) -> u128 {
+        let candidates = (0..WARMUPS + SAMPLES)
+            .map(|_| engine.state.clone())
+            .collect::<Vec<_>>();
+        let mut candidates = candidates.into_iter();
+        for _ in 0..WARMUPS {
+            let mut candidate = candidates.next().unwrap();
+            black_box(apply_command(
+                &engine.catalog,
+                engine.limits,
+                &mut candidate,
+                command,
+            ))
+            .unwrap();
+        }
+        let mut values = Vec::with_capacity(SAMPLES);
+        for _ in 0..SAMPLES {
+            let mut candidate = candidates.next().unwrap();
+            let started = Instant::now();
+            black_box(apply_command(
+                &engine.catalog,
+                engine.limits,
+                &mut candidate,
+                command,
+            ))
+            .unwrap();
+            values.push(started.elapsed().as_nanos());
+        }
+        median_ns(values)
+    }
+
+    /// Measures the portable, non-I/O portion of one transition. It mirrors
+    /// the ordering in `transact_with_freshness` while retaining the base
+    /// engine so every sample starts at the same revision and semantic state.
+    fn measure_transition_without_persistence(engine: &Engine, command: &CommandKind) -> u128 {
+        let candidates = (0..WARMUPS + SAMPLES)
+            .map(|_| engine.state.clone())
+            .collect::<Vec<_>>();
+        let mut candidates = candidates.into_iter();
+        let run = |candidate: State| {
+            let mut candidate = candidate;
+            let output =
+                apply_command(&engine.catalog, engine.limits, &mut candidate, command).unwrap();
+            check_invariants(&engine.catalog, engine.limits, &candidate).unwrap();
+            let record = JournalRecord::build(
+                engine.state.revision,
+                engine.state.freshness.boot(),
+                engine.state.freshness.registry(),
+                engine.state.freshness.binding(),
+                engine.state.freshness.journal(),
+                engine.state.freshness.device(),
+                engine.catalog.digest(),
+                engine.state.head,
+                command.clone(),
+            )
+            .unwrap();
+            candidate.revision = record.revision();
+            candidate.head = record.digest();
+            black_box((
+                output,
+                record,
+                projection_digest(&candidate, engine.catalog.digest()),
+            ));
+        };
+        for _ in 0..WARMUPS {
+            run(candidates.next().unwrap());
+        }
+        let mut values = Vec::with_capacity(SAMPLES);
+        for _ in 0..SAMPLES {
+            let started = Instant::now();
+            run(candidates.next().unwrap());
+            values.push(started.elapsed().as_nanos());
+        }
+        median_ns(values)
+    }
+
+    fn live_claim_count(state: &State) -> usize {
+        state
+            .estates
+            .values()
+            .map(|estate| estate.claims.len())
+            .sum::<usize>()
+            + state
+                .composite_effects
+                .values()
+                .map(|effect| {
+                    effect
+                        .components
+                        .values()
+                        .map(|component| component.claims.len())
+                        .sum::<usize>()
+                })
+                .sum::<usize>()
+    }
+
     #[test]
     #[ignore = "manual portable-core performance profile; timing is not a correctness assertion"]
     fn portable_core_state_work_profile() {
         for live_claims in SIZES {
             let engine = fixture(live_claims);
+            let command = profile_command();
             let clone_ns = measure(|| {
                 let state = black_box(engine.state.clone());
                 black_box(state);
@@ -12136,8 +12252,22 @@ mod performance_profile_tests {
             let digest_ns = measure(|| {
                 black_box(projection_digest(&engine.state, engine.catalog.digest()));
             });
+            let apply_ns = measure_candidate_apply(&engine, &command);
+            let transition_no_persist_ns =
+                measure_transition_without_persistence(&engine, &command);
             println!(
-                "CSER_CORE_STATE_PROFILE {{\"live_claims\":{live_claims},\"clone_median_ns\":{clone_ns},\"invariant_median_ns\":{invariant_ns},\"projection_digest_median_ns\":{digest_ns},\"warmups\":{WARMUPS},\"samples\":{SAMPLES}}}"
+                "CSER_CORE_STATE_PROFILE {{\"profile_version\":2,\"scope\":\"portable_core_no_persistence\",\"live_claims\":{},\"estates\":{},\"composites\":{},\"resources\":{},\"candidate_clone_median_ns\":{},\"candidate_apply_median_ns\":{},\"invariant_median_ns\":{},\"projection_digest_median_ns\":{},\"transition_no_persist_median_ns\":{},\"warmups\":{},\"samples\":{}}}",
+                live_claim_count(&engine.state),
+                engine.state.estates.len(),
+                engine.state.composite_effects.len(),
+                engine.state.resources.len(),
+                clone_ns,
+                apply_ns,
+                invariant_ns,
+                digest_ns,
+                transition_no_persist_ns,
+                WARMUPS,
+                SAMPLES,
             );
         }
         // Keep a non-timing semantic assertion at the end of the manual run.
