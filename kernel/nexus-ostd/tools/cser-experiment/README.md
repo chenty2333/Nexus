@@ -14,9 +14,13 @@ recovery boots reuse the same row-local media, TPM state, endpoint database,
 and identity. A changed namespace, authority/effect ID, catalog digest, or
 retention policy is a startup failure, not a reinterpretation of old evidence.
 
-The endpoint has the v2 state machine `Accepted -> [Pending] ->
-Succeeded(result_digest) | Failed(code)`; a synchronous operation may advance
-directly from `Accepted` to a terminal state. Terminal states are immutable. A
+The real CSER2 endpoint has the asynchronous state machine `Accepted ->
+[Pending] -> Succeeded(result_digest) | Failed(code)`. `POST /v2/operations`
+durably writes both the Accepted row and a queue entry, then returns HTTP 202;
+an independent worker obtains a durable lease, queries the provider before any
+dispatch, and commits the terminal record only after a queryable provider
+outcome. The older `/v1/operations` route remains a deliberately synchronous
+test-compatibility path. Terminal states are immutable. A
 lookup can also return `expired` (HTTP 410) after its retention window or
 `absent` (HTTP 404) when no matching record exists. Only checksum- and
 identity-bound `absent` may reach the narrow same-key retry path; `expired`
@@ -26,8 +30,8 @@ apparent absence.
 | v2 state | HTTP result | CSER meaning |
 | --- | --- | --- |
 | `accepted` / `pending` | 202 | Nonterminal; no evidence digest and no retirement authority |
-| `succeeded` | 201 on first submit, 200 on replay/query | Terminal outcome evidence with a v2 evidence digest |
-| `failed` | 409 | Terminal failure outcome evidence with a v2 evidence digest |
+| `succeeded` | 200 on v2 replay/query | Terminal outcome evidence with a v2 evidence digest |
+| `failed` | 409 on v2 replay/query | Terminal failure outcome evidence with a v2 evidence digest |
 | `expired` | 410 | Retained expiry tombstone; never retry/release authority |
 | `absent` | 404 | Exact-identity absence; the only state eligible for same-key retry |
 
@@ -55,21 +59,27 @@ CSER2 RESP <http_status> <namespace> <authority> <effect> <run_id> <operation_ke
 
 The final frame checksum is SHA-256 of the preceding tokens joined with exactly
 one ASCII space. `GET` carries no new effect: it queries the complete durable
-identity. `--fault-after-apply-once` models the important ambiguity: a durable
-record exists but the client loses the response and must query it by that same
-identity.
+identity. The two distinct fault controls are
+`--fault-after-response-commit-once` (durable adapter record, lost client
+response) and `--provider-fault-after-apply-once` (durable provider outcome,
+no adapter terminal record). Recovery of the latter first queries the provider
+with the complete catalog-bound identity; it does not redispatch blindly.
 
-Retention is fail-closed. Expiry turns an old row into a retained `expired`
+Retention is fail-closed. Accepted and Pending have no retention deadline;
+only a terminal evidence record starts the retention clock. Expiry turns an old row into a retained `expired`
 tombstone rather than deleting it into ambiguity. Legacy v1 rows migrate only
 to unbound, expired tombstones; they never acquire a v2 authority/catalog
 binding retroactively. An unknown, corrupt, or newer endpoint schema fails
-startup. The adapter deliberately does **not** provide remote MACs,
+startup. The adapter adds `async_queue_schema_version=1` to its durable
+metadata when reopening a pre-queue v2 database; a pre-existing queue with an
+unknown layout, missing foreign key, orphan, or terminal work fails startup.
+The adapter deliberately does **not** provide remote MACs,
 mTLS, a remote registry, multi-tenancy, or cross-host trust establishment.
 
 Example:
 
 ```
-python3 tool_endpoint.py --database /tmp/cser-tool.db --port 18080 --fault-after-apply-once
+python3 tool_endpoint.py --database /tmp/cser-tool.db --port 18080 --fault-after-response-commit-once
 python3 uart_http_bridge.py --socket /tmp/cser-tool.sock --run-id 0123456789abcdef0123456789abcdef --endpoint-port 18080
 python3 -m unittest discover -s tests -v
 ```
@@ -182,7 +192,11 @@ without observing a crash barrier.
 
 The endpoint also exposes local counters and state inventory at `/v1/metrics`.
 They report adapter/contract version, bound authority/namespace/catalog,
-retention, state counts, and submit/replay/conflict/expiry/transition counts.
+retention, state counts, queue depth/leases/attempts, provider query/apply/
+dedup counts, and submit/replay/conflict/expiry/transition/infrastructure-
+retry/backoff counts. Provider or SQLite failures release the lease but wait
+with a bounded exponential backoff before reclaiming work; they remain Pending
+rather than becoming a terminal application failure.
 They are readiness and diagnosis data, not remote evidence and not a claim
 that retention duration, administrative disposition, or endpoint latency has
 been measured.

@@ -37,10 +37,13 @@ from protocol import (
     record_digest,
     validate_run_id,
 )
+from tool_provider import ProviderStore
+from tool_worker import AsyncWorker
 
 
 _DEFAULT_CATALOG_DIGEST = hashlib.sha256(b"nexus-cser-local-evidence-unbound-v2").hexdigest()
 _DEFAULT_NAMESPACE = "trusted-local"
+_ASYNC_QUEUE_SCHEMA_VERSION = 1
 
 
 def _valid_id(value: object) -> bool:
@@ -134,6 +137,19 @@ class EndpointRecord:
         }
 
 
+@dataclass(frozen=True)
+class WorkItem:
+    namespace_id: str
+    authority_id: str
+    effect_id: str
+    catalog_digest: str
+    run_id: str
+    operation_key: str
+    input_digest: str
+    payload: bytes
+    lease_token: str
+
+
 class Store:
     """SQLite-backed v2 evidence store with fail-closed expiry.
 
@@ -179,9 +195,13 @@ class Store:
             self._catalog_digest = catalog_digest
             self._configured_authority_id = authority_id
             self._configured_effect_id = effect_id
+            self._database = database
             self._retention_ns = retention_seconds * 1_000_000_000
             self._fault_before_commit_once = fault_before_commit_once
-            self._counters = {"submit": 0, "replay": 0, "conflict": 0, "expired": 0, "transition": 0}
+            self._counters = {
+                "submit": 0, "replay": 0, "conflict": 0, "expired": 0, "transition": 0,
+                "infrastructure_retry": 0, "infrastructure_backoff": 0,
+            }
             self._migrate_and_open()
         except BaseException:
             # A corrupt, newer, or unmigratable database is a hard startup
@@ -232,6 +252,11 @@ class Store:
                 self._connection.execute(
                     "CREATE TABLE IF NOT EXISTS adapter_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
                 )
+                queue_columns = self._connection.execute("PRAGMA table_info(operation_queue)").fetchall()
+                if not queue_columns:
+                    self._create_operation_queue_table()
+                else:
+                    self._validate_operation_queue_schema(queue_columns)
                 metadata = dict(self._connection.execute("SELECT key, value FROM adapter_metadata").fetchall())
                 if not metadata:
                     metadata = {
@@ -241,16 +266,27 @@ class Store:
                         "namespace_id": self._namespace_id,
                         "catalog_digest": self._catalog_digest,
                         "retention_ns": str(self._retention_ns),
+                        "async_queue_schema_version": str(_ASYNC_QUEUE_SCHEMA_VERSION),
                         "created_at_ns": str(time.time_ns()),
                     }
                     self._connection.executemany(
                         "INSERT INTO adapter_metadata(key, value) VALUES (?, ?)", metadata.items()
                     )
+                # Existing v2 databases had no queue.  Adding this explicit
+                # marker is the one-way migration boundary for the async
+                # durable schema; malformed pre-existing queues are rejected.
+                if "async_queue_schema_version" not in metadata:
+                    self._connection.execute(
+                        "INSERT INTO adapter_metadata(key, value) VALUES ('async_queue_schema_version', ?)",
+                        (str(_ASYNC_QUEUE_SCHEMA_VERSION),),
+                    )
+                    metadata["async_queue_schema_version"] = str(_ASYNC_QUEUE_SCHEMA_VERSION)
                 expected = {
                     "schema_version": str(ENDPOINT_RECORD_SCHEMA_VERSION),
                     "namespace_id": self._namespace_id,
                     "catalog_digest": self._catalog_digest,
                     "retention_ns": str(self._retention_ns),
+                    "async_queue_schema_version": str(_ASYNC_QUEUE_SCHEMA_VERSION),
                 }
                 if any(metadata.get(key) != value for key, value in expected.items()):
                     raise ValueError("endpoint database configuration differs from its durable evidence contract")
@@ -301,6 +337,45 @@ class Store:
                )"""
         )
 
+    def _create_operation_queue_table(self) -> None:
+        self._connection.execute(
+            """CREATE TABLE operation_queue (
+                   namespace_id TEXT NOT NULL, run_id TEXT NOT NULL, operation_key TEXT NOT NULL,
+                   lease_token TEXT, lease_until_ns INTEGER, attempts INTEGER NOT NULL DEFAULT 0,
+                   PRIMARY KEY(namespace_id, run_id, operation_key),
+                   FOREIGN KEY(namespace_id, run_id, operation_key)
+                     REFERENCES operations(namespace_id, run_id, operation_key)
+               )"""
+        )
+
+    def _validate_operation_queue_schema(self, columns: list[tuple[Any, ...]]) -> None:
+        expected = {
+            "namespace_id": ("TEXT", 1, None, 1), "run_id": ("TEXT", 1, None, 2),
+            "operation_key": ("TEXT", 1, None, 3), "lease_token": ("TEXT", 0, None, 0),
+            "lease_until_ns": ("INTEGER", 0, None, 0), "attempts": ("INTEGER", 1, "0", 0),
+        }
+        actual = {
+            row[1]: (str(row[2]).upper(), row[3], None if row[4] is None else str(row[4]), row[5])
+            for row in columns
+        }
+        if actual != expected:
+            raise ValueError("endpoint database has an unknown or unmigratable operation_queue schema")
+        foreign = self._connection.execute("PRAGMA foreign_key_list(operation_queue)").fetchall()
+        actual_foreign = {(row[2], row[3], row[4]) for row in foreign}
+        expected_foreign = {
+            ("operations", "namespace_id", "namespace_id"), ("operations", "run_id", "run_id"),
+            ("operations", "operation_key", "operation_key"),
+        }
+        if actual_foreign != expected_foreign:
+            raise ValueError("operation_queue is missing its operations foreign key")
+        orphan = self._connection.execute(
+            """SELECT 1 FROM operation_queue q LEFT JOIN operations o
+                 ON (o.namespace_id, o.run_id, o.operation_key) = (q.namespace_id, q.run_id, q.operation_key)
+                 WHERE o.namespace_id IS NULL OR o.state IN ('succeeded','failed','expired') LIMIT 1"""
+        ).fetchone()
+        if orphan is not None:
+            raise ValueError("operation_queue contains orphaned or terminal work")
+
     @property
     def authority_id(self) -> str:
         return self._authority_id
@@ -316,6 +391,10 @@ class Store:
     @property
     def catalog_digest(self) -> str:
         return self._catalog_digest
+
+    @property
+    def database(self) -> Path:
+        return self._database
 
     def _from_row(self, row: tuple[Any, ...]) -> EndpointRecord:
         return EndpointRecord(
@@ -350,7 +429,9 @@ class Store:
         return None if row is None else self._from_row(row)
 
     def _expire_if_needed(self, record: EndpointRecord, now: int) -> EndpointRecord:
-        if record.state == OperationState.EXPIRED or now < record.expires_at_ns:
+        # Retention begins only after immutable terminal evidence exists.
+        # Accepted/Pending are recovery obligations, never expirable completion.
+        if not record.state.terminal or record.state == OperationState.EXPIRED or now < record.expires_at_ns:
             return record
         self._connection.execute(
             "UPDATE operations SET state='expired', result='retention_expired', updated_at_ns=? "
@@ -437,6 +518,137 @@ class Store:
                 self._connection.execute("ROLLBACK")
                 raise
 
+    def enqueue(self, run_id: str, operation_key: str, input_digest: str, payload: bytes) -> tuple[int, dict[str, str]]:
+        """Durably accept a v2 operation and its work item before returning 202."""
+        now = self._now()
+        with self._lock:
+            self._connection.execute("BEGIN IMMEDIATE")
+            try:
+                existing = self._select(run_id, operation_key)
+                if existing is not None:
+                    existing = self._expire_if_needed(existing, now)
+                    if existing.state == OperationState.EXPIRED:
+                        self._connection.execute("COMMIT")
+                        return HTTPStatus.GONE, existing.document(replayed=True)
+                    if existing.input_digest != input_digest:
+                        self._counters["conflict"] += 1
+                        self._connection.execute("COMMIT")
+                        return HTTPStatus.CONFLICT, {"error": "operation_key_input_conflict"}
+                    self._counters["replay"] += 1
+                    self._connection.execute("COMMIT")
+                    return self._status_for(existing, replayed=True), existing.document(replayed=True)
+                self._connection.execute(
+                    """INSERT INTO operations(namespace_id, authority_id, effect_id, run_id, operation_key,
+                       input_digest, payload, state, result, catalog_digest, record_schema_version,
+                       created_at_ns, updated_at_ns, expires_at_ns)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, 'accepted', 'queued', ?, ?, ?, ?, 0)""",
+                    (self._namespace_id, self._authority_id, self._effect_id, run_id, operation_key,
+                     input_digest, payload, self._catalog_digest, ENDPOINT_RECORD_SCHEMA_VERSION, now, now),
+                )
+                self._connection.execute(
+                    "INSERT INTO operation_queue(namespace_id, run_id, operation_key) VALUES (?, ?, ?)",
+                    (self._namespace_id, run_id, operation_key),
+                )
+                record = self._select(run_id, operation_key)
+                assert record is not None
+                if self._fault_before_commit_once:
+                    self._fault_before_commit_once = False
+                    raise RuntimeError("injected endpoint failure before durable commit")
+                self._connection.execute("COMMIT")
+                self._counters["submit"] += 1
+                return HTTPStatus.ACCEPTED, record.document(replayed=False)
+            except BaseException:
+                self._connection.execute("ROLLBACK")
+                raise
+
+    def claim_next(self, worker_id: str, lease_seconds: float) -> WorkItem | None:
+        if not _valid_id(worker_id) or lease_seconds <= 0:
+            raise ValueError("invalid worker lease")
+        now = self._now()
+        with self._lock:
+            self._connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._connection.execute(
+                    """SELECT o.namespace_id, o.authority_id, o.effect_id, o.catalog_digest, o.run_id, o.operation_key,
+                              o.input_digest, o.payload
+                       FROM operation_queue q JOIN operations o
+                         ON (o.namespace_id, o.run_id, o.operation_key) =
+                            (q.namespace_id, q.run_id, q.operation_key)
+                       WHERE o.state IN ('accepted','pending')
+                         AND (q.lease_until_ns IS NULL OR q.lease_until_ns < ?)
+                       ORDER BY o.created_at_ns LIMIT 1""",
+                    (now,),
+                ).fetchone()
+                if row is None:
+                    self._connection.execute("COMMIT")
+                    return None
+                token = secrets.token_hex(16)
+                until = now + int(lease_seconds * 1_000_000_000)
+                changed = self._connection.execute(
+                    """UPDATE operation_queue SET lease_token=?, lease_until_ns=?, attempts=attempts+1
+                       WHERE namespace_id=? AND run_id=? AND operation_key=?
+                         AND (lease_until_ns IS NULL OR lease_until_ns < ?)""",
+                    (token, until, row[0], row[4], row[5], now),
+                ).rowcount
+                if changed != 1:
+                    self._connection.execute("COMMIT")
+                    return None
+                self._connection.execute(
+                    """UPDATE operations SET state='pending', result='working', updated_at_ns=?
+                       WHERE namespace_id=? AND run_id=? AND operation_key=? AND state='accepted'""",
+                    (now, row[0], row[4], row[5]),
+                )
+                self._counters["transition"] += 1
+                self._connection.execute("COMMIT")
+                return WorkItem(*row, token)
+            except BaseException:
+                self._connection.execute("ROLLBACK")
+                raise
+
+    def complete_lease(self, item: WorkItem, state: str, result: str) -> bool:
+        if state not in ("succeeded", "failed") or not _valid_id(result):
+            raise ValueError("invalid provider outcome")
+        now = self._now()
+        with self._lock:
+            self._connection.execute("BEGIN IMMEDIATE")
+            try:
+                changed = self._connection.execute(
+                    """UPDATE operations SET state=?, result=?, updated_at_ns=?, expires_at_ns=?
+                       WHERE namespace_id=? AND run_id=? AND operation_key=? AND state IN ('accepted','pending')
+                         AND EXISTS (SELECT 1 FROM operation_queue q WHERE q.namespace_id=operations.namespace_id
+                           AND q.run_id=operations.run_id AND q.operation_key=operations.operation_key
+                           AND q.lease_token=?)""",
+                    (state, result, now, now + self._retention_ns, item.namespace_id, item.run_id,
+                     item.operation_key, item.lease_token),
+                ).rowcount
+                if changed:
+                    self._connection.execute(
+                        "DELETE FROM operation_queue WHERE namespace_id=? AND run_id=? AND operation_key=? AND lease_token=?",
+                        (item.namespace_id, item.run_id, item.operation_key, item.lease_token),
+                    )
+                    self._counters["transition"] += 1
+                self._connection.execute("COMMIT")
+                return changed == 1
+            except BaseException:
+                self._connection.execute("ROLLBACK")
+                raise
+
+    def release_lease(self, item: WorkItem) -> None:
+        with self._lock:
+            self._connection.execute(
+                """UPDATE operation_queue SET lease_token=NULL, lease_until_ns=NULL
+                   WHERE namespace_id=? AND run_id=? AND operation_key=? AND lease_token=?""",
+                (item.namespace_id, item.run_id, item.operation_key, item.lease_token),
+            )
+
+    def record_infrastructure_retry(self) -> None:
+        with self._lock:
+            self._counters["infrastructure_retry"] += 1
+
+    def record_infrastructure_backoff(self) -> None:
+        with self._lock:
+            self._counters["infrastructure_backoff"] += 1
+
     def transition(self, run_id: str, operation_key: str, state: OperationState, result: str) -> dict[str, str] | None:
         """Advance a nonterminal local job; terminal/expired facts are immutable."""
         if not _valid_id(result) or state == OperationState.EXPIRED:
@@ -460,10 +672,18 @@ class Store:
                 if state not in allowed[record.state]:
                     self._connection.execute("COMMIT")
                     return record.document(replayed=True)
+                expires = now + self._retention_ns if state.terminal else record.expires_at_ns
                 self._connection.execute(
-                    "UPDATE operations SET state=?, result=?, updated_at_ns=? WHERE namespace_id=? AND run_id=? AND operation_key=?",
-                    (state.value, result, now, self._namespace_id, run_id, operation_key),
+                    "UPDATE operations SET state=?, result=?, updated_at_ns=?, expires_at_ns=? WHERE namespace_id=? AND run_id=? AND operation_key=?",
+                    (state.value, result, now, expires, self._namespace_id, run_id, operation_key),
                 )
+                if state.terminal:
+                    # Manual/test terminal publication must not leave a queue
+                    # row capable of redispatching the same operation.
+                    self._connection.execute(
+                        "DELETE FROM operation_queue WHERE namespace_id=? AND run_id=? AND operation_key=?",
+                        (self._namespace_id, run_id, operation_key),
+                    )
                 self._counters["transition"] += 1
                 updated = self._select(run_id, operation_key)
                 assert updated is not None
@@ -476,6 +696,9 @@ class Store:
     def metrics(self) -> dict[str, str]:
         with self._lock:
             counts = dict(self._connection.execute("SELECT state, COUNT(*) FROM operations GROUP BY state").fetchall())
+            queue = self._connection.execute(
+                "SELECT COUNT(*), COALESCE(SUM(attempts), 0), COALESCE(SUM(lease_token IS NOT NULL), 0) FROM operation_queue"
+            ).fetchone()
             return {
                 "adapter_schema_version": str(ENDPOINT_RECORD_SCHEMA_VERSION),
                 "contract_version": str(ENDPOINT_HTTP_CONTRACT_VERSION),
@@ -484,6 +707,9 @@ class Store:
                 "catalog_digest": self._catalog_digest,
                 "retention_ns": str(self._retention_ns),
                 **{f"operations_{state}": str(counts.get(state, 0)) for state in OperationState},
+                "queue_queued": str(queue[0]),
+                "queue_attempts": str(queue[1]),
+                "queue_leased": str(queue[2]),
                 **{f"requests_{name}": str(value) for name, value in self._counters.items()},
             }
 
@@ -492,18 +718,40 @@ class Store:
 
 
 class Endpoint(ThreadingHTTPServer):
-    def __init__(self, address: tuple[str, int], store: Store, fault_after_apply_once: bool) -> None:
+    def __init__(self, address: tuple[str, int], store: Store, fault_after_response_commit_once: bool,
+                 *, provider_database: Path | None = None, start_worker: bool = False,
+                 provider_fault_after_apply_once: bool = False) -> None:
         super().__init__(address, Handler)
         self.store = store
-        self.fault_after_apply_once = fault_after_apply_once
+        self.fault_after_response_commit_once = fault_after_response_commit_once
         self._fault_lock = threading.Lock()
+        self.provider = ProviderStore(
+            provider_database or store.database.with_suffix(".provider.sqlite"),
+            fault_after_apply_once=provider_fault_after_apply_once,
+        )
+        self.worker = AsyncWorker(store, self.provider, worker_id="endpoint-worker")
+        self._async_closed = False
+        if start_worker:
+            self.worker.start()
 
-    def take_fault(self) -> bool:
+    def take_lost_response_fault(self) -> bool:
         with self._fault_lock:
-            if not self.fault_after_apply_once:
+            if not self.fault_after_response_commit_once:
                 return False
-            self.fault_after_apply_once = False
+            self.fault_after_response_commit_once = False
             return True
+
+    def close_async(self) -> None:
+        if self._async_closed:
+            return
+        if not self.worker.stop():
+            raise RuntimeError("async worker did not stop before provider close")
+        self.provider.close()
+        self._async_closed = True
+
+    def server_close(self) -> None:
+        self.close_async()
+        super().server_close()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -583,17 +831,19 @@ class Handler(BaseHTTPRequestHandler):
         values = self._document(v2=self.path == "/v2/operations")
         if values is None:
             return
-        status, record = self.server.store.submit(*values)
-        # The crucial ambiguity remains: a durable terminal record exists but
-        # the client loses the response and must query by its exact key.
-        if status < 300 and self.server.take_fault():
+        # v1 remains an explicit synchronous compatibility endpoint used by
+        # isolated legacy tests. v2 is the real asynchronous CSER contract.
+        status, record = self.server.store.enqueue(*values) if self.path == "/v2/operations" else self.server.store.submit(*values)
+        # The client can lose either the durable v2 acceptance response or a
+        # v1 terminal response; recovery always queries this exact key.
+        if status < 300 and self.server.take_lost_response_fault():
             self.close_connection = True
             return
         self._json(status, record)
 
     def do_GET(self) -> None:  # noqa: N802
         if self.path == "/v1/metrics":
-            self._json(HTTPStatus.OK, self.server.store.metrics())
+            self._json(HTTPStatus.OK, self.server.store.metrics() | self.server.provider.metrics())
             return
         prefix = "/v1/operations/"
         v2_prefix = "/v2/operations/"
@@ -658,12 +908,17 @@ def main() -> None:
     parser.add_argument("--authority-id", default=None)
     parser.add_argument("--effect-id", default=None)
     parser.add_argument("--retention-seconds", default=24 * 60 * 60, type=int)
-    parser.add_argument("--fault-after-apply-once", action="store_true")
+    parser.add_argument("--fault-after-response-commit-once", action="store_true",
+                        help="commit an adapter record, then drop one client response")
+    parser.add_argument("--provider-fault-after-apply-once", action="store_true",
+                        help="durably apply once in the provider, then leave the adapter Pending")
+    parser.add_argument("--provider-database", type=Path)
     args = parser.parse_args()
     endpoint = Endpoint(
         (args.host, args.port),
         Store(args.database, namespace_id=args.namespace, catalog_digest=args.catalog_digest, authority_id=args.authority_id, effect_id=args.effect_id, retention_seconds=args.retention_seconds),
-        args.fault_after_apply_once,
+        args.fault_after_response_commit_once, provider_database=args.provider_database, start_worker=True,
+        provider_fault_after_apply_once=args.provider_fault_after_apply_once,
     )
     if args.port_file is not None:
         args.port_file.write_text(f"{endpoint.server_port}\n", encoding="ascii")
@@ -671,6 +926,7 @@ def main() -> None:
         endpoint.serve_forever()
     finally:
         endpoint.server_close()
+        endpoint.close_async()
         endpoint.store.close()
 
 

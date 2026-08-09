@@ -99,7 +99,7 @@ class EndpointConcurrencyFaultTest(unittest.TestCase):
         )
 
     def test_lost_reply_survives_endpoint_shutdown_and_cold_reopen(self) -> None:
-        self.server.fault_after_apply_once = True
+        self.server.fault_after_response_commit_once = True
         connection = http.client.HTTPConnection(
             "127.0.0.1", self.server.server_port, timeout=5
         )

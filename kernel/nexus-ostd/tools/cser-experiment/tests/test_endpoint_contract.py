@@ -175,7 +175,7 @@ class EndpointContractTests(unittest.TestCase):
             reopened = Store(database, catalog_digest=CATALOG)
             recovered = reopened.get(RUN, "op-lost-reply")
             assert recovered is not None
-            self.assertEqual(recovered["state"], "succeeded")
+            self.assertEqual(recovered["state"], "accepted")
             self.assertEqual(recovered["catalog_digest"], CATALOG)
             reopened.close()
 
