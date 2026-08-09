@@ -17,6 +17,8 @@ from pathlib import Path
 from matrix_protocol import UART_WRITE_INTER_CHUNK_SECONDS, paced_sendall
 from protocol import (MAX_LINE_BYTES, ProtocolError, digest, parse_request, parse_request_v2, parse_request_v3, record_digest,
                       response, response_v2, response_v3, evidence_record_digest, evidence_record_digest_v3, validate_run_id)
+from handoff_identity import (ParentDescriptorContext, child_transport_effect_id,
+                              expected_child_request, validate_child_descriptor_v1)
 
 MAX_FIRMWARE_PREAMBLE_BYTES = 64 * 1024
 # Development-tunable bound for one boot's same-identity reconciliation.  It
@@ -239,6 +241,122 @@ def _serve_client_v2(client: socket.socket, endpoint: tuple[str, int], identity:
         return method, status, operation, input_digest
     except (OSError, http.client.HTTPException, json.JSONDecodeError, ProtocolError) as exc:
         raise BridgeStageError("frame-complete" if isinstance(exc, ProtocolError) else "endpoint-connect", exc) from exc
+
+
+def serve_handoff_session(client: socket.socket, *, parent_endpoint: tuple[str, int], child_endpoint: tuple[str, int],
+                          parent_identity: tuple[str, str, str, str, str],
+                          parent_descriptor: ParentDescriptorContext,
+                          request_timeout: float = 5.0, uart_pace_seconds: float = 0.0) -> None:
+    """Serve the strict two-identity CSER3 handoff conversation on one COM2.
+
+    Only the parent may produce the single descriptor.  A child cannot be
+    forwarded until that terminal descriptor has passed independent wire and
+    transport-identity validation.  Per-identity POST/retry state prevents a
+    parent 404 or operation key from authorizing a child side effect.
+    """
+    namespace, authority, parent_effect, run, catalog = parent_identity
+    child_identity = (namespace, authority,
+                      child_transport_effect_id(namespace, authority, parent_effect, run, catalog), run, catalog)
+    states: dict[tuple[str, str, str, str, str], dict[str, object]] = {
+        parent_identity: {"operation": None, "retry": None, "posts": 0},
+        child_identity: {"operation": None, "retry": None, "posts": 0},
+    }
+    child_authorized = False
+    expected_child: tuple[str, bytes, str] | None = None
+    client.settimeout(request_timeout)
+    for _ in range(MAX_V2_EXCHANGES * 2):
+        line = _read_request_frame(client, marker=b"CSER3 ")
+        method, namespace, authority, effect, run, operation, input_digest, catalog, payload = parse_request_v3(line)
+        identity = (namespace, authority, effect, run, catalog)
+        if identity not in states:
+            raise BridgeStageError("frame-complete", ProtocolError("handoff request names a non-allowlisted effect"))
+        is_child = identity == child_identity
+        if is_child and not child_authorized:
+            raise BridgeStageError("frame-complete", ProtocolError("child observed before validated parent descriptor"))
+        if is_child and expected_child is not None:
+            expected_operation, expected_payload, expected_input = expected_child
+            if (operation, input_digest) != (expected_operation, expected_input) or \
+               (method == "POST" and payload != expected_payload) or (method == "GET" and payload):
+                raise BridgeStageError("frame-complete", ProtocolError("child request does not match parent descriptor"))
+        state = states[identity]
+        seen = (operation, input_digest)
+        if state["operation"] is not None and state["operation"] != seen:
+            raise BridgeStageError("frame-complete", ProtocolError("identity changed durable operation key"))
+        if state["retry"] is not None and (method != "POST" or state["retry"] != seen):
+            raise BridgeStageError("frame-complete", ProtocolError("GET/404 retry changed durable key"))
+        endpoint = child_endpoint if is_child else parent_endpoint
+        if method == "POST":
+            if state["posts"]:
+                raise BridgeStageError("frame-complete", ProtocolError("identity issued a second POST"))
+            status, record = post_v3(endpoint, namespace, authority, effect, run, operation, input_digest, catalog, payload)
+            state["posts"] = 1
+        else:
+            status, record = get_v3(endpoint, namespace, authority, effect, run, operation, input_digest, catalog)
+        state["operation"] = seen
+        if status == HTTPStatus.NOT_FOUND:
+            if method != "GET":
+                raise BridgeStageError("frame-complete", ProtocolError("only GET/404 authorizes same-key retry"))
+            paced_sendall(client, response_v3(namespace, authority, effect, run, operation, input_digest, catalog,
+                                               status, "absent", "not_found", None, None, None), inter_chunk_seconds=uart_pace_seconds)
+            state["retry"] = seen
+            continue
+        if set(record) != _V3_ENDPOINT_RECORD_KEYS or record["contract_version"] != "3" or record["record_schema_version"] != "3":
+            raise BridgeStageError("frame-complete", ProtocolError("handoff endpoint downgraded CSER3 record"))
+        if tuple(record[key] for key in ("namespace_id", "authority_id", "effect_id", "run_id", "catalog_digest")) != identity or (record["operation_key"], record["input_digest"]) != seen:
+            raise BridgeStageError("frame-complete", ProtocolError("handoff endpoint identity mismatch"))
+        terminal = record["state"] in ("succeeded", "failed")
+        output = b"" if record["output_b64"] == "-" else base64.b64decode(record["output_b64"], validate=True)
+        kind = record["output_kind"]
+        if not terminal and any(record[key] != "-" for key in ("output_kind", "output_len", "output_digest", "output_b64", "evidence_record_digest")):
+            raise BridgeStageError("frame-complete", ProtocolError("nonterminal handoff output"))
+        if terminal and (record["output_len"] != str(len(output)) or record["output_digest"] != digest(output) or record["evidence_record_digest"] != evidence_record_digest_v3(namespace, authority, effect, run, operation, input_digest, catalog, record["state"], record["result"], kind, output)):
+            raise BridgeStageError("frame-complete", ProtocolError("handoff terminal evidence mismatch"))
+        if is_child and terminal and kind != "none":
+            raise BridgeStageError("frame-complete", ProtocolError("child returned non-none output"))
+        if not is_child and terminal:
+            if kind != "child_descriptor_v1":
+                raise BridgeStageError("frame-complete", ProtocolError("parent terminal missing child descriptor"))
+            validate_child_descriptor_v1(output, parent=parent_descriptor, catalog_digest=catalog, input_digest=input_digest)
+            expected_child = expected_child_request(output, parent=parent_descriptor)
+            child_authorized = True
+        paced_sendall(client, response_v3(namespace, authority, effect, run, operation, input_digest, catalog,
+                                           status, record["state"], record["result"], kind if terminal else None,
+                                           output if terminal else None, record["evidence_record_digest"] if terminal else None), inter_chunk_seconds=uart_pace_seconds)
+        state["retry"] = None
+        if is_child and terminal:
+            return
+    raise BridgeStageError("frame-complete", ProtocolError("handoff exchange limit exhausted"))
+
+
+def connect_and_serve_handoff(socket_path: Path, *, parent_endpoint: tuple[str, int], child_endpoint: tuple[str, int],
+                              parent_identity: tuple[str, str, str, str, str], parent_descriptor: ParentDescriptorContext,
+                              timeout: float = 30.0, request_timeout: float = 30.0,
+                              uart_pace_seconds: float = 0.0, status_file: Path | None = None) -> None:
+    """Connect to QEMU-owned COM2 and run one bounded dual-endpoint session."""
+    deadline = time.monotonic() + timeout
+    while True:
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            client.connect(str(socket_path))
+            _write_signal(status_file, "connected")
+            with client:
+                serve_handoff_session(client, parent_endpoint=parent_endpoint, child_endpoint=child_endpoint,
+                                      parent_identity=parent_identity, parent_descriptor=parent_descriptor,
+                                      request_timeout=request_timeout, uart_pace_seconds=uart_pace_seconds)
+            _write_signal(status_file, "served")
+            return
+        except (FileNotFoundError, ConnectionRefusedError):
+            pass
+        except BridgeStageError as exc:
+            _write_signal(status_file, "failed", stage=exc.stage, detail=str(exc))
+            raise
+        finally:
+            client.close()
+        if time.monotonic() >= deadline:
+            error = TimeoutError(f"QEMU COM2 socket did not accept bridge: {socket_path}")
+            _write_signal(status_file, "failed", stage="bridge-ready", detail=str(error))
+            raise error
+        time.sleep(0.05)
 
 
 def _serve_client(
@@ -514,6 +632,11 @@ def main() -> None:
     parser.add_argument("--catalog-digest")
     parser.add_argument("--cser2", action="store_true")
     parser.add_argument("--cser3", action="store_true")
+    parser.add_argument("--handoff-cser3", action="store_true")
+    parser.add_argument("--child-endpoint-port", type=int)
+    parser.add_argument("--handoff-parent-root", type=lambda value: int(value, 0))
+    parser.add_argument("--handoff-parent-sequence", type=lambda value: int(value, 0))
+    parser.add_argument("--handoff-parent-component", type=lambda value: int(value, 0))
     parser.add_argument("--uart-pace-seconds", type=float, default=UART_WRITE_INTER_CHUNK_SECONDS)
     parser.add_argument("--allow-no-request", action="store_true")
     parser.add_argument("--connect-timeout", default=30.0, type=float)
@@ -526,23 +649,38 @@ def main() -> None:
         _write_signal(args.startup_ready_file, "ready")
         _write_signal(args.status_file, "starting")
         identity = None
-        if args.cser2 or args.cser3:
+        if args.cser2 or args.cser3 or args.handoff_cser3:
             if None in (args.namespace_id, args.authority_id, args.effect_id, args.catalog_digest):
                 raise ValueError("CSER2/CSER3 bridge requires namespace, authority, effect, and catalog")
             validate_run_id(args.authority_id); validate_run_id(args.effect_id)
             identity = (args.namespace_id, args.authority_id, args.effect_id, args.run_id, args.catalog_digest)
-        connect_and_serve(
-            args.socket,
-            (args.endpoint_host, args.endpoint_port),
-            args.run_id,
-            args.connect_timeout,
-            args.request_timeout,
-            args.status_file,
-            identity,
-            args.uart_pace_seconds,
-            args.allow_no_request,
-            args.cser3,
-        )
+        if args.handoff_cser3:
+            if args.cser2 or args.cser3 or args.allow_no_request or args.child_endpoint_port is None or identity is None or \
+               None in (args.handoff_parent_root, args.handoff_parent_sequence, args.handoff_parent_component):
+                raise ValueError("handoff CSER3 requires only exact parent identity, child endpoint, and parent coordinate")
+            if args.handoff_parent_root <= 0 or args.handoff_parent_sequence < 0 or args.handoff_parent_component <= 0:
+                raise ValueError("handoff parent coordinate is out of range")
+            connect_and_serve_handoff(
+                args.socket, parent_endpoint=(args.endpoint_host, args.endpoint_port),
+                child_endpoint=(args.endpoint_host, args.child_endpoint_port), parent_identity=identity,
+                parent_descriptor=ParentDescriptorContext(args.handoff_parent_root, args.handoff_parent_sequence,
+                                                          args.handoff_parent_component), timeout=args.connect_timeout,
+                request_timeout=args.request_timeout, uart_pace_seconds=args.uart_pace_seconds,
+                status_file=args.status_file,
+            )
+        else:
+            connect_and_serve(
+                args.socket,
+                (args.endpoint_host, args.endpoint_port),
+                args.run_id,
+                args.connect_timeout,
+                args.request_timeout,
+                args.status_file,
+                identity,
+                args.uart_pace_seconds,
+                args.allow_no_request,
+                args.cser3,
+            )
     except (BridgeStageError, OSError, ProtocolError, TimeoutError, ValueError) as exc:
         stage = exc.stage if isinstance(exc, BridgeStageError) else "bridge-ready"
         _write_signal(args.status_file, "failed", stage=stage, detail=str(exc))
