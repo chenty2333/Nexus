@@ -6756,12 +6756,23 @@ fn apply_command(
             projection,
         } => {
             let rebuilt = decode_whole_state_checkpoint(&image, catalog, limits)?;
+            let mut canonical = state.clone();
+            canonical.charges.retain(|_, units| *units != 0);
             if rebuilt.recovery_target.is_some()
                 || projection_digest(&rebuilt, catalog.digest()) != projection
-                || rebuilt != *state
+                || rebuilt != canonical
             {
                 return Err(CoreError::InvariantViolation);
             }
+            // The checkpoint intentionally excludes derived reverse indexes
+            // and charge caches. In particular, a live terminal transition
+            // may retain an otherwise harmless zero-valued charge entry until
+            // a later in-memory mutation, while checkpoint recovery rebuilds
+            // the canonical empty cache. The projection binds every durable
+            // primary field, and the exact comparison above differs from the
+            // live state only by normalizing those semantically empty keys.
+            // `decode_whole_state_checkpoint` has already rebuilt and
+            // invariant-checked every derived structure.
             Ok(AppliedOutput::none(TransitionEvent::RecoveryCheckpointed))
         }
         CommandKind::CheckpointRecovery {
@@ -14221,6 +14232,43 @@ mod whole_state_checkpoint_tests {
         let offset = image.len() / 2;
         image[offset] ^= 0x80;
         assert!(decode_whole_state_checkpoint(&image, &engine.catalog, engine.limits).is_err());
+    }
+
+    #[test]
+    fn checkpoint_accepts_canonical_rebuild_of_zero_derived_charge_entries() {
+        let mut journal = Vec::new();
+        let (mut engine, _, _) = seed(&mut journal);
+        // Retiring the final live claim leaves this zero-valued derived cache
+        // entry permitted by the invariant checker. It is intentionally not
+        // serialized; recovery rebuilds the canonical empty cache.
+        let (_, credit_class) = engine
+            .state
+            .charges
+            .keys()
+            .next()
+            .copied()
+            .expect("seeded charge");
+        engine
+            .state
+            .charges
+            .insert((ChargeAccountId::new(2).unwrap(), credit_class), 0);
+        check_invariants(&engine.catalog, engine.limits, &engine.state).unwrap();
+
+        append_checkpoint(&mut engine, &mut journal);
+        let rebuilt = decode_whole_state_checkpoint(
+            &encode_whole_state_checkpoint(&engine.state),
+            &engine.catalog,
+            engine.limits,
+        )
+        .unwrap();
+        assert_ne!(rebuilt, engine.state);
+        let mut canonical = engine.state.clone();
+        canonical.charges.retain(|_, units| *units != 0);
+        assert_eq!(rebuilt, canonical);
+        assert_eq!(
+            projection_digest(&rebuilt, engine.catalog.digest()),
+            engine.projection_digest()
+        );
     }
 
     #[cfg(feature = "test-support")]
