@@ -11,6 +11,7 @@
 //! evidence, this module emits no terminal result.
 
 use alloc::sync::Arc;
+use core::fmt;
 use cser_core::{
     ChargeAccountId, ClaimId, CommandRequest, CoreLimits, DEVICE_DOMAIN, DEVICE_EVIDENCE_IOTLB,
     DEVICE_EVIDENCE_IRQ_DRAINED, DEVICE_EVIDENCE_RESET, DeviceScopeId, EffectId, PrincipalId,
@@ -31,7 +32,9 @@ use ostd::{
 };
 
 use super::{
-    core_crash_probe::{CrashCutpoint, CrashProbe, CrashProbeError, CrashRunId},
+    core_crash_probe::{
+        CrashCutpoint, CrashProbe, CrashProbeError, CrashRunId, ExperimentIdentity,
+    },
     core_cser_tool_experiment::{
         ToolDmaBarrier, ToolDmaBarrierHook, ToolDmaCoordinates, ToolDmaCoreOwner,
         ToolDmaResumeState, arm_tool_dma, resume_tool_dma, tool_dma_metrics, tool_dma_terminal,
@@ -45,10 +48,9 @@ use super::{
     core_runtime::OstdCserRuntime,
     core_tool_adapter::{ToolOperationPlan, ToolTransportError, UartToolEndpoint},
     core_tool_dma_runtime::ToolDmaRuntime,
-    core_tool_uart::ToolUart,
+    core_tool_uart::{ToolRunId, ToolUart, ToolV2Identity},
 };
 
-const RUN: [u8; 16] = [0x42; 16];
 const EFFECT_ROOT: u64 = 0x544f_4f4c;
 const EFFECT_SEQUENCE: u64 = 1;
 const CLAIM_TOOL: u64 = 0x5101;
@@ -67,6 +69,8 @@ const MAX_IRQ_SPINS: usize = 20_000_000;
 /// any marker; lack of a terminal marker is deliberately not success.
 pub(crate) fn run() {
     let catalog = tool_dma_catalog();
+    let experiment_identity = acquire_experiment_identity(catalog.digest());
+    let run_id = experiment_identity.run_id().bytes();
     let binding = RecoveryBinding::new(
         catalog.digest(),
         RegistryInstance::new(1).expect("non-zero experiment registry"),
@@ -84,11 +88,19 @@ pub(crate) fn run() {
     let resume = resume_tool_dma(&boot, effect)
         .unwrap_or_else(|_| panic!("TOOL_DMA_FAIL stage=resume-projection"));
     match resume.state() {
-        ToolDmaResumeState::Absent => run_initial(boot, effect, arena),
+        ToolDmaResumeState::Absent => run_initial(boot, effect, arena, run_id, experiment_identity),
         state => {
+            if state == ToolDmaResumeState::Prepared {
+                panic!("TOOL_DMA_FAIL stage=unsupported-prepublication-recovery");
+            }
+            let plan = fixed_tool_plan(effect, run_id, experiment_identity);
+            assert!(
+                resume.binds_tool_operation(plan.operation_digest()),
+                "TOOL_DMA_FAIL stage=recovery-experiment-identity-mismatch"
+            );
             let retry_after_checkpoint =
-                resume.allows_tool_idempotent_retry(fixed_tool_plan(effect).operation_digest());
-            run_recovery(boot, effect, arena, state, retry_after_checkpoint)
+                resume.allows_tool_idempotent_retry(plan.operation_digest());
+            run_recovery(boot, effect, arena, state, retry_after_checkpoint, plan)
         }
     }
 }
@@ -103,12 +115,12 @@ fn run_recovery(
     arena: nexus_ostd_virtio::PersistentDmaArenaLayout,
     state: ToolDmaResumeState,
     retry_after_checkpoint: bool,
+    plan: ToolOperationPlan,
 ) {
     // A successor always queries the independently durable endpoint record
     // before it claims any settlement authority. A retry POST is permitted
     // only when that GET says absent *and* the exact durable intent still
     // exists; it is the same idempotency key, never a fresh operation.
-    let plan = fixed_tool_plan(effect);
     let tool = ToolDmaRuntime::new(plan, 1).expect("fixed tool verifier epoch");
     let mut observation = {
         let mut uart = ToolUart::acquire().expect("experiment owns COM2");
@@ -135,7 +147,7 @@ fn run_recovery(
             tool_dma_terminal(metrics),
             "TOOL_DMA_FAIL stage=terminal-projection"
         );
-        finish_recovery(boot, metrics);
+        finish_recovery(boot, metrics, plan.run_id());
     }
 
     // Consume an existing tool intent before fencing: fencing intentionally
@@ -162,13 +174,6 @@ fn run_recovery(
         observation = Some(post_same_tool_plan(tool));
     }
     let successor = snapshot_ready_rebind(&mut boot, effect, state);
-    if state == ToolDmaResumeState::Prepared {
-        // The seven-cut campaign publishes the real queue and records its
-        // local acknowledgement before *any* observable marker, so this
-        // prefix is deliberately outside that campaign rather than being
-        // repaired by inventing a pre-publication device owner.
-        panic!("TOOL_DMA_FAIL stage=unsupported-prepublication-recovery");
-    }
     let observation = observation
         .unwrap_or_else(|| panic!("TOOL_DMA_FAIL stage=recovery-endpoint-get state={state:?}"));
     // A fence turns the interrupted claim into a new reconciliation generation;
@@ -187,12 +192,13 @@ fn run_recovery(
         tool_dma_terminal(metrics),
         "recovery left CSER claims retained"
     );
-    finish_recovery(boot, metrics);
+    finish_recovery(boot, metrics, plan.run_id());
 }
 
 fn finish_recovery(
     boot: super::core_qemu_persistent_boot::QemuPersistentBoot,
     metrics: super::core_cser_tool_experiment::ToolDmaMetrics,
+    run_id: [u8; 16],
 ) -> ! {
     let activated = boot
         .try_activate()
@@ -201,27 +207,72 @@ fn finish_recovery(
     // a merely replayed terminal projection into a false reuse claim.
     let _ = activated;
     println!(
-        "TOOL_DMA_RECOVERY_METRICS {{\"variant\":\"cser\",\"run_id\":\"42424242424242424242424242424242\",\"terminal\":true,\"invariants_ok\":true,\"retired_by_evidence\":{},\"retained_claims\":{},\"gate_rejections\":null,\"reconciliation_delay_ms\":null,\"reconciliation_steps\":{},\"reconciliation_delay_unit\":\"unmeasured\",\"topology_registered\":true,\"tool_finalized\":true,\"dma_finalized\":true,\"reuse_authorized\":false}}",
-        metrics.retired_components, metrics.retained_claims, metrics.reconciliation_steps,
+        "TOOL_DMA_RECOVERY_METRICS {{\"variant\":\"cser\",\"run_id\":\"{}\",\"terminal\":true,\"invariants_ok\":true,\"retired_by_evidence\":{},\"retained_claims\":{},\"gate_rejections\":null,\"reconciliation_delay_ms\":null,\"reconciliation_steps\":{},\"reconciliation_delay_unit\":\"unmeasured\",\"topology_registered\":true,\"tool_finalized\":true,\"dma_finalized\":true,\"reuse_authorized\":false}}",
+        HexRun(run_id),
+        metrics.retired_components,
+        metrics.retained_claims,
+        metrics.reconciliation_steps,
     );
     poweroff(ExitCode::Success)
 }
 
-fn fixed_tool_plan(effect: EffectId) -> ToolOperationPlan {
+struct HexRun([u8; 16]);
+
+impl fmt::Display for HexRun {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+fn acquire_experiment_identity(expected_catalog: cser_core::Digest) -> ExperimentIdentity {
+    let mut control = CrashProbe::acquire().expect("experiment owns COM3 configuration channel");
+    let identity = control
+        .experiment_identity()
+        .unwrap_or_else(|_| panic!("TOOL_DMA_FAIL stage=experiment-identity"));
+    assert!(
+        identity.catalog_digest() == expected_catalog.bytes(),
+        "TOOL_DMA_FAIL stage=experiment-catalog-binding"
+    );
+    identity
+}
+
+fn fixed_tool_plan(
+    effect: EffectId,
+    run_id: [u8; 16],
+    identity: ExperimentIdentity,
+) -> ToolOperationPlan {
     ToolOperationPlan::new(
-        RUN,
+        run_id,
         effect,
         TOOL_DMA_COMPONENT_TOOL,
         nz(CLAIM_TOOL),
         nz(RESOURCE_TOOL),
         nz(1),
+        tool_dma_catalog().digest(),
         b"tool-dma-e2e",
     )
     .expect("fixed tool plan")
+    .bind_cser2(
+        ToolV2Identity::new(
+            identity.namespace(),
+            ToolRunId::new(identity.authority_id().bytes()),
+            ToolRunId::new(identity.effect_id().bytes()),
+            identity.catalog_digest(),
+        )
+        .expect("COM3 identity is valid CSER2 identity"),
+    )
 }
 
-fn fixed_tool_runtime(effect: EffectId) -> ToolDmaRuntime {
-    ToolDmaRuntime::new(fixed_tool_plan(effect), 1).expect("fixed tool verifier epoch")
+fn fixed_tool_runtime(
+    effect: EffectId,
+    run_id: [u8; 16],
+    identity: ExperimentIdentity,
+) -> ToolDmaRuntime {
+    ToolDmaRuntime::new(fixed_tool_plan(effect, run_id, identity), 1)
+        .expect("fixed tool verifier epoch")
 }
 
 fn post_same_tool_plan(tool: ToolDmaRuntime) -> super::core_tool_adapter::DurableToolObservation {
@@ -392,6 +443,8 @@ fn run_initial(
     boot: super::core_qemu_persistent_boot::QemuPersistentBoot,
     effect: EffectId,
     arena: nexus_ostd_virtio::PersistentDmaArenaLayout,
+    run_id: [u8; 16],
+    experiment_identity: ExperimentIdentity,
 ) {
     let activated = boot
         .try_activate()
@@ -404,13 +457,13 @@ fn run_initial(
         .unwrap_or_else(|_| panic!("TOOL_DMA_FAIL stage=real-virtio-prepare"));
     let identity = prepared.identity();
     let coordinates = coordinates(effect, identity.device_bdf());
-    let mut barriers = QemuBarriers::acquire();
+    let mut barriers = QemuBarriers::acquire(run_id);
     let mut deferred = DeferredBarriers;
+    let tool_plan = fixed_tool_plan(effect, run_id, experiment_identity);
     let mut armed = arm_tool_dma(
         &mut runtime,
         coordinates,
-        RUN,
-        b"tool-dma-e2e",
+        tool_plan,
         persistent_dma_arena_digest(arena),
         &mut deferred,
     )
@@ -490,7 +543,7 @@ fn run_initial(
         &mut runtime,
         effect,
         fixed_actor(),
-        fixed_tool_runtime(effect),
+        fixed_tool_runtime(effect, run_id, experiment_identity),
         observation,
         || {
             barriers
@@ -508,8 +561,11 @@ fn run_initial(
         .reached(ToolDmaBarrier::ComponentsRetired)
         .unwrap_or_else(|_| panic!("TOOL_DMA_FAIL stage=barrier-7"));
     println!(
-        "TOOL_DMA_RECOVERY_METRICS {{\"variant\":\"cser\",\"run_id\":\"42424242424242424242424242424242\",\"terminal\":true,\"invariants_ok\":true,\"retired_by_evidence\":{},\"retained_claims\":{},\"gate_rejections\":null,\"reconciliation_delay_ms\":null,\"reconciliation_steps\":{},\"reconciliation_delay_unit\":\"unmeasured\",\"topology_registered\":true,\"tool_finalized\":true,\"dma_finalized\":true,\"reuse_authorized\":false}}",
-        metrics.retired_components, metrics.retained_claims, metrics.reconciliation_steps,
+        "TOOL_DMA_RECOVERY_METRICS {{\"variant\":\"cser\",\"run_id\":\"{}\",\"terminal\":true,\"invariants_ok\":true,\"retired_by_evidence\":{},\"retained_claims\":{},\"gate_rejections\":null,\"reconciliation_delay_ms\":null,\"reconciliation_steps\":{},\"reconciliation_delay_unit\":\"unmeasured\",\"topology_registered\":true,\"tool_finalized\":true,\"dma_finalized\":true,\"reuse_authorized\":false}}",
+        HexRun(run_id),
+        metrics.retired_components,
+        metrics.retained_claims,
+        metrics.reconciliation_steps,
     );
     poweroff(ExitCode::Success)
 }
@@ -700,6 +756,7 @@ impl LiveCserDma {
 
 struct QemuBarriers {
     probe: CrashProbe,
+    run_id: [u8; 16],
 }
 
 struct DeferredBarriers;
@@ -713,9 +770,10 @@ impl ToolDmaBarrierHook for DeferredBarriers {
 }
 
 impl QemuBarriers {
-    fn acquire() -> Self {
+    fn acquire(run_id: [u8; 16]) -> Self {
         Self {
             probe: CrashProbe::acquire().expect("experiment owns COM3"),
+            run_id,
         }
     }
 }
@@ -724,8 +782,10 @@ impl ToolDmaBarrierHook for QemuBarriers {
     type Error = CrashProbeError;
 
     fn reached(&mut self, barrier: ToolDmaBarrier) -> Result<(), Self::Error> {
-        self.probe
-            .barrier(CrashRunId::new(RUN), CrashCutpoint::new(barrier.wire_id()))
+        self.probe.barrier(
+            CrashRunId::new(self.run_id),
+            CrashCutpoint::new(barrier.wire_id()),
+        )
     }
 }
 

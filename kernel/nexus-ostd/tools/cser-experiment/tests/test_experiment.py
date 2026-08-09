@@ -13,9 +13,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from protocol import ProtocolError, parse_request, record_digest, request, response
+from protocol import (MAX_LINE_BYTES, MAX_PAYLOAD_BYTES, ProtocolError, digest,
+                      evidence_record_digest, parse_request, parse_request_v2, record_digest,
+                      request, request_v2, response, response_v2)
 from tool_endpoint import Endpoint, Store
-from uart_http_bridge import serve
+from uart_http_bridge import BridgeStageError, _serve_client, _serve_client_v2, connect_and_serve, serve
 from uart_sink import consume_recovery_uart
 
 
@@ -83,6 +85,43 @@ class EndpointTest(unittest.TestCase):
 
 
 class ProtocolTest(unittest.TestCase):
+    def test_cser2_golden_identity_frame_and_expiry_is_nonterminal(self) -> None:
+        namespace, authority, effect, run, operation = "tool-dma-a", "a" * 32, "b" * 32, "c" * 32, "op-1"
+        catalog, payload = "d" * 64, b"body"
+        expected_request = b"CSER2 REQ POST tool-dma-a aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccccccccccccccccccccccccccc op-1 230d8358dc8e8890b4c58deeb62912ee2f20357ae92a5cc861b98e68fe31acb5 dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd Ym9keQ== 91b54ca0980cc688c385c23b3c1fec77a39dbe74401f057d488bad3430eac202\n"
+        frame = request_v2(namespace, authority, effect, run, operation, payload, catalog)
+        self.assertEqual(frame, expected_request)
+        self.assertEqual(parse_request_v2(frame), ("POST", namespace, authority, effect, run, operation, digest(payload), catalog, payload))
+        expired = response_v2(namespace, authority, effect, run, operation, digest(payload), catalog, 410, "expired", "retention_expired", None)
+        self.assertEqual(expired, b"CSER2 RESP 410 tool-dma-a aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccccccccccccccccccccccccccc op-1 230d8358dc8e8890b4c58deeb62912ee2f20357ae92a5cc861b98e68fe31acb5 dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd expired retention_expired - edb2a26ce22598c4772f866fee78e16a1cd34b03d65ea608f3e953924c2fd375\n")
+        evidence = evidence_record_digest(namespace, authority, effect, run, operation, digest(payload), catalog, 2, "succeeded", "success")
+        self.assertEqual(response_v2(namespace, authority, effect, run, operation, digest(payload), catalog, 201, "succeeded", "success", evidence), b"CSER2 RESP 201 tool-dma-a aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccccccccccccccccccccccccccc op-1 230d8358dc8e8890b4c58deeb62912ee2f20357ae92a5cc861b98e68fe31acb5 dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd succeeded success f687e1c2ba5433cb134e961e490b7c35ef900f39b14f8a1634fd92a7d6941613 b1e977c1b3fc1d5120666a3373257d0e6967d16c61595da124e99ab096c38233\n")
+        failed = evidence_record_digest(namespace, authority, effect, run, operation, digest(payload), catalog, 2, "failed", "remote_failed")
+        self.assertEqual(response_v2(namespace, authority, effect, run, operation, digest(payload), catalog, 409, "failed", "remote_failed", failed), b"CSER2 RESP 409 tool-dma-a aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccccccccccccccccccccccccccc op-1 230d8358dc8e8890b4c58deeb62912ee2f20357ae92a5cc861b98e68fe31acb5 dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd failed remote_failed a6e9f8f63fd0a76931527d63a8849d6c73b18fbbd20ed96dbea88cfcd47d5ab2 aba8c48cddfcffec81624d5bf3ac99ea6e385ad608a525500ba904b6cfd95d8e\n")
+        self.assertEqual(response_v2(namespace, authority, effect, run, operation, digest(payload), catalog, 404, "absent", "not_found", None), b"CSER2 RESP 404 tool-dma-a aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccccccccccccccccccccccccccc op-1 230d8358dc8e8890b4c58deeb62912ee2f20357ae92a5cc861b98e68fe31acb5 dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd absent not_found - df3447d5f56d7db483a1a2e8a9ed74d64f87f68c48fa75f66d21c08879ec3710\n")
+
+    def test_uart_limits_match_guest_codec(self) -> None:
+        run = "a" * 32
+        with self.assertRaises(ProtocolError):
+            request(run, "op", b"x" * 577)
+        with self.assertRaises(ProtocolError):
+            parse_request(b"x" * MAX_LINE_BYTES + b"\n")
+
+    def test_maximum_guest_v2_request_fits_and_round_trips(self) -> None:
+        payload = b"x" * MAX_PAYLOAD_BYTES
+        frame = request_v2(
+            "n" * 128, "a" * 32, "b" * 32, "c" * 32,
+            "o" * 64, payload, "d" * 64,
+        )
+        self.assertGreater(len(frame), 1024)
+        self.assertLessEqual(len(frame), MAX_LINE_BYTES)
+        parsed = parse_request_v2(frame)
+        self.assertEqual(parsed[1:8], (
+            "n" * 128, "a" * 32, "b" * 32, "c" * 32,
+            "o" * 64, digest(payload), "d" * 64,
+        ))
+        self.assertEqual(parsed[8], payload)
+
     def test_request_round_trip_and_bad_checksum_rejected(self) -> None:
         run = "0123456789abcdef0123456789abcdef"
         frame = request(run, "op-1", b"hello")
@@ -115,6 +154,242 @@ class ProtocolTest(unittest.TestCase):
 
 
 class BridgeTest(unittest.TestCase):
+    def test_v2_bridge_post_get_absence_and_expiry(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            store = Store(Path(temp) / "tool.db", namespace_id="tool-dma-a", authority_id="a" * 32,
+                          effect_id="b" * 32, catalog_digest="d" * 64, retention_seconds=1)
+            server = Endpoint(("127.0.0.1", 0), store, False)
+            thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
+            namespace, authority, effect, run, catalog = "tool-dma-a", "a" * 32, "b" * 32, "c" * 32, "d" * 64
+            identity = (namespace, authority, effect, run, catalog)
+            payload = b"body"; operation = "op-v2"; frame = request_v2(namespace, authority, effect, run, operation, payload, catalog)
+            def exchange(request_frame: bytes) -> bytes:
+                host, guest = socket.socketpair()
+                errors: list[BaseException] = []
+                def serve_v2() -> None:
+                    try:
+                        _serve_client_v2(host, ("127.0.0.1", server.server_port), identity)
+                    except BaseException as error:
+                        errors.append(error)
+                worker = threading.Thread(target=serve_v2, daemon=True)
+                worker.start(); guest.sendall(request_frame); reply = guest.recv(1024); worker.join(2)
+                guest.close(); host.close(); self.assertFalse(errors); return reply
+            self.assertIn(b" RESP 201 ", exchange(frame))
+            query = request_v2(namespace, authority, effect, run, operation, b"", catalog, method="GET", expected_input_digest=digest(payload))
+            self.assertIn(b" RESP 200 ", exchange(query))
+            missing = request_v2(namespace, authority, effect, run, "missing", b"", catalog, method="GET", expected_input_digest="e" * 64)
+            self.assertIn(b" RESP 404 ", exchange(missing))
+            store._connection.execute("UPDATE operations SET expires_at_ns=0")
+            self.assertIn(b" RESP 410 ", exchange(query))
+            server.shutdown(); server.server_close(); store.close()
+    def test_bridge_labels_missing_first_uart_byte(self) -> None:
+        host, guest = socket.socketpair()
+        try:
+            with self.assertRaises(BridgeStageError) as raised:
+                _serve_client(host, ("127.0.0.1", 1), "a" * 32, 0.01)
+            self.assertEqual(raised.exception.stage, "first-byte")
+        finally:
+            host.close(); guest.close()
+
+    def test_real_bridge_publishes_served_status_after_one_request(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            store = Store(Path(temp) / "tool.db")
+            server = Endpoint(("127.0.0.1", 0), store, False)
+            server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+            server_thread.start()
+            path = Path(temp) / "uart.sock"
+            status = Path(temp) / "bridge-status.json"
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            listener.bind(str(path)); listener.listen(1)
+            run = "0123456789abcdef0123456789abcdef"
+            errors: list[BaseException] = []
+
+            def run_bridge() -> None:
+                try:
+                    connect_and_serve(path, ("127.0.0.1", server.server_port), run, 1, 1, status)
+                except BaseException as error:
+                    errors.append(error)
+
+            bridge = threading.Thread(target=run_bridge, daemon=True)
+            bridge.start()
+            peer, _ = listener.accept()
+            try:
+                peer.sendall(request(run, "op-1", b"payload"))
+                self.assertIn(b" 201 ", peer.recv(2048))
+            finally:
+                peer.close(); listener.close()
+            bridge.join(1)
+            self.assertFalse(bridge.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(json.loads(status.read_text())["state"], "served")
+            server.shutdown(); server.server_close(); store.close()
+
+    def test_real_v2_bridge_serves_exact_404_then_one_post_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            namespace, authority, effect = "tool-dma-retry", "a" * 32, "b" * 32
+            run, catalog = "c" * 32, "d" * 64
+            store = Store(
+                Path(temp) / "tool.db",
+                namespace_id=namespace,
+                authority_id=authority,
+                effect_id=effect,
+                catalog_digest=catalog,
+            )
+            server = Endpoint(("127.0.0.1", 0), store, False)
+            server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+            server_thread.start()
+            path = Path(temp) / "uart.sock"
+            status = Path(temp) / "bridge-status.json"
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            listener.bind(str(path)); listener.listen(1)
+            identity = (namespace, authority, effect, run, catalog)
+            payload = b"recovery-retry"
+            errors: list[BaseException] = []
+
+            def run_bridge() -> None:
+                try:
+                    connect_and_serve(
+                        path,
+                        ("127.0.0.1", server.server_port),
+                        run,
+                        1,
+                        1,
+                        status,
+                        identity,
+                    )
+                except BaseException as error:
+                    errors.append(error)
+
+            bridge = threading.Thread(target=run_bridge, daemon=True)
+            bridge.start()
+            peer, _ = listener.accept()
+            try:
+                peer.sendall(request_v2(
+                    namespace, authority, effect, run, "op-retry", b"", catalog,
+                    method="GET", expected_input_digest=digest(payload),
+                ))
+                self.assertIn(b" RESP 404 ", peer.recv(2048))
+                peer.sendall(request_v2(
+                    namespace, authority, effect, run, "op-retry", payload, catalog,
+                ))
+                self.assertIn(b" RESP 201 ", peer.recv(2048))
+            finally:
+                peer.close(); listener.close()
+            bridge.join(1)
+            self.assertFalse(bridge.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(json.loads(status.read_text())["state"], "served")
+            server.shutdown(); server.server_close(); store.close()
+
+    def test_v2_bridge_rejects_changed_404_retry_before_endpoint_submit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            namespace, authority, effect = "tool-dma-retry", "a" * 32, "b" * 32
+            run, catalog = "c" * 32, "d" * 64
+            store = Store(
+                Path(temp) / "tool.db", namespace_id=namespace,
+                authority_id=authority, effect_id=effect, catalog_digest=catalog,
+            )
+            server = Endpoint(("127.0.0.1", 0), store, False)
+            server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+            server_thread.start()
+            host, guest = socket.socketpair()
+            payload = b"changed-retry"
+            input_digest = digest(payload)
+            errors: list[BaseException] = []
+
+            def serve_retry() -> None:
+                try:
+                    first = _serve_client_v2(
+                        host, ("127.0.0.1", server.server_port),
+                        (namespace, authority, effect, run, catalog),
+                    )
+                    _serve_client_v2(
+                        host, ("127.0.0.1", server.server_port),
+                        (namespace, authority, effect, run, catalog),
+                        expected_retry=(first[2], first[3]),
+                    )
+                except BaseException as error:
+                    errors.append(error)
+                finally:
+                    host.close()
+
+            worker = threading.Thread(target=serve_retry, daemon=True)
+            worker.start()
+            guest.sendall(request_v2(
+                namespace, authority, effect, run, "original", b"", catalog,
+                method="GET", expected_input_digest=input_digest,
+            ))
+            self.assertIn(b" RESP 404 ", guest.recv(2048))
+            guest.sendall(request_v2(
+                namespace, authority, effect, run, "different", payload, catalog,
+            ))
+            self.assertEqual(guest.recv(2048), b"")
+            worker.join(1); guest.close()
+            self.assertEqual(len(errors), 1)
+            self.assertIsInstance(errors[0], BridgeStageError)
+            self.assertIsNone(store.get(run, "different"))
+            server.shutdown(); server.server_close(); store.close()
+
+    def test_recovery_bridge_reports_unused_after_firmware_only_close(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "uart.sock"
+            status = Path(temp) / "bridge-status.json"
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            listener.bind(str(path)); listener.listen(1)
+            run = "c" * 32
+            identity = ("tool-dma-unused", "a" * 32, "b" * 32, run, "d" * 64)
+            errors: list[BaseException] = []
+
+            def run_bridge() -> None:
+                try:
+                    connect_and_serve(
+                        path, ("127.0.0.1", 1), run, 1, 1, status,
+                        identity, 0.0, True,
+                    )
+                except BaseException as error:
+                    errors.append(error)
+
+            bridge = threading.Thread(target=run_bridge, daemon=True)
+            bridge.start()
+            peer, _ = listener.accept()
+            peer.sendall(b"OVMF boot console\n")
+            peer.close(); listener.close()
+            bridge.join(1)
+            self.assertFalse(bridge.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(json.loads(status.read_text())["state"], "unused")
+
+    def test_real_bridge_publishes_endpoint_connect_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "uart.sock"
+            status = Path(temp) / "bridge-status.json"
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            listener.bind(str(path)); listener.listen(1)
+            run = "0123456789abcdef0123456789abcdef"
+            errors: list[BaseException] = []
+
+            def run_bridge() -> None:
+                try:
+                    connect_and_serve(path, ("127.0.0.1", 1), run, 1, 0.1, status)
+                except BaseException as error:
+                    errors.append(error)
+
+            bridge = threading.Thread(target=run_bridge, daemon=True)
+            bridge.start()
+            peer, _ = listener.accept()
+            try:
+                peer.sendall(request(run, "op-1", b"payload"))
+                self.assertIn(b" 503 ", peer.recv(2048))
+            finally:
+                peer.close(); listener.close()
+            bridge.join(1)
+            self.assertFalse(bridge.is_alive())
+            self.assertEqual(len(errors), 1)
+            self.assertIsInstance(errors[0], BridgeStageError)
+            signal = json.loads(status.read_text())
+            self.assertEqual(signal["state"], "failed")
+            self.assertEqual(signal["stage"], "endpoint-connect")
+
     def test_bridge_ignores_bounded_firmware_preamble_before_request(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             store = Store(Path(temp) / "tool.db")
@@ -236,6 +511,20 @@ class BridgeTest(unittest.TestCase):
 
 
 class RecoveryUartSinkTest(unittest.TestCase):
+    def test_recovery_configuration_is_required_when_a_catalog_is_supplied(self) -> None:
+        from matrix_protocol import config_response
+        import hashlib
+
+        hello = b"CSER1 CONFIG_HELLO"
+        host, guest = socket.socketpair()
+        guest.sendall(hello + b" " + hashlib.sha256(hello).hexdigest().encode() + b"\n")
+        guest.shutdown(socket.SHUT_WR)
+        thread = threading.Thread(target=consume_recovery_uart, args=(host, "a" * 32, "b" * 64, "tool", "c" * 32, "d" * 32))
+        thread.start()
+        self.assertEqual(guest.recv(1024), config_response("a" * 32, "b" * 64, "tool", "c" * 32, "d" * 32))
+        thread.join(1)
+        guest.close(); host.close()
+
     def test_firmware_preamble_is_allowed_but_barrier_is_rejected(self) -> None:
         from matrix_protocol import barrier
 

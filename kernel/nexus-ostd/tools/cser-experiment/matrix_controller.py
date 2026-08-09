@@ -14,7 +14,8 @@ import sys
 from pathlib import Path
 from typing import Any, Iterable
 
-from matrix_protocol import BarrierProtocolError, barrier_ack, parse_barrier
+from matrix_protocol import (BarrierProtocolError, UART_WRITE_INTER_CHUNK_SECONDS, barrier_ack,
+                             config_response, paced_sendall, parse_barrier, parse_config_hello)
 
 SCHEMA_VERSION = 2
 VARIANTS = frozenset(("cser", "baseline"))
@@ -22,6 +23,8 @@ _CID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$")
 _RECOVERY_METRICS_PREFIX = "TOOL_DMA_RECOVERY_METRICS "
 _MAX_RECOVERY_SERIAL_LINE_BYTES = 64 * 1024
 _RECOVERY_STDERR_TAIL_BYTES = 4096
+# Legacy fake-guest compatibility only. Real QEMU rows always receive a fresh
+# host-generated identity through the explicit COM3 configuration handshake.
 _CURRENT_GUEST_RUN_ID = "42" * 16
 _TERMINAL_COUNTER_FIELDS = (
     "retired_by_evidence",
@@ -32,13 +35,14 @@ _TERMINAL_COUNTER_FIELDS = (
 def _read_one_frame(client: socket.socket) -> bytes:
     data = bytearray()
     while len(data) <= 1024:
-        block = client.recv(min(256, 1025 - len(data)))
+        # Do not consume a following control/barrier frame in the same socket
+        # read: COM3 is a byte stream and a guest may write hello+barrier
+        # back-to-back once the host answers promptly.
+        block = client.recv(1)
         if not block:
             break
         data.extend(block)
-        if b"\n" in block:
-            if data.count(b"\n") != 1 or not data.endswith(b"\n"):
-                raise BarrierProtocolError("invalid barrier framing")
+        if block == b"\n":
             return bytes(data)
     preview = bytes(data[:64]).hex()
     raise BarrierProtocolError(
@@ -62,7 +66,11 @@ def _connect_qemu_server(socket_path: Path, timeout_seconds: float) -> socket.so
     raise RuntimeError(f"QEMU COM3 server unavailable at {socket_path}: {last_error}")
 
 
-def observe_barriers(client: socket.socket, run_id: str, target_cutpoint: int, *, pass_through: bool) -> bool:
+def observe_barriers(
+    client: socket.socket, run_id: str, target_cutpoint: int, *, pass_through: bool,
+    catalog_digest: str | None = None, namespace_id: str | None = None, authority_id: str | None = None, effect_id: str | None = None,
+    uart_pace_seconds: float = 0.0,
+) -> bool:
     """ACK exactly the in-order prefix, then close at the selected target.
 
     The guest's numeric cutpoints are a closed sequence 1..7.  A duplicate,
@@ -71,6 +79,11 @@ def observe_barriers(client: socket.socket, run_id: str, target_cutpoint: int, *
     """
     if not 1 <= target_cutpoint <= 7:
         raise BarrierProtocolError("target cutpoint is outside the seven-cutpoint matrix")
+    if catalog_digest is not None:
+        if namespace_id is None or authority_id is None or effect_id is None:
+            raise BarrierProtocolError("configuration requires endpoint namespace, authority, and effect")
+        parse_config_hello(_read_one_frame(client))
+        paced_sendall(client, config_response(run_id, catalog_digest, namespace_id, authority_id, effect_id), inter_chunk_seconds=uart_pace_seconds)
     expected = 1
     while True:
         observed = parse_barrier(_read_one_frame(client), expected_run_id=run_id)
@@ -79,13 +92,13 @@ def observe_barriers(client: socket.socket, run_id: str, target_cutpoint: int, *
             raise BarrierProtocolError(f"unexpected cutpoint {observed}; expected {expected}")
         if observed == target_cutpoint:
             if pass_through:
-                client.sendall(barrier_ack(run_id, observed))
+                paced_sendall(client, barrier_ack(run_id, observed), inter_chunk_seconds=uart_pace_seconds)
                 return True
             # Closing before the destructive action is intentional: a target
             # barrier must leave the guest blocked/notified only by QEMU death.
             client.shutdown(socket.SHUT_RDWR)
             return False
-        client.sendall(barrier_ack(run_id, observed))
+        paced_sendall(client, barrier_ack(run_id, observed), inter_chunk_seconds=uart_pace_seconds)
         expected += 1
 
 
@@ -213,13 +226,10 @@ def _validate_real_qemu_launcher(args: argparse.Namespace) -> None:
     expected = Path(__file__).with_name("qemu_boot.sh").resolve()
     if Path(args.guest[0]).resolve() != expected or args.recovery_guest.resolve() != expected:
         raise ValueError("real QEMU trials must use the dedicated qemu_boot.sh launcher for both boots")
-    # The current bounded guest has a compile-time run identity. Each matrix
-    # row nevertheless owns isolated media and endpoint state, so reusing this
-    # identity across rows cannot cross-contaminate an experiment. Do not
-    # silently generate a random host id until the guest receives one through
-    # a durable boot configuration channel.
-    if args.run_id != _CURRENT_GUEST_RUN_ID:
-        raise ValueError("real QEMU trials must use the current guest run id 4242…4242")
+    if args.catalog_digest is None:
+        raise ValueError("real QEMU trials require an explicit catalog digest for COM3 configuration")
+    if args.namespace_id is None or args.authority_id is None or args.effect_id is None:
+        raise ValueError("real QEMU trials require endpoint namespace, authority, and effect configuration")
     # qemu_boot's OSDK invocation has a 90-second internal timeout.  The
     # controller's envelope must leave room to collect its terminal receipt
     # and logs instead of racing that inner timeout.
@@ -377,6 +387,14 @@ def run_trial(args: argparse.Namespace) -> dict[str, Any]:
                 "CSER_EXPERIMENT_BARRIER_SOCKET": str(socket_path), "CSER_EXPERIMENT_TRIAL_DIR": str(trial_dir),
                 "CSER_EXPERIMENT_GUEST_METRICS": str(metrics_path), "CSER_EXPERIMENT_CID_FILE": str(cid_path),
                 "CSER_EXPERIMENT_VARIANT": args.variant})
+    if args.catalog_digest is not None:
+        env["CSER_EXPERIMENT_CATALOG_DIGEST"] = args.catalog_digest
+    if args.namespace_id is not None:
+        env["CSER_EXPERIMENT_NAMESPACE_ID"] = args.namespace_id
+    if args.authority_id is not None:
+        env["CSER_EXPERIMENT_AUTHORITY_ID"] = args.authority_id
+    if args.effect_id is not None:
+        env["CSER_EXPERIMENT_EFFECT_ID"] = args.effect_id
     initial_stdout = (trial_dir / "initial.stdout.log").open("wb")
     initial_stderr = (trial_dir / "initial.stderr.log").open("wb")
     try:
@@ -395,7 +413,12 @@ def run_trial(args: argparse.Namespace) -> dict[str, Any]:
     initial_captured = False
     try:
         with _connect_qemu_server(socket_path, args.timeout_seconds) as client:
-            observe_barriers(client, args.run_id, args.cutpoint_id, pass_through=args.pass_through)
+            observe_barriers(
+                client, args.run_id, args.cutpoint_id, pass_through=args.pass_through,
+                catalog_digest=args.catalog_digest,
+                namespace_id=args.namespace_id, authority_id=args.authority_id, effect_id=args.effect_id,
+                uart_pace_seconds=UART_WRITE_INTER_CHUNK_SECONDS if args.real_qemu else 0.0,
+            )
         if args.kill_mode == "pid":
             _kill_process_group(process)
         else:
@@ -446,6 +469,10 @@ def append_jsonl(path: Path, metric: dict[str, Any]) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--variant", required=True, choices=sorted(VARIANTS)); parser.add_argument("--run-id", required=True)
+    parser.add_argument("--catalog-digest", default=None)
+    parser.add_argument("--namespace-id", default=None)
+    parser.add_argument("--authority-id", default=None)
+    parser.add_argument("--effect-id", default=None)
     parser.add_argument("--trial", required=True, type=int); parser.add_argument("--cutpoint", required=True); parser.add_argument("--cutpoint-id", required=True, type=int)
     parser.add_argument("--barrier-socket", required=True, type=Path)
     parser.add_argument("--trial-dir", required=True, type=Path); parser.add_argument("--metrics-jsonl", required=True, type=Path)
@@ -466,6 +493,14 @@ def main() -> None:
         args.recovery_timeout_seconds = args.timeout_seconds
     if args.recovery_timeout_seconds <= 0:
         parser.error("--recovery-timeout-seconds must be positive")
+    if args.catalog_digest is not None and not re.fullmatch(r"[0-9a-f]{64}", args.catalog_digest):
+        parser.error("--catalog-digest must be exactly 64 lowercase hexadecimal characters")
+    if args.namespace_id is not None and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", args.namespace_id):
+        parser.error("--namespace-id is invalid")
+    if args.authority_id is not None and not re.fullmatch(r"[0-9a-f]{32}", args.authority_id):
+        parser.error("--authority-id must be exactly 32 lowercase hexadecimal characters")
+    if args.effect_id is not None and not re.fullmatch(r"[0-9a-f]{32}", args.effect_id):
+        parser.error("--effect-id must be exactly 32 lowercase hexadecimal characters")
     if not args.guest or args.guest[0] != "--": parser.error("guest command must follow --")
     args.guest = args.guest[1:]
     if not args.guest: parser.error("missing guest command")

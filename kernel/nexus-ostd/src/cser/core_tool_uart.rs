@@ -2,18 +2,18 @@
 
 //! Bounded COM2 transport for the experimental CSER tool endpoint.
 //!
-//! This module deliberately owns only the guest-side wire contract.  It is
-//! not wired into a runtime profile yet: a future adapter must acquire it
-//! before starting tool work, retain the request identity in the CSER journal,
-//! and decide which reply is retirement evidence.  Keeping that policy out of
-//! the UART driver prevents a successful byte exchange from being mistaken for
-//! an evidence-backed effect retirement.
+//! This module deliberately owns only the guest-side wire contract. The real
+//! tool-plus-DMA CSER and baseline profiles bind CSER2 identities before
+//! escape; policy still remains outside the UART driver so a successful byte
+//! exchange cannot be mistaken for evidence-backed effect retirement.
 //!
 //! The host bridge protocol is ASCII, one bounded line per request or reply:
 //!
 //! ```text
 //! CSER1 REQ  <POST|GET> <run_id> <operation_key> <payload_sha256> <payload_base64> <sha256>\n
 //! CSER1 RESP <run_id> <operation_key> <http_status> <payload_sha256> <terminal_status> <result> <record_sha256> <sha256>\n
+//! CSER2 REQ  <POST|GET> <namespace> <authority> <effect> <run_id> <operation_key> <input_sha256> <catalog_sha256> <payload_base64> <sha256>\n
+//! CSER2 RESP <http_status> <namespace> <authority> <effect> <run_id> <operation_key> <input_sha256> <catalog_sha256> <state> <result> <evidence_sha256|-> <sha256>\n
 //! ```
 //!
 //! There is exactly one ASCII space between tokens. `run_id` is 16 bytes
@@ -25,7 +25,10 @@
 
 use core::hint::spin_loop;
 
-use ostd::{arch::device::io_port::ReadWriteAccess, io::IoPort};
+use ostd::{
+    arch::device::io_port::ReadWriteAccess, io::IoPort, irq::InterruptLevel, prelude::println,
+    task::Task,
+};
 use sha2::{Digest as _, Sha256};
 
 /// Guest COM2 base port. The QEMU profile must reserve this endpoint for the
@@ -43,17 +46,103 @@ const UART_LCR_8N1: u8 = 0x03;
 const UART_FCR_ENABLE_CLEAR: u8 = 0x07;
 const UART_MCR_DTR_RTS: u8 = 0x03;
 
-/// Bounded spin count, deliberately not a wall-clock duration claim. Unlike
-/// COM3's in-process ACK, COM2 crosses a host Python bridge, SQLite, and HTTP;
-/// even one hundred million TCG polls can expire before that bounded round trip
-/// completes when the host schedules QEMU, Python, SQLite, and swtpm together.
-/// The host QEMU envelope retains an independent wall-clock hard timeout.
-const UART_POLL_LIMIT: u32 = 1_000_000_000;
-const MAX_LINE_BYTES: usize = 1024;
+/// Bounded polls for one UART-ready wait, deliberately not a wall-clock
+/// duration claim. COM2 crosses a host Python bridge, SQLite, and HTTP, so the
+/// guest yields after each bounded batch rather than monopolizing the vCPU in a
+/// billion-iteration spin. The host QEMU envelope retains the independent
+/// wall-clock hard timeout.
+const UART_POLL_LIMIT: u32 = 1 << 27;
+/// A batch is short enough to give the task scheduler regular opportunities to
+/// run the host-facing work, while preserving a polling-only UART contract.
+const UART_POLL_BATCH: u32 = 1 << 12;
+// A maximum CSER2 request combines a 128-byte namespace, 64-byte operation
+// key, 576-byte payload (768 base64 bytes), four digests/identities, and its
+// checksum. Keep the fixed guest buffer large enough for that legal product,
+// not merely for each field in isolation.
+const MAX_LINE_BYTES: usize = 1536;
 const MAX_OPERATION_KEY_BYTES: usize = 64;
 const MAX_PAYLOAD_BYTES: usize = 576;
 const RUN_ID_BYTES: usize = 16;
+const RUN_ID_HEX_BYTES: usize = RUN_ID_BYTES * 2;
 const SHA256_HEX_BYTES: usize = 64;
+const MAX_NAMESPACE_BYTES: usize = 128;
+
+/// Checksum-bound CSER2 identity.  Real QEMU profiles must use this; the
+/// `None` transport shape remains only for isolated legacy codec tests.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ToolV2Identity {
+    namespace: [u8; MAX_NAMESPACE_BYTES],
+    namespace_len: u8,
+    authority: ToolRunId,
+    effect: ToolRunId,
+    catalog_digest: [u8; 32],
+}
+
+impl ToolV2Identity {
+    pub(crate) fn new(
+        namespace: &[u8],
+        authority: ToolRunId,
+        effect: ToolRunId,
+        catalog_digest: [u8; 32],
+    ) -> Result<Self, ToolProtocolError> {
+        if namespace.is_empty()
+            || namespace.len() > MAX_NAMESPACE_BYTES
+            || !namespace.iter().copied().all(is_operation_key_byte)
+        {
+            return Err(ToolProtocolError::InvalidNamespace);
+        }
+        let mut stored = [0; MAX_NAMESPACE_BYTES];
+        stored[..namespace.len()].copy_from_slice(namespace);
+        Ok(Self {
+            namespace: stored,
+            namespace_len: namespace.len() as u8,
+            authority,
+            effect,
+            catalog_digest,
+        })
+    }
+    pub(crate) fn namespace(&self) -> &[u8] {
+        &self.namespace[..usize::from(self.namespace_len)]
+    }
+
+    pub(crate) const fn authority(self) -> ToolRunId {
+        self.authority
+    }
+
+    pub(crate) const fn effect(self) -> ToolRunId {
+        self.effect
+    }
+
+    pub(crate) const fn catalog_digest(self) -> [u8; 32] {
+        self.catalog_digest
+    }
+
+    /// Stable local recovery binding for a complete CSER2 request identity.
+    /// This is not endpoint evidence; the baseline stores it before escape so
+    /// a changed COM3 configuration cannot authorize a new recovery request.
+    pub(crate) fn request_binding_digest(
+        self,
+        run: ToolRunId,
+        operation: &[u8],
+        input_digest: [u8; 32],
+    ) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(b"nexus-cser-tool-request-binding-v2");
+        for field in [
+            self.namespace(),
+            &self.authority.bytes(),
+            &self.effect.bytes(),
+            &run.bytes(),
+            operation,
+            &input_digest,
+            &self.catalog_digest,
+        ] {
+            hasher.update((field.len() as u64).to_le_bytes());
+            hasher.update(field);
+        }
+        hasher.finalize().into()
+    }
+}
 
 /// Stable operation identity supplied by the durable adapter, not an endpoint
 /// generated nonce. The host may use it for idempotent reconciliation.
@@ -109,6 +198,7 @@ pub(crate) struct ToolRequest {
     payload_digest: [u8; 32],
     payload: [u8; MAX_PAYLOAD_BYTES],
     payload_len: u16,
+    identity: Option<ToolV2Identity>,
 }
 
 impl ToolRequest {
@@ -129,7 +219,19 @@ impl ToolRequest {
             payload_digest: Sha256::digest(payload).into(),
             payload: stored,
             payload_len: payload.len() as u16,
+            identity: None,
         })
+    }
+
+    pub(crate) fn new_v2(
+        identity: ToolV2Identity,
+        run_id: ToolRunId,
+        operation: OperationKey,
+        payload: &[u8],
+    ) -> Result<Self, ToolProtocolError> {
+        let mut request = Self::new(run_id, operation, payload)?;
+        request.identity = Some(identity);
+        Ok(request)
     }
 
     fn payload(&self) -> &[u8] {
@@ -148,7 +250,19 @@ impl ToolRequest {
             payload_digest,
             payload: [0; MAX_PAYLOAD_BYTES],
             payload_len: 0,
+            identity: None,
         }
+    }
+
+    pub(crate) fn get_v2(
+        identity: ToolV2Identity,
+        run_id: ToolRunId,
+        operation: OperationKey,
+        payload_digest: [u8; 32],
+    ) -> Self {
+        let mut request = Self::get(run_id, operation, payload_digest);
+        request.identity = Some(identity);
+        request
     }
 }
 
@@ -214,6 +328,7 @@ pub(crate) fn terminal_record_for_test(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ToolTerminalOutcome {
     Success,
+    Failure,
 }
 
 /// The bounded response returned by the bridge. A successful HTTP status is
@@ -249,10 +364,63 @@ pub(crate) enum ToolUartError {
     Protocol(ToolProtocolError),
 }
 
+/// Per-transaction guest-side timing and polling diagnostics. TSC points are
+/// diagnostic ordering evidence only: QEMU/TCG timing is not a host wall-clock
+/// measurement. A missing point means the transaction did not reach that
+/// phase. The transport retains this snapshot even when it returns an error.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ToolUartTiming {
+    transmit_started_tsc: u64,
+    transmit_completed_tsc: Option<u64>,
+    first_response_byte_tsc: Option<u64>,
+    full_response_frame_tsc: Option<u64>,
+    endpoint_response_available_tsc: Option<u64>,
+    polls: u32,
+    scheduler_yields: u32,
+}
+
+impl ToolUartTiming {
+    fn started() -> Self {
+        Self {
+            transmit_started_tsc: guest_tsc(),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) const fn transmit_started_tsc(self) -> u64 {
+        self.transmit_started_tsc
+    }
+
+    pub(crate) const fn transmit_completed_tsc(self) -> Option<u64> {
+        self.transmit_completed_tsc
+    }
+
+    pub(crate) const fn first_response_byte_tsc(self) -> Option<u64> {
+        self.first_response_byte_tsc
+    }
+
+    pub(crate) const fn full_response_frame_tsc(self) -> Option<u64> {
+        self.full_response_frame_tsc
+    }
+
+    pub(crate) const fn endpoint_response_available_tsc(self) -> Option<u64> {
+        self.endpoint_response_available_tsc
+    }
+
+    pub(crate) const fn polls(self) -> u32 {
+        self.polls
+    }
+
+    pub(crate) const fn scheduler_yields(self) -> u32 {
+        self.scheduler_yields
+    }
+}
+
 /// Malformed peer data, a mismatched request identity, or a checksum mismatch.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ToolProtocolError {
     InvalidOperationKey,
+    InvalidNamespace,
     PayloadTooLong,
     FrameTooLong,
     InvalidFrame,
@@ -279,6 +447,7 @@ pub(crate) struct ToolUart {
     _line_control: IoPort<u8, ReadWriteAccess>,
     _modem_control: IoPort<u8, ReadWriteAccess>,
     line_status: IoPort<u8, ReadWriteAccess>,
+    last_timing: ToolUartTiming,
 }
 
 impl ToolUart {
@@ -333,7 +502,14 @@ impl ToolUart {
             _line_control: line_control,
             _modem_control: modem_control,
             line_status,
+            last_timing: ToolUartTiming::default(),
         })
+    }
+
+    /// The most recent transaction's phase/poll diagnostic, including a
+    /// transaction which failed closed before a valid endpoint response.
+    pub(crate) const fn last_timing(&self) -> ToolUartTiming {
+        self.last_timing
     }
 
     /// Sends exactly one request and accepts only the matching response.
@@ -342,24 +518,51 @@ impl ToolUart {
         request: &ToolRequest,
     ) -> Result<ToolResponse, ToolUartError> {
         let mut line = [0; MAX_LINE_BYTES];
-        let request_len = encode_request(request, &mut line).map_err(ToolUartError::Protocol)?;
-        self.write_all(&line[..request_len])?;
-        let response_len = self.read_line(&mut line)?;
-        decode_response(&line[..response_len], request).map_err(ToolUartError::Protocol)
+        let mut timing = ToolUartTiming::started();
+        let result = (|| {
+            let request_len =
+                encode_request(request, &mut line).map_err(ToolUartError::Protocol)?;
+            self.write_all(&line[..request_len], &mut timing)?;
+            timing.transmit_completed_tsc = Some(guest_tsc());
+            let response_len = self.read_line(&mut line, &mut timing)?;
+            timing.full_response_frame_tsc = Some(guest_tsc());
+            let response =
+                decode_response(&line[..response_len], request).map_err(ToolUartError::Protocol)?;
+            timing.endpoint_response_available_tsc = Some(guest_tsc());
+            Ok(response)
+        })();
+        self.last_timing = timing;
+        emit_timing(if result.is_ok() { "response" } else { "failed" }, timing);
+        result
     }
 
-    fn write_all(&mut self, bytes: &[u8]) -> Result<(), ToolUartError> {
+    fn write_all(
+        &mut self,
+        bytes: &[u8],
+        timing: &mut ToolUartTiming,
+    ) -> Result<(), ToolUartError> {
         for byte in bytes.iter().copied() {
-            self.wait_for(UART_LSR_TRANSMIT_EMPTY, ToolUartError::TransmitTimeout)?;
+            self.wait_for(
+                UART_LSR_TRANSMIT_EMPTY,
+                ToolUartError::TransmitTimeout,
+                timing,
+            )?;
             self.data.write(byte);
         }
         Ok(())
     }
 
-    fn read_line(&mut self, output: &mut [u8; MAX_LINE_BYTES]) -> Result<usize, ToolUartError> {
+    fn read_line(
+        &mut self,
+        output: &mut [u8; MAX_LINE_BYTES],
+        timing: &mut ToolUartTiming,
+    ) -> Result<usize, ToolUartError> {
         for (index, slot) in output.iter_mut().enumerate() {
-            self.wait_for(UART_LSR_DATA_READY, ToolUartError::ReceiveTimeout)?;
+            self.wait_for(UART_LSR_DATA_READY, ToolUartError::ReceiveTimeout, timing)?;
             *slot = self.data.read();
+            if index == 0 {
+                timing.first_response_byte_tsc = Some(guest_tsc());
+            }
             if *slot == b'\n' {
                 return Ok(index + 1);
             }
@@ -367,15 +570,57 @@ impl ToolUart {
         Err(ToolUartError::LineTooLong)
     }
 
-    fn wait_for(&self, mask: u8, timeout: ToolUartError) -> Result<(), ToolUartError> {
-        for _ in 0..UART_POLL_LIMIT {
-            if self.line_status.read() & mask != 0 {
-                return Ok(());
+    fn wait_for(
+        &self,
+        mask: u8,
+        timeout: ToolUartError,
+        timing: &mut ToolUartTiming,
+    ) -> Result<(), ToolUartError> {
+        let mut remaining = UART_POLL_LIMIT;
+        while remaining != 0 {
+            let batch = remaining.min(UART_POLL_BATCH);
+            for _ in 0..batch {
+                timing.polls = timing.polls.saturating_add(1);
+                if self.line_status.read() & mask != 0 {
+                    return Ok(());
+                }
+                spin_loop();
             }
-            spin_loop();
+            remaining -= batch;
+            if remaining != 0 {
+                yield_after_poll_batch(timing);
+            }
         }
         Err(timeout)
     }
+}
+
+/// UART transports are acquired only by the experiment manager task. Keep the
+/// scheduler yield out of bootstrap and interrupt context so a future caller
+/// cannot turn a polling transport into an early-boot or IRQ-context sleep.
+fn yield_after_poll_batch(timing: &mut ToolUartTiming) {
+    if Task::current().is_some() && InterruptLevel::current().is_task_context() {
+        timing.scheduler_yields = timing.scheduler_yields.saturating_add(1);
+        Task::yield_now();
+    }
+}
+
+fn guest_tsc() -> u64 {
+    ostd::arch::read_tsc()
+}
+
+fn emit_timing(result: &str, timing: ToolUartTiming) {
+    println!(
+        "TOOL_UART_TIMING result={} transmit_started_tsc={} transmit_completed_tsc={} first_response_byte_tsc={} full_response_frame_tsc={} endpoint_response_available_tsc={} polls={} scheduler_yields={} timing_unit=guest_tsc",
+        result,
+        timing.transmit_started_tsc,
+        timing.transmit_completed_tsc.unwrap_or(0),
+        timing.first_response_byte_tsc.unwrap_or(0),
+        timing.full_response_frame_tsc.unwrap_or(0),
+        timing.endpoint_response_available_tsc.unwrap_or(0),
+        timing.polls,
+        timing.scheduler_yields,
+    );
 }
 
 fn encode_request(
@@ -383,6 +628,30 @@ fn encode_request(
     output: &mut [u8; MAX_LINE_BYTES],
 ) -> Result<usize, ToolProtocolError> {
     let mut writer = LineWriter::new(output);
+    if let Some(identity) = request.identity {
+        writer.push(b"CSER2 REQ ")?;
+        writer.push(match request.method {
+            ToolRequestMethod::Post => b"POST",
+            ToolRequestMethod::Get => b"GET",
+        })?;
+        writer.push_byte(b' ')?;
+        writer.push(identity.namespace())?;
+        writer.push_byte(b' ')?;
+        writer.push_run_id(identity.authority)?;
+        writer.push_byte(b' ')?;
+        writer.push_run_id(identity.effect)?;
+        writer.push_byte(b' ')?;
+        writer.push_run_id(request.run_id)?;
+        writer.push_byte(b' ')?;
+        writer.push(request.operation.as_bytes())?;
+        writer.push_byte(b' ')?;
+        writer.push_hex(&request.payload_digest)?;
+        writer.push_byte(b' ')?;
+        writer.push_hex(&identity.catalog_digest)?;
+        writer.push_byte(b' ')?;
+        writer.push_base64(request.payload())?;
+        return writer.finish_with_checksum();
+    }
     writer.push(b"CSER1 REQ ")?;
     writer.push(match request.method {
         ToolRequestMethod::Post => b"POST",
@@ -407,6 +676,9 @@ pub(crate) fn decode_response(
         return Err(ToolProtocolError::InvalidFrame);
     }
     let without_newline = &line[..line.len() - 1];
+    if request.identity.is_some() {
+        return decode_response_v2(without_newline, request);
+    }
     let tokens = split_response_tokens(without_newline)?;
     if tokens[0] != b"CSER1" || tokens[1] != b"RESP" {
         return Err(ToolProtocolError::InvalidFrame);
@@ -437,6 +709,15 @@ pub(crate) fn decode_response(
             }
             let outcome = match (terminal_status, result) {
                 (b"applied", b"success") => ToolTerminalOutcome::Success,
+                // A durable logical failure is still terminal outcome
+                // evidence. It can settle the tool fact, never the DMA
+                // component; accepted/pending records have no terminal digest
+                // and therefore cannot reach this branch.
+                (b"failed", result)
+                    if !result.is_empty() && result.iter().copied().all(is_operation_key_byte) =>
+                {
+                    ToolTerminalOutcome::Failure
+                }
                 _ => return Err(ToolProtocolError::InvalidTerminalRecord),
             };
             let record_digest = parse_digest(record_digest)?;
@@ -460,6 +741,119 @@ pub(crate) fn decode_response(
         }
     };
     Ok(ToolResponse { status, terminal })
+}
+
+fn decode_response_v2(
+    line: &[u8],
+    request: &ToolRequest,
+) -> Result<ToolResponse, ToolProtocolError> {
+    let identity = request
+        .identity
+        .ok_or(ToolProtocolError::UnexpectedResponse)?;
+    let tokens = split_v2_response_tokens(line)?;
+    if tokens[0] != b"CSER2" || tokens[1] != b"RESP" {
+        return Err(ToolProtocolError::InvalidFrame);
+    }
+    verify_checksum(line, tokens[13])?;
+    if tokens[3] != identity.namespace()
+        || parse_run_id(tokens[4])? != identity.authority
+        || parse_run_id(tokens[5])? != identity.effect
+        || parse_run_id(tokens[6])? != request.run_id
+        || tokens[7] != request.operation.as_bytes()
+        || parse_digest(tokens[8])? != request.payload_digest
+        || parse_digest(tokens[9])? != identity.catalog_digest
+    {
+        return Err(ToolProtocolError::UnexpectedResponse);
+    }
+    let status = parse_status(tokens[2])?;
+    let state = tokens[10];
+    let result = tokens[11];
+    let evidence = tokens[12];
+    if state == b"accepted" || state == b"pending" {
+        if status != 202 || evidence != b"-" {
+            return Err(ToolProtocolError::IncompleteTerminalRecord);
+        }
+        return Ok(ToolResponse {
+            status,
+            terminal: None,
+        });
+    }
+    if state == b"expired" {
+        if status != 410 || evidence != b"-" {
+            return Err(ToolProtocolError::IncompleteTerminalRecord);
+        }
+        return Ok(ToolResponse {
+            status,
+            terminal: None,
+        });
+    }
+    // Only a checksum- and identity-bound 404 absence grants the adapter's
+    // existing same-key retry path.  In particular, 410/expired above never
+    // reaches this branch.
+    if state == b"absent" {
+        if status != 404 || result != b"not_found" || evidence != b"-" {
+            return Err(ToolProtocolError::IncompleteTerminalRecord);
+        }
+        return Ok(ToolResponse {
+            status,
+            terminal: None,
+        });
+    }
+    let outcome = match state {
+        b"succeeded" if result == b"success" => ToolTerminalOutcome::Success,
+        b"failed" if !result.is_empty() && result.iter().copied().all(is_operation_key_byte) => {
+            ToolTerminalOutcome::Failure
+        }
+        _ => return Err(ToolProtocolError::InvalidTerminalRecord),
+    };
+    if !matches!(status, 200 | 201 | 409) || evidence == b"-" {
+        return Err(ToolProtocolError::IncompleteTerminalRecord);
+    }
+    let record_digest = parse_digest(evidence)?;
+    let expected = canonical_evidence_record_digest(
+        identity,
+        request.run_id,
+        request.operation.as_bytes(),
+        &request.payload_digest,
+        state,
+        result,
+    );
+    if record_digest != expected {
+        return Err(ToolProtocolError::RecordDigestMismatch);
+    }
+    Ok(ToolResponse {
+        status,
+        terminal: Some(ToolTerminalRecord {
+            run_id: request.run_id,
+            operation: request.operation,
+            payload_digest: request.payload_digest,
+            outcome,
+            record_digest,
+        }),
+    })
+}
+
+fn split_v2_response_tokens(line: &[u8]) -> Result<[&[u8]; 14], ToolProtocolError> {
+    let mut tokens = [&[][..]; 14];
+    let mut start = 0;
+    let mut count = 0;
+    for (index, byte) in line.iter().copied().enumerate() {
+        if byte == b' ' {
+            if index == start || count == 13 {
+                return Err(ToolProtocolError::InvalidFrame);
+            }
+            tokens[count] = &line[start..index];
+            count += 1;
+            start = index + 1;
+        } else if !byte.is_ascii_graphic() {
+            return Err(ToolProtocolError::InvalidFrame);
+        }
+    }
+    if count != 13 || start >= line.len() {
+        return Err(ToolProtocolError::InvalidFrame);
+    }
+    tokens[13] = &line[start..];
+    Ok(tokens)
 }
 
 fn split_response_tokens(line: &[u8]) -> Result<[&[u8]; 10], ToolProtocolError> {
@@ -554,6 +948,44 @@ fn canonical_record_digest(
         operation,
         &payload_digest_hex[..],
         terminal_status,
+        result,
+    ] {
+        hasher.update((field.len() as u64).to_le_bytes());
+        hasher.update(field);
+    }
+    hasher.finalize().into()
+}
+
+fn canonical_evidence_record_digest(
+    identity: ToolV2Identity,
+    run_id: ToolRunId,
+    operation: &[u8],
+    input_digest: &[u8; 32],
+    state: &[u8],
+    result: &[u8],
+) -> [u8; 32] {
+    let mut authority = [0; RUN_ID_HEX_BYTES];
+    encode_hex(&identity.authority.bytes(), &mut authority);
+    let mut effect = [0; RUN_ID_HEX_BYTES];
+    encode_hex(&identity.effect.bytes(), &mut effect);
+    let mut run = [0; RUN_ID_HEX_BYTES];
+    encode_hex(&run_id.bytes(), &mut run);
+    let mut input = [0; SHA256_HEX_BYTES];
+    encode_hex(input_digest, &mut input);
+    let mut catalog = [0; SHA256_HEX_BYTES];
+    encode_hex(&identity.catalog_digest, &mut catalog);
+    let mut hasher = Sha256::new();
+    hasher.update(b"nexus-cser-local-evidence-record-v2");
+    for field in [
+        &identity.namespace()[..],
+        &authority[..],
+        &effect[..],
+        &run[..],
+        operation,
+        &input[..],
+        &catalog[..],
+        b"2",
+        state,
         result,
     ] {
         hasher.update((field.len() as u64).to_le_bytes());
@@ -801,6 +1233,32 @@ mod tests {
         let query_tokens = split_request_tokens(&line[..query_len - 1]).unwrap();
         assert_eq!(query_tokens[2], b"GET");
         assert_eq!(query_tokens[6], b"-");
+    }
+
+    #[ktest]
+    fn maximum_v2_request_fits_the_fixed_guest_frame() {
+        let namespace = [b'n'; MAX_NAMESPACE_BYTES];
+        let operation = [b'o'; MAX_OPERATION_KEY_BYTES];
+        let payload = [b'x'; MAX_PAYLOAD_BYTES];
+        let identity = ToolV2Identity::new(
+            &namespace,
+            ToolRunId::new([0xaa; RUN_ID_BYTES]),
+            ToolRunId::new([0xbb; RUN_ID_BYTES]),
+            [0xdd; 32],
+        )
+        .unwrap();
+        let request = ToolRequest::new_v2(
+            identity,
+            ToolRunId::new([0xcc; RUN_ID_BYTES]),
+            OperationKey::new(&operation).unwrap(),
+            &payload,
+        )
+        .unwrap();
+        let mut line = [0; MAX_LINE_BYTES];
+        let len = encode_request(&request, &mut line).unwrap();
+        assert!(len > 1024);
+        assert!(len <= MAX_LINE_BYTES);
+        assert_eq!(line[len - 1], b'\n');
     }
 
     #[ktest]

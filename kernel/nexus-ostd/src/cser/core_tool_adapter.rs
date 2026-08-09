@@ -21,7 +21,7 @@ use sha2::{Digest as _, Sha256};
 
 use super::core_tool_uart::{
     OperationKey, ToolRequest, ToolRunId, ToolTerminalOutcome, ToolTerminalRecord, ToolUart,
-    ToolUartError,
+    ToolUartError, ToolV2Identity,
 };
 
 /// Must remain no larger than the bounded UART transport's payload limit.
@@ -36,6 +36,7 @@ const MAX_TOOL_PAYLOAD_BYTES: usize = 576;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ToolOperationPlan {
     run_id: [u8; 16],
+    catalog_digest: Digest,
     effect: EffectId,
     component: ComponentId,
     claim: ClaimId,
@@ -46,6 +47,7 @@ pub(crate) struct ToolOperationPlan {
     payload: [u8; MAX_TOOL_PAYLOAD_BYTES],
     payload_len: u16,
     operation_digest: Digest,
+    transport_identity: Option<ToolV2Identity>,
 }
 
 impl ToolOperationPlan {
@@ -56,6 +58,7 @@ impl ToolOperationPlan {
         claim: ClaimId,
         resource: ResourceId,
         resource_generation: ResourceGeneration,
+        catalog_digest: Digest,
         payload: &[u8],
     ) -> Result<Self, ToolPlanError> {
         if component != cser_core::TOOL_DMA_COMPONENT_TOOL || payload.is_empty() {
@@ -81,12 +84,15 @@ impl ToolOperationPlan {
             &[
                 &operation_key.bytes(),
                 &payload_digest.bytes(),
+                &run_id,
+                &catalog_digest.bytes(),
                 &resource.get().to_le_bytes(),
                 &resource_generation.get().to_le_bytes(),
             ],
         );
         Ok(Self {
             run_id,
+            catalog_digest,
             effect,
             component,
             claim,
@@ -97,7 +103,28 @@ impl ToolOperationPlan {
             payload: stored_payload,
             payload_len: payload.len() as u16,
             operation_digest,
+            transport_identity: None,
         })
+    }
+
+    pub(crate) fn bind_cser2(mut self, identity: ToolV2Identity) -> Self {
+        // The durable commit operation is the recovery authority for an
+        // idempotent external retry. Bind the complete transport identity
+        // before that operation is recorded so a successor cannot adopt a
+        // fresh host configuration and POST under a different endpoint key.
+        let base = self.operation_digest.bytes();
+        self.operation_digest = hash_parts(
+            b"nexus-cser-tool-operation-v2",
+            &[
+                &base,
+                identity.namespace(),
+                &identity.authority().bytes(),
+                &identity.effect().bytes(),
+                &identity.catalog_digest(),
+            ],
+        );
+        self.transport_identity = Some(identity);
+        self
     }
 
     pub(crate) const fn effect(self) -> EffectId {
@@ -105,6 +132,9 @@ impl ToolOperationPlan {
     }
     pub(crate) const fn run_id(self) -> [u8; 16] {
         self.run_id
+    }
+    pub(crate) const fn catalog_digest(self) -> Digest {
+        self.catalog_digest
     }
     pub(crate) const fn component(self) -> ComponentId {
         self.component
@@ -187,6 +217,7 @@ impl DurableToolObservation {
         }
         let outcome = match record.outcome() {
             ToolTerminalOutcome::Success => ExternalOutcome::Success,
+            ToolTerminalOutcome::Failure => ExternalOutcome::Failure,
         };
         let endpoint_record_digest = Digest::new(record.record_digest());
         Ok(Self {
@@ -281,11 +312,19 @@ impl ToolEndpoint for UartToolEndpoint<'_> {
     type Error = ToolTransportError;
 
     fn post(&mut self, plan: ToolOperationPlan) -> Result<DurableToolObservation, Self::Error> {
-        let request = ToolRequest::new(
-            ToolRunId::new(plan.run_id()),
-            Self::operation(plan)?,
-            plan.payload(),
-        )
+        let request = match plan.transport_identity {
+            Some(identity) => ToolRequest::new_v2(
+                identity,
+                ToolRunId::new(plan.run_id()),
+                Self::operation(plan)?,
+                plan.payload(),
+            ),
+            None => ToolRequest::new(
+                ToolRunId::new(plan.run_id()),
+                Self::operation(plan)?,
+                plan.payload(),
+            ),
+        }
         .map_err(ToolTransportError::Protocol)?;
         let reply = self
             .uart
@@ -295,11 +334,19 @@ impl ToolEndpoint for UartToolEndpoint<'_> {
     }
 
     fn get(&mut self, plan: ToolOperationPlan) -> Result<DurableToolObservation, Self::Error> {
-        let request = ToolRequest::get(
-            ToolRunId::new(plan.run_id()),
-            Self::operation(plan)?,
-            plan.payload_digest().bytes(),
-        );
+        let request = match plan.transport_identity {
+            Some(identity) => ToolRequest::get_v2(
+                identity,
+                ToolRunId::new(plan.run_id()),
+                Self::operation(plan)?,
+                plan.payload_digest().bytes(),
+            ),
+            None => ToolRequest::get(
+                ToolRunId::new(plan.run_id()),
+                Self::operation(plan)?,
+                plan.payload_digest().bytes(),
+            ),
+        };
         let reply = self
             .uart
             .transact(&request)
@@ -497,7 +544,9 @@ fn hash_parts(label: &[u8], parts: &[&[u8]]) -> Digest {
 #[cfg(ktest)]
 mod tests {
     use super::*;
-    use crate::core_tool_uart::{OperationKey, ToolResponse, ToolRunId, terminal_record_for_test};
+    use crate::core_tool_uart::{
+        OperationKey, ToolResponse, ToolRunId, ToolV2Identity, terminal_record_for_test,
+    };
     use cser_core::{ClaimId, ComponentId, EffectId, ResourceGeneration, ResourceId, RootId};
 
     #[test]
@@ -510,6 +559,7 @@ mod tests {
             ClaimId::new(11).unwrap(),
             ResourceId::new(12).unwrap(),
             ResourceGeneration::new(1).unwrap(),
+            Digest::new([0x77; 32]),
             b"first payload",
         )
         .unwrap();
@@ -520,12 +570,52 @@ mod tests {
             ClaimId::new(11).unwrap(),
             ResourceId::new(12).unwrap(),
             ResourceGeneration::new(1).unwrap(),
+            Digest::new([0x77; 32]),
             b"second payload",
         )
         .unwrap();
         assert_ne!(plan.operation_key(), Digest::ZERO);
         assert_ne!(plan.operation_digest(), changed_payload.operation_digest());
         assert_eq!(plan.operation_key(), changed_payload.operation_key());
+    }
+
+    #[test]
+    fn cser2_plan_digest_binds_complete_recovery_identity() {
+        let effect = EffectId::new(RootId::new(7).unwrap(), 9).unwrap();
+        let base = ToolOperationPlan::new(
+            [0x12; 16],
+            effect,
+            cser_core::TOOL_DMA_COMPONENT_TOOL,
+            ClaimId::new(11).unwrap(),
+            ResourceId::new(12).unwrap(),
+            ResourceGeneration::new(1).unwrap(),
+            Digest::new([0x77; 32]),
+            b"payload",
+        )
+        .unwrap();
+        let first = base.bind_cser2(
+            ToolV2Identity::new(
+                b"tool",
+                ToolRunId::new([0xa1; 16]),
+                ToolRunId::new([0xb1; 16]),
+                [0x77; 32],
+            )
+            .unwrap(),
+        );
+        let changed_authority = base.bind_cser2(
+            ToolV2Identity::new(
+                b"tool",
+                ToolRunId::new([0xa2; 16]),
+                ToolRunId::new([0xb1; 16]),
+                [0x77; 32],
+            )
+            .unwrap(),
+        );
+        assert_ne!(base.operation_digest(), first.operation_digest());
+        assert_ne!(
+            first.operation_digest(),
+            changed_authority.operation_digest()
+        );
     }
 
     #[test]
@@ -538,6 +628,7 @@ mod tests {
             ClaimId::new(11).unwrap(),
             ResourceId::new(12).unwrap(),
             ResourceGeneration::new(1).unwrap(),
+            Digest::new([0x77; 32]),
             b"payload",
         )
         .unwrap();
@@ -568,6 +659,7 @@ mod tests {
             ClaimId::new(11).unwrap(),
             ResourceId::new(12).unwrap(),
             ResourceGeneration::new(1).unwrap(),
+            Digest::new([0x77; 32]),
             b"payload",
         )
         .unwrap();

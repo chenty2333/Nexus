@@ -3,10 +3,30 @@ import json, os, socket, subprocess, sys, tempfile, time, unittest
 from pathlib import Path
 TOOLS = Path(__file__).resolve().parents[1]; sys.path.insert(0, str(TOOLS))
 from matrix_controller import _CURRENT_GUEST_RUN_ID, _RECOVERY_METRICS_PREFIX, _metric, _recovery_metrics_from_serial, observe_barriers
-from matrix_protocol import BarrierProtocolError, barrier, parse_barrier
+from matrix_protocol import BarrierProtocolError, barrier, parse_barrier, config_response, paced_sendall
 from summarize_metrics import load_metrics, summarize
 
 class MatrixProtocolTests(unittest.TestCase):
+    def test_paced_uart_write_chunks_and_preserves_the_complete_frame(self) -> None:
+        class Capture:
+            def __init__(self) -> None:
+                self.parts: list[bytes] = []
+            def sendall(self, data: bytes) -> None:
+                self.parts.append(data)
+        peer = Capture()
+        frame = config_response("a" * 32, "b" * 64, "tool-dma-test", "c" * 32, "d" * 32)
+        paced_sendall(peer, frame, chunk_bytes=8, inter_chunk_seconds=0.000001)
+        self.assertGreater(len(peer.parts), 1)
+        self.assertTrue(all(0 < len(part) <= 8 for part in peer.parts))
+        self.assertEqual(b"".join(peer.parts), frame)
+
+    def test_maximum_config_response_fits_guest_com3_frame(self) -> None:
+        # The guest accepts a bounded 512-byte COM3 control frame. This row is
+        # deliberately larger than the old 128-byte barrier-only buffer.
+        frame = config_response("a" * 32, "b" * 64, "n" * 128, "c" * 32, "d" * 32)
+        self.assertGreater(len(frame), 128)
+        self.assertLessEqual(len(frame), 512)
+
     def test_barrier_binds_exact_run_and_cutpoint(self) -> None:
         value = barrier("a" * 32, 2)
         parse_barrier(value, expected_run_id="a" * 32, expected_cutpoint=2)
@@ -18,6 +38,31 @@ class MatrixProtocolTests(unittest.TestCase):
             guest.sendall(barrier("a" * 32, 1))
             self.assertFalse(observe_barriers(host, "a" * 32, 1, pass_through=False))
             self.assertEqual(guest.recv(1024), b"")
+        finally:
+            host.close(); guest.close()
+
+    def test_configuration_handshake_binds_fresh_run_and_catalog_before_barrier(self) -> None:
+        host, guest = socket.socketpair()
+        try:
+            hello_prefix = b"CSER1 CONFIG_HELLO"
+            import hashlib
+            guest.sendall(hello_prefix + b" " + hashlib.sha256(hello_prefix).hexdigest().encode() + b"\n")
+            guest.sendall(barrier("a" * 32, 1))
+            self.assertFalse(observe_barriers(
+                host, "a" * 32, 1, pass_through=False, catalog_digest="b" * 64,
+                namespace_id="tool-dma-test", authority_id="c" * 32, effect_id="d" * 32,
+            ))
+            response = guest.recv(1024)
+            self.assertEqual(response, config_response("a" * 32, "b" * 64, "tool-dma-test", "c" * 32, "d" * 32))
+        finally:
+            host.close(); guest.close()
+
+    def test_invalid_configuration_hello_fails_closed_before_barrier(self) -> None:
+        host, guest = socket.socketpair()
+        try:
+            guest.sendall(b"CSER1 CONFIG_HELLO " + b"0" * 64 + b"\n")
+            with self.assertRaises(BarrierProtocolError):
+                observe_barriers(host, "a" * 32, 1, pass_through=False, catalog_digest="b" * 64, namespace_id="tool", authority_id="c" * 32, effect_id="d" * 32)
         finally:
             host.close(); guest.close()
 
@@ -47,7 +92,7 @@ class MatrixProtocolTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             _recovery_metrics_from_serial(marker + marker, variant="cser", run_id="a" * 32)
 
-    def test_current_real_guest_identity_is_the_explicit_42_value(self) -> None:
+    def test_legacy_fake_guest_identity_is_not_a_real_qemu_authority(self) -> None:
         self.assertEqual(_CURRENT_GUEST_RUN_ID, "42" * 16)
 
     def test_recovery_terminal_requires_measured_counters_and_explicit_unmeasured_fields(self) -> None:

@@ -13,6 +13,13 @@ base=$1
 mkdir -p -- "$base"
 base=$(cd "$base" && pwd -P)
 
+# `baseline` and `cser` have distinct QEMU/OSDK locks but may intentionally
+# share this immutable blank-media directory.  Serialize the full
+# validate-or-create transaction so a concurrent first caller cannot observe a
+# just-created, still-being-sized sibling file.
+exec {base_lock_fd}>"$base/.tool-dma-base-media.lock"
+flock --exclusive "$base_lock_fd"
+
 declare -A sizes=(
   [journal.raw]=$((4 * 1024 * 1024))
   [outbox.raw]=$((4 * 1024 * 1024))

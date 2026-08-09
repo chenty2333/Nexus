@@ -13,7 +13,9 @@
 
 use sha2::{Digest as _, Sha256};
 
-use super::core_tool_uart::{OperationKey, ToolRequest, ToolRunId, ToolTerminalRecord, ToolUart};
+use super::core_tool_uart::{
+    OperationKey, ToolRequest, ToolRunId, ToolTerminalRecord, ToolUart, ToolV2Identity,
+};
 use super::{
     core_baseline_runtime::{
         BASELINE_RECORD_BYTES, BaselineDigest, BaselineDmaReceipt, BaselineDmaReceiptVerifier,
@@ -652,11 +654,13 @@ pub(crate) struct UartBaselineEndpoint<'a> {
     payload: &'a [u8],
     record: BaselineRecord,
     terminal: Option<ToolTerminalRecord>,
+    identity: ToolV2Identity,
 }
 
 impl<'a> UartBaselineEndpoint<'a> {
-    pub(crate) fn new(
+    pub(crate) fn new_v2(
         uart: &'a mut ToolUart,
+        identity: ToolV2Identity,
         run: ToolRunId,
         operation: OperationKey,
         payload: &'a [u8],
@@ -669,6 +673,7 @@ impl<'a> UartBaselineEndpoint<'a> {
             payload,
             record,
             terminal: None,
+            identity,
         }
     }
 }
@@ -689,7 +694,7 @@ impl BaselineEndpointProvider for UartBaselineEndpoint<'_> {
         let reply = self
             .uart
             .transact(
-                &ToolRequest::new(self.run, self.operation, self.payload)
+                &ToolRequest::new_v2(self.identity, self.run, self.operation, self.payload)
                     .map_err(UartBaselineEndpointError::Protocol)?,
             )
             .map_err(UartBaselineEndpointError::Transport)?;
@@ -709,7 +714,12 @@ impl BaselineEndpointProvider for UartBaselineEndpoint<'_> {
             let digest = self.record.tool_binding().payload_digest().bytes();
             let reply = self
                 .uart
-                .transact(&ToolRequest::get(self.run, self.operation, digest))
+                .transact(&ToolRequest::get_v2(
+                    self.identity,
+                    self.run,
+                    self.operation,
+                    digest,
+                ))
                 .map_err(UartBaselineEndpointError::Transport)?;
             self.terminal = reply.terminal_record();
         }

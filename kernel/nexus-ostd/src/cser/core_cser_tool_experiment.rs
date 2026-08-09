@@ -234,6 +234,7 @@ impl ToolDmaCoordinates {
             self.tool_claim,
             self.tool_resource,
             self.tool_generation,
+            tool_dma_catalog().digest(),
             payload,
         )
         .map_err(|_| CoreError::InvalidPayload)
@@ -476,14 +477,19 @@ impl ArmedToolDma {
 pub(crate) fn arm_tool_dma<O: ToolDmaCoreOwner, H: ToolDmaBarrierHook>(
     runtime: &mut O,
     coordinates: ToolDmaCoordinates,
-    run_id: [u8; 16],
-    payload: &[u8],
+    plan: ToolOperationPlan,
     dma_arena_digest: Digest,
     barriers: &mut H,
 ) -> Result<ArmedToolDma, ToolDmaExperimentError<O::PersistenceError, H::Error>> {
-    let plan = coordinates
-        .tool_plan(run_id, payload)
-        .map_err(ToolDmaExperimentError::Core)?;
+    if plan.effect() != coordinates.effect
+        || plan.component() != TOOL_DMA_COMPONENT_TOOL
+        || plan.claim() != coordinates.tool_claim
+        || plan.resource() != coordinates.tool_resource
+        || plan.resource_generation() != coordinates.tool_generation
+        || plan.catalog_digest() != tool_dma_catalog().digest()
+    {
+        return Err(ToolDmaExperimentError::Core(CoreError::InvalidPayload));
+    }
     for command in coordinates.topology() {
         expect_none(runtime.transact(command.into()))?;
     }
@@ -586,6 +592,15 @@ impl ToolDmaResume {
 
     pub(crate) const fn dma(&self) -> Option<ComponentProjection> {
         self.dma
+    }
+
+    /// Confirms that the successor's complete endpoint plan is the same
+    /// operation recorded before the first escape. Callers must perform this
+    /// check before issuing even a recovery GET: a changed host configuration
+    /// is not a new authority for the old effect.
+    pub(crate) fn binds_tool_operation(&self, operation: Digest) -> bool {
+        self.tool
+            .is_some_and(|tool| tool.commit_operation == Some(operation))
     }
 
     /// Reports the narrow post-checkpoint authority for retrying an absent
@@ -838,11 +853,11 @@ mod tests {
         let mut runtime = new_tool_dma_runtime(TestDurability, freshness());
         let coordinates = coordinates();
         let mut barriers = NoopBarriers;
+        let plan = coordinates.tool_plan([0x42; 16], b"tool-payload").unwrap();
         let armed = arm_tool_dma(
             &mut runtime,
             coordinates,
-            [0x42; 16],
-            b"tool-payload",
+            plan,
             Digest::new([0x55; 32]),
             &mut barriers,
         )

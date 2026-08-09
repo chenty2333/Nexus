@@ -13,7 +13,10 @@
 
 use core::hint::spin_loop;
 
-use ostd::{arch::device::io_port::ReadWriteAccess, io::IoPort};
+use ostd::{
+    arch::device::io_port::ReadWriteAccess, io::IoPort, irq::InterruptLevel, prelude::println,
+    task::Task,
+};
 use sha2::{Digest as _, Sha256};
 
 /// Guest COM3 base port. The QEMU profile must reserve it for the crash
@@ -30,11 +33,20 @@ const UART_LCR_DLAB: u8 = 1 << 7;
 const UART_LCR_8N1: u8 = 0x03;
 const UART_FCR_ENABLE_CLEAR: u8 = 0x07;
 const UART_MCR_DTR_RTS: u8 = 0x03;
-const UART_POLL_LIMIT: u32 = 100_000_000;
+/// Bounded readiness polls for one byte. The crash controller supplies the
+/// wall-clock deadline; this guest-side budget prevents unbounded polling.
+const UART_POLL_LIMIT: u32 = 1 << 24;
+const UART_POLL_BATCH: u32 = 1 << 12;
 const RUN_ID_BYTES: usize = 16;
 const RUN_ID_HEX_BYTES: usize = RUN_ID_BYTES * 2;
 const SHA256_HEX_BYTES: usize = 64;
-const MAX_LINE_BYTES: usize = 128;
+// A CSER1 CONFIG response contains a 64-byte catalog digest, three 32-byte
+// identities, a namespace of up to 128 bytes, checksum and separators.  The
+// former 128-byte barrier-sized buffer truncated a valid per-trial response
+// after its first byte; keep enough bounded headroom while retaining a fixed
+// non-streaming COM3 frame.
+const MAX_LINE_BYTES: usize = 512;
+const MAX_NAMESPACE_BYTES: usize = 128;
 
 /// A bounded identifier for one host-directed crash run.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -43,6 +55,46 @@ pub(crate) struct CrashRunId([u8; RUN_ID_BYTES]);
 impl CrashRunId {
     pub(crate) const fn new(bytes: [u8; RUN_ID_BYTES]) -> Self {
         Self(bytes)
+    }
+
+    pub(crate) const fn bytes(self) -> [u8; RUN_ID_BYTES] {
+        self.0
+    }
+}
+
+/// Host-provided, per-row identity for the bounded QEMU experiment.
+///
+/// This is received over the same trusted-local COM3 control channel before
+/// the guest creates an operation plan.  It is not an external receipt and
+/// cannot by itself retire anything; its only role is to prevent a compiled
+/// test namespace from becoming authority for a later row.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ExperimentIdentity {
+    run_id: CrashRunId,
+    catalog_digest: [u8; 32],
+    authority_id: CrashRunId,
+    effect_id: CrashRunId,
+    namespace: [u8; MAX_NAMESPACE_BYTES],
+    namespace_len: u8,
+}
+
+impl ExperimentIdentity {
+    pub(crate) const fn run_id(self) -> CrashRunId {
+        self.run_id
+    }
+
+    pub(crate) const fn catalog_digest(self) -> [u8; 32] {
+        self.catalog_digest
+    }
+
+    pub(crate) const fn authority_id(self) -> CrashRunId {
+        self.authority_id
+    }
+    pub(crate) const fn effect_id(self) -> CrashRunId {
+        self.effect_id
+    }
+    pub(crate) fn namespace(&self) -> &[u8] {
+        &self.namespace[..usize::from(self.namespace_len)]
     }
 }
 
@@ -71,6 +123,58 @@ pub(crate) enum CrashProbeError {
     InvalidAck,
     ChecksumMismatch,
     UnexpectedAck,
+    InvalidConfiguration,
+}
+
+/// Per-barrier guest-side phase diagnostics. TSC values order events in the
+/// guest only; they deliberately make no host wall-clock claim. A missing ACK
+/// point is expected when the host kills QEMU after receiving a barrier.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct CrashProbeTiming {
+    transmit_started_tsc: u64,
+    transmit_completed_tsc: Option<u64>,
+    first_ack_byte_tsc: Option<u64>,
+    full_ack_frame_tsc: Option<u64>,
+    matching_ack_available_tsc: Option<u64>,
+    polls: u32,
+    scheduler_yields: u32,
+}
+
+impl CrashProbeTiming {
+    fn started() -> Self {
+        Self {
+            transmit_started_tsc: guest_tsc(),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) const fn transmit_started_tsc(self) -> u64 {
+        self.transmit_started_tsc
+    }
+
+    pub(crate) const fn transmit_completed_tsc(self) -> Option<u64> {
+        self.transmit_completed_tsc
+    }
+
+    pub(crate) const fn first_ack_byte_tsc(self) -> Option<u64> {
+        self.first_ack_byte_tsc
+    }
+
+    pub(crate) const fn full_ack_frame_tsc(self) -> Option<u64> {
+        self.full_ack_frame_tsc
+    }
+
+    pub(crate) const fn matching_ack_available_tsc(self) -> Option<u64> {
+        self.matching_ack_available_tsc
+    }
+
+    pub(crate) const fn polls(self) -> u32 {
+        self.polls
+    }
+
+    pub(crate) const fn scheduler_yields(self) -> u32 {
+        self.scheduler_yields
+    }
 }
 
 /// Linear COM3 owner. This is polling-only; boot wiring owns UART setup and
@@ -83,6 +187,7 @@ pub(crate) struct CrashProbe {
     _line_control: IoPort<u8, ReadWriteAccess>,
     _modem_control: IoPort<u8, ReadWriteAccess>,
     line_status: IoPort<u8, ReadWriteAccess>,
+    last_timing: CrashProbeTiming,
 }
 
 impl CrashProbe {
@@ -137,7 +242,42 @@ impl CrashProbe {
             _line_control: line_control,
             _modem_control: modem_control,
             line_status,
+            last_timing: CrashProbeTiming::default(),
         })
+    }
+
+    /// The last barrier's phase/poll diagnostic, including one that timed out
+    /// or was malformed before a matching ACK was accepted.
+    pub(crate) const fn last_timing(&self) -> CrashProbeTiming {
+        self.last_timing
+    }
+
+    /// Obtains the exact host-selected run namespace and catalog binding.
+    /// Missing, malformed, or checksum-invalid control data is a hard error;
+    /// callers must retain custody rather than fall back to a compiled id.
+    pub(crate) fn experiment_identity(&mut self) -> Result<ExperimentIdentity, CrashProbeError> {
+        let mut line = [0; MAX_LINE_BYTES];
+        let mut timing = CrashProbeTiming::started();
+        let result = (|| {
+            let request_len = encode_config_hello(&mut line);
+            self.write_all(&line[..request_len], &mut timing)?;
+            timing.transmit_completed_tsc = Some(guest_tsc());
+            let response_len = self.read_line(&mut line, &mut timing)?;
+            timing.full_ack_frame_tsc = Some(guest_tsc());
+            let identity = decode_config(&line[..response_len])?;
+            timing.matching_ack_available_tsc = Some(guest_tsc());
+            Ok(identity)
+        })();
+        self.last_timing = timing;
+        emit_timing(
+            if result.is_ok() {
+                "configuration"
+            } else {
+                "configuration_failed"
+            },
+            timing,
+        );
+        result
     }
 
     /// Announces a post-condition reached by the guest and waits for a host
@@ -149,24 +289,57 @@ impl CrashProbe {
         cutpoint: CrashCutpoint,
     ) -> Result<(), CrashProbeError> {
         let mut line = [0; MAX_LINE_BYTES];
-        let request_len = encode_barrier(run_id, cutpoint, &mut line);
-        self.write_all(&line[..request_len])?;
-        let response_len = self.read_line(&mut line)?;
-        decode_ack(&line[..response_len], run_id, cutpoint)
+        let mut timing = CrashProbeTiming::started();
+        let result = (|| {
+            let request_len = encode_barrier(run_id, cutpoint, &mut line);
+            self.write_all(&line[..request_len], &mut timing)?;
+            timing.transmit_completed_tsc = Some(guest_tsc());
+            emit_timing("barrier_transmitted", timing);
+            let response_len = self.read_line(&mut line, &mut timing)?;
+            timing.full_ack_frame_tsc = Some(guest_tsc());
+            decode_ack(&line[..response_len], run_id, cutpoint)?;
+            timing.matching_ack_available_tsc = Some(guest_tsc());
+            Ok(())
+        })();
+        self.last_timing = timing;
+        emit_timing(
+            if result.is_ok() {
+                "matching_ack"
+            } else {
+                "failed"
+            },
+            timing,
+        );
+        result
     }
 
-    fn write_all(&mut self, bytes: &[u8]) -> Result<(), CrashProbeError> {
+    fn write_all(
+        &mut self,
+        bytes: &[u8],
+        timing: &mut CrashProbeTiming,
+    ) -> Result<(), CrashProbeError> {
         for byte in bytes.iter().copied() {
-            self.wait_for(UART_LSR_TRANSMIT_EMPTY, CrashProbeError::TransmitTimeout)?;
+            self.wait_for(
+                UART_LSR_TRANSMIT_EMPTY,
+                CrashProbeError::TransmitTimeout,
+                timing,
+            )?;
             self.data.write(byte);
         }
         Ok(())
     }
 
-    fn read_line(&mut self, output: &mut [u8; MAX_LINE_BYTES]) -> Result<usize, CrashProbeError> {
+    fn read_line(
+        &mut self,
+        output: &mut [u8; MAX_LINE_BYTES],
+        timing: &mut CrashProbeTiming,
+    ) -> Result<usize, CrashProbeError> {
         for (index, slot) in output.iter_mut().enumerate() {
-            self.wait_for(UART_LSR_DATA_READY, CrashProbeError::ReceiveTimeout)?;
+            self.wait_for(UART_LSR_DATA_READY, CrashProbeError::ReceiveTimeout, timing)?;
             *slot = self.data.read();
+            if index == 0 {
+                timing.first_ack_byte_tsc = Some(guest_tsc());
+            }
             if *slot == b'\n' {
                 return Ok(index + 1);
             }
@@ -174,15 +347,56 @@ impl CrashProbe {
         Err(CrashProbeError::LineTooLong)
     }
 
-    fn wait_for(&self, mask: u8, timeout: CrashProbeError) -> Result<(), CrashProbeError> {
-        for _ in 0..UART_POLL_LIMIT {
-            if self.line_status.read() & mask != 0 {
-                return Ok(());
+    fn wait_for(
+        &self,
+        mask: u8,
+        timeout: CrashProbeError,
+        timing: &mut CrashProbeTiming,
+    ) -> Result<(), CrashProbeError> {
+        let mut remaining = UART_POLL_LIMIT;
+        while remaining != 0 {
+            let batch = remaining.min(UART_POLL_BATCH);
+            for _ in 0..batch {
+                timing.polls = timing.polls.saturating_add(1);
+                if self.line_status.read() & mask != 0 {
+                    return Ok(());
+                }
+                spin_loop();
             }
-            spin_loop();
+            remaining -= batch;
+            if remaining != 0 {
+                yield_after_poll_batch(timing);
+            }
         }
         Err(timeout)
     }
+}
+
+/// COM3 is used from the experiment manager task. Do not schedule from early
+/// boot or an IRQ context if this small transport is ever reused elsewhere.
+fn yield_after_poll_batch(timing: &mut CrashProbeTiming) {
+    if Task::current().is_some() && InterruptLevel::current().is_task_context() {
+        timing.scheduler_yields = timing.scheduler_yields.saturating_add(1);
+        Task::yield_now();
+    }
+}
+
+fn guest_tsc() -> u64 {
+    ostd::arch::read_tsc()
+}
+
+fn emit_timing(result: &str, timing: CrashProbeTiming) {
+    println!(
+        "CRASH_PROBE_TIMING result={} transmit_started_tsc={} transmit_completed_tsc={} first_ack_byte_tsc={} full_ack_frame_tsc={} matching_ack_available_tsc={} polls={} scheduler_yields={} timing_unit=guest_tsc",
+        result,
+        timing.transmit_started_tsc,
+        timing.transmit_completed_tsc.unwrap_or(0),
+        timing.first_ack_byte_tsc.unwrap_or(0),
+        timing.full_ack_frame_tsc.unwrap_or(0),
+        timing.matching_ack_available_tsc.unwrap_or(0),
+        timing.polls,
+        timing.scheduler_yields,
+    );
 }
 
 fn encode_barrier(
@@ -200,6 +414,90 @@ fn encode_barrier(
     push_hex(output, &mut cursor, &digest);
     push_byte(output, &mut cursor, b'\n');
     cursor
+}
+
+fn encode_config_hello(output: &mut [u8; MAX_LINE_BYTES]) -> usize {
+    let mut cursor = 0;
+    push(output, &mut cursor, b"CSER1 CONFIG_HELLO");
+    let digest = Sha256::digest(&output[..cursor]);
+    push_byte(output, &mut cursor, b' ');
+    push_hex(output, &mut cursor, &digest);
+    push_byte(output, &mut cursor, b'\n');
+    cursor
+}
+
+fn decode_config(line: &[u8]) -> Result<ExperimentIdentity, CrashProbeError> {
+    if line.len() < 2 || line.last() != Some(&b'\n') || line[..line.len() - 1].contains(&b'\r') {
+        return Err(CrashProbeError::InvalidConfiguration);
+    }
+    let line = &line[..line.len() - 1];
+    let tokens = split_config_tokens(line)?;
+    if tokens[0] != b"CSER1" || tokens[1] != b"CONFIG" {
+        return Err(CrashProbeError::InvalidConfiguration);
+    }
+    verify_checksum(line, tokens[7]).map_err(|_| CrashProbeError::InvalidConfiguration)?;
+    let run_id = parse_run_id(tokens[2]).map_err(|_| CrashProbeError::InvalidConfiguration)?;
+    let catalog_digest =
+        parse_hex_digest(tokens[3]).map_err(|_| CrashProbeError::InvalidConfiguration)?;
+    let authority_id =
+        parse_run_id(tokens[5]).map_err(|_| CrashProbeError::InvalidConfiguration)?;
+    let effect_id = parse_run_id(tokens[6]).map_err(|_| CrashProbeError::InvalidConfiguration)?;
+    let mut namespace = [0; MAX_NAMESPACE_BYTES];
+    namespace[..tokens[4].len()].copy_from_slice(tokens[4]);
+    Ok(ExperimentIdentity {
+        run_id,
+        catalog_digest,
+        authority_id,
+        effect_id,
+        namespace,
+        namespace_len: tokens[4].len() as u8,
+    })
+}
+
+fn split_config_tokens(line: &[u8]) -> Result<[&[u8]; 8], CrashProbeError> {
+    let mut tokens = [&[][..]; 8];
+    let mut start = 0;
+    let mut count = 0;
+    for (index, byte) in line.iter().copied().enumerate() {
+        if byte == b' ' {
+            if index == start || count == 7 {
+                return Err(CrashProbeError::InvalidConfiguration);
+            }
+            tokens[count] = &line[start..index];
+            count += 1;
+            start = index + 1;
+        } else if !byte.is_ascii_graphic() {
+            return Err(CrashProbeError::InvalidConfiguration);
+        }
+    }
+    if count != 7 || start >= line.len() {
+        return Err(CrashProbeError::InvalidConfiguration);
+    }
+    tokens[7] = &line[start..];
+    // Namespace and authority are part of the checksum-bound control
+    // contract even though the current compact guest plan does not yet retain
+    // them as independent durable coordinates.
+    if tokens[4].is_empty()
+        || tokens[4].len() > 128
+        || tokens[5].len() != RUN_ID_HEX_BYTES
+        || tokens[6].len() != RUN_ID_HEX_BYTES
+    {
+        return Err(CrashProbeError::InvalidConfiguration);
+    }
+    let _ = parse_run_id(tokens[5])?;
+    let _ = parse_run_id(tokens[6])?;
+    Ok(tokens)
+}
+
+fn parse_hex_digest(token: &[u8]) -> Result<[u8; 32], CrashProbeError> {
+    if token.len() != SHA256_HEX_BYTES || !token.iter().copied().all(is_lower_hex) {
+        return Err(CrashProbeError::InvalidConfiguration);
+    }
+    let mut bytes = [0; 32];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = (hex_value(token[index * 2])? << 4) | hex_value(token[index * 2 + 1])?;
+    }
+    Ok(bytes)
 }
 
 fn decode_ack(

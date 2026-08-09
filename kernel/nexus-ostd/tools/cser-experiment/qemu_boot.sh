@@ -13,6 +13,10 @@ root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 variant=${CSER_EXPERIMENT_VARIANT:?missing CSER_EXPERIMENT_VARIANT}
 trial_dir=${CSER_EXPERIMENT_TRIAL_DIR:?missing CSER_EXPERIMENT_TRIAL_DIR}
 run_id=${CSER_EXPERIMENT_RUN_ID:?missing CSER_EXPERIMENT_RUN_ID}
+catalog_digest=${CSER_EXPERIMENT_CATALOG_DIGEST:?missing CSER_EXPERIMENT_CATALOG_DIGEST}
+namespace=${CSER_EXPERIMENT_NAMESPACE_ID:?missing CSER_EXPERIMENT_NAMESPACE_ID}
+authority_id=${CSER_EXPERIMENT_AUTHORITY_ID:?missing CSER_EXPERIMENT_AUTHORITY_ID}
+effect_id=${CSER_EXPERIMENT_EFFECT_ID:?missing CSER_EXPERIMENT_EFFECT_ID}
 phase=${CSER_EXPERIMENT_PHASE:-initial}
 
 case "$variant" in
@@ -22,6 +26,10 @@ case "$variant" in
 esac
 case "$phase" in initial|recovery) ;; *) echo "qemu_boot: invalid phase: $phase" >&2; exit 2 ;; esac
 [[ $run_id =~ ^[0-9a-f]{32}$ ]] || { echo "qemu_boot: invalid run id" >&2; exit 2; }
+[[ $catalog_digest =~ ^[0-9a-f]{64}$ ]] || { echo "qemu_boot: invalid catalog digest" >&2; exit 2; }
+[[ $namespace =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$ ]] || { echo "qemu_boot: invalid namespace" >&2; exit 2; }
+[[ $authority_id =~ ^[0-9a-f]{32}$ ]] || { echo "qemu_boot: invalid authority" >&2; exit 2; }
+[[ $effect_id =~ ^[0-9a-f]{32}$ ]] || { echo "qemu_boot: invalid effect" >&2; exit 2; }
 [[ -d $trial_dir/media ]] || { echo "qemu_boot: trial media is missing" >&2; exit 2; }
 
 require_medium() {
@@ -79,10 +87,80 @@ fi
 
 database="$trial_dir/tool-endpoint.sqlite"
 port_file="$trial_dir/tool-endpoint.port"
-rm -f -- "$port_file"
+endpoint_log="$trial_dir/endpoint.stderr.log"
+bridge_ready="$trial_dir/bridge.startup-ready.json"
+bridge_status="$trial_dir/bridge.status.json"
+bridge_log="$trial_dir/bridge.stderr.log"
+sink_ready="$trial_dir/recovery-sink.startup-ready.json"
+sink_status="$trial_dir/recovery-sink.status.json"
+sink_log="$trial_dir/recovery-sink.stderr.log"
+rm -f -- "$port_file" "$bridge_ready" "$bridge_status" "$sink_ready" "$sink_status"
 endpoint_pid=
 bridge_pid=
 crash_sink_pid=
+
+stage_fail() {
+  local stage=$1; shift
+  echo "qemu_boot: stage=$stage: $*" >&2
+  exit 1
+}
+
+signal_detail() {
+  local signal_file=$1
+  [[ -s $signal_file ]] || return 0
+  python3 - "$signal_file" <<'PY'
+import json, sys
+try:
+    value = json.load(open(sys.argv[1], encoding="utf-8"))
+    print(json.dumps(value, sort_keys=True, separators=(",", ":")))
+except (OSError, ValueError) as error:
+    print(f"unreadable-signal:{error}")
+PY
+}
+
+wait_for_startup_ready() {
+  local stage=$1 pid=$2 signal_file=$3
+  for _ in {1..100}; do
+    if [[ -s $signal_file ]]; then
+      if grep -Fq '"state": "ready"' "$signal_file"; then
+        return 0
+      fi
+      stage_fail "$stage" "invalid startup signal $(signal_detail "$signal_file")"
+    fi
+    kill -0 "$pid" 2>/dev/null || stage_fail "$stage" "helper exited; see its stderr log"
+    sleep .05
+  done
+  stage_fail "$stage" "startup readiness timed out"
+}
+
+wait_for_terminal_helper() {
+  local stage=$1 pid=$2 signal_file=$3 expected=$4
+  for _ in {1..100}; do
+    local matched=false
+    if [[ -s $signal_file ]]; then
+      if grep -Fq "\"state\": \"$expected\"" "$signal_file"; then
+        matched=true
+      elif [[ $expected == served-or-unused ]] \
+        && { grep -Fq '"state": "served"' "$signal_file" \
+          || grep -Fq '"state": "unused"' "$signal_file"; }; then
+        matched=true
+      fi
+    fi
+    if [[ $matched == true ]]; then
+      wait "$pid" || stage_fail "$stage" "helper exited nonzero after $expected: $(signal_detail "$signal_file")"
+      return 0
+    fi
+    if ! kill -0 "$pid" 2>/dev/null; then
+      wait "$pid" || true
+      stage_fail "$stage" "helper exited before $expected: $(signal_detail "$signal_file")"
+    fi
+    sleep .05
+  done
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  stage_fail "$stage" "helper did not reach $expected: $(signal_detail "$signal_file")"
+}
+
 cleanup() {
   [[ -z ${crash_sink_pid:-} ]] || kill "$crash_sink_pid" 2>/dev/null || true
   [[ -z ${bridge_pid:-} ]] || kill "$bridge_pid" 2>/dev/null || true
@@ -94,31 +172,41 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 python3 "$root/tools/cser-experiment/tool_endpoint.py" \
-  --database "$database" --port 0 --port-file "$port_file" &
+  --database "$database" --namespace "$namespace" --authority-id "$authority_id" --effect-id "$effect_id" --catalog-digest "$catalog_digest" \
+  --port 0 --port-file "$port_file" 2>>"$endpoint_log" &
 endpoint_pid=$!
 for _ in {1..100}; do
   if [[ -s $port_file ]]; then break; fi
-  kill -0 "$endpoint_pid" 2>/dev/null || { echo "qemu_boot: endpoint failed to start" >&2; exit 1; }
+  kill -0 "$endpoint_pid" 2>/dev/null || stage_fail endpoint-connect "endpoint exited before publishing a port; see $endpoint_log"
   sleep .05
 done
-[[ -s $port_file ]] || { echo "qemu_boot: endpoint did not publish its port" >&2; exit 1; }
+[[ -s $port_file ]] || stage_fail endpoint-connect "endpoint did not publish its port; see $endpoint_log"
 port=$(<"$port_file")
-[[ $port =~ ^[1-9][0-9]*$ && $port -le 65535 ]] || { echo "qemu_boot: endpoint published invalid port" >&2; exit 1; }
+[[ $port =~ ^[1-9][0-9]*$ && $port -le 65535 ]] || stage_fail endpoint-connect "endpoint published invalid port"
+endpoint_ready=false
 for _ in {1..100}; do
   if python3 - "$port" <<'PY' >/dev/null 2>&1
 import socket, sys
 s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=.1)
 s.close()
 PY
-  then break; fi
+  then endpoint_ready=true; break; fi
   sleep .05
 done
-kill -0 "$endpoint_pid" 2>/dev/null || { echo "qemu_boot: endpoint failed to start" >&2; exit 1; }
+kill -0 "$endpoint_pid" 2>/dev/null || stage_fail endpoint-connect "endpoint exited before accepting TCP; see $endpoint_log"
+[[ $endpoint_ready == true ]] || stage_fail endpoint-connect "endpoint did not accept TCP before deadline; see $endpoint_log"
 
+bridge_args=(
+  --socket "$artifact_dir/com2-tool.sock" --run-id "$run_id" --endpoint-port "$port" --cser2
+  --namespace-id "$namespace" --authority-id "$authority_id" --effect-id "$effect_id" --catalog-digest "$catalog_digest"
+  --connect-timeout 90 --request-timeout 90 --startup-ready-file "$bridge_ready"
+  --status-file "$bridge_status"
+)
+[[ $phase != recovery ]] || bridge_args+=(--allow-no-request)
 python3 "$root/tools/cser-experiment/uart_http_bridge.py" \
-  --socket "$artifact_dir/com2-tool.sock" --run-id "$run_id" --endpoint-port "$port" \
-  --connect-timeout 90 --request-timeout 90 &
+  "${bridge_args[@]}" 2>>"$bridge_log" &
 bridge_pid=$!
+wait_for_startup_ready bridge-ready "$bridge_pid" "$bridge_ready"
 
 # COM3 uses wait=on so no initial crash barrier can be lost before the matrix
 # controller connects. Recovery deliberately has no crash cutpoints, but QEMU
@@ -126,17 +214,25 @@ bridge_pid=$!
 # fails if the recovered guest unexpectedly emits a barrier.
 if [[ $phase == recovery ]]; then
   python3 "$root/tools/cser-experiment/uart_sink.py" \
-    --socket "$artifact_dir/com3-crash.sock" --run-id "$run_id" --connect-timeout 90 &
+    --socket "$artifact_dir/com3-crash.sock" --run-id "$run_id" --connect-timeout 90 \
+    --catalog-digest "$catalog_digest" \
+    --namespace-id "$namespace" --authority-id "$authority_id" --effect-id "$effect_id" \
+    --startup-ready-file "$sink_ready" --status-file "$sink_status" 2>>"$sink_log" &
   crash_sink_pid=$!
+  wait_for_startup_ready recovery-receipt "$crash_sink_pid" "$sink_ready"
 fi
 
 # The x command starts QEMU (and its swtpm peer) in the exact reviewed scheme.
 # Its serial output is forwarded unchanged; matrix_controller parses the
 # recovery marker from this stream instead of trusting host-created metrics.
-"$root/x" run-tool-dma-boot "$scheme"
+if ! "$root/x" run-tool-dma-boot "$scheme"; then
+  stage_fail guest-boot "QEMU launcher exited nonzero; bridge=$(signal_detail "$bridge_status") sink=$(signal_detail "$sink_status")"
+fi
 
 if [[ $phase == recovery ]]; then
-  wait "$crash_sink_pid"
+  wait_for_terminal_helper bridge-ready "$bridge_pid" "$bridge_status" served-or-unused
+  bridge_pid=
+  wait_for_terminal_helper recovery-receipt "$crash_sink_pid" "$sink_status" closed
   crash_sink_pid=
 fi
 

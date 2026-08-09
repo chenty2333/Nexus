@@ -17,7 +17,7 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 const RECORD_MAGIC: [u8; 8] = *b"NEXBASE1";
-const RECORD_VERSION: u16 = 3;
+const RECORD_VERSION: u16 = 4;
 pub(crate) const BASELINE_RECORD_BYTES: usize = 256;
 const CHECKSUM_OFFSET: usize = BASELINE_RECORD_BYTES - 8;
 
@@ -127,6 +127,7 @@ pub(crate) struct BaselineToolBinding {
     operation_key: BaselineOperationKey,
     payload_digest: BaselineDigest,
     endpoint_record_digest: BaselineDigest,
+    request_identity_digest: BaselineDigest,
 }
 
 impl BaselineToolBinding {
@@ -134,11 +135,13 @@ impl BaselineToolBinding {
         operation_key: BaselineOperationKey,
         payload_digest: BaselineDigest,
         endpoint_record_digest: BaselineDigest,
+        request_identity_digest: BaselineDigest,
     ) -> Self {
         Self {
             operation_key,
             payload_digest,
             endpoint_record_digest,
+            request_identity_digest,
         }
     }
 
@@ -154,14 +157,24 @@ impl BaselineToolBinding {
         self.endpoint_record_digest
     }
 
+    pub(crate) const fn request_identity_digest(self) -> BaselineDigest {
+        self.request_identity_digest
+    }
+
     /// Endpoint terminal records do not exist before POST.  A zero digest
     /// means the independent terminal-record verifier, rather than topology
     /// registration, binds the eventual durable endpoint row.
     pub(crate) const fn unbound_endpoint(
         operation_key: BaselineOperationKey,
         payload_digest: BaselineDigest,
+        request_identity_digest: BaselineDigest,
     ) -> Self {
-        Self::new(operation_key, payload_digest, BaselineDigest::zero())
+        Self::new(
+            operation_key,
+            payload_digest,
+            BaselineDigest::zero(),
+            request_identity_digest,
+        )
     }
 
     const fn default_for(effect: BaselineEffectId) -> Self {
@@ -172,6 +185,7 @@ impl BaselineToolBinding {
             operation_key: BaselineOperationKey(effect.get()),
             payload_digest: BaselineDigest::synthetic(1, effect.get()),
             endpoint_record_digest: BaselineDigest::synthetic(2, effect.get()),
+            request_identity_digest: BaselineDigest::synthetic(3, effect.get()),
         }
     }
 }
@@ -228,7 +242,7 @@ impl BaselineRecord {
         generation: u64,
         tool_binding: BaselineToolBinding,
     ) -> Result<Self, BaselineError> {
-        if executor == 0 || generation == 0 {
+        if executor == 0 || generation == 0 || tool_binding.request_identity_digest().is_zero() {
             return Err(BaselineError::InvalidIdentity);
         }
         Ok(Self {
@@ -972,6 +986,7 @@ pub(crate) fn encode_baseline_record(
     put_u64(&mut bytes, 80, record.tool_binding.operation_key.get());
     bytes[88..120].copy_from_slice(&record.tool_binding.payload_digest.0);
     bytes[120..152].copy_from_slice(&record.tool_binding.endpoint_record_digest.0);
+    bytes[152..184].copy_from_slice(&record.tool_binding.request_identity_digest.0);
     let flags = (record.topology_registered as u16)
         | ((record.executor_fenced as u16) << 1)
         | ((record.tool_dispatched as u16) << 2)
@@ -1012,7 +1027,7 @@ pub(crate) fn decode_baseline_record(
         || flags & 1 == 0
         || bytes[10..16].iter().any(|byte| *byte != 0)
         || bytes[74..80].iter().any(|byte| *byte != 0)
-        || bytes[152..CHECKSUM_OFFSET].iter().any(|byte| *byte != 0)
+        || bytes[184..CHECKSUM_OFFSET].iter().any(|byte| *byte != 0)
     {
         return Err(BaselineError::RecordCorrupt);
     }
@@ -1023,6 +1038,8 @@ pub(crate) fn decode_baseline_record(
     payload_digest.copy_from_slice(&bytes[88..120]);
     let mut endpoint_record_digest = [0; 32];
     endpoint_record_digest.copy_from_slice(&bytes[120..152]);
+    let mut request_identity_digest = [0; 32];
+    request_identity_digest.copy_from_slice(&bytes[152..184]);
     let record = BaselineRecord {
         effect,
         resource,
@@ -1030,6 +1047,7 @@ pub(crate) fn decode_baseline_record(
             operation_key,
             BaselineDigest::new(payload_digest),
             BaselineDigest::new(endpoint_record_digest),
+            BaselineDigest::new(request_identity_digest),
         ),
         executor,
         fence_epoch,
@@ -1074,7 +1092,8 @@ pub(crate) fn closed_record_for_experiment_metrics_test() -> BaselineRecord {
 /// Checksums detect torn bytes; these checks prevent a wholly checksummed but
 /// semantically impossible image from becoming reuse authority.
 fn validate_decoded_record(record: BaselineRecord) -> Result<(), BaselineError> {
-    if record.executor_fenced != (record.fence_epoch > 1)
+    if record.tool_binding.request_identity_digest().is_zero()
+        || record.executor_fenced != (record.fence_epoch > 1)
         || (record.endpoint_applied && !record.tool_dispatched)
         || (record.tool_finalized && (!record.tool_dispatched || !record.endpoint_applied))
         || (record.reconciliation_intent_recorded && !record.tool_finalized)
@@ -1264,6 +1283,19 @@ mod tests {
         assert_eq!(
             decode_baseline_record(&bytes, 1),
             Err(BaselineError::RecordCorrupt)
+        );
+    }
+
+    #[cfg_attr(ktest, ktest)]
+    #[cfg_attr(test, test)]
+    fn durable_record_roundtrips_the_pre_escape_request_identity() {
+        let original = record();
+        let decoded = decode_baseline_record(&encode_baseline_record(original, 1), 1).unwrap();
+        assert_eq!(decoded, original);
+        assert!(!decoded.tool_binding().request_identity_digest().is_zero());
+        assert_ne!(
+            decoded.tool_binding().request_identity_digest(),
+            BaselineDigest::new([0x55; 32])
         );
     }
 

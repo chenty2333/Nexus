@@ -10,8 +10,9 @@
 //! for this fixed baseline workload only, not a generic finalizer protocol.
 
 use alloc::sync::Arc;
+use core::fmt;
 
-use cser_core::DeviceGeneration;
+use cser_core::{DeviceGeneration, tool_dma_catalog};
 use nexus_ostd_virtio::{
     CompletedRequest, InterruptCompletionProgress, InterruptReceipt, MaskedIntx,
     ProductionClosureProgress, ProductionDevice, ProductionResetRetryError, PublishedRequest, Root,
@@ -37,7 +38,9 @@ use super::{
         BaselineFinalizer, BaselineOperationKey, BaselineRecord, BaselineResourceId,
         BaselineToolBinding, DmaFinalizer,
     },
-    core_crash_probe::{CrashCutpoint, CrashProbe, CrashProbeError, CrashRunId},
+    core_crash_probe::{
+        CrashCutpoint, CrashProbe, CrashProbeError, CrashRunId, ExperimentIdentity,
+    },
     core_device_quarantine::OstdVirtioBootQuarantine,
     core_dma_arena_allocator::{persistent_dma_arena_base, persistent_dma_arena_ready},
     core_experiment_dma_flow::{
@@ -46,10 +49,9 @@ use super::{
     },
     core_pio_journal::AtaJournalFixture,
     core_reboot::BootDeviceQuarantine,
-    core_tool_uart::{OperationKey, ToolRunId, ToolUart},
+    core_tool_uart::{OperationKey, ToolRunId, ToolUart, ToolV2Identity},
 };
 
-const RUN: [u8; 16] = [0x42; 16];
 const EFFECT: u64 = 0x4241_5345_4c49_4e45;
 const RESOURCE: u64 = 0xd100_0002;
 const EXECUTOR: u64 = 0x4241_5345;
@@ -63,6 +65,15 @@ const MAX_IRQ_SPINS: usize = 20_000_000;
 /// barrier or kills this VM; the next boot reconstructs only the independent
 /// ATA/TPM baseline record and repeats no already durable external action.
 pub(crate) fn run() {
+    let experiment_identity = acquire_experiment_identity();
+    let run_id = experiment_identity.run_id().bytes();
+    let transport_identity = ToolV2Identity::new(
+        experiment_identity.namespace(),
+        ToolRunId::new(experiment_identity.authority_id().bytes()),
+        ToolRunId::new(experiment_identity.effect_id().bytes()),
+        experiment_identity.catalog_digest(),
+    )
+    .expect("baseline COM3 identity is valid CSER2 identity");
     let mut store = AtaTpmBaselineStore::acquire_qemu_fixture(AtaJournalFixture::PrimaryMaster)
         .expect("baseline ATA/TPM store opens before selecting a physical fence generation");
     let guard = acquire_common_quarantine(
@@ -70,24 +81,35 @@ pub(crate) fn run() {
             .next_device_generation()
             .expect("baseline experiment tip selects nonzero next device generation"),
     );
-    let record = fixed_record();
+    let expected_record = fixed_record(transport_identity, run_id);
     let has_record = store
         .has_record()
         .expect("baseline ATA record inspection succeeds");
     let mut arm = if has_record {
         BaselineExperimentArm::recover(store).expect("baseline record reconstructs")
     } else {
-        BaselineExperimentArm::initialize_durable(store, record)
+        BaselineExperimentArm::initialize_durable(store, expected_record)
             .expect("baseline topology is persisted before endpoint dispatch")
     };
 
     let record = arm
         .record()
         .expect("baseline runtime snapshots durable record");
+    assert_eq!(
+        record.tool_binding().request_identity_digest(),
+        expected_record.tool_binding().request_identity_digest(),
+        "TOOL_DMA_FAIL stage=recovery-experiment-identity-mismatch"
+    );
     let mut uart = ToolUart::acquire().expect("baseline profile owns COM2");
     let operation = OperationKey::new(OPERATION).expect("fixed operation is valid");
-    let mut endpoint =
-        UartBaselineEndpoint::new(&mut uart, ToolRunId::new(RUN), operation, PAYLOAD, record);
+    let mut endpoint = UartBaselineEndpoint::new_v2(
+        &mut uart,
+        transport_identity,
+        ToolRunId::new(run_id),
+        operation,
+        PAYLOAD,
+        record,
+    );
     let mut dma = if record.dma_published() && !record.dma_finalized() {
         BaselineDmaExecution::Recovered(
             QuarantinedBaselineDma::from_quarantine(record, &guard)
@@ -103,6 +125,7 @@ pub(crate) fn run() {
     let mut crash = QemuBaselineCrashHook {
         probe: CrashProbe::acquire().expect("baseline profile owns COM3"),
         enabled: !has_record,
+        run_id,
     };
 
     let gate = arm
@@ -110,11 +133,12 @@ pub(crate) fn run() {
         .unwrap_or_else(|_| panic!("baseline experiment retained a failed boundary"));
     let metrics = *arm.metrics();
     assert!(metrics.invariants_hold());
-    // The host matrix accepts only this recovered-guest receipt. The fixed
-    // compile-time run id is deliberately repeated here until a durable boot
-    // configuration channel exists; the host rejects any other run id.
+    // The host matrix accepts only this recovered-guest receipt. The run id
+    // and full CSER2 request identity were checked against the durable record
+    // before COM2 was acquired.
     println!(
-        "TOOL_DMA_RECOVERY_METRICS {{\"variant\":\"baseline\",\"run_id\":\"42424242424242424242424242424242\",\"terminal\":true,\"invariants_ok\":true,\"retired_by_evidence\":{},\"retained_claims\":{},\"gate_rejections\":null,\"reconciliation_delay_ms\":null,\"reconciliation_steps\":{},\"reconciliation_delay_unit\":\"unmeasured\",\"topology_registered\":{},\"tool_finalized\":{},\"dma_finalized\":{},\"reuse_authorized\":true,\"successor_generation\":{}}}",
+        "TOOL_DMA_RECOVERY_METRICS {{\"variant\":\"baseline\",\"run_id\":\"{}\",\"terminal\":true,\"invariants_ok\":true,\"retired_by_evidence\":{},\"retained_claims\":{},\"gate_rejections\":null,\"reconciliation_delay_ms\":null,\"reconciliation_steps\":{},\"reconciliation_delay_unit\":\"unmeasured\",\"topology_registered\":{},\"tool_finalized\":{},\"dma_finalized\":{},\"reuse_authorized\":true,\"successor_generation\":{}}}",
+        HexRun(run_id),
         metrics.retired_by_evidence,
         metrics.retained_claims,
         metrics.reconciliation_steps,
@@ -147,12 +171,17 @@ fn acquire_common_quarantine(next_generation: u64) -> nexus_ostd_virtio::BootQua
     }
 }
 
-fn fixed_record() -> BaselineRecord {
+fn fixed_record(transport_identity: ToolV2Identity, run_id: [u8; 16]) -> BaselineRecord {
     let effect = BaselineEffectId::new(EFFECT).expect("fixed effect is nonzero");
     let resource = BaselineResourceId::new(RESOURCE).expect("fixed resource is nonzero");
     let operation = BaselineOperationKey::from_operation_bytes(OPERATION)
         .expect("fixed operation has an independent baseline projection");
-    let payload_digest = Sha256::digest(PAYLOAD).into();
+    let payload_digest: [u8; 32] = Sha256::digest(PAYLOAD).into();
+    let request_identity_digest = transport_identity.request_binding_digest(
+        ToolRunId::new(run_id),
+        OPERATION,
+        payload_digest,
+    );
     BaselineRecord::register_with_tool_binding(
         effect,
         resource,
@@ -161,6 +190,7 @@ fn fixed_record() -> BaselineRecord {
         BaselineToolBinding::unbound_endpoint(
             operation,
             super::core_baseline_runtime::BaselineDigest::new(payload_digest),
+            super::core_baseline_runtime::BaselineDigest::new(request_identity_digest),
         ),
     )
     .expect("fixed baseline topology is valid")
@@ -169,6 +199,7 @@ fn fixed_record() -> BaselineRecord {
 struct QemuBaselineCrashHook {
     probe: CrashProbe,
     enabled: bool,
+    run_id: [u8; 16],
 }
 
 impl BaselineCrashHook for QemuBaselineCrashHook {
@@ -178,11 +209,35 @@ impl BaselineCrashHook for QemuBaselineCrashHook {
         if !self.enabled {
             return Ok(());
         }
-        self.probe
-            .barrier(CrashRunId::new(RUN), CrashCutpoint::new(cutpoint.id()))
+        self.probe.barrier(
+            CrashRunId::new(self.run_id),
+            CrashCutpoint::new(cutpoint.id()),
+        )
     }
 }
 
+struct HexRun([u8; 16]);
+
+impl fmt::Display for HexRun {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+fn acquire_experiment_identity() -> ExperimentIdentity {
+    let mut control = CrashProbe::acquire().expect("baseline owns COM3 configuration channel");
+    let identity = control
+        .experiment_identity()
+        .unwrap_or_else(|_| panic!("TOOL_DMA_FAIL stage=experiment-identity"));
+    assert!(
+        identity.catalog_digest() == tool_dma_catalog().digest().bytes(),
+        "TOOL_DMA_FAIL stage=experiment-catalog-binding"
+    );
+    identity
+}
 /// One real IRQ handoff.  The IRQ callback only reads/acks VirtIO ISR state;
 /// the manager remasks before extracting the owner and completing its used
 /// ring in task context.

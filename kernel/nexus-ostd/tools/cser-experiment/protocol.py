@@ -7,8 +7,11 @@ import hashlib
 import re
 
 
-MAX_LINE_BYTES = 16 * 1024
-MAX_PAYLOAD_BYTES = 8 * 1024
+# Must stay exactly aligned with the guest's bounded `core_tool_uart` codec.
+MAX_LINE_BYTES = 1536
+MAX_PAYLOAD_BYTES = 576
+ENDPOINT_RECORD_SCHEMA_VERSION = 2
+ENDPOINT_HTTP_CONTRACT_VERSION = 2
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _RUN_ID = re.compile(r"^[0-9a-f]{32}$")
@@ -67,6 +70,58 @@ def record_digest(
     return hasher.hexdigest()
 
 
+def evidence_record_digest(
+    namespace_id: str,
+    authority_id: str,
+    effect_id: str,
+    run_id: str,
+    operation_key: str,
+    input_digest: str,
+    catalog_digest: str,
+    schema_version: int,
+    state: str,
+    result: str,
+) -> str:
+    """Digest a v2 local-evidence record.
+
+    ``record_digest`` above remains only for isolated v1 compatibility tests.
+    This digest is the authoritative record identity for the trusted-local v2
+    adapter and the strict real-QEMU UART path: it
+    binds the durable local authority, namespace/effect identity, input and
+    catalog contract as well as the terminal state.  It is deliberately not a
+    signature; this adapter is explicitly a trusted-local sidecar.
+    """
+    namespace_id = _id(namespace_id, "namespace id")
+    authority_id = validate_run_id(authority_id)
+    effect_id = validate_run_id(effect_id)
+    run_id = validate_run_id(run_id)
+    operation_key = _id(operation_key, "operation key")
+    input_digest = _digest(input_digest)
+    catalog_digest = _digest(catalog_digest)
+    if schema_version != ENDPOINT_RECORD_SCHEMA_VERSION:
+        raise ProtocolError("unsupported endpoint record schema")
+    state = _id(state, "state")
+    result = _id(result, "result")
+    hasher = hashlib.sha256()
+    hasher.update(b"nexus-cser-local-evidence-record-v2")
+    for field in (
+        namespace_id,
+        authority_id,
+        effect_id,
+        run_id,
+        operation_key,
+        input_digest,
+        catalog_digest,
+        str(schema_version),
+        state,
+        result,
+    ):
+        encoded = field.encode("ascii")
+        hasher.update(len(encoded).to_bytes(8, "little"))
+        hasher.update(encoded)
+    return hasher.hexdigest()
+
+
 def _decode_payload(value: str) -> bytes:
     if value == "-":
         return b""
@@ -108,6 +163,91 @@ def parse_request(line: bytes) -> tuple[str, str, str, str, bytes]:
     if method == "GET" and payload:
         raise ProtocolError("GET must not carry a payload")
     return method, run_id, operation_key, payload_digest, payload
+
+
+def parse_request_v2(line: bytes) -> tuple[str, str, str, str, str, str, str, str, bytes]:
+    """Parse the strict, identity-bound COM2 request used by real QEMU runs.
+
+    V1 remains only for isolated compatibility tests.  A v2 request makes the
+    endpoint authority and catalog part of the checksum-bound request, rather
+    than trusting the bridge launch arguments implicitly.
+    """
+    if not line.endswith(b"\n") or len(line) > MAX_LINE_BYTES:
+        raise ProtocolError("invalid frame length")
+    try:
+        fields = line[:-1].decode("ascii").split(" ")
+    except UnicodeDecodeError as exc:
+        raise ProtocolError("frame is not ASCII") from exc
+    if len(fields) != 12 or fields[:2] != ["CSER2", "REQ"]:
+        raise ProtocolError("invalid v2 request frame")
+    if not _HEX64.fullmatch(fields[-1]) or fields[-1] != _checksum(fields[:-1]):
+        raise ProtocolError("invalid request checksum")
+    method = fields[2]
+    if method not in ("POST", "GET"):
+        raise ProtocolError("invalid request method")
+    namespace, authority, effect, run, operation, input_digest, catalog = fields[3:10]
+    namespace = _id(namespace, "namespace id")
+    authority = validate_run_id(authority)
+    effect = validate_run_id(effect)
+    run = validate_run_id(run)
+    operation = _id(operation, "operation key")
+    input_digest = _digest(input_digest)
+    catalog = _digest(catalog)
+    payload = _decode_payload(fields[10])
+    if method == "POST" and digest(payload) != input_digest:
+        raise ProtocolError("payload digest mismatch")
+    if method == "GET" and payload:
+        raise ProtocolError("GET must not carry a payload")
+    return method, namespace, authority, effect, run, operation, input_digest, catalog, payload
+
+
+def response_v2(namespace_id: str, authority_id: str, effect_id: str, run_id: str,
+                operation_key: str, input_digest: str, catalog_digest: str,
+                status: int, state: str, result: str, evidence_digest: str | None) -> bytes:
+    """Construct a strict v2 response; only terminal records carry evidence."""
+    if not 100 <= status <= 599:
+        raise ProtocolError("invalid HTTP status")
+    namespace_id = _id(namespace_id, "namespace id")
+    authority_id = validate_run_id(authority_id)
+    effect_id = validate_run_id(effect_id)
+    run_id = validate_run_id(run_id)
+    operation_key = _id(operation_key, "operation key")
+    input_digest = _digest(input_digest)
+    catalog_digest = _digest(catalog_digest)
+    state = _id(state, "state")
+    result = _id(result, "result")
+    terminal = state in ("succeeded", "failed")
+    if terminal:
+        if evidence_digest != evidence_record_digest(namespace_id, authority_id, effect_id, run_id,
+                                                     operation_key, input_digest, catalog_digest,
+                                                     ENDPOINT_RECORD_SCHEMA_VERSION, state, result):
+            raise ProtocolError("evidence digest mismatch")
+    elif evidence_digest is not None:
+        raise ProtocolError("nonterminal response must not carry evidence")
+    tokens = ["CSER2", "RESP", str(status), namespace_id, authority_id, effect_id, run_id,
+              operation_key, input_digest, catalog_digest, state, result, evidence_digest or "-"]
+    return (" ".join(tokens + [_checksum(tokens)]) + "\n").encode("ascii")
+
+
+def request_v2(namespace_id: str, authority_id: str, effect_id: str, run_id: str,
+               operation_key: str, payload: bytes, catalog_digest: str,
+               method: str = "POST", expected_input_digest: str | None = None) -> bytes:
+    """Canonical identity-bound request frame for the production QEMU path."""
+    namespace_id = _id(namespace_id, "namespace id")
+    authority_id = validate_run_id(authority_id)
+    effect_id = validate_run_id(effect_id)
+    run_id = validate_run_id(run_id)
+    operation_key = _id(operation_key, "operation key")
+    catalog_digest = _digest(catalog_digest)
+    if len(payload) > MAX_PAYLOAD_BYTES or method not in ("POST", "GET") or (method == "GET" and payload):
+        raise ProtocolError("invalid request")
+    input_digest = digest(payload) if expected_input_digest is None else _digest(expected_input_digest)
+    if method == "POST" and input_digest != digest(payload):
+        raise ProtocolError("payload digest mismatch")
+    encoded = base64.b64encode(payload).decode("ascii") or "-"
+    tokens = ["CSER2", "REQ", method, namespace_id, authority_id, effect_id, run_id,
+              operation_key, input_digest, catalog_digest, encoded]
+    return (" ".join(tokens + [_checksum(tokens)]) + "\n").encode("ascii")
 
 
 def response(

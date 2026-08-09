@@ -19,6 +19,13 @@ while (($#)); do case "$1" in
 cutpoints=(pre_escape post_register post_endpoint_apply post_effect_fact post_quiescence pre_discharge post_discharge)
 [[ ! -e $output ]] || { echo "output already exists: $output" >&2; exit 2; }
 mkdir -p "$output"; metrics="$output/metrics.jsonl"; touch "$metrics"
+catalog_digest=
+if [[ $real_qemu == true ]]; then
+  project_root=$(cd "$root/../.." && pwd -P)
+  catalog_digest=$(cargo run --quiet --locked --manifest-path "$project_root/../../Cargo.toml" \
+    -p cser-core --features std --bin cser-catalog-digest -- tool-dma)
+  [[ $catalog_digest =~ ^[0-9a-f]{64}$ ]] || { echo 'tool catalog digest command returned invalid output' >&2; exit 1; }
+fi
 if [[ -n $only_cutpoint ]]; then
   valid=false
   for candidate in "${cutpoints[@]}"; do [[ $candidate == "$only_cutpoint" ]] && valid=true; done
@@ -28,15 +35,28 @@ else
   selected_cutpoints=("${cutpoints[@]}")
 fi
 for ((trial=1; trial<=trials; trial++)); do for cutpoint in "${selected_cutpoints[@]}"; do
+  run_id=$(python3 -c 'import secrets; print(secrets.token_hex(16))')
+  trial_dir="$output/${variant}-t${trial}-${cutpoint}-${run_id}"; mkdir -p "$trial_dir/media"; media_args=(); base_media_manifest="$trial_dir/base-media.sha256"
   if [[ $real_qemu == true ]]; then
-    # See matrix_controller._CURRENT_GUEST_RUN_ID: this is not a global test
-    # identity, because every row gets independently copied durable media.
-    run_id=42424242424242424242424242424242
-  else
-    run_id=$(python3 -c 'import secrets; print(secrets.token_hex(16))')
+    namespace_id="tool-dma-${run_id}"
+    authority_id=$(python3 -c 'import secrets; print(secrets.token_hex(16))')
+    effect_id=$(python3 -c 'import secrets; print(secrets.token_hex(16))')
+    printf '{"authority_id":"%s","catalog_digest":"%s","effect_id":"%s","namespace_id":"%s","run_id":"%s"}\n' "$authority_id" "$catalog_digest" "$effect_id" "$namespace_id" "$run_id" > "$trial_dir/experiment-identity.json"
   fi
-  trial_dir="$output/${variant}-t${trial}-${cutpoint}-${run_id}"; mkdir -p "$trial_dir/media"; media_args=()
-  for source in "${base_media[@]}"; do [[ -f $source ]] || { echo "base media is not a regular file: $source" >&2; exit 2; }; destination="$trial_dir/media/$(basename "$source")"; cp --reflink=auto --preserve=mode,timestamps "$source" "$destination"; media_args+=(--media "$destination"); done
+  for source in "${base_media[@]}"; do
+    [[ -f $source ]] || { echo "base media is not a regular file: $source" >&2; exit 2; }
+    destination="$trial_dir/media/$(basename "$source")"
+    source_digest=$(sha256sum -- "$source"); source_digest=${source_digest%% *}
+    cp --reflink=auto --preserve=mode,timestamps "$source" "$destination"
+    destination_digest=$(sha256sum -- "$destination"); destination_digest=${destination_digest%% *}
+    source_digest_after=$(sha256sum -- "$source"); source_digest_after=${source_digest_after%% *}
+    [[ $source_digest_after == "$source_digest" && $destination_digest == "$source_digest" ]] || {
+      echo "trial media digest mismatch: source=$source destination=$destination" >&2
+      exit 1
+    }
+    printf '%s  %s\n' "$source_digest" "$(basename "$source")" >> "$base_media_manifest"
+    media_args+=(--media "$destination")
+  done
   cutpoint_id=0; for index in "${!cutpoints[@]}"; do [[ ${cutpoints[$index]} == "$cutpoint" ]] && cutpoint_id=$((index + 1)); done
   barrier_socket="$trial_dir/com3-crash.sock"
   if [[ $real_qemu == true ]]; then
@@ -48,6 +68,6 @@ for ((trial=1; trial<=trials; trial++)); do for cutpoint in "${selected_cutpoint
     project_root=$(cd "$root/../.." && pwd -P)
     barrier_socket="$project_root/artifacts/tool-dma-$variant/com3-crash.sock"
   fi
-  command=(python3 "$root/matrix_controller.py" --variant "$variant" --run-id "$run_id" --trial "$trial" --cutpoint "$cutpoint" --cutpoint-id "$cutpoint_id" --barrier-socket "$barrier_socket" --trial-dir "$trial_dir" --prepared-trial-dir --metrics-jsonl "$metrics" --timeout-seconds "$timeout" --recovery-timeout-seconds "$recovery_timeout" --kill-mode "$kill_mode"); command+=("${media_args[@]}"); [[ -z $recovery_guest ]] || command+=(--recovery-guest "$recovery_guest"); [[ $recovery_output_metrics == false ]] || command+=(--recovery-output-metrics); [[ $real_qemu == false ]] || command+=(--real-qemu); if [[ $kill_mode == container ]]; then command+=(--container-kill-command "${container_kill[@]}"); fi; command+=(-- "$@"); "${command[@]}"
+  command=(python3 "$root/matrix_controller.py" --variant "$variant" --run-id "$run_id" --trial "$trial" --cutpoint "$cutpoint" --cutpoint-id "$cutpoint_id" --barrier-socket "$barrier_socket" --trial-dir "$trial_dir" --prepared-trial-dir --metrics-jsonl "$metrics" --timeout-seconds "$timeout" --recovery-timeout-seconds "$recovery_timeout" --kill-mode "$kill_mode"); command+=("${media_args[@]}"); [[ -z $recovery_guest ]] || command+=(--recovery-guest "$recovery_guest"); [[ $recovery_output_metrics == false ]] || command+=(--recovery-output-metrics); if [[ $real_qemu == true ]]; then command+=(--real-qemu --catalog-digest "$catalog_digest" --namespace-id "$namespace_id" --authority-id "$authority_id" --effect-id "$effect_id"); fi; if [[ $kill_mode == container ]]; then command+=(--container-kill-command "${container_kill[@]}"); fi; command+=(-- "$@"); "${command[@]}"
 done; done
 python3 "$root/summarize_metrics.py" --input "$metrics" --output "$output/summary.json"
