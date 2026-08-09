@@ -12126,7 +12126,12 @@ mod performance_profile_tests {
                 black_box(state);
             });
             let invariant_ns = measure(|| {
-                black_box(check_invariants(&engine.catalog, engine.limits, &engine.state).unwrap());
+                black_box(check_invariants(
+                    &engine.catalog,
+                    engine.limits,
+                    &engine.state,
+                ))
+                .unwrap();
             });
             let digest_ns = measure(|| {
                 black_box(projection_digest(&engine.state, engine.catalog.digest()));
