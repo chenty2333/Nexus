@@ -29,8 +29,10 @@ current fixed tool-plus-DMA experiment does not do so.
 The trusted-local reference-adapter, orchestration-hardening, and measured-
 performance phase is complete. Remote endpoint authentication, multi-provider
 registries, multi-tenancy, and SDK/platform work remain deliberately deferred.
-The next research step is the late-bound compositional workload described in
-`task.md`, not further mechanism expansion on the fixed tool-plus-DMA topology.
+The leading next-research candidate is a narrowly gated late-bound custody
+handoff pilot, not further mechanism expansion on the fixed tool-plus-DMA
+topology. Its workload, baseline powers, and falsification criteria still need
+explicit approval before they become active work in `task.md`.
 
 ## Current State
 
@@ -86,12 +88,12 @@ counterfactual revision metric, and QEMU-versus-physical boundary. It builds as
 five pages. RFC 0007 is explicitly the historical v5 baseline and RFC 0008 is
 the current v6 amendment.
 
-Local integration is complete: `main` was fast-forwarded to the reviewed CSER
-work and is now the development branch. External publication remains
-outstanding because local `main` is ahead of `origin/main`; the sibling
-`nexus-hotos` checkout has no Git remote. Generated QEMU receipts and
-comparison outputs are intentionally Git-ignored, so publishing source commits
-alone will not publish the research evidence.
+Local and GitHub integration are complete through `ed26354`: the reviewed CSER
+source is on `origin/main`, and local `main` remains the development branch.
+The sibling `nexus-hotos` checkout still has no Git remote. Generated QEMU
+receipts and comparison outputs are intentionally Git-ignored, so the current
+source publication does not yet constitute a small source-bound evidence
+bundle or publish the paper checkout.
 
 ## Current Tasks
 
@@ -119,4 +121,5 @@ alone will not publish the research evidence.
 - [x] Instrument full-state clone/invariant/digest work and replace it with verified incremental or copy-on-write paths only if measurement establishes it as material.
 - [x] Measure ATA journal growth and, if dominant, implement an append-oriented segment/checkpoint layout without weakening readback, crash atomicity, or journal-before-anchor ordering.
 - [x] Measure runtime mutex queue/hold time and reduce demonstrated serialization without exposing uncommitted state or effects.
-- [ ] Publish the local Nexus `main` branch and a small source-bound evidence bundle after external GitHub publication is explicitly authorized; configure a remote for `nexus-hotos` before publishing the paper commit.
+- [x] Publish the reviewed local Nexus `main` source branch to GitHub after explicit authorization.
+- [ ] Publish a small source-bound evidence bundle and configure a remote for `nexus-hotos` before publishing the paper commit.
