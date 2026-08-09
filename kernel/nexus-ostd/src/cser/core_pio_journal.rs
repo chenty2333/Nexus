@@ -1239,8 +1239,11 @@ struct VNextActiveImage {
 /// Development vNext journal: three append-only segments, two independently
 /// checksummed committed headers per segment, and a prefix hash chain.
 ///
-/// Normal appends only rewrite the final partially filled data sector plus two
-/// small header sectors.  It is intentionally kept behind a separate type
+/// Normal appends only rewrite the final partially filled data sector plus one
+/// newly committed header copy.  The manifest makes that copy authoritative
+/// before the other header copy is mirrored, so a crash always has either the
+/// old endpoint or a self-validating new endpoint. It is intentionally kept
+/// behind a separate type
 /// until the core exposes a replayable checkpoint representation.  Calling
 /// [`Self::checkpoint_exact`] is only sound when its `image` is already a
 /// complete replacement journal stream (for example a future core snapshot
@@ -1339,35 +1342,22 @@ where
                 .try_reserve_exact(suffix.len())
                 .map_err(|_| BankedJournalError::AllocationFailed { requested: new_len })?;
             payload.extend_from_slice(suffix);
+            // Cache publication follows the manifest authority pivot. Reserve
+            // every byte it will need before touching disk, so an allocation
+            // failure cannot leave a new durable endpoint with stale cache.
+            self.active
+                .bytes
+                .try_reserve_exact(suffix.len())
+                .map_err(|_| BankedJournalError::AllocationFailed {
+                    requested: self.active.bytes.len().saturating_add(suffix.len()),
+                })?;
             let generation = current
                 .generation
                 .checked_add(1)
                 .ok_or(BankedJournalError::GenerationExhausted)?;
-            // Never rewrite the manifest-selected segment.  Until the new
-            // manifest is durable, its old header and payload remain an exact
-            // recoverable prefix; after publication this alternate segment
-            // becomes the endpoint and the former one becomes free.
-            let replacement = (1..=VNEXT_SEGMENT_COUNT)
-                .map(|offset| (current.segment + offset) % VNEXT_SEGMENT_COUNT)
-                .find(|segment| !self.active.occupied[*segment as usize])
-                .ok_or(BankedJournalError::JournalFull {
-                    current: self.active.bytes.len(),
-                    additional: suffix.len(),
-                    capacity: VNEXT_CAPACITY,
-                })?;
-            let header = self.publish_segment(
-                replacement,
-                generation,
-                current.first_generation,
-                current.previous_head,
-                &payload,
-                0,
-            )?;
-            self.publish_manifest(&header)?;
+            let header = self.publish_append_in_place(&current, generation, &payload)?;
             self.active.bytes.truncate(current_start);
             self.active.bytes.extend_from_slice(&payload);
-            self.active.occupied[current.segment as usize] = false;
-            self.active.occupied[replacement as usize] = true;
             self.active.header = Some(header);
             self.mark_phase(JournalIoPhase::CacheUpdated);
             return Ok(());
@@ -1465,6 +1455,20 @@ where
                 capacity: VNEXT_CAPACITY,
             });
         }
+        // Complete the next cache image before any replacement segment can be
+        // committed. Once M0 is durable, every remaining cache transition is
+        // an infallible move rather than an allocation point.
+        let mut next_bytes = Vec::new();
+        next_bytes.try_reserve_exact(image.len()).map_err(|_| {
+            BankedJournalError::AllocationFailed {
+                requested: image.len(),
+            }
+        })?;
+        next_bytes.extend_from_slice(image);
+        let mut next_occupied = [false; VNEXT_SEGMENT_COUNT as usize];
+        for &segment in free.iter().take(needed) {
+            next_occupied[segment as usize] = true;
+        }
         let mut generation = self
             .active
             .header
@@ -1491,18 +1495,8 @@ where
         }
         let endpoint = endpoint.ok_or(BankedJournalError::CorruptBankMetadata)?;
         self.publish_manifest(&endpoint)?;
-        self.active.bytes.clear();
-        self.active
-            .bytes
-            .try_reserve_exact(image.len())
-            .map_err(|_| BankedJournalError::AllocationFailed {
-                requested: image.len(),
-            })?;
-        self.active.bytes.extend_from_slice(image);
-        self.active.occupied = [false; VNEXT_SEGMENT_COUNT as usize];
-        for segment in free.into_iter().take(needed) {
-            self.active.occupied[segment as usize] = true;
-        }
+        self.active.bytes = next_bytes;
+        self.active.occupied = next_occupied;
         self.active.header = Some(endpoint);
         self.mark_phase(JournalIoPhase::CacheUpdated);
         Ok(())
@@ -1515,6 +1509,28 @@ where
         payload: &[u8],
         checkpoint: bool,
     ) -> Result<(), BankedJournalError<B::Error>> {
+        // Prebuild the cache image before starting disk mutation. This is
+        // required for the same reason as replacement: manifest publication
+        // is the authority pivot and cannot be followed by fallible growth.
+        let next_len = if checkpoint {
+            payload.len()
+        } else {
+            self.active.bytes.len().checked_add(payload.len()).ok_or(
+                BankedJournalError::AllocationFailed {
+                    requested: usize::MAX,
+                },
+            )?
+        };
+        let mut next_bytes = Vec::new();
+        next_bytes.try_reserve_exact(next_len).map_err(|_| {
+            BankedJournalError::AllocationFailed {
+                requested: next_len,
+            }
+        })?;
+        if !checkpoint {
+            next_bytes.extend_from_slice(&self.active.bytes);
+        }
+        next_bytes.extend_from_slice(payload);
         let generation = match self.active.header.as_ref() {
             Some(header) => header
                 .generation
@@ -1526,16 +1542,9 @@ where
             self.publish_segment(segment, generation, generation, previous_head, payload, 0)?;
         self.publish_manifest(&header)?;
         if checkpoint {
-            self.active.bytes.clear();
             self.active.occupied = [false; VNEXT_SEGMENT_COUNT as usize];
         }
-        self.active
-            .bytes
-            .try_reserve_exact(payload.len())
-            .map_err(|_| BankedJournalError::AllocationFailed {
-                requested: payload.len(),
-            })?;
-        self.active.bytes.extend_from_slice(payload);
+        self.active.bytes = next_bytes;
         self.active.occupied[segment as usize] = true;
         self.active.header = Some(header);
         self.mark_phase(JournalIoPhase::CacheUpdated);
@@ -1558,11 +1567,6 @@ where
                 capacity: VNEXT_SEGMENT_CAPACITY,
             });
         }
-        self.write_segment_tail(segment, payload, previous_len)?;
-        self.mark_phase(JournalIoPhase::PayloadWritten);
-        self.flush()?;
-        self.mark_phase(JournalIoPhase::PayloadFlushed);
-
         let payload_digest = self.hash(payload);
         let head = self.segment_head(previous_head, payload);
         let header = VNextHeader {
@@ -1575,26 +1579,117 @@ where
             head,
         };
         let encoded = header.encode();
-        // Each copy is independently a complete committed superblock.  A
-        // crash after the first flush may expose the new prefix; a corrupted
-        // first copy still leaves the previous committed copy usable.
-        self.write_sector(vnext_header_lba(segment, 0), &encoded)?;
-        self.mark_phase(JournalIoPhase::HeaderWritten);
-        self.flush()?;
-        self.write_sector(vnext_header_lba(segment, 1), &encoded)?;
-        self.flush()?;
-        self.mark_phase(JournalIoPhase::HeaderFlushed);
+        let result = (|| {
+            self.write_segment_tail(segment, payload, previous_len)?;
+            self.mark_phase(JournalIoPhase::PayloadWritten);
+            self.flush()?;
+            self.mark_phase(JournalIoPhase::PayloadFlushed);
 
-        match self.inspect_segment(segment)? {
-            VNextSegmentInspection::Valid(image)
-                if image.header == header && image.bytes == payload =>
-            {
-                self.mark_phase(JournalIoPhase::ReadbackValidated);
-                Ok(header)
+            // Each copy is independently a complete committed superblock. A
+            // crash after the first flush may expose the new prefix; a
+            // corrupted first copy still leaves the previous one usable.
+            self.write_sector(vnext_header_lba(segment, 0), &encoded)?;
+            self.mark_phase(JournalIoPhase::HeaderWritten);
+            self.flush()?;
+            self.write_sector(vnext_header_lba(segment, 1), &encoded)?;
+            self.flush()?;
+            self.mark_phase(JournalIoPhase::HeaderFlushed);
+
+            match self.inspect_segment(segment)? {
+                VNextSegmentInspection::Valid(image)
+                    if image.header == header && image.bytes == payload =>
+                {
+                    self.mark_phase(JournalIoPhase::ReadbackValidated);
+                    Ok(header.clone())
+                }
+                VNextSegmentInspection::Blank
+                | VNextSegmentInspection::Invalid
+                | VNextSegmentInspection::Valid(_) => Err(BankedJournalError::ReadbackMismatch),
             }
-            VNextSegmentInspection::Blank
-            | VNextSegmentInspection::Invalid
-            | VNextSegmentInspection::Valid(_) => Err(BankedJournalError::ReadbackMismatch),
+        })();
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+
+    /// Publish one same-segment append without rebuilding the existing
+    /// segment.  The data tail is durable before a fresh header copy can name
+    /// it.  The old header copy remains usable until the manifest selects the
+    /// new endpoint; only then do we mirror the new header into the old slot.
+    fn publish_append_in_place(
+        &mut self,
+        current: &VNextHeader,
+        generation: u64,
+        payload: &[u8],
+    ) -> Result<VNextHeader, BankedJournalError<B::Error>> {
+        let header = VNextHeader {
+            segment: current.segment,
+            generation,
+            first_generation: current.first_generation,
+            logical_len: payload.len(),
+            previous_head: current.previous_head,
+            payload_digest: self.hash(payload),
+            head: self.segment_head(current.previous_head, payload),
+        };
+        let encoded = header.encode();
+        // Alternate the first committed slot.  This leaves the preceding
+        // header intact while the manifest still names the old payload.
+        let fresh_copy = (generation & 1) as u32;
+        let mirror_copy = 1 - fresh_copy;
+        let result = (|| {
+            self.write_segment_tail(current.segment, payload, current.logical_len)?;
+            self.mark_phase(JournalIoPhase::PayloadWritten);
+            self.flush()?;
+            self.mark_phase(JournalIoPhase::PayloadFlushed);
+
+            self.write_sector(vnext_header_lba(current.segment, fresh_copy), &encoded)?;
+            self.mark_phase(JournalIoPhase::HeaderWritten);
+            self.flush()?;
+            // Before the manifest can pivot authority, prove the staged copy
+            // names the exact new payload. The untouched mirror still names
+            // the old endpoint if this validation fails or power cuts here.
+            self.validate_exact_header_copy(current.segment, fresh_copy, &header, payload)?;
+
+            // Header and manifest together bind the new exact prefix.  If
+            // only M0 is durable after a cut, its larger generation wins over
+            // the old M1 and recovery accepts this fully staged endpoint.
+            self.publish_manifest(&header)?;
+
+            // Once authority has moved, restore two equivalent headers. A
+            // failure here leaves a recoverable one-header endpoint and
+            // poisons the in-memory cache so callers must reopen.
+            self.write_sector(vnext_header_lba(current.segment, mirror_copy), &encoded)?;
+            self.flush()?;
+            self.mark_phase(JournalIoPhase::HeaderFlushed);
+            self.validate_exact_header_copy(current.segment, mirror_copy, &header, payload)?;
+            self.mark_phase(JournalIoPhase::ReadbackValidated);
+            Ok(())
+        })();
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result.map(|()| header)
+    }
+
+    fn validate_exact_header_copy(
+        &mut self,
+        segment: u32,
+        copy: u32,
+        expected: &VNextHeader,
+        payload: &[u8],
+    ) -> Result<(), BankedJournalError<B::Error>> {
+        let mut bytes = [0u8; SECTOR_BYTES];
+        self.read_sector(vnext_header_lba(segment, copy), &mut bytes)?;
+        let VNextHeaderInspection::Valid(header) = VNextHeader::decode(segment, &bytes) else {
+            return Err(BankedJournalError::ReadbackMismatch);
+        };
+        if &header != expected {
+            return Err(BankedJournalError::ReadbackMismatch);
+        }
+        match self.validate_segment_payload(header)? {
+            Some(image) if image.bytes == payload => Ok(()),
+            Some(_) | None => Err(BankedJournalError::ReadbackMismatch),
         }
     }
 
@@ -1636,13 +1731,16 @@ where
             });
         };
         let endpoint = manifest.endpoint;
+        if !self.has_exact_segment_header(&endpoint)? {
+            return Err(BankedJournalError::CorruptBankMetadata);
+        }
         let Some(current) = self.validate_segment_payload(endpoint.clone())? else {
             return Err(BankedJournalError::CorruptBankMetadata);
         };
-        match self.inspect_segment(endpoint.segment)? {
-            VNextSegmentInspection::Valid(image) if image.header == endpoint => {}
-            _ => return Err(BankedJournalError::CorruptBankMetadata),
-        }
+        // The manifest pins this exact header, not merely the newest valid
+        // header physically present in the segment.  During an interrupted
+        // in-place append the fresh header may be newer while the manifest
+        // still selects this old one; both payload prefixes remain valid.
         let mut images = Vec::new();
         for segment in 0..VNEXT_SEGMENT_COUNT {
             match self.inspect_segment(segment)? {
@@ -1702,6 +1800,21 @@ where
             bytes,
             occupied,
         })
+    }
+
+    fn has_exact_segment_header(
+        &mut self,
+        expected: &VNextHeader,
+    ) -> Result<bool, BankedJournalError<B::Error>> {
+        for copy in 0..VNEXT_HEADER_COPIES {
+            let mut bytes = [0u8; SECTOR_BYTES];
+            self.read_sector(vnext_header_lba(expected.segment, copy), &mut bytes)?;
+            if matches!(VNextHeader::decode(expected.segment, &bytes), VNextHeaderInspection::Valid(header) if header == *expected)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn read_manifest(&mut self) -> Result<Option<VNextManifest>, BankedJournalError<B::Error>> {
@@ -2600,10 +2713,10 @@ mod tests {
         let after = journal.telemetry().expect("telemetry");
 
         assert_eq!(journal.read_all_image().expect("image"), b"first-second");
-        // COW keeps the committed prefix untouched: the replacement contains
-        // both framed sectors, followed by two headers and two manifest
-        // copies. This is bounded by one segment rather than the whole log.
-        assert_eq!(after.sectors_written - before.sectors_written, 6);
+        // Same-segment append writes its changed data sector, one fresh
+        // header, both manifest copies, then the mirrored header.  It never
+        // copies the committed prefix into another segment.
+        assert_eq!(after.sectors_written - before.sectors_written, 5);
         assert_eq!(after.flushes - before.flushes, 5);
         assert_eq!(after.sectors_read - before.sectors_read, 6);
         assert!(after.hash_bytes > before.hash_bytes);
@@ -2615,14 +2728,14 @@ mod tests {
     }
 
     #[ktest]
-    fn pio_vnext_unpublished_replacement_keeps_the_manifest_selected_prefix() {
+    fn pio_vnext_unpublished_in_place_header_keeps_the_manifest_selected_prefix() {
         let mut journal = vnext_journal();
         journal.append_exact(b"committed").expect("baseline");
 
-        // Same-segment growth is copy-on-write. Simulate a crash after the
-        // replacement payload and one independently valid header copy reach
-        // the alternate segment, but before either manifest copy names it.
-        // Recovery must follow the old manifest and ignore the orphan.
+        // Simulate a cut after same-segment payload and one fresh header copy
+        // are durable, but before either manifest copy names it. The other
+        // header remains the old endpoint, so recovery must ignore the new
+        // unselected prefix.
         let mut replacement = encode_vnext_frame(b"committed").expect("base frame");
         replacement.extend_from_slice(&encode_vnext_frame(b"-new-tail").expect("tail frame"));
         for (index, chunk) in replacement.chunks(SECTOR_BYTES).enumerate() {
@@ -2630,11 +2743,11 @@ mod tests {
             sector[..chunk.len()].copy_from_slice(chunk);
             journal
                 .backend_mut()
-                .write_sector(vnext_data_lba(1) + index as u32, &sector)
+                .write_sector(vnext_data_lba(0) + index as u32, &sector)
                 .expect("inject replacement payload");
         }
         let replacement_header = VNextHeader {
-            segment: 1,
+            segment: 0,
             generation: 2,
             first_generation: 1,
             logical_len: replacement.len(),
@@ -2645,7 +2758,7 @@ mod tests {
         .encode();
         journal
             .backend_mut()
-            .write_sector(vnext_header_lba(1, 0), &replacement_header)
+            .write_sector(vnext_header_lba(0, 0), &replacement_header)
             .expect("inject replacement header copy");
 
         let mut reopened = SegmentedJournalVNext::open(journal.into_backend()).expect("reopen");
@@ -2708,25 +2821,33 @@ mod tests {
     }
 
     #[ktest]
-    fn pio_vnext_readback_failure_does_not_publish_the_cache() {
+    fn pio_vnext_post_publication_readback_failure_requires_reopen() {
         let mut journal = vnext_journal();
         journal.append_exact(b"committed").expect("baseline");
-        journal.backend_mut().fail_reads_after = Some(0);
+        // Staged-header validation consumes three reads (H0 plus two payload
+        // sectors) and manifest readback consumes two. The final H1 header
+        // read then fails after every durable phase has completed.
+        journal.backend_mut().fail_reads_after = Some(5);
         assert_eq!(
             journal.append_exact(b"-unread"),
             Err(BankedJournalError::Storage(
                 MemoryError::InjectedReadFailure
             ))
         );
+        assert!(matches!(
+            journal.read_all_image(),
+            Err(BankedJournalError::CorruptBankMetadata)
+        ));
         journal.backend_mut().fail_reads_after = None;
+        let mut reopened = SegmentedJournalVNext::open(journal.into_backend()).expect("reopen");
         assert_eq!(
-            journal.read_all_image().expect("cached prefix"),
-            b"committed"
+            reopened.read_all_image().expect("durable endpoint"),
+            b"committed-unread"
         );
     }
 
     #[ktest]
-    fn pio_vnext_flush_failure_does_not_publish_the_cache() {
+    fn pio_vnext_flush_failure_requires_reopen_for_old_endpoint() {
         let mut journal = vnext_journal();
         journal.append_exact(b"committed").expect("baseline");
         journal.backend_mut().fail_flushes_after = Some(0);
@@ -2737,8 +2858,9 @@ mod tests {
             ))
         );
         journal.backend_mut().fail_flushes_after = None;
+        let mut reopened = SegmentedJournalVNext::open(journal.into_backend()).expect("reopen");
         assert_eq!(
-            journal.read_all_image().expect("cached prefix"),
+            reopened.read_all_image().expect("old endpoint"),
             b"committed"
         );
     }
@@ -2870,12 +2992,12 @@ mod tests {
     }
 
     #[ktest]
-    fn pio_vnext_cow_cut_before_manifest_reopens_old_endpoint() {
+    fn pio_vnext_in_place_cut_before_manifest_reopens_old_endpoint() {
         let mut journal = vnext_journal();
         journal.append_exact(b"old").expect("baseline");
-        // Alternate payload plus both headers are durable; the first manifest
-        // sector is the next write and fails before authority changes.
-        journal.backend_mut().fail_writes_after = Some(3);
+        // The same-segment tail and fresh header are durable; the first
+        // manifest sector is the next write and fails before authority moves.
+        journal.backend_mut().fail_writes_after = Some(2);
         assert!(journal.append_exact(b"-new").is_err());
         journal.backend_mut().fail_writes_after = None;
         let mut reopened = SegmentedJournalVNext::open(journal.into_backend()).expect("reopen");
@@ -2883,16 +3005,72 @@ mod tests {
     }
 
     #[ktest]
-    fn pio_vnext_cow_cut_after_manifest_copy_zero_is_complete() {
+    fn pio_vnext_in_place_cut_after_payload_reopens_old_endpoint() {
+        let mut journal = vnext_journal();
+        journal.append_exact(b"old").expect("baseline");
+        // The tail itself is durable, but no staged header exists yet.
+        journal.backend_mut().fail_writes_after = Some(1);
+        assert!(journal.append_exact(b"-new").is_err());
+        journal.backend_mut().fail_writes_after = None;
+        let mut reopened = SegmentedJournalVNext::open(journal.into_backend()).expect("reopen");
+        assert_eq!(reopened.read_all_image().expect("old endpoint"), b"old");
+    }
+
+    #[ktest]
+    fn pio_vnext_in_place_cut_after_manifest_copy_zero_is_complete() {
         let mut journal = vnext_journal();
         journal.append_exact(b"old").expect("baseline");
         // The first manifest copy and its flush complete; copy one fails.
-        journal.backend_mut().fail_writes_after = Some(4);
+        journal.backend_mut().fail_writes_after = Some(3);
         assert!(journal.append_exact(b"-new").is_err());
         journal.backend_mut().fail_writes_after = None;
         let mut reopened = SegmentedJournalVNext::open(journal.into_backend()).expect("reopen");
         let image = reopened.read_all_image().expect("complete endpoint");
-        assert!(image == b"old" || image == b"old-new");
+        assert_eq!(image, b"old-new");
+    }
+
+    #[ktest]
+    fn pio_vnext_in_place_cut_after_manifest_copy_one_is_complete() {
+        let mut journal = vnext_journal();
+        journal.append_exact(b"old").expect("baseline");
+        // Both manifest copies are durable; restoring header redundancy is
+        // the next write and may fail without changing the endpoint.
+        journal.backend_mut().fail_writes_after = Some(4);
+        assert!(journal.append_exact(b"-new").is_err());
+        journal.backend_mut().fail_writes_after = None;
+        let mut reopened = SegmentedJournalVNext::open(journal.into_backend()).expect("reopen");
+        assert_eq!(
+            reopened.read_all_image().expect("complete endpoint"),
+            b"old-new"
+        );
+    }
+
+    #[ktest]
+    fn pio_vnext_in_place_fill_writes_less_than_legacy_64k_fill() {
+        let mut journal = vnext_journal();
+        journal.enable_telemetry();
+
+        // This is the same 128 x 512-byte logical fill measured by the
+        // deployed double-bank test above. Each 512-byte raw record frames to
+        // two sectors, so this occupies two vNext segments (128 KiB physical)
+        // while retaining the same 64-KiB logical fill. Each append remains
+        // an in-place tail update rather than a full-segment COW rewrite.
+        for record in 1..=BANK_DATA_SECTORS {
+            journal
+                .append_exact(&vec![record as u8; SECTOR_BYTES])
+                .expect("publish fill record");
+        }
+
+        let telemetry = journal.telemetry().expect("telemetry enabled");
+        assert_eq!(
+            journal.read_all_image().expect("full image").len(),
+            JOURNAL_CAPACITY
+        );
+        // The legacy 64-KiB fill deterministically writes 8,384 sectors.
+        // This concrete vNext count proves normal framed appends do not copy
+        // the growing prefix on every record.
+        assert_eq!(telemetry.sectors_written, 768);
+        assert!(telemetry.sectors_written * 8 < 8_384);
     }
 
     #[ktest]
@@ -2932,20 +3110,23 @@ mod tests {
         pio_journal_reopen_revalidates_corrupted_cached_bank();
         pio_journal_repair_updates_cache_only_after_readback();
         pio_vnext_appends_without_rewriting_the_prefix_and_reports_io();
-        pio_vnext_unpublished_replacement_keeps_the_manifest_selected_prefix();
+        pio_vnext_unpublished_in_place_header_keeps_the_manifest_selected_prefix();
         pio_vnext_torn_header_copy_keeps_the_other_committed_copy();
         pio_vnext_manifest_selects_the_committed_endpoint_and_rejects_a_tie();
         pio_vnext_interrupted_checkpoint_keeps_the_old_chain();
-        pio_vnext_readback_failure_does_not_publish_the_cache();
-        pio_vnext_flush_failure_does_not_publish_the_cache();
+        pio_vnext_post_publication_readback_failure_requires_reopen();
+        pio_vnext_flush_failure_requires_reopen_for_old_endpoint();
         pio_vnext_corrupt_reopen_fails_closed();
         pio_vnext_rolls_to_segments_then_backpressures_and_recovers_twice();
         pio_vnext_checkpoint_rotates_to_a_single_replayable_replacement();
         pio_vnext_checkpoint_reduces_replay_image_and_survives_second_reopen();
         pio_vnext_spans_segment_boundaries_without_fragmentation();
         pio_vnext_repair_publishes_early_current_and_zero_prefixes();
-        pio_vnext_cow_cut_before_manifest_reopens_old_endpoint();
-        pio_vnext_cow_cut_after_manifest_copy_zero_is_complete();
+        pio_vnext_in_place_cut_after_payload_reopens_old_endpoint();
+        pio_vnext_in_place_cut_before_manifest_reopens_old_endpoint();
+        pio_vnext_in_place_cut_after_manifest_copy_zero_is_complete();
+        pio_vnext_in_place_cut_after_manifest_copy_one_is_complete();
+        pio_vnext_in_place_fill_writes_less_than_legacy_64k_fill();
         pio_vnext_full_preflight_keeps_old_replay_image();
     }
 }
