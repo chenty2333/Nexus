@@ -46,7 +46,10 @@ use super::{
     core_experiment_dma_flow::{CserResetLiveDma, prepare_live_irq, probe_reset_once},
     core_qemu_persistent_boot::{PreparedQemuPersistentBoot, persistent_dma_arena_digest},
     core_runtime::OstdCserRuntime,
-    core_tool_adapter::{ToolOperationPlan, ToolTransportError, UartToolEndpoint},
+    core_tool_adapter::{
+        DurableToolObservation, ToolEndpointObservation, ToolOperationPlan, ToolTransportError,
+        UartToolEndpoint,
+    },
     core_tool_dma_runtime::ToolDmaRuntime,
     core_tool_uart::{ToolRunId, ToolUart, ToolV2Identity},
 };
@@ -63,6 +66,11 @@ const RESOURCE_PAGES: u64 = 0x6103;
 const RESOURCE_IOVA: u64 = 0x6104;
 const MAX_DEVICE_TURNS: usize = 16_384;
 const MAX_IRQ_SPINS: usize = 20_000_000;
+/// Development-tunable number of same-identity GET observations attempted in
+/// one boot after an accepted/pending endpoint response.  Exhaustion retains
+/// the durable tool intent and physical claims; it is not a synthetic error
+/// or authority to POST again.
+const MAX_ENDPOINT_GET_POLLS: usize = 4;
 
 /// Runs exactly one fixed first-boot prefix.  Every marker follows a durable
 /// transition or a real endpoint/device action.  The matrix may kill QEMU at
@@ -122,15 +130,12 @@ fn run_recovery(
     // only when that GET says absent *and* the exact durable intent still
     // exists; it is the same idempotency key, never a fresh operation.
     let tool = ToolDmaRuntime::new(plan, 1).expect("fixed tool verifier epoch");
-    let mut observation = {
-        let mut uart = ToolUart::acquire().expect("experiment owns COM2");
-        let mut endpoint = UartToolEndpoint::new(&mut uart);
-        match tool.recover(&mut endpoint) {
-            Ok(observation) => Some(observation),
-            Err(ToolTransportError::NoTerminalRecord { status: 404 }) => None,
-            Err(error) => {
-                panic!("TOOL_DMA_FAIL stage=recovery-endpoint-get state={state:?} error={error:?}")
-            }
+    let mut observation = match poll_same_tool_plan(tool) {
+        Ok(EndpointPoll::Terminal(observation)) => Some(observation),
+        Ok(EndpointPoll::Absent) => None,
+        Ok(EndpointPoll::Deferred(progress)) => finish_deferred(plan.run_id(), state, progress),
+        Err(error) => {
+            panic!("TOOL_DMA_FAIL stage=recovery-endpoint-get state={state:?} error={error:?}")
         }
     };
 
@@ -162,7 +167,16 @@ fn run_recovery(
         let intent = intent.expect("tool intent retained in projection");
         let endpoint_observation = match observation {
             Some(value) => value,
-            None => post_same_tool_plan(tool),
+            None => match post_same_tool_plan(tool) {
+                Ok(EndpointPoll::Terminal(value)) => value,
+                Ok(EndpointPoll::Deferred(progress)) => {
+                    finish_deferred(plan.run_id(), state, progress)
+                }
+                Ok(EndpointPoll::Absent) => panic!("TOOL_DMA_FAIL stage=recovery-post-absent"),
+                Err(error) => {
+                    panic!("TOOL_DMA_FAIL stage=recovery-idempotent-post error={error:?}")
+                }
+            },
         };
         let command = boot
             .observe(|engine| tool.acknowledge_commit(engine, intent, &endpoint_observation))
@@ -171,7 +185,12 @@ fn run_recovery(
         observation = Some(endpoint_observation);
     }
     if observation.is_none() && retry_after_checkpoint {
-        observation = Some(post_same_tool_plan(tool));
+        observation = Some(match post_same_tool_plan(tool) {
+            Ok(EndpointPoll::Terminal(value)) => value,
+            Ok(EndpointPoll::Deferred(progress)) => finish_deferred(plan.run_id(), state, progress),
+            Ok(EndpointPoll::Absent) => panic!("TOOL_DMA_FAIL stage=recovery-post-absent"),
+            Err(error) => panic!("TOOL_DMA_FAIL stage=recovery-idempotent-post error={error:?}"),
+        });
     }
     let successor = snapshot_ready_rebind(&mut boot, effect, state);
     let observation = observation
@@ -275,11 +294,68 @@ fn fixed_tool_runtime(
         .expect("fixed tool verifier epoch")
 }
 
-fn post_same_tool_plan(tool: ToolDmaRuntime) -> super::core_tool_adapter::DurableToolObservation {
+enum EndpointPoll {
+    Terminal(DurableToolObservation),
+    Absent,
+    Deferred(ToolEndpointObservation),
+}
+
+fn poll_same_tool_plan(tool: ToolDmaRuntime) -> Result<EndpointPoll, ToolTransportError> {
     let mut uart = ToolUart::acquire().expect("experiment owns COM2 for idempotent retry");
     let mut endpoint = UartToolEndpoint::new(&mut uart);
-    tool.submit(&mut endpoint)
-        .unwrap_or_else(|_| panic!("TOOL_DMA_FAIL stage=recovery-idempotent-post"))
+    for attempt in 0..MAX_ENDPOINT_GET_POLLS {
+        match tool.recover(&mut endpoint)? {
+            ToolEndpointObservation::Terminal(value) => return Ok(EndpointPoll::Terminal(value)),
+            ToolEndpointObservation::Absent => return Ok(EndpointPoll::Absent),
+            ToolEndpointObservation::Expired => {
+                return Ok(EndpointPoll::Deferred(ToolEndpointObservation::Expired));
+            }
+            progress @ ToolEndpointObservation::Nonterminal(_)
+                if attempt + 1 == MAX_ENDPOINT_GET_POLLS =>
+            {
+                return Ok(EndpointPoll::Deferred(progress));
+            }
+            ToolEndpointObservation::Nonterminal(_) => Task::yield_now(),
+        }
+    }
+    unreachable!("bounded endpoint poll always returns")
+}
+
+/// POST is reachable only from a checksum-bound GET/404 absence.  A valid
+/// Accepted/Pending POST response is followed by bounded GET polling; it is
+/// never treated as a failed POST or authority for a second POST.
+fn post_same_tool_plan(tool: ToolDmaRuntime) -> Result<EndpointPoll, ToolTransportError> {
+    let mut uart = ToolUart::acquire().expect("experiment owns COM2 for idempotent retry");
+    let mut endpoint = UartToolEndpoint::new(&mut uart);
+    match tool.submit(&mut endpoint)? {
+        ToolEndpointObservation::Terminal(value) => Ok(EndpointPoll::Terminal(value)),
+        ToolEndpointObservation::Nonterminal(progress) => {
+            drop(endpoint);
+            match poll_same_tool_plan(tool)? {
+                EndpointPoll::Terminal(value) => Ok(EndpointPoll::Terminal(value)),
+                EndpointPoll::Absent => Ok(EndpointPoll::Absent),
+                EndpointPoll::Deferred(_) => Ok(EndpointPoll::Deferred(
+                    ToolEndpointObservation::Nonterminal(progress),
+                )),
+            }
+        }
+        ToolEndpointObservation::Absent => Ok(EndpointPoll::Absent),
+        ToolEndpointObservation::Expired => {
+            Ok(EndpointPoll::Deferred(ToolEndpointObservation::Expired))
+        }
+    }
+}
+
+fn finish_deferred(
+    run_id: [u8; 16],
+    state: ToolDmaResumeState,
+    progress: ToolEndpointObservation,
+) -> ! {
+    println!(
+        "TOOL_DMA_DEFERRED {{\"variant\":\"cser\",\"run_id\":\"{}\",\"state\":\"{state:?}\",\"endpoint\":\"{progress:?}\",\"terminal\":false,\"claims_retained\":true,\"post_authorized\":false}}",
+        HexRun(run_id),
+    );
+    poweroff(ExitCode::Success)
 }
 
 fn reconcile_tool<O: ToolDmaCoreOwner>(
@@ -515,12 +591,29 @@ fn run_initial(
     barriers
         .reached(ToolDmaBarrier::CommitIntentsDurable)
         .unwrap_or_else(|_| panic!("TOOL_DMA_FAIL stage=barrier-2"));
-    let mut uart = ToolUart::acquire().expect("experiment owns COM2");
-    let observation = {
+    let initial = {
+        let mut uart = ToolUart::acquire().expect("experiment owns COM2");
         let mut endpoint = UartToolEndpoint::new(&mut uart);
         armed
             .post_tool(&mut endpoint)
             .unwrap_or_else(|_| panic!("TOOL_DMA_FAIL stage=durable-tool-post"))
+    };
+    let observation = match initial {
+        ToolEndpointObservation::Terminal(value) => value,
+        ToolEndpointObservation::Nonterminal(progress) => {
+            match poll_same_tool_plan(fixed_tool_runtime(effect, run_id, experiment_identity)) {
+                Ok(EndpointPoll::Terminal(value)) => value,
+                Ok(EndpointPoll::Deferred(_)) | Ok(EndpointPoll::Absent) => finish_deferred(
+                    run_id,
+                    ToolDmaResumeState::Absent,
+                    ToolEndpointObservation::Nonterminal(progress),
+                ),
+                Err(error) => panic!("TOOL_DMA_FAIL stage=initial-endpoint-poll error={error:?}"),
+            }
+        }
+        ToolEndpointObservation::Absent | ToolEndpointObservation::Expired => {
+            panic!("TOOL_DMA_FAIL stage=initial-endpoint-invalid-state")
+        }
     };
     barriers
         .reached(ToolDmaBarrier::ToolEndpointApplied)

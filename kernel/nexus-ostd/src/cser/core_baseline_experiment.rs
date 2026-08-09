@@ -14,8 +14,11 @@
 use sha2::{Digest as _, Sha256};
 
 use super::core_tool_uart::{
-    OperationKey, ToolRequest, ToolRunId, ToolTerminalRecord, ToolUart, ToolV2Identity,
+    OperationKey, ToolRequest, ToolResponseState, ToolRunId, ToolTerminalRecord, ToolUart,
+    ToolV2Identity,
 };
+
+const MAX_BASELINE_ENDPOINT_GET_POLLS: usize = 4;
 use super::{
     core_baseline_runtime::{
         BASELINE_RECORD_BYTES, BaselineDigest, BaselineDmaReceipt, BaselineDmaReceiptVerifier,
@@ -70,9 +73,10 @@ pub(crate) trait BaselineCrashHook {
 pub(crate) trait BaselineEndpointProvider {
     type Error;
 
-    /// Issues the immutable POST, or performs the recovery GET/retry for that
-    /// same operation.  It must not itself make an old-epoch finalizer.
-    fn dispatch_or_recover_tool(&mut self) -> Result<(), Self::Error>;
+    /// On the initial arm, issues the immutable POST. On recovery, GETs the
+    /// same durable identity first and may POST only after its exact 404.
+    /// It must not itself make an old-epoch finalizer.
+    fn dispatch_or_recover_tool(&mut self, recovery: bool) -> Result<(), Self::Error>;
 
     /// Re-reads and verifies the terminal endpoint record after the executor
     /// fence has advanced.  This is deliberately separate from dispatch:
@@ -194,12 +198,14 @@ impl BaselineExperimentSink for BaselineMetrics {
 /// implementation before this arm is considered production evidence.
 pub(crate) struct BaselineExperimentArm<D = BaselineDoubleBank> {
     runtime: BaselineRuntime<D, BaselineMetrics>,
+    recovery: bool,
 }
 
 impl BaselineExperimentArm<BaselineDoubleBank> {
     pub(crate) fn new(record: BaselineRecord) -> Self {
         Self {
             runtime: BaselineRuntime::new(record, BaselineMetrics::default()),
+            recovery: false,
         }
     }
 }
@@ -218,6 +224,7 @@ impl<D: BaselineDurableStore> BaselineExperimentArm<D> {
                 record,
                 BaselineMetrics::default(),
             )?,
+            recovery: false,
         })
     }
 
@@ -226,6 +233,7 @@ impl<D: BaselineDurableStore> BaselineExperimentArm<D> {
         let metrics = BaselineMetrics::from_durable_record(durable.recover()?);
         Ok(Self {
             runtime: BaselineRuntime::from_durable(durable, metrics)?,
+            recovery: true,
         })
     }
 
@@ -313,7 +321,7 @@ impl<D: BaselineDurableStore> BaselineExperimentArm<D> {
 
         if !record.endpoint_applied() {
             endpoint
-                .dispatch_or_recover_tool()
+                .dispatch_or_recover_tool(self.recovery)
                 .map_err(BaselineExperimentError::Endpoint)?;
             self.runtime
                 .record_endpoint_applied()
@@ -683,6 +691,9 @@ pub(crate) enum UartBaselineEndpointError {
     Transport(super::core_tool_uart::ToolUartError),
     Protocol(super::core_tool_uart::ToolProtocolError),
     MissingTerminal,
+    /// Bounded same-key reconciliation observed only Accepted/Pending.  The
+    /// baseline record remains durable and its DMA custody remains retained.
+    Deferred,
     BindingMismatch,
     ReceiptRejected,
 }
@@ -690,19 +701,29 @@ pub(crate) enum UartBaselineEndpointError {
 impl BaselineEndpointProvider for UartBaselineEndpoint<'_> {
     type Error = UartBaselineEndpointError;
 
-    fn dispatch_or_recover_tool(&mut self) -> Result<(), Self::Error> {
-        let reply = self
-            .uart
-            .transact(
-                &ToolRequest::new_v2(self.identity, self.run, self.operation, self.payload)
-                    .map_err(UartBaselineEndpointError::Protocol)?,
-            )
-            .map_err(UartBaselineEndpointError::Transport)?;
-        self.terminal = reply.terminal_record();
-        if self.terminal.is_none() {
-            return Err(UartBaselineEndpointError::MissingTerminal);
+    fn dispatch_or_recover_tool(&mut self, recovery: bool) -> Result<(), Self::Error> {
+        if recovery {
+            let digest = self.record.tool_binding().payload_digest().bytes();
+            let reply = self
+                .uart
+                .transact(&ToolRequest::get_v2(
+                    self.identity,
+                    self.run,
+                    self.operation,
+                    digest,
+                ))
+                .map_err(UartBaselineEndpointError::Transport)?;
+            return match reply.state() {
+                ToolResponseState::Absent => self.post_initial_or_after_exact_absence(),
+                ToolResponseState::Terminal
+                | ToolResponseState::Accepted
+                | ToolResponseState::Pending => self.accept_or_poll(reply),
+                ToolResponseState::Expired | ToolResponseState::LegacyNonterminal => {
+                    Err(UartBaselineEndpointError::MissingTerminal)
+                }
+            };
         }
-        Ok(())
+        self.post_initial_or_after_exact_absence()
     }
 
     fn verified_tool_finalizer(&mut self, epoch: u64) -> Result<BaselineFinalizer, Self::Error> {
@@ -721,7 +742,7 @@ impl BaselineEndpointProvider for UartBaselineEndpoint<'_> {
                     digest,
                 ))
                 .map_err(UartBaselineEndpointError::Transport)?;
-            self.terminal = reply.terminal_record();
+            self.accept_or_poll(reply)?;
         }
         let terminal = self
             .terminal
@@ -751,6 +772,71 @@ impl BaselineEndpointProvider for UartBaselineEndpoint<'_> {
         ToolFinalizer::from_receipt(&verifier, receipt)
             .map(BaselineFinalizer::Tool)
             .map_err(|_| UartBaselineEndpointError::ReceiptRejected)
+    }
+}
+
+impl UartBaselineEndpoint<'_> {
+    /// Initial dispatch is already authorized by the newly armed durable
+    /// record.  Recovery reaches this only after the exact GET returned 404.
+    fn post_initial_or_after_exact_absence(&mut self) -> Result<(), UartBaselineEndpointError> {
+        let reply = self
+            .uart
+            .transact(
+                &ToolRequest::new_v2(self.identity, self.run, self.operation, self.payload)
+                    .map_err(UartBaselineEndpointError::Protocol)?,
+            )
+            .map_err(UartBaselineEndpointError::Transport)?;
+        self.accept_or_poll(reply)
+    }
+
+    fn accept_or_poll(
+        &mut self,
+        reply: super::core_tool_uart::ToolResponse,
+    ) -> Result<(), UartBaselineEndpointError> {
+        match reply.state() {
+            ToolResponseState::Terminal => {
+                self.terminal = reply.terminal_record();
+                self.terminal
+                    .ok_or(UartBaselineEndpointError::MissingTerminal)
+                    .map(|_| ())
+            }
+            ToolResponseState::Accepted | ToolResponseState::Pending => {
+                for attempt in 0..MAX_BASELINE_ENDPOINT_GET_POLLS {
+                    let digest = self.record.tool_binding().payload_digest().bytes();
+                    let next = self
+                        .uart
+                        .transact(&ToolRequest::get_v2(
+                            self.identity,
+                            self.run,
+                            self.operation,
+                            digest,
+                        ))
+                        .map_err(UartBaselineEndpointError::Transport)?;
+                    if next.state() == ToolResponseState::Terminal {
+                        self.terminal = next.terminal_record();
+                        return self
+                            .terminal
+                            .ok_or(UartBaselineEndpointError::MissingTerminal)
+                            .map(|_| ());
+                    }
+                    if !matches!(
+                        next.state(),
+                        ToolResponseState::Accepted | ToolResponseState::Pending
+                    ) {
+                        return Err(UartBaselineEndpointError::MissingTerminal);
+                    }
+                    if attempt + 1 != MAX_BASELINE_ENDPOINT_GET_POLLS {
+                        ostd::task::Task::yield_now();
+                    }
+                }
+                Err(UartBaselineEndpointError::Deferred)
+            }
+            ToolResponseState::Absent
+            | ToolResponseState::Expired
+            | ToolResponseState::LegacyNonterminal => {
+                Err(UartBaselineEndpointError::MissingTerminal)
+            }
+        }
     }
 }
 
@@ -796,6 +882,7 @@ mod tests {
     struct OrderState {
         dma_published: bool,
         endpoint_applied: bool,
+        endpoint_recovery: Option<bool>,
         barriers: Vec<u16>,
     }
 
@@ -823,8 +910,10 @@ mod tests {
     impl BaselineEndpointProvider for OrderedEndpoint {
         type Error = ();
 
-        fn dispatch_or_recover_tool(&mut self) -> Result<(), Self::Error> {
-            self.state.lock().endpoint_applied = true;
+        fn dispatch_or_recover_tool(&mut self, recovery: bool) -> Result<(), Self::Error> {
+            let mut state = self.state.lock();
+            state.endpoint_applied = true;
+            state.endpoint_recovery = Some(recovery);
             Ok(())
         }
 
@@ -990,5 +1079,31 @@ mod tests {
         let mut hook = OrderedHook(Arc::clone(&state));
         arm.execute(&mut endpoint, &mut dma, &mut hook).unwrap();
         assert_eq!(state.lock().barriers.as_slice(), &[1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(state.lock().endpoint_recovery, Some(false));
+    }
+
+    #[ktest]
+    fn reconstructed_arm_tells_endpoint_to_query_before_any_retry() {
+        let record = BaselineRecord::register(
+            super::super::core_baseline_runtime::BaselineEffectId::new(21).unwrap(),
+            super::super::core_baseline_runtime::BaselineResourceId::new(22).unwrap(),
+            23,
+            1,
+        )
+        .unwrap();
+        let state = Arc::new(SpinLock::new(OrderState::default()));
+        let mut arm = BaselineExperimentArm::new(record);
+        arm.recovery = true;
+        let mut endpoint = OrderedEndpoint {
+            record,
+            state: Arc::clone(&state),
+        };
+        let mut dma = OrderedDma {
+            record,
+            state: Arc::clone(&state),
+        };
+        let mut hook = OrderedHook(Arc::clone(&state));
+        arm.execute(&mut endpoint, &mut dma, &mut hook).unwrap();
+        assert_eq!(state.lock().endpoint_recovery, Some(true));
     }
 }

@@ -16,7 +16,8 @@ use cser_core::{
 };
 
 use super::core_tool_adapter::{
-    DurableToolObservation, ToolEndpoint, ToolFactVerifier, ToolOperationPlan, ToolOutcomeVerifier,
+    DurableToolObservation, ToolEndpoint, ToolEndpointObservation, ToolFactVerifier,
+    ToolOperationPlan, ToolOutcomeVerifier,
 };
 
 /// The component-local tool half of one tool-plus-DMA composite effect.
@@ -52,7 +53,7 @@ impl ToolDmaRuntime {
     pub(crate) fn submit<E: ToolEndpoint>(
         &self,
         endpoint: &mut E,
-    ) -> Result<DurableToolObservation, E::Error> {
+    ) -> Result<ToolEndpointObservation, E::Error> {
         endpoint.post(self.plan)
     }
 
@@ -61,7 +62,7 @@ impl ToolDmaRuntime {
     pub(crate) fn recover<E: ToolEndpoint>(
         &self,
         endpoint: &mut E,
-    ) -> Result<DurableToolObservation, E::Error> {
+    ) -> Result<ToolEndpointObservation, E::Error> {
         endpoint.get(self.plan)
     }
 

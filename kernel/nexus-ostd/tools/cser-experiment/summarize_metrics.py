@@ -33,11 +33,12 @@ def load_metrics(path: Path) -> list[dict[str, Any]]:
         if item["variant"] not in ("cser", "baseline"): raise ValueError(f"metric {number} has invalid variant")
         if item["cutpoint"] not in CUTPOINTS or item["cutpoint_id"] != CUTPOINTS[item["cutpoint"]]: raise ValueError(f"metric {number} has invalid cutpoint binding")
         if not isinstance(item["barrier_observed"], bool) or not isinstance(item["barrier_acknowledged"], bool): raise ValueError(f"metric {number} has invalid barrier observations")
-        if item["completion_state"] not in ("recovery_verified", "crashed_unrecovered"): raise ValueError(f"metric {number} has invalid completion state")
+        if item["completion_state"] not in ("recovery_verified", "deferred_retained", "crashed_unrecovered"): raise ValueError(f"metric {number} has invalid completion state")
         if item["retention_horizon"] != "bounded_observation": raise ValueError(f"metric {number} overclaims retention horizon")
         if item["permanent_retention"] is not None or item["admin_disposition"] is not None or item["admin_disposition_count"] is not None: raise ValueError(f"metric {number} overclaims permanence or administrative support")
-        if item["metrics_source"] not in ("initial_guest_file", "recovery_terminal"): raise ValueError(f"metric {number} has invalid metrics source")
+        if item["metrics_source"] not in ("initial_guest_file", "recovery_terminal", "recovery_deferred"): raise ValueError(f"metric {number} has invalid metrics source")
         if item["metrics_source"] == "recovery_terminal" and item["completion_state"] != "recovery_verified": raise ValueError(f"metric {number} has terminal metrics without verified recovery")
+        if item["metrics_source"] == "recovery_deferred" and item["completion_state"] != "deferred_retained": raise ValueError(f"metric {number} has deferred metrics without retained recovery")
         for field in COUNTER_FIELDS:
             value = item[field]
             if isinstance(value, bool) or (value is not None and (not isinstance(value, int) or value < 0)):

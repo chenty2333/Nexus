@@ -31,7 +31,8 @@ use sha2::{Digest as _, Sha256};
 use super::{
     core_baseline_experiment::{
         AtaTpmBaselineStore, BaselineCrashHook, BaselineCutpoint, BaselineDmaProvider,
-        BaselineExperimentArm, QuarantinedBaselineDma, UartBaselineEndpoint,
+        BaselineExperimentArm, BaselineExperimentError, QuarantinedBaselineDma,
+        UartBaselineEndpoint, UartBaselineEndpointError,
     },
     core_baseline_runtime::{
         BaselineDmaReceipt, BaselineDmaReceiptVerifier, BaselineEffectId, BaselineError,
@@ -128,9 +129,17 @@ pub(crate) fn run() {
         run_id,
     };
 
-    let gate = arm
-        .execute_resume(&mut endpoint, &mut dma, &mut crash)
-        .unwrap_or_else(|_| panic!("baseline experiment retained a failed boundary"));
+    let gate = match arm.execute_resume(&mut endpoint, &mut dma, &mut crash) {
+        Ok(gate) => gate,
+        Err(BaselineExperimentError::Endpoint(UartBaselineEndpointError::Deferred)) => {
+            println!(
+                "TOOL_DMA_DEFERRED {{\"variant\":\"baseline\",\"run_id\":\"{}\",\"terminal\":false,\"claims_retained\":true,\"post_authorized\":false}}",
+                HexRun(run_id),
+            );
+            poweroff(ExitCode::Success)
+        }
+        Err(_) => panic!("baseline experiment retained a failed boundary"),
+    };
     let metrics = *arm.metrics();
     assert!(metrics.invariants_hold());
     // The host matrix accepts only this recovered-guest receipt. The run id

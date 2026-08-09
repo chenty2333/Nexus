@@ -71,7 +71,7 @@ class EndpointTest(unittest.TestCase):
         conn.close()
 
     def test_apply_before_response_fault_leaves_durable_operation(self) -> None:
-        self.server.fault_after_apply_once = True
+        self.server.fault_after_response_commit_once = True
         conn = http.client.HTTPConnection("127.0.0.1", self.server.server_port)
         payload = b"ambiguous"
         import hashlib
@@ -174,7 +174,8 @@ class BridgeTest(unittest.TestCase):
                 worker = threading.Thread(target=serve_v2, daemon=True)
                 worker.start(); guest.sendall(request_frame); reply = guest.recv(1024); worker.join(2)
                 guest.close(); host.close(); self.assertFalse(errors); return reply
-            self.assertIn(b" RESP 201 ", exchange(frame))
+            self.assertIn(b" RESP 202 ", exchange(frame))
+            self.assertTrue(server.worker.run_once())
             query = request_v2(namespace, authority, effect, run, operation, b"", catalog, method="GET", expected_input_digest=digest(payload))
             self.assertIn(b" RESP 200 ", exchange(query))
             missing = request_v2(namespace, authority, effect, run, "missing", b"", catalog, method="GET", expected_input_digest="e" * 64)
@@ -272,13 +273,15 @@ class BridgeTest(unittest.TestCase):
                 peer.sendall(request_v2(
                     namespace, authority, effect, run, "op-retry", payload, catalog,
                 ))
-                self.assertIn(b" RESP 201 ", peer.recv(2048))
+                self.assertIn(b" RESP 202 ", peer.recv(2048))
             finally:
                 peer.close(); listener.close()
             bridge.join(1)
             self.assertFalse(bridge.is_alive())
             self.assertEqual(errors, [])
-            self.assertEqual(json.loads(status.read_text())["state"], "served")
+            # v2 POST is asynchronous: without a worker, the accepted row is
+            # an honest deferred run, not a terminal endpoint result.
+            self.assertEqual(json.loads(status.read_text())["state"], "deferred")
             server.shutdown(); server.server_close(); store.close()
 
     def test_v2_bridge_rejects_changed_404_retry_before_endpoint_submit(self) -> None:

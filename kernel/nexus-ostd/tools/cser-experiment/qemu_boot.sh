@@ -140,9 +140,10 @@ wait_for_terminal_helper() {
     if [[ -s $signal_file ]]; then
       if grep -Fq "\"state\": \"$expected\"" "$signal_file"; then
         matched=true
-      elif [[ $expected == served-or-unused ]] \
+      elif [[ $expected == served-or-unused-or-deferred ]] \
         && { grep -Fq '"state": "served"' "$signal_file" \
-          || grep -Fq '"state": "unused"' "$signal_file"; }; then
+          || grep -Fq '"state": "unused"' "$signal_file" \
+          || grep -Fq '"state": "deferred"' "$signal_file"; }; then
         matched=true
       fi
     fi
@@ -230,7 +231,7 @@ if ! "$root/x" run-tool-dma-boot "$scheme"; then
 fi
 
 if [[ $phase == recovery ]]; then
-  wait_for_terminal_helper bridge-ready "$bridge_pid" "$bridge_status" served-or-unused
+  wait_for_terminal_helper bridge-ready "$bridge_pid" "$bridge_status" served-or-unused-or-deferred
   bridge_pid=
   wait_for_terminal_helper recovery-receipt "$crash_sink_pid" "$sink_status" closed
   crash_sink_pid=

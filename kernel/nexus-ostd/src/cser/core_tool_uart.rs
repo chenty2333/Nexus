@@ -338,6 +338,7 @@ pub(crate) enum ToolTerminalOutcome {
 pub(crate) struct ToolResponse {
     pub(crate) status: u16,
     terminal: Option<ToolTerminalRecord>,
+    state: ToolResponseState,
 }
 
 impl ToolResponse {
@@ -345,13 +346,40 @@ impl ToolResponse {
         self.terminal
     }
 
+    /// A valid non-terminal reply is protocol progress, not a malformed or
+    /// missing terminal record.  Keep this distinction at the wire boundary
+    /// so recovery can retain the durable intent without re-POSTing it.
+    pub(crate) const fn state(self) -> ToolResponseState {
+        self.state
+    }
+
     #[cfg(ktest)]
     pub(crate) const fn missing_terminal_for_test(status: u16) -> Self {
         Self {
             status,
             terminal: None,
+            state: if status == 404 {
+                ToolResponseState::Absent
+            } else if status == 410 {
+                ToolResponseState::Expired
+            } else {
+                ToolResponseState::LegacyNonterminal
+            },
         }
     }
+}
+
+/// Checksum- and identity-bound endpoint observation state.  Only
+/// [`Terminal`] contains retirement-capable outcome evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ToolResponseState {
+    Terminal,
+    Accepted,
+    Pending,
+    Absent,
+    Expired,
+    /// CSER1 has no typed nonterminal vocabulary.  It remains fail-closed.
+    LegacyNonterminal,
 }
 
 /// Acquisition, bounded I/O, and protocol failures are all fail-closed.
@@ -740,7 +768,19 @@ pub(crate) fn decode_response(
             })
         }
     };
-    Ok(ToolResponse { status, terminal })
+    Ok(ToolResponse {
+        status,
+        state: if terminal.is_some() {
+            ToolResponseState::Terminal
+        } else if status == 404 {
+            ToolResponseState::Absent
+        } else if status == 410 {
+            ToolResponseState::Expired
+        } else {
+            ToolResponseState::LegacyNonterminal
+        },
+        terminal,
+    })
 }
 
 fn decode_response_v2(
@@ -776,6 +816,11 @@ fn decode_response_v2(
         return Ok(ToolResponse {
             status,
             terminal: None,
+            state: if state == b"accepted" {
+                ToolResponseState::Accepted
+            } else {
+                ToolResponseState::Pending
+            },
         });
     }
     if state == b"expired" {
@@ -785,6 +830,7 @@ fn decode_response_v2(
         return Ok(ToolResponse {
             status,
             terminal: None,
+            state: ToolResponseState::Expired,
         });
     }
     // Only a checksum- and identity-bound 404 absence grants the adapter's
@@ -797,6 +843,7 @@ fn decode_response_v2(
         return Ok(ToolResponse {
             status,
             terminal: None,
+            state: ToolResponseState::Absent,
         });
     }
     let outcome = match state {
@@ -823,6 +870,7 @@ fn decode_response_v2(
     }
     Ok(ToolResponse {
         status,
+        state: ToolResponseState::Terminal,
         terminal: Some(ToolTerminalRecord {
             run_id: request.run_id,
             operation: request.operation,

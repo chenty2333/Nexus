@@ -19,6 +19,11 @@ from protocol import (MAX_LINE_BYTES, ProtocolError, parse_request, parse_reques
                       response, response_v2, evidence_record_digest, validate_run_id)
 
 MAX_FIRMWARE_PREAMBLE_BYTES = 64 * 1024
+# Development-tunable bound for one boot's same-identity reconciliation.  It
+# is deliberately a protocol backpressure bound, not a claim about endpoint
+# completion latency.  The guest retains on exhaustion and reconnects on a
+# later boot.
+MAX_V2_EXCHANGES = 8
 _V2_ENDPOINT_RECORD_KEYS = frozenset({
     "contract_version", "namespace_id", "authority_id", "effect_id", "run_id",
     "operation_key", "payload_digest", "input_digest", "catalog_digest",
@@ -135,7 +140,8 @@ def get_v2(endpoint: tuple[str, int], namespace: str, authority: str, effect: st
 
 def _serve_client_v2(client: socket.socket, endpoint: tuple[str, int], identity: tuple[str, str, str, str, str],
                      request_timeout: float = 5.0, uart_pace_seconds: float = 0.0,
-                     expected_retry: tuple[str, str] | None = None) -> tuple[str, int, str, str]:
+                     expected_retry: tuple[str, str] | None = None,
+                     expected_operation: tuple[str, str] | None = None) -> tuple[str, int, str, str]:
     """Strict real-QEMU bridge: CSER1 is not a tolerated fallback here."""
     client.settimeout(request_timeout)
     try:
@@ -143,6 +149,8 @@ def _serve_client_v2(client: socket.socket, endpoint: tuple[str, int], identity:
         method, namespace, authority, effect, run, operation, input_digest, catalog, payload = parse_request_v2(line)
         if (namespace, authority, effect, run, catalog) != identity:
             raise ProtocolError("unexpected v2 experiment identity")
+        if expected_operation is not None and (operation, input_digest) != expected_operation:
+            raise ProtocolError("same-identity reconciliation changed its durable key")
         if expected_retry is not None and (method, operation, input_digest) != (
             "POST", expected_retry[0], expected_retry[1]
         ):
@@ -298,27 +306,49 @@ def connect_and_serve(
             print(f"tool bridge connected socket={socket_path}", file=sys.stderr, flush=True)
             _write_signal(status_file, "connected")
             with client:
-                # A boot normally has one bounded tool operation. Recovery has
-                # one deliberately narrow exception: an exact-key GET/404 is
-                # the authority to retry that same durable operation once.
-                # Serve precisely that POST and never turn COM2 into an
-                # unbounded request loop.
+                # A boot has a bounded same-identity reconciliation sequence:
+                # one POST at most, followed only by GET polls of that exact
+                # operation.  A GET/404 is the sole authority for that one
+                # POST.  Accepted/Pending are ordinary nonterminal progress,
+                # so retain the socket long enough for guest polling without
+                # turning COM2 into an unbounded request loop.
                 try:
                     if identity is None:
                         _serve_client(client, endpoint, expected_run_id, request_timeout)
                     else:
-                        first_method, first_status, first_operation, first_input = _serve_client_v2(
-                            client, endpoint, identity, request_timeout, uart_pace_seconds
-                        )
-                        if (first_method, first_status) == ("GET", HTTPStatus.NOT_FOUND):
-                            _serve_client_v2(
-                                client,
-                                endpoint,
-                                identity,
-                                request_timeout,
-                                uart_pace_seconds,
-                                (first_operation, first_input),
-                            )
+                        operation: tuple[str, str] | None = None
+                        retry: tuple[str, str] | None = None
+                        posts = 0
+                        for _ in range(MAX_V2_EXCHANGES):
+                            try:
+                                method, status, seen_operation, seen_input = _serve_client_v2(
+                                    client,
+                                    endpoint,
+                                    identity,
+                                    request_timeout,
+                                    uart_pace_seconds,
+                                    retry,
+                                    operation,
+                                )
+                            except BridgeStageError as error:
+                                # After a valid Accepted/Pending reply the
+                                # guest may exhaust its own smaller poll budget
+                                # and power off.  That is a retained/deferred
+                                # run, not an endpoint or wire failure.
+                                if operation is not None and isinstance(error.cause, NoRequestBeforeClose):
+                                    _write_signal(status_file, "deferred")
+                                    return
+                                raise
+                            operation = (seen_operation, seen_input)
+                            if method == "POST":
+                                posts += 1
+                                if posts > 1:
+                                    raise ProtocolError("bounded reconciliation issued a second POST")
+                            retry = operation if (method, status) == ("GET", HTTPStatus.NOT_FOUND) else None
+                            # A 404 GET is the one deliberate continuation:
+                            # its next frame must be the exact same POST.
+                            if status != HTTPStatus.ACCEPTED and retry is None:
+                                return _write_signal(status_file, "served")
                 except BridgeStageError as error:
                     if allow_no_request and isinstance(error.cause, NoRequestBeforeClose):
                         _write_signal(status_file, "unused")

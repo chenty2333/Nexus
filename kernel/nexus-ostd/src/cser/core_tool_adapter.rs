@@ -20,8 +20,8 @@ use cser_core::{
 use sha2::{Digest as _, Sha256};
 
 use super::core_tool_uart::{
-    OperationKey, ToolRequest, ToolRunId, ToolTerminalOutcome, ToolTerminalRecord, ToolUart,
-    ToolUartError, ToolV2Identity,
+    OperationKey, ToolRequest, ToolResponse, ToolResponseState, ToolRunId, ToolTerminalOutcome,
+    ToolTerminalRecord, ToolUart, ToolUartError, ToolV2Identity,
 };
 
 /// Must remain no larger than the bounded UART transport's payload limit.
@@ -256,13 +256,30 @@ pub(crate) enum ToolObservationError {
     PlanRecordMismatch,
 }
 
+/// The complete endpoint observation vocabulary exposed to the guest
+/// orchestrator.  `Accepted` and `Pending` deliberately remain nonterminal:
+/// neither permits a second POST nor an effect/claim transition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ToolEndpointObservation {
+    Terminal(DurableToolObservation),
+    Nonterminal(ToolNonterminalState),
+    Absent,
+    Expired,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ToolNonterminalState {
+    Accepted,
+    Pending,
+}
+
 /// Transport used by the runtime.  Implementations may POST on the initial
 /// attempt, but recovery must use `get` first and may retry only this plan.
 pub(crate) trait ToolEndpoint {
     type Error;
 
-    fn post(&mut self, plan: ToolOperationPlan) -> Result<DurableToolObservation, Self::Error>;
-    fn get(&mut self, plan: ToolOperationPlan) -> Result<DurableToolObservation, Self::Error>;
+    fn post(&mut self, plan: ToolOperationPlan) -> Result<ToolEndpointObservation, Self::Error>;
+    fn get(&mut self, plan: ToolOperationPlan) -> Result<ToolEndpointObservation, Self::Error>;
 }
 
 /// Concrete guest transport for the bounded endpoint. Both first dispatch and
@@ -283,15 +300,32 @@ impl<'a> UartToolEndpoint<'a> {
 
     fn observation(
         plan: ToolOperationPlan,
-        reply: super::core_tool_uart::ToolResponse,
-    ) -> Result<DurableToolObservation, ToolTransportError> {
-        let record = reply
-            .terminal_record()
-            .ok_or(ToolTransportError::NoTerminalRecord {
+        reply: ToolResponse,
+    ) -> Result<ToolEndpointObservation, ToolTransportError> {
+        match reply.state() {
+            ToolResponseState::Terminal => {
+                let record =
+                    reply
+                        .terminal_record()
+                        .ok_or(ToolTransportError::NoTerminalRecord {
+                            status: reply.status,
+                        })?;
+                DurableToolObservation::from_terminal_record(plan, record)
+                    .map(ToolEndpointObservation::Terminal)
+                    .map_err(ToolTransportError::Observation)
+            }
+            ToolResponseState::Accepted => Ok(ToolEndpointObservation::Nonterminal(
+                ToolNonterminalState::Accepted,
+            )),
+            ToolResponseState::Pending => Ok(ToolEndpointObservation::Nonterminal(
+                ToolNonterminalState::Pending,
+            )),
+            ToolResponseState::Absent => Ok(ToolEndpointObservation::Absent),
+            ToolResponseState::Expired => Ok(ToolEndpointObservation::Expired),
+            ToolResponseState::LegacyNonterminal => Err(ToolTransportError::NoTerminalRecord {
                 status: reply.status,
-            })?;
-        DurableToolObservation::from_terminal_record(plan, record)
-            .map_err(ToolTransportError::Observation)
+            }),
+        }
     }
 }
 
@@ -311,7 +345,7 @@ pub(crate) enum ToolTransportError {
 impl ToolEndpoint for UartToolEndpoint<'_> {
     type Error = ToolTransportError;
 
-    fn post(&mut self, plan: ToolOperationPlan) -> Result<DurableToolObservation, Self::Error> {
+    fn post(&mut self, plan: ToolOperationPlan) -> Result<ToolEndpointObservation, Self::Error> {
         let request = match plan.transport_identity {
             Some(identity) => ToolRequest::new_v2(
                 identity,
@@ -333,7 +367,7 @@ impl ToolEndpoint for UartToolEndpoint<'_> {
         Self::observation(plan, reply)
     }
 
-    fn get(&mut self, plan: ToolOperationPlan) -> Result<DurableToolObservation, Self::Error> {
+    fn get(&mut self, plan: ToolOperationPlan) -> Result<ToolEndpointObservation, Self::Error> {
         let request = match plan.transport_identity {
             Some(identity) => ToolRequest::get_v2(
                 identity,
@@ -650,7 +684,7 @@ mod tests {
     }
 
     #[test]
-    fn only_a_checksum_valid_404_is_classified_as_an_absent_endpoint_record() {
+    fn checksum_bound_nonterminal_absent_and_expired_states_remain_distinct() {
         let effect = EffectId::new(RootId::new(7).unwrap(), 9).unwrap();
         let plan = ToolOperationPlan::new(
             [0x33; 16],
@@ -665,7 +699,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             UartToolEndpoint::observation(plan, ToolResponse::missing_terminal_for_test(404)),
-            Err(ToolTransportError::NoTerminalRecord { status: 404 }),
+            Ok(ToolEndpointObservation::Absent),
         );
         assert_eq!(
             UartToolEndpoint::observation(plan, ToolResponse::missing_terminal_for_test(500)),

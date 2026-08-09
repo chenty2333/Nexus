@@ -2,7 +2,7 @@ from __future__ import annotations
 import json, os, socket, subprocess, sys, tempfile, time, unittest
 from pathlib import Path
 TOOLS = Path(__file__).resolve().parents[1]; sys.path.insert(0, str(TOOLS))
-from matrix_controller import _CURRENT_GUEST_RUN_ID, _RECOVERY_METRICS_PREFIX, _metric, _recovery_metrics_from_serial, observe_barriers
+from matrix_controller import _CURRENT_GUEST_RUN_ID, _RECOVERY_DEFERRED_PREFIX, _RECOVERY_METRICS_PREFIX, _metric, _recovery_metrics_from_serial, observe_barriers
 from matrix_protocol import BarrierProtocolError, barrier, parse_barrier, config_response, paced_sendall
 from summarize_metrics import load_metrics, summarize
 
@@ -108,6 +108,24 @@ class MatrixProtocolTests(unittest.TestCase):
             malformed = dict(base); malformed[field] = bad
             with self.assertRaises(ValueError):
                 _recovery_metrics_from_serial((_RECOVERY_METRICS_PREFIX + json.dumps(malformed) + "\n").encode(), variant="cser", run_id="a" * 32)
+
+    def test_deferred_recovery_is_not_accepted_as_a_terminal_measurement(self) -> None:
+        deferred = {
+            "variant": "cser", "run_id": "a" * 32, "terminal": False,
+            "claims_retained": True, "post_authorized": False,
+        }
+        parsed = _recovery_metrics_from_serial(
+            (_RECOVERY_DEFERRED_PREFIX + json.dumps(deferred) + "\n").encode(),
+            variant="cser", run_id="a" * 32,
+        )
+        self.assertFalse(parsed["terminal"])
+        row = _metric(
+            run_id="a" * 32, variant="cser", trial=1, cutpoint="post_register", cutpoint_id=2,
+            crash_method="pid_sigkill", trial_dir=Path("/trial"), media=[], guest={},
+            recovery=parsed, recovery_metrics_authoritative=True, container_id=None,
+        )
+        self.assertEqual((row["completion_state"], row["metrics_source"], row["retained_claims"]),
+                         ("deferred_retained", "recovery_deferred", None))
 
     def test_authoritative_recovery_metrics_win_over_initial_host_file(self) -> None:
         recovery = {

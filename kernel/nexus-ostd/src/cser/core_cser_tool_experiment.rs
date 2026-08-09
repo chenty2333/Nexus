@@ -29,7 +29,9 @@ use cser_core::{
 use super::{
     core_reboot::{BootDeviceQuarantineGuard, OstdBootJournal, QuarantinedRecoveredBoot},
     core_runtime::OstdCserRuntime,
-    core_tool_adapter::{DurableToolObservation, ToolEndpoint, ToolOperationPlan},
+    core_tool_adapter::{
+        DurableToolObservation, ToolEndpoint, ToolEndpointObservation, ToolOperationPlan,
+    },
     core_tool_dma_runtime::ToolDmaRuntime,
 };
 
@@ -430,7 +432,7 @@ impl ArmedToolDma {
     pub(crate) fn post_tool<E: ToolEndpoint>(
         &self,
         endpoint: &mut E,
-    ) -> Result<DurableToolObservation, E::Error> {
+    ) -> Result<ToolEndpointObservation, E::Error> {
         self.tool.submit(endpoint)
     }
 
@@ -439,7 +441,7 @@ impl ArmedToolDma {
     pub(crate) fn recover_tool<E: ToolEndpoint>(
         &self,
         endpoint: &mut E,
-    ) -> Result<DurableToolObservation, E::Error> {
+    ) -> Result<ToolEndpointObservation, E::Error> {
         self.tool.recover(endpoint)
     }
 

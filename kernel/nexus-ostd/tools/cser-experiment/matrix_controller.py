@@ -21,6 +21,7 @@ SCHEMA_VERSION = 2
 VARIANTS = frozenset(("cser", "baseline"))
 _CID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$")
 _RECOVERY_METRICS_PREFIX = "TOOL_DMA_RECOVERY_METRICS "
+_RECOVERY_DEFERRED_PREFIX = "TOOL_DMA_DEFERRED "
 _MAX_RECOVERY_SERIAL_LINE_BYTES = 64 * 1024
 _RECOVERY_STDERR_TAIL_BYTES = 4096
 # Legacy fake-guest compatibility only. Real QEMU rows always receive a fresh
@@ -131,6 +132,7 @@ def _recovery_metrics_from_serial_lines(
     invariant assertions must be a guest marker from the recovered kernel.
     """
     marker: str | None = None
+    deferred: str | None = None
     for raw_line in lines:
         try:
             decoded = raw_line.decode("utf-8", errors="strict")
@@ -142,19 +144,27 @@ def _recovery_metrics_from_serial_lines(
         # bounded by the LF-delimited chunk limit.
         for line in decoded.splitlines():
             if line.startswith(_RECOVERY_METRICS_PREFIX):
-                if marker is not None:
-                    raise ValueError("recovery serial must contain exactly one terminal metrics marker")
+                if marker is not None or deferred is not None:
+                    raise ValueError("recovery serial must contain one terminal or deferred marker")
                 marker = line[len(_RECOVERY_METRICS_PREFIX):]
-    if marker is None:
-        raise ValueError("recovery serial must contain exactly one terminal metrics marker")
+            if line.startswith(_RECOVERY_DEFERRED_PREFIX):
+                if marker is not None or deferred is not None:
+                    raise ValueError("recovery serial must contain one terminal or deferred marker")
+                deferred = line[len(_RECOVERY_DEFERRED_PREFIX):]
+    if marker is None and deferred is None:
+        raise ValueError("recovery serial must contain one terminal or deferred marker")
     try:
-        value = json.loads(marker)
+        value = json.loads(marker if marker is not None else deferred)
     except json.JSONDecodeError as exc:
         raise ValueError(f"invalid recovery serial metrics: {exc}") from exc
     if not isinstance(value, dict):
         raise ValueError("recovery serial metrics must be a JSON object")
     if value.get("variant") != variant or value.get("run_id") != run_id:
         raise ValueError("recovery serial metrics identity mismatch")
+    if deferred is not None:
+        if value.get("terminal") is not False or value.get("claims_retained") is not True or value.get("post_authorized") is not False:
+            raise ValueError("deferred recovery receipt must retain claims and forbid POST")
+        return value
     if value.get("terminal") is not True or value.get("invariants_ok") is not True:
         raise ValueError("recovery guest did not publish terminal invariants_ok metrics")
     _require_terminal_metrics(value)
@@ -339,19 +349,29 @@ def _metric(*, run_id: str, variant: str, trial: int, cutpoint: str, cutpoint_id
         # Real QEMU results have exactly one authority for these counters: the
         # terminal receipt emitted after recovery.  Never substitute the
         # initial guest's host-captured file, which necessarily predates it.
-        _require_terminal_metrics(recovery)
-        metric_source = recovery
-        metrics_source = "recovery_terminal"
+        # `_metric` is also used by focused controller tests with a validated
+        # terminal counter shape but without the serial marker's redundant
+        # `terminal: true`.  Only an explicit false is nonterminal here.
+        if recovery.get("terminal") is not False:
+            _require_terminal_metrics(recovery)
+            metric_source = recovery
+            metrics_source = "recovery_terminal"
+            completion_state = "recovery_verified"
+        else:
+            metric_source = {}
+            metrics_source = "recovery_deferred"
+            completion_state = "deferred_retained"
     else:
         # Keep generic controller/fake-guest users working.  They do not claim
         # that this optional host file is an authentic terminal measurement.
         metric_source = guest
         metrics_source = "initial_guest_file"
+        completion_state = "recovery_verified" if recovery is not None else "crashed_unrecovered"
     return {
         "schema_version": SCHEMA_VERSION, "run_id": run_id, "variant": variant,
         "trial": trial, "cutpoint": cutpoint, "cutpoint_id": cutpoint_id, "crash_method": crash_method,
         "barrier_observed": True, "barrier_acknowledged": False, "trial_dir": str(trial_dir),
-        "completion_state": "recovery_verified" if recovery is not None else "crashed_unrecovered",
+        "completion_state": completion_state,
         "retention_horizon": "bounded_observation", "permanent_retention": None,
         "admin_disposition": None, "admin_disposition_count": None,
         "metrics_source": metrics_source,
