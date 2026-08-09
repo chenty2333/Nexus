@@ -2538,11 +2538,12 @@ mod tests {
         let after = journal.telemetry().expect("telemetry");
 
         assert_eq!(journal.read_all_image().expect("image"), b"first-second");
-        // The second append touches one data sector, two segment headers, and
-        // two manifest copies—not a complete image-sized bank.
-        assert_eq!(after.sectors_written - before.sectors_written, 5);
+        // COW keeps the committed prefix untouched: the replacement contains
+        // both framed sectors, followed by two headers and two manifest
+        // copies. This is bounded by one segment rather than the whole log.
+        assert_eq!(after.sectors_written - before.sectors_written, 6);
         assert_eq!(after.flushes - before.flushes, 5);
-        assert_eq!(after.sectors_read - before.sectors_read, 5);
+        assert_eq!(after.sectors_read - before.sectors_read, 6);
         assert!(after.hash_bytes > before.hash_bytes);
         assert_ne!(after.phase_tsc[JournalIoPhase::PayloadWritten as usize], 0);
         assert_ne!(
