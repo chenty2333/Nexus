@@ -1,38 +1,70 @@
 # CSER host tool endpoint experiment
 
-`tool_endpoint.py` is deliberately independent of Nexus.  It persists one
-operation under `(run_id, operation_key)` before responding.  Retrying the same
-key and payload digest is idempotent; changing the payload for that key is a
-conflict.  `GET` exposes the durable status.  SQLite uses rollback journaling
-and `synchronous=FULL`.
+This is a **reference-grade trusted-local adapter**, not a remote attestation
+service. `tool_endpoint.py` owns one launcher-selected local SQLite database;
+SQLite rollback journaling and `synchronous=FULL` establish the sidecar's
+durability boundary. Its authority is the local process plus that database,
+not an identity asserted by a remote peer.
+
+Every real-QEMU trial generates and persists one complete v2 identity before
+the initial boot: `run_id`, namespace, local authority ID, effect ID, catalog
+digest, operation key, and input digest. The endpoint persists its authority,
+effect, namespace, catalog and retention contract in metadata; the initial and
+recovery boots reuse the same row-local media, TPM state, endpoint database,
+and identity. A changed namespace, authority/effect ID, catalog digest, or
+retention policy is a startup failure, not a reinterpretation of old evidence.
+
+The endpoint has the v2 state machine `Accepted -> [Pending] ->
+Succeeded(result_digest) | Failed(code)`; a synchronous operation may advance
+directly from `Accepted` to a terminal state. Terminal states are immutable. A
+lookup can also return `expired` (HTTP 410) after its retention window or
+`absent` (HTTP 404) when no matching record exists. Only checksum- and
+identity-bound `absent` may reach the narrow same-key retry path; `expired`
+never authorizes retry or release. An input-digest mismatch is conflict, never
+apparent absence.
+
+| v2 state | HTTP result | CSER meaning |
+| --- | --- | --- |
+| `accepted` / `pending` | 202 | Nonterminal; no evidence digest and no retirement authority |
+| `succeeded` | 201 on first submit, 200 on replay/query | Terminal outcome evidence with a v2 evidence digest |
+| `failed` | 409 | Terminal failure outcome evidence with a v2 evidence digest |
+| `expired` | 410 | Retained expiry tombstone; never retry/release authority |
+| `absent` | 404 | Exact-identity absence; the only state eligible for same-key retry |
+
+Outcome and quiescence remain separate. A terminal endpoint record is logical
+outcome evidence for the tool component; it cannot retire the DMA queue, page,
+or IOVA claims. Reset/IRQ-drain/IOTLB evidence may retire those physical claims
+while the tool outcome remains unresolved.
 
 `uart_http_bridge.py` is the only adapter between COM2's QEMU Unix-socket UART
-and the HTTP endpoint.  It accepts only the configured 32-lowercase-hex run id and checks framing,
-checksum, payload digest, and size before issuing HTTP.  Before a successful
-reply crosses UART it recomputes the endpoint record digest over `(run_id,
-operation_key, payload_digest, terminal_status, result)`; HTTP formatting and
-the `replayed` marker are not evidence. Errors are returned as 503 with no
-terminal record, never as a success-shaped response.
+and the HTTP endpoint. Real QEMU rows use CSER2, which checks the complete
+identity and carries a v2 evidence digest. The digest is length-delimited under
+`nexus-cser-local-evidence-record-v2` and binds namespace, authority, effect,
+run, operation, input, catalog, schema, terminal state, and result. It is a
+local integrity binding, **not** a signature or remote authentication proof.
+The bridge rejects malformed framing, checksum, identity, input, catalog, and
+evidence-digest mismatches fail-closed. The older CSER1/five-field digest is a
+delimited compatibility path for focused tests, not the real-QEMU authority.
 
-Request frame (ASCII, exactly one line):
-
-```
-CSER1 REQ <POST|GET> <run_id> <operation_key> <sha256(payload)> <base64(payload)|-> <sha256(preceding tokens)>\n
-```
-
-Response frame:
+CSER2 request and response frames are ASCII, one bounded line each:
 
 ```
-CSER1 RESP <run_id> <operation_key> <http_status> <payload_sha256> <terminal_status> <result> <record_sha256> <sha256(preceding tokens)>\n
+CSER2 REQ <POST|GET> <namespace> <authority> <effect> <run_id> <operation_key> <input_sha256> <catalog_sha256> <payload_base64> <sha256(preceding tokens)>\n
+CSER2 RESP <http_status> <namespace> <authority> <effect> <run_id> <operation_key> <input_sha256> <catalog_sha256> <state> <result> <evidence_sha256|-> <sha256(preceding tokens)>\n
 ```
 
-The checksum is SHA-256 of the preceding tokens joined with exactly one ASCII
-space. `record_sha256` is SHA-256 under the domain separator
-`nexus-cser-tool-record-v1`, with each of the five terminal-record fields
-length-delimited. `GET` carries the pre-recorded payload digest and an empty
-payload; it queries instead of applying. `--fault-after-apply-once` models the key CSER ambiguity: the operation
-is durable, but the client loses the response and must use its key to retry or
-query it.
+The final frame checksum is SHA-256 of the preceding tokens joined with exactly
+one ASCII space. `GET` carries no new effect: it queries the complete durable
+identity. `--fault-after-apply-once` models the important ambiguity: a durable
+record exists but the client loses the response and must query it by that same
+identity.
+
+Retention is fail-closed. Expiry turns an old row into a retained `expired`
+tombstone rather than deleting it into ambiguity. Legacy v1 rows migrate only
+to unbound, expired tombstones; they never acquire a v2 authority/catalog
+binding retroactively. An unknown, corrupt, or newer endpoint schema fails
+startup. The adapter deliberately does **not** provide remote MACs,
+mTLS, a remote registry, multi-tenancy, or cross-host trust establishment.
 
 Example:
 
@@ -49,6 +81,12 @@ python3 -m unittest discover -s tests -v
 `post_quiescence`, `pre_discharge`, and `post_discharge`. Each trial receives a
 fresh reflink-or-copy of every `--base-media` input and retains its media after
 the crash.
+
+Before each copy, the runner SHA-256s the base medium, verifies that both the
+copied file and the base still match that digest after the copy, and records
+the digest under `TRIAL/base-media.sha256`. `--base-media-dir` provisioning is
+directory-locked, so concurrent baseline and CSER first runs can share an
+empty base directory without seeing an in-progress `truncate` result.
 
 `--only-cutpoint NAME` selects one of those seven rows for focused diagnosis;
 it does not alter that row's guest, media, controller, or recovery path.
@@ -92,13 +130,13 @@ PIPE before a barrier.
 `qemu_boot.sh` for both boots, stages each row's `journal.raw`, `outbox.raw`,
 and `ram.raw` into the reviewed OSDK envelope (and resets per-row swtpm state
 before boot one), starts the endpoint and COM2
-bridge, and rejects host-created recovery JSON. Its present guest uses the
-fixed run identity `4242…4242`; every row has separate durable media and a
-separate endpoint database. Until the guest accepts a durable per-trial boot
-identity, the runner must not substitute a random host identity. A recovery
-row is accepted only when QEMU serial contains exactly one
-`TOOL_DMA_RECOVERY_METRICS {…}` record with matching variant/run id and both
-`terminal` and `invariants_ok` true. The informational
+bridge, and rejects host-created recovery JSON. Every row instead receives a
+fresh, persisted per-trial CSER2 identity: run, namespace, authority, effect,
+and the catalog digest computed from the same workspace source as the guest.
+Recovery reuses that exact identity and endpoint database; it cannot replace it
+with a random host value. A recovery row is accepted only when QEMU serial
+contains exactly one `TOOL_DMA_RECOVERY_METRICS {…}` record with matching
+variant/run id and both `terminal` and `invariants_ok` true. The informational
 `TOOL_DMA_EXPERIMENT ...` smoke marker is never a completion receipt.
 
 For real QEMU, the initial/cutpoint budget defaults to 90 seconds and the
@@ -133,6 +171,22 @@ race ahead of the host controller. Recovery boots have no crash cutpoints and
 use `uart_sink.py` solely to satisfy that startup handshake; receiving any byte
 on that recovery-only channel is an error.
 
+The trusted-local launcher supervises the endpoint, COM2 bridge, recovery UART
+sink, and QEMU separately. The bridge and sink publish atomic local readiness
+and terminal status files for the row; these files are diagnostics only, never
+guest evidence. A failed row names one of `endpoint-connect`, `bridge-ready`,
+`guest-boot`, `frame-complete`, `recovery-receipt`, or `cleanup`, and preserves
+the corresponding helper stderr log. Recovery accepts a terminal receipt only
+after the bridge served its single recovery request and the COM3 sink closed
+without observing a crash barrier.
+
+The endpoint also exposes local counters and state inventory at `/v1/metrics`.
+They report adapter/contract version, bound authority/namespace/catalog,
+retention, state counts, and submit/replay/conflict/expiry/transition counts.
+They are readiness and diagnosis data, not remote evidence and not a claim
+that retention duration, administrative disposition, or endpoint latency has
+been measured.
+
 `summarize_metrics.py` accepts repeated `--input` arguments. Supplying one
 terminal JSONL from each arm produces a single comparison summary without
 copying or rewriting either arm's raw rows.
@@ -146,3 +200,39 @@ reusing one is rejected instead of appending duplicate row identities.
 This remains a correctness-only matrix. Terminal retained inventory and
 evidence-retirement counts do not measure retained duration, peak retention,
 or the proportion of operations that would require administrative disposition.
+
+## Current performance evidence and non-decisions
+
+The release-profile full-state measurement currently reports, at 4,096 live
+claims, clone `1.014 ms`, invariant checking `1.623 ms`, and projection digest
+`1.753 ms`: `4.390 ms` total. Across the current and prior comparable writable
+runs, the observed total range is approximately `4.39–5.13 ms` (the earlier
+three-run range was `4.63–5.13 ms`); the 512-claim current point is
+approximately `0.871 ms`. These are profile measurements, not latency SLOs or
+hardware-general results.
+
+The deterministic 64 KiB ATA journal fill writes and reads 8,384 sectors each,
+flushes 256 times, and writes roughly 65.5x the logical payload. The validated
+cache avoids revalidating banks between appends; the older uncached path read
+24,769 sectors for the same fill profile. This is evidence to prioritize an
+append/checkpoint design only after its crash-atomic and readback contract is
+preserved; it is not a license to weaken journal-before-anchor ordering.
+
+Runtime-mutex telemetry currently covers only one fail-closed transaction on
+the SMP BSP smoke path. It has not measured contention or cross-CPU
+transactions, so there is no evidence for splitting the authoritative writer
+mutex yet. Any future change must retain one durable ordering and must not
+expose candidate state or effects before the journal and anchor commit.
+
+## UART polling diagnostics
+
+COM2 and COM3 use bounded readiness-poll batches. Between batches they yield
+only from an ordinary OSTD task context; bootstrap and IRQ context remain
+polling-only, so the transport never turns an early-boot or IRQ path into a
+scheduler sleep. The host controller's deadline remains authoritative.
+
+The guest serial log records `TOOL_UART_TIMING` and `CRASH_PROBE_TIMING` lines
+with guest-TSC points for transmit start/completion, first response or ACK
+byte, full frame, and verified endpoint response or matching ACK, plus poll and
+scheduler-yield counts. They are diagnosis and ordering data only: QEMU/TCG
+guest TSC is not an elapsed host-time, endpoint-latency, or performance metric.

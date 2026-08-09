@@ -26,50 +26,59 @@ complete. Further core expansion now needs a compositional workload that can
 distinguish CSER from a strong workload-specific independent finalizer; the
 current fixed tool-plus-DMA experiment does not do so.
 
-The immediate engineering phase is intentionally narrower than full product
-release: complete a trusted-local reference adapter, harden bridge/media/UART
-orchestration, then measure and address demonstrated state-transition,
-journal, and runtime-serialization costs. Remote endpoint authentication,
-multi-provider registries, multi-tenancy, and SDK/platform work are deferred.
+The trusted-local reference-adapter, orchestration-hardening, and measured-
+performance phase is complete. Remote endpoint authentication, multi-provider
+registries, multi-tenancy, and SDK/platform work remain deliberately deferred.
+The next research step is the late-bound compositional workload described in
+`task.md`, not further mechanism expansion on the fixed tool-plus-DMA topology.
 
 ## Current State
 
-The local `main` branch contains the completed catalog-v6 cleanup,
-tool-plus-DMA adapters, and host-controlled crash matrix in reviewable commits
-layered as core, kernel, experiment harness, and documentation. It includes
-typed
-Outcome/Quiescence and Recoverable/Ephemeral catalog fields, symmetric
-Shared/Exclusive admission across both reverse indexes, last-custodian
-conservation, global fail-closed unknown evidence, corrected persistence and
-backpressure checks, catalog-v6 cutover wiring, and RFC 0008. The standard
-catalog remains Exclusive-only; Shared is a tested extension point with one
-complete discharge, reuse, activation, and generation-plus-one lifecycle.
+The local `main` branch contains the catalog-v6 cleanup, tool-plus-DMA adapters,
+strong independent-finalizer baseline, trusted-local CSER2 endpoint contract,
+and host-controlled crash matrix in reviewable commits. The reference adapter
+uses durable `Accepted`/`Pending`/`Succeeded`/`Failed` states and binds terminal
+records to namespace, authority, effect, run, operation, input, catalog, and
+schema. Expired and migrated legacy records remain fail-closed tombstones;
+only exact-identity absence permits one same-key retry. Initial and recovery
+boots share a persisted random identity, and recovery validates that binding
+against durable intent before any endpoint request.
 
-Core all-feature suites, no-std checks, formatting, the production static
-cutover, 27 host-harness tests, both experiment builds, and the HotOS PDF build
-pass. A clean-tree catalog-v6, journal-schema-6 four-boot QEMU seal at commit
-`1a8f75e319167077631ad1e8433d6ec1cfe0b15e` records generation `1 -> 2` reuse,
-stable repeated recovery, and zero retained claims; its locally generated,
-Git-ignored receipt SHA-256 is
-`c94c66a2b272f8e3d0cc663e11a21127e23e92613f9e7fe6590fd39900e9ef8b`.
+The harness supervises endpoint, bridge, UART sink, and QEMU stages; streams
+bounded logs; separates timeout budgets; cleans process groups; locks and
+digest-checks shared base media; and paces bounded COM2/COM3 frames while the
+guest records poll, first-byte, complete-frame, and endpoint timing points. All
+55 host regressions pass with resource warnings promoted to errors. A bounded
+60-second, 12-worker endpoint soak completed with 64 durable keys, 1,329
+idempotent replays, 111 expected conflicts, and zero errors. Focused endpoint,
+bridge, journal, TPM, Loom, and recovery fault paths also pass.
 
-The host harness now streams launcher output directly to per-trial logs,
-separates the 120-second recovery envelope from the guest's internal 90-second
-budget, terminates complete recovery process groups, and parses terminal
-receipts with bounded memory. These regressions run on the public quick and
-full test paths. Fresh real-QEMU smoke rows for both CSER and the baseline at
-`post_endpoint_apply` each recover with two evidence-retired components, zero
-retained claims, and one reconciliation step.
+Fresh strict-CSER2 real-QEMU matrices use the same seven host-controlled crash
+cutpoints and isolated durable ATA, RAM, TPM, and endpoint state for both arms.
+The final baseline and CSER runs each complete 7/7 recoveries with totals of 14
+evidence-retired components, zero retained claims, and seven reconciliation
+steps. This is parity, not a demonstrated CSER safety advantage. Gate-rejection
+counts, wall-clock reconciliation delay, permanent-retention proportion, and
+administrative-disposition proportion remain explicitly unmeasured.
 
-The real-QEMU comparison uses the same seven host-controlled container-kill
-cutpoints and durable ATA, RAM, TPM, and endpoint state for both variants. The
-final reviewed baseline and CSER runs each complete 7/7 recoveries with totals
-of 14 evidence-retired components, zero retained claims, and seven
-reconciliation steps. This is parity, not a demonstrated CSER safety
-advantage: the independent finalizer is deliberately the strongest baseline
-for this fixed workload. Gate-rejection counts, wall-clock reconciliation
-delay, permanent-retention proportion, and administrative-disposition
-proportion remain explicitly unmeasured rather than inferred from the matrix.
+Measured full-state clone, canonical invariant checking, and projection digest
+cost 4.390 ms total at 4,096 live claims in the current release profile, with a
+comparable observed range of about 4.39--5.13 ms. The cached 64-KiB ATA fill
+still performs 8,384 sector writes, 8,384 reads, and 256 flushes (about 65.5x
+write amplification), while removing the old repeated active-bank validation
+reads. Runtime mutex wait/hold telemetry is present, but the SMP smoke observes
+only one BSP transaction and therefore no contention. These measurements do
+not justify a copy-on-write core, segmented journal, or split authoritative
+mutex yet; those changes require workload-level dominance or contention
+evidence.
+
+The public quick gate, both experiment builds, the production cutover check,
+the real in-QEMU PIO-journal ktest, and the separate two-vCPU/multi-thread-TCG
+SMP smoke pass. The SMP result proves a CPU1 IPI and CSER persistence smoke in
+one boot while explicitly retaining the current BSP-only transaction boundary.
+A prior clean-tree catalog-v6 four-boot seal remains the historical production
+recovery seal; current generated QEMU receipts and comparison outputs are
+Git-ignored evidence, not source-controlled release artifacts.
 
 The HotOS draft now states the I2 evidence layers, exact I3 coordinates,
 retirement/abort distinction, evidence-axis separation, Shared boundary,
@@ -102,12 +111,12 @@ alone will not publish the research evidence.
 - [x] Split the work into reviewable core, kernel, experiment, and documentation commits and produce a clean-tree production recovery seal.
 - [x] Remove launcher pipe backpressure, separate nested recovery timeout budgets, clean complete recovery process groups, bound receipt parsing, and place the 27 host regressions on the public quick/full paths.
 - [x] Fast-forward the completed CSER feature work into the local Nexus `main` branch and make it the continuing development branch.
-- [ ] Complete the trusted-local reference adapter with a versioned durable terminal-state contract, bound persistent identities, fail-closed retention/migration rules, focused crash tests, readiness, diagnostics, and basic metrics.
-- [ ] Supervise bridge/endpoint/UART/QEMU readiness and exits with bounded, stage-specific failure reports.
-- [ ] Make shared base media immutable or lock-protected and digest-checked under parallel baseline/CSER provisioning.
-- [ ] Replace COM2/COM3 busy-spin waits with bounded polling plus yield/backoff and phase timing while preserving fail-closed deadlines.
-- [ ] Run targeted long-duration soak, injected endpoint/bridge/journal/TPM failures, and SMP/concurrency validation after the focused paths stabilize.
-- [ ] Instrument full-state clone/invariant/digest work and replace it with verified incremental or copy-on-write paths only if measurement establishes it as material.
-- [ ] Measure ATA journal growth and, if dominant, implement an append-oriented segment/checkpoint layout without weakening readback, crash atomicity, or journal-before-anchor ordering.
-- [ ] Measure runtime mutex queue/hold time and reduce demonstrated serialization without exposing uncommitted state or effects.
+- [x] Complete the trusted-local reference adapter with a versioned durable terminal-state contract, bound persistent identities, fail-closed retention/migration rules, focused crash tests, readiness, diagnostics, and basic metrics.
+- [x] Supervise bridge/endpoint/UART/QEMU readiness and exits with bounded, stage-specific failure reports.
+- [x] Make shared base media immutable or lock-protected and digest-checked under parallel baseline/CSER provisioning.
+- [x] Replace COM2/COM3 busy-spin waits with bounded polling plus yield/backoff and phase timing while preserving fail-closed deadlines.
+- [x] Run targeted long-duration soak, injected endpoint/bridge/journal/TPM failures, and SMP/concurrency validation after the focused paths stabilize.
+- [x] Instrument full-state clone/invariant/digest work and replace it with verified incremental or copy-on-write paths only if measurement establishes it as material.
+- [x] Measure ATA journal growth and, if dominant, implement an append-oriented segment/checkpoint layout without weakening readback, crash atomicity, or journal-before-anchor ordering.
+- [x] Measure runtime mutex queue/hold time and reduce demonstrated serialization without exposing uncommitted state or effects.
 - [ ] Publish the local Nexus `main` branch and a small source-bound evidence bundle after external GitHub publication is explicitly authorized; configure a remote for `nexus-hotos` before publishing the paper commit.
