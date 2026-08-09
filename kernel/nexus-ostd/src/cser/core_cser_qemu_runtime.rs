@@ -352,8 +352,10 @@ fn finish_deferred(
     progress: ToolEndpointObservation,
 ) -> ! {
     println!(
-        "TOOL_DMA_DEFERRED {{\"variant\":\"cser\",\"run_id\":\"{}\",\"state\":\"{state:?}\",\"endpoint\":\"{progress:?}\",\"terminal\":false,\"claims_retained\":true,\"post_authorized\":false}}",
+        "TOOL_DMA_DEFERRED {{\"variant\":\"cser\",\"run_id\":\"{}\",\"state\":\"{:?}\",\"endpoint\":\"{:?}\",\"terminal\":false,\"claims_retained\":true,\"post_authorized\":false}}",
         HexRun(run_id),
+        state,
+        progress,
     );
     poweroff(ExitCode::Success)
 }
