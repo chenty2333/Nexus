@@ -30,6 +30,22 @@ pub(crate) fn launch_baseline() -> ! {
     )
 }
 
+#[cfg(feature = "cser-tool-handoff-experiment")]
+pub(crate) fn launch_handoff() -> ! {
+    launch(
+        run_handoff_profile,
+        "logical CSER handoff experiment manager task builds",
+    )
+}
+
+#[cfg(feature = "cser-tool-handoff-baseline-experiment")]
+pub(crate) fn launch_handoff_baseline() -> ! {
+    launch(
+        run_handoff_baseline_profile,
+        "logical independent-finalizer handoff manager task builds",
+    )
+}
+
 fn launch(run: fn(), message: &'static str) -> ! {
     let manager = Arc::new(TaskOptions::new(run).build().expect(message));
     manager.run();
@@ -45,6 +61,16 @@ fn run_cser_profile() {
 #[cfg(feature = "cser-tool-dma-baseline-experiment")]
 fn run_baseline_profile() {
     super::core_baseline_qemu_runtime::run();
+}
+
+#[cfg(feature = "cser-tool-handoff-experiment")]
+fn run_handoff_profile() {
+    super::core_cser_handoff_qemu_runtime::run();
+}
+
+#[cfg(feature = "cser-tool-handoff-baseline-experiment")]
+fn run_handoff_baseline_profile() {
+    super::core_baseline_handoff_qemu_runtime::run();
 }
 
 /// The initial integrated path has one fixed run identity so the guest-side

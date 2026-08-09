@@ -14,6 +14,8 @@ extern crate alloc;
     feature = "cser-pio-journal-ktest",
     feature = "cser-tool-dma-experiment",
     feature = "cser-tool-dma-baseline-experiment",
+    feature = "cser-tool-handoff-experiment",
+    feature = "cser-tool-handoff-baseline-experiment",
 )))]
 compile_error!("one CSER core runtime profile must be selected");
 
@@ -47,11 +49,24 @@ compile_error!("one CSER core runtime profile must be selected");
         feature = "cser-pio-journal-ktest",
         feature = "cser-tool-dma-baseline-experiment"
     ),
+    all(
+        feature = "cser-pio-journal-ktest",
+        feature = "cser-tool-handoff-experiment"
+    ),
+    all(
+        feature = "cser-pio-journal-ktest",
+        feature = "cser-tool-handoff-baseline-experiment"
+    ),
     all(feature = "cser-production", feature = "cser-tool-dma-experiment"),
     all(
         feature = "cser-production",
         feature = "cser-tool-dma-baseline-experiment"
     ),
+    all(feature = "cser-production", feature = "cser-tool-handoff-experiment"),
+    all(
+        feature = "cser-production",
+        feature = "cser-tool-handoff-baseline-experiment"
+    ),
     all(
         feature = "cser-core-reply-recovery",
         feature = "cser-tool-dma-experiment"
@@ -61,12 +76,28 @@ compile_error!("one CSER core runtime profile must be selected");
         feature = "cser-tool-dma-baseline-experiment"
     ),
     all(
+        feature = "cser-core-reply-recovery",
+        feature = "cser-tool-handoff-experiment"
+    ),
+    all(
+        feature = "cser-core-reply-recovery",
+        feature = "cser-tool-handoff-baseline-experiment"
+    ),
+    all(
         feature = "cser-core-dma-recovery",
         feature = "cser-tool-dma-experiment"
     ),
     all(
         feature = "cser-core-dma-recovery",
         feature = "cser-tool-dma-baseline-experiment"
+    ),
+    all(
+        feature = "cser-core-dma-recovery",
+        feature = "cser-tool-handoff-experiment"
+    ),
+    all(
+        feature = "cser-core-dma-recovery",
+        feature = "cser-tool-handoff-baseline-experiment"
     ),
     all(feature = "cser-core-tpm-anchor", feature = "cser-tool-dma-experiment"),
     all(
@@ -74,13 +105,46 @@ compile_error!("one CSER core runtime profile must be selected");
         feature = "cser-tool-dma-baseline-experiment"
     ),
     all(
+        feature = "cser-core-tpm-anchor",
+        feature = "cser-tool-handoff-experiment"
+    ),
+    all(
+        feature = "cser-core-tpm-anchor",
+        feature = "cser-tool-handoff-baseline-experiment"
+    ),
+    all(
         feature = "cser-tool-dma-experiment",
         feature = "cser-tool-dma-baseline-experiment"
+    ),
+    all(
+        feature = "cser-tool-dma-experiment",
+        feature = "cser-tool-handoff-experiment"
+    ),
+    all(
+        feature = "cser-tool-dma-baseline-experiment",
+        feature = "cser-tool-handoff-experiment"
+    ),
+    all(
+        feature = "cser-tool-dma-experiment",
+        feature = "cser-tool-handoff-baseline-experiment"
+    ),
+    all(
+        feature = "cser-tool-dma-baseline-experiment",
+        feature = "cser-tool-handoff-baseline-experiment"
+    ),
+    all(
+        feature = "cser-tool-handoff-experiment",
+        feature = "cser-tool-handoff-baseline-experiment"
     ),
     all(feature = "cser-smp-smoke", feature = "cser-tool-dma-experiment"),
     all(
         feature = "cser-smp-smoke",
         feature = "cser-tool-dma-baseline-experiment"
+    ),
+    all(feature = "cser-smp-smoke", feature = "cser-tool-handoff-experiment"),
+    all(
+        feature = "cser-smp-smoke",
+        feature = "cser-tool-handoff-baseline-experiment"
     ),
 ))]
 compile_error!("CSER runtime profiles are mutually exclusive");
@@ -94,7 +158,8 @@ mod core_reply_adapter;
     feature = "cser-core-reply-recovery",
     feature = "cser-core-dma-recovery",
     feature = "cser-smp-smoke",
-    feature = "cser-tool-dma-experiment"
+    feature = "cser-tool-dma-experiment",
+    feature = "cser-tool-handoff-experiment"
 ))]
 #[path = "cser/core_runtime.rs"]
 mod core_runtime;
@@ -123,6 +188,8 @@ mod core_supervisor_vnext;
     feature = "cser-production",
     feature = "cser-tool-dma-experiment",
     feature = "cser-tool-dma-baseline-experiment",
+    feature = "cser-tool-handoff-experiment",
+    feature = "cser-tool-handoff-baseline-experiment",
     feature = "cser-pio-journal-ktest",
 ))]
 #[path = "cser/core_reboot.rs"]
@@ -133,6 +200,7 @@ mod core_reboot;
     feature = "cser-core-dma-recovery",
     feature = "cser-tool-dma-experiment",
     feature = "cser-tool-dma-baseline-experiment",
+    feature = "cser-tool-handoff-experiment",
 ))]
 #[path = "cser/core_dma_adapter.rs"]
 mod core_dma_adapter;
@@ -140,6 +208,7 @@ mod core_dma_adapter;
 #[cfg(any(
     feature = "cser-tool-dma-experiment",
     feature = "cser-tool-dma-baseline-experiment",
+    feature = "cser-tool-handoff-experiment",
 ))]
 #[path = "cser/core_experiment_dma_flow.rs"]
 mod core_experiment_dma_flow;
@@ -153,6 +222,8 @@ mod core_dma_runtime;
     feature = "cser-core-tpm-anchor",
     feature = "cser-tool-dma-experiment",
     feature = "cser-tool-dma-baseline-experiment",
+    feature = "cser-tool-handoff-experiment",
+    feature = "cser-tool-handoff-baseline-experiment",
 ))]
 #[path = "cser/core_tpm_anchor.rs"]
 mod core_tpm_anchor;
@@ -161,6 +232,8 @@ mod core_tpm_anchor;
     feature = "cser-production",
     feature = "cser-tool-dma-experiment",
     feature = "cser-tool-dma-baseline-experiment",
+    feature = "cser-tool-handoff-experiment",
+    feature = "cser-tool-handoff-baseline-experiment",
     feature = "cser-pio-journal-ktest",
 ))]
 #[path = "cser/core_pio_journal.rs"]
@@ -174,6 +247,7 @@ mod core_reply_outbox;
     feature = "cser-production",
     feature = "cser-tool-dma-experiment",
     feature = "cser-tool-dma-baseline-experiment",
+    feature = "cser-tool-handoff-experiment",
 ))]
 #[path = "cser/core_device_quarantine.rs"]
 mod core_device_quarantine;
@@ -182,6 +256,7 @@ mod core_device_quarantine;
     feature = "cser-production",
     feature = "cser-tool-dma-experiment",
     feature = "cser-tool-dma-baseline-experiment",
+    feature = "cser-tool-handoff-experiment",
 ))]
 #[path = "cser/core_dma_arena_allocator.rs"]
 mod core_dma_arena_allocator;
@@ -190,6 +265,7 @@ mod core_dma_arena_allocator;
     feature = "cser-production",
     feature = "cser-tool-dma-experiment",
     feature = "cser-tool-dma-baseline-experiment",
+    feature = "cser-tool-handoff-experiment",
 ))]
 #[path = "cser/core_qemu_persistent_boot.rs"]
 mod core_qemu_persistent_boot;
@@ -201,6 +277,8 @@ mod core_persistent_runtime;
 #[cfg(any(
     feature = "cser-tool-dma-experiment",
     feature = "cser-tool-dma-baseline-experiment",
+    feature = "cser-tool-handoff-experiment",
+    feature = "cser-tool-handoff-baseline-experiment",
 ))]
 #[path = "cser/core_crash_probe.rs"]
 mod core_crash_probe;
@@ -208,6 +286,8 @@ mod core_crash_probe;
 #[cfg(any(
     feature = "cser-tool-dma-experiment",
     feature = "cser-tool-dma-baseline-experiment",
+    feature = "cser-tool-handoff-experiment",
+    feature = "cser-tool-handoff-baseline-experiment",
 ))]
 #[path = "cser/core_tool_uart.rs"]
 mod core_tool_uart;
@@ -215,11 +295,16 @@ mod core_tool_uart;
 #[cfg(any(
     feature = "cser-tool-dma-experiment",
     feature = "cser-tool-dma-baseline-experiment",
+    feature = "cser-tool-handoff-experiment",
+    feature = "cser-tool-handoff-baseline-experiment",
 ))]
 #[path = "cser/core_tool_adapter.rs"]
 mod core_tool_adapter;
 
-#[cfg(feature = "cser-tool-dma-experiment")]
+#[cfg(any(
+    feature = "cser-tool-dma-experiment",
+    feature = "cser-tool-handoff-experiment",
+))]
 #[path = "cser/core_tool_dma_runtime.rs"]
 mod core_tool_dma_runtime;
 
@@ -231,13 +316,29 @@ mod core_cser_tool_experiment;
 #[path = "cser/core_cser_qemu_runtime.rs"]
 mod core_cser_qemu_runtime;
 
+#[cfg(feature = "cser-tool-handoff-experiment")]
+#[path = "cser/core_cser_handoff_experiment.rs"]
+mod core_cser_handoff_experiment;
+
+#[cfg(feature = "cser-tool-handoff-experiment")]
+#[path = "cser/core_cser_handoff_qemu_runtime.rs"]
+mod core_cser_handoff_qemu_runtime;
+
+#[cfg(feature = "cser-tool-handoff-baseline-experiment")]
+#[path = "cser/core_baseline_handoff_qemu_runtime.rs"]
+mod core_baseline_handoff_qemu_runtime;
+
 #[cfg(feature = "cser-tool-dma-baseline-experiment")]
 #[path = "cser/core_baseline_runtime.rs"]
 mod core_baseline_runtime;
 
-// A deliberately portable, workload-specific upper-bound baseline for the
-// late-bound handoff experiment.  It is not wired to the QEMU baseline.
-#[cfg(feature = "cser-tool-dma-baseline-experiment")]
+// A workload-specific upper-bound baseline for the late-bound handoff
+// experiment. Its portable state machine is also used by the independent
+// logical-only QEMU baseline lane below.
+#[cfg(any(
+    feature = "cser-tool-dma-baseline-experiment",
+    feature = "cser-tool-handoff-baseline-experiment",
+))]
 #[path = "cser/core_baseline_handoff.rs"]
 mod core_baseline_handoff;
 
@@ -252,6 +353,8 @@ mod core_baseline_qemu_runtime;
 #[cfg(any(
     feature = "cser-tool-dma-experiment",
     feature = "cser-tool-dma-baseline-experiment",
+    feature = "cser-tool-handoff-experiment",
+    feature = "cser-tool-handoff-baseline-experiment",
 ))]
 #[path = "cser/core_experiment_runtime.rs"]
 mod core_experiment_runtime;
@@ -296,4 +399,16 @@ fn kernel_main() {
 #[ostd::main]
 fn kernel_main() {
     core_experiment_runtime::launch_baseline()
+}
+
+#[cfg(feature = "cser-tool-handoff-experiment")]
+#[ostd::main]
+fn kernel_main() {
+    core_experiment_runtime::launch_handoff()
+}
+
+#[cfg(feature = "cser-tool-handoff-baseline-experiment")]
+#[ostd::main]
+fn kernel_main() {
+    core_experiment_runtime::launch_handoff_baseline()
 }

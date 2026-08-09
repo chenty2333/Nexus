@@ -225,6 +225,94 @@ qemu.args = """\
     -drive if=pflash,format=raw,unit=1,file=/tmp/nexus-home/OVMF_VARS.fd \
 """
 
+# Matched, logical-only CSER3 single-hop handoff lane.  This gets fresh legacy
+# journal/outbox media and independent COM2/COM3/TPM sockets so it cannot
+# consume or overwrite Tool+DMA experiment artifacts.
+[scheme."tool-handoff-cser"]
+build.no_default_features = true
+build.features = ["cser-tool-handoff-experiment"]
+qemu.args = """\
+    -nodefaults \
+    -object memory-backend-file,id=tool-handoff-ram,size=1G,mem-path=/work/artifacts/tool-handoff-cser/ram.raw,offset=0,share=on,discard-data=off,readonly=off \
+    -machine q35,kernel-irqchip=split,default-bus-bypass-iommu=off,memory-backend=tool-handoff-ram \
+    -accel tcg,thread=single \
+    -cpu Icelake-Server,+x2apic \
+    -m 1G \
+    -smp 1 \
+    -no-reboot \
+    -display none \
+    -monitor none \
+    -chardev stdio,id=serial0,signal=off \
+    -serial chardev:serial0 \
+    -chardev socket,id=tool-com2,path=/work/artifacts/tool-handoff-cser/com2-tool.sock,server=on,wait=on \
+    -serial chardev:tool-com2 \
+    -chardev socket,id=crash-com3,path=/work/artifacts/tool-handoff-cser/com3-crash.sock,server=on,wait=on \
+    -serial chardev:crash-com3 \
+    -chardev file,id=entry-debugcon,path=/work/artifacts/tool-handoff-cser/task-entry-debugcon.log \
+    -device isa-debugcon,iobase=0xe9,chardev=entry-debugcon \
+    -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
+    -device intel-iommu,intremap=on,caching-mode=on,dma-drain=on \
+    -blockdev driver=file,filename=/opt/nexus-fixtures/runtime-fs-block.raw,node-name=nexusfs-file,read-only=on,auto-read-only=off \
+    -blockdev driver=raw,file=nexusfs-file,node-name=nexusfs,read-only=on \
+    -device virtio-blk-pci,drive=nexusfs,bus=pcie.0,addr=05.0,bootindex=-1,disable-legacy=on,iommu_platform=on,packed=off,indirect_desc=off,event_idx=off,queue_reset=off,queue-size=16,num-queues=1,ioeventfd=off,request-merging=off,vectors=0,write-cache=off,config-wce=off,discard=off,write-zeroes=off \
+    -device piix3-ide,id=legacy-ide \
+    -blockdev driver=file,filename=/work/artifacts/tool-handoff-cser/journal.raw,node-name=tool-journal-file,read-only=off,auto-read-only=off,cache.direct=off,cache.no-flush=off \
+    -blockdev driver=raw,file=tool-journal-file,node-name=tool-journal \
+    -device ide-hd,drive=tool-journal,bus=legacy-ide.0,bootindex=-1 \
+    -blockdev driver=file,filename=/work/artifacts/tool-handoff-cser/outbox.raw,node-name=tool-outbox-file,read-only=off,auto-read-only=off,cache.direct=off,cache.no-flush=off \
+    -blockdev driver=raw,file=tool-outbox-file,node-name=tool-outbox \
+    -device ide-hd,drive=tool-outbox,bus=legacy-ide.1,bootindex=-1 \
+    -chardev socket,id=chrtpm,path=/work/artifacts/tool-handoff-cser/swtpm-qemu.sock \
+    -tpmdev emulator,id=tpm0,chardev=chrtpm \
+    -device tpm-tis,tpmdev=tpm0 \
+    -drive if=pflash,format=raw,unit=0,readonly=on,file=/root/ovmf/release/OVMF.fd \
+    -drive if=pflash,format=raw,unit=1,file=/tmp/nexus-home/OVMF_VARS.fd \
+"""
+
+# Independent-finalizer arm of the logical CSER3 handoff experiment. Its
+# artifact tree is distinct from the CSER arm while retaining the matched
+# legacy-media, COM2/COM3, TPM, and QEMU/TCG envelope.
+[scheme."tool-handoff-baseline"]
+build.no_default_features = true
+build.features = ["cser-tool-handoff-baseline-experiment"]
+qemu.args = """\
+    -nodefaults \
+    -object memory-backend-file,id=tool-handoff-baseline-ram,size=1G,mem-path=/work/artifacts/tool-handoff-baseline/ram.raw,offset=0,share=on,discard-data=off,readonly=off \
+    -machine q35,kernel-irqchip=split,default-bus-bypass-iommu=off,memory-backend=tool-handoff-baseline-ram \
+    -accel tcg,thread=single \
+    -cpu Icelake-Server,+x2apic \
+    -m 1G \
+    -smp 1 \
+    -no-reboot \
+    -display none \
+    -monitor none \
+    -chardev stdio,id=serial0,signal=off \
+    -serial chardev:serial0 \
+    -chardev socket,id=tool-com2,path=/work/artifacts/tool-handoff-baseline/com2-tool.sock,server=on,wait=on \
+    -serial chardev:tool-com2 \
+    -chardev socket,id=crash-com3,path=/work/artifacts/tool-handoff-baseline/com3-crash.sock,server=on,wait=on \
+    -serial chardev:crash-com3 \
+    -chardev file,id=entry-debugcon,path=/work/artifacts/tool-handoff-baseline/task-entry-debugcon.log \
+    -device isa-debugcon,iobase=0xe9,chardev=entry-debugcon \
+    -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
+    -device intel-iommu,intremap=on,caching-mode=on,dma-drain=on \
+    -blockdev driver=file,filename=/opt/nexus-fixtures/runtime-fs-block.raw,node-name=nexusfs-file,read-only=on,auto-read-only=off \
+    -blockdev driver=raw,file=nexusfs-file,node-name=nexusfs,read-only=on \
+    -device virtio-blk-pci,drive=nexusfs,bus=pcie.0,addr=05.0,bootindex=-1,disable-legacy=on,iommu_platform=on,packed=off,indirect_desc=off,event_idx=off,queue_reset=off,queue-size=16,num-queues=1,ioeventfd=off,request-merging=off,vectors=0,write-cache=off,config-wce=off,discard=off,write-zeroes=off \
+    -device piix3-ide,id=legacy-ide \
+    -blockdev driver=file,filename=/work/artifacts/tool-handoff-baseline/journal.raw,node-name=tool-journal-file,read-only=off,auto-read-only=off,cache.direct=off,cache.no-flush=off \
+    -blockdev driver=raw,file=tool-journal-file,node-name=tool-journal \
+    -device ide-hd,drive=tool-journal,bus=legacy-ide.0,bootindex=-1 \
+    -blockdev driver=file,filename=/work/artifacts/tool-handoff-baseline/outbox.raw,node-name=tool-outbox-file,read-only=off,auto-read-only=off,cache.direct=off,cache.no-flush=off \
+    -blockdev driver=raw,file=tool-outbox-file,node-name=tool-outbox \
+    -device ide-hd,drive=tool-outbox,bus=legacy-ide.1,bootindex=-1 \
+    -chardev socket,id=chrtpm,path=/work/artifacts/tool-handoff-baseline/swtpm-qemu.sock \
+    -tpmdev emulator,id=tpm0,chardev=chrtpm \
+    -device tpm-tis,tpmdev=tpm0 \
+    -drive if=pflash,format=raw,unit=0,readonly=on,file=/root/ovmf/release/OVMF.fd \
+    -drive if=pflash,format=raw,unit=1,file=/tmp/nexus-home/OVMF_VARS.fd \
+"""
+
 # Fresh-media counterpart of tool-dma-cser.  It deliberately uses a distinct
 # artifact directory and selects the typed append/checkpoint ATA journal at
 # build time; it never probes, migrates, or overwrites the legacy image.

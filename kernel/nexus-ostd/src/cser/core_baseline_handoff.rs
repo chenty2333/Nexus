@@ -199,8 +199,8 @@ impl DurableOperationBinding {
     }
 }
 
-/// Recovery state for a future real-QEMU handoff runtime.  The descriptor and
-/// terminal digests are opaque bytes until that runtime independently queries
+/// Recovery state for the independent real-QEMU handoff runtime. The descriptor
+/// and terminal digests are opaque bytes until that runtime independently queries
 /// and validates the endpoint again; decoding this record alone grants no
 /// child-observation authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -216,8 +216,8 @@ pub(crate) struct DurableHandoffRecord {
 
 impl DurableHandoffRecord {
     /// A parent identity must be made durable before descriptor discovery or
-    /// any child request.  This is the baseline's structural precondition for
-    /// a future QEMU bridge to issue the source POST.
+    /// any child request. This is the baseline's structural precondition for
+    /// the QEMU bridge to issue the source POST.
     pub(crate) fn parent_intent(source: ToolOperationPlan) -> Result<Self, HandoffError> {
         if source.component() != cser_core::TOOL_HANDOFF_SOURCE_COMPONENT
             || !source.is_cser3_source()
@@ -311,7 +311,8 @@ impl DurableHandoffRecord {
         mut self,
         child: DurableToolObservation,
     ) -> Result<Self, HandoffError> {
-        if !self.child_post_permitted()
+        if child.outcome() != ExternalOutcome::Success
+            || !self.child_post_permitted()
             || Some(DurableOperationBinding::from_plan(child.plan())) != self.child
         {
             return Err(HandoffError::ChildMismatch);
@@ -320,6 +321,44 @@ impl DurableHandoffRecord {
         self.phase = HandoffPhase::ChildTerminal;
         self.validate_shape()?;
         Ok(self)
+    }
+
+    /// Revalidates a freshly fetched source terminal record against the
+    /// canonical descriptor and receipt retained on disk.  It grants no new
+    /// authority and is used on every recovery boot before progressing a
+    /// partially completed handoff.
+    pub(crate) fn reverify_source_descriptor(
+        &self,
+        descriptor: &[u8],
+        source: DurableToolObservation,
+    ) -> Result<(), HandoffError> {
+        let expected = self.descriptor.ok_or(HandoffError::SourceMismatch)?;
+        let parsed = Descriptor::parse(descriptor)?;
+        validate_source(parsed, source)?;
+        if parsed.wire != expected
+            || Some(source.terminal_record_digest().bytes()) != self.source_terminal_digest
+            || DurableOperationBinding::from_plan(source.plan()) != self.source
+        {
+            return Err(HandoffError::SourceMismatch);
+        }
+        Ok(())
+    }
+
+    /// Revalidates the durable child terminal receipt on an idempotent
+    /// recovery replay.  A matching receipt is evidence only; it cannot mint
+    /// a permit or alter the durable phase.
+    pub(crate) fn reverify_child_terminal(
+        &self,
+        child: DurableToolObservation,
+    ) -> Result<(), HandoffError> {
+        if child.outcome() != ExternalOutcome::Success
+            || self.phase != HandoffPhase::ChildTerminal
+            || Some(DurableOperationBinding::from_plan(child.plan())) != self.child
+            || Some(child.terminal_record_digest().bytes()) != self.child_terminal_digest
+        {
+            return Err(HandoffError::ChildMismatch);
+        }
+        Ok(())
     }
 
     pub(crate) fn encode(&self) -> [u8; HANDOFF_DURABLE_RECORD_BYTES] {
@@ -371,6 +410,32 @@ impl DurableHandoffRecord {
         let flags = bytes[19];
         if flags & !0x0f != 0 {
             return Err(HandoffError::Persist);
+        }
+        // The record has a fixed canonical image: an absent optional value
+        // must leave its whole slot zeroed.  Otherwise a checksum-valid
+        // record could retain unparsed stale data and have more than one
+        // encoding for the same durable state.
+        for (present, slot) in [
+            (
+                flags & 1 != 0,
+                &bytes[DESCRIPTOR_OFFSET..DESCRIPTOR_OFFSET + DESCRIPTOR_LEN],
+            ),
+            (
+                flags & 2 != 0,
+                &bytes[SOURCE_TERMINAL_OFFSET..SOURCE_TERMINAL_OFFSET + 32],
+            ),
+            (
+                flags & 4 != 0,
+                &bytes[CHILD_BINDING_OFFSET..CHILD_BINDING_OFFSET + BINDING_BYTES],
+            ),
+            (
+                flags & 8 != 0,
+                &bytes[CHILD_TERMINAL_OFFSET..CHILD_TERMINAL_OFFSET + 32],
+            ),
+        ] {
+            if !present && slot.iter().any(|byte| *byte != 0) {
+                return Err(HandoffError::Persist);
+            }
         }
         let phase = parse_phase(bytes[18])?;
         let descriptor = if flags & 1 != 0 {
@@ -951,6 +1016,40 @@ impl AtaTpmBaselineHandoffStore {
             .map_err(|_| AtaTpmBaselineHandoffStoreError::Corrupt)?;
         Ok((record, permit))
     }
+
+    /// Exact-coordinate baseline gate over the anchored canonical record.
+    /// The coordinate stays unavailable until the child's terminal receipt is
+    /// durably recorded; this method has no CSER dependency.
+    pub(crate) fn check_reusable(
+        &mut self,
+        coordinate: HandoffClaimCoordinate,
+    ) -> Result<(), AtaTpmBaselineHandoffStoreError> {
+        if let Some(record) = self.load()? {
+            if record.phase == HandoffPhase::ParentIntentDurable {
+                // The child coordinate has not been discovered yet.  Keep the
+                // gate globally fail-closed rather than treating an absent
+                // descriptor as a release of the durable parent intent.
+                return Err(AtaTpmBaselineHandoffStoreError::Corrupt);
+            }
+            if record.phase != HandoffPhase::ChildTerminal {
+                let descriptor = record
+                    .descriptor
+                    .ok_or(AtaTpmBaselineHandoffStoreError::Corrupt)?;
+                let parsed = Descriptor::parse(&descriptor)
+                    .map_err(|_| AtaTpmBaselineHandoffStoreError::Corrupt)?;
+                let parent_still_retained = matches!(
+                    record.phase,
+                    HandoffPhase::DescriptorDurable | HandoffPhase::ChildPrepared
+                );
+                if parsed.claim == coordinate
+                    || (parent_still_retained && record.source.coordinate == coordinate)
+                {
+                    return Err(AtaTpmBaselineHandoffStoreError::Corrupt);
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// One-shot authority minted only after the atomic parent-release/child-intent
@@ -1102,7 +1201,17 @@ impl<S: HandoffStore> BaselineHandoff<S> {
     ) -> Result<(), HandoffError> {
         let record = self.store.load()?;
         if let Some(record) = record {
-            if record.descriptor.claim == coordinate && record.phase != HandoffPhase::ChildTerminal
+            let parent_still_retained = matches!(
+                record.phase,
+                HandoffPhase::DescriptorDurable | HandoffPhase::ChildPrepared
+            );
+            let parent_coordinate = HandoffClaimCoordinate {
+                resource: record.source_receipt.plan().resource().get(),
+                generation: record.source_receipt.plan().resource_generation().get(),
+            };
+            if record.phase != HandoffPhase::ChildTerminal
+                && (record.descriptor.claim == coordinate
+                    || (parent_still_retained && parent_coordinate == coordinate))
             {
                 return Err(HandoffError::ConflictRetained);
             }
@@ -1220,10 +1329,14 @@ impl HandoffStore for MemoryDoubleBank {
 
 #[cfg(ktest)]
 mod tests {
+    use alloc::format;
+    use core::str;
+
     use super::*;
     use crate::core_tool_adapter::DurableToolObservation;
     use crate::core_tool_uart::{
-        OperationKey, ToolRunId, ToolTerminalOutput, ToolTerminalRecord, ToolV2Identity,
+        decode_response, OperationKey, ToolRequest, ToolRunId, ToolTerminalOutput,
+        ToolTerminalRecord, ToolV2Identity,
     };
     use cser_core::{
         ClaimId, Digest, EffectId, ResourceGeneration, ResourceId, RootId, TOOL_CLAIM_OUTCOME_SLOT,
@@ -1327,8 +1440,68 @@ mod tests {
         DurableToolObservation::from_terminal_record(plan, terminal).unwrap()
     }
 
-    fn phases_recover_and_exact_coordinate_stays_retained_until_second_terminal() {
+    fn hex(input: &[u8]) -> [u8; 64] {
+        const DIGITS: &[u8; 16] = b"0123456789abcdef";
+        let mut output = [0; 64];
+        for (byte, pair) in input.iter().copied().zip(output.chunks_exact_mut(2)) {
+            pair[0] = DIGITS[usize::from(byte >> 4)];
+            pair[1] = DIGITS[usize::from(byte & 0x0f)];
+        }
+        output
+    }
+
+    /// Builds a checksum- and digest-valid failed endpoint terminal through
+    /// the production UART decoder, rather than manufacturing an observation.
+    fn failed_child_observation(plan: ToolOperationPlan) -> DurableToolObservation {
+        let request = ToolRequest::new(
+            ToolRunId::new(plan.run_id()),
+            OperationKey::new(&plan.operation_key_hex()).unwrap(),
+            plan.payload(),
+        )
+        .unwrap();
+        let run_hex = hex(&plan.run_id());
+        let run = &run_hex[..32];
+        let operation = plan.operation_key_hex();
+        let payload = hex(&plan.payload_digest().bytes());
+        let mut record_hasher = Sha256::new();
+        record_hasher.update(b"nexus-cser-tool-record-v1");
+        for field in [
+            run,
+            &operation[..],
+            &payload[..],
+            b"failed".as_slice(),
+            b"rejected".as_slice(),
+        ] {
+            record_hasher.update((field.len() as u64).to_le_bytes());
+            record_hasher.update(field);
+        }
+        let record = hex(&record_hasher.finalize());
+        let prefix = format!(
+            "CSER1 RESP {} {} 200 {} failed rejected {}",
+            str::from_utf8(run).unwrap(),
+            str::from_utf8(&operation).unwrap(),
+            str::from_utf8(&payload).unwrap(),
+            str::from_utf8(&record).unwrap(),
+        );
+        let checksum = hex(&Sha256::digest(prefix.as_bytes()));
+        let line = format!("{} {}\n", prefix, str::from_utf8(&checksum).unwrap());
+        DurableToolObservation::from_terminal_record(
+            plan,
+            decode_response(line.as_bytes(), &request)
+                .unwrap()
+                .terminal_record()
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn parent_and_child_coordinates_follow_the_durable_handoff_phases() {
         let (mut handoff, wire, source, child, coordinate) = fixture();
+        let parent_coordinate = HandoffClaimCoordinate {
+            resource: source.plan().resource().get(),
+            generation: source.plan().resource_generation().get(),
+        };
+        assert_ne!(parent_coordinate, coordinate);
         handoff.adopt_descriptor(&wire, source).unwrap();
         assert_eq!(
             BaselineHandoff::new(handoff.store_mut().recovered_copy()).recover(),
@@ -1338,15 +1511,32 @@ mod tests {
             handoff.check_reusable(coordinate),
             Err(HandoffError::ConflictRetained)
         );
+        assert_eq!(
+            handoff.check_reusable(parent_coordinate),
+            Err(HandoffError::ConflictRetained)
+        );
         handoff.prepare_child(child).unwrap();
         assert_eq!(
             BaselineHandoff::new(handoff.store_mut().recovered_copy()).recover(),
             Ok(Some(HandoffPhase::ChildPrepared))
         );
+        assert_eq!(
+            handoff.check_reusable(coordinate),
+            Err(HandoffError::ConflictRetained)
+        );
+        assert_eq!(
+            handoff.check_reusable(parent_coordinate),
+            Err(HandoffError::ConflictRetained)
+        );
         let permit = handoff.release_parent_and_record_child_intent().unwrap();
         assert_eq!(
             BaselineHandoff::new(handoff.store_mut().recovered_copy()).recover(),
             Ok(Some(HandoffPhase::ParentReleasedChildIntentDurable))
+        );
+        assert_eq!(handoff.check_reusable(parent_coordinate), Ok(()));
+        assert_eq!(
+            handoff.check_reusable(coordinate),
+            Err(HandoffError::ConflictRetained)
         );
         handoff
             .observe_child_terminal(permit, child_observation(child))
@@ -1356,6 +1546,7 @@ mod tests {
             Ok(Some(HandoffPhase::ChildTerminal))
         );
         assert_eq!(handoff.check_reusable(coordinate), Ok(()));
+        assert_eq!(handoff.check_reusable(parent_coordinate), Ok(()));
     }
 
     fn duplicate_adoption_and_persist_failure_do_not_change_live_gate() {
@@ -1440,6 +1631,25 @@ mod tests {
         assert_eq!(DurableHandoffRecord::decode(&bytes), Ok(parent));
         assert_eq!(parent.source.reconstruct(), Ok(source.plan()));
 
+        // A checksum-valid ParentIntent record must still reject any stale
+        // bytes in every absent fixed optional slot.
+        for offset in [
+            DESCRIPTOR_OFFSET,
+            SOURCE_TERMINAL_OFFSET,
+            CHILD_BINDING_OFFSET,
+            CHILD_TERMINAL_OFFSET,
+        ] {
+            let mut noncanonical = parent.encode();
+            noncanonical[offset] = 1;
+            let checksum: [u8; 32] =
+                Sha256::digest(&noncanonical[..HANDOFF_DURABLE_RECORD_BYTES - 32]).into();
+            noncanonical[HANDOFF_DURABLE_RECORD_BYTES - 32..].copy_from_slice(&checksum);
+            assert_eq!(
+                DurableHandoffRecord::decode(&noncanonical),
+                Err(HandoffError::Persist)
+            );
+        }
+
         let descriptor = parent.record_descriptor(&wire, source).unwrap();
         assert!(!descriptor.child_post_permitted());
         let prepared = descriptor.prepare_child(child).unwrap();
@@ -1491,14 +1701,52 @@ mod tests {
         );
     }
 
+    fn failed_child_terminal_cannot_advance_or_revalidate_the_durable_record() {
+        let (_handoff, wire, source, child, _) = fixture();
+        let released = DurableHandoffRecord::parent_intent(source.plan())
+            .unwrap()
+            .record_descriptor(&wire, source)
+            .unwrap()
+            .prepare_child(child)
+            .unwrap()
+            .release_parent_and_record_child_intent()
+            .unwrap();
+        let failed = failed_child_observation(child);
+
+        assert_eq!(
+            released.record_child_terminal(failed),
+            Err(HandoffError::ChildMismatch)
+        );
+        assert_eq!(
+            released.phase,
+            HandoffPhase::ParentReleasedChildIntentDurable
+        );
+        assert!(released.child_terminal_digest.is_none());
+        assert_eq!(
+            DurableHandoffRecord::decode(&released.encode()),
+            Ok(released)
+        );
+
+        let terminal = released
+            .record_child_terminal(child_observation(child))
+            .unwrap();
+        assert_eq!(
+            terminal.reverify_child_terminal(failed),
+            Err(HandoffError::ChildMismatch)
+        );
+        assert_eq!(terminal.phase, HandoffPhase::ChildTerminal);
+        assert!(terminal.child_terminal_digest.is_some());
+    }
+
     /// Aggregate only this portable coordinator's focused regressions into one
     /// OSDK test. It is intentionally not a general baseline test framework.
     #[ktest]
     fn cser_baseline_handoff_gate() {
-        phases_recover_and_exact_coordinate_stays_retained_until_second_terminal();
+        parent_and_child_coordinates_follow_the_durable_handoff_phases();
         duplicate_adoption_and_persist_failure_do_not_change_live_gate();
         tampered_descriptor_and_generic_child_bypass_are_rejected();
         wrong_child_claim_or_resource_coordinate_cannot_be_prepared();
         canonical_record_codec_is_torn_corrupt_safe_and_gates_child_post();
+        failed_child_terminal_cannot_advance_or_revalidate_the_durable_record();
     }
 }

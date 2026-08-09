@@ -188,6 +188,7 @@ RUN --mount=type=bind,source=kernel/nexus-ostd,target=/tmp/nexus-ostd-source,rea
     && cargo fetch --manifest-path target/osdk/nexus-kernel-run-base/Cargo.toml --locked \
     && CARGO_NET_OFFLINE=true cargo osdk build --scheme cser-production \
     && cmp /tmp/nexus-ostd-inputs/Cargo.lock /work/Cargo.lock \
+    && sed -i 's/[[:space:]]\+$//' target/osdk/nexus-kernel-run-base/*.ld \
     && diff -ru /tmp/nexus-ostd-inputs/osdk-runner-base \
         /work/target/osdk/nexus-kernel-run-base \
     && rm -rf /work /tmp/nexus-ostd-inputs

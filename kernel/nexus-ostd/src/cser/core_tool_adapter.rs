@@ -12,6 +12,7 @@
 use cser_core::{
     ChargeAccountId, ClaimId, ClaimScope, CommandRequest, ComponentId, Digest, EffectFactChallenge,
     EffectFactKind, EffectId, EffectReceiptVerifier, EvidenceChallenge, ExternalOutcome,
+    HandoffChildResolutionVerifier, HandoffResolutionChallenge, HandoffResolutionVerifier,
     PrincipalIncarnation, ReceiptVerifier, ResourceGeneration, ResourceId, RootId,
     TOOL_APPLY_RECEIPT_SCHEMA, TOOL_CLAIM_OUTCOME_SLOT, TOOL_COMMIT_RECEIPT_SCHEMA, TOOL_DOMAIN,
     TOOL_EVIDENCE_OUTCOME_ACK, TOOL_OBLIGATION_INVOCATION, TOOL_RECEIPT_SCHEMA,
@@ -895,6 +896,117 @@ impl cser_core::ChildDescriptorVerifier for ToolChildDescriptorVerifier {
     }
 }
 
+/// Dedicated verifier for refining a fenced parent from indeterminate to the
+/// same durable terminal success observed by the source endpoint.  It cannot
+/// mint or recover a commit nonce and is accepted only by the core's narrow
+/// handoff-resolution transition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ToolHandoffResolutionVerifier {
+    inner: ToolOutcomeVerifier,
+    /// Present only for target recovery. It pins the child verifier to the
+    /// descriptor that derived its immutable operation plan.
+    child_descriptor: Option<cser_core::ChildDescriptorV1>,
+}
+
+impl ToolHandoffResolutionVerifier {
+    pub(crate) const fn new(plan: ToolOperationPlan, epoch: u64) -> Option<Self> {
+        if !plan.cser3_output || plan.child_route.is_none() {
+            return None;
+        }
+        match ToolOutcomeVerifier::new(plan, epoch) {
+            Some(inner) => Some(Self {
+                inner,
+                child_descriptor: None,
+            }),
+            None => None,
+        }
+    }
+
+    /// Builds the child-side verifier only for the exact descriptor-derived
+    /// plan. This is deliberately distinct from [`Self::new`], which remains
+    /// source-only and requires descriptor output authority.
+    pub(crate) fn new_child(
+        child: ToolOperationPlan,
+        source: ToolOperationPlan,
+        descriptor: cser_core::ChildDescriptorV1,
+        epoch: u64,
+    ) -> Option<Self> {
+        if !child.is_cser3_child()
+            || ToolOperationPlan::handoff_child_for_descriptor(source, descriptor).ok()? != child
+        {
+            return None;
+        }
+        ToolOutcomeVerifier::new(child, epoch).map(|inner| Self {
+            inner,
+            child_descriptor: Some(descriptor),
+        })
+    }
+}
+
+impl HandoffResolutionVerifier for ToolHandoffResolutionVerifier {
+    type Receipt = DurableToolObservation;
+
+    fn identity(&self) -> VerifierIdentity {
+        self.inner.identity_for(TOOL_COMMIT_RECEIPT_SCHEMA)
+    }
+
+    fn verify_handoff_parent_success(
+        &self,
+        challenge: &HandoffResolutionChallenge,
+        observation: &DurableToolObservation,
+    ) -> Result<Digest, VerificationError> {
+        if !self.inner.exact_observation(observation)
+            || observation.outcome() != ExternalOutcome::Success
+            || challenge.effect() != self.inner.plan.effect()
+            || challenge.component() != self.inner.plan.component()
+            || challenge.domain() != TOOL_DOMAIN
+            || challenge.obligation() != TOOL_OBLIGATION_INVOCATION
+            || challenge.operation() != self.inner.plan.operation_digest()
+            || challenge.expected_verifier() != TOOL_VERIFIER
+            || challenge.expected_receipt_schema() != TOOL_COMMIT_RECEIPT_SCHEMA
+        {
+            return Err(VerificationError::Rejected);
+        }
+        let descriptor = ToolChildDescriptorVerifier::new(self.inner.plan)
+            .ok_or(VerificationError::Rejected)?
+            .decode(*observation)
+            .map_err(|_| VerificationError::Rejected)?;
+        if descriptor != challenge.descriptor() {
+            return Err(VerificationError::Rejected);
+        }
+        Ok(observation.receipt_digest(b"nexus-cser-tool-commit-v1"))
+    }
+}
+
+impl HandoffChildResolutionVerifier for ToolHandoffResolutionVerifier {
+    type Receipt = DurableToolObservation;
+
+    fn identity(&self) -> VerifierIdentity {
+        self.inner.identity_for(TOOL_COMMIT_RECEIPT_SCHEMA)
+    }
+
+    fn verify_handoff_child_success(
+        &self,
+        challenge: &HandoffResolutionChallenge,
+        observation: &DurableToolObservation,
+    ) -> Result<Digest, VerificationError> {
+        if self.child_descriptor != Some(challenge.descriptor())
+            || !self.inner.exact_observation(observation)
+            || observation.outcome() != ExternalOutcome::Success
+            || challenge.effect() != self.inner.plan.effect()
+            || challenge.component() != self.inner.plan.component()
+            || challenge.domain() != TOOL_DOMAIN
+            || challenge.obligation() != TOOL_OBLIGATION_INVOCATION
+            || challenge.operation() != self.inner.plan.operation_digest()
+            || challenge.expected_verifier() != TOOL_VERIFIER
+            || challenge.expected_receipt_schema() != TOOL_COMMIT_RECEIPT_SCHEMA
+        {
+            return Err(VerificationError::Rejected);
+        }
+        Ok(observation.receipt_digest(b"nexus-cser-tool-commit-v1"))
+    }
+}
+
 fn decode_core_child_descriptor(
     output: ToolTerminalOutput,
 ) -> Result<cser_core::ChildDescriptorV1, ToolObservationError> {
@@ -1242,6 +1354,11 @@ mod tests {
             ToolOperationPlan::handoff_child_for_descriptor(source, wrong_descriptor),
             Err(ToolPlanError::InvalidCoordinate)
         );
+        assert!(ToolHandoffResolutionVerifier::new(child, 1).is_none());
+        assert!(ToolHandoffResolutionVerifier::new_child(child, source, descriptor, 1).is_some());
+        assert!(
+            ToolHandoffResolutionVerifier::new_child(child, source, wrong_descriptor, 1).is_none()
+        );
     }
 
     #[test]
@@ -1256,8 +1373,8 @@ mod tests {
         assert_eq!(
             handoff_child_transport_effect(parent, [0xdd; 16]).bytes(),
             [
-                0x18, 0xf2, 0x28, 0xfd, 0x72, 0xac, 0x7f, 0x08, 0x60, 0x85, 0x49, 0x35, 0x28,
-                0x69, 0x8c, 0x05,
+                0x18, 0xf2, 0x28, 0xfd, 0x72, 0xac, 0x7f, 0x08, 0x60, 0x85, 0x49, 0x35, 0x28, 0x69,
+                0x8c, 0x05,
             ]
         );
     }

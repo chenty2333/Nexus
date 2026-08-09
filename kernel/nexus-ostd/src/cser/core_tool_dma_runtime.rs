@@ -17,7 +17,7 @@ use cser_core::{
 
 use super::core_tool_adapter::{
     DurableToolObservation, ToolChildDescriptorVerifier, ToolEndpoint, ToolEndpointObservation,
-    ToolFactVerifier, ToolOperationPlan, ToolOutcomeVerifier,
+    ToolFactVerifier, ToolHandoffResolutionVerifier, ToolOperationPlan, ToolOutcomeVerifier,
 };
 
 /// The component-local tool half of one tool-plus-DMA composite effect.
@@ -152,6 +152,62 @@ impl ToolDmaRuntime {
                 intent: failure.into_intent(),
             })?;
         Ok((command, descriptor))
+    }
+
+    /// Resolves only the crash-fenced `Committed + Indeterminate` source left
+    /// when the endpoint durably completed before the ordinary parent
+    /// acknowledgement.  The core challenge carries no recovered nonce and
+    /// the resulting command neither activates the root nor creates a child.
+    pub(crate) fn resolve_indeterminate_handoff_parent_success(
+        &self,
+        engine: &Engine,
+        observation: &DurableToolObservation,
+    ) -> Result<(Command, ChildDescriptorV1), CoreError> {
+        let descriptor_verifier =
+            ToolChildDescriptorVerifier::new(self.plan).ok_or(CoreError::InvalidPayload)?;
+        let descriptor = descriptor_verifier
+            .decode(*observation)
+            .map_err(|_| CoreError::VerificationFailed)?;
+        let verified_descriptor =
+            engine.verify_child_descriptor(descriptor, &descriptor_verifier, observation)?;
+        let resolution_verifier =
+            ToolHandoffResolutionVerifier::new(self.plan, self.verifier_epoch)
+                .ok_or(CoreError::InvalidPayload)?;
+        let resolution = engine.verify_handoff_resolution(
+            verified_descriptor,
+            &resolution_verifier,
+            observation,
+        )?;
+        Ok((resolution.resolve(), descriptor))
+    }
+
+    /// Resolves an installed fenced CSER3 child only from its exact durable
+    /// terminal success record; this never recreates its spent commit nonce.
+    pub(crate) fn resolve_indeterminate_handoff_child_success(
+        &self,
+        engine: &Engine,
+        source: ToolDmaRuntime,
+        descriptor: ChildDescriptorV1,
+        descriptor_observation: &DurableToolObservation,
+        observation: &DurableToolObservation,
+    ) -> Result<Command, CoreError> {
+        let descriptor_verifier =
+            ToolChildDescriptorVerifier::new(source.plan()).ok_or(CoreError::InvalidPayload)?;
+        let verified_descriptor = engine.verify_child_descriptor(
+            descriptor,
+            &descriptor_verifier,
+            descriptor_observation,
+        )?;
+        let verifier = ToolHandoffResolutionVerifier::new_child(
+            self.plan,
+            source.plan(),
+            descriptor,
+            self.verifier_epoch,
+        )
+        .ok_or(CoreError::InvalidPayload)?;
+        Ok(engine
+            .verify_handoff_child_resolution(verified_descriptor, &verifier, observation)?
+            .resolve())
     }
 
     /// Atomically creates, enrolls, and prepares the single child through the

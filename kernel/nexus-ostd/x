@@ -153,6 +153,7 @@ container() {
     local -a cpu_args=()
     local -a security_args=()
     local -a cid_args=()
+    local -a handoff_identity_args=()
     if [[ -n ${NEXUS_CONTAINER_CPUSET:-} ]]; then
         cpu_args=(--cpuset-cpus "$NEXUS_CONTAINER_CPUSET")
     fi
@@ -183,12 +184,32 @@ container() {
             return 1
         fi
         cid_args=(--cidfile "$cid_file")
+        # The handoff controller may need to clean up a QEMU container when a
+        # cidfile was never published or was damaged by the crash.  These
+        # labels are deliberately restricted to that lane and bind a random
+        # run identity plus the controller's trial-directory token; they are
+        # not a general container discovery mechanism.
+        if [[ ${CSER_EXPERIMENT_LANE:-} == handoff ]]; then
+            local handoff_run_id=${CSER_EXPERIMENT_RUN_ID:-}
+            local handoff_trial_token=${CSER_EXPERIMENT_TRIAL_TOKEN:-}
+            if [[ ! $handoff_run_id =~ ^[0-9a-f]{32}$ \
+                || ! $handoff_trial_token =~ ^[0-9a-f]{64}$ ]]; then
+                echo 'handoff experiment container requires valid run and trial identities' >&2
+                return 1
+            fi
+            handoff_identity_args=(
+                --label nexus.cser-experiment=handoff
+                --label "nexus.cser-run-id=$handoff_run_id"
+                --label "nexus.cser-trial-token=$handoff_trial_token"
+            )
+        fi
     fi
     command "$docker_bin" run --rm \
         --init \
         "${cpu_args[@]}" \
         "${security_args[@]}" \
         "${cid_args[@]}" \
+        "${handoff_identity_args[@]}" \
         --platform linux/amd64 \
         --network none \
         --user "$(id -u):$(id -g)" \
@@ -732,6 +753,10 @@ prepare_runner_base() {
 }
 
 assert_runner_base() {
+    # cargo-osdk 0.18 may indent otherwise-empty linker-script lines while
+    # regenerating the runner. Normalize only trailing whitespace in `*.ld`;
+    # Cargo metadata, source, and every other runner file remain byte-exact.
+    sed -i 's/[[:space:]]\+$//' "$runner_target"/*.ld
     diff -ru "$runner_base" "$runner_target"
 }
 
@@ -841,7 +866,29 @@ build_tool_dma_experiments() {
     assert_runner_base
 }
 
-# One boot of the host-owned tool-plus-DMA experiment envelope.  The matching
+# Compile-only gate for the logically separate CSER3 single-hop handoff lane.
+# It intentionally does not launch QEMU: the matched controller owns fresh
+# media, paired endpoints, crash cuts, and receipt interpretation.
+build_tool_handoff_experiments() {
+    container cargo check --locked --offline --target x86_64-unknown-none \
+        --no-default-features --features cser-tool-handoff-experiment
+
+    prepare_runner_base
+    container cargo osdk build --scheme tool-handoff-cser
+    assert_runner_base
+}
+
+# Compile-only gate for the matched independent-finalizer handoff arm.
+build_tool_handoff_baseline_experiments() {
+    container cargo check --locked --offline --target x86_64-unknown-none \
+        --no-default-features --features cser-tool-handoff-baseline-experiment
+
+    prepare_runner_base
+    container cargo osdk build --scheme tool-handoff-baseline
+    assert_runner_base
+}
+
+# One boot of a host-owned CSER experiment envelope.  The matching
 # matrix controller stages unique media before invoking this command and kills
 # its process group at the authenticated COM3 target barrier.  This helper
 # deliberately has no success oracle: recovery acceptance belongs to the
@@ -893,13 +940,15 @@ stop_tool_dma_swtpm() {
 }
 
 run_tool_dma_boot() (
-    local scheme=$1 artifact_dir status=0
+    local scheme=$1 artifact_dir status=0 launcher_timeout_seconds=90
     local record_cid=0
     case "$scheme" in
         tool-dma-cser) artifact_dir="$root/artifacts/tool-dma-cser" ;;
         tool-dma-cser-vnext) artifact_dir="$root/artifacts/tool-dma-cser-vnext" ;;
         tool-dma-baseline) artifact_dir="$root/artifacts/tool-dma-baseline" ;;
-        *) echo "invalid tool-DMA scheme: $scheme" >&2; return 2 ;;
+        tool-handoff-cser) artifact_dir="$root/artifacts/tool-handoff-cser" ;;
+        tool-handoff-baseline) artifact_dir="$root/artifacts/tool-handoff-baseline" ;;
+        *) echo "invalid CSER experiment scheme: $scheme" >&2; return 2 ;;
     esac
     for medium in journal.raw outbox.raw ram.raw; do
         [[ -f $artifact_dir/$medium ]] || {
@@ -907,6 +956,13 @@ run_tool_dma_boot() (
             return 2
         }
     done
+    # Handoff recovery has two endpoint reconciliations plus a stable reopen.
+    # Keep this narrow exception out of the initial crash envelope and every
+    # existing Tool+DMA scheme, whose reviewed inner timeout remains 90s.
+    if [[ ${CSER_EXPERIMENT_PHASE:-initial} == recovery \
+        && ( $scheme == tool-handoff-cser || $scheme == tool-handoff-baseline ) ]]; then
+        launcher_timeout_seconds=130
+    fi
     trap 'stop_tool_dma_swtpm' EXIT INT TERM
     start_tool_dma_swtpm "$artifact_dir"
     if [[ ${CSER_EXPERIMENT_PHASE:-initial} == initial \
@@ -916,7 +972,7 @@ run_tool_dma_boot() (
     NEXUS_CONTAINER_HOST_UNIX_SOCKET=1 NEXUS_CONTAINER_RECORD_CID=$record_cid container bash -c "
         set -euo pipefail
         cp /root/ovmf/release/OVMF_VARS.fd \"\$HOME/OVMF_VARS.fd\"
-        exec timeout --signal=TERM --kill-after=2s 90s cargo osdk run --scheme $scheme
+        exec timeout --signal=TERM --kill-after=2s ${launcher_timeout_seconds}s cargo osdk run --scheme $scheme
     " || status=$?
     stop_tool_dma_swtpm
     trap - EXIT INT TERM
@@ -2400,11 +2456,11 @@ capture_core_persistent_run() {
         'composite_effect=true' \
         'effect_identity=shared' \
         'component_ids=reply+dma' \
-        'api_profile=3' \
+        'api_profile=4' \
         'catalog_version=7' \
-        'projection_version=7' \
-        'snapshot_version=3' \
-        'journal_schema=7' \
+        'projection_version=8' \
+        'snapshot_version=4' \
+        'journal_schema=8' \
         'operation_effect_root=50433' \
         'operation_effect_sequence=1' \
         'reply_component_id=1' \
@@ -2429,11 +2485,11 @@ capture_core_persistent_run() {
         "$core_persistent_artifact_dir/boot2-serial.log" \
         'CSER_CORE_PERSISTENT_BOOT2 PASS' \
         'production_registry=single' \
-        'api_profile=3' \
+        'api_profile=4' \
         'catalog_version=7' \
-        'projection_version=7' \
-        'snapshot_version=3' \
-        'journal_schema=7' \
+        'projection_version=8' \
+        'snapshot_version=4' \
+        'journal_schema=8' \
         'operation_effect_root=50433' \
         'operation_effect_sequence=1' \
         'reply_component_id=1' \
@@ -2468,11 +2524,11 @@ capture_core_persistent_run() {
         "$core_persistent_artifact_dir/boot3-serial.log" \
         'CSER_CORE_PERSISTENT_BOOT3 PASS' \
         'production_registry=single' \
-        'api_profile=3' \
+        'api_profile=4' \
         'catalog_version=7' \
-        'projection_version=7' \
-        'snapshot_version=3' \
-        'journal_schema=7' \
+        'projection_version=8' \
+        'snapshot_version=4' \
+        'journal_schema=8' \
         'operation_effect_root=50433' \
         'operation_effect_sequence=1' \
         'reply_component_id=1' \
@@ -2503,11 +2559,11 @@ capture_core_persistent_run() {
         "$core_persistent_artifact_dir/boot4-serial.log" \
         'CSER_CORE_PERSISTENT_BOOT4 PASS' \
         'production_registry=single' \
-        'api_profile=3' \
+        'api_profile=4' \
         'catalog_version=7' \
-        'projection_version=7' \
-        'snapshot_version=3' \
-        'journal_schema=7' \
+        'projection_version=8' \
+        'snapshot_version=4' \
+        'journal_schema=8' \
         'operation_effect_root=50433' \
         'operation_effect_sequence=1' \
         'reply_component_id=1' \
@@ -2707,7 +2763,7 @@ capture_core_persistent_run() {
     schema5_tpm_lease_slot=$(core_schema5_tpm_snapshot_field \
         "$core_schema5_tpm_after" lease_selected_slot '^[01]$')
 
-    combined_receipt="CSER_CORE_PERSISTENT_QEMU_RESTART PASS boots=4 schema5_negative_boot=true schema5_selected_revision=5 schema5_selected_catalog=$core_schema5_fixture_catalog schema5_expected_catalog=$catalog_digest schema5_trusted_tpm_candidate_selected=true schema5_profile2_binding_authorized=false schema5_anchor_binding_match=false schema5_typed_rejection=migration-required schema5_semantic_replay=false schema5_pairing_inference=false schema5_registry_publication=false schema5_device_activation=false schema5_device_guard_retained=true schema5_arena_withheld=true schema5_bus_master_disabled=true schema5_intx_masked=true schema5_reset_status_zero=true schema5_observed_isr_bits=0 schema5_isr_reads_at_least=2 schema5_consecutive_empty_isr_reads=2 schema5_iotlb_used_remapped_iova=true schema5_iotlb_completed_trigger_pages_at_least=1 schema5_pci_bus_master_fence_readback=true schema5_iotlb_completion=true schema5_tpm_selected_nv_unchanged=true schema5_tpm_selected_coordinate_digest=$schema5_tpm_coordinate_digest schema5_tpm_tip_counter_hex=$schema5_tpm_tip_counter schema5_tpm_tip_selected_slot=$schema5_tpm_tip_slot schema5_tpm_lease_counter_hex=$schema5_tpm_lease_counter schema5_tpm_lease_selected_slot=$schema5_tpm_lease_slot shared_runtime=true shared_media=journal+swtpm+ram api_profile=3 catalog_version=$catalog_version projection_version=7 snapshot_version=3 journal_schema=7 composite_effect=shared operation_effect=50433:1 component_ids=1,2 evidence_schemes=reply+dma production_registry=single portal=nxp3 supervisor=core-v1 journal=ata-pio outbox=ata-pio-secondary ram_backend=memory-backend-file ram_backend_offset=0 qemu_ram_mapping=guest-paddr-equals-file-offset anchor=tpm2-nv quarantine=pre-replay-virtio+vtd reply=committed-then-intent-crash-then-settled second_crash=after-durable-apply-intent reconciliation=without-second-intent stable_recovery=true freshness=strictly-increasing projection_sequence=boot-distinct service_principal_generations=1,2,3,4 binding_generations=1,2,3,4 boot1_composite_task_death_exact_reap=true boot1_ingress_closed_rejected=true boot2_fresh_ready_rebind_death_exact_reap=true boot2_ingress_closed_rejected=true boot3_fresh_ready_rebind_live_open=true boot4_fresh_ready_rebind_live_open=true boot3_prior_service_fence=same-boot-exact-reap boot4_prior_service_fence=boot-checkpoint dma_generation_reuse=1->2 dma_generation1_retired=true dma_generation2_retired=true dma_queue=retired retained=0 resource_reuse_authorized=true arena_provider_contract=stable guest_pfn_reuse=true emulated_iova_reuse=true host_backing_file_offset_reuse=true qemu=true physical_hardware=false host_physical_pfn_identity=false physical_dma_drain=false physical_antirollback=false physical_powerloss=false"
+    combined_receipt="CSER_CORE_PERSISTENT_QEMU_RESTART PASS boots=4 schema5_negative_boot=true schema5_selected_revision=5 schema5_selected_catalog=$core_schema5_fixture_catalog schema5_expected_catalog=$catalog_digest schema5_trusted_tpm_candidate_selected=true schema5_profile2_binding_authorized=false schema5_anchor_binding_match=false schema5_typed_rejection=migration-required schema5_semantic_replay=false schema5_pairing_inference=false schema5_registry_publication=false schema5_device_activation=false schema5_device_guard_retained=true schema5_arena_withheld=true schema5_bus_master_disabled=true schema5_intx_masked=true schema5_reset_status_zero=true schema5_observed_isr_bits=0 schema5_isr_reads_at_least=2 schema5_consecutive_empty_isr_reads=2 schema5_iotlb_used_remapped_iova=true schema5_iotlb_completed_trigger_pages_at_least=1 schema5_pci_bus_master_fence_readback=true schema5_iotlb_completion=true schema5_tpm_selected_nv_unchanged=true schema5_tpm_selected_coordinate_digest=$schema5_tpm_coordinate_digest schema5_tpm_tip_counter_hex=$schema5_tpm_tip_counter schema5_tpm_tip_selected_slot=$schema5_tpm_tip_slot schema5_tpm_lease_counter_hex=$schema5_tpm_lease_counter schema5_tpm_lease_selected_slot=$schema5_tpm_lease_slot shared_runtime=true shared_media=journal+swtpm+ram api_profile=4 catalog_version=$catalog_version projection_version=8 snapshot_version=4 journal_schema=8 composite_effect=shared operation_effect=50433:1 component_ids=1,2 evidence_schemes=reply+dma production_registry=single portal=nxp3 supervisor=core-v1 journal=ata-pio outbox=ata-pio-secondary ram_backend=memory-backend-file ram_backend_offset=0 qemu_ram_mapping=guest-paddr-equals-file-offset anchor=tpm2-nv quarantine=pre-replay-virtio+vtd reply=committed-then-intent-crash-then-settled second_crash=after-durable-apply-intent reconciliation=without-second-intent stable_recovery=true freshness=strictly-increasing projection_sequence=boot-distinct service_principal_generations=1,2,3,4 binding_generations=1,2,3,4 boot1_composite_task_death_exact_reap=true boot1_ingress_closed_rejected=true boot2_fresh_ready_rebind_death_exact_reap=true boot2_ingress_closed_rejected=true boot3_fresh_ready_rebind_live_open=true boot4_fresh_ready_rebind_live_open=true boot3_prior_service_fence=same-boot-exact-reap boot4_prior_service_fence=boot-checkpoint dma_generation_reuse=1->2 dma_generation1_retired=true dma_generation2_retired=true dma_queue=retired retained=0 resource_reuse_authorized=true arena_provider_contract=stable guest_pfn_reuse=true emulated_iova_reuse=true host_backing_file_offset_reuse=true qemu=true physical_hardware=false host_physical_pfn_identity=false physical_dma_drain=false physical_antirollback=false physical_powerloss=false"
     combined_receipt+=" focused_test_profiles=profile1-historical focused_test_profiles_are_production=false"
     receipt_header=nexus.cser.production-receipt.v1
     receipt_basename=combined-receipt.txt
@@ -2938,6 +2994,14 @@ case "$command" in
         ensure_image
         build_tool_dma_experiments
         ;;
+    build-tool-handoff-experiments)
+        ensure_image
+        build_tool_handoff_experiments
+        ;;
+    build-tool-handoff-baseline-experiments)
+        ensure_image
+        build_tool_handoff_baseline_experiments
+        ;;
     build-cser-smp-smoke)
         ensure_image
         build_cser_smp_smoke_kernel
@@ -2960,7 +3024,7 @@ case "$command" in
         capture_cser_smp_smoke
         ;;
     run-tool-dma-boot)
-        [[ $# == 2 ]] || { echo 'usage: ./x run-tool-dma-boot {tool-dma-cser|tool-dma-cser-vnext|tool-dma-baseline}' >&2; exit 2; }
+        [[ $# == 2 ]] || { echo 'usage: ./x run-tool-dma-boot {tool-dma-cser|tool-dma-cser-vnext|tool-dma-baseline|tool-handoff-cser|tool-handoff-baseline}' >&2; exit 2; }
         ensure_image
         run_tool_dma_boot "$2"
         ;;
@@ -2994,10 +3058,10 @@ case "$command" in
         rm -rf "$root/target" "$root/artifacts"
         ;;
     -h|--help|help)
-        echo "usage: ./x {doctor|image|fmt|check|clippy|build|run|test|build-core-persistent-recovery|build-tool-dma-experiments|build-cser-smp-smoke|run-cser-smp-smoke|test-pio-journal|test-baseline-handoff|run-tool-dma-boot|run-core-persistent-recovery|seal-core-persistent-recovery|test-core-persistent-arena-checker|test-core-schema5-negative-oracles|test-core-schema5-fixture|clean}"
+        echo "usage: ./x {doctor|image|fmt|check|clippy|build|run|test|build-core-persistent-recovery|build-tool-dma-experiments|build-tool-handoff-experiments|build-tool-handoff-baseline-experiments|build-cser-smp-smoke|run-cser-smp-smoke|test-pio-journal|test-baseline-handoff|run-tool-dma-boot|run-core-persistent-recovery|seal-core-persistent-recovery|test-core-persistent-arena-checker|test-core-schema5-negative-oracles|test-core-schema5-fixture|clean}"
         ;;
     *)
-        echo "usage: ./x {doctor|image|fmt|check|clippy|build|run|test|build-core-persistent-recovery|build-tool-dma-experiments|build-cser-smp-smoke|run-cser-smp-smoke|test-pio-journal|test-baseline-handoff|run-tool-dma-boot|run-core-persistent-recovery|seal-core-persistent-recovery|test-core-persistent-arena-checker|test-core-schema5-negative-oracles|test-core-schema5-fixture|clean}" >&2
+        echo "usage: ./x {doctor|image|fmt|check|clippy|build|run|test|build-core-persistent-recovery|build-tool-dma-experiments|build-tool-handoff-experiments|build-tool-handoff-baseline-experiments|build-cser-smp-smoke|run-cser-smp-smoke|test-pio-journal|test-baseline-handoff|run-tool-dma-boot|run-core-persistent-recovery|seal-core-persistent-recovery|test-core-persistent-arena-checker|test-core-schema5-negative-oracles|test-core-schema5-fixture|clean}" >&2
         exit 2
         ;;
 esac

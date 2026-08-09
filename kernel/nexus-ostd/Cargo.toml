@@ -29,6 +29,13 @@ cser-tool-dma-experiment = ["dep:nexus-ostd-virtio", "dep:osdk-frame-allocator"]
 # recovery machinery is identical; only the typed ATA backend changes.
 cser-tool-dma-experiment-vnext = ["cser-tool-dma-experiment"]
 cser-tool-dma-baseline-experiment = ["dep:nexus-ostd-virtio", "dep:osdk-frame-allocator"]
+# Logical-only, CSER3 single-hop handoff lane.  It retains the same bounded
+# persistent-QEMU substrate as the Tool+DMA profiles but never enables their
+# device-flow entry points.
+cser-tool-handoff-experiment = ["dep:nexus-ostd-virtio", "dep:osdk-frame-allocator"]
+# Matched independent-finalizer counterpart of the logical CSER3 handoff
+# lane. The feature owns no CSER engine/runtime entry point.
+cser-tool-handoff-baseline-experiment = ["dep:nexus-ostd-virtio", "dep:osdk-frame-allocator"]
 
 [dependencies]
 cser-core = { path = "../../crates/cser-core", default-features = false }
