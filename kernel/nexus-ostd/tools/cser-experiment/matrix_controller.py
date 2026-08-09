@@ -12,7 +12,7 @@ import socket
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from matrix_protocol import BarrierProtocolError, barrier_ack, parse_barrier
 
@@ -20,6 +20,8 @@ SCHEMA_VERSION = 2
 VARIANTS = frozenset(("cser", "baseline"))
 _CID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$")
 _RECOVERY_METRICS_PREFIX = "TOOL_DMA_RECOVERY_METRICS "
+_MAX_RECOVERY_SERIAL_LINE_BYTES = 64 * 1024
+_RECOVERY_STDERR_TAIL_BYTES = 4096
 _CURRENT_GUEST_RUN_ID = "42" * 16
 _TERMINAL_COUNTER_FIELDS = (
     "retired_by_evidence",
@@ -106,22 +108,34 @@ def _guest_metrics(path: Path) -> dict[str, Any]:
     return value
 
 
-def _recovery_metrics_from_serial(stdout: bytes, *, variant: str, run_id: str) -> dict[str, Any]:
+def _recovery_metrics_from_serial_lines(
+    lines: Iterable[bytes], *, variant: str, run_id: str
+) -> dict[str, Any]:
     """Read the one terminal receipt emitted by the recovery guest itself.
 
     The real-QEMU path intentionally does not trust an arbitrary host-side
     metrics file.  A launcher may capture serial output, but the terminal and
     invariant assertions must be a guest marker from the recovered kernel.
     """
-    try:
-        lines = stdout.decode("utf-8", errors="strict").splitlines()
-    except UnicodeDecodeError as exc:
-        raise ValueError(f"recovery serial is not UTF-8: {exc}") from exc
-    markers = [line[len(_RECOVERY_METRICS_PREFIX):] for line in lines if line.startswith(_RECOVERY_METRICS_PREFIX)]
-    if len(markers) != 1:
+    marker: str | None = None
+    for raw_line in lines:
+        try:
+            decoded = raw_line.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"recovery serial is not UTF-8: {exc}") from exc
+        # QEMU's serial stream may use a bare carriage return before a guest
+        # line.  `bytes.splitlines()` was the original accepted framing, so
+        # preserve that behavior while the outer file iterator keeps memory
+        # bounded by the LF-delimited chunk limit.
+        for line in decoded.splitlines():
+            if line.startswith(_RECOVERY_METRICS_PREFIX):
+                if marker is not None:
+                    raise ValueError("recovery serial must contain exactly one terminal metrics marker")
+                marker = line[len(_RECOVERY_METRICS_PREFIX):]
+    if marker is None:
         raise ValueError("recovery serial must contain exactly one terminal metrics marker")
     try:
-        value = json.loads(markers[0])
+        value = json.loads(marker)
     except json.JSONDecodeError as exc:
         raise ValueError(f"invalid recovery serial metrics: {exc}") from exc
     if not isinstance(value, dict):
@@ -132,6 +146,33 @@ def _recovery_metrics_from_serial(stdout: bytes, *, variant: str, run_id: str) -
         raise ValueError("recovery guest did not publish terminal invariants_ok metrics")
     _require_terminal_metrics(value)
     return value
+
+
+def _recovery_metrics_from_serial(stdout: bytes, *, variant: str, run_id: str) -> dict[str, Any]:
+    """Parse bounded in-memory serial used by focused protocol unit tests."""
+    return _recovery_metrics_from_serial_lines(stdout.splitlines(), variant=variant, run_id=run_id)
+
+
+def _recovery_metrics_from_serial_log(path: Path, *, variant: str, run_id: str) -> dict[str, Any]:
+    """Parse the terminal serial receipt with bounded line buffering.
+
+    Launcher output belongs in the trial log, not an unbounded controller
+    buffer.  A malformed serial sender cannot make recovery parsing retain a
+    giant line in host memory.
+    """
+    def bounded_lines() -> Iterable[bytes]:
+        with path.open("rb") as handle:
+            while True:
+                line = handle.readline(_MAX_RECOVERY_SERIAL_LINE_BYTES + 1)
+                if not line:
+                    return
+                if len(line) > _MAX_RECOVERY_SERIAL_LINE_BYTES:
+                    raise ValueError(
+                        f"recovery serial line exceeds {_MAX_RECOVERY_SERIAL_LINE_BYTES} byte limit"
+                    )
+                yield line
+
+    return _recovery_metrics_from_serial_lines(bounded_lines(), variant=variant, run_id=run_id)
 
 
 def _require_terminal_metrics(metrics: dict[str, Any]) -> None:
@@ -179,6 +220,13 @@ def _validate_real_qemu_launcher(args: argparse.Namespace) -> None:
     # a durable boot configuration channel.
     if args.run_id != _CURRENT_GUEST_RUN_ID:
         raise ValueError("real QEMU trials must use the current guest run id 4242…4242")
+    # qemu_boot's OSDK invocation has a 90-second internal timeout.  The
+    # controller's envelope must leave room to collect its terminal receipt
+    # and logs instead of racing that inner timeout.
+    if args.recovery_timeout_seconds <= 90:
+        raise ValueError(
+            "real QEMU recovery stage requires --recovery-timeout-seconds greater than the internal 90s launcher timeout"
+        )
 
 
 def _kill_process_group(process: subprocess.Popen[bytes]) -> None:
@@ -188,16 +236,73 @@ def _kill_process_group(process: subprocess.Popen[bytes]) -> None:
         return
 
 
-def _capture_process(process: subprocess.Popen[bytes], trial_dir: Path, prefix: str) -> None:
-    """Drain and retain launcher output after its process group has stopped."""
-    stdout, stderr = process.communicate(timeout=10)
-    (trial_dir / f"{prefix}.stdout.log").write_bytes(stdout)
-    (trial_dir / f"{prefix}.stderr.log").write_bytes(stderr)
+def _finish_process_capture(
+    process: subprocess.Popen[bytes], stdout_log: Any, stderr_log: Any, *, stage: str
+) -> None:
+    """Close directly-streamed launcher logs after the process group has stopped.
+
+    QEMU and its launcher can produce more than a pipe buffer before the first
+    COM3 barrier.  Keeping either stream in an unread PIPE would therefore let
+    launcher logging prevent the very crash point that the controller is
+    waiting to observe.  The file descriptors below are inherited directly by
+    the child and kernel-backed files continuously consume the output.
+    """
+    try:
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            _kill_process_group(process)
+            process.wait(timeout=10)
+    except subprocess.SubprocessError as exc:
+        raise RuntimeError(f"{stage} launcher did not stop after termination: {exc}") from exc
+    finally:
+        stdout_log.close()
+        stderr_log.close()
 
 
-def _write_completed_capture(completed: subprocess.CompletedProcess[bytes], trial_dir: Path, prefix: str) -> None:
-    (trial_dir / f"{prefix}.stdout.log").write_bytes(completed.stdout)
-    (trial_dir / f"{prefix}.stderr.log").write_bytes(completed.stderr)
+def _run_recovery_launcher(
+    command: Path, *, env: dict[str, str], trial_dir: Path, timeout_seconds: float
+) -> tuple[int, Path, str]:
+    """Run recovery with streaming logs and a recovery-specific envelope."""
+    stdout_path = trial_dir / "recovery.stdout.log"
+    stderr_path = trial_dir / "recovery.stderr.log"
+    with stdout_path.open("wb") as stdout_log, stderr_path.open("wb") as stderr_log:
+        process = subprocess.Popen(
+            command,
+            env=env,
+            start_new_session=True,
+            stdout=stdout_log,
+            stderr=stderr_log,
+        )
+        try:
+            returncode = process.wait(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired as exc:
+            _kill_process_group(process)
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired as wait_exc:
+                raise RuntimeError("recovery stage launcher did not stop after timeout termination") from wait_exc
+            raise RuntimeError(
+                f"recovery stage exceeded its {timeout_seconds:g}s envelope"
+            ) from exc
+        except BaseException:
+            _kill_process_group(process)
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                pass
+            raise
+        # A launcher that returns while leaving a helper behind is not a
+        # complete recovery.  The dedicated process group makes this cleanup
+        # exact even after the leader has reaped itself.
+        _kill_process_group(process)
+    # The serial terminal receipt is parsed only after the launcher exits. No
+    # child PIPE is involved, and only a bounded tail is read for diagnostics.
+    with stderr_path.open("rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        handle.seek(max(0, handle.tell() - _RECOVERY_STDERR_TAIL_BYTES), os.SEEK_SET)
+        stderr_tail = handle.read(_RECOVERY_STDERR_TAIL_BYTES).decode("utf-8", errors="replace").strip()
+    return returncode, stdout_path, stderr_tail
 
 
 def _kill_container(cid_path: Path, command_prefix: list[str]) -> str:
@@ -272,7 +377,20 @@ def run_trial(args: argparse.Namespace) -> dict[str, Any]:
                 "CSER_EXPERIMENT_BARRIER_SOCKET": str(socket_path), "CSER_EXPERIMENT_TRIAL_DIR": str(trial_dir),
                 "CSER_EXPERIMENT_GUEST_METRICS": str(metrics_path), "CSER_EXPERIMENT_CID_FILE": str(cid_path),
                 "CSER_EXPERIMENT_VARIANT": args.variant})
-    process = subprocess.Popen(args.guest, env=env, start_new_session=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    initial_stdout = (trial_dir / "initial.stdout.log").open("wb")
+    initial_stderr = (trial_dir / "initial.stderr.log").open("wb")
+    try:
+        process = subprocess.Popen(
+            args.guest,
+            env=env,
+            start_new_session=True,
+            stdout=initial_stdout,
+            stderr=initial_stderr,
+        )
+    except BaseException:
+        initial_stdout.close()
+        initial_stderr.close()
+        raise
     crash_method, container_id = "pid_sigkill", None
     initial_captured = False
     try:
@@ -284,20 +402,24 @@ def run_trial(args: argparse.Namespace) -> dict[str, Any]:
             container_id = _kill_container(cid_path, args.container_kill_command)
             crash_method = "container_kill"
             _kill_process_group(process)  # kill any launcher outside the container too
-        _capture_process(process, trial_dir, "initial")
+        _finish_process_capture(process, initial_stdout, initial_stderr, stage="initial")
         initial_captured = True
         recovery = None
         if args.recovery_guest is not None:
             recovery_env = env.copy()
             recovery_env.update({"CSER_EXPERIMENT_PHASE": "recovery", "CSER_EXPERIMENT_RECOVERY_METRICS": str(recovery_metrics_path)})
-            recovered = subprocess.run(args.recovery_guest, env=recovery_env, capture_output=True, timeout=args.timeout_seconds)
-            _write_completed_capture(recovered, trial_dir, "recovery")
-            if recovered.returncode != 0:
+            recovery_returncode, recovery_stdout_log, recovery_stderr = _run_recovery_launcher(
+                args.recovery_guest,
+                env=recovery_env,
+                trial_dir=trial_dir,
+                timeout_seconds=args.recovery_timeout_seconds,
+            )
+            if recovery_returncode != 0:
                 raise RuntimeError(
-                    f"recovery guest exited {recovered.returncode}: {recovered.stderr.decode('utf-8', errors='replace').strip()}"
+                    f"recovery stage exited {recovery_returncode}: {recovery_stderr}"
                 )
             recovery = (
-                _recovery_metrics_from_serial(recovered.stdout, variant=args.variant, run_id=args.run_id)
+                _recovery_metrics_from_serial_log(recovery_stdout_log, variant=args.variant, run_id=args.run_id)
                 if args.recovery_output_metrics
                 else _guest_metrics(recovery_metrics_path)
             )
@@ -313,7 +435,7 @@ def run_trial(args: argparse.Namespace) -> dict[str, Any]:
     except BaseException:
         _kill_process_group(process)
         if not initial_captured:
-            _capture_process(process, trial_dir, "initial")
+            _finish_process_capture(process, initial_stdout, initial_stderr, stage="initial")
         raise
 def append_jsonl(path: Path, metric: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -329,6 +451,8 @@ def main() -> None:
     parser.add_argument("--trial-dir", required=True, type=Path); parser.add_argument("--metrics-jsonl", required=True, type=Path)
     parser.add_argument("--prepared-trial-dir", action="store_true")
     parser.add_argument("--media", action="append", default=[]); parser.add_argument("--timeout-seconds", type=float, default=30.0)
+    parser.add_argument("--recovery-timeout-seconds", type=float, default=None,
+                        help="outer recovery-launcher budget; defaults to --timeout-seconds")
     parser.add_argument("--kill-mode", choices=("pid", "container"), default="pid")
     parser.add_argument("--pass-through", action="store_true", help="ACK a non-target barrier; never use for a crash target")
     parser.add_argument("--recovery-guest", type=Path, default=None, help="executable recovery boot launched on the retained trial media")
@@ -336,6 +460,12 @@ def main() -> None:
     parser.add_argument("--real-qemu", action="store_true", help="restrict this trial to the dedicated two-boot QEMU launcher")
     parser.add_argument("--container-kill-command", nargs="+", default=None); parser.add_argument("guest", nargs=argparse.REMAINDER)
     args = parser.parse_args()
+    if args.timeout_seconds <= 0:
+        parser.error("--timeout-seconds must be positive")
+    if args.recovery_timeout_seconds is None:
+        args.recovery_timeout_seconds = args.timeout_seconds
+    if args.recovery_timeout_seconds <= 0:
+        parser.error("--recovery-timeout-seconds must be positive")
     if not args.guest or args.guest[0] != "--": parser.error("guest command must follow --")
     args.guest = args.guest[1:]
     if not args.guest: parser.error("missing guest command")

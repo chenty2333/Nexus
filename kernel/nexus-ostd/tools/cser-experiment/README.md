@@ -81,6 +81,13 @@ trial media and requires `$CSER_EXPERIMENT_RECOVERY_METRICS` to contain
 `completion_state: "recovery_verified"`; without it, a crash row is explicitly
 `crashed_unrecovered`, never completed.
 
+`--timeout-seconds` bounds initial boot / COM3 cutpoint observation. Recovery
+has its own outer `--recovery-timeout-seconds` envelope (defaulting to the
+initial budget in the generic runner), and failures name the recovery stage.
+Both launcher stdout and stderr stream directly to each trial's
+`initial.*.log` or `recovery.*.log`; they are never left in an unread host
+PIPE before a barrier.
+
 `run_qemu_matrix.sh` is the separate real-QEMU entrypoint. It accepts only
 `qemu_boot.sh` for both boots, stages each row's `journal.raw`, `outbox.raw`,
 and `ram.raw` into the reviewed OSDK envelope (and resets per-row swtpm state
@@ -93,6 +100,11 @@ row is accepted only when QEMU serial contains exactly one
 `TOOL_DMA_RECOVERY_METRICS {…}` record with matching variant/run id and both
 `terminal` and `invariants_ok` true. The informational
 `TOOL_DMA_EXPERIMENT ...` smoke marker is never a completion receipt.
+
+For real QEMU, the initial/cutpoint budget defaults to 90 seconds and the
+recovery envelope defaults to 120 seconds. The latter is required to exceed
+the 90-second timeout inside `qemu_boot.sh`; lowering it to 90 seconds or less
+is rejected rather than making the two envelopes race.
 
 Real-QEMU rows use schema version 2. Their terminal experiment metrics
 are copied only from that verified recovery terminal record, never from the

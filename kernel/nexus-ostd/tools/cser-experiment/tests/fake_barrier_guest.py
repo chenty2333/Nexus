@@ -6,6 +6,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from matrix_protocol import barrier
 metrics = Path(os.environ["CSER_EXPERIMENT_GUEST_METRICS"])
 metrics.write_text(json.dumps({"retired_by_evidence": 1, "retained_claims": 2, "gate_rejections": 3}), encoding="utf-8")
+emit_bytes = int(os.environ.get("CSER_EXPERIMENT_EMIT_BYTES", "0"))
+if emit_bytes:
+    # Exercise controller capture before any barrier: an unread PIPE would
+    # block long before the host can observe the cutpoint.
+    sys.stdout.buffer.write(b"O" * emit_bytes); sys.stdout.buffer.flush()
+    sys.stderr.buffer.write(b"E" * emit_bytes); sys.stderr.buffer.flush()
 path = os.environ["CSER_EXPERIMENT_BARRIER_SOCKET"]
 with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
     server.bind(path); server.listen(1)

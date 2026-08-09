@@ -7,6 +7,7 @@
 //! and that the retirement reference count releases the coordinate only when
 //! the last custodian discharges.
 
+#[allow(dead_code)]
 mod support;
 
 use cser_core::{

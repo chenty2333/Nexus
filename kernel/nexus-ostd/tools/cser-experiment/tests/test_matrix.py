@@ -1,5 +1,5 @@
 from __future__ import annotations
-import json, socket, subprocess, sys, tempfile, unittest
+import json, os, socket, subprocess, sys, tempfile, time, unittest
 from pathlib import Path
 TOOLS = Path(__file__).resolve().parents[1]; sys.path.insert(0, str(TOOLS))
 from matrix_controller import _CURRENT_GUEST_RUN_ID, _RECOVERY_METRICS_PREFIX, _metric, _recovery_metrics_from_serial, observe_barriers
@@ -37,6 +37,9 @@ class MatrixProtocolTests(unittest.TestCase):
         )
         result = _recovery_metrics_from_serial(marker, variant="cser", run_id="a" * 32)
         self.assertTrue(result["terminal"])
+        self.assertTrue(
+            _recovery_metrics_from_serial(b"\r" + marker, variant="cser", run_id="a" * 32)["terminal"]
+        )
         with self.assertRaises(ValueError):
             _recovery_metrics_from_serial(b"", variant="cser", run_id="a" * 32)
         with self.assertRaises(ValueError):
@@ -117,6 +120,102 @@ class MatrixProtocolTests(unittest.TestCase):
             summarize([first, row("baseline", "post_register", 2)])
 
 class MatrixControllerIntegrationTests(unittest.TestCase):
+    @staticmethod
+    def _proc_identity(pid: int) -> tuple[str, str] | None:
+        try:
+            fields = Path(f"/proc/{pid}/stat").read_text(encoding="ascii").rpartition(")")[2].split()
+        except FileNotFoundError:
+            return None
+        return fields[0], fields[19]  # state, then Linux proc stat field 22
+
+    def test_launcher_output_streams_past_pipe_capacity_before_barrier(self) -> None:
+        """A noisy launcher must still reach the barrier before its crash.
+
+        This is deliberately larger than the typical pipe capacity on Linux.
+        If matrix_controller changes back to an unread stdout/stderr PIPE, the
+        fake guest blocks before binding COM3 and this controller invocation
+        times out instead of producing a recovery row.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); trial_dir = root / "trial"; media = trial_dir / "media"
+            media.mkdir(parents=True); image = media / "fresh.img"; image.write_bytes(b"fresh media")
+            env = os.environ.copy(); env["CSER_EXPERIMENT_EMIT_BYTES"] = str(1_200_000)
+            subprocess.run(
+                [sys.executable, str(TOOLS / "matrix_controller.py"), "--variant", "cser", "--run-id", "a" * 32,
+                 "--trial", "1", "--cutpoint", "pre_escape", "--cutpoint-id", "1",
+                 "--barrier-socket", str(trial_dir / "com3-crash.sock"), "--trial-dir", str(trial_dir),
+                 "--prepared-trial-dir", "--metrics-jsonl", str(root / "metrics.jsonl"), "--media", str(image),
+                 "--recovery-guest", str(TOOLS / "tests" / "fake_recovery_guest.py"), "--",
+                 sys.executable, str(TOOLS / "tests" / "fake_barrier_guest.py")],
+                check=True, cwd=TOOLS, timeout=20, env=env,
+            )
+            self.assertGreater((trial_dir / "initial.stdout.log").stat().st_size, 1_000_000)
+            self.assertGreater((trial_dir / "initial.stderr.log").stat().st_size, 1_000_000)
+
+    def test_recovery_output_streams_past_pipe_capacity_and_parses_terminal_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); trial_dir = root / "trial"; media = trial_dir / "media"
+            media.mkdir(parents=True); image = media / "fresh.img"; image.write_bytes(b"fresh media")
+            env = os.environ.copy()
+            env.update({"CSER_EXPERIMENT_RECOVERY_EMIT_BYTES": str(1_200_000), "CSER_EXPERIMENT_RECOVERY_SERIAL": "1"})
+            subprocess.run(
+                [sys.executable, str(TOOLS / "matrix_controller.py"), "--variant", "cser", "--run-id", "b" * 32,
+                 "--trial", "1", "--cutpoint", "pre_escape", "--cutpoint-id", "1",
+                 "--barrier-socket", str(trial_dir / "com3-crash.sock"), "--trial-dir", str(trial_dir),
+                 "--prepared-trial-dir", "--metrics-jsonl", str(root / "metrics.jsonl"), "--media", str(image),
+                 "--recovery-guest", str(TOOLS / "tests" / "fake_recovery_guest.py"), "--recovery-output-metrics", "--",
+                 sys.executable, str(TOOLS / "tests" / "fake_barrier_guest.py")],
+                check=True, cwd=TOOLS, timeout=20, env=env,
+            )
+            self.assertGreater((trial_dir / "recovery.stdout.log").stat().st_size, 1_000_000)
+            self.assertGreater((trial_dir / "recovery.stderr.log").stat().st_size, 1_000_000)
+            row = load_metrics(root / "metrics.jsonl")[0]
+            self.assertEqual(row["metrics_source"], "recovery_terminal")
+            self.assertEqual(row["retired_by_evidence"], 1)
+
+    def test_recovery_timeout_kills_its_process_group_descendant(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); trial_dir = root / "trial"; media = trial_dir / "media"; child_file = root / "child"
+            media.mkdir(parents=True); image = media / "fresh.img"; image.write_bytes(b"fresh media")
+            env = os.environ.copy()
+            env.update({
+                "CSER_EXPERIMENT_RECOVERY_SPAWN_LONG_CHILD": "1",
+                "CSER_EXPERIMENT_RECOVERY_CHILD_FILE": str(child_file),
+            })
+            result = subprocess.run(
+                [sys.executable, str(TOOLS / "matrix_controller.py"), "--variant", "cser", "--run-id", "c" * 32,
+                 "--trial", "1", "--cutpoint", "pre_escape", "--cutpoint-id", "1",
+                 "--barrier-socket", str(trial_dir / "com3-crash.sock"), "--trial-dir", str(trial_dir),
+                 "--prepared-trial-dir", "--metrics-jsonl", str(root / "metrics.jsonl"), "--media", str(image),
+                 "--recovery-guest", str(TOOLS / "tests" / "fake_recovery_guest.py"), "--recovery-timeout-seconds", "0.2", "--",
+                 sys.executable, str(TOOLS / "tests" / "fake_barrier_guest.py")],
+                cwd=TOOLS, timeout=20, env=env, text=True, capture_output=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("recovery stage exceeded", result.stderr)
+            pid_text, starttime = child_file.read_text(encoding="ascii").split()
+            pid = int(pid_text)
+            # Compare the proc starttime as well as PID: a rapid PID recycle is
+            # evidence that our exact descendant is gone, not a false success.
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                identity = self._proc_identity(pid)
+                if identity is None or identity[1] != starttime:
+                    break
+                time.sleep(0.02)
+            else:
+                self.fail(f"recovery descendant {pid} remained after timeout cleanup")
+
+    def test_real_qemu_recovery_budget_cannot_race_internal_launcher_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            result = subprocess.run(
+                [str(TOOLS / "run_qemu_matrix.sh"), "--variant", "cser", "--output", str(Path(temporary) / "out"),
+                 "--base-media", str(Path(temporary) / "unneeded.raw"), "--recovery-timeout-seconds", "90"],
+                cwd=TOOLS, text=True, capture_output=True,
+            )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("recovery timeout must exceed", result.stderr)
+
     def test_fake_guest_is_killed_only_after_bound_barrier(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary); metrics = root / "metrics.jsonl"

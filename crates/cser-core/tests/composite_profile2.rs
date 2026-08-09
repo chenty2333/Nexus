@@ -3384,16 +3384,15 @@ fn closure_persistence_failure_keeps_final_quiescence_release_unobservable() {
         Err(CoreError::ResourceRetained)
     );
     assert!(harness.engine.persistence_recovery_required());
-    assert_eq!(
-        harness
+    assert!(
+        !harness
             .engine
             .component_claims(effect, AGENT_COMPONENT_DMA)
             .unwrap()
             .into_iter()
             .find(|claim| claim.resource == queue)
             .unwrap()
-            .retired,
-        false
+            .retired
     );
 }
 

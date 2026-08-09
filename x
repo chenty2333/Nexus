@@ -189,14 +189,23 @@ check_host_shell_sources() {
     echo "HOST SHELL PASS sources=$count"
 }
 
+check_host_cser_experiment() {
+    require_command python3
+    python3 -m unittest discover \
+        -s "$root/kernel/nexus-ostd/tools/cser-experiment/tests" \
+        -v
+}
+
 run_quick() {
     check_host_shell_sources
+    check_host_cser_experiment
     run_xtask quick
     run_backend "$kernel_backend" check "Nexus OSTD kernel"
 }
 
 run_check() {
     check_host_shell_sources
+    check_host_cser_experiment
     run_xtask check
     run_backend "$kernel_backend" check "Nexus OSTD kernel"
 }
@@ -209,6 +218,7 @@ run_format() {
 verify_all() {
     require_docker
     check_host_shell_sources
+    check_host_cser_experiment
     run_xtask verify
     # The production acceptance path exercises the focused reply/DMA guests,
     # then one recovered core owner across four real QEMU boots with the same

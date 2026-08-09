@@ -7,11 +7,14 @@ variant=
 output=
 trials=1
 timeout=90
+# qemu_boot's OSDK envelope is 90 seconds. Keep the controller outside it so
+# the recovered VM can terminate and its serial receipt can be collected.
+recovery_timeout=120
 only_cutpoint=
 media=()
 base_media_dir=
 usage() {
-  echo "usage: $0 --variant {cser,baseline} --output DIR (--base-media FILE ... | --base-media-dir DIR) [--trials N] [--timeout-seconds N] [--only-cutpoint NAME]" >&2
+  echo "usage: $0 --variant {cser,baseline} --output DIR (--base-media FILE ... | --base-media-dir DIR) [--trials N] [--timeout-seconds N] [--recovery-timeout-seconds N] [--only-cutpoint NAME]" >&2
 }
 while (($#)); do
   case "$1" in
@@ -21,6 +24,7 @@ while (($#)); do
     --base-media-dir) base_media_dir=${2:?}; shift 2 ;;
     --trials) trials=${2:?}; shift 2 ;;
     --timeout-seconds) timeout=${2:?}; shift 2 ;;
+    --recovery-timeout-seconds) recovery_timeout=${2:?}; shift 2 ;;
     --only-cutpoint) only_cutpoint=${2:?}; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) usage; exit 2 ;;
@@ -28,7 +32,11 @@ while (($#)); do
 done
 [[ $variant == cser || $variant == baseline ]] || { usage; exit 2; }
 [[ -n $output ]] || { usage; exit 2; }
-[[ $trials =~ ^[1-9][0-9]*$ && $timeout =~ ^[1-9][0-9]*$ ]] || { usage; exit 2; }
+[[ $trials =~ ^[1-9][0-9]*$ && $timeout =~ ^[1-9][0-9]*$ && $recovery_timeout =~ ^[1-9][0-9]*$ ]] || { usage; exit 2; }
+(( recovery_timeout > 90 )) || {
+  echo "real-QEMU recovery timeout must exceed the qemu_boot internal 90s timeout" >&2
+  exit 2
+}
 [[ -z $base_media_dir || ${#media[@]} -eq 0 ]] || { echo "choose either --base-media or --base-media-dir" >&2; exit 2; }
 
 # Each OSDK scheme has one fixed artifact directory, TPM state, and COM2/COM3
@@ -50,7 +58,7 @@ for medium in "${media[@]}"; do [[ -f $medium ]] || { echo "not a regular base m
 # qemu_boot receives this identity through the controller environment.  The
 # original generic runner remains useful for isolated protocol tests; this
 # entrypoint is the research campaign and therefore forces real-QEMU mode.
-args=(--variant "$variant" --output "$output" --trials "$trials" --timeout-seconds "$timeout" \
+args=(--variant "$variant" --output "$output" --trials "$trials" --timeout-seconds "$timeout" --recovery-timeout-seconds "$recovery_timeout" \
   --real-qemu --recovery-output-metrics --recovery-guest "$root/qemu_boot.sh" \
   --kill-mode container)
 [[ -z $only_cutpoint ]] || args+=(--only-cutpoint "$only_cutpoint")
