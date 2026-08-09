@@ -1,6 +1,6 @@
 # RFC 0008: CSER catalog v6 evidence and conflict amendment
 
-- Status: **Implemented; catalog-v6 development QEMU proof captured**
+- Status: **Implemented; catalog-v6 clean-tree QEMU seal captured**
 - Decision date: 2026-08-04
 - Amends: [RFC 0007](0007-cser-composite-effect-custody.md)
 
@@ -72,16 +72,16 @@ The existing `CSERJR5\0` schema-5 rule in RFC 0007 remains unchanged.
 
 ## Current evidence binding
 
-The current development artifact is
-`kernel/nexus-ostd/artifacts/cser-production/combined-proof.txt`. It records
-four fresh QEMU boots with catalog v6 and journal schema 6, exact generation
-`1 -> 2` reuse, stable repeated recovery, and zero retained claims at boot 4.
-Its receipt SHA-256 is
-`99b2f5694a7340df6d4fab0cc08c22336f9ba7b6a8f6b32a797009c962ed94d4`.
+The current clean-tree seal is generated locally in the Git-ignored artifact
+tree at
+`kernel/nexus-ostd/artifacts/cser-production/combined-receipt.txt`, bound to
+committed revision `1a8f75e`. It records four fresh QEMU boots with catalog v6
+and journal schema 6, exact generation `1 -> 2` reuse, stable repeated
+recovery, and zero retained claims at boot 4. Its receipt SHA-256 is
+`c94c66a2b272f8e3d0cc663e11a21127e23e92613f9e7fe6590fd39900e9ef8b`.
 
-The receipt is deliberately `NONSEALABLE` because it binds the current dirty
-development tree rather than a committed release revision. It remains a valid
-execution result, not a release seal. It also records the negative physical
+This is a clean-tree execution seal for the bounded QEMU research path, not a
+hardware-general or product-release seal. It records the negative physical
 boundaries explicitly: no physical-hardware, host-PFN-identity, physical DMA
 drain, physical anti-rollback, or physical power-loss claim. Older catalog-v5
 artifacts remain available through Git; this RFC imposes no append-only

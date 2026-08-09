@@ -30,7 +30,7 @@ current fixed tool-plus-DMA experiment does not do so.
 
 The `cser-evidence-capability-and-conflict` branch contains the completed
 catalog-v6 cleanup, tool-plus-DMA adapters, and host-controlled crash matrix in
-four reviewable commits layered as core, kernel, experiment harness, and
+reviewable commits layered as core, kernel, experiment harness, and
 documentation. It includes typed
 Outcome/Quiescence and Recoverable/Ephemeral catalog fields, symmetric
 Shared/Exclusive admission across both reverse indexes, last-custodian
@@ -40,11 +40,20 @@ catalog remains Exclusive-only; Shared is a tested extension point with one
 complete discharge, reuse, activation, and generation-plus-one lifecycle.
 
 Core all-feature suites, no-std checks, formatting, the production static
-cutover, 23 host-harness tests, both experiment builds, and the HotOS PDF build
+cutover, 27 host-harness tests, both experiment builds, and the HotOS PDF build
 pass. A clean-tree catalog-v6, journal-schema-6 four-boot QEMU seal at commit
-`6bdeae4429ec23145481be6bef17bbdc29f53e2a` records generation `1 -> 2` reuse,
-stable repeated recovery, and zero retained claims; its receipt SHA-256 is
-`839e821bf02cbdb63ae06503c1460eb32e9281fc95e41078e18ab0b1172f549b`.
+`1a8f75e319167077631ad1e8433d6ec1cfe0b15e` records generation `1 -> 2` reuse,
+stable repeated recovery, and zero retained claims; its locally generated,
+Git-ignored receipt SHA-256 is
+`c94c66a2b272f8e3d0cc663e11a21127e23e92613f9e7fe6590fd39900e9ef8b`.
+
+The host harness now streams launcher output directly to per-trial logs,
+separates the 120-second recovery envelope from the guest's internal 90-second
+budget, terminates complete recovery process groups, and parses terminal
+receipts with bounded memory. These regressions run on the public quick and
+full test paths. Fresh real-QEMU smoke rows for both CSER and the baseline at
+`post_endpoint_apply` each recover with two evidence-retired components, zero
+retained claims, and one reconciliation step.
 
 The real-QEMU comparison uses the same seven host-controlled container-kill
 cutpoints and durable ATA, RAM, TPM, and endpoint state for both variants. The
@@ -62,6 +71,11 @@ counterfactual revision metric, and QEMU-versus-physical boundary. It builds as
 five pages. RFC 0007 is explicitly the historical v5 baseline and RFC 0008 is
 the current v6 amendment.
 
+Publication remains outstanding. This Nexus branch has no upstream and does
+not exist on `origin`; the sibling `nexus-hotos` checkout has no Git remote.
+Generated QEMU receipts and comparison outputs are intentionally Git-ignored,
+so publishing source commits alone will not publish the research evidence.
+
 ## Current Tasks
 
 - [x] Align I3 and design text with live `(ResourceId, generation)` conflict coordinates, current-custodian conservation, and intentional per-sharer credit charging.
@@ -78,3 +92,5 @@ the current v6 amendment.
 - [x] Compare safety gaps, retained claims, reconciliation work, and the limits of the currently observable gate and delay metrics without manufacturing missing measurements.
 - [x] Narrow volatile, legacy, and mutable persistence surfaces; repair automatic-retirement evidence contracts and align the README, CSER guide, RFCs, and HotOS paper.
 - [x] Split the work into reviewable core, kernel, experiment, and documentation commits and produce a clean-tree production recovery seal.
+- [x] Remove launcher pipe backpressure, separate nested recovery timeout budgets, clean complete recovery process groups, bound receipt parsing, and place the 27 host regressions on the public quick/full paths.
+- [ ] Publish the local Nexus branch and a small source-bound evidence bundle after external GitHub publication is explicitly authorized; configure a remote for `nexus-hotos` before publishing the paper commit.

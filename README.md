@@ -72,7 +72,7 @@ kernel, service, resource, and device map is
 | Track | Status | Meaning |
 | --- | --- | --- |
 | `v0.1.0` | Published, archived research artifact | Bounded CSER composition with reproducible models, implementation slices, and receipts |
-| Current development branch | Catalog-v6 development result | RFC 0006's portable core and RFC 0008's evidence/conflict amendment are exercised by a four-boot QEMU development proof; the current dirty-tree receipt is explicitly non-sealable, not a release seal |
+| Current development branch | Catalog-v6 clean-tree QEMU seal | RFC 0006's portable core and RFC 0008's evidence/conflict amendment are exercised by a four-boot QEMU seal at committed revision `1a8f75e`; it remains a bounded QEMU research result, not a hardware-general or product-release claim |
 | Production system | Not established | The `cser-production` profile is a bounded QEMU research path, not a hardware-general, SMP, availability, or production-readiness result |
 | Paper | None peer reviewed | `NARRATIVE.md` is a technical research account; the Zenodo object is software and reproducibility evidence |
 
@@ -121,13 +121,16 @@ reply outbox, and swtpm state, with device quarantine established before
 replay. Those focused schemes provide domain evidence; they are not alternate
 production Registries and do not introduce live dual-write.
 
-The current catalog-v6 development receipt records four fresh QEMU boots, exact
-generation `1 -> 2` reuse, stable repeated recovery, and zero retained claims
-at boot 4. It is deliberately `NONSEALABLE` because it binds the dirty
-development tree rather than a committed release revision; it is an execution
-result, not a release seal. Earlier C3 clean local and exact-C3 CI receipts,
-including their swtpm and Docker/AppArmor negative records, remain historical
-release evidence in the ledger.
+The current catalog-v6 clean-tree seal is bound to committed revision
+`1a8f75e`. The locally generated, Git-ignored receipt at
+`kernel/nexus-ostd/artifacts/cser-production/combined-receipt.txt` records four
+fresh QEMU boots, exact generation `1 -> 2` reuse, stable repeated recovery,
+and zero retained claims at boot 4; its SHA-256 is
+`c94c66a2b272f8e3d0cc663e11a21127e23e92613f9e7fe6590fd39900e9ef8b`.
+This is a clean-tree execution seal for the bounded research path, not a
+hardware-general or product-release seal. Earlier C3 clean local and exact-C3
+CI receipts, including their swtpm and Docker/AppArmor negative records,
+remain historical evidence in the ledger.
 
 A separate tool-plus-DMA experiment now pairs a durable, idempotency-keyed host
 tool endpoint with the real guest VirtIO/IRQ/IOMMU path. The same seven semantic
@@ -174,8 +177,9 @@ The public workflow is intentionally small:
 ./x clean [--all]
 ```
 
-`--unit` stays on the host semantic graph and `--quick` adds the kernel static
-gate. `--system` runs the two focused guest evidence schemes followed by the
+`--unit` stays on the host semantic graph and `--quick` adds the host
+tool-endpoint/matrix regressions plus the kernel static gate. `--system` runs
+the two focused guest evidence schemes followed by the
 four-boot production recovery path and writes an explicitly non-sealable proof.
 `--full` is the same clean-source seal gate as `verify`; it rejects tracked,
 staged, or nonignored untracked source changes before QEMU. Set

@@ -52,7 +52,7 @@ first reproducible Nexus adapter should therefore use a host-resident durable
 tool service with a small controlled transport instead of adding a guest TCP/IP
 stack as an unrelated experimental variable.
 
-The service contract is:
+The intended service contract for a broader endpoint adapter is:
 
 1. `submit(effect_id, input_digest)` durably records a job and is idempotent by
    `effect_id`;
@@ -61,8 +61,16 @@ The service contract is:
    `Failed(code)` from durable state;
 4. terminal outcome remains queryable across guest and service restart.
 
-That component supplies recoverable outcome evidence.  The existing VirtIO DMA
-component independently supplies recoverable quiescence evidence for its queue,
-page, and generation claims.  Putting both beneath one composite effect tests
-component-local retirement without pretending that either fact proves the
-other.
+The current experiment implements only the successful-path subset of that
+contract: it durably stores an idempotent `(run_id, operation_key)` record with
+`status=applied` and `result=success`, then exposes that record through `GET`.
+It deliberately does not create a durable `Pending` record or represent
+`Succeeded(result_digest)` and `Failed(code)` as distinct terminal states. The
+full Pending/Succeeded/Failed contract above remains the target for a broader
+endpoint adapter, not evidence supplied by this one.
+
+The implemented successful-path record supplies recoverable outcome evidence.
+The existing VirtIO DMA component independently supplies recoverable quiescence
+evidence for its queue, page, and generation claims. Putting both beneath one
+composite effect tests component-local retirement without pretending that
+either fact proves the other.
