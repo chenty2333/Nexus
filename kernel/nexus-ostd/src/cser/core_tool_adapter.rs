@@ -61,6 +61,7 @@ pub(crate) struct ToolOperationPlan {
     payload_len: u16,
     operation_digest: Digest,
     transport_identity: Option<ToolV2Identity>,
+    cser3_bound: bool,
     cser3_output: bool,
     child_route: Option<Digest>,
 }
@@ -189,6 +190,7 @@ impl ToolOperationPlan {
             payload_len: payload.len() as u16,
             operation_digest,
             transport_identity: None,
+            cser3_bound: false,
             cser3_output: false,
             child_route: None,
         })
@@ -222,6 +224,7 @@ impl ToolOperationPlan {
             return self;
         }
         self.transport_identity = Some(identity);
+        self.cser3_bound = true;
         self.cser3_output = true;
         self.child_route = Some(provider_child_route());
         self.operation_digest = hash_parts(
@@ -236,6 +239,65 @@ impl ToolOperationPlan {
             ],
         );
         self
+    }
+
+    /// Binds the child to the same CSER3 request grammar, but explicitly
+    /// prohibits a second descriptor output.  The child terminal record is an
+    /// ordinary, output-free durable outcome.
+    pub(crate) fn bind_cser3_child(mut self, identity: ToolV2Identity) -> Self {
+        if self.component != cser_core::TOOL_HANDOFF_COMPONENT {
+            return self;
+        }
+        let base = self.operation_digest.bytes();
+        self.operation_digest = hash_parts(
+            b"nexus-cser-tool-child-operation-v3",
+            &[
+                &base,
+                &identity.request_binding_digest(
+                    ToolRunId::new(self.run_id),
+                    &self.operation_key_hex(),
+                    self.payload_digest.bytes(),
+                ),
+            ],
+        );
+        self.transport_identity = Some(identity);
+        self.cser3_bound = true;
+        self.cser3_output = false;
+        self
+    }
+
+    /// Creates the only child operation accepted by the single-hop runtime.
+    /// Every field comes from the verified descriptor and source transport
+    /// identity; callers cannot select a child run, endpoint effect, or
+    /// payload.
+    pub(crate) fn handoff_child_for_descriptor(
+        source: ToolOperationPlan,
+        descriptor: cser_core::ChildDescriptorV1,
+    ) -> Result<Self, ToolPlanError> {
+        if !source.is_cser3_source()
+            || descriptor.parent != source.effect
+            || descriptor.parent_component != source.component
+            || descriptor.catalog_digest != source.catalog_digest
+            || descriptor.input_digest != source.payload_digest
+        {
+            return Err(ToolPlanError::InvalidCoordinate);
+        }
+        let effect = descriptor
+            .child_effect()
+            .map_err(|_| ToolPlanError::InvalidCoordinate)?;
+        let identity = source
+            .transport_identity
+            .ok_or(ToolPlanError::InvalidCoordinate)?;
+        Self::handoff_child(
+            source.run_id(),
+            effect,
+            descriptor.claim,
+            descriptor.resource,
+            descriptor.resource_generation,
+            descriptor.catalog_digest,
+            &handoff_child_payload(descriptor).bytes(),
+        )
+        .map(|plan| plan.bind_cser3_child(handoff_child_transport_identity(source, identity)))
     }
 
     pub(crate) const fn effect(self) -> EffectId {
@@ -285,6 +347,19 @@ impl ToolOperationPlan {
     pub(crate) const fn child_route(self) -> Option<Digest> {
         self.child_route
     }
+    /// Exact checksum-bound transport identity selected before durable intent.
+    /// This is read-only recovery metadata, never endpoint authority.
+    pub(crate) const fn transport_identity(self) -> Option<ToolV2Identity> {
+        self.transport_identity
+    }
+    pub(crate) const fn is_cser3_source(self) -> bool {
+        self.cser3_bound && self.cser3_output
+    }
+    pub(crate) fn is_cser3_child(self) -> bool {
+        self.cser3_bound
+            && !self.cser3_output
+            && self.component == cser_core::TOOL_HANDOFF_COMPONENT
+    }
 
     /// Stable settlement intent.  It deliberately names the already durable
     /// endpoint record rather than a second external action.
@@ -304,6 +379,49 @@ impl ToolOperationPlan {
 pub(crate) enum ToolPlanError {
     InvalidCoordinate,
     PayloadTooLong,
+}
+
+/// Derives the child endpoint effect from the complete parent transport
+/// identity. Kept crate-visible for the QEMU runtime and host golden vectors.
+pub(crate) fn handoff_child_transport_effect(
+    parent: ToolV2Identity,
+    source_run_id: [u8; 16],
+) -> ToolRunId {
+    let digest = hash_parts(
+        b"nexus-cser-handoff-child-transport-effect-v1",
+        &[
+            parent.namespace(),
+            &parent.authority().bytes(),
+            &parent.effect().bytes(),
+            &source_run_id,
+            &parent.catalog_digest(),
+        ],
+    );
+    let mut effect = [0; 16];
+    effect.copy_from_slice(&digest.bytes()[..16]);
+    ToolRunId::new(effect)
+}
+
+/// The child request payload is a digest of the complete canonical descriptor,
+/// not a caller-supplied workflow argument.
+pub(crate) fn handoff_child_payload(descriptor: cser_core::ChildDescriptorV1) -> Digest {
+    hash_parts(
+        b"nexus-cser-tool-handoff-child-payload-v1",
+        &[&descriptor.encode_wire()],
+    )
+}
+
+fn handoff_child_transport_identity(
+    source: ToolOperationPlan,
+    parent: ToolV2Identity,
+) -> ToolV2Identity {
+    ToolV2Identity::new(
+        parent.namespace(),
+        parent.authority(),
+        handoff_child_transport_effect(parent, source.run_id()),
+        parent.catalog_digest(),
+    )
+    .expect("parent identity is already canonical")
 }
 
 /// Outcome recovered from the endpoint's own durable operation record.
@@ -327,6 +445,9 @@ impl DurableToolObservation {
         if record.run_id().bytes() != plan.run_id()
             || record.operation() != plan.operation_key_hex()
             || record.payload_digest() != plan.payload_digest().bytes()
+            || (plan.is_cser3_source()
+                && record.output().kind() != ToolTerminalOutputKind::ChildDescriptorV1)
+            || (plan.is_cser3_child() && record.output().kind() != ToolTerminalOutputKind::None)
         {
             return Err(ToolObservationError::PlanRecordMismatch);
         }
@@ -469,7 +590,7 @@ impl ToolEndpoint for UartToolEndpoint<'_> {
 
     fn post(&mut self, plan: ToolOperationPlan) -> Result<ToolEndpointObservation, Self::Error> {
         let request = match plan.transport_identity {
-            Some(identity) if plan.cser3_output => ToolRequest::new_v3(
+            Some(identity) if plan.cser3_bound => ToolRequest::new_v3(
                 identity,
                 ToolRunId::new(plan.run_id()),
                 Self::operation(plan)?,
@@ -497,7 +618,7 @@ impl ToolEndpoint for UartToolEndpoint<'_> {
 
     fn get(&mut self, plan: ToolOperationPlan) -> Result<ToolEndpointObservation, Self::Error> {
         let request = match plan.transport_identity {
-            Some(identity) if plan.cser3_output => ToolRequest::get_v3(
+            Some(identity) if plan.cser3_bound => ToolRequest::get_v3(
                 identity,
                 ToolRunId::new(plan.run_id()),
                 Self::operation(plan)?,
@@ -975,6 +1096,7 @@ mod tests {
         )
         .unwrap()
         .bind_cser3(identity);
+        assert_eq!(plan.transport_identity(), Some(identity));
         let descriptor = cser_core::ChildDescriptorV1 {
             schema: 1,
             sequence: 1,
@@ -1039,6 +1161,104 @@ mod tests {
                 &observation
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn cser3_child_plan_is_descriptor_bound_and_requires_output_none() {
+        let parent = EffectId::new(RootId::new(31).unwrap(), 2).unwrap();
+        let catalog = cser_core::tool_dma_catalog().digest();
+        let identity = ToolV2Identity::new(
+            b"handoff",
+            ToolRunId::new([4; 16]),
+            ToolRunId::new([5; 16]),
+            catalog.bytes(),
+        )
+        .unwrap();
+        let source = ToolOperationPlan::handoff_source(
+            [6; 16],
+            parent,
+            ClaimId::new(7).unwrap(),
+            ResourceId::new(8).unwrap(),
+            ResourceGeneration::new(1).unwrap(),
+            catalog,
+            b"parent-input",
+        )
+        .unwrap()
+        .bind_cser3(identity);
+        assert_eq!(source.transport_identity(), Some(identity));
+        let descriptor = cser_core::ChildDescriptorV1 {
+            schema: 1,
+            sequence: 1,
+            parent,
+            parent_component: cser_core::TOOL_HANDOFF_SOURCE_COMPONENT,
+            route_digest: provider_child_route(),
+            child_kind: cser_core::TOOL_HANDOFF_CHILD_COMPOSITE,
+            child_component: cser_core::TOOL_HANDOFF_COMPONENT,
+            claim: ClaimId::new(9).unwrap(),
+            claim_kind: cser_core::TOOL_CLAIM_OUTCOME_SLOT,
+            scope: cser_core::ClaimScope::Logical,
+            resource: ResourceId::new(10).unwrap(),
+            resource_generation: ResourceGeneration::new(1).unwrap(),
+            units: 1,
+            input_digest: source.payload_digest(),
+            catalog_digest: catalog,
+        };
+        let child = ToolOperationPlan::handoff_child_for_descriptor(source, descriptor).unwrap();
+        assert!(child.is_cser3_child());
+        assert_eq!(child.run_id(), source.run_id());
+        assert_eq!(child.effect(), descriptor.child_effect().unwrap());
+        assert_eq!(child.payload_digest(), handoff_child_payload(descriptor));
+        assert_eq!(
+            child.transport_identity().unwrap().effect(),
+            handoff_child_transport_effect(identity, source.run_id())
+        );
+        assert_eq!(
+            child.transport_identity(),
+            Some(handoff_child_transport_identity(source, identity))
+        );
+        let terminal = terminal_record_for_test(
+            ToolRunId::new(child.run_id()),
+            OperationKey::new(&child.operation_key_hex()).unwrap(),
+            child.payload(),
+        );
+        assert!(DurableToolObservation::from_terminal_record(child, terminal).is_ok());
+        let output = ToolTerminalOutput::child_descriptor(&descriptor.encode_wire()).unwrap();
+        let wrong_output = ToolTerminalRecord::succeeded_with_output_for_test(
+            handoff_child_transport_identity(source, identity),
+            ToolRunId::new(child.run_id()),
+            OperationKey::new(&child.operation_key_hex()).unwrap(),
+            child.payload(),
+            output,
+        )
+        .unwrap();
+        assert_eq!(
+            DurableToolObservation::from_terminal_record(child, wrong_output),
+            Err(ToolObservationError::PlanRecordMismatch)
+        );
+        let mut wrong_descriptor = descriptor;
+        wrong_descriptor.parent = EffectId::new(RootId::new(32).unwrap(), 2).unwrap();
+        assert_eq!(
+            ToolOperationPlan::handoff_child_for_descriptor(source, wrong_descriptor),
+            Err(ToolPlanError::InvalidCoordinate)
+        );
+    }
+
+    #[test]
+    fn child_transport_effect_uses_raw_wire_identity_golden() {
+        let parent = ToolV2Identity::new(
+            b"tool-dma",
+            ToolRunId::new([0xbb; 16]),
+            ToolRunId::new([0xcc; 16]),
+            [0xaa; 32],
+        )
+        .unwrap();
+        assert_eq!(
+            handoff_child_transport_effect(parent, [0xdd; 16]).bytes(),
+            [
+                0x18, 0xf2, 0x28, 0xfd, 0x72, 0xac, 0x7f, 0x08, 0x60, 0x85, 0x49, 0x35, 0x28,
+                0x69, 0x8c, 0x05,
+            ]
         );
     }
 }

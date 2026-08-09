@@ -74,7 +74,7 @@ impl ToolDmaRuntime {
         intent: CommitIntent,
         observation: &DurableToolObservation,
     ) -> Result<Command, ToolCommitFailure> {
-        if let Err(error) = self.require_tool_intent(&intent) {
+        if let Err(error) = self.require_plan_intent(&intent) {
             return Err(ToolCommitFailure { error, intent });
         }
         let verifier = match ToolFactVerifier::commit(self.plan, self.verifier_epoch) {
@@ -178,12 +178,14 @@ impl ToolDmaRuntime {
     }
 
     /// Atomically releases the fully retired source and records the target's
-    /// first commit intent. The operation is derived from the descriptor's
-    /// complete evidence-bound identity rather than supplied by a caller.
+    /// first commit intent. The exact child plan is validated against the
+    /// descriptor and source transport identity; its durable operation digest
+    /// is the sole operation recorded by the core.
     pub(crate) fn release_handoff_source_and_record_target_intent(
         &self,
         engine: &Engine,
         observation: &DurableToolObservation,
+        child_plan: ToolOperationPlan,
         actor: PrincipalIncarnation,
         binding_generation: u64,
     ) -> Result<Command, CoreError> {
@@ -193,8 +195,12 @@ impl ToolDmaRuntime {
             .decode(*observation)
             .map_err(|_| CoreError::VerificationFailed)?;
         let verified = engine.verify_child_descriptor(descriptor, &verifier, observation)?;
-        let operation = handoff_operation_digest(descriptor, observation.terminal_record_digest());
-        Ok(verified.release_source_and_record_target_intent(actor, binding_generation, operation))
+        self.require_exact_handoff_child_plan(descriptor, child_plan)?;
+        Ok(verified.release_source_and_record_target_intent(
+            actor,
+            binding_generation,
+            child_plan.operation_digest(),
+        ))
     }
 
     /// Records that later settlement refers to the same durable endpoint
@@ -203,7 +209,7 @@ impl ToolDmaRuntime {
         &self,
         claim: SettlementClaim,
     ) -> Result<Command, ToolSettlementFailure> {
-        if let Err(error) = self.require_tool_claim(&claim) {
+        if let Err(error) = self.require_plan_claim(&claim) {
             return Err(ToolSettlementFailure { error, claim });
         }
         claim
@@ -222,7 +228,7 @@ impl ToolDmaRuntime {
         claim: SettlementClaim,
         observation: &DurableToolObservation,
     ) -> Result<Command, ToolSettlementFailure> {
-        if let Err(error) = self.require_tool_claim(&claim) {
+        if let Err(error) = self.require_plan_claim(&claim) {
             return Err(ToolSettlementFailure { error, claim });
         }
         let verifier = match ToolFactVerifier::apply(self.plan, self.verifier_epoch) {
@@ -254,7 +260,7 @@ impl ToolDmaRuntime {
         claim: SettlementClaim,
         observation: &DurableToolObservation,
     ) -> Result<Command, ToolSettlementFailure> {
-        if let Err(error) = self.require_tool_claim(&claim) {
+        if let Err(error) = self.require_plan_claim(&claim) {
             return Err(ToolSettlementFailure { error, claim });
         }
         let verifier = match ToolFactVerifier::settlement(self.plan, self.verifier_epoch) {
@@ -291,7 +297,7 @@ impl ToolDmaRuntime {
         Ok(engine
             .verify_component_retirement_evidence(
                 self.plan.effect(),
-                TOOL_DMA_COMPONENT_TOOL,
+                self.plan.component(),
                 self.plan.claim(),
                 TOOL_EVIDENCE_OUTCOME_ACK,
                 &verifier,
@@ -300,9 +306,9 @@ impl ToolDmaRuntime {
             .submit())
     }
 
-    fn require_tool_intent(&self, intent: &CommitIntent) -> Result<(), CoreError> {
+    fn require_plan_intent(&self, intent: &CommitIntent) -> Result<(), CoreError> {
         if intent.effect() != self.plan.effect()
-            || intent.component() != Some(TOOL_DMA_COMPONENT_TOOL)
+            || intent.component() != Some(self.plan.component())
         {
             return Err(CoreError::StaleCommitIntent);
         }
@@ -319,33 +325,26 @@ impl ToolDmaRuntime {
         Ok(())
     }
 
-    fn require_tool_claim(&self, claim: &SettlementClaim) -> Result<(), CoreError> {
-        if claim.effect() != self.plan.effect()
-            || claim.component() != Some(TOOL_DMA_COMPONENT_TOOL)
+    fn require_plan_claim(&self, claim: &SettlementClaim) -> Result<(), CoreError> {
+        if claim.effect() != self.plan.effect() || claim.component() != Some(self.plan.component())
         {
             return Err(CoreError::StaleSettlementClaim);
         }
         Ok(())
     }
-}
 
-fn handoff_operation_digest(
-    descriptor: ChildDescriptorV1,
-    terminal_record: cser_core::Digest,
-) -> cser_core::Digest {
-    use sha2::{Digest as _, Sha256};
-    let mut hash = Sha256::new();
-    hash.update(b"nexus-cser-child-operation-v1");
-    for field in [
-        descriptor.route_digest.bytes(),
-        descriptor.input_digest.bytes(),
-        descriptor.catalog_digest.bytes(),
-        terminal_record.bytes(),
-    ] {
-        hash.update((field.len() as u64).to_le_bytes());
-        hash.update(field);
+    fn require_exact_handoff_child_plan(
+        &self,
+        descriptor: ChildDescriptorV1,
+        child_plan: ToolOperationPlan,
+    ) -> Result<(), CoreError> {
+        let expected = ToolOperationPlan::handoff_child_for_descriptor(self.plan, descriptor)
+            .map_err(|_| CoreError::InvalidPayload)?;
+        if child_plan != expected {
+            return Err(CoreError::InvalidPayload);
+        }
+        Ok(())
     }
-    cser_core::Digest::new(hash.finalize().into())
 }
 
 /// A rejected tool commit acknowledgement which preserves the exact durable
