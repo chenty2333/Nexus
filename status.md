@@ -31,13 +31,11 @@ Late-bound composition remains a falsification target rather than a presumed
 CSER advantage. Kubernetes Job/DRA and NVMe Namespace Management were useful
 Gate-0 counterexamples because their provider-native coordination already owns
 first observation. Nexus now has a bounded `ChildDescriptorV1`, catalog-bound
-single-hop core guard, CSER3 adapter verification, and a structurally
-independent portable baseline handoff. This is intentionally partial: the real
-QEMU Tool+DMA launcher still uses CSER2 and does not exercise descriptor
-discovery or a parent-to-child handoff. The next implementation step, if this
-line of research continues, is one matched CSER3 logical handoff lane for CSER
-and the strongest baseline—not a general workflow graph or dynamic component
-API.
+single-hop core guard, CSER3 adapter verification, and matched real-QEMU
+logical handoff lanes for CSER and a structurally independent strongest
+baseline. Both arms complete the same five crash prefixes safely. This proves
+the bounded mechanism and comparison path; it does not establish a CSER
+advantage or justify a general workflow graph or dynamic component API.
 
 Performance changes remain evidence-gated. The current data does not justify
 a core copy-on-write rewrite or splitting the authoritative runtime mutex.
@@ -47,8 +45,8 @@ deferred.
 
 ## Current State
 
-The core contract coordinates are API profile 3, standard catalog 7,
-projection 7, recovery snapshot 3, and journal schema 7. Whole-state checkpoint
+The core contract coordinates are API profile 4, standard catalog 7,
+projection 8, recovery snapshot 4, and journal schema 8. Whole-state checkpoint
 records encode estates, composites, resources, accepted evidence, and bounded
 single-hop roles; recovery validates the canonical projection and rebuilds
 derived indexes before an anchored vNext replacement can become active. The
@@ -66,13 +64,16 @@ bounded deferred-retained result instead of manufacturing failure evidence.
 
 The CSER3 endpoint can return a bounded, evidence-digested 187-byte
 `ChildDescriptorV1`. The core and adapter verify its parent, route, catalog,
-input, child product, claim class, and exact coordinate. Focused core tests
-cover acknowledgement, child installation, atomic parent release plus child
-intent, descriptor tampering, and checkpoint recovery at all three durable
-handoff states. A separate portable baseline stores and gates the same
-canonical descriptor without calling the CSER engine; its dedicated in-QEMU
-ktest passes. Neither arm is wired into the real QEMU experiment runtime yet,
-so these checks support only the approved partial handoff deliverable.
+input, child product, claim class, and exact coordinate. Dedicated resolution
+commands recover only the exact evidence-bound fenced parent or child whose
+outcome became indeterminate. The matched logical-only QEMU lanes cover
+descriptor discovery, durable parent acknowledgement, child installation,
+atomic parent release plus child intent, and child first observation. All five
+cuts complete in both arms through two stable recovery boots with exactly one
+source and one child provider application per row. The baseline uses its own
+fixed-record ATA+TPM protocol without calling the CSER engine or verifier
+authority. These runs report `device_actions=0`; they are not DMA or physical
+quiescence evidence.
 
 The source-labelled trace pipeline uses per-study HMAC pseudonyms, independent
 source status, bounded event counts, role-checked provenance, dropped-event
@@ -95,20 +96,24 @@ recovery scope contains no authoritative runtime transaction, so no mutex
 contention conclusion follows. Core COW/incremental state and mutex splitting
 remain deferred.
 
-The full host discovery suite passes 104 tests with `ResourceWarning` promoted
-to an error. The core all-feature tests and Clippy gate, production cutover
-assertion, all Tool+DMA experiment builds, the real PIO-journal gate, and the
-dedicated portable baseline-handoff gate pass. The prior GitHub quick and
-rebaseline jobs are green. A further checkpoint-only reboot was not claimed:
-the saved trial media lacked its matching TPM state, so combining it with a
-different artifact would not be valid recovery evidence.
+The full host discovery suite passes 131 tests with `ResourceWarning` promoted
+to an error. The core all-feature tests and all-target Clippy gate, production
+cutover assertion, both handoff experiment builds, the full project check, the
+real PIO-journal gate, and the independent baseline-handoff ktest pass. The
+strict matched handoff campaign passes all five cuts for both variants with
+container-kill provenance, 20 terminal recovery receipts, and 20 exact
+endpoint/provider ledgers. The prior GitHub quick and rebaseline jobs are
+green. A further checkpoint-only reboot was not claimed: the saved trial media
+lacked its matching TPM state, so combining it with a different artifact would
+not be valid recovery evidence.
 
-Local `main` is the continuing Nexus development branch. The sanitized evidence
-bundle is source-bound to the clean runtime commit and publishes only
-pseudonyms and raw-input digests; SQLite databases, logs, media, TPM state, raw
-identities, and the HMAC key remain local. Per the current user direction, the
-sibling `nexus-hotos` checkout and HotOS paper are not being configured or
-published.
+Local `main` is the continuing Nexus development branch. The sanitized
+applicability and matched-handoff evidence bundles are source-bound to their
+executable commits. The handoff bundle publishes the strict aggregate and
+digests of the raw variant metrics; SQLite databases, logs, media, TPM state,
+raw identities, provider records, and the HMAC key remain local. Per the
+current user direction, the sibling `nexus-hotos` checkout and HotOS paper are
+not being configured or published.
 
 ## Current Tasks
 
@@ -147,5 +152,5 @@ published.
 - [x] Add an evidence-bound `ChildDescriptorV1`, catalog-bound single-hop core guard, CSER3 adapter verification, and structurally independent portable baseline handoff tests.
 - [x] Add the fresh-media vNext append/checkpoint path, phase telemetry, and matched legacy/vNext development measurements; record the small-log I/O regression as well as checkpoint shrinkage.
 - [x] Publish a small source-bound, pseudonymized Nexus evidence bundle without raw media, identities, logs, databases, TPM state, or HMAC key.
-- [ ] Wire the CSER3 single-hop handoff into matched real-QEMU CSER and strongest-baseline runtime lanes before making an end-to-end handoff claim.
+- [x] Wire the CSER3 single-hop handoff into matched real-QEMU CSER and strongest-baseline runtime lanes before making an end-to-end handoff claim.
 - [ ] Configure or publish the sibling `nexus-hotos` remote and paper commit — explicitly deferred by the user; do not perform.

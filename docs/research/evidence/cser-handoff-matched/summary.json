@@ -1,0 +1,28 @@
+{
+  "acceptance": "matched 5 cuts x 2 variants",
+  "matched": true,
+  "schema_version": 1,
+  "scope": "logical",
+  "variants": {
+    "baseline": {
+      "cutpoints": {
+        "child_first_observed": 1,
+        "child_installed": 1,
+        "descriptor_discovered": 1,
+        "handoff_committed": 1,
+        "parent_ack_or_descriptor_durable": 1
+      },
+      "trials": 5
+    },
+    "cser": {
+      "cutpoints": {
+        "child_first_observed": 1,
+        "child_installed": 1,
+        "descriptor_discovered": 1,
+        "handoff_committed": 1,
+        "parent_ack_or_descriptor_durable": 1
+      },
+      "trials": 5
+    }
+  }
+}

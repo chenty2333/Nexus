@@ -1,0 +1,17 @@
+{
+  "inputs": [
+    {
+      "role": "cser_strict_metrics",
+      "sha256": "0fc8f866678f9f2ecd2f4a237c7a739b3a829b3be0ea3047574de224fe12cfd7"
+    },
+    {
+      "role": "baseline_strict_metrics",
+      "sha256": "11b975c9ba3b6f63f1ef99697b196658312495cb6b31470524592a0ad7b8d4ec"
+    },
+    {
+      "role": "strict_matched_summary",
+      "sha256": "0d43c4fe2ecdebd4f9d2618922554baebbdf0d61889641b63bd146c0f53dbc88"
+    }
+  ],
+  "schema_version": 1
+}

@@ -89,13 +89,32 @@ rule. A separate workload-specific baseline independently parses the same wire
 record and persists descriptor, child preparation, atomic parent release plus
 child intent, and child terminal phases without calling the CSER engine.
 
-This is intentionally a **partial adapter implementation**, not a QEMU handoff
-result. Core, UART/adapter, provider, and portable-baseline tests cover the
-descriptor and crash/recovery boundaries. The real Tool+DMA QEMU launcher
-still uses CSER2 and does not execute descriptor discovery, parent release,
-child enrollment/publication, or handoff recovery. Therefore the QEMU matrix,
-performance lane, and applicability export below are evidence for the existing
-Tool+DMA path only; they do not establish an end-to-end handoff advantage.
+The bounded handoff is also wired as a separate, logical-only real-QEMU lane.
+It uses two independently durable CSER3 endpoint/provider stores behind one
+allowlisted COM2 router: the source may return only the bound descriptor, and
+the derived child may return only `none`. The child is queried before any POST,
+and only an exact checksum-bound 404 authorizes the same-key request. Five
+matched crash cuts cover descriptor discovery, durable parent acknowledgement,
+child installation, atomic parent release plus child intent, and the first
+child observation. Every row requires two terminal recovery boots and exact
+one-row source/child endpoint and provider ledgers.
+
+The comparison arm is the strongest workload-specific baseline: its own fixed
+ATA record and TPM tip persist the same descriptor and handoff phases without
+calling the CSER engine, verifier token, journal, or permit types. The strict
+runner accepts only all five cuts for both variants after a label-bound QEMU
+container kill:
+
+```
+tools/cser-experiment/run_qemu_matched_handoff.sh \
+  --output /tmp/cser-handoff --base-media-dir /tmp/cser-handoff-base
+```
+
+This result is deliberately scoped to logical claims (`device_actions=0`). It
+does not exercise DMA, physical quiescence, remote authentication, a general
+workflow graph, or a general dynamic-component API. The ordinary Tool+DMA QEMU
+matrix below remains a distinct CSER2 experiment and must not be reinterpreted
+as handoff evidence.
 
 ## Small async performance lane
 

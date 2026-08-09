@@ -32,7 +32,7 @@ also included a one-time build/cache delay and is not compared. No transaction
 ran inside the measured recovery-scope runtime mutex, so the zero mutex samples
 do not establish an absence of contention and do not justify splitting it.
 
-The current real-QEMU launcher remains CSER2. `ChildDescriptorV1`, CSER3
+The real-QEMU launcher used for this historical sample was CSER2. `ChildDescriptorV1`, CSER3
 descriptor verification, the core single-hop guard, and the independent
 portable baseline handoff are covered by focused core/adapter/kernel tests but
 are not exercised by this sample. Consequently these files do not establish
