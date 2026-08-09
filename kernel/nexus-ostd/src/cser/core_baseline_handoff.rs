@@ -1335,8 +1335,8 @@ mod tests {
     use super::*;
     use crate::core_tool_adapter::DurableToolObservation;
     use crate::core_tool_uart::{
-        decode_response, OperationKey, ToolRequest, ToolRunId, ToolTerminalOutput,
-        ToolTerminalRecord, ToolV2Identity,
+        OperationKey, ToolRequest, ToolRunId, ToolTerminalOutput, ToolTerminalRecord,
+        ToolV2Identity, decode_response,
     };
     use cser_core::{
         ClaimId, Digest, EffectId, ResourceGeneration, ResourceId, RootId, TOOL_CLAIM_OUTCOME_SLOT,

@@ -11,6 +11,10 @@ source-owned JSONL traces with the same study HMAC key:
 * ``worker_provider.jsonl`` records the worker/provider Pending and recovered
   terminal observations.
 
+For an explicitly local audit, ``--raw-trace-output`` writes matching raw
+JSONL files in a separate directory. That directory is never nested in the
+sanitized output directory and is not a publishable sample artifact.
+
 The provider's exact-key table is explicitly labelled as an *existing
 coordinator*.  No guest, device-quiescence, allocator-claim, or allocator-gate
 fact is invented: those source roles are present in the endpoint trace's
@@ -63,6 +67,8 @@ class SampleOutputs:
     worker_provider_trace: Path
     aggregate_path: Path
     state_dir: Path
+    raw_endpoint_trace: Path | None = None
+    raw_worker_provider_trace: Path | None = None
 
 
 def _close_quietly(resource: object) -> None:
@@ -71,6 +77,18 @@ def _close_quietly(resource: object) -> None:
         getattr(resource, "close")()
     except BaseException:
         pass
+
+
+def _trace_exit(recorder: TraceRecorder, availability: dict[str, SourceAvailability],
+                workflow_succeeded: dict[str, bool]):
+    """Finalize only on a clean workflow exit; otherwise preserve raw incomplete."""
+    def finish(exception_type: object, *_: object) -> bool:
+        if exception_type is None and workflow_succeeded["value"]:
+            recorder.close(availability)
+        else:
+            recorder.abort()
+        return False
+    return finish
 
 
 def _record_endpoint(recorder: TraceRecorder, *, raw_effect: str, state: EffectState,
@@ -169,7 +187,8 @@ class WorkerProviderTraceSink:
 
 
 def run_sample(output_dir: Path, *, study_id: str, key: bytes,
-               state_dir: Path | None = None, run_id: str = _DEFAULT_RUN_ID) -> SampleOutputs:
+               state_dir: Path | None = None, run_id: str = _DEFAULT_RUN_ID,
+               raw_trace_dir: Path | None = None) -> SampleOutputs:
     """Execute one controlled recovery and write source-owned trace files.
 
     ``output_dir`` must be absent or empty so a result can never silently mix
@@ -178,6 +197,13 @@ def run_sample(output_dir: Path, *, study_id: str, key: bytes,
     """
     if output_dir.exists() and any(output_dir.iterdir()):
         raise ValueError("output directory must be absent or empty")
+    if raw_trace_dir is not None:
+        output_root = output_dir.resolve()
+        raw_root = raw_trace_dir.resolve()
+        if raw_root == output_root or output_root in raw_root.parents:
+            raise ValueError("raw trace directory must remain outside the sanitized output directory")
+        if raw_trace_dir.exists() and (not raw_trace_dir.is_dir() or any(raw_trace_dir.iterdir())):
+            raise ValueError("raw trace directory must be absent or empty")
     output_dir.mkdir(parents=True, exist_ok=True)
     durable_state = state_dir or output_dir / "state"
     if durable_state.exists() and any(durable_state.iterdir()):
@@ -185,28 +211,33 @@ def run_sample(output_dir: Path, *, study_id: str, key: bytes,
     durable_state.mkdir(parents=True, exist_ok=True)
     endpoint_path = output_dir / "endpoint.jsonl"
     worker_path = output_dir / "worker_provider.jsonl"
+    raw_endpoint_path = None if raw_trace_dir is None else raw_trace_dir / "endpoint.raw.jsonl"
+    raw_worker_path = None if raw_trace_dir is None else raw_trace_dir / "worker_provider.raw.jsonl"
     aggregate_path = output_dir / "aggregate.json"
     if aggregate_path.exists():
         raise ValueError("aggregate output already exists")
 
     pseudonymizer = StudyPseudonymizer(study_id, key)
     with ExitStack() as cleanup:
-        endpoint_trace = TraceRecorder(endpoint_path, pseudonymizer)
+        workflow_succeeded = {"value": False}
+        endpoint_trace = TraceRecorder(endpoint_path, pseudonymizer, raw_output=raw_endpoint_path)
+        endpoint_availability = {
+            "endpoint": SourceAvailability.AVAILABLE,
+            "guest": SourceAvailability.MISSING,
+            "device": SourceAvailability.MISSING,
+            "allocator_gate": SourceAvailability.MISSING,
+        }
+        cleanup.push(_trace_exit(endpoint_trace, endpoint_availability, workflow_succeeded))
         endpoint_trace.describe_source("endpoint", SourceRole.ENDPOINT, _BOUNDARY)
         # These profiles/statuses are a manifest of required but unavailable
         # observation authorities.  They are intentionally not endpoint facts.
         endpoint_trace.describe_source("guest", SourceRole.GUEST, _BOUNDARY)
         endpoint_trace.describe_source("device", SourceRole.DEVICE, _BOUNDARY)
         endpoint_trace.describe_source("allocator_gate", SourceRole.ALLOCATOR_GATE, _BOUNDARY)
-        cleanup.callback(endpoint_trace.close, {
-            "endpoint": SourceAvailability.AVAILABLE,
-            "guest": SourceAvailability.MISSING,
-            "device": SourceAvailability.MISSING,
-            "allocator_gate": SourceAvailability.MISSING,
-        })
-        worker_trace = TraceRecorder(worker_path, pseudonymizer)
+        worker_trace = TraceRecorder(worker_path, pseudonymizer, raw_output=raw_worker_path)
+        worker_availability = {"worker_provider": SourceAvailability.AVAILABLE}
+        cleanup.push(_trace_exit(worker_trace, worker_availability, workflow_succeeded))
         worker_trace.describe_source("worker_provider", SourceRole.WORKER_PROVIDER, _BOUNDARY)
-        cleanup.callback(worker_trace.close, {"worker_provider": SourceAvailability.AVAILABLE})
         sink = WorkerProviderTraceSink(worker_trace)
 
         store = Store(durable_state / "endpoint.sqlite", catalog_digest=_CATALOG_DIGEST)
@@ -254,6 +285,7 @@ def run_sample(output_dir: Path, *, study_id: str, key: bytes,
         if (first_provider_dropped or int(provider.metrics()["provider_telemetry_dropped"])
                 or first.telemetry_dropped or recovered.telemetry_dropped):
             raise RuntimeError("source-owned trace telemetry was dropped")
+        workflow_succeeded["value"] = True
 
     summary = aggregate(load_trace([endpoint_path, worker_path]))
     # This is an explicit result qualifier, not an inferred endpoint fact.
@@ -266,7 +298,8 @@ def run_sample(output_dir: Path, *, study_id: str, key: bytes,
     with aggregate_path.open("x", encoding="utf-8") as stream:
         json.dump(summary, stream, sort_keys=True, indent=2)
         stream.write("\n")
-    return SampleOutputs(endpoint_path, worker_path, aggregate_path, durable_state)
+    return SampleOutputs(endpoint_path, worker_path, aggregate_path, durable_state,
+                         raw_endpoint_path, raw_worker_path)
 
 
 def main() -> None:
@@ -277,16 +310,21 @@ def main() -> None:
                         help="private >=32-byte study HMAC key; never copied into trace output")
     parser.add_argument("--state-dir", type=Path,
                         help="durable Store/ProviderStore directory (defaults under output-dir)")
+    parser.add_argument("--raw-trace-output", type=Path,
+                        help="local-only raw JSONL directory; must be outside --output-dir")
     parser.add_argument("--run-id", default=_DEFAULT_RUN_ID)
     args = parser.parse_args()
     key = args.key_file.read_bytes()
     outputs = run_sample(args.output_dir, study_id=args.study_id, key=key,
-                         state_dir=args.state_dir, run_id=args.run_id)
+                         state_dir=args.state_dir, run_id=args.run_id,
+                         raw_trace_dir=args.raw_trace_output)
     print(json.dumps({
         "endpoint_trace": str(outputs.endpoint_trace),
         "worker_provider_trace": str(outputs.worker_provider_trace),
         "aggregate": str(outputs.aggregate_path),
         "state_dir": str(outputs.state_dir),
+        "raw_endpoint_trace": None if outputs.raw_endpoint_trace is None else str(outputs.raw_endpoint_trace),
+        "raw_worker_provider_trace": None if outputs.raw_worker_provider_trace is None else str(outputs.raw_worker_provider_trace),
     }, sort_keys=True))
 
 

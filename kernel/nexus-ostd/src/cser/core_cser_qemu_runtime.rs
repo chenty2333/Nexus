@@ -46,6 +46,7 @@ use super::{
         project_replayed_component_claim,
     },
     core_experiment_dma_flow::{CserResetLiveDma, prepare_live_irq, probe_reset_once},
+    core_pio_journal::JournalIoPhase,
     core_qemu_persistent_boot::{
         PreparedQemuPersistentBoot, PreparedQemuPersistentBootVNext, QemuPersistentAnchor,
         QemuPersistentBoot, QemuPersistentBootVNext, persistent_dma_arena_digest,
@@ -119,7 +120,7 @@ fn emit_perf(runtime: &ExperimentRuntime, phase: &'static str, run_id: [u8; 16])
         )
     });
     println!(
-        "TOOL_DMA_PERF_V1 {{\"version\":1,\"run_id\":\"{}\",\"phase\":\"{}\",\"clock\":\"guest_tsc\",\"calibrated\":false,\"journal_format\":\"{}\",\"runtime_transactions\":{},\"mutex_wait_cycles\":{},\"mutex_max_wait_cycles\":{},\"mutex_hold_cycles\":{},\"mutex_max_hold_cycles\":{},\"journal_sectors_read\":{},\"journal_sectors_written\":{},\"journal_flushes\":{},\"journal_hash_bytes\":{},\"journal_image_bytes\":{},\"journal_capacity_bytes\":{},\"tpm_lease_advances\":{},\"tpm_tip_advances\":{},\"tpm_lease_cycles\":{},\"tpm_tip_cycles\":{}}}",
+        "TOOL_DMA_PERF_V2 {{\"version\":2,\"run_id\":\"{}\",\"phase\":\"{}\",\"clock\":\"guest_tsc\",\"calibrated\":false,\"journal_format\":\"{}\",\"journal_phase_scope\":\"last-complete-publication\",\"runtime_transactions\":{},\"mutex_wait_cycles\":{},\"mutex_max_wait_cycles\":{},\"mutex_hold_cycles\":{},\"mutex_max_hold_cycles\":{},\"journal_sectors_read\":{},\"journal_sectors_written\":{},\"journal_flushes\":{},\"journal_hash_bytes\":{},\"journal_image_bytes\":{},\"journal_capacity_bytes\":{},\"journal_payload_written_tsc\":{},\"journal_payload_flushed_tsc\":{},\"journal_header_written_tsc\":{},\"journal_header_flushed_tsc\":{},\"journal_readback_validated_tsc\":{},\"journal_cache_updated_tsc\":{},\"tpm_lease_advances\":{},\"tpm_tip_advances\":{},\"tpm_lease_cycles\":{},\"tpm_tip_cycles\":{}}}",
         HexRun(run_id),
         phase,
         EXPERIMENT_JOURNAL_FORMAT,
@@ -134,6 +135,12 @@ fn emit_perf(runtime: &ExperimentRuntime, phase: &'static str, run_id: [u8; 16])
         journal.counters.hash_bytes,
         journal.image_bytes,
         journal.capacity_bytes,
+        journal.counters.phase_tsc[JournalIoPhase::PayloadWritten as usize],
+        journal.counters.phase_tsc[JournalIoPhase::PayloadFlushed as usize],
+        journal.counters.phase_tsc[JournalIoPhase::HeaderWritten as usize],
+        journal.counters.phase_tsc[JournalIoPhase::HeaderFlushed as usize],
+        journal.counters.phase_tsc[JournalIoPhase::ReadbackValidated as usize],
+        journal.counters.phase_tsc[JournalIoPhase::CacheUpdated as usize],
         tpm.recovery_lease_advances,
         tpm.tip_compare_and_advances,
         tpm.recovery_lease_cycles,
@@ -825,6 +832,11 @@ fn run_initial(
             panic!("TOOL_DMA_FAIL stage=initial-endpoint-invalid-state")
         }
     };
+    // The performance lane kills this boot at barrier three. Emit its one
+    // diagnostic receipt after the endpoint outcome is durable but before the
+    // crash probe can terminate QEMU. This is deliberately not a terminal
+    // effect receipt and precedes any vNext compaction.
+    emit_perf(&runtime, "post-endpoint-precrash", run_id);
     barriers
         .reached(ToolDmaBarrier::ToolEndpointApplied)
         .unwrap_or_else(|_| panic!("TOOL_DMA_FAIL stage=barrier-3"));

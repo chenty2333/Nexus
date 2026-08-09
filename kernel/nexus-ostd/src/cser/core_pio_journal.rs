@@ -2714,11 +2714,13 @@ mod tests {
 
         assert_eq!(journal.read_all_image().expect("image"), b"first-second");
         // Same-segment append writes its changed data sector, one fresh
-        // header, both manifest copies, then the mirrored header.  It never
-        // copies the committed prefix into another segment.
+        // header, both manifest copies, then the mirrored header. It reads
+        // the exact header-plus-two-sector payload for both staged and mirror
+        // validation and reads back both manifests (3 + 2 + 3 sectors). It
+        // never copies the committed prefix into another segment.
         assert_eq!(after.sectors_written - before.sectors_written, 5);
         assert_eq!(after.flushes - before.flushes, 5);
-        assert_eq!(after.sectors_read - before.sectors_read, 6);
+        assert_eq!(after.sectors_read - before.sectors_read, 8);
         assert!(after.hash_bytes > before.hash_bytes);
         assert_ne!(after.phase_tsc[JournalIoPhase::PayloadWritten as usize], 0);
         assert_ne!(
@@ -3066,10 +3068,17 @@ mod tests {
             journal.read_all_image().expect("full image").len(),
             JOURNAL_CAPACITY
         );
-        // The legacy 64-KiB fill deterministically writes 8,384 sectors.
-        // This concrete vNext count proves normal framed appends do not copy
-        // the growing prefix on every record.
+        // The legacy 64-KiB fill deterministically writes and reads 8,384
+        // sectors, flushes 256 times, and hashes 8,454,144 bytes.  vNext
+        // removes the cumulative payload rewrite, but its exact staged-header
+        // validation rereads and rehashes the growing segment twice per
+        // append and its publication protocol uses five flushes per frame.
+        // Retain the full tradeoff rather than reporting only the favorable
+        // write count.
         assert_eq!(telemetry.sectors_written, 768);
+        assert_eq!(telemetry.sectors_read, 17_148);
+        assert_eq!(telemetry.flushes, 640);
+        assert_eq!(telemetry.hash_bytes, 25_567_168);
         assert!(telemetry.sectors_written * 8 < 8_384);
     }
 

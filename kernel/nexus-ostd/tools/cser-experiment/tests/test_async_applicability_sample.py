@@ -6,11 +6,12 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from applicability_trace import EventKind, SourceAvailability, load_trace
+from applicability_trace import EventKind, SourceAvailability, StudyPseudonymizer, aggregate, aggregate_raw_trace, load_published_trace, load_raw_trace, load_trace
 from async_applicability_sample import run_sample
 from tool_endpoint import Store
 from tool_provider import ProviderStore
@@ -50,6 +51,40 @@ class AsyncApplicabilitySampleTests(unittest.TestCase):
             run_sample(output, study_id="bounded_async_test", key=b"k" * 32)
             with self.assertRaises(ValueError):
                 run_sample(output, study_id="bounded_async_test", key=b"k" * 32)
+
+    def test_optional_raw_traces_are_external_and_match_sanitized_sample(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            result = run_sample(root / "sample", study_id="bounded_async_test", key=b"k" * 32,
+                                raw_trace_dir=root / "local-raw")
+            assert result.raw_endpoint_trace is not None
+            assert result.raw_worker_provider_trace is not None
+            published = load_trace([result.endpoint_trace, result.worker_provider_trace])
+            pseudonymizer = StudyPseudonymizer("bounded_async_test", b"k" * 32)
+            retained = load_raw_trace([result.raw_endpoint_trace, result.raw_worker_provider_trace], pseudonymizer)
+            self.assertEqual(aggregate_raw_trace(retained, pseudonymizer), aggregate(published))
+            self.assertIn("bounded-async-sample", result.raw_endpoint_trace.read_text(encoding="utf-8"))
+            self.assertNotIn("bounded-async-sample", result.endpoint_trace.read_text(encoding="utf-8"))
+            with self.assertRaisesRegex(ValueError, "outside"):
+                run_sample(root / "nested", study_id="bounded_async_test", key=b"k" * 32,
+                           raw_trace_dir=root / "nested" / "raw")
+
+    def test_workflow_failure_exitstack_aborts_raw_traces(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output = root / "sample"
+            raw = root / "local-raw"
+            with mock.patch("async_applicability_sample.AsyncWorker.run_once", side_effect=RuntimeError("worker failed")):
+                with self.assertRaisesRegex(RuntimeError, "worker failed"):
+                    run_sample(output, study_id="bounded_async_test", key=b"k" * 32,
+                               raw_trace_dir=raw)
+            for name in ("endpoint.jsonl", "worker_provider.jsonl"):
+                trace = output / name
+                self.assertFalse(trace.exists())
+                marker = json.loads(trace.with_name(trace.name + ".publication.json").read_text())
+                self.assertEqual(marker["state"], "incomplete")
+                with self.assertRaisesRegex(ValueError, "incomplete"):
+                    load_published_trace([trace])
 
     def test_refuses_existing_state_and_observer_failures_cannot_change_durable_result(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

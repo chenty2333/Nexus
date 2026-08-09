@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Export one real Tool+DMA QEMU trial without turning absent evidence into facts.
 
-Inputs stay local: the output contains only HMAC pseudonyms, controlled labels,
-counts, and SHA-256 digests.  In particular a terminal endpoint/provider row
-does not imply DMA quiescence, claim release, or allocator admission.
+Published output contains only HMAC pseudonyms, controlled labels, counts, and
+SHA-256 digests.  A caller may separately retain a local raw trace with
+``--raw-trace-output``; it is rejected when nested in this export directory or
+its evidence bundle.  In particular a terminal endpoint/provider row does not
+imply DMA quiescence, claim release, or allocator admission.
 """
 from __future__ import annotations
 
@@ -31,6 +33,7 @@ class ExportOutputs:
     trace: Path
     aggregate: Path
     bundle: Path
+    raw_trace: Path | None = None
 
 
 def _object(path: Path) -> dict[str, Any]:
@@ -254,8 +257,14 @@ def export_trial(trial_dir: Path, output_dir: Path, *, study_id: str, key: bytes
                  endpoint_db: Path | None = None, provider_db: Path | None = None,
                  endpoint_record: Path | None = None, provider_record: Path | None = None,
                  initial_receipt: Path | None = None, recovery_receipt: Path | None = None,
-                 bridge_status: Path | None = None, sink_status: Path | None = None) -> ExportOutputs:
+                 bridge_status: Path | None = None, sink_status: Path | None = None,
+                 raw_trace_output: Path | None = None) -> ExportOutputs:
     if output_dir.exists() and any(output_dir.iterdir()): raise ValueError("output directory must be empty")
+    if raw_trace_output is not None:
+        output_root = output_dir.resolve()
+        raw_path = raw_trace_output.resolve()
+        if raw_path == output_root or output_root in raw_path.parents:
+            raise ValueError("raw trace output must remain outside the published export directory")
     source_binding = _source_binding(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     identity = _identity(trial_dir); effect = identity["effect_id"] + ":" + identity["run_id"]
@@ -267,41 +276,46 @@ def export_trial(trial_dir: Path, output_dir: Path, *, study_id: str, key: bytes
     # Initial logs are never authority for a completed recovery observation.
     initial = initial_receipt.is_file()
     recovery = _terminal_receipt(recovery_receipt, identity)
-    trace = output_dir / "applicability.jsonl"; recorder = TraceRecorder(trace, StudyPseudonymizer(study_id, key))
-    for source, role in (("endpoint", SourceRole.ENDPOINT), ("worker_provider", SourceRole.WORKER_PROVIDER), ("guest", SourceRole.GUEST), ("device", SourceRole.DEVICE), ("allocator_gate", SourceRole.ALLOCATOR_GATE)): recorder.describe_source(source, role, _BOUNDARY)
-    availability = {"endpoint": SourceAvailability.MISSING, "worker_provider": SourceAvailability.MISSING, "guest": SourceAvailability.MISSING, "device": SourceAvailability.MISSING, "allocator_gate": SourceAvailability.MISSING}
-    if endpoint:
-        availability["endpoint"] = SourceAvailability.AVAILABLE
-        terminal = _terminal(endpoint["state"])
-        if terminal: _record_terminal(recorder, "endpoint", terminal, effect, endpoint["operation_key"])
-        else: availability["endpoint"] = SourceAvailability.PARTIAL
-    if provider:
-        availability["worker_provider"] = SourceAvailability.AVAILABLE
-        terminal = _terminal(provider["state"])
-        if terminal: _record_terminal(recorder, "worker_provider", terminal, effect, provider["operation_key"])
-        else: availability["worker_provider"] = SourceAvailability.PARTIAL
-    # Receipts prove a bounded guest ran, but their aggregate counters name no
-    # coordinate; never turn claims_retained/retired_by_evidence into a claim.
-    if initial or recovery is not None: availability["guest"] = SourceAvailability.PARTIAL
-    # Plain launcher/serial text is not a versioned, identity- and
-    # coordinate-bound quiescence receipt. Keep the device source partial.
-    retained_gate, reusable_gate = _dma_gate_pair(recovery)
-    quiescence = _dma_quiescence_evidence(recovery, reusable_gate)
-    if quiescence is not None:
-        _record_quiescent_dma(recorder, quiescence, effect=effect, run_id=identity["run_id"])
-        availability["device"] = SourceAvailability.AVAILABLE
-    elif initial or recovery is not None:
-        _record_device_observation_ended(recorder, effect=effect, run_id=identity["run_id"])
-        availability["device"] = SourceAvailability.PARTIAL
-    for gate in (retained_gate, reusable_gate):
-        if gate is not None:
-            _record_dma_gate(recorder, gate, effect=effect, run_id=identity["run_id"])
-    if retained_gate is not None or reusable_gate is not None:
-        availability["allocator_gate"] = SourceAvailability.AVAILABLE
-    # Status documents supervise transport only; they cannot prove a gate fact.
-    elif initial or recovery is not None or _status(bridge_status) or _status(sink_status):
-        availability["allocator_gate"] = SourceAvailability.PARTIAL
-    recorder.close(availability)
+    trace = output_dir / "applicability.jsonl"; recorder = TraceRecorder(
+        trace, StudyPseudonymizer(study_id, key), raw_output=raw_trace_output)
+    try:
+        for source, role in (("endpoint", SourceRole.ENDPOINT), ("worker_provider", SourceRole.WORKER_PROVIDER), ("guest", SourceRole.GUEST), ("device", SourceRole.DEVICE), ("allocator_gate", SourceRole.ALLOCATOR_GATE)): recorder.describe_source(source, role, _BOUNDARY)
+        availability = {"endpoint": SourceAvailability.MISSING, "worker_provider": SourceAvailability.MISSING, "guest": SourceAvailability.MISSING, "device": SourceAvailability.MISSING, "allocator_gate": SourceAvailability.MISSING}
+        if endpoint:
+            availability["endpoint"] = SourceAvailability.AVAILABLE
+            terminal = _terminal(endpoint["state"])
+            if terminal: _record_terminal(recorder, "endpoint", terminal, effect, endpoint["operation_key"])
+            else: availability["endpoint"] = SourceAvailability.PARTIAL
+        if provider:
+            availability["worker_provider"] = SourceAvailability.AVAILABLE
+            terminal = _terminal(provider["state"])
+            if terminal: _record_terminal(recorder, "worker_provider", terminal, effect, provider["operation_key"])
+            else: availability["worker_provider"] = SourceAvailability.PARTIAL
+        # Receipts prove a bounded guest ran, but their aggregate counters name no
+        # coordinate; never turn claims_retained/retired_by_evidence into a claim.
+        if initial or recovery is not None: availability["guest"] = SourceAvailability.PARTIAL
+        # Plain launcher/serial text is not a versioned, identity- and
+        # coordinate-bound quiescence receipt. Keep the device source partial.
+        retained_gate, reusable_gate = _dma_gate_pair(recovery)
+        quiescence = _dma_quiescence_evidence(recovery, reusable_gate)
+        if quiescence is not None:
+            _record_quiescent_dma(recorder, quiescence, effect=effect, run_id=identity["run_id"])
+            availability["device"] = SourceAvailability.AVAILABLE
+        elif initial or recovery is not None:
+            _record_device_observation_ended(recorder, effect=effect, run_id=identity["run_id"])
+            availability["device"] = SourceAvailability.PARTIAL
+        for gate in (retained_gate, reusable_gate):
+            if gate is not None:
+                _record_dma_gate(recorder, gate, effect=effect, run_id=identity["run_id"])
+        if retained_gate is not None or reusable_gate is not None:
+            availability["allocator_gate"] = SourceAvailability.AVAILABLE
+        # Status documents supervise transport only; they cannot prove a gate fact.
+        elif initial or recovery is not None or _status(bridge_status) or _status(sink_status):
+            availability["allocator_gate"] = SourceAvailability.PARTIAL
+        recorder.close(availability)
+    except BaseException:
+        recorder.abort()
+        raise
     summary = aggregate(load_trace([trace])); summary["export_limits"] = {"claim_coordinates": "exported_only_from_exact_core_gate_receipt", "gate_decisions": "exported_only_from_exact_core_gate_receipt", "bridge_sink": "supervisor_status_not_effect_evidence", "physical_dma_quiescence": "not_inferred_from_allocator_gate"}
     aggregate_path = output_dir / "aggregate.json"; aggregate_path.write_text(json.dumps(summary, sort_keys=True, indent=2)+"\n")
     bundle = _write_bundle(output_dir / "evidence-bundle", summary, [
@@ -312,12 +326,12 @@ def export_trial(trial_dir: Path, output_dir: Path, *, study_id: str, key: bytes
         ("initial_serial_log", initial_receipt), ("recovery_serial_log", recovery_receipt),
         ("bridge_status", bridge_status), ("recovery_sink_status", sink_status),
     ], source_binding)
-    return ExportOutputs(trace, aggregate_path, bundle)
+    return ExportOutputs(trace, aggregate_path, bundle, raw_trace_output)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__); parser.add_argument("--trial-dir", type=Path, required=True); parser.add_argument("--output-dir", type=Path, required=True); parser.add_argument("--study-id", default="tool_dma_qemu_v1"); parser.add_argument("--key-file", type=Path, required=True); parser.add_argument("--endpoint-db", type=Path); parser.add_argument("--provider-db", type=Path); parser.add_argument("--endpoint-record", type=Path); parser.add_argument("--provider-record", type=Path); parser.add_argument("--initial-receipt", type=Path); parser.add_argument("--recovery-receipt", type=Path); parser.add_argument("--bridge-status", type=Path); parser.add_argument("--sink-status", type=Path)
-    args = parser.parse_args(); outputs = export_trial(args.trial_dir, args.output_dir, study_id=args.study_id, key=args.key_file.read_bytes(), endpoint_db=args.endpoint_db, provider_db=args.provider_db, endpoint_record=args.endpoint_record, provider_record=args.provider_record, initial_receipt=args.initial_receipt, recovery_receipt=args.recovery_receipt, bridge_status=args.bridge_status, sink_status=args.sink_status); print(json.dumps({"trace": str(outputs.trace), "aggregate": str(outputs.aggregate), "bundle": str(outputs.bundle)}, sort_keys=True))
+    parser = argparse.ArgumentParser(description=__doc__); parser.add_argument("--trial-dir", type=Path, required=True); parser.add_argument("--output-dir", type=Path, required=True); parser.add_argument("--study-id", default="tool_dma_qemu_v1"); parser.add_argument("--key-file", type=Path, required=True); parser.add_argument("--endpoint-db", type=Path); parser.add_argument("--provider-db", type=Path); parser.add_argument("--endpoint-record", type=Path); parser.add_argument("--provider-record", type=Path); parser.add_argument("--initial-receipt", type=Path); parser.add_argument("--recovery-receipt", type=Path); parser.add_argument("--bridge-status", type=Path); parser.add_argument("--sink-status", type=Path); parser.add_argument("--raw-trace-output", type=Path, help="local-only raw JSONL; must be outside --output-dir")
+    args = parser.parse_args(); outputs = export_trial(args.trial_dir, args.output_dir, study_id=args.study_id, key=args.key_file.read_bytes(), endpoint_db=args.endpoint_db, provider_db=args.provider_db, endpoint_record=args.endpoint_record, provider_record=args.provider_record, initial_receipt=args.initial_receipt, recovery_receipt=args.recovery_receipt, bridge_status=args.bridge_status, sink_status=args.sink_status, raw_trace_output=args.raw_trace_output); print(json.dumps({"trace": str(outputs.trace), "aggregate": str(outputs.aggregate), "bundle": str(outputs.bundle), "raw_trace": None if outputs.raw_trace is None else str(outputs.raw_trace)}, sort_keys=True))
 
 
 if __name__ == "__main__": main()

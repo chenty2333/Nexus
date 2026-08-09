@@ -15,7 +15,7 @@ sys.path.insert(0, str(ROOT))
 
 from summarize_performance import summarize
 from matrix_controller import _write_stage_timings
-from run_qemu_performance import _recovery_runtime_measurements, extract_trial
+from run_qemu_performance import _runtime_measurements, extract_trial
 from tool_endpoint import Store
 from tool_provider import ProviderStore
 from tool_worker import AsyncWorker
@@ -26,16 +26,29 @@ CATALOG = "a" * 64
 
 class PerformanceLaneTests(unittest.TestCase):
     @staticmethod
-    def _perf_line(*, journal: str = "legacy", phase: str = "terminal-recovery", run_id: str = RUN) -> str:
+    def _perf_line(*, journal: str = "legacy", phase: str = "terminal-recovery", run_id: str = RUN, transactions: int = 1, phases: tuple[int, int, int, int, int, int] = (16, 17, 18, 19, 20, 21)) -> str:
         fields = {
-            "version": 1, "run_id": run_id, "phase": phase, "clock": "guest_tsc", "calibrated": False, "journal_format": journal,
-            "runtime_transactions": 1, "mutex_wait_cycles": 2, "mutex_max_wait_cycles": 3,
+            "version": 2, "run_id": run_id, "phase": phase, "clock": "guest_tsc", "calibrated": False, "journal_format": journal,
+            "journal_phase_scope": "last-complete-publication", "runtime_transactions": transactions, "mutex_wait_cycles": 2, "mutex_max_wait_cycles": 3,
             "mutex_hold_cycles": 4, "mutex_max_hold_cycles": 5, "journal_sectors_read": 6,
             "journal_sectors_written": 7, "journal_flushes": 8, "journal_hash_bytes": 9,
             "journal_image_bytes": 10, "journal_capacity_bytes": 11, "tpm_lease_advances": 12,
             "tpm_tip_advances": 13, "tpm_lease_cycles": 14, "tpm_tip_cycles": 15,
+            "journal_payload_written_tsc": phases[0], "journal_payload_flushed_tsc": phases[1],
+            "journal_header_written_tsc": phases[2], "journal_header_flushed_tsc": phases[3],
+            "journal_readback_validated_tsc": phases[4], "journal_cache_updated_tsc": phases[5],
         }
-        return "TOOL_DMA_PERF_V1 " + json.dumps(fields, sort_keys=True) + "\n"
+        return "TOOL_DMA_PERF_V2 " + json.dumps(fields, sort_keys=True) + "\n"
+
+    @classmethod
+    def _write_perf_logs(cls, trial: Path, *, journal: str = "legacy", initial: str | None = None, recovery: str | None = None) -> None:
+        (trial / "initial.stdout.log").write_text(
+            initial if initial is not None else cls._perf_line(journal=journal, phase="post-endpoint-precrash"),
+            encoding="utf-8",
+        )
+        (trial / "recovery.stdout.log").write_text(
+            recovery if recovery is not None else cls._perf_line(journal=journal), encoding="utf-8",
+        )
 
     @staticmethod
     def _compaction_line(*, run_id: str = RUN) -> str:
@@ -123,7 +136,7 @@ class PerformanceLaneTests(unittest.TestCase):
             AsyncWorker(store, provider, worker_id="one").run_once(); provider.close(); store.close()
             (trial / "stage-timings.json").write_text(
                 '{"clock":"monotonic_ns","schema_version":1,"stages":{"initial_start_ns":100,"initial_end_ns":200,"recovery_start_ns":300,"recovery_end_ns":500}}\n', encoding="utf-8")
-            (trial / "recovery.stdout.log").write_text(self._perf_line(), encoding="utf-8")
+            self._write_perf_logs(trial)
             row = extract_trial(trial, "control", 1, expected_run_id=RUN)
             self.assertEqual((row["trial"], row["operation_key"], row["measurements"]["max_inflight"]), (1, "primary", {"value": 1, "unit": "count"}))
 
@@ -133,32 +146,69 @@ class PerformanceLaneTests(unittest.TestCase):
             self.assertEqual(json.loads((Path(temporary) / "stage-timings.json").read_text()),
                              {"schema_version": 1, "clock": "monotonic_ns", "stages": {"initial_start_ns": 1, "initial_end_ns": 2}})
 
-    def test_runtime_perf_parser_requires_exactly_one_well_formed_marker(self) -> None:
+    def test_runtime_perf_parser_requires_exactly_one_well_formed_marker_per_phase(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            trial = Path(temporary); log = trial / "recovery.stdout.log"
-            log.write_text(self._perf_line(), encoding="utf-8")
-            values = _recovery_runtime_measurements(trial, "legacy", RUN)
-            self.assertEqual(values["guest_journal_hash_bytes"], {"value": 9, "unit": "bytes"})
+            trial = Path(temporary); self._write_perf_logs(trial)
+            values = _runtime_measurements(trial, "legacy", RUN)
+            self.assertEqual(values["recovery_journal_hash_bytes"], {"value": 9, "unit": "bytes"})
+            self.assertEqual(values["initial_journal_payload_write_to_flush_cycles"], {"value": 1, "unit": "cycles"})
+            log = trial / "recovery.stdout.log"
             for contents in ("", self._perf_line() + self._perf_line(), "TOOL_DMA_PERF_V1 {bad}\n", self._perf_line(phase="terminal-initial"), self._perf_line(run_id="f" * 32)):
                 log.write_text(contents, encoding="utf-8")
-                with self.assertRaises(ValueError): _recovery_runtime_measurements(trial, "legacy", RUN)
+                with self.assertRaises(ValueError): _runtime_measurements(trial, "legacy", RUN)
 
     def test_runtime_perf_parser_enforces_format_and_vnext_compaction(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             trial = Path(temporary); log = trial / "recovery.stdout.log"
-            log.write_text(self._perf_line(journal="legacy"), encoding="utf-8")
-            with self.assertRaises(ValueError): _recovery_runtime_measurements(trial, "vnext", RUN)
-            log.write_text(self._perf_line(journal="vnext") + self._compaction_line(), encoding="utf-8")
-            self.assertEqual(_recovery_runtime_measurements(trial, "vnext", RUN)["compaction_logical_bytes_after"], {"value": 5, "unit": "bytes"})
-            self.assertEqual(_recovery_runtime_measurements(trial, "vnext", RUN)["compaction_sectors_written_delta"], {"value": 4, "unit": "count"})
+            self._write_perf_logs(trial, journal="legacy")
+            with self.assertRaises(ValueError): _runtime_measurements(trial, "vnext", RUN)
+            self._write_perf_logs(trial, journal="vnext", recovery=self._perf_line(journal="vnext") + self._compaction_line())
+            self.assertEqual(_runtime_measurements(trial, "vnext", RUN)["compaction_logical_bytes_after"], {"value": 5, "unit": "bytes"})
+            self.assertEqual(_runtime_measurements(trial, "vnext", RUN)["compaction_sectors_written_delta"], {"value": 4, "unit": "count"})
             log.write_text(self._perf_line(journal="vnext") + self._compaction_line(run_id="e" * 32), encoding="utf-8")
-            with self.assertRaises(ValueError): _recovery_runtime_measurements(trial, "vnext", RUN)
+            with self.assertRaises(ValueError): _runtime_measurements(trial, "vnext", RUN)
             log.write_text(self._perf_line() + self._compaction_line(), encoding="utf-8")
-            with self.assertRaises(ValueError): _recovery_runtime_measurements(trial, "legacy", RUN)
+            with self.assertRaises(ValueError): _runtime_measurements(trial, "legacy", RUN)
+
+    def test_runtime_perf_parser_rejects_missing_or_invalid_initial_publication_phases(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            trial = Path(temporary)
+            self._write_perf_logs(
+                trial,
+                initial=self._perf_line(phase="post-endpoint-precrash", transactions=0),
+            )
+            with self.assertRaises(ValueError):
+                _runtime_measurements(trial, "legacy", RUN)
+
+            self._write_perf_logs(
+                trial,
+                initial=(self._perf_line(phase="post-endpoint-precrash")
+                         + self._perf_line(phase="post-endpoint-precrash")),
+            )
+            with self.assertRaises(ValueError):
+                _runtime_measurements(trial, "legacy", RUN)
+
+            self._write_perf_logs(
+                trial,
+                initial=self._perf_line(phase="post-endpoint-precrash", phases=(16, 15, 18, 19, 20, 21)),
+            )
+            with self.assertRaises(ValueError):
+                _runtime_measurements(trial, "legacy", RUN)
+
+            self._write_perf_logs(
+                trial,
+                initial=self._perf_line(phase="post-endpoint-precrash", phases=(0, 17, 18, 19, 20, 21)),
+            )
+            with self.assertRaises(ValueError):
+                _runtime_measurements(trial, "legacy", RUN)
+
+            (trial / "initial.stdout.log").unlink()
+            with self.assertRaises(ValueError):
+                _runtime_measurements(trial, "legacy", RUN)
 
     def test_runtime_parser_measurements_are_accepted_by_unit_aware_summary(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            trial = Path(temporary); (trial / "recovery.stdout.log").write_text(self._perf_line(), encoding="utf-8")
-            result = summarize([{"point": "control", "measurements": _recovery_runtime_measurements(trial, "legacy", RUN)}])
+            trial = Path(temporary); self._write_perf_logs(trial)
+            result = summarize([{"point": "control", "measurements": _runtime_measurements(trial, "legacy", RUN)}])
             units = {group["unit"] for group in result["groups"]}
             self.assertTrue({"bytes", "count", "cycles"}.issubset(units))

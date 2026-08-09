@@ -20,9 +20,9 @@ from typing import Any
 from summarize_performance import summarize
 
 
-_PERF_PREFIX = "TOOL_DMA_PERF_V1 "
+_PERF_PREFIX = "TOOL_DMA_PERF_V2 "
 _COMPACTION_PREFIX = "CSER_VNEXT_COMPACTION "
-_MAX_RECOVERY_PERF_LINE_BYTES = 4096
+_MAX_RUNTIME_PERF_LINE_BYTES = 4096
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _RUN_ID = re.compile(r"^[0-9a-f]{32}$")
 _PERF_NUMERIC_UNITS = {
@@ -32,7 +32,12 @@ _PERF_NUMERIC_UNITS = {
     "journal_image_bytes": "bytes", "journal_capacity_bytes": "bytes", "tpm_lease_advances": "count",
     "tpm_tip_advances": "count", "tpm_lease_cycles": "cycles", "tpm_tip_cycles": "cycles",
 }
-_PERF_KEYS = frozenset({"version", "run_id", "phase", "clock", "calibrated", "journal_format"} | set(_PERF_NUMERIC_UNITS))
+_JOURNAL_PHASE_TSC = (
+    "journal_payload_written_tsc", "journal_payload_flushed_tsc",
+    "journal_header_written_tsc", "journal_header_flushed_tsc",
+    "journal_readback_validated_tsc", "journal_cache_updated_tsc",
+)
+_PERF_KEYS = frozenset({"version", "run_id", "phase", "clock", "calibrated", "journal_format", "journal_phase_scope"} | set(_PERF_NUMERIC_UNITS) | set(_JOURNAL_PHASE_TSC))
 _COMPACTION_KEYS = frozenset({"version", "run_id", "journal_format", "phase", "revision_before", "head_before", "revision_after", "head_after", "logical_bytes_before", "logical_bytes_after", "sectors_read_delta", "sectors_written_delta", "flushes_delta"})
 
 
@@ -61,45 +66,94 @@ def _stage_duration_ms(trial: Path, stage: str) -> float:
     return (end - start) / 1_000_000
 
 
-def _recovery_runtime_measurements(trial: Path, journal: str, expected_run_id: str) -> dict[str, dict[str, int | str]]:
-    """Strictly parse diagnostic-only recovery telemetry from bounded lines."""
+def _runtime_perf_marker(
+    trial: Path, log_name: str, label: str, journal: str, expected_run_id: str,
+    expected_phase: str, *, require_transaction: bool, allow_compaction: bool,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Parse one exact phase-bound diagnostic marker from one bounded log."""
     perf: dict[str, Any] | None = None
     compaction: dict[str, Any] | None = None
-    path = trial / "recovery.stdout.log"
+    path = trial / log_name
     try:
         with path.open("rb") as handle:
             while True:
-                raw = handle.readline(_MAX_RECOVERY_PERF_LINE_BYTES + 1)
+                raw = handle.readline(_MAX_RUNTIME_PERF_LINE_BYTES + 1)
                 if not raw:
                     break
-                if len(raw) > _MAX_RECOVERY_PERF_LINE_BYTES:
-                    raise ValueError("recovery runtime telemetry line exceeds 4 KiB")
+                if len(raw) > _MAX_RUNTIME_PERF_LINE_BYTES:
+                    raise ValueError(f"{label} runtime telemetry line exceeds 4 KiB")
                 try:
                     line = raw.decode("utf-8", errors="strict").rstrip("\r\n")
                 except UnicodeDecodeError as exc:
-                    raise ValueError("recovery runtime telemetry is not UTF-8") from exc
+                    raise ValueError(f"{label} runtime telemetry is not UTF-8") from exc
                 target: str | None = None
                 if line.startswith(_PERF_PREFIX):
-                    if perf is not None: raise ValueError("recovery must contain exactly one performance marker")
+                    if perf is not None: raise ValueError(f"{label} must contain exactly one performance marker")
                     target = line[len(_PERF_PREFIX):]
                     try: perf = json.loads(target)
-                    except json.JSONDecodeError as exc: raise ValueError("malformed recovery performance marker") from exc
+                    except json.JSONDecodeError as exc: raise ValueError(f"malformed {label} performance marker") from exc
                 elif line.startswith(_COMPACTION_PREFIX):
-                    if compaction is not None: raise ValueError("recovery must contain at most one compaction marker")
+                    if compaction is not None: raise ValueError(f"{label} must contain at most one compaction marker")
                     target = line[len(_COMPACTION_PREFIX):]
                     try: compaction = json.loads(target)
-                    except json.JSONDecodeError as exc: raise ValueError("malformed recovery compaction marker") from exc
+                    except json.JSONDecodeError as exc: raise ValueError(f"malformed {label} compaction marker") from exc
     except OSError as exc:
-        raise ValueError("trial misses recovery stdout telemetry") from exc
+        raise ValueError(f"trial misses {label} stdout telemetry") from exc
     if not isinstance(perf, dict) or set(perf) != _PERF_KEYS:
-        raise ValueError("recovery performance marker has an unexpected schema")
-    if (not _RUN_ID.fullmatch(expected_run_id) or perf.get("version") != 1 or perf.get("run_id") != expected_run_id
-            or perf.get("phase") != "terminal-recovery" or perf.get("clock") != "guest_tsc"
+        raise ValueError(f"{label} performance marker has an unexpected schema")
+    if (not _RUN_ID.fullmatch(expected_run_id) or perf.get("version") != 2 or perf.get("run_id") != expected_run_id
+            or perf.get("phase") != expected_phase or perf.get("clock") != "guest_tsc"
             or perf.get("calibrated") is not False or perf.get("journal_format") != journal):
-        raise ValueError("recovery performance marker has mismatched phase, clock, calibration, or journal format")
+        raise ValueError(f"{label} performance marker has mismatched phase, clock, calibration, or journal format")
+    if perf.get("journal_phase_scope") != "last-complete-publication":
+        raise ValueError(f"{label} performance marker has an unsupported journal phase scope")
     for key in _PERF_NUMERIC_UNITS:
         if not isinstance(perf[key], int) or isinstance(perf[key], bool) or perf[key] < 0:
-            raise ValueError(f"recovery performance marker has invalid {key}")
+            raise ValueError(f"{label} performance marker has invalid {key}")
+    if require_transaction and perf["runtime_transactions"] == 0:
+        raise ValueError(f"{label} performance marker must include a runtime transaction")
+    phase_tsc = [perf[key] for key in _JOURNAL_PHASE_TSC]
+    if (any(not isinstance(value, int) or isinstance(value, bool) or value <= 0 for value in phase_tsc)
+            or phase_tsc != sorted(phase_tsc)):
+        raise ValueError(f"{label} performance marker has missing or nonmonotonic publication phases")
+    if not allow_compaction and compaction is not None:
+        raise ValueError(f"{label} must not emit a compaction marker")
+    return perf, compaction
+
+
+def _phase_measurements(prefix: str, perf: dict[str, Any]) -> dict[str, dict[str, int | str]]:
+    """Convert same-publication absolute guest TSC stamps into phase intervals.
+
+    The raw V2 receipt retains absolute stamps for audit, while campaign rows
+    expose only within-publication deltas.  They remain uncalibrated guest TSC
+    cycles and must not be compared as host wall-clock latency.
+    """
+    measurements = {f"{prefix}_{key}": {"value": perf[key], "unit": unit}
+                    for key, unit in _PERF_NUMERIC_UNITS.items()}
+    payload_written, payload_flushed, header_written, header_flushed, readback, cache = (
+        perf[key] for key in _JOURNAL_PHASE_TSC
+    )
+    measurements.update({
+        f"{prefix}_journal_payload_write_to_flush_cycles": {"value": payload_flushed - payload_written, "unit": "cycles"},
+        f"{prefix}_journal_header_written_to_redundancy_flushed_cycles": {"value": header_flushed - header_written, "unit": "cycles"},
+        f"{prefix}_journal_header_flush_to_readback_cycles": {"value": readback - header_flushed, "unit": "cycles"},
+        f"{prefix}_journal_readback_to_cache_publication_cycles": {"value": cache - readback, "unit": "cycles"},
+    })
+    return measurements
+
+
+def _runtime_measurements(trial: Path, journal: str, expected_run_id: str) -> dict[str, dict[str, int | str]]:
+    """Bind cut-3 initial and terminal-recovery telemetry, then prefix both."""
+    initial, initial_compaction = _runtime_perf_marker(
+        trial, "initial.stdout.log", "initial", journal, expected_run_id,
+        "post-endpoint-precrash", require_transaction=True, allow_compaction=False,
+    )
+    recovery, compaction = _runtime_perf_marker(
+        trial, "recovery.stdout.log", "recovery", journal, expected_run_id,
+        "terminal-recovery", require_transaction=False, allow_compaction=True,
+    )
+    if initial_compaction is not None:
+        raise ValueError("initial must not emit a compaction marker")
     if journal == "legacy":
         if compaction is not None: raise ValueError("legacy recovery must not emit vNext compaction")
     elif journal == "vnext":
@@ -119,7 +173,7 @@ def _recovery_runtime_measurements(trial: Path, journal: str, expected_run_id: s
             raise ValueError("vNext compaction marker is invalid")
     else:
         raise ValueError("unknown journal format")
-    measurements = {f"guest_{key}": {"value": perf[key], "unit": unit} for key, unit in _PERF_NUMERIC_UNITS.items()}
+    measurements = _phase_measurements("initial", initial) | _phase_measurements("recovery", recovery)
     if compaction is not None:
         measurements.update({
             "compaction_revision_before": {"value": compaction["revision_before"], "unit": "count"},
@@ -183,7 +237,7 @@ def extract_trial(
             "initial_launcher": {"value": _stage_duration_ms(trial, "initial"), "unit": "ms"},
             "recovery_launcher": {"value": _stage_duration_ms(trial, "recovery"), "unit": "ms"},
             "max_inflight": {"value": int(max_inflight[0]), "unit": "count"},
-        } | _recovery_runtime_measurements(trial, journal, expected_run_id),
+        } | _runtime_measurements(trial, journal, expected_run_id),
     }
 
 

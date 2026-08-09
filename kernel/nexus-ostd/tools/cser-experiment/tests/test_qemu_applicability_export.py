@@ -10,7 +10,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from applicability_trace import load_trace
+from applicability_trace import StudyPseudonymizer, aggregate, aggregate_raw_trace, load_raw_trace, load_trace
 from qemu_applicability_export import export_trial
 
 
@@ -40,7 +40,9 @@ class QemuApplicabilityExportTests(unittest.TestCase):
             (trial / "recovery.stdout.log").write_text(self._terminal(identity, dma_retained_gate=retained, dma_reusable_gate=reusable))
             (trial / "bridge.status.json").write_text('{"state":"served"}\n')
             output = Path(temporary) / "out"
-            result = export_trial(trial, output, study_id="qemu_test_v1", key=b"x" * 32)
+            local_raw = Path(temporary) / "local-only.raw.jsonl"
+            result = export_trial(trial, output, study_id="qemu_test_v1", key=b"x" * 32,
+                                  raw_trace_output=local_raw)
             events = load_trace([result.trace])
             observations = [event for event in events if event["event_type"] == "effect_observation"]
             self.assertEqual(len(observations), 4)
@@ -66,11 +68,28 @@ class QemuApplicabilityExportTests(unittest.TestCase):
             bundle_text = "".join(path.read_text() for path in result.bundle.iterdir())
             self.assertNotIn("effect-secret", bundle_text)
             self.assertNotIn("operation-secret", bundle_text)
+            self.assertNotIn("24836", bundle_text)
+            self.assertEqual(result.raw_trace, local_raw)
+            pseudonymizer = StudyPseudonymizer("qemu_test_v1", b"x" * 32)
+            retained = load_raw_trace([local_raw], pseudonymizer)
+            self.assertEqual(aggregate_raw_trace(retained, pseudonymizer), aggregate(events))
+            self.assertIn("effect-secret", local_raw.read_text(encoding="utf-8"))
             manifest = json.loads((result.bundle / "manifest.json").read_text())
             self.assertEqual({entry["role"] for entry in manifest["inputs"]}, {"experiment_identity", "endpoint_database", "recovery_serial_log", "bridge_status"})
             source = json.loads((result.bundle / "source.json").read_text())
             self.assertEqual(source["repository"], "Nexus")
             self.assertIn("source_tree_sha256", source)
+
+    def test_refuses_raw_trace_nested_in_published_export(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            trial = Path(temporary) / "trial"; trial.mkdir()
+            identity = {"namespace_id": "ns", "authority_id": "authority", "effect_id": "effect",
+                        "catalog_digest": "a" * 64, "run_id": "r" * 32}
+            (trial / "experiment-identity.json").write_text(json.dumps(identity))
+            output = Path(temporary) / "out"
+            with self.assertRaisesRegex(ValueError, "outside"):
+                export_trial(trial, output, study_id="qemu_test_v1", key=b"x" * 32,
+                             raw_trace_output=output / "raw.jsonl")
 
     def test_rejects_gate_receipt_without_read_only_revision_and_head_provenance(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -3,9 +3,11 @@
 
 This module is deliberately independent of the endpoint and guest protocols.
 Producers submit a small, validated observation through :class:`TraceRecorder`;
-the recorder replaces the producer's local effect identifier with a per-study
-HMAC pseudonym before it reaches JSONL.  The resulting trace describes one
-bounded source/sample, not workload or industry prevalence.
+its primary output replaces the producer's local effect identifier with a
+per-study HMAC pseudonym before it reaches JSONL. An explicit, separate
+local-only raw-retention sink can preserve the source-labelled identifiers for
+audit, but it is never a replacement for the publishable trace. The resulting
+trace describes one bounded source/sample, not workload or industry prevalence.
 
 The schema separates an endpoint's declared capability from an observation,
 the system result, and the research inference.  In particular, missing input
@@ -21,6 +23,7 @@ import argparse
 import hashlib
 import hmac
 import json
+import os
 import re
 import threading
 import time
@@ -32,10 +35,32 @@ from typing import Any, Iterable, Mapping
 
 
 TRACE_SCHEMA_VERSION = 1
+RAW_TRACE_SCHEMA_VERSION = 1
+RAW_PUBLICATION_SCHEMA_VERSION = 1
 _LABEL = re.compile(r"[A-Za-z][A-Za-z0-9_.:-]{0,63}\Z")
 _PSEUDONYM = re.compile(r"e1_[0-9a-f]{64}\Z")
 _OPERATION_PSEUDONYM = re.compile(r"o1_[0-9a-f]{64}\Z")
 _RESOURCE_PSEUDONYM = re.compile(r"r1_[0-9a-f]{64}\Z")
+
+
+def _publication_marker(output: Path) -> Path:
+    return output.with_name(output.name + ".publication.json")
+
+
+def _fsync_parent(path: Path) -> None:
+    descriptor = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _write_fsynced(path: Path, payload: bytes, *, exclusive: bool) -> None:
+    mode = "xb" if exclusive else "wb"
+    with path.open(mode) as stream:
+        stream.write(payload)
+        stream.flush()
+        os.fsync(stream.fileno())
 
 
 class OutcomeCapability(str, Enum):
@@ -262,6 +287,42 @@ def validate_event(item: Mapping[str, Any]) -> dict[str, Any]:
     return event
 
 
+def validate_raw_event(item: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate a local-only raw-retention record.
+
+    Raw retention is deliberately a separate envelope, never an alternate
+    published trace format.  Its embedded sanitized event makes every retained
+    row independently comparable with its public counterpart while the raw
+    identifiers permit local re-aggregation when the study key is available.
+    """
+    if not isinstance(item, Mapping):
+        raise ValueError("raw trace event must be an object")
+    record = dict(item)
+    required = {"raw_schema_version", "raw_event_type", "sanitized_event", "raw_identifiers"}
+    if set(record) != required or record["raw_schema_version"] != RAW_TRACE_SCHEMA_VERSION:
+        raise ValueError("unsupported raw trace schema")
+    sanitized = validate_event(record["sanitized_event"])
+    if record["raw_event_type"] != sanitized["event_type"]:
+        raise ValueError("raw trace event type does not match sanitized event")
+    identifiers = record["raw_identifiers"]
+    if sanitized["event_type"] != "effect_observation":
+        if identifiers is not None:
+            raise ValueError("raw source metadata cannot carry identifiers")
+    else:
+        if not isinstance(identifiers, Mapping) or set(identifiers) != {
+            "effect_id", "operation_id", "resource_id",
+        }:
+            raise ValueError("raw observation identifiers are incomplete")
+        for name in ("effect_id", "operation_id"):
+            value = identifiers[name]
+            if not isinstance(value, str) or not value or len(value) > 512:
+                raise ValueError(f"invalid raw {name}")
+        resource = identifiers["resource_id"]
+        if resource is not None and (not isinstance(resource, str) or not resource or len(resource) > 512):
+            raise ValueError("invalid raw resource_id")
+    return record
+
+
 def _ordering(event: Mapping[str, Any]) -> None:
     for name in ("sequence", "relative_ns"):
         value = event[name]
@@ -314,29 +375,73 @@ def _validate_role_fact(event: Mapping[str, Any]) -> None:
 
 @dataclass
 class TraceRecorder:
-    """Bounded generic producer API that persists privacy-safe JSONL only."""
+    """Bounded producer API with an optional, separate local raw-retention sink.
+
+    ``output`` is always the publication-safe HMAC-pseudonymized trace.
+    ``raw_output`` is opt-in local evidence retention and must be a distinct
+    path; callers are responsible for keeping it outside any publish bundle.
+    """
 
     output: Path
     pseudonymizer: StudyPseudonymizer
     max_events: int = 10_000
     max_sources: int = 64
+    raw_output: Path | None = None
     _written: int = field(default=0, init=False)
     _dropped: Counter[str] = field(default_factory=Counter, init=False)
     _sources: set[str] = field(default_factory=set, init=False)
     _profiles: dict[str, tuple[str, str]] = field(default_factory=dict, init=False)
     _closed: bool = field(default=False, init=False)
+    _poisoned: bool = field(default=False, init=False)
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False)
     _sequence: int = field(default=0, init=False)
     _started_ns: int = field(default_factory=time.monotonic_ns, init=False)
+    _output_stream: Any = field(init=False, default=None, repr=False)
+    _raw_stream: Any = field(init=False, default=None, repr=False)
 
     def __post_init__(self) -> None:
         if self.max_events <= 0 or self.max_sources <= 0:
             raise ValueError("trace bounds must be positive")
+        if self.raw_output is not None and self.raw_output.resolve() == self.output.resolve():
+            raise ValueError("raw trace output must differ from sanitized output")
         self.output.parent.mkdir(parents=True, exist_ok=True)
+        if self.raw_output is None:
+            if self.output.exists():
+                raise ValueError("trace output already exists; refusing to append")
+            try:
+                self._output_stream = self.output.open("xb+")
+            except FileExistsError as exc:
+                raise ValueError("trace output already exists; refusing to append") from exc
+            return
+
+        self.raw_output.parent.mkdir(parents=True, exist_ok=True)
+        marker = _publication_marker(self.output)
+        temporary = self.output.with_name(self.output.name + ".tmp")
+        marker_temporary = marker.with_name(marker.name + ".tmp")
+        if any(path.exists() for path in (self.output, self.raw_output, marker, temporary, marker_temporary)):
+            raise ValueError("raw publication output already exists or is incomplete; refusing to append")
+        incomplete = json.dumps({
+            "publication_schema_version": RAW_PUBLICATION_SCHEMA_VERSION,
+            "mode": "raw_authoritative_derivation",
+            "state": "incomplete",
+        }, sort_keys=True, separators=(",", ":")).encode("utf-8") + b"\n"
         try:
-            self.output.open("x", encoding="utf-8").close()
-        except FileExistsError as exc:
-            raise ValueError("trace output already exists; refusing to append") from exc
+            # The marker becomes durable before raw observation begins. A
+            # crash can therefore never make a raw-mode trace look complete.
+            _write_fsynced(marker, incomplete, exclusive=True)
+            _fsync_parent(marker)
+            self._raw_stream = self.raw_output.open("xb+")
+        except (FileExistsError, OSError) as exc:
+            if self._raw_stream is not None:
+                self._raw_stream.close()
+            for path in (self.raw_output, marker):
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+            if isinstance(exc, FileExistsError):
+                raise ValueError("raw publication output already exists or is incomplete; refusing to append") from exc
+            raise RuntimeError("unable to create raw authoritative trace") from exc
 
     def _ordered(self, event: dict[str, Any]) -> dict[str, Any]:
         event["sequence"] = self._sequence
@@ -344,18 +449,131 @@ class TraceRecorder:
         self._sequence += 1
         return event
 
-    def _write(self, event: dict[str, Any]) -> None:
+    def _assert_active(self) -> None:
+        if self._closed:
+            raise RuntimeError("trace recorder is closed")
+        if self._poisoned:
+            raise RuntimeError("trace recorder is poisoned after output failure")
+
+    def _rollback(self, streams: list[tuple[Any, int]]) -> None:
+        for stream, offset in streams:
+            try:
+                stream.seek(offset)
+                stream.truncate()
+                stream.flush()
+            except Exception:
+                # The recorder is poisoned regardless; the caller must retain
+                # neither file as a complete measurement if rollback itself
+                # fails on the host filesystem.
+                pass
+
+    def _write(self, event: dict[str, Any], *, raw_identifiers: Mapping[str, str | None] | None = None) -> None:
+        self._assert_active()
         checked = validate_event(self._ordered(event))
         _validate_role_fact(checked)
-        with self.output.open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps(checked, sort_keys=True, separators=(",", ":")) + "\n")
+        raw: dict[str, Any] | None = None
+        if self.raw_output is not None:
+            raw = validate_raw_event({
+                "raw_schema_version": RAW_TRACE_SCHEMA_VERSION,
+                "raw_event_type": checked["event_type"],
+                "sanitized_event": checked,
+                "raw_identifiers": None if raw_identifiers is None else dict(raw_identifiers),
+            })
+        # Serialize and validate before changing a recorder-owned stream.
+        sanitized_line = (json.dumps(checked, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+        raw_line = None if raw is None else (json.dumps(raw, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+        if self.raw_output is not None:
+            assert self._raw_stream is not None and raw_line is not None
+            raw_offset = self._raw_stream.tell()
+            try:
+                self._raw_stream.write(raw_line)
+                self._raw_stream.flush()
+                os.fsync(self._raw_stream.fileno())
+            except Exception as exc:
+                self._rollback([(self._raw_stream, raw_offset)])
+                self._poisoned = True
+                raise RuntimeError("raw authoritative trace write failed; recorder is poisoned") from exc
+            return
+
+        assert self._output_stream is not None
+        output_offset = self._output_stream.tell()
+        try:
+            self._output_stream.write(sanitized_line)
+            self._output_stream.flush()
+        except Exception as exc:
+            self._rollback([(self._output_stream, output_offset)])
+            self._poisoned = True
+            raise RuntimeError("trace recorder output failed; recorder is poisoned") from exc
+
+    def _close_streams(self) -> None:
+        first_error: Exception | None = None
+        for stream in (self._output_stream, self._raw_stream):
+            if stream is None:
+                continue
+            try:
+                stream.close()
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise RuntimeError("trace recorder output close failed") from first_error
+
+    def _finalize_raw_publication(self) -> None:
+        """Derive a publishable trace only from a closed, fsynced raw log."""
+        assert self.raw_output is not None and self._raw_stream is not None
+        marker = _publication_marker(self.output)
+        temporary = self.output.with_name(self.output.name + ".tmp")
+        marker_temporary = marker.with_name(marker.name + ".tmp")
+        try:
+            self._raw_stream.flush()
+            os.fsync(self._raw_stream.fileno())
+            self._raw_stream.close()
+            self._raw_stream = None
+            records = load_raw_trace([self.raw_output], self.pseudonymizer)
+            sanitized = [record["sanitized_event"] for record in records]
+            # Cross-event validation makes the completed marker mean more than
+            # successful JSON decoding (profiles and source statuses agree).
+            aggregate(sanitized)
+            payload = b"".join(
+                (json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+                for event in sanitized
+            )
+            _write_fsynced(temporary, payload, exclusive=True)
+            os.replace(temporary, self.output)
+            _fsync_parent(self.output)
+            completed = {
+                "publication_schema_version": RAW_PUBLICATION_SCHEMA_VERSION,
+                "mode": "raw_authoritative_derivation",
+                "state": "complete",
+                "study_id": self.pseudonymizer.study_id,
+                # Do not publish even an unsalted raw-log fingerprint: the
+                # completed set exposes only a study-keyed HMAC commitment.
+                "raw_hmac_sha256": hmac.new(self.pseudonymizer.key, self.raw_output.read_bytes(), hashlib.sha256).hexdigest(),
+                "sanitized_sha256": hashlib.sha256(payload).hexdigest(),
+                "event_count": len(sanitized),
+            }
+            _write_fsynced(marker_temporary,
+                           json.dumps(completed, sort_keys=True, separators=(",", ":")).encode("utf-8") + b"\n",
+                           exclusive=True)
+            # This atomic replacement is the process-crash publication pivot.
+            # It is deliberately the final fallible action: all derived output
+            # and its directory, plus this marker temporary, were fsynced
+            # above. We make no physical-power-loss durability claim here.
+            os.replace(marker_temporary, marker)
+        except Exception as exc:
+            self._poisoned = True
+            for path in (temporary, marker_temporary):
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+            raise RuntimeError("raw trace publication failed; completion marker remains incomplete") from exc
 
     def describe_source(self, source_id: str, role: SourceRole | str,
                         claim_boundary: StudyClaimBoundary | str) -> None:
         """Durably declare an observation authority and the sample's claim limit."""
         with self._lock:
-            if self._closed:
-                raise RuntimeError("trace recorder is closed")
+            self._assert_active()
             _label(source_id, "source id")
             role_value = str(getattr(role, "value", role))
             boundary_value = str(getattr(claim_boundary, "value", claim_boundary))
@@ -387,8 +605,7 @@ class TraceRecorder:
                endpoint_domain: str, resource_authority_domain: str, relative_time_bucket: str,
                right_censored: bool, reason_code: str, raw_resource_id: str | None = None) -> bool:
         with self._lock:
-            if self._closed:
-                raise RuntimeError("trace recorder is closed")
+            self._assert_active()
             _label(source_id, "source id")
             if source_id not in self._profiles:
                 raise ValueError("source must be described before recording")
@@ -424,7 +641,11 @@ class TraceRecorder:
             }
             # Ordering is recorder-owned, but validate all producer-owned fields first.
             _enum(values["event_kind"], EventKind, "event kind")
-            self._write(values)
+            self._write(values, raw_identifiers={
+                "effect_id": raw_effect_id,
+                "operation_id": raw_operation_id,
+                "resource_id": raw_resource_id,
+            })
             self._written += 1
             return True
 
@@ -432,29 +653,80 @@ class TraceRecorder:
         with self._lock:
             if self._closed:
                 return
-            available = availability or {}
-            source_ids = sorted(self._sources | set(self._dropped) | set(available) | set(self._profiles))
-            if any(source_id not in self._profiles for source_id in source_ids):
-                raise ValueError("source status needs a source profile")
-            for source_id in source_ids:
-                state = str(getattr(available.get(source_id, SourceAvailability.AVAILABLE), "value", available.get(source_id, SourceAvailability.AVAILABLE)))
-                if self._dropped[source_id] and state == SourceAvailability.AVAILABLE.value:
-                    state = SourceAvailability.PARTIAL.value
-                self._write({"schema_version": TRACE_SCHEMA_VERSION, "event_type": "source_status",
-                             "study_id": self.pseudonymizer.study_id, "source_id": source_id,
-                             "source_availability": state, "dropped_events": self._dropped[source_id]})
+            try:
+                self._assert_active()
+                available = availability or {}
+                source_ids = sorted(self._sources | set(self._dropped) | set(available) | set(self._profiles))
+                if any(source_id not in self._profiles for source_id in source_ids):
+                    raise ValueError("source status needs a source profile")
+                for source_id in source_ids:
+                    state = str(getattr(available.get(source_id, SourceAvailability.AVAILABLE), "value", available.get(source_id, SourceAvailability.AVAILABLE)))
+                    if self._dropped[source_id] and state == SourceAvailability.AVAILABLE.value:
+                        state = SourceAvailability.PARTIAL.value
+                    self._write({"schema_version": TRACE_SCHEMA_VERSION, "event_type": "source_status",
+                                 "study_id": self.pseudonymizer.study_id, "source_id": source_id,
+                                 "source_availability": state, "dropped_events": self._dropped[source_id]})
+                if self.raw_output is not None:
+                    self._finalize_raw_publication()
+            finally:
+                self._closed = True
+                self._close_streams()
+
+    def abort(self) -> None:
+        """Stop without synthesizing source status or publishing raw output.
+
+        For raw-authoritative traces the durable marker deliberately remains
+        ``incomplete``. This is the only cleanup action permitted after a
+        producer/workflow exception.
+        """
+        with self._lock:
+            if self._closed:
+                return
+            self._poisoned = True
             self._closed = True
+            self._close_streams()
 
     def __enter__(self) -> "TraceRecorder":
         return self
 
-    def __exit__(self, *_: object) -> None:
-        self.close()
+    def __exit__(self, exception_type: object, *_: object) -> None:
+        if exception_type is None:
+            self.close()
+        else:
+            self.abort()
 
 
-def load_trace(paths: Iterable[Path]) -> list[dict[str, Any]]:
+def _verify_publication(path: Path, *, require_marker: bool) -> None:
+    marker = _publication_marker(path)
+    if not marker.exists():
+        if require_marker:
+            raise ValueError(f"published trace lacks completion marker: {path}")
+        return
+    try:
+        value = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"published trace has invalid completion marker: {path}") from exc
+    expected = {
+        "publication_schema_version", "mode", "state", "study_id",
+        "raw_hmac_sha256", "sanitized_sha256", "event_count",
+    }
+    if not isinstance(value, Mapping) or set(value) != expected or value.get("publication_schema_version") != RAW_PUBLICATION_SCHEMA_VERSION or value.get("mode") != "raw_authoritative_derivation" or value.get("state") != "complete":
+        raise ValueError(f"published trace is incomplete: {path}")
+    if not path.is_file():
+        raise ValueError(f"published trace missing finalized JSONL: {path}")
+    payload = path.read_bytes()
+    if value["sanitized_sha256"] != hashlib.sha256(payload).hexdigest():
+        raise ValueError(f"published trace digest mismatch: {path}")
+    if not isinstance(value["event_count"], int) or value["event_count"] < 0:
+        raise ValueError(f"published trace has invalid event count: {path}")
+    if sum(bool(line) for line in payload.splitlines()) != value["event_count"]:
+        raise ValueError(f"published trace event count mismatch: {path}")
+
+
+def load_trace(paths: Iterable[Path], *, require_publication_marker: bool = False) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
     for path in paths:
+        _verify_publication(path, require_marker=require_publication_marker)
         for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
             if not line:
                 continue
@@ -467,6 +739,59 @@ def load_trace(paths: Iterable[Path]) -> list[dict[str, Any]]:
             except ValueError as exc:
                 raise ValueError(f"invalid trace event in {path}:{line_number}: {exc}") from exc
     return events
+
+
+def load_published_trace(paths: Iterable[Path]) -> list[dict[str, Any]]:
+    """Load only a completed raw-authoritative publication set."""
+    return load_trace(paths, require_publication_marker=True)
+
+
+def _validate_raw_binding(record: Mapping[str, Any], pseudonymizer: StudyPseudonymizer) -> dict[str, Any]:
+    """Validate that local identifiers reproduce the embedded HMAC projection."""
+    checked = validate_raw_event(record)
+    event = checked["sanitized_event"]
+    if event["study_id"] != pseudonymizer.study_id:
+        raise ValueError("raw trace study does not match pseudonymizer")
+    identifiers = checked["raw_identifiers"]
+    if event["event_type"] == "effect_observation":
+        assert isinstance(identifiers, Mapping)
+        if event["effect_pseudonym"] != pseudonymizer.effect(identifiers["effect_id"]):
+            raise ValueError("raw effect id does not match pseudonym")
+        if event["operation_pseudonym"] != pseudonymizer.operation(identifiers["operation_id"]):
+            raise ValueError("raw operation id does not match pseudonym")
+        resource = identifiers["resource_id"]
+        expected_resource = None if resource is None else pseudonymizer.resource(resource)
+        if event["resource_pseudonym"] != expected_resource:
+            raise ValueError("raw resource id does not match pseudonym")
+    return checked
+
+
+def load_raw_trace(paths: Iterable[Path], pseudonymizer: StudyPseudonymizer) -> list[dict[str, Any]]:
+    """Load the explicitly local-only raw-retention envelope.
+
+    This function intentionally requires the study pseudonymizer: raw IDs are
+    useful local evidence only when they recompute every embedded public HMAC
+    pseudonym. It does not accept a sanitized trace.
+    """
+    records: list[dict[str, Any]] = []
+    for path in paths:
+        for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if not line:
+                continue
+            try:
+                parsed = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"invalid raw JSONL in {path}:{line_number}") from exc
+            try:
+                records.append(_validate_raw_binding(parsed, pseudonymizer))
+            except ValueError as exc:
+                raise ValueError(f"invalid raw trace event in {path}:{line_number}: {exc}") from exc
+    return records
+
+
+def aggregate_raw_trace(records: Iterable[Mapping[str, Any]], pseudonymizer: StudyPseudonymizer) -> dict[str, Any]:
+    """Re-aggregate local raw retention through the exact sanitized projection."""
+    return aggregate([_validate_raw_binding(record, pseudonymizer)["sanitized_event"] for record in records])
 
 
 def aggregate(events: Iterable[Mapping[str, Any]]) -> dict[str, Any]:

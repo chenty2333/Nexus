@@ -116,6 +116,42 @@ workflow graph, or a general dynamic-component API. The ordinary Tool+DMA QEMU
 matrix below remains a distinct CSER2 experiment and must not be reinterpreted
 as handoff evidence.
 
+## Local raw applicability retention
+
+`applicability_trace.py` always writes the HMAC-pseudonymized JSONL supplied as
+its primary output. For an explicit local audit, `TraceRecorder(...,
+raw_output=PATH)` additionally writes a separate `raw_schema_version: 1`
+envelope. Each raw record contains the exact sanitized event plus the local
+source-labelled effect, operation, and optional resource identifiers, so it can
+be re-aggregated through the same sanitized projection only with the matching
+per-study HMAC key; the loader recomputes every pseudonym and rejects a mismatch.
+It is not a publication format and must be handled as local sensitive evidence.
+
+When raw retention is enabled, raw JSONL is the only event log while the
+recorder is active; each accepted raw record is flushed and fsynced. The
+sanitized JSONL is derived only during a normal close from the closed raw log,
+after keyed validation, into a temporary file that is fsynced and atomically
+replaced. A sibling completion marker starts as `incomplete` before any raw
+event and changes to `complete` only after the derived file's digest and event
+count are recorded. Replacing that complete marker is the final process-crash
+publication pivot; no operation follows it. `load_published_trace()` requires that marker; `load_trace`
+also rejects any present incomplete or mismatched marker. Thus a killed or
+poisoned raw-mode recorder leaves raw-only/incomplete local evidence, not a
+completed public trace. This is a machine-detectable local publication protocol,
+not a cross-directory or physical-power-loss atomicity claim.
+
+`TraceRecorder.close()` is an explicit successful-finalize operation. Context
+manager exceptions and experiment workflow cleanup call `abort()` instead: they
+close local streams but neither synthesize source-status records nor derive a
+sanitized publication.
+
+Both bounded runners expose this opt-in retention without changing their normal
+output: `async_applicability_sample.py --raw-trace-output DIR` writes separate
+endpoint and worker raw files; `qemu_applicability_export.py --raw-trace-output
+FILE` writes one raw file. The arguments reject paths nested below the
+sanitized/export directory. In particular, the QEMU exporter never includes a
+raw trace in `evidence-bundle`, its manifest, summary, or source binding.
+
 ## Small async performance lane
 
 The ordinary endpoint remains `--provider-delay-ms 0 --worker-count 1`.
@@ -135,12 +171,21 @@ provider-apply→terminal, launcher/recovery, and durable max-inflight values.
 Launcher/recovery durations come from controller-written `monotonic_ns` stage
 artifacts, never log file mtimes; duration measurements use `ms` and
 max-inflight uses `count` explicitly.
-The runner also strictly consumes one bounded `TOOL_DMA_PERF_V1` marker from
-each recovery serial log. Its guest-TSC runtime/journal/TPM telemetry is
-diagnostic scope for post-activation and, for vNext, compaction only; host
-stage durations still cover the whole recovery launcher. vNext rows require
-one matching compaction marker with replay-image bytes plus separate sector
-read, sector write, and flush deltas, while legacy rows reject one.
+The runner also strictly consumes one bounded `TOOL_DMA_PERF_V2` marker from
+the cut-3 initial serial log and one from the terminal recovery log. The
+initial marker is emitted after the endpoint result is durable but before the
+crash barrier and must contain at least one authoritative runtime transaction;
+the recovery marker may honestly contain none. Both bind the exact run and
+journal and report guest-TSC runtime/journal/TPM diagnostics. Six absolute
+journal stamps describe the last complete publication, and the runner exports
+only their within-publication spans. In particular, vNext's
+header-written-to-redundancy-flushed span includes staged-header validation,
+the manifest authority pivot, and mirror-header restoration; it is not a
+standalone physical flush latency. All guest-TSC values are uncalibrated, and
+host stage durations still cover the whole launcher. vNext recovery rows
+require one matching compaction marker with replay-image bytes plus separate
+sector read, sector write, and flush deltas, while initial and legacy rows
+reject one.
 The concurrency point uses bounded host-local background endpoint jobs and
 fails if their durable timing does not overlap the primary request; they are
 not CSER claims. The summary includes
