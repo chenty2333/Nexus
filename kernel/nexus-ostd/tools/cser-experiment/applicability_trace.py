@@ -10,7 +10,10 @@ bounded source/sample, not workload or industry prevalence.
 The schema separates an endpoint's declared capability from an observation,
 the system result, and the research inference.  In particular, missing input
 is represented as source loss or right censoring and is never exported as an
-absence claim.
+absence claim.  ``source_id``, domains, operation kinds, time buckets, and
+reason codes are *public controlled labels*: they must use the restricted
+label grammar below and are never automatically pseudonymized.  Callers must
+therefore not put hostnames, URLs, payloads, tenant names, or raw IDs in them.
 """
 from __future__ import annotations
 
@@ -147,6 +150,7 @@ _ENUMS: dict[str, type[Enum]] = {
 
 
 def _label(value: object, name: str) -> str:
+    """Validate a controlled, publication-safe label; this is not anonymization."""
     if not isinstance(value, str) or _LABEL.fullmatch(value) is None:
         raise ValueError(f"invalid {name}")
     return value
@@ -264,6 +268,40 @@ def _ordering(event: Mapping[str, Any]) -> None:
             raise ValueError(f"invalid {name}")
 
 
+def _validate_role_fact(event: Mapping[str, Any]) -> None:
+    """Reject a fact that its declared source authority cannot attest.
+
+    Unknown/not-applicable values are allowed as diagnostic context.  A fact
+    which would affect an aggregate must come from the authority role that
+    owns it, so role filtering can never silently erase a claimed result.
+    """
+    if event.get("event_type") != "effect_observation":
+        return
+    role = event["source_role"]
+    if role in (SourceRole.ENDPOINT.value, SourceRole.WORKER_PROVIDER.value):
+        invalid = (
+            event["quiescence_observation"] == Observation.OBSERVED.value
+            or event["claim_state"] in (ClaimState.RETAINED.value, ClaimState.RELEASED.value)
+            or event["gate_decision"] in (GateDecision.ADMITTED.value, GateDecision.REJECTED.value)
+        )
+    elif role == SourceRole.DEVICE.value:
+        invalid = (
+            event["outcome_observation"] == Observation.OBSERVED.value
+            or event["claim_state"] in (ClaimState.RETAINED.value, ClaimState.RELEASED.value)
+            or event["gate_decision"] in (GateDecision.ADMITTED.value, GateDecision.REJECTED.value)
+        )
+    else:  # guest and allocator-gate provenance owns custody facts, not endpoint/device facts.
+        invalid = (
+            event["outcome_observation"] == Observation.OBSERVED.value
+            or event["quiescence_observation"] == Observation.OBSERVED.value
+        )
+    if invalid:
+        raise ValueError("source role is not authoritative for recorded fact")
+    if (event["claim_state"] in (ClaimState.RETAINED.value, ClaimState.RELEASED.value)
+            or event["gate_decision"] in (GateDecision.ADMITTED.value, GateDecision.REJECTED.value)) and event["resource_pseudonym"] is None:
+        raise ValueError("claim or gate fact requires a resource pseudonym")
+
+
 @dataclass
 class TraceRecorder:
     """Bounded generic producer API that persists privacy-safe JSONL only."""
@@ -297,8 +335,10 @@ class TraceRecorder:
         return event
 
     def _write(self, event: dict[str, Any]) -> None:
+        checked = validate_event(self._ordered(event))
+        _validate_role_fact(checked)
         with self.output.open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps(validate_event(self._ordered(event)), sort_keys=True, separators=(",", ":")) + "\n")
+            stream.write(json.dumps(checked, sort_keys=True, separators=(",", ":")) + "\n")
 
     def describe_source(self, source_id: str, role: SourceRole | str,
                         claim_boundary: StudyClaimBoundary | str) -> None:
@@ -388,6 +428,8 @@ class TraceRecorder:
                 raise ValueError("source status needs a source profile")
             for source_id in source_ids:
                 state = str(getattr(available.get(source_id, SourceAvailability.AVAILABLE), "value", available.get(source_id, SourceAvailability.AVAILABLE)))
+                if self._dropped[source_id] and state == SourceAvailability.AVAILABLE.value:
+                    state = SourceAvailability.PARTIAL.value
                 self._write({"schema_version": TRACE_SCHEMA_VERSION, "event_type": "source_status",
                              "study_id": self.pseudonymizer.study_id, "source_id": source_id,
                              "source_availability": state, "dropped_events": self._dropped[source_id]})
@@ -427,16 +469,25 @@ def aggregate(events: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
         raise ValueError("aggregate requires exactly one study id")
     source_status: dict[str, dict[str, Any]] = {}
     for status in statuses:
-        prior = source_status.get(status["source_id"])
-        if prior is not None and prior != status:
-            raise ValueError("conflicting source status")
+        if status["source_id"] in source_status:
+            raise ValueError("duplicate source status")
         source_status[status["source_id"]] = status
     source_profiles: dict[str, dict[str, Any]] = {}
     for profile in profiles:
         prior = source_profiles.get(profile["source_id"])
-        if prior is not None and prior != profile:
-            raise ValueError("conflicting source profile")
+        semantic = {key: profile[key] for key in ("study_id", "source_id", "source_role", "study_claim_boundary")}
+        if prior is not None:
+            prior_semantic = {key: prior[key] for key in semantic}
+            if prior_semantic != semantic:
+                raise ValueError("conflicting source profile")
+            continue
         source_profiles[profile["source_id"]] = profile
+    missing_status = set(source_profiles) - set(source_status)
+    if missing_status:
+        raise ValueError(f"source profile has no source status: {sorted(missing_status)[0]}")
+    extra_status = set(source_status) - set(source_profiles)
+    if extra_status:
+        raise ValueError(f"source status has no source profile: {sorted(extra_status)[0]}")
     effects = {event["effect_pseudonym"] for event in observations}
     by_source: dict[str, int] = Counter(event["source_id"] for event in observations)
     for source_id in by_source:
@@ -444,35 +495,73 @@ def aggregate(events: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
             raise ValueError("observation has no source-status accounting")
         if source_id not in source_profiles:
             raise ValueError("observation has no source profile")
-    sequence_ids = [event["sequence"] for event in observations + statuses + profiles]
-    if len(sequence_ids) != len(set(sequence_ids)):
-        raise ValueError("trace sequence is not unique")
-    by_effect: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    by_source_events: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for event in observations + statuses + profiles:
+        by_source_events[event["source_id"]].append(event)
+    for source_id, source_events in by_source_events.items():
+        sequences = [event["sequence"] for event in source_events]
+        if len(sequences) != len(set(sequences)):
+            raise ValueError(f"trace sequence is not unique for source {source_id}")
+        ordered = sorted(source_events, key=lambda event: event["sequence"])
+        if any(later["relative_ns"] < earlier["relative_ns"] for earlier, later in zip(ordered, ordered[1:])):
+            raise ValueError(f"trace relative time regressed for source {source_id}")
+    by_effect: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     for event in observations:
-        by_effect[event["effect_pseudonym"]].append(event)
+        profile = source_profiles[event["source_id"]]
+        if event["source_role"] != profile["source_role"] or event["study_claim_boundary"] != profile["study_claim_boundary"]:
+            raise ValueError("observation does not match its source profile")
+        _validate_role_fact(event)
+        by_effect[(event["source_id"], event["effect_pseudonym"])].append(event)
     final = {
-        effect: max(history, key=lambda event: (event["relative_ns"], event["sequence"]))
+        effect: max(history, key=lambda event: event["sequence"])
         for effect, history in by_effect.items()
     }
     final_events = list(final.values())
-    final_state = Counter(event["effect_state"] for event in final_events)
+
+    def unique_role_effects(roles: set[str], predicate: Any) -> set[str]:
+        return {
+            event["effect_pseudonym"] for event in final_events
+            if event["source_role"] in roles and predicate(event)
+        }
+
+    outcome_roles = {SourceRole.ENDPOINT.value, SourceRole.WORKER_PROVIDER.value}
+    claim_roles = {SourceRole.GUEST.value, SourceRole.ALLOCATOR_GATE.value}
+    device_roles = {SourceRole.DEVICE.value}
+    role_final_counts = Counter(event["source_role"] for event in final_events)
+    outcome_effects = unique_role_effects(outcome_roles, lambda _: True)
+    terminal_effects = unique_role_effects(outcome_roles, lambda event: event["effect_state"] in (EffectState.SUCCEEDED.value, EffectState.FAILED.value))
+    succeeded_effects = unique_role_effects(outcome_roles, lambda event: event["effect_state"] == EffectState.SUCCEEDED.value)
+    failed_effects = unique_role_effects(outcome_roles, lambda event: event["effect_state"] == EffectState.FAILED.value)
+    terminal_conflicts = succeeded_effects & failed_effects
+    claim_history: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
+    for event in observations:
+        if event["source_role"] in claim_roles and event["resource_pseudonym"] is not None:
+            claim_history[(event["source_id"], event["effect_pseudonym"], event["resource_pseudonym"])].append(event)
+    claim_final = [max(history, key=lambda event: event["sequence"]) for history in claim_history.values()]
+    retained = sum(event["claim_state"] == ClaimState.RETAINED.value for event in claim_final)
+    released = sum(event["claim_state"] == ClaimState.RELEASED.value for event in claim_final)
+    gate_rejected = sum(event["gate_decision"] == GateDecision.REJECTED.value for event in claim_final)
+    gate_admitted = sum(event["gate_decision"] == GateDecision.ADMITTED.value for event in claim_final)
     return {
         "schema_version": TRACE_SCHEMA_VERSION,
         "study_id": next(iter(studies)),
         "scope": "bounded_source_sample_not_prevalence",
         "study_claim_boundaries": sorted({profile["study_claim_boundary"] for profile in source_profiles.values()}),
         "source_roles": dict(sorted(Counter(profile["source_role"] for profile in source_profiles.values()).items())),
-        "denominator": {"eligible_effects": len(effects), "final_effects": len(final_events), "raw_effect_observations": len(observations), "sources": len(source_status)},
+        "denominator": {"eligible_effects": len(effects), "final_source_effects": len(final_events), "raw_effect_observations": len(observations), "sources": len(source_status)},
         "raw_events": {"effect_observations": len(observations), "by_kind": dict(sorted(Counter(e["event_kind"] for e in observations).items()))},
-        "final_outcomes": {"by_effect_state": dict(sorted(final_state.items())),
-                           "terminal_effects": sum(event["effect_state"] in (EffectState.SUCCEEDED.value, EffectState.FAILED.value) for event in final_events),
-                           "outcome_observed_effects": sum(e["outcome_observation"] == Observation.OBSERVED.value for e in final_events),
-                           "quiescence_observed_effects": sum(e["quiescence_observation"] == Observation.OBSERVED.value for e in final_events)},
-        "final_claims": {"retained_effects": sum(e["claim_state"] == ClaimState.RETAINED.value for e in final_events),
-                         "released_effects": sum(e["claim_state"] == ClaimState.RELEASED.value for e in final_events)},
-        "final_gates": {"rejected_effects": sum(e["gate_decision"] == GateDecision.REJECTED.value for e in final_events),
-                        "admitted_effects": sum(e["gate_decision"] == GateDecision.ADMITTED.value for e in final_events)},
-        "right_censored_effects": sum(e["right_censored"] for e in final_events),
+        "final_source_effects_by_role": dict(sorted(role_final_counts.items())),
+        "final_outcomes": {"eligible_effects": len(outcome_effects), "terminal_effects": len(terminal_effects),
+                           "succeeded_effects": len(succeeded_effects - terminal_conflicts), "failed_effects": len(failed_effects - terminal_conflicts),
+                           "conflicting_terminal_effects": len(terminal_conflicts),
+                           "outcome_observed_effects": len(unique_role_effects(outcome_roles, lambda e: e["outcome_observation"] == Observation.OBSERVED.value))},
+        "final_quiescence": {"observed_effects": len(unique_role_effects(device_roles, lambda e: e["quiescence_observation"] == Observation.OBSERVED.value)),
+                             "right_censored_effects": len(unique_role_effects(device_roles, lambda e: e["right_censored"]))},
+        "final_claims": {"retained_resource_coordinates": retained, "released_resource_coordinates": released,
+                         "final_resource_coordinates": len(claim_final)},
+        "final_gates": {"rejected_resource_coordinates": gate_rejected, "admitted_resource_coordinates": gate_admitted,
+                        "final_resource_coordinates": len(claim_final)},
+        "right_censored_effects": len({event["effect_pseudonym"] for event in final_events if event["right_censored"]}),
         "missing_sources": sorted(source for source, status in source_status.items() if status["source_availability"] == SourceAvailability.MISSING.value),
         "partial_sources": sorted(source for source, status in source_status.items() if status["source_availability"] == SourceAvailability.PARTIAL.value),
         "dropped_events": sum(status["dropped_events"] for status in source_status.values()),
@@ -492,6 +581,9 @@ def main() -> None:
     args = parser.parse_args()
     events = load_trace(args.input)
     if args.command == "validate":
+        # Aggregate performs cross-event source-profile, source-status, role,
+        # and per-source ordering validation without exporting any identities.
+        aggregate(events)
         print(json.dumps({"valid_events": len(events), "schema_version": TRACE_SCHEMA_VERSION}, sort_keys=True))
         return
     result = aggregate(events)
