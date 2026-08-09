@@ -66,7 +66,15 @@ for ((trial=1; trial<=trials; trial++)); do for cutpoint in "${selected_cutpoint
     # has a chance to create it. Rows are intentionally sequential, so this
     # shared transport path does not mix trial state.
     project_root=$(cd "$root/../.." && pwd -P)
-    barrier_socket="$project_root/artifacts/tool-dma-$variant/com3-crash.sock"
+    artifact_variant=$variant
+    if [[ ${CSER_EXPERIMENT_JOURNAL_VNEXT:-0} == 1 ]]; then
+      [[ $variant == cser ]] || {
+        echo 'journal vNext is available only for the CSER real-QEMU variant' >&2
+        exit 2
+      }
+      artifact_variant=cser-vnext
+    fi
+    barrier_socket="$project_root/artifacts/tool-dma-$artifact_variant/com3-crash.sock"
   fi
   command=(python3 "$root/matrix_controller.py" --variant "$variant" --run-id "$run_id" --trial "$trial" --cutpoint "$cutpoint" --cutpoint-id "$cutpoint_id" --barrier-socket "$barrier_socket" --trial-dir "$trial_dir" --prepared-trial-dir --metrics-jsonl "$metrics" --timeout-seconds "$timeout" --recovery-timeout-seconds "$recovery_timeout" --kill-mode "$kill_mode"); command+=("${media_args[@]}"); [[ -z $recovery_guest ]] || command+=(--recovery-guest "$recovery_guest"); [[ $recovery_output_metrics == false ]] || command+=(--recovery-output-metrics); if [[ $real_qemu == true ]]; then command+=(--real-qemu --catalog-digest "$catalog_digest" --namespace-id "$namespace_id" --authority-id "$authority_id" --effect-id "$effect_id"); fi; if [[ $kill_mode == container ]]; then command+=(--container-kill-command "${container_kill[@]}"); fi; command+=(-- "$@"); "${command[@]}"
 done; done

@@ -64,10 +64,13 @@ class ToolDmaMediaProvisionTests(unittest.TestCase):
 
     def test_real_launcher_binds_cser_tpm_to_computed_catalog_and_baseline_to_blank_selector(self) -> None:
         launcher = (TOOLS / "qemu_boot.sh").read_text(encoding="utf-8")
+        matrix = (TOOLS / "run_matrix.sh").read_text(encoding="utf-8")
         self.assertIn("cser-catalog-digest -- tool-dma", launcher)
         self.assertIn('"$root/scripts/provision-cser-tpm-nv.sh"', launcher)
         self.assertIn("--experiment-blank", launcher)
         self.assertIn("require_medium journal.raw", launcher)
+        self.assertIn("artifact_variant=cser-vnext", matrix)
+        self.assertIn('artifacts/tool-dma-$artifact_variant/com3-crash.sock', matrix)
 
 
 if __name__ == "__main__":
