@@ -176,6 +176,42 @@ class ApplicabilityTraceTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "no source status"):
                 aggregate(load_trace([trace]))
 
+    def test_operator_disposition_is_counted_but_cannot_attest_safety_facts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            trace = Path(temp) / "operator.jsonl"
+            recorder = TraceRecorder(trace, StudyPseudonymizer("study_local_v1", b"o" * 32))
+            recorder.describe_source(
+                "operator_observer",
+                SourceRole.OPERATOR,
+                StudyClaimBoundary.BOUNDED_APPLICABILITY_SAMPLE,
+            )
+            self.assertTrue(self._record(
+                recorder,
+                "effect",
+                source_id="operator_observer",
+                raw_resource_id=None,
+                event_kind=EventKind.ADMIN_DISPOSITION,
+                claim_state=ClaimState.NOT_APPLICABLE,
+                gate_decision=GateDecision.NOT_OBSERVED,
+                right_censored=False,
+                reason_code="operator_accepted_residual_risk",
+            ))
+            with self.assertRaisesRegex(ValueError, "not authoritative"):
+                self._record(
+                    recorder,
+                    "unsafe-effect",
+                    source_id="operator_observer",
+                    event_kind=EventKind.TERMINAL,
+                    effect_state=EffectState.SUCCEEDED,
+                    outcome_observation=Observation.OBSERVED,
+                    claim_state=ClaimState.NOT_APPLICABLE,
+                    gate_decision=GateDecision.NOT_OBSERVED,
+                    right_censored=False,
+                )
+            recorder.close()
+            result = aggregate(load_trace([trace]))
+            self.assertEqual(result["administrative_dispositions"]["observed_effects"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

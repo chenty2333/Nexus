@@ -108,6 +108,7 @@ class SourceRole(str, Enum):
     GUEST = "guest"
     DEVICE = "device"
     ALLOCATOR_GATE = "allocator_gate"
+    OPERATOR = "operator"
 
 
 class StudyClaimBoundary(str, Enum):
@@ -289,6 +290,15 @@ def _validate_role_fact(event: Mapping[str, Any]) -> None:
             event["outcome_observation"] == Observation.OBSERVED.value
             or event["claim_state"] in (ClaimState.RETAINED.value, ClaimState.RELEASED.value)
             or event["gate_decision"] in (GateDecision.ADMITTED.value, GateDecision.REJECTED.value)
+        )
+    elif role == SourceRole.OPERATOR.value:
+        invalid = (
+            event["outcome_observation"] == Observation.OBSERVED.value
+            or event["quiescence_observation"] == Observation.OBSERVED.value
+            or event["claim_state"] in (ClaimState.RETAINED.value, ClaimState.RELEASED.value)
+            or event["gate_decision"] in (GateDecision.ADMITTED.value, GateDecision.REJECTED.value)
+            or event["event_kind"]
+            not in (EventKind.ADMIN_DISPOSITION.value, EventKind.OBSERVATION_ENDED.value)
         )
     else:  # guest and allocator-gate provenance owns custody facts, not endpoint/device facts.
         invalid = (
@@ -527,6 +537,7 @@ def aggregate(events: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
     outcome_roles = {SourceRole.ENDPOINT.value, SourceRole.WORKER_PROVIDER.value}
     claim_roles = {SourceRole.GUEST.value, SourceRole.ALLOCATOR_GATE.value}
     device_roles = {SourceRole.DEVICE.value}
+    operator_roles = {SourceRole.OPERATOR.value}
     role_final_counts = Counter(event["source_role"] for event in final_events)
     outcome_effects = unique_role_effects(outcome_roles, lambda _: True)
     terminal_effects = unique_role_effects(outcome_roles, lambda event: event["effect_state"] in (EffectState.SUCCEEDED.value, EffectState.FAILED.value))
@@ -561,6 +572,12 @@ def aggregate(events: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
                          "final_resource_coordinates": len(claim_final)},
         "final_gates": {"rejected_resource_coordinates": gate_rejected, "admitted_resource_coordinates": gate_admitted,
                         "final_resource_coordinates": len(claim_final)},
+        "administrative_dispositions": {
+            "observed_effects": len(unique_role_effects(
+                operator_roles,
+                lambda event: event["event_kind"] == EventKind.ADMIN_DISPOSITION.value,
+            )),
+        },
         "right_censored_effects": len({event["effect_pseudonym"] for event in final_events if event["right_censored"]}),
         "missing_sources": sorted(source for source, status in source_status.items() if status["source_availability"] == SourceAvailability.MISSING.value),
         "partial_sources": sorted(source for source, status in source_status.items() if status["source_availability"] == SourceAvailability.PARTIAL.value),
