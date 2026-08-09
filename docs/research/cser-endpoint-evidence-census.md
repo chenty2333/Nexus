@@ -52,25 +52,27 @@ first reproducible Nexus adapter should therefore use a host-resident durable
 tool service with a small controlled transport instead of adding a guest TCP/IP
 stack as an unrelated experimental variable.
 
-The intended service contract for a broader endpoint adapter is:
+The current trusted-local adapter contract is:
 
-1. `submit(effect_id, input_digest)` durably records a job and is idempotent by
-   `effect_id`;
+1. a CSER2 `submit` binds the durable namespace, authority ID, effect ID, run
+   ID, operation key, input digest, and catalog digest; retrying that exact
+   identity is idempotent;
 2. a fault point may execute the job while dropping its reply;
-3. `status(effect_id)` returns `Pending`, `Succeeded(result_digest)`, or
-   `Failed(code)` from durable state;
-4. terminal outcome remains queryable across guest and service restart.
+3. the durable store admits `Accepted -> [Pending] ->
+   Succeeded(result_digest) | Failed(code)`, where `Pending` is optional; only
+   the two terminal states carry a v2 outcome-evidence digest. The current
+   experiment's HTTP `POST` completes synchronously as `Succeeded`; it does
+   not yet expose an asynchronous job worker or a remote Pending transition;
+4. expiry returns a retained `expired` tombstone (HTTP 410), not absence; only
+   an exact-identity `absent` result (HTTP 404) can take the narrow same-key
+   retry path. Expiry never authorizes retry or release.
 
-The current experiment implements only the successful-path subset of that
-contract: it durably stores an idempotent `(run_id, operation_key)` record with
-`status=applied` and `result=success`, then exposes that record through `GET`.
-It deliberately does not create a durable `Pending` record or represent
-`Succeeded(result_digest)` and `Failed(code)` as distinct terminal states. The
-full Pending/Succeeded/Failed contract above remains the target for a broader
-endpoint adapter, not evidence supplied by this one.
-
-The implemented successful-path record supplies recoverable outcome evidence.
-The existing VirtIO DMA component independently supplies recoverable quiescence
-evidence for its queue, page, and generation claims. Putting both beneath one
-composite effect tests component-local retirement without pretending that
-either fact proves the other.
+The store-level four-state contract is covered independently from the current
+synchronous HTTP path. The v2 digest is a trusted-local integrity binding, not
+remote authentication: it binds the complete identity, schema, terminal
+state, and result to the launcher-selected SQLite sidecar. The existing VirtIO
+DMA component
+independently supplies recoverable quiescence evidence for its queue, page,
+and generation claims. Putting both beneath one composite effect tests
+component-local retirement without pretending that endpoint outcome evidence
+can retire DMA claims, or that DMA quiescence can settle an outcome.

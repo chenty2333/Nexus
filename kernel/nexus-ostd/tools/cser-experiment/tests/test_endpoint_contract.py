@@ -58,12 +58,27 @@ class EndpointContractTests(unittest.TestCase):
 
     def test_monotonic_states_and_expiry_are_never_reclassified_as_absence(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
-            store = Store(Path(temp) / "evidence.sqlite", catalog_digest=CATALOG)
+            database = Path(temp) / "evidence.sqlite"
+            store = Store(database, catalog_digest=CATALOG)
             _, accepted = self.submit(store, initial_state=OperationState.ACCEPTED, result="queued")
             self.assertEqual(accepted["state"], "accepted")
             pending = store.transition(RUN, "op-1", OperationState.PENDING, "working")
             assert pending is not None
             self.assertEqual(pending["state"], "pending")
+            self.assertEqual(pending["evidence_record_digest"], "-")
+
+            # Pending is durable recovery state, not terminal evidence.  A
+            # cold sidecar restart must preserve it rather than reinterpret it
+            # as absence, success, or retry authority.
+            authority = store.authority_id
+            store.close()
+            store = Store(database, catalog_digest=CATALOG)
+            recovered_pending = store.get(RUN, "op-1")
+            assert recovered_pending is not None
+            self.assertEqual(store.authority_id, authority)
+            self.assertEqual(recovered_pending["state"], "pending")
+            self.assertEqual(recovered_pending["evidence_record_digest"], "-")
+
             # Pending cannot return to accepted: the transition is a no-op,
             # not a reinterpretation of the evidence history.
             self.assertEqual(store.transition(RUN, "op-1", OperationState.ACCEPTED, "queued")["state"], "pending")

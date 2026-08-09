@@ -29,12 +29,13 @@ current fixed tool-plus-DMA experiment does not do so.
 The trusted-local reference-adapter, orchestration-hardening, and measured-
 performance phase is complete. Remote endpoint authentication, multi-provider
 registries, multi-tenancy, and SDK/platform work remain deliberately deferred.
-The active research phase is a narrowly gated late-bound custody handoff
-falsification pilot, not further mechanism expansion on the fixed
-tool-plus-DMA topology. It begins with a credible workload card and a portable
-comparison against independent journals, provider-native generation fencing,
-wildcard reservation, and a workload-specific coordinator. Full QEMU work and
-new dynamic-component semantics require an explicit Go result first.
+The proposed late-bound custody handoff pilot stopped at Gate 0: Kubernetes
+Job/DRA and NVMe Namespace Management both reveal exact coordinates late, but
+already hold first observation behind a workload-specific or provider-native
+coordinator. No G0/G1 experiment was frozen, and no synthetic portable or QEMU
+pilot is active. The next research input is a real endpoint-applicability trace
+that can show whether an executor/effect custody gap exists outside an existing
+scheduler, provider lease, attachment gate, or workflow database.
 
 ## Current State
 
@@ -85,11 +86,26 @@ recovery seal; current generated QEMU receipts and comparison outputs are
 Git-ignored evidence, not source-controlled release artifacts.
 
 The current composite mechanism remains sealed-topology: the catalog fixes its
-component product at creation and preparation freezes claim enrollment. The
-next pilot therefore starts with the existing-contract handoff `A retained ->
-create and enroll B -> release A -> B escape`; it does not assume arbitrary
-component insertion. The endpoint capability census still contains one stale
-description of the pre-CSER2 successful-only adapter and needs factual repair.
+component product at creation and preparation freezes claim enrollment. An
+exploratory same-root handoff showed that the existing contract can represent
+`A retained -> create and enroll B -> release A -> B escape`, but its A-to-B
+causal edge lived in test support and no Gate-0 workload justified promoting
+that sequence into project source. The endpoint capability census now matches
+the trusted-local CSER2 identity, terminal evidence, 410 tombstone, and narrow
+404 retry boundary. It also states the remaining layer boundary: the durable
+Store supports Accepted/Pending states, while the current HTTP experiment
+completes POST synchronously rather than exposing an asynchronous job worker.
+
+Two primary-source workload cards now record a Gate-0 No-Go. Kubernetes DRA
+already coordinates allocation and consumer admission in ResourceClaim state;
+NVMe Create returns a controller-selected NSID late, but keeps the namespace
+unattached and inactive until provider-governed Attach and Linux publication.
+Late knowledge alone is therefore not evidence of an executor/effect custody
+gap. The bounded evidence-availability result remains useful: a Pending Store
+row survives database reopen without terminal evidence, expiry remains a 410
+tombstone, and missing reset/IRQ/IOTLB facts retain their exact physical claims.
+These controlled cases do not measure workload prevalence, permanent-retain or
+administrative-disposition proportions, or wall-clock resource-seconds.
 
 The HotOS draft now states the I2 evidence layers, exact I3 coordinates,
 retirement/abort distinction, evidence-axis separation, Shared boundary,
@@ -97,12 +113,14 @@ counterfactual revision metric, and QEMU-versus-physical boundary. It builds as
 five pages. RFC 0007 is explicitly the historical v5 baseline and RFC 0008 is
 the current v6 amendment.
 
-Local and GitHub integration are complete through `ed26354`: the reviewed CSER
-source is on `origin/main`, and local `main` remains the development branch.
-The sibling `nexus-hotos` checkout still has no Git remote. Generated QEMU
-receipts and comparison outputs are intentionally Git-ignored, so the current
-source publication does not yet constitute a small source-bound evidence
-bundle or publish the paper checkout.
+Local `main` remains the development branch and tracks the published
+`origin/main`. The recent GitHub failures were one real Rust 1.95 Clippy
+`unit_arg` regression in the ignored core performance profile, not stale CI
+semantics; the non-unit black-box fix passes the corresponding local all-target
+Clippy gate. The sibling `nexus-hotos` checkout still has no Git remote.
+Generated QEMU receipts and comparison outputs are intentionally Git-ignored,
+so the current source publication does not yet constitute a small source-bound
+evidence bundle or publish the paper checkout.
 
 ## Current Tasks
 
@@ -131,10 +149,10 @@ bundle or publish the paper checkout.
 - [x] Measure ATA journal growth and, if dominant, implement an append-oriented segment/checkpoint layout without weakening readback, crash atomicity, or journal-before-anchor ordering.
 - [x] Measure runtime mutex queue/hold time and reduce demonstrated serialization without exposing uncommitted state or effects.
 - [x] Publish the reviewed local Nexus `main` source branch to GitHub after explicit authorization.
-- [ ] Correct the endpoint capability census so its adapter description matches the current trusted-local CSER2 contract.
-- [ ] Freeze one credible late-bound workload card, including why exact pre-registration is unavailable or measurably conservative.
-- [ ] Freeze the G0/G1 portable oracle, strongest baseline powers, four fence/crash windows, second-recovery schedules, hard properties, and Go/No-Go rules.
-- [ ] Implement the portable handoff pilot using the existing core contract, including independent-finalizer and provider-native generation-fence alternatives without adding dynamic-component semantics.
-- [ ] Measure wildcard reservation at 2, 8, and 32 candidates plus claim retention, gate decisions, reconciliation, and missing-evidence outcomes across the pilot.
-- [ ] Record the evidence-backed Go/No-Go decision; design a real-QEMU continuation only if the pre-registered Go conditions hold.
+- [x] Correct the endpoint capability census so its adapter description matches the current trusted-local CSER2 and Store-layer contracts.
+- [x] Audit Kubernetes Job/DRA and NVMe Namespace Management as primary-source late-bound workload candidates and record their Gate-0 No-Go result.
+- [x] Apply the conditional Gate-0 rule before freezing G0/G1: discard the synthetic portable pilot and avoid dynamic-component or real-QEMU expansion when neither candidate establishes a custody gap.
+- [x] Record the bounded evidence-availability result, including Pending Store recovery, terminal/expired/absent distinctions, component-local retirement, and the measurements that remain unavailable.
+- [x] Repair the Rust 1.95 `unit_arg` CI regression and pass the corresponding local all-target Clippy gate.
+- [ ] Obtain a real endpoint-applicability trace that can measure outcome/quiescence availability, existing provider coordination, bounded retained resources, and gate denials without manufacturing workload proportions.
 - [ ] Publish a small source-bound evidence bundle and configure a remote for `nexus-hotos` before publishing the paper commit.
