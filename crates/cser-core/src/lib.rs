@@ -79,8 +79,10 @@ pub use identity::{
     RootId, SnapshotId, VerifierId,
 };
 pub use journal::{
-    JOURNAL_CORE_API_PROFILE, JOURNAL_MAGIC, JOURNAL_SCHEMA_VERSION, JournalDecodeError,
-    JournalRecord, JournalRepair, JournalScan, scan_journal, scan_journal_to_head,
+    JOURNAL_CHECKPOINT_MAGIC, JOURNAL_CHECKPOINT_VERSION, JOURNAL_CORE_API_PROFILE, JOURNAL_MAGIC,
+    JOURNAL_SCHEMA_VERSION, JournalCheckpoint, JournalCheckpointAnchor,
+    JournalCheckpointDecodeError, JournalDecodeError, JournalRecord, JournalRepair, JournalScan,
+    MAX_JOURNAL_CHECKPOINT_IMAGE_BYTES, scan_journal, scan_journal_to_head,
 };
 pub use persistence::{
     CoordinatedPersistence, CoordinatedPersistenceError, DurableJournalBackend,

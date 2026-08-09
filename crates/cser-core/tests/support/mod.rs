@@ -1,12 +1,12 @@
 use cser_core::{
     BootGeneration, ChargeAccountId, ClaimId, Command as AuthorizedCommand,
     CommandRequest as Command, CoreError, CoreLimits, DeviceGeneration, Digest, EffectFactKind,
-    EffectId, EffectReceiptVerifier, Engine, ExternalOutcome, Freshness, JournalGeneration,
-    PrincipalId, PrincipalIncarnation, ReceiptBinding, ReceiptSchemaId, ReceiptVerifier,
-    RegistryInstance, ResourceGeneration, ResourceId, RootId, SnapshotId, TransitionOutput,
-    TransitionReceipt, TxError, VerificationError, VerifiedApplyReceipt, VerifiedCommitOutcome,
-    VerifiedEffectObservation, VerifiedObservation, VerifiedSettlementAck, VerifierId,
-    VerifierIdentity, standard_catalog,
+    EffectId, EffectReceiptVerifier, Engine, ExternalOutcome, Freshness, JournalCheckpoint,
+    JournalGeneration, PrincipalId, PrincipalIncarnation, ReceiptBinding, ReceiptSchemaId,
+    ReceiptVerifier, RegistryInstance, ResourceGeneration, ResourceId, RootId, SnapshotId,
+    TransitionOutput, TransitionReceipt, TxError, VerificationError, VerifiedApplyReceipt,
+    VerifiedCommitOutcome, VerifiedEffectObservation, VerifiedObservation, VerifiedSettlementAck,
+    VerifierId, VerifierIdentity, standard_catalog,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -192,6 +192,15 @@ impl Harness {
         C: Into<AuthorizedCommand>,
     {
         self.tx(command).unwrap().into_output()
+    }
+
+    /// Captures the in-memory durable journal as a validated exact-replay image.
+    ///
+    /// Test persistence deliberately uses the same checkpoint construction as
+    /// a replacement backend rather than treating a copied `Vec<u8>` as an
+    /// independently authoritative state source.
+    pub fn checkpoint(&self) -> JournalCheckpoint {
+        self.engine.journal_checkpoint(&self.journal).unwrap()
     }
 }
 

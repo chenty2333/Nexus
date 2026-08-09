@@ -13,10 +13,10 @@ use crate::{
     BootGeneration, ChargeAccountId, ClaimId, ClaimKindId, ClaimScopePolicy, ComponentId,
     CompositeKindId, ConflictMode, CreditClassId, DeviceGeneration, DeviceGenerationEffect,
     DeviceScopeId, Digest, DomainCatalog, DomainId, EffectId, EvidenceKindId, Freshness,
-    FreshnessAxes, JournalDecodeError, JournalGeneration, JournalRecord, JournalRepair,
-    ObligationKindId, ObligationPolicy, PrincipalIncarnation, ReceiptSchemaId, RegistryInstance,
-    ResourceGeneration, ResourceId, RootId, SnapshotId, VerifierId, scan_journal,
-    scan_journal_to_head,
+    FreshnessAxes, JournalCheckpoint, JournalCheckpointDecodeError, JournalDecodeError,
+    JournalGeneration, JournalRecord, JournalRepair, ObligationKindId, ObligationPolicy,
+    PrincipalIncarnation, ReceiptSchemaId, RegistryInstance, ResourceGeneration, ResourceId,
+    RootId, SnapshotId, VerifierId, scan_journal, scan_journal_to_head,
 };
 
 /// Forces recognized predecessor journals through typed schema rejection even
@@ -3070,6 +3070,8 @@ pub enum CoreError {
     InvariantViolation,
     /// Journal encoding or decoding failed.
     Journal(JournalDecodeError),
+    /// A journal checkpoint envelope was malformed.
+    JournalCheckpoint(JournalCheckpointDecodeError),
 }
 
 /// Failure while executing a durable transition.
@@ -4800,6 +4802,148 @@ impl Engine {
     /// Computes a deterministic digest over the authoritative projection.
     pub fn projection_digest(&self) -> Digest {
         projection_digest(&self.state, self.catalog.digest())
+    }
+
+    /// Creates a canonical exact-replay checkpoint for the current journal prefix.
+    ///
+    /// Checkpoint creation is intentionally refused while recovery is pending:
+    /// a replacement image must describe an already checkpointed freshness
+    /// epoch, never the half-recovered state which still needs its durable
+    /// `CheckpointRecovery` transition. The result is an envelope containing
+    /// the original records verbatim, not a compact private-state codec.
+    pub fn journal_checkpoint(&self, journal_image: &[u8]) -> Result<JournalCheckpoint, CoreError> {
+        if self.state.recovery_target.is_some() {
+            return Err(CoreError::RecoveryPending);
+        }
+        if self.persistence_recovery_required {
+            return Err(CoreError::PersistenceRecoveryRequired);
+        }
+        if self.journal_repair_required.is_some() {
+            return Err(CoreError::JournalRepairRequired);
+        }
+        let checkpoint = JournalCheckpoint::build(
+            self.catalog.digest(),
+            self.state.freshness,
+            self.state.revision,
+            self.state.head,
+            self.projection_digest(),
+            journal_image,
+        )
+        .map_err(CoreError::JournalCheckpoint)?;
+        let rebuilt =
+            Self::validate_journal_checkpoint(self.catalog.clone(), self.limits, &checkpoint)?;
+        if rebuilt.projection_digest() != self.projection_digest() {
+            return Err(CoreError::InvariantViolation);
+        }
+        Ok(checkpoint)
+    }
+
+    pub(crate) fn validate_journal_checkpoint(
+        catalog: DomainCatalog,
+        limits: CoreLimits,
+        checkpoint: &JournalCheckpoint,
+    ) -> Result<Self, CoreError> {
+        let anchor = checkpoint.anchor();
+        if anchor.catalog_digest() != catalog.digest() {
+            return Err(CoreError::SchemaMismatch);
+        }
+        let scan = scan_journal(checkpoint.image()).map_err(CoreError::Journal)?;
+        if scan.torn_tail().is_some() || scan.unanchored_suffix().is_some() {
+            return Err(CoreError::RollbackDetected);
+        }
+        if anchor.revision() == 0 {
+            if !scan.records().is_empty() {
+                return Err(CoreError::RevisionConflict);
+            }
+            let engine = Self::new(catalog, limits, anchor.freshness());
+            if !anchor.head().is_zero() || engine.projection_digest() != anchor.projection() {
+                return Err(CoreError::RollbackDetected);
+            }
+            return Ok(engine);
+        }
+        let first = scan.records().first().ok_or(CoreError::RollbackDetected)?;
+        if first.catalog_digest() != catalog.digest()
+            || first.registry() != anchor.freshness().registry()
+        {
+            return Err(CoreError::SchemaMismatch);
+        }
+        let initial = Freshness::new(
+            first.boot(),
+            first.registry(),
+            first.binding(),
+            first.device(),
+            first.journal(),
+        )
+        .map_err(|_| CoreError::InvariantViolation)?;
+        let mut engine = Self::new(catalog, limits, initial);
+        for record in scan.records() {
+            if !record.command().is_profile_two_compatible() {
+                return Err(CoreError::IncompatibleApiProfile);
+            }
+            if record.base_revision() != engine.state.revision
+                || record.revision()
+                    != engine
+                        .state
+                        .revision
+                        .checked_add(1)
+                        .ok_or(CoreError::GenerationExhausted)?
+            {
+                return Err(CoreError::RevisionConflict);
+            }
+            if record.predecessor() != engine.state.head {
+                return Err(CoreError::PredecessorMismatch);
+            }
+            if record.catalog_digest() != engine.catalog.digest()
+                || record.registry() != engine.state.freshness.registry()
+                || record.binding() != engine.state.freshness.binding()
+                || record.boot() != engine.state.freshness.boot()
+                || record.journal() != engine.state.freshness.journal()
+                || record.device() != engine.state.freshness.device()
+            {
+                return Err(CoreError::SchemaMismatch);
+            }
+            if let CommandKind::CheckpointRecovery {
+                boot,
+                journal,
+                device,
+            } = record.command()
+            {
+                if boot.get() <= engine.state.freshness.boot().get()
+                    || journal.get() <= engine.state.freshness.journal().get()
+                    || device.get() < engine.state.freshness.device().get()
+                {
+                    return Err(CoreError::FreshnessRollback);
+                }
+                engine.state.recovery_target = Some(
+                    Freshness::new(
+                        *boot,
+                        engine.state.freshness.registry(),
+                        engine.state.freshness.binding(),
+                        *device,
+                        *journal,
+                    )
+                    .map_err(|_| CoreError::InvariantViolation)?,
+                );
+            }
+            apply_command(
+                &engine.catalog,
+                engine.limits,
+                &mut engine.state,
+                record.command(),
+            )?;
+            check_invariants(&engine.catalog, engine.limits, &engine.state)?;
+            engine.state.revision = record.revision();
+            engine.state.head = record.digest();
+        }
+        if engine.state.revision != anchor.revision()
+            || engine.state.head != anchor.head()
+            || engine.state.freshness != anchor.freshness()
+            || engine.state.recovery_target.is_some()
+            || engine.projection_digest() != anchor.projection()
+        {
+            return Err(CoreError::RollbackDetected);
+        }
+        Ok(engine)
     }
 }
 

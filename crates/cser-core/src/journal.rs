@@ -17,6 +17,15 @@ pub const JOURNAL_SCHEMA_VERSION: u16 = 6;
 /// Semantic core API profile explicitly bound in every schema-6 envelope.
 pub const JOURNAL_CORE_API_PROFILE: u16 = CSER_CORE_API_PROFILE_VERSION;
 
+/// Magic prefix of a portable exact-replay checkpoint envelope.
+///
+/// This is deliberately distinct from a journal record. A checkpoint carries
+/// a canonical *image* of the exact journal prefix it replaces; it is not a
+/// lossy serialization of the private engine state.
+pub const JOURNAL_CHECKPOINT_MAGIC: [u8; 8] = *b"CSERCP1\0";
+/// Version of [`JournalCheckpoint`] envelopes.
+pub const JOURNAL_CHECKPOINT_VERSION: u16 = 1;
+
 const PROFILE_ONE_JOURNAL_MAGIC: [u8; 8] = *b"CSERJR5\0";
 const PROFILE_ONE_JOURNAL_SCHEMA_VERSION: u16 = 5;
 const LEGACY_JOURNAL_MAGIC: [u8; 8] = *b"CSERJR4\0";
@@ -25,6 +34,350 @@ const LEGACY_JOURNAL_SCHEMA_VERSION: u16 = 4;
 const FIXED_WITHOUT_DIGEST: usize = 140;
 const DIGEST_LEN: usize = 32;
 const MIN_RECORD_LEN: usize = FIXED_WITHOUT_DIGEST + DIGEST_LEN;
+const CHECKPOINT_FIXED_WITHOUT_DIGEST: usize = 8 + 2 + 2 + 4 + 32 + 8 + 32 + 32 + 40 + 4;
+const CHECKPOINT_MIN_LEN: usize = CHECKPOINT_FIXED_WITHOUT_DIGEST + DIGEST_LEN;
+/// Largest exact journal image accepted by the portable checkpoint envelope.
+///
+/// This is deliberately a conservative bounded recovery input, not a claim
+/// that a checkpoint compacts journal history.
+pub const MAX_JOURNAL_CHECKPOINT_IMAGE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Exact trusted coordinates bound by a [`JournalCheckpoint`].
+///
+/// A storage implementation may atomically anchor this tuple (and the
+/// envelope digest) before replacing an older journal prefix. In particular,
+/// the projection is not advisory telemetry: restore recomputes it before the
+/// checkpoint can be accepted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct JournalCheckpointAnchor {
+    catalog_digest: Digest,
+    freshness: crate::Freshness,
+    revision: u64,
+    head: Digest,
+    projection: Digest,
+    envelope: Digest,
+}
+
+impl JournalCheckpointAnchor {
+    /// Returns the catalog which interprets the replay image.
+    pub const fn catalog_digest(self) -> Digest {
+        self.catalog_digest
+    }
+    /// Returns the exact recovered freshness coordinates.
+    pub const fn freshness(self) -> crate::Freshness {
+        self.freshness
+    }
+    /// Returns the covered journal revision.
+    pub const fn revision(self) -> u64 {
+        self.revision
+    }
+    /// Returns the covered journal head.
+    pub const fn head(self) -> Digest {
+        self.head
+    }
+    /// Returns the deterministic projection digest which must be rebuilt.
+    pub const fn projection(self) -> Digest {
+        self.projection
+    }
+    /// Returns the digest of the complete encoded envelope.
+    pub const fn envelope(self) -> Digest {
+        self.envelope
+    }
+}
+
+/// Canonical, self-checking exact-replay image for journal replacement.
+///
+/// The envelope is intentionally not a compact state snapshot. It contains
+/// the original command records verbatim, so decoding rebuilds the state by
+/// normal command replay, invariant checks, and projection recomputation.
+/// This makes it safe for a journal backend to replace one validated prefix,
+/// but does not by itself reduce journal space; a future compact checkpoint
+/// needs a separately specified canonical state codec.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JournalCheckpoint {
+    catalog_digest: Digest,
+    freshness: crate::Freshness,
+    revision: u64,
+    head: Digest,
+    projection: Digest,
+    image: Vec<u8>,
+    envelope: Digest,
+}
+
+impl JournalCheckpoint {
+    pub(crate) fn build(
+        catalog_digest: Digest,
+        freshness: crate::Freshness,
+        revision: u64,
+        head: Digest,
+        projection: Digest,
+        image: &[u8],
+    ) -> Result<Self, JournalCheckpointDecodeError> {
+        if catalog_digest.is_zero() || (revision == 0) != head.is_zero() {
+            return Err(JournalCheckpointDecodeError::InvalidCoordinates);
+        }
+        if image.len() > MAX_JOURNAL_CHECKPOINT_IMAGE_BYTES {
+            return Err(JournalCheckpointDecodeError::ImageTooLarge);
+        }
+        let image_len =
+            u32::try_from(image.len()).map_err(|_| JournalCheckpointDecodeError::LengthOverflow)?;
+        let total = CHECKPOINT_FIXED_WITHOUT_DIGEST
+            .checked_add(image.len())
+            .and_then(|value| value.checked_add(DIGEST_LEN))
+            .ok_or(JournalCheckpointDecodeError::LengthOverflow)?;
+        let total_u32 =
+            u32::try_from(total).map_err(|_| JournalCheckpointDecodeError::LengthOverflow)?;
+        let mut bytes = Vec::with_capacity(total);
+        bytes.extend_from_slice(&JOURNAL_CHECKPOINT_MAGIC);
+        bytes.extend_from_slice(&JOURNAL_CHECKPOINT_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&JOURNAL_CORE_API_PROFILE.to_le_bytes());
+        bytes.extend_from_slice(&total_u32.to_le_bytes());
+        bytes.extend_from_slice(&catalog_digest.bytes());
+        bytes.extend_from_slice(&revision.to_le_bytes());
+        bytes.extend_from_slice(&head.bytes());
+        bytes.extend_from_slice(&projection.bytes());
+        put_freshness(&mut bytes, freshness);
+        bytes.extend_from_slice(&image_len.to_le_bytes());
+        bytes.extend_from_slice(image);
+        let envelope = Digest::new(Sha256::digest(&bytes).into());
+        Ok(Self {
+            catalog_digest,
+            freshness,
+            revision,
+            head,
+            projection,
+            image: image.to_vec(),
+            envelope,
+        })
+    }
+
+    /// Decodes a structurally valid checkpoint envelope.
+    ///
+    /// Call [`Self::recover`] with a trusted advancing anchor before trusting the contained projection or
+    /// replacing a journal: structural decoding does not interpret commands.
+    pub fn decode(bytes: &[u8]) -> Result<Self, JournalCheckpointDecodeError> {
+        if bytes.len() < CHECKPOINT_MIN_LEN {
+            return Err(JournalCheckpointDecodeError::InvalidLength);
+        }
+        if bytes[..8] != JOURNAL_CHECKPOINT_MAGIC {
+            return Err(JournalCheckpointDecodeError::BadMagic);
+        }
+        let version = checkpoint_read_u16(bytes, 8)?;
+        if version != JOURNAL_CHECKPOINT_VERSION {
+            return Err(JournalCheckpointDecodeError::UnsupportedVersion { version });
+        }
+        let profile = checkpoint_read_u16(bytes, 10)?;
+        if profile != JOURNAL_CORE_API_PROFILE {
+            return Err(JournalCheckpointDecodeError::UnsupportedApiProfile { profile });
+        }
+        let total = usize::try_from(checkpoint_read_u32(bytes, 12)?)
+            .map_err(|_| JournalCheckpointDecodeError::InvalidLength)?;
+        if total != bytes.len() || total < CHECKPOINT_MIN_LEN {
+            return Err(JournalCheckpointDecodeError::InvalidLength);
+        }
+        let digest_offset = total
+            .checked_sub(DIGEST_LEN)
+            .ok_or(JournalCheckpointDecodeError::InvalidLength)?;
+        // Reject oversized or structurally inconsistent images before hashing
+        // attacker-controlled input. This is the recovery-input admission
+        // bound, not merely an allocation bound.
+        let image_len = usize::try_from(checkpoint_read_u32(bytes, 160)?)
+            .map_err(|_| JournalCheckpointDecodeError::InvalidLength)?;
+        if image_len > MAX_JOURNAL_CHECKPOINT_IMAGE_BYTES {
+            return Err(JournalCheckpointDecodeError::ImageTooLarge);
+        }
+        let image_end = 164usize
+            .checked_add(image_len)
+            .ok_or(JournalCheckpointDecodeError::InvalidLength)?;
+        if image_end != digest_offset {
+            return Err(JournalCheckpointDecodeError::InvalidLength);
+        }
+        let expected = Digest::new(
+            bytes[digest_offset..]
+                .try_into()
+                .map_err(|_| JournalCheckpointDecodeError::InvalidLength)?,
+        );
+        let actual = Digest::new(Sha256::digest(&bytes[..digest_offset]).into());
+        if expected != actual {
+            return Err(JournalCheckpointDecodeError::ChecksumMismatch);
+        }
+        let catalog_digest = Digest::new(
+            bytes[16..48]
+                .try_into()
+                .map_err(|_| JournalCheckpointDecodeError::InvalidLength)?,
+        );
+        let revision = checkpoint_read_u64(bytes, 48)?;
+        let head = Digest::new(
+            bytes[56..88]
+                .try_into()
+                .map_err(|_| JournalCheckpointDecodeError::InvalidLength)?,
+        );
+        let projection = Digest::new(
+            bytes[88..120]
+                .try_into()
+                .map_err(|_| JournalCheckpointDecodeError::InvalidLength)?,
+        );
+        let freshness = checkpoint_read_freshness(bytes, 120)?;
+        if catalog_digest.is_zero() || (revision == 0) != head.is_zero() {
+            return Err(JournalCheckpointDecodeError::InvalidCoordinates);
+        }
+        Ok(Self {
+            catalog_digest,
+            freshness,
+            revision,
+            head,
+            projection,
+            image: bytes[164..image_end].to_vec(),
+            envelope: expected,
+        })
+    }
+
+    /// Recovers the checkpoint image through the normal trusted-anchor path.
+    ///
+    /// The anchor is consumed by [`crate::Engine::recover`], which reserves a
+    /// newer freshness epoch, fences roots, and quarantines device claims.
+    /// This API deliberately cannot return an old-epoch writable engine.
+    pub fn recover(
+        &self,
+        catalog: crate::DomainCatalog,
+        limits: crate::CoreLimits,
+        anchor: crate::RecoveryAnchor,
+    ) -> Result<crate::RecoveryReport, crate::CoreError> {
+        let expected = self.anchor();
+        if anchor.catalog_digest() != expected.catalog_digest()
+            || anchor.committed_freshness() != expected.freshness()
+            || anchor.minimum_revision() != expected.revision()
+            || anchor.expected_head() != expected.head()
+        {
+            return Err(crate::CoreError::RollbackDetected);
+        }
+        // Rebuild the pre-recovery image before advancing freshness. This
+        // binds the stored projection to actual replayed state; the following
+        // normal recovery deliberately changes that projection by installing
+        // a recovery target and device quarantine.
+        crate::Engine::validate_journal_checkpoint(catalog.clone(), limits, self)?;
+        crate::Engine::recover(catalog, limits, anchor, self.image())
+    }
+
+    /// Returns the trusted coordinates which must be anchored with this image.
+    pub const fn anchor(&self) -> JournalCheckpointAnchor {
+        JournalCheckpointAnchor {
+            catalog_digest: self.catalog_digest,
+            freshness: self.freshness,
+            revision: self.revision,
+            head: self.head,
+            projection: self.projection,
+            envelope: self.envelope,
+        }
+    }
+    /// Returns the verbatim exact journal image.
+    pub fn image(&self) -> &[u8] {
+        &self.image
+    }
+    /// Encodes this checkpoint envelope without retaining a duplicate buffer.
+    pub fn encode(&self) -> Vec<u8> {
+        let image_len = u32::try_from(self.image.len()).expect("checkpoint image was bounded");
+        let total = CHECKPOINT_FIXED_WITHOUT_DIGEST + self.image.len() + DIGEST_LEN;
+        let mut bytes = Vec::with_capacity(total);
+        bytes.extend_from_slice(&JOURNAL_CHECKPOINT_MAGIC);
+        bytes.extend_from_slice(&JOURNAL_CHECKPOINT_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&JOURNAL_CORE_API_PROFILE.to_le_bytes());
+        bytes.extend_from_slice(
+            &(u32::try_from(total).expect("checkpoint envelope was bounded")).to_le_bytes(),
+        );
+        bytes.extend_from_slice(&self.catalog_digest.bytes());
+        bytes.extend_from_slice(&self.revision.to_le_bytes());
+        bytes.extend_from_slice(&self.head.bytes());
+        bytes.extend_from_slice(&self.projection.bytes());
+        put_freshness(&mut bytes, self.freshness);
+        bytes.extend_from_slice(&image_len.to_le_bytes());
+        bytes.extend_from_slice(&self.image);
+        debug_assert_eq!(Digest::new(Sha256::digest(&bytes).into()), self.envelope);
+        bytes.extend_from_slice(&self.envelope.bytes());
+        bytes
+    }
+}
+
+/// Failure while decoding a [`JournalCheckpoint`] envelope.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum JournalCheckpointDecodeError {
+    /// The envelope is too short or has inconsistent declared lengths.
+    InvalidLength,
+    /// The envelope prefix is not the checkpoint magic.
+    BadMagic,
+    /// The envelope version is unsupported.
+    UnsupportedVersion {
+        /// Unsupported envelope version.
+        version: u16,
+    },
+    /// The checkpoint binds an unsupported semantic profile.
+    UnsupportedApiProfile {
+        /// Unsupported semantic API profile.
+        profile: u16,
+    },
+    /// A length cannot be represented by the envelope.
+    LengthOverflow,
+    /// Catalog, revision, or head coordinates are structurally inconsistent.
+    InvalidCoordinates,
+    /// The trailing envelope digest does not match its contents.
+    ChecksumMismatch,
+    /// A non-zero freshness identity decoded as zero.
+    ZeroIdentity,
+    /// The image exceeds [`MAX_JOURNAL_CHECKPOINT_IMAGE_BYTES`].
+    ImageTooLarge,
+}
+
+fn put_freshness(bytes: &mut Vec<u8>, freshness: crate::Freshness) {
+    bytes.extend_from_slice(&freshness.boot().get().to_le_bytes());
+    bytes.extend_from_slice(&freshness.registry().get().to_le_bytes());
+    bytes.extend_from_slice(&freshness.binding().to_le_bytes());
+    bytes.extend_from_slice(&freshness.device().get().to_le_bytes());
+    bytes.extend_from_slice(&freshness.journal().get().to_le_bytes());
+}
+
+fn checkpoint_read_u16(bytes: &[u8], offset: usize) -> Result<u16, JournalCheckpointDecodeError> {
+    Ok(u16::from_le_bytes(
+        bytes
+            .get(offset..offset + 2)
+            .ok_or(JournalCheckpointDecodeError::InvalidLength)?
+            .try_into()
+            .map_err(|_| JournalCheckpointDecodeError::InvalidLength)?,
+    ))
+}
+fn checkpoint_read_u32(bytes: &[u8], offset: usize) -> Result<u32, JournalCheckpointDecodeError> {
+    Ok(u32::from_le_bytes(
+        bytes
+            .get(offset..offset + 4)
+            .ok_or(JournalCheckpointDecodeError::InvalidLength)?
+            .try_into()
+            .map_err(|_| JournalCheckpointDecodeError::InvalidLength)?,
+    ))
+}
+fn checkpoint_read_u64(bytes: &[u8], offset: usize) -> Result<u64, JournalCheckpointDecodeError> {
+    Ok(u64::from_le_bytes(
+        bytes
+            .get(offset..offset + 8)
+            .ok_or(JournalCheckpointDecodeError::InvalidLength)?
+            .try_into()
+            .map_err(|_| JournalCheckpointDecodeError::InvalidLength)?,
+    ))
+}
+fn checkpoint_read_freshness(
+    bytes: &[u8],
+    offset: usize,
+) -> Result<crate::Freshness, JournalCheckpointDecodeError> {
+    let boot = crate::BootGeneration::new(checkpoint_read_u64(bytes, offset)?)
+        .map_err(|_| JournalCheckpointDecodeError::ZeroIdentity)?;
+    let registry = crate::RegistryInstance::new(checkpoint_read_u64(bytes, offset + 8)?)
+        .map_err(|_| JournalCheckpointDecodeError::ZeroIdentity)?;
+    let binding = checkpoint_read_u64(bytes, offset + 16)?;
+    let device = crate::DeviceGeneration::new(checkpoint_read_u64(bytes, offset + 24)?)
+        .map_err(|_| JournalCheckpointDecodeError::ZeroIdentity)?;
+    let journal = crate::JournalGeneration::new(checkpoint_read_u64(bytes, offset + 32)?)
+        .map_err(|_| JournalCheckpointDecodeError::ZeroIdentity)?;
+    crate::Freshness::new(boot, registry, binding, device, journal)
+        .map_err(|_| JournalCheckpointDecodeError::ZeroIdentity)
+}
 
 /// One validated, hash-chained CSER journal record.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -446,4 +799,73 @@ fn read_u64(bytes: &[u8], offset: usize) -> u64 {
             .try_into()
             .expect("fixed envelope field"),
     )
+}
+
+#[cfg(test)]
+mod checkpoint_tests {
+    use super::*;
+    use crate::{CoreError, CoreLimits, Engine, RecoveryAnchor, standard_catalog};
+
+    fn freshness(boot: u64, journal: u64) -> crate::Freshness {
+        crate::Freshness::new(
+            crate::BootGeneration::new(boot).unwrap(),
+            crate::RegistryInstance::new(1).unwrap(),
+            1,
+            crate::DeviceGeneration::new(1).unwrap(),
+            crate::JournalGeneration::new(journal).unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn recovery_rejects_a_checksum_valid_checkpoint_with_wrong_projection() {
+        let catalog = standard_catalog();
+        let engine = Engine::new(
+            catalog.clone(),
+            CoreLimits::bounded_default(),
+            freshness(1, 1),
+        );
+        let checkpoint = JournalCheckpoint::build(
+            catalog.digest(),
+            freshness(1, 1),
+            0,
+            Digest::ZERO,
+            Digest::new([7; 32]),
+            &[],
+        )
+        .unwrap();
+        assert!(matches!(
+            checkpoint.recover(
+                catalog.clone(),
+                CoreLimits::bounded_default(),
+                RecoveryAnchor::from_trusted_provider(
+                    catalog.digest(),
+                    freshness(1, 1),
+                    freshness(2, 2),
+                    0,
+                    Digest::ZERO,
+                )
+                .unwrap(),
+            ),
+            Err(CoreError::RollbackDetected)
+        ));
+        assert_ne!(engine.projection_digest(), Digest::new([7; 32]));
+    }
+
+    #[test]
+    fn decode_rejects_oversized_image_before_checksum_validation() {
+        let total = CHECKPOINT_MIN_LEN + MAX_JOURNAL_CHECKPOINT_IMAGE_BYTES + 1;
+        let mut bytes = vec![0u8; total];
+        bytes[..8].copy_from_slice(&JOURNAL_CHECKPOINT_MAGIC);
+        bytes[8..10].copy_from_slice(&JOURNAL_CHECKPOINT_VERSION.to_le_bytes());
+        bytes[10..12].copy_from_slice(&JOURNAL_CORE_API_PROFILE.to_le_bytes());
+        bytes[12..16].copy_from_slice(&(u32::try_from(total).unwrap()).to_le_bytes());
+        bytes[160..164].copy_from_slice(
+            &(u32::try_from(MAX_JOURNAL_CHECKPOINT_IMAGE_BYTES + 1).unwrap()).to_le_bytes(),
+        );
+        assert_eq!(
+            JournalCheckpoint::decode(&bytes),
+            Err(JournalCheckpointDecodeError::ImageTooLarge)
+        );
+    }
 }
