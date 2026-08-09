@@ -2553,35 +2553,38 @@ mod tests {
     }
 
     #[ktest]
-    fn pio_vnext_torn_record_uses_the_other_committed_header_copy() {
+    fn pio_vnext_unpublished_replacement_keeps_the_manifest_selected_prefix() {
         let mut journal = vnext_journal();
         journal.append_exact(b"committed").expect("baseline");
-        let old_header = journal.backend_mut().sectors[vnext_header_lba(0, 1) as usize];
 
-        // Simulate the point after new payload and header copy zero became
-        // visible but before header copy one was published.  The payload digest
-        // rejects the torn candidate, leaving the older committed copy.
-        let mut torn_payload = [0u8; SECTOR_BYTES];
-        torn_payload[..b"committed".len()].copy_from_slice(b"committed");
-        journal
-            .backend_mut()
-            .write_sector(vnext_data_lba(0), &torn_payload)
-            .expect("inject torn payload");
-        let torn_header = VNextHeader {
-            segment: 0,
+        // Same-segment growth is copy-on-write. Simulate a crash after the
+        // replacement payload and one independently valid header copy reach
+        // the alternate segment, but before either manifest copy names it.
+        // Recovery must follow the old manifest and ignore the orphan.
+        let mut replacement = encode_vnext_frame(b"committed").expect("base frame");
+        replacement.extend_from_slice(&encode_vnext_frame(b"-new-tail").expect("tail frame"));
+        for (index, chunk) in replacement.chunks(SECTOR_BYTES).enumerate() {
+            let mut sector = [0u8; SECTOR_BYTES];
+            sector[..chunk.len()].copy_from_slice(chunk);
+            journal
+                .backend_mut()
+                .write_sector(vnext_data_lba(1) + index as u32, &sector)
+                .expect("inject replacement payload");
+        }
+        let replacement_header = VNextHeader {
+            segment: 1,
             generation: 2,
             first_generation: 1,
-            logical_len: 17,
+            logical_len: replacement.len(),
             previous_head: [0; 32],
-            payload_digest: Sha256::digest(b"committed-new-tail").into(),
-            head: Sha256::digest(b"not-the-real-head").into(),
+            payload_digest: Sha256::digest(&replacement).into(),
+            head: journal.segment_head([0; 32], &replacement),
         }
         .encode();
         journal
             .backend_mut()
-            .write_sector(vnext_header_lba(0, 0), &torn_header)
-            .expect("inject torn header copy");
-        journal.backend_mut().sectors[vnext_header_lba(0, 1) as usize] = old_header;
+            .write_sector(vnext_header_lba(1, 0), &replacement_header)
+            .expect("inject replacement header copy");
 
         let mut reopened = SegmentedJournalVNext::open(journal.into_backend()).expect("reopen");
         assert_eq!(reopened.read_all_image().expect("old prefix"), b"committed");
