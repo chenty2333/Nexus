@@ -48,7 +48,7 @@ fn profile2_receipt_journal_and_snapshot_are_self_describing() {
     assert!(authorized.is_profile_two_compatible());
 
     let receipt = harness.tx(create).unwrap();
-    assert_eq!(receipt.core_api_profile(), 3);
+    assert_eq!(receipt.core_api_profile(), JOURNAL_CORE_API_PROFILE);
     assert_eq!(receipt.journal_schema(), JOURNAL_SCHEMA_VERSION);
     assert_eq!(receipt.catalog_digest(), standard_catalog().digest());
     assert_eq!(receipt.projection_version(), PROJECTION_VERSION);
@@ -60,7 +60,7 @@ fn profile2_receipt_journal_and_snapshot_are_self_describing() {
     assert_eq!(receipt.coordinates().claim(), None);
     assert_eq!(
         u16::from_le_bytes(harness.journal[8..10].try_into().unwrap()),
-        7
+        JOURNAL_SCHEMA_VERSION
     );
     assert_eq!(
         u16::from_le_bytes(harness.journal[10..12].try_into().unwrap()),
@@ -96,7 +96,7 @@ fn profile2_receipt_journal_and_snapshot_are_self_describing() {
         .engine
         .snapshot_root(operation.root(), snapshot(1))
         .unwrap();
-    assert_eq!(cohort.core_api_profile(), 3);
+    assert_eq!(cohort.core_api_profile(), JOURNAL_CORE_API_PROFILE);
     assert_eq!(cohort.snapshot_version(), RECOVERY_SNAPSHOT_VERSION);
     assert_eq!(cohort.journal_schema(), JOURNAL_SCHEMA_VERSION);
     assert_eq!(cohort.catalog_digest(), standard_catalog().digest());

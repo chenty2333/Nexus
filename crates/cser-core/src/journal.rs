@@ -11,10 +11,10 @@ use crate::{
 };
 
 /// Magic prefix of every CSER journal record.
-pub const JOURNAL_MAGIC: [u8; 8] = *b"CSERJR7\0";
-/// Frozen journal schema for CSER core semantic API profile 3.
-pub const JOURNAL_SCHEMA_VERSION: u16 = 7;
-/// Semantic core API profile explicitly bound in every schema-7 envelope.
+pub const JOURNAL_MAGIC: [u8; 8] = *b"CSERJR8\0";
+/// Frozen journal schema for CSER core semantic API profile 4.
+pub const JOURNAL_SCHEMA_VERSION: u16 = 8;
+/// Semantic core API profile explicitly bound in every schema-8 envelope.
 pub const JOURNAL_CORE_API_PROFILE: u16 = CSER_CORE_API_PROFILE_VERSION;
 
 /// Magic prefix of a portable exact-replay checkpoint envelope.
@@ -26,6 +26,8 @@ pub const JOURNAL_CHECKPOINT_MAGIC: [u8; 8] = *b"CSERCP1\0";
 /// Version of [`JournalCheckpoint`] envelopes.
 pub const JOURNAL_CHECKPOINT_VERSION: u16 = 1;
 
+const PRE_HANDOFF_RESOLUTION_JOURNAL_MAGIC: [u8; 8] = *b"CSERJR7\0";
+const PRE_HANDOFF_RESOLUTION_JOURNAL_SCHEMA_VERSION: u16 = 7;
 const PROFILE_ONE_JOURNAL_MAGIC: [u8; 8] = *b"CSERJR5\0";
 const PROFILE_ONE_JOURNAL_SCHEMA_VERSION: u16 = 5;
 const LEGACY_JOURNAL_MAGIC: [u8; 8] = *b"CSERJR4\0";
@@ -658,6 +660,11 @@ fn scan_journal_inner(
                 },
                 false,
             ));
+        }
+        if remaining[..8] == PRE_HANDOFF_RESOLUTION_JOURNAL_MAGIC {
+            return Err(JournalDecodeError::UnsupportedVersion {
+                version: PRE_HANDOFF_RESOLUTION_JOURNAL_SCHEMA_VERSION,
+            });
         }
         if remaining[..8] == PROFILE_ONE_JOURNAL_MAGIC {
             return Err(JournalDecodeError::UnsupportedVersion {

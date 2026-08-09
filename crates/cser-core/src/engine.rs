@@ -28,6 +28,7 @@ pub(crate) fn reject_recognized_legacy_journal_prefix(
     bytes: &[u8],
 ) -> Result<(), JournalDecodeError> {
     if bytes.starts_with(b"CSERJR6\0")
+        || bytes.starts_with(b"CSERJR7\0")
         || bytes.starts_with(b"CSERJR5\0")
         || bytes.starts_with(b"CSERJR4\0")
     {
@@ -237,6 +238,134 @@ pub trait ChildDescriptorVerifier {
         descriptor: ChildDescriptorV1,
         receipt: &Self::Receipt,
     ) -> Result<Digest, VerificationError>;
+}
+
+/// Read-only recovery challenge for resolving a fenced, indeterminate handoff
+/// parent without reconstructing its spent commit nonce.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HandoffResolutionChallenge {
+    effect: EffectId,
+    component: ComponentId,
+    domain: DomainId,
+    obligation: ObligationKindId,
+    operation: Digest,
+    descriptor: ChildDescriptorV1,
+    current_observation: Freshness,
+    expected_verifier: VerifierId,
+    expected_receipt_schema: ReceiptSchemaId,
+}
+
+impl HandoffResolutionChallenge {
+    /// Returns the fenced parent effect.
+    pub const fn effect(self) -> EffectId {
+        self.effect
+    }
+    /// Returns the sole parent component being resolved.
+    pub const fn component(self) -> ComponentId {
+        self.component
+    }
+    /// Returns the parent component domain.
+    pub const fn domain(self) -> DomainId {
+        self.domain
+    }
+    /// Returns the parent component obligation class.
+    pub const fn obligation(self) -> ObligationKindId {
+        self.obligation
+    }
+    /// Returns the durable operation whose outcome was indeterminate.
+    pub const fn operation(self) -> Digest {
+        self.operation
+    }
+    /// Returns the independently verified descriptor bound to this resolution.
+    pub const fn descriptor(self) -> ChildDescriptorV1 {
+        self.descriptor
+    }
+    /// Returns the current recovery freshness context.
+    pub const fn current_observation(self) -> Freshness {
+        self.current_observation
+    }
+    /// Returns the configured recovery verifier identity.
+    pub const fn expected_verifier(self) -> VerifierId {
+        self.expected_verifier
+    }
+    /// Returns the configured canonical recovery receipt schema.
+    pub const fn expected_receipt_schema(self) -> ReceiptSchemaId {
+        self.expected_receipt_schema
+    }
+}
+
+/// Dedicated trust boundary for proving terminal handoff-parent success after
+/// crash recovery. This is intentionally distinct from [`EffectReceiptVerifier`]
+/// and never receives or reconstructs a commit nonce.
+pub trait HandoffResolutionVerifier {
+    /// Platform-specific recovery receipt type.
+    type Receipt: ?Sized;
+
+    /// Returns the configured verifier identity.
+    fn identity(&self) -> VerifierIdentity;
+
+    /// Proves that the challenged operation terminally succeeded and is bound
+    /// to the exact opaque child descriptor in the challenge.
+    fn verify_handoff_parent_success(
+        &self,
+        challenge: &HandoffResolutionChallenge,
+        receipt: &Self::Receipt,
+    ) -> Result<Digest, VerificationError>;
+}
+
+/// Dedicated trust boundary for proving terminal handoff-child success after
+/// crash recovery, without reconstructing the child's consumed commit nonce.
+pub trait HandoffChildResolutionVerifier {
+    /// Platform-specific recovery receipt type.
+    type Receipt: ?Sized;
+
+    /// Returns the configured verifier identity.
+    fn identity(&self) -> VerifierIdentity;
+
+    /// Proves the challenged installed child terminally succeeded and remains
+    /// bound to the exact descriptor which created it.
+    fn verify_handoff_child_success(
+        &self,
+        challenge: &HandoffResolutionChallenge,
+        receipt: &Self::Receipt,
+    ) -> Result<Digest, VerificationError>;
+}
+
+/// Opaque proof minted only by [`HandoffResolutionVerifier`] for the dedicated
+/// fenced-parent recovery transition.
+#[derive(Debug, Eq, PartialEq)]
+pub struct VerifiedHandoffResolution {
+    descriptor: VerifiedChildDescriptor,
+    terminal_receipt_digest: Digest,
+}
+
+impl VerifiedHandoffResolution {
+    /// Consumes this proof into the only recovery handoff-parent command.
+    pub fn resolve(self) -> Command {
+        Command(CommandKind::ResolveIndeterminateHandoffParent {
+            descriptor: self.descriptor.descriptor,
+            terminal_receipt_digest: self.terminal_receipt_digest,
+            descriptor_receipt_digest: self.descriptor.receipt_digest,
+        })
+    }
+}
+
+/// Opaque proof for resolving only an installed, fenced handoff child.
+#[derive(Debug, Eq, PartialEq)]
+pub struct VerifiedHandoffChildResolution {
+    descriptor: VerifiedChildDescriptor,
+    terminal_receipt_digest: Digest,
+}
+
+impl VerifiedHandoffChildResolution {
+    /// Consumes this proof into the nonce-free handoff recovery command.
+    pub fn resolve(self) -> Command {
+        Command(CommandKind::ResolveIndeterminateHandoffParent {
+            descriptor: self.descriptor.descriptor,
+            terminal_receipt_digest: self.terminal_receipt_digest,
+            descriptor_receipt_digest: self.descriptor.receipt_digest,
+        })
+    }
 }
 
 /// Authority state of one effect.
@@ -1457,9 +1586,39 @@ pub(crate) enum CommandKind {
         binding_generation: u64,
         operation: Digest,
     },
+    /// Resolves a crash-fenced indeterminate source into a success-bound
+    /// handoff source without recreating the consumed commit nonce.
+    ResolveIndeterminateHandoffParent {
+        descriptor: ChildDescriptorV1,
+        terminal_receipt_digest: Digest,
+        descriptor_receipt_digest: Digest,
+    },
 }
 
 impl CommandKind {
+    /// Derives trace coordinates for commands whose role is determined by
+    /// durable state. Tag 41 is shared by fenced-source and installed-target
+    /// recovery, so a target resolution must be attributed to the child it
+    /// changes rather than to the source descriptor's parent.
+    fn coordinates_for_state(&self, state: &State) -> TransitionCoordinates {
+        if let Self::ResolveIndeterminateHandoffParent {
+            descriptor,
+            descriptor_receipt_digest,
+            ..
+        } = self
+            && let Ok(child) = descriptor.child_effect()
+            && handoff_child_resolution_eligible(state, *descriptor, *descriptor_receipt_digest)
+        {
+            return TransitionCoordinates::new(
+                Some(child.root()),
+                Some(child),
+                Some(descriptor.child_component),
+                None,
+            );
+        }
+        self.coordinates()
+    }
+
     const fn is_profile_two_compatible(&self) -> bool {
         match self {
             Self::CreateEstate { .. }
@@ -1499,7 +1658,8 @@ impl CommandKind {
             Self::WholeStateCheckpointV1 { .. }
             | Self::AcknowledgeHandoffParent { .. }
             | Self::InstallHandoffChild { .. }
-            | Self::ReleaseHandoffSourceAndRecordTargetIntent { .. } => true,
+            | Self::ReleaseHandoffSourceAndRecordTargetIntent { .. }
+            | Self::ResolveIndeterminateHandoffParent { .. } => true,
         }
     }
 
@@ -1601,6 +1761,12 @@ impl CommandKind {
                 Some(descriptor.claim),
             ),
             Self::ReleaseHandoffSourceAndRecordTargetIntent { descriptor, .. } => (
+                Some(descriptor.parent.root()),
+                Some(descriptor.parent),
+                Some(descriptor.parent_component),
+                None,
+            ),
+            Self::ResolveIndeterminateHandoffParent { descriptor, .. } => (
                 Some(descriptor.parent.root()),
                 Some(descriptor.parent),
                 Some(descriptor.parent_component),
@@ -4092,6 +4258,196 @@ impl Engine {
         })
     }
 
+    /// Builds the only recovery challenge that may resolve a fenced,
+    /// indeterminate handoff parent. The descriptor is already opaque
+    /// verifier-minted authority; this method only exposes its immutable
+    /// canonical data to the separate recovery verifier.
+    pub fn handoff_resolution_challenge(
+        &self,
+        descriptor: &VerifiedChildDescriptor,
+    ) -> Result<HandoffResolutionChallenge, CoreError> {
+        let descriptor = descriptor.descriptor;
+        let root = self
+            .state
+            .roots
+            .get(&descriptor.parent.root())
+            .ok_or(CoreError::UnknownEstate)?;
+        let composite = self
+            .state
+            .composite_effects
+            .get(&descriptor.parent)
+            .ok_or(CoreError::UnknownEstate)?;
+        let component = composite
+            .components
+            .get(&descriptor.parent_component)
+            .ok_or(CoreError::UnknownObligationClass)?;
+        let operation = component
+            .commit_operation
+            .ok_or(CoreError::WrongCommitState)?;
+        if !matches!(root.state, RootRecoveryState::Fenced { .. })
+            || composite.authority != AuthorityState::Fenced
+            || composite.custodian != CustodyState::KernelEstate
+            || !matches!(composite.handoff, SingleHopRole::None)
+            || component.commit != CommitState::Committed
+            || component.commit_nonce.is_some()
+            || component.commit_fact.is_some()
+            || component.outcome != OutcomeState::Indeterminate(operation)
+            || descriptor.catalog_digest != self.catalog.digest()
+            || descriptor.parent != composite.effect
+            || descriptor.child_effect().is_err()
+            || !matches!(self.catalog.single_hop_handoff_rule(composite.kind), Some(rule) if rule.target() == descriptor.child_kind)
+        {
+            return Err(CoreError::HandoffGuardRequired);
+        }
+        let binding = self
+            .catalog
+            .obligation_rule(component.domain, component.obligation)
+            .ok_or(CoreError::UnknownObligationClass)?
+            .receipts()
+            .commit_outcome();
+        Ok(HandoffResolutionChallenge {
+            effect: descriptor.parent,
+            component: descriptor.parent_component,
+            domain: component.domain,
+            obligation: component.obligation,
+            operation,
+            descriptor,
+            current_observation: component_freshness(&self.state, composite, component)?,
+            expected_verifier: binding.verifier(),
+            expected_receipt_schema: binding.receipt_schema(),
+        })
+    }
+
+    /// Verifies a terminal-success recovery receipt and binds it to an opaque
+    /// child descriptor for [`VerifiedHandoffResolution::resolve`].
+    pub fn verify_handoff_resolution<V: HandoffResolutionVerifier>(
+        &self,
+        descriptor: VerifiedChildDescriptor,
+        verifier: &V,
+        receipt: &V::Receipt,
+    ) -> Result<VerifiedHandoffResolution, CoreError> {
+        let challenge = self.handoff_resolution_challenge(&descriptor)?;
+        let identity = verifier.identity();
+        if identity.verifier() != challenge.expected_verifier() {
+            return Err(CoreError::UnknownVerifier);
+        }
+        if identity.receipt_schema() != challenge.expected_receipt_schema() {
+            return Err(CoreError::ReceiptSchemaMismatch);
+        }
+        if self
+            .state
+            .verifier_epochs
+            .get(&identity.verifier())
+            .copied()
+            != Some(identity.epoch())
+        {
+            return Err(CoreError::StaleVerifierEpoch);
+        }
+        let terminal_receipt_digest = verifier
+            .verify_handoff_parent_success(&challenge, receipt)
+            .map_err(|_| CoreError::VerificationFailed)?;
+        require_digest(terminal_receipt_digest)?;
+        Ok(VerifiedHandoffResolution {
+            descriptor,
+            terminal_receipt_digest,
+        })
+    }
+
+    /// Builds the exact challenge for an already installed handoff child whose
+    /// nonce was consumed by checkpoint recovery.
+    pub fn handoff_child_resolution_challenge(
+        &self,
+        descriptor: &VerifiedChildDescriptor,
+    ) -> Result<HandoffResolutionChallenge, CoreError> {
+        let descriptor = descriptor.descriptor;
+        let child = descriptor.child_effect()?;
+        let root = self
+            .state
+            .roots
+            .get(&child.root())
+            .ok_or(CoreError::UnknownEstate)?;
+        let composite = self
+            .state
+            .composite_effects
+            .get(&child)
+            .ok_or(CoreError::UnknownEstate)?;
+        let component = composite
+            .components
+            .get(&descriptor.child_component)
+            .ok_or(CoreError::UnknownObligationClass)?;
+        let source = self
+            .state
+            .composite_effects
+            .get(&descriptor.parent)
+            .ok_or(CoreError::UnknownEstate)?;
+        let operation = component
+            .commit_operation
+            .ok_or(CoreError::WrongCommitState)?;
+        if !matches!(root.state, RootRecoveryState::Fenced { .. })
+            || composite.authority != AuthorityState::Fenced
+            || composite.custodian != CustodyState::KernelEstate
+            || !matches!(composite.handoff, SingleHopRole::Target { parent, descriptor_digest } if parent == descriptor.parent && descriptor_digest == handoff_descriptor_digest(descriptor))
+            || !matches!(&source.handoff, SingleHopRole::Source { descriptor: saved, .. } if **saved == descriptor)
+            || component.commit != CommitState::Committed
+            || component.commit_nonce.is_some()
+            || component.commit_fact.is_some()
+            || component.outcome != OutcomeState::Indeterminate(operation)
+        {
+            return Err(CoreError::HandoffGuardRequired);
+        }
+        let binding = self
+            .catalog
+            .obligation_rule(component.domain, component.obligation)
+            .ok_or(CoreError::UnknownObligationClass)?
+            .receipts()
+            .commit_outcome();
+        Ok(HandoffResolutionChallenge {
+            effect: child,
+            component: descriptor.child_component,
+            domain: component.domain,
+            obligation: component.obligation,
+            operation,
+            descriptor,
+            current_observation: component_freshness(&self.state, composite, component)?,
+            expected_verifier: binding.verifier(),
+            expected_receipt_schema: binding.receipt_schema(),
+        })
+    }
+
+    /// Verifies a terminal-success receipt for the one installed fenced child.
+    pub fn verify_handoff_child_resolution<V: HandoffChildResolutionVerifier>(
+        &self,
+        descriptor: VerifiedChildDescriptor,
+        verifier: &V,
+        receipt: &V::Receipt,
+    ) -> Result<VerifiedHandoffChildResolution, CoreError> {
+        let challenge = self.handoff_child_resolution_challenge(&descriptor)?;
+        let identity = verifier.identity();
+        if identity.verifier() != challenge.expected_verifier() {
+            return Err(CoreError::UnknownVerifier);
+        }
+        if identity.receipt_schema() != challenge.expected_receipt_schema() {
+            return Err(CoreError::ReceiptSchemaMismatch);
+        }
+        if self
+            .state
+            .verifier_epochs
+            .get(&identity.verifier())
+            .copied()
+            != Some(identity.epoch())
+        {
+            return Err(CoreError::StaleVerifierEpoch);
+        }
+        let terminal_receipt_digest = verifier
+            .verify_handoff_child_success(&challenge, receipt)
+            .map_err(|_| CoreError::VerificationFailed)?;
+        require_digest(terminal_receipt_digest)?;
+        Ok(VerifiedHandoffChildResolution {
+            descriptor,
+            terminal_receipt_digest,
+        })
+    }
+
     /// Builds the exact challenge for externally completing a durable
     /// settlement apply intent.
     pub fn apply_completion_challenge(
@@ -4452,7 +4808,7 @@ impl Engine {
         P: FnOnce(&JournalRecord, Freshness) -> Result<(), E>,
     {
         let Command(command) = command.into();
-        let coordinates = command.coordinates();
+        let coordinates = command.coordinates_for_state(&self.state);
         if self.api_mode == EngineApiMode::ProfileTwo && !command.is_profile_two_compatible() {
             return Err(TxError::Core(CoreError::IncompatibleApiProfile));
         }
@@ -5536,6 +5892,71 @@ fn apply_command(
     command: &CommandKind,
 ) -> Result<AppliedOutput, CoreError> {
     match command.clone() {
+        CommandKind::ResolveIndeterminateHandoffParent {
+            descriptor,
+            terminal_receipt_digest,
+            descriptor_receipt_digest,
+        } => {
+            require_digest(terminal_receipt_digest)?;
+            require_digest(descriptor_receipt_digest)?;
+            let child = descriptor.child_effect()?;
+            if handoff_child_resolution_eligible(state, descriptor, descriptor_receipt_digest) {
+                state
+                    .composite_effects
+                    .get_mut(&child)
+                    .expect("validated child")
+                    .components
+                    .get_mut(&descriptor.child_component)
+                    .expect("validated component")
+                    .outcome = OutcomeState::KnownSuccess(terminal_receipt_digest);
+                return Ok(AppliedOutput::none(TransitionEvent::EffectCommitted));
+            }
+            let root = state
+                .roots
+                .get(&descriptor.parent.root())
+                .ok_or(CoreError::UnknownEstate)?;
+            let composite = state
+                .composite_effects
+                .get(&descriptor.parent)
+                .ok_or(CoreError::UnknownEstate)?;
+            let component = composite
+                .components
+                .get(&descriptor.parent_component)
+                .ok_or(CoreError::UnknownObligationClass)?;
+            let operation = component
+                .commit_operation
+                .ok_or(CoreError::WrongCommitState)?;
+            if !matches!(root.state, RootRecoveryState::Fenced { .. })
+                || composite.authority != AuthorityState::Fenced
+                || composite.custodian != CustodyState::KernelEstate
+                || !matches!(composite.handoff, SingleHopRole::None)
+                || component.commit != CommitState::Committed
+                || component.commit_nonce.is_some()
+                || component.commit_fact.is_some()
+                || component.outcome != OutcomeState::Indeterminate(operation)
+                || descriptor.catalog_digest != catalog.digest()
+                || descriptor.parent != composite.effect
+                || descriptor.child_effect().is_err()
+                || !matches!(catalog.single_hop_handoff_rule(composite.kind), Some(rule) if rule.target() == descriptor.child_kind)
+            {
+                return Err(CoreError::HandoffGuardRequired);
+            }
+            let composite = state
+                .composite_effects
+                .get_mut(&descriptor.parent)
+                .expect("validated source");
+            let component = composite
+                .components
+                .get_mut(&descriptor.parent_component)
+                .expect("validated component");
+            component.outcome = OutcomeState::KnownSuccess(terminal_receipt_digest);
+            composite.handoff = SingleHopRole::Source {
+                descriptor: Box::new(descriptor),
+                terminal_receipt_digest,
+                descriptor_receipt_digest,
+            };
+            Ok(AppliedOutput::none(TransitionEvent::EffectCommitted))
+        }
         CommandKind::AcknowledgeHandoffParent {
             fact,
             descriptor,
@@ -7301,6 +7722,48 @@ fn apply_command(
             Ok(AppliedOutput::none(TransitionEvent::EstateReleased))
         }
     }
+}
+
+/// Tag 41 is shared by source and child recovery. A target takes the child
+/// branch only after recovery has durably consumed its nonce and marked the
+/// exact committed operation indeterminate. A merely installed/prepared child
+/// must not preempt a still-valid parent resolution.
+fn handoff_child_resolution_eligible(
+    state: &State,
+    descriptor: ChildDescriptorV1,
+    descriptor_receipt_digest: Digest,
+) -> bool {
+    let Ok(child) = descriptor.child_effect() else {
+        return false;
+    };
+    if child == descriptor.parent {
+        return false;
+    }
+    let Some(root) = state.roots.get(&child.root()) else {
+        return false;
+    };
+    let Some(composite) = state.composite_effects.get(&child) else {
+        return false;
+    };
+    let Some(component) = composite.components.get(&descriptor.child_component) else {
+        return false;
+    };
+    let Some(source) = state.composite_effects.get(&descriptor.parent) else {
+        return false;
+    };
+    let Some(operation) = component.commit_operation else {
+        return false;
+    };
+    matches!(root.state, RootRecoveryState::Fenced { .. })
+        && composite.authority == AuthorityState::Fenced
+        && composite.custodian == CustodyState::KernelEstate
+        && matches!(composite.handoff, SingleHopRole::Target { parent, descriptor_digest } if parent == descriptor.parent && descriptor_digest == handoff_descriptor_digest(descriptor))
+        && matches!(&source.handoff, SingleHopRole::Source { descriptor: saved, .. } if **saved == descriptor)
+        && matches!(&source.handoff, SingleHopRole::Source { descriptor_receipt_digest: saved, .. } if *saved == descriptor_receipt_digest)
+        && component.commit == CommitState::Committed
+        && component.commit_nonce.is_none()
+        && component.commit_fact.is_none()
+        && component.outcome == OutcomeState::Indeterminate(operation)
 }
 
 /// Summarizes the modes of every live custodian at one exact resource
@@ -10666,6 +11129,19 @@ fn check_invariants(
             } else if matches!(
                 component.outcome,
                 OutcomeState::KnownSuccess(_) | OutcomeState::KnownFailure(_)
+            ) && !matches!(
+                (&composite.handoff, component.outcome),
+                (
+                    SingleHopRole::Source {
+                        descriptor,
+                        terminal_receipt_digest,
+                        ..
+                    },
+                    OutcomeState::KnownSuccess(receipt),
+                ) if descriptor.parent_component == component.id && receipt == *terminal_receipt_digest
+            ) && !matches!(
+                (&composite.handoff, component.outcome),
+                (SingleHopRole::Target { .. }, OutcomeState::KnownSuccess(_))
             ) {
                 return Err(CoreError::InvariantViolation);
             }
@@ -12166,6 +12642,16 @@ impl CommandKind {
                 put_u64(&mut bytes, binding_generation);
                 put_digest(&mut bytes, operation);
             }
+            Self::ResolveIndeterminateHandoffParent {
+                descriptor,
+                terminal_receipt_digest,
+                descriptor_receipt_digest,
+            } => {
+                put_u8(&mut bytes, 41);
+                put_child_descriptor(&mut bytes, descriptor);
+                put_digest(&mut bytes, terminal_receipt_digest);
+                put_digest(&mut bytes, descriptor_receipt_digest);
+            }
         }
         bytes
     }
@@ -12525,6 +13011,11 @@ impl CommandKind {
                 actor: cursor.incarnation()?,
                 binding_generation: cursor.nonzero_u64()?,
                 operation: cursor.digest()?,
+            },
+            41 => Self::ResolveIndeterminateHandoffParent {
+                descriptor: cursor.child_descriptor()?,
+                terminal_receipt_digest: cursor.digest()?,
+                descriptor_receipt_digest: cursor.digest()?,
             },
             _ => return Err(CommandDecodeError::InvalidTag),
         };
@@ -14524,6 +15015,276 @@ mod handoff_guard_tests {
         (engine, parent, actor, descriptor)
     }
 
+    struct TestChildDescriptorVerifier;
+
+    impl ChildDescriptorVerifier for TestChildDescriptorVerifier {
+        type Receipt = ();
+
+        fn verify_child_descriptor(
+            &self,
+            _descriptor: ChildDescriptorV1,
+            _receipt: &Self::Receipt,
+        ) -> Result<Digest, VerificationError> {
+            Ok(Digest::new([0x41; 32]))
+        }
+    }
+
+    struct TestHandoffResolutionVerifier;
+
+    impl HandoffResolutionVerifier for TestHandoffResolutionVerifier {
+        type Receipt = ();
+
+        fn identity(&self) -> VerifierIdentity {
+            VerifierIdentity {
+                verifier: TOOL_VERIFIER,
+                epoch: 1,
+                receipt_schema: TOOL_COMMIT_RECEIPT_SCHEMA,
+            }
+        }
+
+        fn verify_handoff_parent_success(
+            &self,
+            challenge: &HandoffResolutionChallenge,
+            _receipt: &Self::Receipt,
+        ) -> Result<Digest, VerificationError> {
+            assert_eq!(challenge.component(), TOOL_HANDOFF_SOURCE_COMPONENT);
+            assert_eq!(challenge.operation(), Digest::new([9; 32]));
+            Ok(Digest::new([0x42; 32]))
+        }
+    }
+
+    impl HandoffChildResolutionVerifier for TestHandoffResolutionVerifier {
+        type Receipt = ();
+        fn identity(&self) -> VerifierIdentity {
+            HandoffResolutionVerifier::identity(self)
+        }
+        fn verify_handoff_child_success(
+            &self,
+            challenge: &HandoffResolutionChallenge,
+            _: &(),
+        ) -> Result<Digest, VerificationError> {
+            assert_eq!(challenge.component(), TOOL_HANDOFF_COMPONENT);
+            Ok(Digest::new([0x43; 32]))
+        }
+    }
+
+    #[test]
+    fn indeterminate_fenced_handoff_parent_resolves_only_through_dedicated_proof_and_recovers() {
+        let (mut engine, parent, actor, descriptor) = setup();
+        let operation = Digest::new([9; 32]);
+        let root = engine.state.roots.get_mut(&parent.root()).unwrap();
+        root.crash_generation = 1;
+        root.state = RootRecoveryState::Fenced {
+            crashed: actor,
+            binding_generation: 1,
+            crash_generation: 1,
+        };
+        let composite = engine.state.composite_effects.get_mut(&parent).unwrap();
+        composite.authority = AuthorityState::Fenced;
+        composite.custodian = CustodyState::KernelEstate;
+        composite.handoff = SingleHopRole::None;
+        let component = composite
+            .components
+            .get_mut(&TOOL_HANDOFF_SOURCE_COMPONENT)
+            .unwrap();
+        component.commit = CommitState::Committed;
+        component.commit_nonce = None;
+        component.commit_fact = None;
+        component.commit_operation = Some(operation);
+        component.outcome = OutcomeState::Indeterminate(operation);
+
+        let verified_descriptor = engine
+            .verify_child_descriptor(descriptor, &TestChildDescriptorVerifier, &())
+            .unwrap();
+        let challenge = engine
+            .handoff_resolution_challenge(&verified_descriptor)
+            .unwrap();
+        assert_eq!(challenge.effect(), parent);
+        assert_eq!(challenge.descriptor(), descriptor);
+        let command = engine
+            .verify_handoff_resolution(verified_descriptor, &TestHandoffResolutionVerifier, &())
+            .unwrap()
+            .resolve();
+        let payload = command.0.encode_payload();
+        assert_eq!(CommandKind::decode_payload(&payload).unwrap(), command.0);
+        transact(&mut engine, command);
+
+        let projection = engine.composite_effect(parent).unwrap();
+        assert_eq!(projection.authority, AuthorityState::Fenced);
+        assert_eq!(projection.custodian, CustodyState::KernelEstate);
+        assert!(matches!(
+            projection.handoff,
+            SingleHopHandoffProjection::Source { .. }
+        ));
+        let component = engine
+            .component(parent, TOOL_HANDOFF_SOURCE_COMPONENT)
+            .unwrap();
+        assert_eq!(component.commit, CommitState::Committed);
+        assert_eq!(component.commit_operation, Some(operation));
+        assert_eq!(
+            component.outcome,
+            OutcomeState::KnownSuccess(Digest::new([0x42; 32]))
+        );
+
+        let recovered = recover_at_checkpoint(&mut engine);
+        assert!(matches!(
+            recovered.composite_effect(parent).unwrap().handoff,
+            SingleHopHandoffProjection::Source { descriptor: ref saved, .. } if **saved == descriptor
+        ));
+    }
+
+    #[test]
+    fn child_handoff_resolution_requires_saved_descriptor_receipt_and_traces_child() {
+        let (mut engine, parent, actor, descriptor) = setup();
+        let child = descriptor.child_effect().unwrap();
+        transact(
+            &mut engine,
+            Command(CommandKind::InstallHandoffChild {
+                descriptor,
+                origin: actor,
+                binding_generation: 1,
+                charge_account: ChargeAccountId::new(1).unwrap(),
+            }),
+        );
+        let operation = Digest::new([0x91; 32]);
+        engine.state.roots.get_mut(&parent.root()).unwrap().state = RootRecoveryState::Fenced {
+            crashed: actor,
+            binding_generation: 1,
+            crash_generation: 1,
+        };
+        let child_composite = engine.state.composite_effects.get_mut(&child).unwrap();
+        child_composite.authority = AuthorityState::Fenced;
+        child_composite.custodian = CustodyState::KernelEstate;
+        let child_component = child_composite
+            .components
+            .get_mut(&TOOL_HANDOFF_COMPONENT)
+            .unwrap();
+        child_component.commit = CommitState::Committed;
+        child_component.commit_nonce = None;
+        child_component.commit_fact = None;
+        child_component.commit_operation = Some(operation);
+        child_component.outcome = OutcomeState::Indeterminate(operation);
+
+        let bad = CommandKind::ResolveIndeterminateHandoffParent {
+            descriptor,
+            terminal_receipt_digest: Digest::new([0x42; 32]),
+            descriptor_receipt_digest: Digest::new([0x17; 32]),
+        };
+        assert_eq!(
+            apply_command(
+                &engine.catalog,
+                engine.limits,
+                &mut engine.state.clone(),
+                &bad
+            ),
+            Err(CoreError::HandoffGuardRequired)
+        );
+
+        let command = CommandKind::ResolveIndeterminateHandoffParent {
+            descriptor,
+            terminal_receipt_digest: Digest::new([0x42; 32]),
+            descriptor_receipt_digest: Digest::new([16; 32]),
+        };
+        assert!(matches!(
+            &engine.state.composite_effects.get(&parent).unwrap().handoff,
+            SingleHopRole::Source { descriptor: saved, descriptor_receipt_digest, .. }
+                if **saved == descriptor && *descriptor_receipt_digest == Digest::new([16; 32])
+        ));
+        assert!(matches!(
+            engine.state.composite_effects.get(&child).unwrap().handoff,
+            SingleHopRole::Target { parent: saved, descriptor_digest }
+                if saved == parent && descriptor_digest == handoff_descriptor_digest(descriptor)
+        ));
+        assert_eq!(
+            command.coordinates_for_state(&engine.state),
+            TransitionCoordinates::new(
+                Some(child.root()),
+                Some(child),
+                Some(TOOL_HANDOFF_COMPONENT),
+                None,
+            )
+        );
+        let result = apply_command(&engine.catalog, engine.limits, &mut engine.state, &command);
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
+    fn prepared_target_does_not_preempt_parent_handoff_resolution() {
+        let (mut engine, parent, actor, descriptor) = setup();
+        let child = descriptor.child_effect().unwrap();
+        transact(
+            &mut engine,
+            Command(CommandKind::InstallHandoffChild {
+                descriptor,
+                origin: actor,
+                binding_generation: 1,
+                charge_account: ChargeAccountId::new(1).unwrap(),
+            }),
+        );
+
+        engine.state.roots.get_mut(&parent.root()).unwrap().state = RootRecoveryState::Fenced {
+            crashed: actor,
+            binding_generation: 1,
+            crash_generation: 1,
+        };
+        let parent_composite = engine.state.composite_effects.get_mut(&parent).unwrap();
+        parent_composite.authority = AuthorityState::Fenced;
+        parent_composite.custodian = CustodyState::KernelEstate;
+        parent_composite.handoff = SingleHopRole::None;
+        let parent_component = parent_composite
+            .components
+            .get_mut(&TOOL_HANDOFF_SOURCE_COMPONENT)
+            .unwrap();
+        parent_component.commit = CommitState::Committed;
+        parent_component.commit_nonce = None;
+        parent_component.commit_fact = None;
+        parent_component.commit_operation = Some(Digest::new([9; 32]));
+        parent_component.outcome = OutcomeState::Indeterminate(Digest::new([9; 32]));
+
+        let child_composite = engine.state.composite_effects.get_mut(&child).unwrap();
+        child_composite.authority = AuthorityState::Fenced;
+        child_composite.custodian = CustodyState::KernelEstate;
+        assert_eq!(
+            child_composite
+                .components
+                .get(&TOOL_HANDOFF_COMPONENT)
+                .unwrap()
+                .commit,
+            CommitState::Prepared
+        );
+
+        let command = CommandKind::ResolveIndeterminateHandoffParent {
+            descriptor,
+            terminal_receipt_digest: Digest::new([0x44; 32]),
+            descriptor_receipt_digest: Digest::new([0x45; 32]),
+        };
+        assert_eq!(
+            command.coordinates_for_state(&engine.state),
+            TransitionCoordinates::new(
+                Some(parent.root()),
+                Some(parent),
+                Some(TOOL_HANDOFF_SOURCE_COMPONENT),
+                None,
+            )
+        );
+        let result = apply_command(&engine.catalog, engine.limits, &mut engine.state, &command);
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            engine
+                .component(parent, TOOL_HANDOFF_SOURCE_COMPONENT)
+                .unwrap()
+                .outcome,
+            OutcomeState::KnownSuccess(Digest::new([0x44; 32]))
+        );
+        assert_eq!(
+            engine
+                .component(child, TOOL_HANDOFF_COMPONENT)
+                .unwrap()
+                .commit,
+            CommitState::Prepared
+        );
+    }
+
     #[test]
     fn handoff_descriptor_tamper_and_generic_bypasses_fail_closed() {
         let (mut engine, parent, actor, descriptor) = setup();
@@ -14862,7 +15623,7 @@ mod handoff_guard_tests {
 }
 
 #[cfg(test)]
-mod projection_v6_tests {
+mod projection_v8_tests {
     use super::*;
     use crate::{
         AGENT_COMPONENT_DMA, AGENT_OPERATION_COMPOSITE, CREDIT_QUEUE_SLOT, DEVICE_CLAIM_QUEUE_SLOT,
@@ -14909,7 +15670,7 @@ mod projection_v6_tests {
     }
 
     #[test]
-    fn projection_v6_binds_composite_claim_and_pending_reuse_fields_at_fixed_head() {
+    fn projection_v8_binds_composite_claim_and_pending_reuse_fields_at_fixed_head() {
         let catalog = crate::standard_catalog();
         let catalog_digest = catalog.digest();
         let mut engine = Engine::new(catalog, CoreLimits::bounded_default(), freshness(1, 1));
@@ -15001,8 +15762,8 @@ mod projection_v6_tests {
         assert_eq!(
             golden.bytes(),
             [
-                147, 17, 219, 145, 179, 177, 86, 218, 40, 167, 207, 136, 250, 86, 117, 206, 169,
-                162, 167, 31, 243, 157, 244, 100, 159, 253, 152, 125, 38, 101, 228, 225,
+                228, 217, 51, 217, 178, 173, 111, 39, 49, 105, 168, 183, 173, 147, 69, 150, 151,
+                14, 59, 240, 166, 230, 255, 100, 184, 236, 49, 178, 30, 246, 17, 196,
             ]
         );
 

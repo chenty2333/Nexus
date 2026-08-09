@@ -16,14 +16,14 @@ use cser_core::{
 };
 
 #[test]
-fn semantic_api_profile_three_freezes_journal_and_domain_catalog() {
-    assert_eq!(CSER_CORE_API_PROFILE_VERSION, 3);
-    assert_eq!(JOURNAL_MAGIC, *b"CSERJR7\0");
-    assert_eq!(JOURNAL_SCHEMA_VERSION, 7);
-    assert_eq!(JOURNAL_CORE_API_PROFILE, 3);
+fn semantic_api_profile_four_freezes_journal_and_domain_catalog() {
+    assert_eq!(CSER_CORE_API_PROFILE_VERSION, 4);
+    assert_eq!(JOURNAL_MAGIC, *b"CSERJR8\0");
+    assert_eq!(JOURNAL_SCHEMA_VERSION, 8);
+    assert_eq!(JOURNAL_CORE_API_PROFILE, 4);
     assert_eq!(STANDARD_CATALOG_VERSION, 7);
-    assert_eq!(PROJECTION_VERSION, 7);
-    assert_eq!(RECOVERY_SNAPSHOT_VERSION, 3);
+    assert_eq!(PROJECTION_VERSION, 8);
+    assert_eq!(RECOVERY_SNAPSHOT_VERSION, 4);
     assert_eq!(NORMALIZED_TRACE_VERSION, 2);
     let catalog = standard_catalog();
     let agent_operation = catalog

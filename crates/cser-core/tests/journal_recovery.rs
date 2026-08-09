@@ -141,7 +141,7 @@ fn current_recovery_rejects_a_schema_six_journal_bound_to_the_frozen_v5_catalog(
     source.tx(create_estate(20)).unwrap();
 
     let mut legacy_catalog_journal = source.journal.clone();
-    assert_eq!(&legacy_catalog_journal[..8], b"CSERJR7\0");
+    assert_eq!(&legacy_catalog_journal[..8], b"CSERJR8\0");
     legacy_catalog_journal[72..104].copy_from_slice(&v5_catalog.bytes());
     let checksum_start = legacy_catalog_journal.len() - 32;
     let checksum = Sha256::digest(&legacy_catalog_journal[..checksum_start]);

@@ -25,18 +25,18 @@ extern crate std;
 /// migration. Standard catalog grammar and validation evolve under the
 /// separate [`STANDARD_CATALOG_VERSION`] coordinate and exact catalog digest;
 /// recovery never reinterprets a journal bound to an older catalog digest.
-pub const CSER_CORE_API_PROFILE_VERSION: u16 = 3;
+pub const CSER_CORE_API_PROFILE_VERSION: u16 = 4;
 
-/// Frozen standard catalog format used by semantic API profile 3.
+/// Frozen standard catalog format used by semantic API profile 4.
 pub const STANDARD_CATALOG_VERSION: u16 = 7;
 
-/// Frozen deterministic projection format used by semantic API profile 3.
-pub const PROJECTION_VERSION: u16 = 7;
+/// Frozen deterministic projection format used by semantic API profile 4.
+pub const PROJECTION_VERSION: u16 = 8;
 
-/// Frozen recovery snapshot format used by semantic API profile 3.
-pub const RECOVERY_SNAPSHOT_VERSION: u16 = 3;
+/// Frozen recovery snapshot format used by semantic API profile 4.
+pub const RECOVERY_SNAPSHOT_VERSION: u16 = 4;
 
-/// Frozen normalized transition trace format used by semantic API profile 3.
+/// Frozen normalized transition trace format used by semantic API profile 4.
 pub const NORMALIZED_TRACE_VERSION: u16 = 2;
 
 mod domain;
@@ -65,12 +65,14 @@ pub use engine::{
     ComponentProjection, ComponentRecoveryItem, CompositeEffectProjection, CompositeRecoveryItem,
     CoreError, CoreLimits, CustodyState, EffectEscapeState, EffectFactChallenge, EffectFactKind,
     EffectReceiptVerifier, Engine, EstateProjection, EvidenceChallenge, ExternalOutcome,
+    HandoffChildResolutionVerifier, HandoffResolutionChallenge, HandoffResolutionVerifier,
     JournalFailure, OutcomeState, PressureProjection, ReceiptVerifier, RecoveryAnchor,
     RecoveryAnchorError, RecoveryEvidenceItem, RecoveryItem, RecoveryReport, RecoverySnapshot,
     RetirementState, ReusePermit, RootRecoveryState, SettlementClaim, SettlementState,
     SingleHopHandoffProjection, TransitionCoordinates, TransitionEvent, TransitionOutput,
     TransitionReceipt, TransitionResult, TxError, VerificationError, VerifiedApplyReceipt,
-    VerifiedChildDescriptor, VerifiedCommitOutcome, VerifiedEffectObservation, VerifiedObservation,
+    VerifiedChildDescriptor, VerifiedCommitOutcome, VerifiedEffectObservation,
+    VerifiedHandoffChildResolution, VerifiedHandoffResolution, VerifiedObservation,
     VerifiedRetirementEvidence, VerifiedSettlementAck, VerifierIdentity, VerifierStamp,
 };
 pub use identity::{
