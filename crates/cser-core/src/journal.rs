@@ -803,6 +803,8 @@ fn read_u64(bytes: &[u8], offset: usize) -> u64 {
 
 #[cfg(test)]
 mod checkpoint_tests {
+    use alloc::vec;
+
     use super::*;
     use crate::{CoreError, CoreLimits, Engine, RecoveryAnchor, standard_catalog};
 
