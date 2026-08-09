@@ -1053,6 +1053,7 @@ declare -A scheme_header_counts=(
     ['[scheme."cser-core-dma-recovery"]']=0
     ['[scheme."cser-smp-smoke"]']=0
     ['[scheme."tool-dma-cser"]']=0
+    ['[scheme."tool-dma-cser-vnext"]']=0
     ['[scheme."tool-dma-baseline"]']=0
 )
 while IFS= read -r scheme_header; do
@@ -1063,6 +1064,7 @@ while IFS= read -r scheme_header; do
         '[scheme."cser-core-dma-recovery"]'|\
         '[scheme."cser-smp-smoke"]'|\
         '[scheme."tool-dma-cser"]'|\
+        '[scheme."tool-dma-cser-vnext"]'|\
         '[scheme."tool-dma-baseline"]')
             ;;
         *)
@@ -1110,6 +1112,7 @@ for profile in reply dma; do
 done
 for specification in \
     'tool-dma-cser:cser-tool-dma-experiment' \
+    'tool-dma-cser-vnext:cser-tool-dma-experiment-vnext' \
     'tool-dma-baseline:cser-tool-dma-baseline-experiment'; do
     scheme=${specification%%:*}
     feature=${specification#*:}

@@ -44,7 +44,10 @@ use super::{
         project_replayed_component_claim,
     },
     core_experiment_dma_flow::{CserResetLiveDma, prepare_live_irq, probe_reset_once},
-    core_qemu_persistent_boot::{PreparedQemuPersistentBoot, persistent_dma_arena_digest},
+    core_qemu_persistent_boot::{
+        PreparedQemuPersistentBoot, PreparedQemuPersistentBootVNext, QemuPersistentBoot,
+        QemuPersistentBootVNext, persistent_dma_arena_digest,
+    },
     core_runtime::OstdCserRuntime,
     core_tool_adapter::{
         DurableToolObservation, ToolEndpointObservation, ToolOperationPlan, ToolTransportError,
@@ -72,6 +75,17 @@ const MAX_IRQ_SPINS: usize = 20_000_000;
 /// or authority to POST again.
 const MAX_ENDPOINT_GET_POLLS: usize = 4;
 
+// The vNext scheme deliberately selects its journal at compile time.  There is
+// no runtime probe and no path from a legacy image into this type.
+#[cfg(feature = "cser-tool-dma-experiment-vnext")]
+type ExperimentPreparedBoot = PreparedQemuPersistentBootVNext;
+#[cfg(not(feature = "cser-tool-dma-experiment-vnext"))]
+type ExperimentPreparedBoot = PreparedQemuPersistentBoot;
+#[cfg(feature = "cser-tool-dma-experiment-vnext")]
+type ExperimentBoot = QemuPersistentBootVNext;
+#[cfg(not(feature = "cser-tool-dma-experiment-vnext"))]
+type ExperimentBoot = QemuPersistentBoot;
+
 /// Runs exactly one fixed first-boot prefix.  Every marker follows a durable
 /// transition or a real endpoint/device action.  The matrix may kill QEMU at
 /// any marker; lack of a terminal marker is deliberately not success.
@@ -85,7 +99,7 @@ pub(crate) fn run() {
         1,
     )
     .expect("valid experiment binding");
-    let prepared = PreparedQemuPersistentBoot::acquire()
+    let prepared = ExperimentPreparedBoot::acquire()
         .unwrap_or_else(|_| panic!("TOOL_DMA_FAIL stage=qemu-persistent-boot"));
     let arena = prepared.arena();
     let boot = prepared
@@ -118,7 +132,7 @@ pub(crate) fn run() {
 /// killed the first boot at its selected cut and only accepts the unique
 /// terminal receipt from this successor.
 fn run_recovery(
-    mut boot: super::core_qemu_persistent_boot::QemuPersistentBoot,
+    mut boot: ExperimentBoot,
     effect: EffectId,
     arena: nexus_ostd_virtio::PersistentDmaArenaLayout,
     state: ToolDmaResumeState,
@@ -215,7 +229,7 @@ fn run_recovery(
 }
 
 fn finish_recovery(
-    boot: super::core_qemu_persistent_boot::QemuPersistentBoot,
+    boot: ExperimentBoot,
     metrics: super::core_cser_tool_experiment::ToolDmaMetrics,
     run_id: [u8; 16],
 ) -> ! {
@@ -425,7 +439,7 @@ fn reconcile_tool<O: ToolDmaCoreOwner>(
 }
 
 fn reconcile_boot_dma(
-    boot: &mut super::core_qemu_persistent_boot::QemuPersistentBoot,
+    boot: &mut ExperimentBoot,
     effect: EffectId,
     arena: nexus_ostd_virtio::PersistentDmaArenaLayout,
 ) {
@@ -518,7 +532,7 @@ fn expect_none<E>(
 }
 
 fn run_initial(
-    boot: super::core_qemu_persistent_boot::QemuPersistentBoot,
+    boot: ExperimentBoot,
     effect: EffectId,
     arena: nexus_ostd_virtio::PersistentDmaArenaLayout,
     run_id: [u8; 16],
@@ -898,7 +912,7 @@ fn fixed_actor() -> PrincipalIncarnation {
 /// conservative indeterminate/reconciliation state. Repeating that fence here
 /// would be a stale-principal transition.
 fn snapshot_ready_rebind(
-    boot: &mut super::core_qemu_persistent_boot::QemuPersistentBoot,
+    boot: &mut ExperimentBoot,
     effect: EffectId,
     state: ToolDmaResumeState,
 ) -> PrincipalIncarnation {

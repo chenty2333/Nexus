@@ -20,7 +20,15 @@ effect_id=${CSER_EXPERIMENT_EFFECT_ID:?missing CSER_EXPERIMENT_EFFECT_ID}
 phase=${CSER_EXPERIMENT_PHASE:-initial}
 
 case "$variant" in
-  cser) scheme=tool-dma-cser; artifact_dir="$root/artifacts/tool-dma-cser" ;;
+  cser)
+    if [[ ${CSER_EXPERIMENT_JOURNAL_VNEXT:-0} == 1 ]]; then
+      scheme=tool-dma-cser-vnext
+      artifact_dir="$root/artifacts/tool-dma-cser-vnext"
+    else
+      scheme=tool-dma-cser
+      artifact_dir="$root/artifacts/tool-dma-cser"
+    fi
+    ;;
   baseline) scheme=tool-dma-baseline; artifact_dir="$root/artifacts/tool-dma-baseline" ;;
   *) echo "qemu_boot: invalid variant: $variant" >&2; exit 2 ;;
 esac

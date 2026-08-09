@@ -793,20 +793,25 @@ test_pio_journal() {
     echo 'CSER_PIO_JOURNAL_KTEST PASS cache=failure=corruption=repair=fill-profile'
 }
 
-# Compile-only gate for the two comparable tool-plus-DMA experiment profiles.
+# Compile-only gate for the two comparable tool-plus-DMA experiment profiles
+# plus the isolated fresh-media append/checkpoint journal selection.
 #
 # This deliberately stops before `cargo osdk run`: the experiment matrix owns
 # host services, crash cutpoints, and QEMU lifecycle separately.  Keeping this
 # gate build-only makes it safe to run while those orchestration pieces evolve.
 build_tool_dma_experiments() {
     local feature
-    for feature in cser-tool-dma-experiment cser-tool-dma-baseline-experiment; do
+    for feature in cser-tool-dma-experiment cser-tool-dma-experiment-vnext cser-tool-dma-baseline-experiment; do
         container cargo check --locked --offline --target x86_64-unknown-none \
             --no-default-features --features "$feature"
     done
 
     prepare_runner_base
     container cargo osdk build --scheme tool-dma-cser
+    assert_runner_base
+
+    prepare_runner_base
+    container cargo osdk build --scheme tool-dma-cser-vnext
     assert_runner_base
 
     prepare_runner_base
@@ -870,6 +875,7 @@ run_tool_dma_boot() (
     local record_cid=0
     case "$scheme" in
         tool-dma-cser) artifact_dir="$root/artifacts/tool-dma-cser" ;;
+        tool-dma-cser-vnext) artifact_dir="$root/artifacts/tool-dma-cser-vnext" ;;
         tool-dma-baseline) artifact_dir="$root/artifacts/tool-dma-baseline" ;;
         *) echo "invalid tool-DMA scheme: $scheme" >&2; return 2 ;;
     esac
@@ -2926,7 +2932,7 @@ case "$command" in
         capture_cser_smp_smoke
         ;;
     run-tool-dma-boot)
-        [[ $# == 2 ]] || { echo 'usage: ./x run-tool-dma-boot {tool-dma-cser|tool-dma-baseline}' >&2; exit 2; }
+        [[ $# == 2 ]] || { echo 'usage: ./x run-tool-dma-boot {tool-dma-cser|tool-dma-cser-vnext|tool-dma-baseline}' >&2; exit 2; }
         ensure_image
         run_tool_dma_boot "$2"
         ;;

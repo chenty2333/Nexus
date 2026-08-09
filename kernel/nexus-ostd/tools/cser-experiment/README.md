@@ -176,6 +176,23 @@ an authenticated revision-zero genesis, so `ExperimentNvAnchor::open` never
 interprets an uninitialized TPM counter as blankness. Recovery reuses that exact
 row-local TPM state in either arm.
 
+### Fresh-media journal-vNext smoke selection
+
+`tool-dma-cser-vnext` is a deliberately separate, development-only QEMU
+scheme for the append/checkpoint ATA journal.  It uses the same 4 MiB blank
+`journal.raw` shape and the same trusted-local endpoint, VirtIO, IOMMU, and
+TPM envelope as `tool-dma-cser`, but stages them only under
+`artifacts/tool-dma-cser-vnext/` and opens `AtaPioJournalVNext` at compile
+time.  It never detects, migrates, or overwrites a legacy journal image.
+
+For a host-controlled trial, set `CSER_EXPERIMENT_JOURNAL_VNEXT=1` while
+invoking `qemu_boot.sh` with the normal `cser` variant.  The script selects the
+vNext scheme and its isolated artifact directory.  `./x build-tool-dma-
+experiments` is the narrow compile/build gate for this path; the existing
+`test-pio-journal` gate exercises append, reopen, repair, and checkpoint fault
+paths using the kernel test runner.  A vNext run is a fresh-media journal
+smoke, not a replacement production seal or a migration claim.
+
 COM3 is a startup-synchronized channel (`wait=on`), so the first barrier cannot
 race ahead of the host controller. Recovery boots have no crash cutpoints and
 use `uart_sink.py` solely to satisfy that startup handshake; receiving any byte

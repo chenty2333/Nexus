@@ -22,7 +22,7 @@ use sha2::{Digest as _, Sha256};
 use super::{
     core_device_quarantine::OstdVirtioBootQuarantine,
     core_dma_arena_allocator::{persistent_dma_arena_base, persistent_dma_arena_ready},
-    core_pio_journal::{AtaJournalFixture, AtaPioJournal},
+    core_pio_journal::{AtaJournalFixture, AtaPioJournal, AtaPioJournalVNext},
     core_reboot::{
         AlreadyQuarantined, BootDeviceQuarantine, OstdBootJournal, QuarantinedRecoveredBoot,
         recover_quarantined_boot,
@@ -37,6 +37,11 @@ pub(crate) type QemuPersistentDurability =
     CoordinatedPersistence<AtaPioJournal, QemuPersistentAnchor>;
 pub(crate) type QemuPersistentBoot =
     QuarantinedRecoveredBoot<AtaPioJournal, QemuPersistentAnchor, BootQuarantineGuard>;
+/// The fresh-media append/checkpoint journal selection.  It intentionally has
+/// a distinct boot-envelope type so a vNext QEMU scheme cannot accidentally
+/// reinterpret a legacy image.
+pub(crate) type QemuPersistentBootVNext =
+    QuarantinedRecoveredBoot<AtaPioJournalVNext, QemuPersistentAnchor, BootQuarantineGuard>;
 
 /// The prepared ownership envelope before catalog-bound recovery.
 ///
@@ -44,12 +49,17 @@ pub(crate) type QemuPersistentBoot =
 /// is a caller decision, while inspecting the TPM and placing the device under
 /// quarantine must happen before either production or an experiment can read
 /// a durable journal prefix.
-pub(crate) struct PreparedQemuPersistentBoot {
+pub(crate) struct PreparedQemuPersistentBootFor<J> {
     arena: PersistentDmaArenaLayout,
     candidate: TpmNvAnchorCandidate<QemuTisTpm2>,
-    journal: AtaPioJournal,
+    journal: J,
     guard: BootQuarantineGuard,
 }
+
+pub(crate) type PreparedQemuPersistentBoot = PreparedQemuPersistentBootFor<AtaPioJournal>;
+/// Prepared envelope for a blank vNext image.  This is deliberately parallel
+/// to the legacy alias rather than a runtime format probe.
+pub(crate) type PreparedQemuPersistentBootVNext = PreparedQemuPersistentBootFor<AtaPioJournalVNext>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum QemuPersistentBootError {
@@ -74,6 +84,28 @@ impl PreparedQemuPersistentBoot {
     /// catalog.  The caller owns the returned linear envelope and can consume
     /// it exactly once through [`Self::recover`].
     pub(crate) fn acquire() -> Result<Self, QemuPersistentBootError> {
+        Self::acquire_with(AtaPioJournal::acquire(AtaJournalFixture::PrimaryMaster))
+    }
+}
+
+impl PreparedQemuPersistentBootVNext {
+    /// Acquires the same QEMU devices as the legacy envelope, but opens the
+    /// fresh append/checkpoint journal.  Callers must give it a separate blank
+    /// artifact path; there is intentionally no migration or auto-detection.
+    pub(crate) fn acquire() -> Result<Self, QemuPersistentBootError> {
+        Self::acquire_with(AtaPioJournalVNext::acquire(
+            AtaJournalFixture::PrimaryMaster,
+        ))
+    }
+}
+
+impl<J> PreparedQemuPersistentBootFor<J>
+where
+    J: OstdBootJournal,
+{
+    fn acquire_with(
+        journal: Result<J, super::core_pio_journal::AtaPioJournalError>,
+    ) -> Result<Self, QemuPersistentBootError> {
         if !persistent_dma_arena_ready() {
             return Err(QemuPersistentBootError::ArenaNotWithheld);
         }
@@ -105,8 +137,7 @@ impl PreparedQemuPersistentBoot {
         let guard = OstdVirtioBootQuarantine::new(observed_generation)
             .quarantine_all()
             .map_err(|_| QemuPersistentBootError::DeviceQuarantine)?;
-        let journal = AtaPioJournal::acquire(AtaJournalFixture::PrimaryMaster)
-            .map_err(|_| QemuPersistentBootError::AtaJournalUnavailable)?;
+        let journal = journal.map_err(|_| QemuPersistentBootError::AtaJournalUnavailable)?;
         Ok(Self {
             arena,
             candidate,
@@ -145,7 +176,10 @@ impl PreparedQemuPersistentBoot {
         catalog: DomainCatalog,
         limits: CoreLimits,
         binding: RecoveryBinding,
-    ) -> Result<QemuPersistentBoot, QemuPersistentBootError> {
+    ) -> Result<
+        QuarantinedRecoveredBoot<J, QemuPersistentAnchor, BootQuarantineGuard>,
+        QemuPersistentBootError,
+    > {
         if catalog.digest() != binding.catalog_digest() {
             return Err(QemuPersistentBootError::CatalogBindingMismatch);
         }

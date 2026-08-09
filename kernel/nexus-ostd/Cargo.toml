@@ -24,6 +24,10 @@ cser-pio-journal-ktest = []
 # profiles may evolve their UART/crash harness without changing the sealed
 # production profile or its source closure.
 cser-tool-dma-experiment = ["dep:nexus-ostd-virtio", "dep:osdk-frame-allocator"]
+# Fresh-media append/checkpoint journal selection for the CSER experiment.
+# It deliberately retains the ordinary experiment feature so all device and
+# recovery machinery is identical; only the typed ATA backend changes.
+cser-tool-dma-experiment-vnext = ["cser-tool-dma-experiment"]
 cser-tool-dma-baseline-experiment = ["dep:nexus-ostd-virtio", "dep:osdk-frame-allocator"]
 
 [dependencies]
