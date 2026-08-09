@@ -16,7 +16,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from protocol import ENDPOINT_HTTP_CONTRACT_VERSION, evidence_record_digest
+from protocol import (ENDPOINT_HTTP_CONTRACT_VERSION, LEGACY_V2_HTTP_CONTRACT_VERSION,
+                      evidence_record_digest, evidence_record_digest_v3)
 from tool_endpoint import Endpoint, OperationState, Store
 
 
@@ -35,17 +36,16 @@ class EndpointContractTests(unittest.TestCase):
             status, record = self.submit(store)
             self.assertEqual(status, 201)
             self.assertEqual(record["contract_version"], str(ENDPOINT_HTTP_CONTRACT_VERSION))
-            self.assertEqual(record["record_schema_version"], "2")
+            self.assertEqual(record["record_schema_version"], "3")
             self.assertEqual(record["namespace_id"], "local-tool")
             self.assertEqual(record["catalog_digest"], CATALOG)
             self.assertEqual(record["state"], "succeeded")
             self.assertEqual(
                 record["evidence_record_digest"],
-                evidence_record_digest(
+                evidence_record_digest_v3(
                     record["namespace_id"], record["authority_id"], record["effect_id"],
                     record["run_id"], record["operation_key"], record["input_digest"],
-                    record["catalog_digest"], int(record["record_schema_version"]),
-                    record["state"], record["result"],
+                    record["catalog_digest"], record["state"], record["result"], "none", b"",
                 ),
             )
             authority, effect, evidence = record["authority_id"], record["effect_id"], record["evidence_record_digest"]
@@ -147,6 +147,34 @@ class EndpointContractTests(unittest.TestCase):
                 gc.collect()
             self.assertFalse(any(item.category is ResourceWarning for item in caught))
 
+    def test_v2_rows_keep_v2_evidence_after_v3_storage_migration(self) -> None:
+        """A schema upgrade may add columns but may not rewrite evidence facts."""
+        with tempfile.TemporaryDirectory() as temp:
+            database = Path(temp) / "old-v2.sqlite"
+            store = Store(database, catalog_digest=CATALOG)
+            _, created = self.submit(store, key="old-v2")
+            store._connection.execute("UPDATE adapter_metadata SET value='2' WHERE key='schema_version'")
+            store._connection.execute("UPDATE operations SET record_schema_version=2 WHERE operation_key='old-v2'")
+            store._connection.commit()
+            store.close()
+
+            reopened = Store(database, catalog_digest=CATALOG)
+            row = reopened._connection.execute(
+                "SELECT record_schema_version FROM operations WHERE operation_key='old-v2'"
+            ).fetchone()
+            self.assertEqual(row[0], 2)
+            # Its legacy view remains independently verifiable, while a v3
+            # evidence digest is deliberately unavailable.
+            legacy = reopened._select(RUN, "old-v2")
+            assert legacy is not None
+            self.assertEqual(legacy.legacy_evidence_digest(), evidence_record_digest(
+                legacy.namespace_id, legacy.authority_id, legacy.effect_id, legacy.run_id,
+                legacy.operation_key, legacy.input_digest, legacy.catalog_digest, 2,
+                legacy.state.value, legacy.result,
+            ))
+            self.assertEqual(legacy.evidence_digest(), "-")
+            reopened.close()
+
     def test_v2_http_contract_rejects_unknown_fields_and_lost_reply_remains_queryable_after_restart(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             database = Path(temp) / "endpoint.sqlite"
@@ -156,7 +184,7 @@ class EndpointContractTests(unittest.TestCase):
             thread.start()
             payload = b"crash-window"
             body = {
-                "contract_version": str(ENDPOINT_HTTP_CONTRACT_VERSION),
+                "contract_version": str(LEGACY_V2_HTTP_CONTRACT_VERSION),
                 "namespace_id": store.namespace_id,
                 "authority_id": store.authority_id,
                 "effect_id": store.effect_id,
@@ -197,6 +225,12 @@ class EndpointContractTests(unittest.TestCase):
             connection.close()
 
             body.pop("ignored")
+            v3_body = dict(body)
+            v3_body["contract_version"] = "2"
+            connection = http.client.HTTPConnection("127.0.0.1", server.server_port)
+            connection.request("POST", "/v3/operations", json.dumps(v3_body), {"Content-Type": "application/json"})
+            self.assertEqual(connection.getresponse().status, 400)
+            connection.close()
             connection = http.client.HTTPConnection("127.0.0.1", server.server_port)
             connection.request("POST", "/v1/operations", json.dumps(body), {"Content-Type": "application/json"})
             self.assertEqual(connection.getresponse().status, 400)

@@ -4,32 +4,51 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
-from tool_provider import ProviderStore
+from tool_provider import ProviderOutcome, ProviderStore
 
 if TYPE_CHECKING:
     from tool_endpoint import Store, WorkItem
 
 
+# Like ProviderStore's observer, this hook is strictly post-transition and
+# best-effort.  It cannot veto, retry, or otherwise influence custody state.
+WorkerObserver = Callable[[str, "WorkItem", ProviderOutcome | None], None]
+
+
 class AsyncWorker:
     def __init__(self, store: "Store", provider: ProviderStore, *, worker_id: str,
                  lease_seconds: float = 2.0, poll_seconds: float = 0.01,
-                 retry_backoff_min_seconds: float = 0.01, retry_backoff_max_seconds: float = 0.25) -> None:
+                 retry_backoff_min_seconds: float = 0.01, retry_backoff_max_seconds: float = 0.25,
+                 observer: WorkerObserver | None = None) -> None:
         if retry_backoff_min_seconds <= 0 or retry_backoff_max_seconds < retry_backoff_min_seconds:
             raise ValueError("invalid worker retry backoff")
         self.store, self.provider = store, provider
         self.worker_id, self.lease_seconds, self.poll_seconds = worker_id, lease_seconds, poll_seconds
         self.retry_backoff_min_seconds = retry_backoff_min_seconds
         self.retry_backoff_max_seconds = retry_backoff_max_seconds
+        self._observer = observer
+        self.telemetry_dropped = 0
         self._failure_streak = 0
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+
+    def _observe(self, event: str, item: "WorkItem", outcome: ProviderOutcome | None = None) -> None:
+        if self._observer is None:
+            return
+        try:
+            self._observer(event, item, outcome)
+        except BaseException:
+            # A trace sink must never perturb durable Pending/terminal state.
+            self.telemetry_dropped += 1
 
     def run_once(self) -> bool:
         item = self.store.claim_next(self.worker_id, self.lease_seconds)
         if item is None:
             return False
+        # claim_next committed Accepted -> Pending before returning this item.
+        self._observe("worker_pending_committed", item)
         identity = (item.namespace_id, item.authority_id, item.effect_id, item.catalog_digest,
                     item.run_id, item.operation_key)
         try:
@@ -39,7 +58,10 @@ class AsyncWorker:
             outcome = self.provider.query(identity, item.input_digest)
             if outcome is None:
                 outcome = self.provider.apply(identity, item.input_digest, item.payload)
-            self.store.complete_lease(item, outcome.state, outcome.result)
+            if self.store.complete_lease(
+                item, outcome.state, outcome.result, outcome.output_kind, outcome.output
+            ):
+                self._observe("worker_terminal_committed", item, outcome)
             self._failure_streak = 0
         except (OSError, sqlite3.Error):
             # Infrastructure failure is deliberately nonterminal.  A later

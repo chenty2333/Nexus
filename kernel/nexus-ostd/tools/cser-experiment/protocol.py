@@ -10,8 +10,11 @@ import re
 # Must stay exactly aligned with the guest's bounded `core_tool_uart` codec.
 MAX_LINE_BYTES = 1536
 MAX_PAYLOAD_BYTES = 576
-ENDPOINT_RECORD_SCHEMA_VERSION = 2
-ENDPOINT_HTTP_CONTRACT_VERSION = 2
+ENDPOINT_RECORD_SCHEMA_VERSION = 3
+ENDPOINT_HTTP_CONTRACT_VERSION = 3
+LEGACY_V2_RECORD_SCHEMA_VERSION = 2
+LEGACY_V2_HTTP_CONTRACT_VERSION = 2
+MAX_TERMINAL_OUTPUT_BYTES = 256
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _RUN_ID = re.compile(r"^[0-9a-f]{32}$")
@@ -98,7 +101,7 @@ def evidence_record_digest(
     operation_key = _id(operation_key, "operation key")
     input_digest = _digest(input_digest)
     catalog_digest = _digest(catalog_digest)
-    if schema_version != ENDPOINT_RECORD_SCHEMA_VERSION:
+    if schema_version != LEGACY_V2_RECORD_SCHEMA_VERSION:
         raise ProtocolError("unsupported endpoint record schema")
     state = _id(state, "state")
     result = _id(result, "result")
@@ -119,6 +122,31 @@ def evidence_record_digest(
         encoded = field.encode("ascii")
         hasher.update(len(encoded).to_bytes(8, "little"))
         hasher.update(encoded)
+    return hasher.hexdigest()
+
+
+def evidence_record_digest_v3(
+    namespace_id: str, authority_id: str, effect_id: str, run_id: str,
+    operation_key: str, input_digest: str, catalog_digest: str, state: str,
+    result: str, output_kind: str, output: bytes,
+) -> str:
+    """Digest the CSER3 terminal record, including its typed bounded output."""
+    namespace_id = _id(namespace_id, "namespace id")
+    authority_id = validate_run_id(authority_id); effect_id = validate_run_id(effect_id)
+    run_id = validate_run_id(run_id); operation_key = _id(operation_key, "operation key")
+    input_digest = _digest(input_digest); catalog_digest = _digest(catalog_digest)
+    state = _id(state, "state"); result = _id(result, "result")
+    output_kind = _id(output_kind, "output kind")
+    if output_kind not in ("none", "child_descriptor_v1"):
+        raise ProtocolError("unsupported terminal output kind")
+    if (state == "failed" and output_kind != "none") or len(output) > MAX_TERMINAL_OUTPUT_BYTES or (output_kind == "none") != (not output):
+        raise ProtocolError("invalid terminal output")
+    hasher = hashlib.sha256()
+    hasher.update(b"nexus-cser-local-evidence-record-v3")
+    for field in (namespace_id, authority_id, effect_id, run_id, operation_key, input_digest,
+                  catalog_digest, "3", state, result, output_kind, str(len(output)), digest(output)):
+        encoded = field.encode("ascii")
+        hasher.update(len(encoded).to_bytes(8, "little")); hasher.update(encoded)
     return hasher.hexdigest()
 
 
@@ -220,7 +248,7 @@ def response_v2(namespace_id: str, authority_id: str, effect_id: str, run_id: st
     if terminal:
         if evidence_digest != evidence_record_digest(namespace_id, authority_id, effect_id, run_id,
                                                      operation_key, input_digest, catalog_digest,
-                                                     ENDPOINT_RECORD_SCHEMA_VERSION, state, result):
+                                                     LEGACY_V2_RECORD_SCHEMA_VERSION, state, result):
             raise ProtocolError("evidence digest mismatch")
     elif evidence_digest is not None:
         raise ProtocolError("nonterminal response must not carry evidence")
@@ -248,6 +276,59 @@ def request_v2(namespace_id: str, authority_id: str, effect_id: str, run_id: str
     tokens = ["CSER2", "REQ", method, namespace_id, authority_id, effect_id, run_id,
               operation_key, input_digest, catalog_digest, encoded]
     return (" ".join(tokens + [_checksum(tokens)]) + "\n").encode("ascii")
+
+
+def request_v3(namespace_id: str, authority_id: str, effect_id: str, run_id: str,
+               operation_key: str, payload: bytes, catalog_digest: str,
+               method: str = "POST", expected_input_digest: str | None = None) -> bytes:
+    """CSER3 uses the CSER2 request identity but asks for a typed output reply."""
+    frame = request_v2(namespace_id, authority_id, effect_id, run_id, operation_key, payload,
+                       catalog_digest, method, expected_input_digest)
+    return b"CSER3" + frame[len(b"CSER2"):]
+
+
+def response_v3(namespace_id: str, authority_id: str, effect_id: str, run_id: str,
+                operation_key: str, input_digest: str, catalog_digest: str,
+                status: int, state: str, result: str, output_kind: str | None,
+                output: bytes | None, evidence_digest: str | None) -> bytes:
+    """Construct a strict CSER3 reply with an evidence-bound bounded output."""
+    if not 100 <= status <= 599:
+        raise ProtocolError("invalid HTTP status")
+    namespace_id = _id(namespace_id, "namespace id")
+    authority_id = validate_run_id(authority_id); effect_id = validate_run_id(effect_id)
+    run_id = validate_run_id(run_id); operation_key = _id(operation_key, "operation key")
+    input_digest = _digest(input_digest); catalog_digest = _digest(catalog_digest)
+    state = _id(state, "state"); result = _id(result, "result")
+    terminal = state in ("succeeded", "failed")
+    if terminal:
+        if output_kind is None or output is None:
+            raise ProtocolError("terminal response lacks output fields")
+        output_kind = _id(output_kind, "output kind")
+        if output_kind not in ("none", "child_descriptor_v1"):
+            raise ProtocolError("unsupported terminal output kind")
+        if (state == "failed" and output_kind != "none") or len(output) > MAX_TERMINAL_OUTPUT_BYTES or (output_kind == "none") != (not output):
+            raise ProtocolError("invalid terminal output")
+        expected = evidence_record_digest_v3(namespace_id, authority_id, effect_id, run_id,
+                                             operation_key, input_digest, catalog_digest,
+                                             state, result, output_kind, output)
+        if evidence_digest != expected:
+            raise ProtocolError("evidence digest mismatch")
+        fields = [output_kind, str(len(output)), digest(output),
+                  base64.b64encode(output).decode("ascii") or "-", evidence_digest]
+    else:
+        if output_kind is not None or output is not None or evidence_digest is not None:
+            raise ProtocolError("nonterminal response must not carry output or evidence")
+        fields = ["-", "-", "-", "-", "-"]
+    tokens = ["CSER3", "RESP", str(status), namespace_id, authority_id, effect_id, run_id,
+              operation_key, input_digest, catalog_digest, state, result, *fields]
+    return (" ".join(tokens + [_checksum(tokens)]) + "\n").encode("ascii")
+
+
+def parse_request_v3(line: bytes) -> tuple[str, str, str, str, str, str, str, str, bytes]:
+    """Parse the CSER3 request; its field layout intentionally matches CSER2."""
+    if not line.startswith(b"CSER3 "):
+        raise ProtocolError("invalid v3 request frame")
+    return parse_request_v2(b"CSER2" + line[len(b"CSER3"):])
 
 
 def response(

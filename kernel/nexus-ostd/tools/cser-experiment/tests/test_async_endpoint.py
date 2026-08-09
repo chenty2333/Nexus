@@ -16,7 +16,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from protocol import ENDPOINT_HTTP_CONTRACT_VERSION
+from protocol import ENDPOINT_HTTP_CONTRACT_VERSION, LEGACY_V2_HTTP_CONTRACT_VERSION, ProtocolError, evidence_record_digest_v3, response_v3
 from tool_endpoint import Endpoint, OperationState, Store
 from tool_provider import ProviderStore
 from tool_worker import AsyncWorker
@@ -198,7 +198,7 @@ class AsyncEndpointTests(unittest.TestCase):
         try:
             payload = b"http"
             body = {
-                "contract_version": str(ENDPOINT_HTTP_CONTRACT_VERSION),
+                "contract_version": str(LEGACY_V2_HTTP_CONTRACT_VERSION),
                 "namespace_id": self.store.namespace_id, "authority_id": self.store.authority_id,
                 "effect_id": self.store.effect_id, "run_id": RUN, "operation_key": "http",
                 "input_digest": hashlib.sha256(payload).hexdigest(), "catalog_digest": CATALOG,
@@ -219,6 +219,30 @@ class AsyncEndpointTests(unittest.TestCase):
             self.assertEqual(terminal["state"], "succeeded")
         finally:
             endpoint.shutdown(); endpoint.server_close(); thread.join(timeout=5)
+
+    def test_cser3_terminal_descriptor_output_is_bounded_and_evidence_bound(self) -> None:
+        descriptor = b"NXSCHD01" + b"x" * 120
+        payload = b"child-descriptor-v1:" + descriptor
+        self.enqueue("descriptor", payload)
+        self.assertTrue(AsyncWorker(self.store, self.provider, worker_id="descriptor-worker").run_once())
+        record = self.store.get(RUN, "descriptor")
+        assert record is not None
+        self.assertEqual((record["state"], record["output_kind"], record["output_len"]),
+                         ("succeeded", "child_descriptor_v1", str(len(descriptor))))
+        self.assertEqual(record["evidence_record_digest"], evidence_record_digest_v3(
+            record["namespace_id"], record["authority_id"], record["effect_id"], record["run_id"],
+            record["operation_key"], record["input_digest"], record["catalog_digest"],
+            record["state"], record["result"], record["output_kind"], descriptor,
+        ))
+        frame = response_v3(record["namespace_id"], record["authority_id"], record["effect_id"], record["run_id"],
+                            record["operation_key"], record["input_digest"], record["catalog_digest"], 200,
+                            record["state"], record["result"], record["output_kind"], descriptor,
+                            record["evidence_record_digest"])
+        self.assertTrue(frame.startswith(b"CSER3 RESP 200 "))
+        with self.assertRaises(ProtocolError):
+            response_v3(record["namespace_id"], record["authority_id"], record["effect_id"], record["run_id"],
+                        record["operation_key"], record["input_digest"], record["catalog_digest"], 200,
+                        "succeeded", "success", "child_descriptor_v1", b"x" * 257, "0" * 64)
 
 
 if __name__ == "__main__":

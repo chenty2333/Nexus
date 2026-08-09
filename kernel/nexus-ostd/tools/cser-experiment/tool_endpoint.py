@@ -30,10 +30,14 @@ from typing import Any
 from protocol import (
     ENDPOINT_HTTP_CONTRACT_VERSION,
     ENDPOINT_RECORD_SCHEMA_VERSION,
+    LEGACY_V2_HTTP_CONTRACT_VERSION,
+    LEGACY_V2_RECORD_SCHEMA_VERSION,
     MAX_PAYLOAD_BYTES,
+    MAX_TERMINAL_OUTPUT_BYTES,
     ProtocolError,
     digest,
     evidence_record_digest,
+    evidence_record_digest_v3,
     record_digest,
     validate_run_id,
 )
@@ -81,6 +85,8 @@ class EndpointRecord:
     catalog_digest: str
     state: OperationState
     result: str
+    output_kind: str
+    output: bytes
     record_schema_version: int
     created_at_ns: int
     updated_at_ns: int
@@ -91,7 +97,7 @@ class EndpointRecord:
             # Migrated records are retained solely as fail-closed tombstones;
             # they must never acquire a v2 evidence identity retroactively.
             return "-"
-        return evidence_record_digest(
+        return evidence_record_digest_v3(
             self.namespace_id,
             self.authority_id,
             self.effect_id,
@@ -99,9 +105,19 @@ class EndpointRecord:
             self.operation_key,
             self.input_digest,
             self.catalog_digest,
-            self.record_schema_version,
             self.state.value,
             self.result,
+            self.output_kind,
+            self.output,
+        )
+
+    def legacy_evidence_digest(self) -> str:
+        if not self.state.terminal:
+            return "-"
+        return evidence_record_digest(
+            self.namespace_id, self.authority_id, self.effect_id, self.run_id,
+            self.operation_key, self.input_digest, self.catalog_digest,
+            LEGACY_V2_RECORD_SCHEMA_VERSION, self.state.value, self.result,
         )
 
     def legacy_record_digest(self) -> str | None:
@@ -111,10 +127,11 @@ class EndpointRecord:
             return record_digest(self.run_id, self.operation_key, self.input_digest, "failed", self.result)
         return None
 
-    def document(self, *, replayed: bool = False) -> dict[str, str]:
+    def document(self, *, replayed: bool = False, protocol_version: int = ENDPOINT_HTTP_CONTRACT_VERSION) -> dict[str, str]:
         legacy = self.legacy_record_digest()
-        return {
-            "contract_version": str(ENDPOINT_HTTP_CONTRACT_VERSION),
+        if protocol_version == LEGACY_V2_HTTP_CONTRACT_VERSION:
+            return {
+            "contract_version": str(LEGACY_V2_HTTP_CONTRACT_VERSION),
             "namespace_id": self.namespace_id,
             "authority_id": self.authority_id,
             "effect_id": self.effect_id,
@@ -123,17 +140,40 @@ class EndpointRecord:
             "payload_digest": self.input_digest,
             "input_digest": self.input_digest,
             "catalog_digest": self.catalog_digest,
-            "record_schema_version": str(self.record_schema_version),
+            "record_schema_version": str(LEGACY_V2_RECORD_SCHEMA_VERSION),
             "state": self.state.value,
             # Retain these two v1 names only for the isolated compatibility API.
             "status": "applied" if self.state == OperationState.SUCCEEDED else self.state.value,
             "result": "success" if self.state == OperationState.SUCCEEDED else self.result,
             "record_digest": legacy or "-",
-            "evidence_record_digest": self.evidence_digest(),
+            "evidence_record_digest": self.legacy_evidence_digest(),
             "created_at_ns": str(self.created_at_ns),
             "updated_at_ns": str(self.updated_at_ns),
             "expires_at_ns": str(self.expires_at_ns),
             "replayed": "true" if replayed else "false",
+            }
+        if protocol_version != ENDPOINT_HTTP_CONTRACT_VERSION:
+            raise ValueError("unsupported endpoint response contract")
+        return {
+            "contract_version": str(ENDPOINT_HTTP_CONTRACT_VERSION),
+            "namespace_id": self.namespace_id, "authority_id": self.authority_id,
+            "effect_id": self.effect_id, "run_id": self.run_id, "operation_key": self.operation_key,
+            # Compatibility-only aliases for direct Store callers. HTTP v3
+            # passes the record through _v3_document, which deliberately
+            # omits them from the closed wire grammar.
+            "payload_digest": self.input_digest,
+            "input_digest": self.input_digest, "catalog_digest": self.catalog_digest,
+            "record_schema_version": str(self.record_schema_version), "state": self.state.value,
+            "status": "applied" if self.state == OperationState.SUCCEEDED else self.state.value,
+            "result": "success" if self.state == OperationState.SUCCEEDED else self.result,
+            "record_digest": legacy or "-",
+            "output_kind": self.output_kind if self.state.terminal else "-",
+            "output_len": str(len(self.output)) if self.state.terminal else "-",
+            "output_digest": digest(self.output) if self.state.terminal else "-",
+            "output_b64": base64.b64encode(self.output).decode("ascii") if self.state.terminal and self.output else "-",
+            "evidence_record_digest": self.evidence_digest(),
+            "created_at_ns": str(self.created_at_ns), "updated_at_ns": str(self.updated_at_ns),
+            "expires_at_ns": str(self.expires_at_ns), "replayed": "true" if replayed else "false",
         }
 
 
@@ -220,14 +260,18 @@ class Store:
                 columns = {
                     row[1] for row in self._connection.execute("PRAGMA table_info(operations)").fetchall()
                 }
-                v2_columns = {
+                v3_columns = {
                     "namespace_id", "authority_id", "effect_id", "run_id", "operation_key",
                     "input_digest", "payload", "state", "result", "catalog_digest",
-                    "record_schema_version", "created_at_ns", "updated_at_ns", "expires_at_ns",
+                    "output_kind", "output", "record_schema_version", "created_at_ns", "updated_at_ns", "expires_at_ns",
                 }
+                v2_columns = v3_columns - {"output_kind", "output"}
                 legacy_columns = {"run_id", "operation_key", "payload_digest", "payload", "status", "result"}
-                if columns and columns != v2_columns and columns != legacy_columns:
+                if columns and columns not in (v3_columns, v2_columns, legacy_columns):
                     raise ValueError("endpoint database has an unknown or unmigratable operations schema")
+                if columns == v2_columns:
+                    self._connection.execute("ALTER TABLE operations ADD COLUMN output_kind TEXT NOT NULL DEFAULT 'none'")
+                    self._connection.execute("ALTER TABLE operations ADD COLUMN output BLOB NOT NULL DEFAULT X''")
                 if columns == legacy_columns:
                     # Preserve the old bytes for diagnosis but make their old,
                     # unbound evidence unavailable after migration.  A caller
@@ -238,11 +282,11 @@ class Store:
                     now = time.time_ns()
                     self._connection.execute(
                         """INSERT INTO operations(namespace_id, authority_id, effect_id, run_id, operation_key,
-                           input_digest, payload, state, result, catalog_digest, record_schema_version,
+                           input_digest, payload, state, result, catalog_digest, output_kind, output, record_schema_version,
                            created_at_ns, updated_at_ns, expires_at_ns)
                            SELECT 'legacy', '00000000000000000000000000000000',
                                   '00000000000000000000000000000000', run_id, operation_key,
-                                  payload_digest, payload, 'expired', result, ?, 1, ?, ?, 0
+                                  payload_digest, payload, 'expired', result, ?, 'none', X'', 1, ?, ?, 0
                            FROM operations_v1_unbound""",
                         (_DEFAULT_CATALOG_DIGEST, now, now),
                     )
@@ -281,6 +325,18 @@ class Store:
                         (str(_ASYNC_QUEUE_SCHEMA_VERSION),),
                     )
                     metadata["async_queue_schema_version"] = str(_ASYNC_QUEUE_SCHEMA_VERSION)
+                if metadata.get("schema_version") == "2":
+                    # Adding storage columns is a database migration, not an
+                    # evidence migration.  Historical v2 rows retain their
+                    # v2 record schema and may only be served through the
+                    # explicit v2 compatibility view.  In particular, a
+                    # terminal v2 fact never gains a forged v3 digest merely
+                    # because this sidecar was upgraded.
+                    self._connection.execute(
+                        "UPDATE adapter_metadata SET value=? WHERE key='schema_version'",
+                        (str(ENDPOINT_RECORD_SCHEMA_VERSION),),
+                    )
+                    metadata["schema_version"] = str(ENDPOINT_RECORD_SCHEMA_VERSION)
                 expected = {
                     "schema_version": str(ENDPOINT_RECORD_SCHEMA_VERSION),
                     "namespace_id": self._namespace_id,
@@ -329,6 +385,8 @@ class Store:
                    state TEXT NOT NULL CHECK(state IN ('accepted','pending','succeeded','failed','expired')),
                    result TEXT NOT NULL,
                    catalog_digest TEXT NOT NULL,
+                   output_kind TEXT NOT NULL,
+                   output BLOB NOT NULL,
                    record_schema_version INTEGER NOT NULL,
                    created_at_ns INTEGER NOT NULL,
                    updated_at_ns INTEGER NOT NULL,
@@ -400,8 +458,8 @@ class Store:
         return EndpointRecord(
             namespace_id=row[0], authority_id=row[1], effect_id=row[2], run_id=row[3],
             operation_key=row[4], input_digest=row[5], state=OperationState(row[6]), result=row[7],
-            catalog_digest=row[8], record_schema_version=row[9], created_at_ns=row[10],
-            updated_at_ns=row[11], expires_at_ns=row[12],
+            catalog_digest=row[8], output_kind=row[9], output=row[10], record_schema_version=row[11],
+            created_at_ns=row[12], updated_at_ns=row[13], expires_at_ns=row[14],
         )
 
     @staticmethod
@@ -411,7 +469,7 @@ class Store:
     def _select(self, run_id: str, operation_key: str) -> EndpointRecord | None:
         row = self._connection.execute(
             """SELECT namespace_id, authority_id, effect_id, run_id, operation_key, input_digest,
-                      state, result, catalog_digest, record_schema_version, created_at_ns, updated_at_ns,
+                      state, result, catalog_digest, output_kind, output, record_schema_version, created_at_ns, updated_at_ns,
                       expires_at_ns FROM operations WHERE namespace_id=? AND run_id=? AND operation_key=?""",
             (self._namespace_id, run_id, operation_key),
         ).fetchone()
@@ -422,7 +480,7 @@ class Store:
         if row is None:
             row = self._connection.execute(
                 """SELECT namespace_id, authority_id, effect_id, run_id, operation_key, input_digest,
-                          state, result, catalog_digest, record_schema_version, created_at_ns, updated_at_ns,
+                          state, result, catalog_digest, output_kind, output, record_schema_version, created_at_ns, updated_at_ns,
                           expires_at_ns FROM operations WHERE run_id=? AND operation_key=?""",
                 (run_id, operation_key),
             ).fetchone()
@@ -473,9 +531,9 @@ class Store:
                 expires = now + self._retention_ns
                 self._connection.execute(
                     """INSERT INTO operations(namespace_id, authority_id, effect_id, run_id, operation_key,
-                       input_digest, payload, state, result, catalog_digest, record_schema_version,
+                       input_digest, payload, state, result, catalog_digest, output_kind, output, record_schema_version,
                        created_at_ns, updated_at_ns, expires_at_ns)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'none', X'', ?, ?, ?, ?)""",
                     (self._namespace_id, self._authority_id, self._effect_id, run_id, operation_key,
                      input_digest, payload, initial_state.value, result, self._catalog_digest,
                      ENDPOINT_RECORD_SCHEMA_VERSION, now, now, expires),
@@ -539,9 +597,9 @@ class Store:
                     return self._status_for(existing, replayed=True), existing.document(replayed=True)
                 self._connection.execute(
                     """INSERT INTO operations(namespace_id, authority_id, effect_id, run_id, operation_key,
-                       input_digest, payload, state, result, catalog_digest, record_schema_version,
+                       input_digest, payload, state, result, catalog_digest, output_kind, output, record_schema_version,
                        created_at_ns, updated_at_ns, expires_at_ns)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, 'accepted', 'queued', ?, ?, ?, ?, 0)""",
+                       VALUES (?, ?, ?, ?, ?, ?, ?, 'accepted', 'queued', ?, 'none', X'', ?, ?, ?, 0)""",
                     (self._namespace_id, self._authority_id, self._effect_id, run_id, operation_key,
                      input_digest, payload, self._catalog_digest, ENDPOINT_RECORD_SCHEMA_VERSION, now, now),
                 )
@@ -605,20 +663,24 @@ class Store:
                 self._connection.execute("ROLLBACK")
                 raise
 
-    def complete_lease(self, item: WorkItem, state: str, result: str) -> bool:
-        if state not in ("succeeded", "failed") or not _valid_id(result):
+    def complete_lease(self, item: WorkItem, state: str, result: str, output_kind: str = "none", output: bytes = b"") -> bool:
+        if (state not in ("succeeded", "failed") or not _valid_id(result)
+                or output_kind not in ("none", "child_descriptor_v1")
+                or (state == "failed" and output_kind != "none")
+                or len(output) > MAX_TERMINAL_OUTPUT_BYTES
+                or (output_kind == "none") != (not output)):
             raise ValueError("invalid provider outcome")
         now = self._now()
         with self._lock:
             self._connection.execute("BEGIN IMMEDIATE")
             try:
                 changed = self._connection.execute(
-                    """UPDATE operations SET state=?, result=?, updated_at_ns=?, expires_at_ns=?
+                    """UPDATE operations SET state=?, result=?, output_kind=?, output=?, updated_at_ns=?, expires_at_ns=?
                        WHERE namespace_id=? AND run_id=? AND operation_key=? AND state IN ('accepted','pending')
                          AND EXISTS (SELECT 1 FROM operation_queue q WHERE q.namespace_id=operations.namespace_id
                            AND q.run_id=operations.run_id AND q.operation_key=operations.operation_key
                            AND q.lease_token=?)""",
-                    (state, result, now, now + self._retention_ns, item.namespace_id, item.run_id,
+                    (state, result, output_kind, output, now, now + self._retention_ns, item.namespace_id, item.run_id,
                      item.operation_key, item.lease_token),
                 ).rowcount
                 if changed:
@@ -773,7 +835,46 @@ class Handler(BaseHTTPRequestHandler):
     def _bad(self, message: str) -> None:
         self._json(HTTPStatus.BAD_REQUEST, {"error": message})
 
-    def _document(self, *, v2: bool) -> tuple[str, str, str, bytes] | None:
+    @staticmethod
+    def _v2_document(record: dict[str, str]) -> dict[str, str]:
+        """CSER2 has an exact closed record grammar; CSER3 fields never leak
+        into it as silently ignored extensions."""
+        state = record["state"]
+        result = "success" if state == "succeeded" else record["result"]
+        evidence = "-" if state not in ("succeeded", "failed") else evidence_record_digest(
+            record["namespace_id"], record["authority_id"], record["effect_id"], record["run_id"],
+            record["operation_key"], record["input_digest"], record["catalog_digest"],
+            LEGACY_V2_RECORD_SCHEMA_VERSION, state, result,
+        )
+        legacy_status = "applied" if state == "succeeded" else state
+        legacy_record = "-" if evidence == "-" else record_digest(
+            record["run_id"], record["operation_key"], record["input_digest"], legacy_status, result,
+        )
+        return {
+            "contract_version": str(LEGACY_V2_HTTP_CONTRACT_VERSION),
+            "namespace_id": record["namespace_id"], "authority_id": record["authority_id"],
+            "effect_id": record["effect_id"], "run_id": record["run_id"],
+            "operation_key": record["operation_key"], "payload_digest": record["input_digest"],
+            "input_digest": record["input_digest"], "catalog_digest": record["catalog_digest"],
+            "record_schema_version": str(LEGACY_V2_RECORD_SCHEMA_VERSION), "state": state,
+            "status": legacy_status, "result": result, "record_digest": legacy_record,
+            "evidence_record_digest": evidence, "created_at_ns": record["created_at_ns"],
+            "updated_at_ns": record["updated_at_ns"], "expires_at_ns": record["expires_at_ns"],
+            "replayed": record["replayed"],
+        }
+
+    @staticmethod
+    def _v3_document(record: dict[str, str]) -> dict[str, str]:
+        """Project internal/direct compatibility aliases out of HTTP v3."""
+        keys = (
+            "contract_version", "namespace_id", "authority_id", "effect_id", "run_id",
+            "operation_key", "input_digest", "catalog_digest", "record_schema_version",
+            "state", "result", "output_kind", "output_len", "output_digest", "output_b64",
+            "evidence_record_digest", "created_at_ns", "updated_at_ns", "expires_at_ns", "replayed",
+        )
+        return {key: record[key] for key in keys}
+
+    def _document(self, *, typed_version: int | None) -> tuple[str, str, str, bytes] | None:
         length = self.headers.get("Content-Length")
         try:
             size = int(length) if length is not None else -1
@@ -793,9 +894,9 @@ class Handler(BaseHTTPRequestHandler):
             v2_fields = {"contract_version", "namespace_id", "authority_id", "effect_id",
                          "run_id", "operation_key", "input_digest", "catalog_digest", "payload_b64"}
             fields = set(document)
-            if not v2 and fields == legacy_fields:
+            if typed_version is None and fields == legacy_fields:
                 pass
-            elif v2 and fields == v2_fields and document["contract_version"] == str(ENDPOINT_HTTP_CONTRACT_VERSION):
+            elif typed_version is not None and fields == v2_fields and document["contract_version"] == str(typed_version):
                 if (document["namespace_id"], document["authority_id"], document["effect_id"],
                     document["catalog_digest"]) != (self.server.store.namespace_id,
                     self.server.store.authority_id, self.server.store.effect_id,
@@ -825,21 +926,24 @@ class Handler(BaseHTTPRequestHandler):
         return run_id, operation_key, input_digest, payload
 
     def do_POST(self) -> None:  # noqa: N802
-        if self.path not in ("/v1/operations", "/v2/operations"):
+        if self.path not in ("/v1/operations", "/v2/operations", "/v3/operations"):
             self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
             return
-        values = self._document(v2=self.path == "/v2/operations")
+        values = self._document(typed_version=(LEGACY_V2_HTTP_CONTRACT_VERSION if self.path == "/v2/operations" else ENDPOINT_HTTP_CONTRACT_VERSION if self.path == "/v3/operations" else None))
         if values is None:
             return
         # v1 remains an explicit synchronous compatibility endpoint used by
         # isolated legacy tests. v2 is the real asynchronous CSER contract.
-        status, record = self.server.store.enqueue(*values) if self.path == "/v2/operations" else self.server.store.submit(*values)
+        status, record = self.server.store.enqueue(*values) if self.path in ("/v2/operations", "/v3/operations") else self.server.store.submit(*values)
         # The client can lose either the durable v2 acceptance response or a
         # v1 terminal response; recovery always queries this exact key.
         if status < 300 and self.server.take_lost_response_fault():
             self.close_connection = True
             return
-        self._json(status, record)
+        if "error" in record:
+            self._json(status, record)
+        else:
+            self._json(status, self._v2_document(record) if self.path != "/v3/operations" else self._v3_document(record))
 
     def do_GET(self) -> None:  # noqa: N802
         if self.path == "/v1/metrics":
@@ -847,11 +951,13 @@ class Handler(BaseHTTPRequestHandler):
             return
         prefix = "/v1/operations/"
         v2_prefix = "/v2/operations/"
-        if not self.path.startswith(prefix) and not self.path.startswith(v2_prefix):
+        v3_prefix = "/v3/operations/"
+        if not self.path.startswith(prefix) and not self.path.startswith(v2_prefix) and not self.path.startswith(v3_prefix):
             self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
             return
-        v2 = self.path.startswith(v2_prefix)
-        parts = self.path[len(v2_prefix if v2 else prefix):].split("/")
+        v2 = self.path.startswith(v2_prefix) or self.path.startswith(v3_prefix)
+        typed_prefix = v3_prefix if self.path.startswith(v3_prefix) else v2_prefix
+        parts = self.path[len(typed_prefix if v2 else prefix):].split("/")
         if v2:
             # v2 path is exactly namespace/authority/effect/run/operation/input/catalog.
             # Validate before slicing so a short or surplus path can never be
@@ -893,7 +999,7 @@ class Handler(BaseHTTPRequestHandler):
             else HTTPStatus.ACCEPTED if state in (OperationState.ACCEPTED, OperationState.PENDING)
             else HTTPStatus.CONFLICT if state == OperationState.FAILED
             else HTTPStatus.GONE,
-            result,
+            self._v2_document(result) if not self.path.startswith(v3_prefix) else self._v3_document(result),
         )
 
 

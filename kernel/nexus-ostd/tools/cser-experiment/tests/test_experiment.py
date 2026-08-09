@@ -7,15 +7,15 @@ import sys
 import tempfile
 import threading
 import unittest
-from base64 import b64encode
+from base64 import b64decode, b64encode
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from protocol import (MAX_LINE_BYTES, MAX_PAYLOAD_BYTES, ProtocolError, digest,
-                      evidence_record_digest, parse_request, parse_request_v2, record_digest,
-                      request, request_v2, response, response_v2)
+                      evidence_record_digest, evidence_record_digest_v3, parse_request, parse_request_v2, parse_request_v3, record_digest,
+                      request, request_v2, request_v3, response, response_v2, response_v3)
 from tool_endpoint import Endpoint, Store
 from uart_http_bridge import BridgeStageError, _serve_client, _serve_client_v2, connect_and_serve, serve
 from uart_sink import consume_recovery_uart
@@ -107,6 +107,19 @@ class ProtocolTest(unittest.TestCase):
         with self.assertRaises(ProtocolError):
             parse_request(b"x" * MAX_LINE_BYTES + b"\n")
 
+    def test_cser3_output_is_terminal_only_and_digest_bound(self) -> None:
+        namespace, authority, effect, run, operation, catalog = "tool", "a" * 32, "b" * 32, "c" * 32, "op", "d" * 64
+        payload, output = b"body", b"NXSCHD01" + b"x" * 120
+        self.assertEqual(parse_request_v3(request_v3(namespace, authority, effect, run, operation, payload, catalog))[0], "POST")
+        evidence = evidence_record_digest_v3(namespace, authority, effect, run, operation, digest(payload), catalog,
+                                             "succeeded", "success", "child_descriptor_v1", output)
+        self.assertIn(b"child_descriptor_v1", response_v3(namespace, authority, effect, run, operation,
+                                                             digest(payload), catalog, 200, "succeeded", "success",
+                                                             "child_descriptor_v1", output, evidence))
+        with self.assertRaises(ProtocolError):
+            response_v3(namespace, authority, effect, run, operation, digest(payload), catalog, 202,
+                        "pending", "working", "child_descriptor_v1", output, evidence)
+
     def test_maximum_guest_v2_request_fits_and_round_trips(self) -> None:
         payload = b"x" * MAX_PAYLOAD_BYTES
         frame = request_v2(
@@ -154,6 +167,58 @@ class ProtocolTest(unittest.TestCase):
 
 
 class BridgeTest(unittest.TestCase):
+    def test_cser3_bridge_forwards_pending_then_evidence_bound_terminal_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            namespace, authority, effect = "tool-dma-v3", "a" * 32, "b" * 32
+            run, catalog, operation = "c" * 32, "d" * 64, "descriptor-op"
+            store = Store(
+                Path(temp) / "tool.db", namespace_id=namespace, authority_id=authority,
+                effect_id=effect, catalog_digest=catalog,
+            )
+            server = Endpoint(("127.0.0.1", 0), store, False)
+            server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+            server_thread.start()
+            identity = (namespace, authority, effect, run, catalog)
+            descriptor = b"NXSCHD01" + b"x" * 120
+            payload = b"child-descriptor-v1:" + descriptor
+
+            def exchange(frame: bytes) -> bytes:
+                host, guest = socket.socketpair()
+                errors: list[BaseException] = []
+                def serve_v3() -> None:
+                    try:
+                        _serve_client_v2(host, ("127.0.0.1", server.server_port), identity, cser3=True)
+                    except BaseException as error:
+                        errors.append(error)
+                    finally:
+                        host.close()
+                worker = threading.Thread(target=serve_v3, daemon=True)
+                guest.settimeout(2)
+                worker.start()
+                guest.sendall(frame)
+                try:
+                    reply = guest.recv(2048)
+                finally:
+                    guest.close()
+                    worker.join(2)
+                self.assertFalse(worker.is_alive())
+                self.assertEqual(errors, [])
+                return reply
+
+            self.assertIn(
+                b" RESP 202 ",
+                exchange(request_v3(namespace, authority, effect, run, operation, payload, catalog)),
+            )
+            self.assertTrue(server.worker.run_once())
+            terminal = exchange(request_v3(
+                namespace, authority, effect, run, operation, b"", catalog,
+                method="GET", expected_input_digest=digest(payload),
+            ))
+            self.assertIn(b" RESP 200 ", terminal)
+            self.assertIn(b" child_descriptor_v1 128 ", terminal)
+            self.assertEqual(descriptor, b64decode(terminal.split()[15]))
+            server.shutdown(); server.server_close(); store.close()
+
     def test_v2_bridge_post_get_absence_and_expiry(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             store = Store(Path(temp) / "tool.db", namespace_id="tool-dma-a", authority_id="a" * 32,
@@ -172,8 +237,16 @@ class BridgeTest(unittest.TestCase):
                     except BaseException as error:
                         errors.append(error)
                 worker = threading.Thread(target=serve_v2, daemon=True)
-                worker.start(); guest.sendall(request_frame); reply = guest.recv(1024); worker.join(2)
-                guest.close(); host.close(); self.assertFalse(errors); return reply
+                guest.settimeout(2)
+                worker.start(); guest.sendall(request_frame)
+                try:
+                    reply = guest.recv(1024)
+                finally:
+                    worker.join(2)
+                    guest.close(); host.close()
+                self.assertFalse(worker.is_alive())
+                self.assertFalse(errors)
+                return reply
             self.assertIn(b" RESP 202 ", exchange(frame))
             self.assertTrue(server.worker.run_once())
             query = request_v2(namespace, authority, effect, run, operation, b"", catalog, method="GET", expected_input_digest=digest(payload))
