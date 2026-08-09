@@ -18,7 +18,7 @@ from protocol import (MAX_LINE_BYTES, MAX_PAYLOAD_BYTES, ProtocolError, digest,
                       request, request_v2, request_v3, response, response_v2, response_v3)
 from tool_endpoint import Endpoint, Store
 from uart_http_bridge import BridgeStageError, _serve_client, _serve_client_v2, connect_and_serve, serve
-from uart_sink import consume_recovery_uart
+from uart_sink import _connect_unix_with_retry, consume_recovery_uart
 
 
 class EndpointTest(unittest.TestCase):
@@ -107,10 +107,52 @@ class ProtocolTest(unittest.TestCase):
         with self.assertRaises(ProtocolError):
             parse_request(b"x" * MAX_LINE_BYTES + b"\n")
 
+    def test_recovery_uart_retries_with_a_fresh_socket_after_stale_inode(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "com3.sock"
+            stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            stale.bind(str(path))
+            stale.listen(1)
+            stale.close()
+
+            accepted: list[bool] = []
+
+            def publish_replacement() -> None:
+                import time
+
+                time.sleep(0.1)
+                path.unlink()
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+                    listener.bind(str(path))
+                    listener.listen(1)
+                    connection, _ = listener.accept()
+                    connection.close()
+                    accepted.append(True)
+
+            thread = threading.Thread(target=publish_replacement)
+            thread.start()
+            with _connect_unix_with_retry(path, 1.0):
+                pass
+            thread.join(timeout=1)
+            self.assertEqual(accepted, [True])
+
     def test_cser3_output_is_terminal_only_and_digest_bound(self) -> None:
         namespace, authority, effect, run, operation, catalog = "tool", "a" * 32, "b" * 32, "c" * 32, "op", "d" * 64
         payload, output = b"body", b"NXSCHD01" + b"x" * 120
-        self.assertEqual(parse_request_v3(request_v3(namespace, authority, effect, run, operation, payload, catalog))[0], "POST")
+        frame = request_v3(namespace, authority, effect, run, operation, payload, catalog)
+        tokens = frame[:-1].decode("ascii").split(" ")
+        self.assertEqual(tokens[-1], digest(" ".join(tokens[:-1]).encode("ascii")))
+        self.assertEqual(parse_request_v3(frame)[0], "POST")
+
+        # CSER3 is part of the checksum preimage. A marker-only rewrite of a
+        # valid CSER2 request used to pass Python's self-parser but is not the
+        # frame emitted by the Rust guest.
+        v2_frame = request_v2(namespace, authority, effect, run, operation, payload, catalog)
+        marker_only_rewrite = b"CSER3" + v2_frame[len(b"CSER2"):]
+        self.assertNotEqual(marker_only_rewrite.split()[-1], tokens[-1].encode("ascii"))
+        with self.assertRaises(ProtocolError):
+            parse_request_v3(marker_only_rewrite)
+
         evidence = evidence_record_digest_v3(namespace, authority, effect, run, operation, digest(payload), catalog,
                                              "succeeded", "success", "child_descriptor_v1", output)
         self.assertIn(b"child_descriptor_v1", response_v3(namespace, authority, effect, run, operation,

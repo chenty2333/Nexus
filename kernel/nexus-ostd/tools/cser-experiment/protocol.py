@@ -293,7 +293,12 @@ def request_v3(namespace_id: str, authority_id: str, effect_id: str, run_id: str
     """CSER3 uses the CSER2 request identity but asks for a typed output reply."""
     frame = request_v2(namespace_id, authority_id, effect_id, run_id, operation_key, payload,
                        catalog_digest, method, expected_input_digest)
-    return b"CSER3" + frame[len(b"CSER2"):]
+    tokens = frame[:-1].decode("ascii").split(" ")
+    tokens[0] = "CSER3"
+    # The wire version is part of the checksum preimage. Replacing only the
+    # marker would create a self-consistent Python fixture that the real Rust
+    # CSER3 encoder correctly rejects.
+    return (" ".join(tokens[:-1] + [_checksum(tokens[:-1])]) + "\n").encode("ascii")
 
 
 def response_v3(namespace_id: str, authority_id: str, effect_id: str, run_id: str,
@@ -335,9 +340,21 @@ def response_v3(namespace_id: str, authority_id: str, effect_id: str, run_id: st
 
 def parse_request_v3(line: bytes) -> tuple[str, str, str, str, str, str, str, str, bytes]:
     """Parse the CSER3 request; its field layout intentionally matches CSER2."""
-    if not line.startswith(b"CSER3 "):
+    if not line.endswith(b"\n") or len(line) > MAX_LINE_BYTES:
         raise ProtocolError("invalid v3 request frame")
-    return parse_request_v2(b"CSER2" + line[len(b"CSER3"):])
+    try:
+        fields = line[:-1].decode("ascii").split(" ")
+    except UnicodeDecodeError as exc:
+        raise ProtocolError("v3 frame is not ASCII") from exc
+    if len(fields) != 12 or fields[:2] != ["CSER3", "REQ"]:
+        raise ProtocolError("invalid v3 request frame")
+    if not _HEX64.fullmatch(fields[-1]) or fields[-1] != _checksum(fields[:-1]):
+        raise ProtocolError("invalid request checksum")
+    # Reuse the identical field validation only after authenticating the
+    # original CSER3 preimage, then provide a fresh internal CSER2 checksum.
+    fields[0] = "CSER2"
+    fields[-1] = _checksum(fields[:-1])
+    return parse_request_v2((" ".join(fields) + "\n").encode("ascii"))
 
 
 def response(

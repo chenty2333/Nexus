@@ -21,9 +21,14 @@ phase=${CSER_EXPERIMENT_PHASE:-initial}
 provider_delay_ms=${CSER_EXPERIMENT_PROVIDER_DELAY_MS:-0}
 worker_count=${CSER_EXPERIMENT_WORKER_COUNT:-1}
 background_jobs=${CSER_EXPERIMENT_BACKGROUND_JOBS:-0}
+lane=${CSER_EXPERIMENT_LANE:-tool-dma}
 
-case "$variant" in
-  cser)
+case "$lane" in
+  tool-dma|handoff) ;;
+  *) echo "qemu_boot: invalid experiment lane: $lane" >&2; exit 2 ;;
+esac
+case "$variant:$lane" in
+  cser:tool-dma)
     if [[ ${CSER_EXPERIMENT_JOURNAL_VNEXT:-0} == 1 ]]; then
       scheme=tool-dma-cser-vnext
       artifact_dir="$root/artifacts/tool-dma-cser-vnext"
@@ -32,9 +37,18 @@ case "$variant" in
       artifact_dir="$root/artifacts/tool-dma-cser"
     fi
     ;;
-  baseline) scheme=tool-dma-baseline; artifact_dir="$root/artifacts/tool-dma-baseline" ;;
+  baseline:tool-dma) scheme=tool-dma-baseline; artifact_dir="$root/artifacts/tool-dma-baseline" ;;
+  # This lane has deliberately separate artifacts from Tool+DMA. The baseline
+  # scheme name is reserved here so the paired arm cannot accidentally inherit
+  # the CSER envelope when its guest runtime lands.
+  cser:handoff) scheme=tool-handoff-cser; artifact_dir="$root/artifacts/tool-handoff-cser" ;;
+  baseline:handoff) scheme=tool-handoff-baseline; artifact_dir="$root/artifacts/tool-handoff-baseline" ;;
   *) echo "qemu_boot: invalid variant: $variant" >&2; exit 2 ;;
 esac
+[[ $lane != handoff || ${CSER_EXPERIMENT_JOURNAL_VNEXT:-0} != 1 ]] || {
+  echo "qemu_boot: handoff lane does not select the vNext journal" >&2
+  exit 2
+}
 case "$phase" in initial|recovery) ;; *) echo "qemu_boot: invalid phase: $phase" >&2; exit 2 ;; esac
 [[ $run_id =~ ^[0-9a-f]{32}$ ]] || { echo "qemu_boot: invalid run id" >&2; exit 2; }
 [[ $catalog_digest =~ ^[0-9a-f]{64}$ ]] || { echo "qemu_boot: invalid catalog digest" >&2; exit 2; }
@@ -96,12 +110,23 @@ if [[ $phase == initial ]]; then
     # it still needs an authenticated empty NV layout before quarantine.
     "$root/scripts/provision-cser-tpm-nv.sh" --experiment-blank "$artifact_dir/tpmstate"
   fi
-  rm -f "$artifact_dir/com2-tool.sock" "$artifact_dir/com3-crash.sock" "$artifact_dir/swtpm-qemu.sock"
 fi
 
+# A crash-killed QEMU leaves its Unix socket path behind. Remove those stale
+# inodes before every boot so recovery helpers cannot race or attach to the
+# prior boot's transport endpoint. The new QEMU instance remains the sole
+# publisher of both wait=on sockets.
+rm -f "$artifact_dir/com2-tool.sock" "$artifact_dir/com3-crash.sock" "$artifact_dir/swtpm-qemu.sock"
+
 database="$trial_dir/tool-endpoint.sqlite"
+provider_database=
 port_file="$trial_dir/tool-endpoint.port"
 endpoint_log="$trial_dir/endpoint.stderr.log"
+child_database=
+child_provider_database=
+child_port_file=
+child_endpoint_log=
+child_effect_id=
 bridge_ready="$trial_dir/bridge.startup-ready.json"
 bridge_status="$trial_dir/bridge.status.json"
 bridge_log="$trial_dir/bridge.stderr.log"
@@ -110,6 +135,7 @@ sink_status="$trial_dir/recovery-sink.status.json"
 sink_log="$trial_dir/recovery-sink.stderr.log"
 rm -f -- "$port_file" "$bridge_ready" "$bridge_status" "$sink_ready" "$sink_status"
 endpoint_pid=
+child_endpoint_pid=
 bridge_pid=
 crash_sink_pid=
 background_pid=
@@ -181,38 +207,79 @@ cleanup() {
   [[ -z ${crash_sink_pid:-} ]] || kill "$crash_sink_pid" 2>/dev/null || true
   [[ -z ${bridge_pid:-} ]] || kill "$bridge_pid" 2>/dev/null || true
   [[ -z ${endpoint_pid:-} ]] || kill "$endpoint_pid" 2>/dev/null || true
+  [[ -z ${child_endpoint_pid:-} ]] || kill "$child_endpoint_pid" 2>/dev/null || true
   [[ -z ${background_pid:-} ]] || kill "$background_pid" 2>/dev/null || true
   wait "${crash_sink_pid:-}" 2>/dev/null || true
   wait "${bridge_pid:-}" 2>/dev/null || true
   wait "${endpoint_pid:-}" 2>/dev/null || true
+  wait "${child_endpoint_pid:-}" 2>/dev/null || true
   wait "${background_pid:-}" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
 
-python3 "$root/tools/cser-experiment/tool_endpoint.py" \
-  --database "$database" --namespace "$namespace" --authority-id "$authority_id" --effect-id "$effect_id" --catalog-digest "$catalog_digest" \
-  --port 0 --port-file "$port_file" --provider-delay-ms "$provider_delay_ms" --worker-count "$worker_count" 2>>"$endpoint_log" &
-endpoint_pid=$!
-for _ in {1..100}; do
-  if [[ -s $port_file ]]; then break; fi
-  kill -0 "$endpoint_pid" 2>/dev/null || stage_fail endpoint-connect "endpoint exited before publishing a port; see $endpoint_log"
-  sleep .05
-done
-[[ -s $port_file ]] || stage_fail endpoint-connect "endpoint did not publish its port; see $endpoint_log"
-port=$(<"$port_file")
-[[ $port =~ ^[1-9][0-9]*$ && $port -le 65535 ]] || stage_fail endpoint-connect "endpoint published invalid port"
-endpoint_ready=false
-for _ in {1..100}; do
-  if python3 - "$port" <<'PY' >/dev/null 2>&1
+start_endpoint() {
+  local stage=$1 database_path=$2 provider_database_path=$3 effect=$4 endpoint_port_file=$5 endpoint_stderr_log=$6
+  local endpoint_args=(
+    --database "$database_path"
+    --namespace "$namespace" --authority-id "$authority_id" --effect-id "$effect" --catalog-digest "$catalog_digest"
+    --port 0 --port-file "$endpoint_port_file" --provider-delay-ms "$provider_delay_ms" --worker-count "$worker_count"
+  )
+  [[ -z $provider_database_path ]] || endpoint_args+=(--provider-database "$provider_database_path")
+  python3 "$root/tools/cser-experiment/tool_endpoint.py" "${endpoint_args[@]}" 2>>"$endpoint_stderr_log" &
+  local pid=$!
+  for _ in {1..100}; do
+    if [[ -s $endpoint_port_file ]]; then break; fi
+    kill -0 "$pid" 2>/dev/null || stage_fail "$stage" "endpoint exited before publishing a port; see $endpoint_stderr_log"
+    sleep .05
+  done
+  [[ -s $endpoint_port_file ]] || stage_fail "$stage" "endpoint did not publish its port; see $endpoint_stderr_log"
+  local endpoint_port
+  endpoint_port=$(<"$endpoint_port_file")
+  [[ $endpoint_port =~ ^[1-9][0-9]*$ && $endpoint_port -le 65535 ]] || stage_fail "$stage" "endpoint published invalid port"
+  local endpoint_ready=false
+  for _ in {1..100}; do
+    if python3 - "$endpoint_port" <<'PY' >/dev/null 2>&1
 import socket, sys
 s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=.1)
 s.close()
 PY
-  then endpoint_ready=true; break; fi
-  sleep .05
-done
-kill -0 "$endpoint_pid" 2>/dev/null || stage_fail endpoint-connect "endpoint exited before accepting TCP; see $endpoint_log"
-[[ $endpoint_ready == true ]] || stage_fail endpoint-connect "endpoint did not accept TCP before deadline; see $endpoint_log"
+    then endpoint_ready=true; break; fi
+    sleep .05
+  done
+  kill -0 "$pid" 2>/dev/null || stage_fail "$stage" "endpoint exited before accepting TCP; see $endpoint_stderr_log"
+  [[ $endpoint_ready == true ]] || stage_fail "$stage" "endpoint did not accept TCP before deadline; see $endpoint_stderr_log"
+  started_endpoint_pid=$pid
+  started_endpoint_port=$endpoint_port
+}
+
+if [[ $lane == handoff ]]; then
+  # Keep the two v3 stores and their provider ledgers physically distinct. The
+  # child identity is a transport identity, not an alias of the parent effect.
+  child_effect_id=$(PYTHONPATH="$root/tools/cser-experiment${PYTHONPATH:+:$PYTHONPATH}" python3 - "$namespace" "$authority_id" "$effect_id" "$run_id" "$catalog_digest" <<'PY'
+import sys
+from handoff_identity import child_transport_effect_id
+print(child_transport_effect_id(*sys.argv[1:]))
+PY
+)
+  [[ $child_effect_id =~ ^[0-9a-f]{32}$ ]] || stage_fail handoff-identity "derived invalid child effect id"
+  database="$trial_dir/handoff-parent-endpoint.sqlite"
+  provider_database="$trial_dir/handoff-parent-provider.sqlite"
+  port_file="$trial_dir/handoff-parent-endpoint.port"
+  endpoint_log="$trial_dir/handoff-parent-endpoint.stderr.log"
+  child_database="$trial_dir/handoff-child-endpoint.sqlite"
+  child_provider_database="$trial_dir/handoff-child-provider.sqlite"
+  child_port_file="$trial_dir/handoff-child-endpoint.port"
+  child_endpoint_log="$trial_dir/handoff-child-endpoint.stderr.log"
+fi
+rm -f -- "$port_file" "${child_port_file:-}"
+start_endpoint endpoint-connect "$database" "$provider_database" "$effect_id" "$port_file" "$endpoint_log"
+endpoint_pid=$started_endpoint_pid
+port=$started_endpoint_port
+if [[ $lane == handoff ]]; then
+  start_endpoint child-endpoint-connect "$child_database" "$child_provider_database" "$child_effect_id" "$child_port_file" "$child_endpoint_log"
+  child_endpoint_pid=$started_endpoint_pid
+  child_port=$started_endpoint_port
+fi
 
 # The performance lane can submit bounded, distinct host-local provider jobs
 # before boot. These are deliberately not guest effects or CSER claims. They
@@ -241,12 +308,18 @@ PY
 fi
 
 bridge_args=(
-  --socket "$artifact_dir/com2-tool.sock" --run-id "$run_id" --endpoint-port "$port" --cser2
+  --socket "$artifact_dir/com2-tool.sock" --run-id "$run_id" --endpoint-port "$port"
   --namespace-id "$namespace" --authority-id "$authority_id" --effect-id "$effect_id" --catalog-digest "$catalog_digest"
   --connect-timeout 90 --request-timeout 90 --startup-ready-file "$bridge_ready"
   --status-file "$bridge_status"
 )
-[[ $phase != recovery ]] || bridge_args+=(--allow-no-request)
+if [[ $lane == handoff ]]; then
+  bridge_args+=(--handoff-cser3 --child-endpoint-port "$child_port"
+    --handoff-parent-root 0x48414e44 --handoff-parent-sequence 1 --handoff-parent-component 6)
+else
+  bridge_args+=(--cser2)
+  [[ $phase != recovery ]] || bridge_args+=(--allow-no-request)
+fi
 python3 "$root/tools/cser-experiment/uart_http_bridge.py" \
   "${bridge_args[@]}" 2>>"$bridge_log" &
 bridge_pid=$!

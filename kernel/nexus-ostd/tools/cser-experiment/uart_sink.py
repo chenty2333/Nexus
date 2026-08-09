@@ -76,6 +76,22 @@ def consume_recovery_uart(
     raise RuntimeError("recovery UART firmware preamble exceeded bound")
 
 
+def _connect_unix_with_retry(socket_path: Path, timeout: float) -> socket.socket:
+    """Connect after QEMU publishes COM3, recreating a failed stream socket."""
+    deadline = time.monotonic() + timeout
+    last_error: OSError | None = None
+    while time.monotonic() < deadline:
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            client.connect(str(socket_path.resolve()))
+            return client
+        except OSError as exc:
+            last_error = exc
+            client.close()
+            time.sleep(0.05)
+    raise RuntimeError(f"UART socket unavailable: {last_error}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--socket", required=True, type=Path)
@@ -93,21 +109,10 @@ def main() -> None:
     _write_signal(args.startup_ready_file, "ready")
     _write_signal(args.status_file, "starting")
     try:
-        deadline = time.monotonic() + args.connect_timeout
-        last_error: OSError | None = None
-        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        while time.monotonic() < deadline:
-            try:
-                client.connect(str(args.socket.resolve()))
-                _write_signal(args.status_file, "connected")
-                break
-            except OSError as exc:
-                last_error = exc
-                time.sleep(0.05)
-        else:
-            raise RuntimeError(f"UART socket unavailable: {last_error}")
-
-        consume_recovery_uart(client, args.run_id, args.catalog_digest, args.namespace_id, args.authority_id, args.effect_id, args.uart_pace_seconds)
+        with _connect_unix_with_retry(args.socket, args.connect_timeout) as client:
+            _write_signal(args.status_file, "connected")
+            consume_recovery_uart(client, args.run_id, args.catalog_digest, args.namespace_id,
+                                  args.authority_id, args.effect_id, args.uart_pace_seconds)
         _write_signal(args.status_file, "closed")
     except (OSError, RuntimeError, ValueError) as exc:
         _write_signal(args.status_file, "failed", stage="recovery-receipt", detail=str(exc))

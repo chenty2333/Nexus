@@ -286,6 +286,11 @@ def serve_handoff_session(client: socket.socket, *, parent_endpoint: tuple[str, 
             raise BridgeStageError("frame-complete", ProtocolError("GET/404 retry changed durable key"))
         endpoint = child_endpoint if is_child else parent_endpoint
         if method == "POST":
+            if state["retry"] != seen:
+                raise BridgeStageError(
+                    "frame-complete",
+                    ProtocolError("POST lacks exact GET/404 retry authority"),
+                )
             if state["posts"]:
                 raise BridgeStageError("frame-complete", ProtocolError("identity issued a second POST"))
             status, record = post_v3(endpoint, namespace, authority, effect, run, operation, input_digest, catalog, payload)

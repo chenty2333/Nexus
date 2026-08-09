@@ -14,8 +14,9 @@ def child_transport_effect_id(namespace_id: str, authority_id: str, parent_effec
                               run_id: str, catalog_digest: str) -> str:
     """Derive the child transport effect from the complete parent identity.
 
-    The digest preimage is domain-separated and each ASCII field is u64-LE
-    length-delimited.  The first 16 digest bytes are the wire identifier; the
+    The digest preimage is domain-separated. The ASCII namespace and the raw
+    decoded authority, parent-effect, run, and catalog bytes are each u64-LE
+    length-delimited. The first 16 digest bytes are the wire identifier; the
     astronomically unlikely all-zero value is canonically remapped to one.
     Rust must use this exact construction.
     """
@@ -84,5 +85,22 @@ def expected_child_request(wire: bytes, *, parent: ParentDescriptorContext) -> t
         b"nexus-cser-tool-key-v1",
         (parent.root.to_bytes(8, "little"), sequence.to_bytes(8, "little"),
          component.to_bytes(4, "little"), claim.to_bytes(8, "little")),
+    ).hex()
+    return operation, payload, digest(payload)
+
+
+def expected_source_request(*, parent: ParentDescriptorContext,
+                            claim: int = 0x6501) -> tuple[str, bytes, str]:
+    """Derive the fixed discovery request accepted by the bounded source lane."""
+    payload = (
+        f"discover-child-v1:{parent.root:016x}:{parent.sequence:016x}:"
+        f"{parent.component:08x}"
+    ).encode("ascii")
+    operation = _hash_parts(
+        b"nexus-cser-tool-key-v1",
+        (parent.root.to_bytes(8, "little"),
+         parent.sequence.to_bytes(8, "little"),
+         parent.component.to_bytes(4, "little"),
+         claim.to_bytes(8, "little")),
     ).hex()
     return operation, payload, digest(payload)

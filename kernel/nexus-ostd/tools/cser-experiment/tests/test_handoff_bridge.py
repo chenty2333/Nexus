@@ -95,19 +95,26 @@ class HandoffSessionTests(unittest.TestCase):
                 "evidence_record_digest": evidence_record_digest_v3(namespace, authority, effect, run, operation, input_digest, catalog, state, result, output_kind, output),
                 "created_at_ns": "1", "updated_at_ns": "1", "expires_at_ns": "2", "replayed": "false"}
 
-    def _run(self, frames: list[bytes], responses: list[tuple[int, dict[str, str]]]) -> None:
+    def _run(self, frames: list[bytes], posts: list[tuple[int, dict[str, str]]],
+             gets: list[tuple[int, dict[str, str]]]) -> None:
         with patch.object(bridge, "_read_request_frame", side_effect=frames), \
-             patch.object(bridge, "post_v3", side_effect=responses), \
+             patch.object(bridge, "post_v3", side_effect=posts), \
+             patch.object(bridge, "get_v3", side_effect=gets), \
              patch.object(bridge, "paced_sendall"):
             bridge.serve_handoff_session(self.Socket(), parent_endpoint=("p", 1), child_endpoint=("c", 2),
                                          parent_identity=self.parent, parent_descriptor=self.context)
 
     def test_happy_parent_then_exact_child(self) -> None:
         child = (self.namespace, self.authority, self.child_effect, self.run_id, self.catalog)
-        frames = [request_v3(*self.parent[:3], self.run_id, self.operation, self.payload, self.catalog),
+        frames = [request_v3(*self.parent[:3], self.run_id, self.operation, b"", self.catalog,
+                             method="GET", expected_input_digest=self.parent_input),
+                  request_v3(*self.parent[:3], self.run_id, self.operation, self.payload, self.catalog),
+                  request_v3(*child[:3], self.run_id, self.child_operation, b"", self.catalog,
+                             method="GET", expected_input_digest=self.child_input),
                   request_v3(*child[:3], self.run_id, self.child_operation, self.child_payload, self.catalog)]
         self._run(frames, [(200, self._record(self.parent, self.operation, self.parent_input, output_kind="child_descriptor_v1", output=self.wire)),
-                           (200, self._record(child, self.child_operation, self.child_input, output_kind="none", output=b""))])
+                           (200, self._record(child, self.child_operation, self.child_input, output_kind="none", output=b""))],
+                  [(404, {}), (404, {})])
 
     def test_rejects_child_before_parent_and_cross_effect_and_bad_child_request(self) -> None:
         child = (self.namespace, self.authority, self.child_effect, self.run_id, self.catalog)
@@ -118,10 +125,13 @@ class HandoffSessionTests(unittest.TestCase):
             with patch.object(bridge, "_read_request_frame", return_value=frame):
                 with self.assertRaises(bridge.BridgeStageError):
                     bridge.serve_handoff_session(self.Socket(), parent_endpoint=("p", 1), child_endpoint=("c", 2), parent_identity=self.parent, parent_descriptor=self.context)
+        parent_get = request_v3(*self.parent[:3], self.run_id, self.operation, b"", self.catalog,
+                                method="GET", expected_input_digest=self.parent_input)
         parent_frame = request_v3(*self.parent[:3], self.run_id, self.operation, self.payload, self.catalog)
         bad_child = request_v3(*child[:3], self.run_id, "wrong", b"bad", self.catalog)
-        with patch.object(bridge, "_read_request_frame", side_effect=[parent_frame, bad_child]), \
+        with patch.object(bridge, "_read_request_frame", side_effect=[parent_get, parent_frame, bad_child]), \
              patch.object(bridge, "post_v3", return_value=(200, self._record(self.parent, self.operation, self.parent_input, output_kind="child_descriptor_v1", output=self.wire))), \
+             patch.object(bridge, "get_v3", return_value=(404, {})), \
              patch.object(bridge, "paced_sendall"):
             with self.assertRaises(bridge.BridgeStageError):
                 bridge.serve_handoff_session(self.Socket(), parent_endpoint=("p", 1), child_endpoint=("c", 2), parent_identity=self.parent, parent_descriptor=self.context)
@@ -132,27 +142,31 @@ class HandoffSessionTests(unittest.TestCase):
             with self.assertRaises(ProtocolError):
                 bridge.serve_handoff_session(self.Socket(), parent_endpoint=("p", 1), child_endpoint=("c", 2), parent_identity=self.parent, parent_descriptor=self.context)
         frame = request_v3(*self.parent[:3], self.run_id, self.operation, self.payload, self.catalog)
-        with patch.object(bridge, "_read_request_frame", return_value=frame), patch.object(bridge, "post_v3", return_value=(404, {})):
-            with self.assertRaises(bridge.BridgeStageError):
+        with patch.object(bridge, "_read_request_frame", return_value=frame):
+            with self.assertRaisesRegex(bridge.BridgeStageError, "GET/404"):
                 bridge.serve_handoff_session(self.Socket(), parent_endpoint=("p", 1), child_endpoint=("c", 2), parent_identity=self.parent, parent_descriptor=self.context)
 
     def test_child_terminal_get_binds_operation_and_input_but_has_empty_wire_payload(self) -> None:
         child = (self.namespace, self.authority, self.child_effect, self.run_id, self.catalog)
-        frames = [request_v3(*self.parent[:3], self.run_id, self.operation, self.payload, self.catalog),
+        frames = [request_v3(*self.parent[:3], self.run_id, self.operation, b"", self.catalog,
+                             method="GET", expected_input_digest=self.parent_input),
+                  request_v3(*self.parent[:3], self.run_id, self.operation, self.payload, self.catalog),
                   request_v3(*child[:3], self.run_id, self.child_operation, b"", self.catalog,
                              method="GET", expected_input_digest=self.child_input)]
         parent_record = self._record(self.parent, self.operation, self.parent_input, output_kind="child_descriptor_v1", output=self.wire)
         child_record = self._record(child, self.child_operation, self.child_input, output_kind="none", output=b"")
         with patch.object(bridge, "_read_request_frame", side_effect=frames), \
              patch.object(bridge, "post_v3", return_value=(200, parent_record)), \
-             patch.object(bridge, "get_v3", return_value=(200, child_record)), \
+             patch.object(bridge, "get_v3", side_effect=[(404, {}), (200, child_record)]), \
              patch.object(bridge, "paced_sendall"):
             bridge.serve_handoff_session(self.Socket(), parent_endpoint=("p", 1), child_endpoint=("c", 2),
                                          parent_identity=self.parent, parent_descriptor=self.context)
 
     def test_child_get_404_allows_only_exact_following_post(self) -> None:
         child = (self.namespace, self.authority, self.child_effect, self.run_id, self.catalog)
-        frames = [request_v3(*self.parent[:3], self.run_id, self.operation, self.payload, self.catalog),
+        frames = [request_v3(*self.parent[:3], self.run_id, self.operation, b"", self.catalog,
+                             method="GET", expected_input_digest=self.parent_input),
+                  request_v3(*self.parent[:3], self.run_id, self.operation, self.payload, self.catalog),
                   request_v3(*child[:3], self.run_id, self.child_operation, b"", self.catalog,
                              method="GET", expected_input_digest=self.child_input),
                   request_v3(*child[:3], self.run_id, self.child_operation, self.child_payload, self.catalog)]
@@ -160,7 +174,7 @@ class HandoffSessionTests(unittest.TestCase):
         child_record = self._record(child, self.child_operation, self.child_input, output_kind="none", output=b"")
         with patch.object(bridge, "_read_request_frame", side_effect=frames), \
              patch.object(bridge, "post_v3", side_effect=[(200, parent_record), (200, child_record)]), \
-             patch.object(bridge, "get_v3", return_value=(404, {})), \
+             patch.object(bridge, "get_v3", side_effect=[(404, {}), (404, {})]), \
              patch.object(bridge, "paced_sendall"):
             bridge.serve_handoff_session(self.Socket(), parent_endpoint=("p", 1), child_endpoint=("c", 2),
                                          parent_identity=self.parent, parent_descriptor=self.context)
