@@ -2,10 +2,12 @@
 
 ## Working stance
 
-The catalog-v6 cleanup and the reference-adapter, stability, and measured-
-performance phase recorded below are complete. They remain here as the
-approved design record. The active phase is the late-bound custody
-falsification pilot at the end of this file.
+The catalog-v6 cleanup, reference-adapter, stability, measured-performance,
+and late-bound Gate-0 phases recorded below are complete. They remain here as
+the approved design record. Kubernetes DRA and NVMe Namespace Management did
+not establish the required custody gap, so the synthetic G0/G1 pilot was not
+promoted. The active phase is the evidence-driven asynchronous applicability
+and safe-scaling plan at the end of this file.
 
 Nexus and CSER are still in a single-team research and development phase with
 no external users. Breaking API, catalog, journal-adjacent, documentation, and
@@ -470,3 +472,242 @@ This phase is complete when the workload card is credible or explicitly
 rejected, the fair baseline powers and schedules are frozen, the G0/G1
 portable pilot has reproducible safety and retention results, and one explicit
 Go/No-Go record determines whether a real-QEMU continuation is justified.
+
+## Approved next phase: evidence-driven asynchronous applicability and safe scaling
+
+### Working stance
+
+This remains an early single-team development project. Contracts, workload
+cards, measurement thresholds, and fault cuts are working decisions rather
+than permanent compatibility promises. Change them when implementation or
+evidence shows a better boundary, and record the reason in the current design
+or result. Do not preserve a weak experiment merely because it was once
+written down.
+
+Development flexibility does not relax the safety semantics that the
+experiment is intended to exercise:
+
+- a nonterminal or unavailable outcome is not retirement evidence;
+- infrastructure failure is not a verified application failure;
+- missing quiescence evidence retains the affected physical claim;
+- telemetry loss cannot make an operation absent, terminal, or reusable; and
+- durable state, journal publication, and anchor advancement remain ordered.
+
+The phase has two primary deliverables: a genuinely asynchronous trusted-local
+reference endpoint, and a source-labelled applicability trace pipeline. It
+also implements a bounded single-hop child descriptor/handoff and uses the new
+workload to drive a real performance optimization cycle. It does not build a
+general workflow engine, remote trust platform, or arbitrary dynamic-component
+core.
+
+### 1. Implement the applicability trace contract
+
+Create a versioned event contract whose unit is one sampled effect, not one
+HTTP request. Keep the collector outside the trusted core: failure, delay, or
+event loss may reduce measurement quality but must never alter admission,
+settlement, retirement, or reuse.
+
+Each trace must be able to record:
+
+- a study and endpoint-profile identity;
+- study-local pseudonymous effect, operation, and resource identities;
+- operation and resource classes without payload, prompt, result body, URL,
+  token, tenant name, or raw resource identifiers;
+- source labels for endpoint, worker/provider, guest, allocator gate, device,
+  and operator observations;
+- registered, submitted, accepted, pending, terminal, quiescent, retained,
+  released, gate-rejected, administrative-disposition, and observation-ended
+  events;
+- declared and observed Outcome/Quiescence capabilities;
+- whether an idempotency record, lease, scheduler, attachment gate, workflow
+  database, or another provider-native coordinator already owns first
+  observation;
+- executor, endpoint, and resource-authority domains;
+- relative monotonic timing, bounded wall-clock buckets where useful, source
+  confidence, and reason codes; and
+- dropped-source counts and right-censoring for incomplete observations.
+
+Keep declaration, observation, system result, and research inference separate.
+Missing events become unknown or right-censored, never absent. Use a per-study
+HMAC salt for published identities and retain raw source-labelled traces
+locally. Every aggregate must state the sampled denominator; a reference-
+adapter run validates the pipeline but does not establish industry prevalence.
+
+Implement a bounded recorder, schema validator, and aggregator. Produce a raw
+JSONL or SQLite trace plus a summary containing denominator, terminal outcome,
+quiescence, retained/released claims, gate decisions, administrative outcomes,
+right-censored effects, and missing-source counts.
+
+### 2. Turn the reference endpoint into a real asynchronous service
+
+The current Store already models Accepted, Pending, Succeeded, Failed, and
+Expired, but normal HTTP POST completes synchronously. Make the asynchronous
+contract real rather than exposing a test-only transition.
+
+Use two independently durable domains in the reference implementation:
+
+- the adapter database stores operation identity, Accepted/Pending state,
+  worker scheduling, and immutable terminal evidence; and
+- a provider database stores the controlled external effect, exact-key
+  deduplication, and queryable outcome.
+
+POST must durably create Accepted state and a queue entry before returning
+202. A worker transactionally acquires a lease, persists Pending, executes
+outside the database lock, and commits Succeeded or Failed through a matching
+lease token. Lease expiry permits recovery, but never supplies exactly-once by
+itself: the provider must accept the complete operation identity as an
+idempotency key or support exact outcome queries. Recovery must query before
+redispatch when apply may have happened.
+
+Failed means a verified application result. Timeout, transport failure,
+worker death, retry exhaustion, and provider unavailability remain Pending or
+unknown and preserve custody. Separate operational retry deadlines from
+terminal-evidence retention. Accepted and Pending must not age into apparent
+completion; terminal evidence starts its retention clock only when a terminal
+record is durably created. Expired terminal evidence remains a fail-closed
+tombstone.
+
+Version the changed HTTP/database contract rather than preserving accidental
+v2 behavior. A migration may deliberately fail closed; there are no external
+compatibility obligations.
+
+Cover at least these focused recovery boundaries, adjusting exact cuts as the
+implementation evolves:
+
+- Accepted committed before a worker claims it;
+- Pending committed before provider apply;
+- provider apply committed before adapter terminal commit;
+- terminal commit before the client receives a reply;
+- competing worker leases;
+- endpoint, worker, and provider restart; and
+- duplicate POST in every observable state.
+
+### 3. Teach the guest to reconcile nonterminal operations
+
+Represent endpoint results explicitly as terminal, nonterminal, absent,
+expired, or transport/protocol failure. Accepted and Pending keep the effect
+and claims live. The guest may use bounded polling with yield/backoff, but
+exhausting a polling budget only ends the current recovery attempt; it does not
+create a business failure or retirement evidence.
+
+Recovery first performs an exact identity query. Pending never authorizes a
+new operation. Preserve the narrow exact-404 retry rule, the 410 tombstone, and
+full identity/checksum/evidence verification for terminal records. Tool
+outcome and DMA quiescence continue to retire independently.
+
+Add a small number of focused host/QEMU scenarios for asynchronous completion,
+Pending across a crash, provider apply before terminal commit, indefinite
+Pending retention, and tool-before-DMA retirement. The cuts are development
+regressions, not a frozen exhaustive matrix; reuse the existing matrix only
+where it materially reduces duplicated setup.
+
+### 4. Add a bounded child descriptor and single-hop handoff
+
+First extend terminal output with a bounded, digest-bound result capable of
+carrying `ChildDescriptorV1`. The descriptor binds parent and child identities,
+route or discovery digest, child profile, exact resource generation, input
+digest, catalog digest, and schema version. Derive a stable child identity from
+the parent, sequence, and descriptor digest. Carry the descriptor through the
+endpoint evidence path, never through COM3 or another unbound harness flag.
+
+Implement one adapter/runtime-level handoff using existing ordinary child
+effects under the same root:
+
+`A retained -> descriptor durable -> create B -> enroll exact B claim ->
+prepare B -> release A -> permit B first observation`.
+
+Keep a safe overlap across crashes, make creation/adoption idempotent, and give
+the comparison baseline the same descriptor. The runtime policy may enforce
+the single-hop sequence without teaching the core a general causal graph.
+Use a few focused cuts around discovery, child enrollment, parent release, and
+child publication; adjust them when they cease to illuminate the code.
+
+Do not add arbitrary component insertion, nested workflow graphs, recursive
+retirement, or a general reverse child index in this phase. If the adapter
+cannot make the handoff recoverable without a core guard, stop that slice and
+specify the smallest required invariant separately before changing the core.
+
+### 5. Build phase-resolved performance evidence
+
+Use the asynchronous endpoint and recovery path as the primary workload.
+Expose default-off measurements for candidate-state construction, clone,
+canonical invariant checking, projection digest, journal append/sync/readback,
+TPM anchor work, runtime mutex queue/hold time, endpoint queue/provider time,
+live claims, journal fill, and recovery latency.
+
+Run representative development sweeps over small and large live state,
+journal fill, delayed endpoint completion, and available concurrency. The
+exact sizes and repetitions are tunable; retain enough fixed points to compare
+before and after results. Distinguish diagnostic cycle counts from calibrated
+time.
+
+### 6. Replace the accumulating double-bank journal with append/checkpoint
+
+The measured double-bank layout has structural cumulative rewrite
+amplification. Implement an append-oriented journal generation with:
+
+- sequential hash-chained records;
+- length, revision, previous-head, and checksum validation;
+- redundant committed headers or superblocks;
+- record flush and readback before committed-head publication;
+- journal publication before trusted-anchor advancement;
+- bounded checkpoint/compaction into an alternate segment; and
+- recovery that selects the newest valid committed prefix and ignores an
+  uncommitted tail.
+
+Because this is a development tree, use a new schema and fail closed on old or
+ambiguous media rather than carrying compatibility machinery without value.
+Exercise representative torn record, torn header, interrupted checkpoint,
+readback failure, corrupt reopen, fill, and second-recovery cases. The list is
+adjustable, but the publication and replay invariants are not.
+
+Re-run the same phase measurements and report sectors, bytes, flushes,
+readback, fill behavior, transition latency, and recovery cost before and
+after.
+
+### 7. Optimize core state or runtime serialization only when observed
+
+If clone, invariant, or digest work is material in the integrated workload,
+introduce a transaction-local overlay, copy-on-write state, or incremental
+indexes/digests. Retain the canonical full checker and full projection digest
+as differential test/debug oracles. No cache or fast index may make a corrupt
+or conflicting state admissible.
+
+If multiple writers create material runtime queueing, consider preparing a
+candidate outside the authoritative mutex and committing it only after exact
+base-revision revalidation. Keep journal and anchor publication ordered; do
+not expose uncommitted state or external effects. Do not split the mutex merely
+because telemetry exists, especially while the production scheduler remains
+BSP-oriented.
+
+Measurement gates in this section are development judgments, not permanent
+thresholds. Record why an optimization was taken or deferred and keep the
+before/after workload comparable.
+
+### 8. Applicability sample and completion standard
+
+Use the collector on the new asynchronous adapter and on at least one bounded,
+source-identified endpoint or local system workload. Good candidates include
+agent code/sandbox workers, asynchronous batch or CI jobs, fire-and-forget
+negative controls, and local accelerator/RDMA/VFIO/SPDK-style brokers. Treat
+existing schedulers, provider leases, workflow databases, and attachment gates
+as first-class results rather than excluding them.
+
+The implementation phase is complete when:
+
+- POST/Pending/worker/provider/recovery are genuinely asynchronous and
+  preserve exact-key idempotency across the focused crash cases;
+- guest reconciliation never converts nonterminal, expired, unavailable, or
+  missing observations into terminal evidence;
+- the trace pipeline emits source-labelled, drop-aware raw data and honest
+  aggregates for a bounded sample;
+- `ChildDescriptorV1` and the single-hop adapter handoff are evidence-bound,
+  replayable, and do not require a general dynamic-component core;
+- the append/checkpoint journal passes its publication/recovery checks and
+  shows a before/after reduction in cumulative rewrite work; and
+- integrated measurements either justify and validate a core/runtime
+  optimization or record why it remains deferred.
+
+Remote receipt authentication, mTLS, multi-tenancy, SDKs, a general provider
+registry, physical-hardware generalization, and a general workflow graph remain
+outside this phase unless a concrete implementation dependency appears.
