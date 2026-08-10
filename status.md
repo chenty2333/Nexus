@@ -21,11 +21,12 @@ logical outcomes remain subject to reconciliation, while missing quiescence
 evidence retains physical claims and refuses reuse. A programmable per-class
 disposition algebra is not in current scope.
 
-The evidence-driven asynchronous applicability and safe-scaling phase has
-delivered its two primary features: a genuinely asynchronous trusted-local
-reference endpoint and a source-labelled, drop-aware applicability trace. A
-fresh-media vNext journal and whole-state checkpoint path are available behind
-an explicit experimental scheme; the legacy journal remains the default.
+The evidence-driven asynchronous applicability and safe-scaling phase is
+complete. It delivered a genuinely asynchronous trusted-local reference
+endpoint, a source-labelled/drop-aware applicability trace with optional local
+raw retention, phase-resolved development measurements, and a final
+same-segment append/checkpoint vNext journal. vNext remains behind an explicit
+experimental scheme; the legacy journal remains the default.
 
 Late-bound composition remains a falsification target rather than a presumed
 CSER advantage. Kubernetes Job/DRA and NVMe Namespace Management were useful
@@ -77,29 +78,48 @@ quiescence evidence.
 
 The source-labelled trace pipeline uses per-study HMAC pseudonyms, independent
 source status, bounded event counts, role-checked provenance, dropped-event
-accounting, and right-censoring. A committed bounded sample contains one real
+accounting, and right-censoring. Optional local raw retention is
+raw-authoritative: collection first publishes an `incomplete` marker, appends
+and syncs only the source-labelled raw JSONL, validates every raw-to-HMAC
+binding on successful close, then derives the sanitized file and atomically
+pivots the marker to `complete`. Abort and process-failure paths remain
+machine-detectably incomplete. The committed final sample contains one real
 vNext Tool+DMA recovery: endpoint and provider both report the same durable
 success; the exact DMA coordinate is rejected while live and admitted after
 evidence-backed release; physical quiescence remains right-censored because no
 structured device receipt is available. It is a pipeline/applicability sample,
-not a workload-prevalence claim.
+not a workload-prevalence claim. The raw trace and study key remain only under
+the ignored local artifact boundary.
 
 Phase-resolved real-QEMU measurements cover one control, delayed-provider, and
-bounded endpoint-concurrency trial for each journal (`n=1` per point). vNext
-compaction advances revision 24 to 25 and reduces the logical replay image from
-6,673 to 2,615 bytes, costing 44 sector reads, 44 sector writes, and 10 flushes.
-For this small workload its total journal cost is worse than legacy: 359 reads,
-359 writes, and 85 flushes versus 153/153/30. The result supports bounded
-fresh-media replacement and a smaller post-checkpoint image, not a small-log
-performance advantage. Diagnostic TSC values are uncalibrated, and the measured
-recovery scope contains no authoritative runtime transaction, so no mutex
-contention conclusion follows. Core COW/incremental state and mutex splitting
-remain deferred.
+bounded endpoint-concurrency trial for each journal (`n=1` per cell), with
+durable endpoint intervals, explicit launcher boundaries, initial and recovery
+runtime/mutex/journal/TPM telemetry, and uncalibrated publication-span TSC
+diagnostics. At the cut-3 initial marker legacy requested 34/34 sectors and 18
+flushes, while vNext requested 125 reads, 45 writes, and 45 flushes. At terminal
+recovery the cumulative values were 153/153/30 and 644/95/85 respectively.
+vNext compaction advances revision 24 to 25 and reduces the logical replay
+image from 6,673 to 2,615 bytes; its measured replacement delta is 74 reads, 20
+writes, and 10 flushes. This small workload therefore does not establish a
+vNext I/O or latency advantage.
 
-The full host discovery suite passes 131 tests with `ResourceWarning` promoted
+The matched 64-KiB MemoryDisk fill profile makes the append tradeoff explicit:
+legacy requested 8,384 reads, 8,384 writes, 256 flushes, and 8,454,144 hash
+bytes; vNext requested 17,148 reads, 768 writes, 640 flushes, and 25,567,168
+hash bytes. The final in-place layout removes cumulative payload-copy write
+amplification in this bounded fill while increasing read, flush, and hashing
+work. The portable release profile covers 1/64/512/4,096 live claims; at 4,096
+the median complete nonpersistent transition was 4.112267 ms. Because that
+host-only scaling cost is not shown material in the small integrated workload,
+core COW/incremental state remains deferred. Recovery executed no authoritative
+runtime transaction, and endpoint-worker overlap is not guest runtime
+contention, so authoritative mutex splitting also remains deferred.
+
+The full host discovery suite passes 142 tests with `ResourceWarning` promoted
 to an error. The core all-feature tests and all-target Clippy gate, production
 cutover assertion, both handoff experiment builds, the full project check, the
-real PIO-journal gate, and the independent baseline-handoff ktest pass. The
+Tool+DMA experiment build, the real PIO-journal gate, and the independent
+baseline-handoff ktest pass. The
 strict matched handoff campaign passes all five cuts for both variants with
 container-kill provenance, 20 terminal recovery receipts, and 20 exact
 endpoint/provider ledgers. The prior GitHub quick and rebaseline jobs are
@@ -107,13 +127,16 @@ green. A further checkpoint-only reboot was not claimed: the saved trial media
 lacked its matching TPM state, so combining it with a different artifact would
 not be valid recovery evidence.
 
-Local `main` is the continuing Nexus development branch. The sanitized
-applicability and matched-handoff evidence bundles are source-bound to their
-executable commits. The handoff bundle publishes the strict aggregate and
-digests of the raw variant metrics; SQLite databases, logs, media, TPM state,
-raw identities, provider records, and the HMAC key remain local. Per the
-current user direction, the sibling `nexus-hotos` checkout and HotOS paper are
-not being configured or published.
+Local `main` is the continuing Nexus development branch. The final asynchronous
+bundle is source-bound to clean implementation commit `e68a76e`, publishes six
+sanitized real-QEMU rows, four portable-core rows, the exact fill profile, and
+the complete HMAC-pseudonymized applicability projection, and hashes 47 local
+raw input roles without publishing them. The matched-handoff bundle remains
+source-bound to its own executable commit. SQLite databases, raw serial logs,
+media, TPM state, raw identities, provider records, the source-labelled raw
+trace, and the HMAC key remain local. Per the current user direction, the
+sibling `nexus-hotos` checkout and HotOS paper are not being configured or
+published.
 
 ## Current Tasks
 

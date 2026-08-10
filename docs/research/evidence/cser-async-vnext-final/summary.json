@@ -1,0 +1,200 @@
+{
+  "applicability": {
+    "bounded_not_prevalence": true,
+    "publication_state": "complete",
+    "published_events": 15,
+    "raw_hmac_commitment": "1458e8d476cedf8bc8f08fa565011d98d4a11be63a147b07559a068bb16b271b",
+    "raw_retained_local": true,
+    "study_id": "cser-final-e68a76e"
+  },
+  "as_of": "2026-08-10",
+  "caveats": [
+    "qemu_cells_are_n_equals_1",
+    "guest_tsc_is_uncalibrated",
+    "launcher_durations_include_boot_qemu_and_emulation",
+    "journal_fill_uses_memorydisk_provider_counters_not_ata_completion",
+    "portable_core_profile_excludes_persistence_endpoint_and_qemu",
+    "no_physical_hardware_or_power_loss_claim"
+  ],
+  "decisions": {
+    "core_cow_or_incremental_state": "defer_integrated_workload_materiality_not_established_by_host_only_portable_profile",
+    "journal_vnext": "retain_experimental_in_place_append_and_checkpoint_path_because_controlled_fill_reduces_writes_and_checkpoint_reduces_replay_image",
+    "runtime_mutex_split": "defer_no_authoritative_runtime_contention_established_recovery_scope_has_zero_transactions",
+    "small_log_performance": "no_advantage_established_vnext_has_more_reads_writes_and_flushes_in_this_qemu_workload"
+  },
+  "journal_fill": {
+    "gate": {
+      "command": "kernel/nexus-ostd/x test-pio-journal",
+      "receipt": "1 passed; 0 failed; CSER_PIO_JOURNAL_KTEST PASS",
+      "result": "pass"
+    },
+    "journals": {
+      "legacy": {
+        "attestations": {
+          "readback_length_validated": true
+        },
+        "measurements": {
+          "flushes": {
+            "calibrated": false,
+            "clock": "not_applicable",
+            "scope": "bounded_64k_fill",
+            "source": "journal_io_telemetry_memorydisk",
+            "unit": "count",
+            "value": 256
+          },
+          "hash_bytes": {
+            "calibrated": false,
+            "clock": "not_applicable",
+            "scope": "bounded_64k_fill",
+            "source": "journal_io_telemetry_memorydisk",
+            "unit": "bytes",
+            "value": 8454144
+          },
+          "sectors_read": {
+            "calibrated": false,
+            "clock": "not_applicable",
+            "scope": "bounded_64k_fill",
+            "source": "journal_io_telemetry_memorydisk",
+            "unit": "count",
+            "value": 8384
+          },
+          "sectors_written": {
+            "calibrated": false,
+            "clock": "not_applicable",
+            "scope": "bounded_64k_fill",
+            "source": "journal_io_telemetry_memorydisk",
+            "unit": "count",
+            "value": 8384
+          }
+        }
+      },
+      "vnext": {
+        "attestations": {
+          "readback_length_validated": true
+        },
+        "framed_bytes": 131072,
+        "measurements": {
+          "flushes": {
+            "calibrated": false,
+            "clock": "not_applicable",
+            "scope": "bounded_64k_fill",
+            "source": "journal_io_telemetry_memorydisk",
+            "unit": "count",
+            "value": 640
+          },
+          "hash_bytes": {
+            "calibrated": false,
+            "clock": "not_applicable",
+            "scope": "bounded_64k_fill",
+            "source": "journal_io_telemetry_memorydisk",
+            "unit": "bytes",
+            "value": 25567168
+          },
+          "sectors_read": {
+            "calibrated": false,
+            "clock": "not_applicable",
+            "scope": "bounded_64k_fill",
+            "source": "journal_io_telemetry_memorydisk",
+            "unit": "count",
+            "value": 17148
+          },
+          "sectors_written": {
+            "calibrated": false,
+            "clock": "not_applicable",
+            "scope": "bounded_64k_fill",
+            "source": "journal_io_telemetry_memorydisk",
+            "unit": "count",
+            "value": 768
+          }
+        },
+        "physical_segments": 2
+      }
+    },
+    "measurement_boundary": "journal_provider_requested_sector_transfers_flushes_and_payload_hash_bytes_not_ata_completion_or_wall_clock",
+    "schema_version": 1,
+    "scope": "qemu_kernel_ktest_memorydisk_algorithmic_profile",
+    "source_commit": "e68a76ea14ec9962b93e9d365011c82fa54a2313",
+    "workload": {
+      "logical_bytes": 65536,
+      "raw_bytes_per_record": 512,
+      "records": 128
+    }
+  },
+  "portable_core": {
+    "clock": "host_monotonic_instant",
+    "largest_profile": {
+      "candidate_clone_median_ns": 1115058,
+      "invariant_median_ns": 1629286,
+      "live_claims": 4096,
+      "projection_digest_median_ns": 1726071,
+      "transition_no_persist_median_ns": 4112267
+    },
+    "live_claims": [
+      1,
+      64,
+      512,
+      4096
+    ],
+    "row_count": 4,
+    "scope": "portable_core_no_persistence"
+  },
+  "qemu": {
+    "all_invariants_ok": true,
+    "all_recovery_terminal": true,
+    "crash_method": "container_kill",
+    "cutpoint": "post_endpoint_apply",
+    "endpoint_concurrency_max_inflight": {
+      "legacy": 2,
+      "vnext": 2
+    },
+    "journal_totals": {
+      "legacy": {
+        "initial": {
+          "flushes": 18,
+          "reads": 34,
+          "writes": 34
+        },
+        "recovery": {
+          "flushes": 30,
+          "reads": 153,
+          "writes": 153
+        }
+      },
+      "vnext": {
+        "initial": {
+          "flushes": 45,
+          "reads": 125,
+          "writes": 45
+        },
+        "recovery": {
+          "flushes": 85,
+          "reads": 644,
+          "writes": 95
+        }
+      }
+    },
+    "journals": [
+      "legacy",
+      "vnext"
+    ],
+    "points": [
+      "control",
+      "delayed_endpoint",
+      "endpoint_concurrency"
+    ],
+    "row_count": 6,
+    "trials_per_cell": 1,
+    "vnext_compaction": {
+      "flushes_delta": 10,
+      "logical_bytes_after": 2615,
+      "logical_bytes_before": 6673,
+      "revision_after": 25,
+      "revision_before": 24,
+      "sectors_read_delta": 74,
+      "sectors_written_delta": 20
+    }
+  },
+  "schema_version": 2,
+  "scope": "development_evidence_not_product_benchmark_or_prevalence",
+  "source_commit": "e68a76ea14ec9962b93e9d365011c82fa54a2313"
+}

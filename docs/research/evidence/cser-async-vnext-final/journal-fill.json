@@ -1,0 +1,98 @@
+{
+  "gate": {
+    "command": "kernel/nexus-ostd/x test-pio-journal",
+    "receipt": "1 passed; 0 failed; CSER_PIO_JOURNAL_KTEST PASS",
+    "result": "pass"
+  },
+  "journals": {
+    "legacy": {
+      "attestations": {
+        "readback_length_validated": true
+      },
+      "measurements": {
+        "flushes": {
+          "calibrated": false,
+          "clock": "not_applicable",
+          "scope": "bounded_64k_fill",
+          "source": "journal_io_telemetry_memorydisk",
+          "unit": "count",
+          "value": 256
+        },
+        "hash_bytes": {
+          "calibrated": false,
+          "clock": "not_applicable",
+          "scope": "bounded_64k_fill",
+          "source": "journal_io_telemetry_memorydisk",
+          "unit": "bytes",
+          "value": 8454144
+        },
+        "sectors_read": {
+          "calibrated": false,
+          "clock": "not_applicable",
+          "scope": "bounded_64k_fill",
+          "source": "journal_io_telemetry_memorydisk",
+          "unit": "count",
+          "value": 8384
+        },
+        "sectors_written": {
+          "calibrated": false,
+          "clock": "not_applicable",
+          "scope": "bounded_64k_fill",
+          "source": "journal_io_telemetry_memorydisk",
+          "unit": "count",
+          "value": 8384
+        }
+      }
+    },
+    "vnext": {
+      "attestations": {
+        "readback_length_validated": true
+      },
+      "framed_bytes": 131072,
+      "measurements": {
+        "flushes": {
+          "calibrated": false,
+          "clock": "not_applicable",
+          "scope": "bounded_64k_fill",
+          "source": "journal_io_telemetry_memorydisk",
+          "unit": "count",
+          "value": 640
+        },
+        "hash_bytes": {
+          "calibrated": false,
+          "clock": "not_applicable",
+          "scope": "bounded_64k_fill",
+          "source": "journal_io_telemetry_memorydisk",
+          "unit": "bytes",
+          "value": 25567168
+        },
+        "sectors_read": {
+          "calibrated": false,
+          "clock": "not_applicable",
+          "scope": "bounded_64k_fill",
+          "source": "journal_io_telemetry_memorydisk",
+          "unit": "count",
+          "value": 17148
+        },
+        "sectors_written": {
+          "calibrated": false,
+          "clock": "not_applicable",
+          "scope": "bounded_64k_fill",
+          "source": "journal_io_telemetry_memorydisk",
+          "unit": "count",
+          "value": 768
+        }
+      },
+      "physical_segments": 2
+    }
+  },
+  "measurement_boundary": "journal_provider_requested_sector_transfers_flushes_and_payload_hash_bytes_not_ata_completion_or_wall_clock",
+  "schema_version": 1,
+  "scope": "qemu_kernel_ktest_memorydisk_algorithmic_profile",
+  "source_commit": "e68a76ea14ec9962b93e9d365011c82fa54a2313",
+  "workload": {
+    "logical_bytes": 65536,
+    "raw_bytes_per_record": 512,
+    "records": 128
+  }
+}

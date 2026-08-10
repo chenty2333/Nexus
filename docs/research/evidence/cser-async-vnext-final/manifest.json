@@ -1,0 +1,289 @@
+{
+  "applicability_raw_inputs": [
+    {
+      "role": "experiment_identity",
+      "sha256": "2607a0cd89e4ee85b81211524c1311f78796705592afabd66ffcd8973712dd88"
+    },
+    {
+      "role": "endpoint_database",
+      "sha256": "bac727dbce48d1d8f4ed4a8b7f455afa0dbeafa94babc0cf933632d4e863a99f"
+    },
+    {
+      "role": "provider_database",
+      "sha256": "00d80a88a26464365ead05b191c1846da59b071d49e1e4afc45b61b93e063c20"
+    },
+    {
+      "role": "initial_serial_log",
+      "sha256": "6460617798a8030ddc331a76a58a0793670c2ec5d66e6cb5b0688f36bab753c2"
+    },
+    {
+      "role": "recovery_serial_log",
+      "sha256": "700205948967d1a8c762f56317306ffb73a31d2e7cbe1770d53a1eaee3274fac"
+    },
+    {
+      "role": "bridge_status",
+      "sha256": "2816b8dfc2bf86ee7e360f89aa2c3d28c1bb26a38f012750196cfeb0d9caa9f4"
+    },
+    {
+      "role": "recovery_sink_status",
+      "sha256": "421c581c3742551f3ef287563713e32211c73177c5b8453f1f27bdc3ba4cc613"
+    }
+  ],
+  "local_raw_inputs": [
+    {
+      "role": "legacy_performance_raw",
+      "row_count": 3,
+      "sha256": "a6bc056e90edf63b3a74d38f8761479e284878b099f4b4bbd1dfae0d9b82811e"
+    },
+    {
+      "role": "legacy_summary_raw",
+      "sha256": "d730d27b9849d5f1f1f05059f8c4e82be1ed823ee3fe74a7db5514ace3bcfecc"
+    },
+    {
+      "role": "vnext_performance_raw",
+      "row_count": 3,
+      "sha256": "717ca2d20d35b525e65bb10e29175d824dcb9ca996c5e912ab95bdaedd5eaf7a"
+    },
+    {
+      "role": "vnext_summary_raw",
+      "sha256": "c269cbe0929f2d8db15fb240021bcd12c60e78a55d83d7d237cace54162902ae"
+    },
+    {
+      "role": "legacy_control_endpoint_database",
+      "sha256": "2dd7c1e4d00684bc5b9b2378e402afd801c2d2bf232d34921d23287906b63e91"
+    },
+    {
+      "role": "legacy_control_initial_serial_log",
+      "sha256": "dc69f2440cdc228e31ba9d2c63ddfac944dd5172fccb89d06eea2514dcbd0082"
+    },
+    {
+      "role": "legacy_control_journal_media",
+      "sha256": "37bfb08a18d071389dc52d50ad4a6c71891c68678f52a5309d0e3aeb67a8c5b3"
+    },
+    {
+      "role": "legacy_control_matrix_metrics",
+      "row_count": 1,
+      "sha256": "9b2586d59455b20dac24195989c7e3473054808b7a5a210b7372b0d8059e7d35"
+    },
+    {
+      "role": "legacy_control_provider_database",
+      "sha256": "77235a16aa8cc55cc1990b42c9a605c2fe95510534ddfb3ba35e9a431c6ff1b1"
+    },
+    {
+      "role": "legacy_control_recovery_serial_log",
+      "sha256": "2c8a1a81d1b4d629d4ba9f42ce5380e50c19dcb27ec1de5ea41544555cf4ca58"
+    },
+    {
+      "role": "legacy_control_stage_timings",
+      "sha256": "ee07ec27059ebb008c7693d1d6754e457ac41c78af433a04e80f83af85f0144f"
+    },
+    {
+      "role": "legacy_delayed_endpoint_endpoint_database",
+      "sha256": "48909d5f194708f7dbe59cc1a148c711294d4e59250d77aa7f4f45d537c8345c"
+    },
+    {
+      "role": "legacy_delayed_endpoint_initial_serial_log",
+      "sha256": "4f4bca0807f92774a94004d30a3e193f4348f4f9d6a9f5c46a8f59df5bdd295d"
+    },
+    {
+      "role": "legacy_delayed_endpoint_journal_media",
+      "sha256": "ff4f793c195df862c2f29b07cefc3e8445ca8926a48443235ac59822c50d6385"
+    },
+    {
+      "role": "legacy_delayed_endpoint_matrix_metrics",
+      "row_count": 1,
+      "sha256": "cc77cbfae418d3389f4ee4606b478cb1ebb7c17c13a8a6ea1b8293725bb889ad"
+    },
+    {
+      "role": "legacy_delayed_endpoint_provider_database",
+      "sha256": "f86ae3570a78368efcb74af184fda035eb0c272b0f83b6fbe823c667d2611187"
+    },
+    {
+      "role": "legacy_delayed_endpoint_recovery_serial_log",
+      "sha256": "a6704a3aa4e67e94c769d72ed54bc98a1f567742913d56a82ab140e070efc60d"
+    },
+    {
+      "role": "legacy_delayed_endpoint_stage_timings",
+      "sha256": "d7ebe49bb225944251c4b72a82f21126c8140435c2e4f06d11f7ee9804cbd63b"
+    },
+    {
+      "role": "legacy_endpoint_concurrency_endpoint_database",
+      "sha256": "a920c5ef6c2b483f14bdd5d03691442c3d6dd0f1f3cb202aa18880f0c441430b"
+    },
+    {
+      "role": "legacy_endpoint_concurrency_initial_serial_log",
+      "sha256": "a41c1f26baf4f6589e30f21b2aab9a39a5442982a2ef0dca94fd9f3055cc7d26"
+    },
+    {
+      "role": "legacy_endpoint_concurrency_journal_media",
+      "sha256": "2dc80285f7492cb0d8c9c0a9fb22aa81ef951387f8c5bf6783a713bf3072b382"
+    },
+    {
+      "role": "legacy_endpoint_concurrency_matrix_metrics",
+      "row_count": 1,
+      "sha256": "094f6bd545fae9ab841562c672474030b7f7332106aaf9f953a203b6ef7970be"
+    },
+    {
+      "role": "legacy_endpoint_concurrency_provider_database",
+      "sha256": "cc2f899cefa96558e7278b343b3deafa7ea16da0931273973b2564a9ade66964"
+    },
+    {
+      "role": "legacy_endpoint_concurrency_recovery_serial_log",
+      "sha256": "41f723fedb0d80799f7e87b769f98733be5a0d2685699d9e9f09294396110a92"
+    },
+    {
+      "role": "legacy_endpoint_concurrency_stage_timings",
+      "sha256": "5e0e10c2eb059b084fd0daf352cce93f43b5bd14af455ef2f89e3cf17e391be4"
+    },
+    {
+      "role": "vnext_control_endpoint_database",
+      "sha256": "bac727dbce48d1d8f4ed4a8b7f455afa0dbeafa94babc0cf933632d4e863a99f"
+    },
+    {
+      "role": "vnext_control_initial_serial_log",
+      "sha256": "6460617798a8030ddc331a76a58a0793670c2ec5d66e6cb5b0688f36bab753c2"
+    },
+    {
+      "role": "vnext_control_journal_media",
+      "sha256": "040cb09b350856d722ac9144e9dd832eec724dc9dbee54550e5fdd4d1e8caf92"
+    },
+    {
+      "role": "vnext_control_matrix_metrics",
+      "row_count": 1,
+      "sha256": "af86a20818643fb644dc5bcaf22fce907397b843567066ab93625874b3bd6045"
+    },
+    {
+      "role": "vnext_control_provider_database",
+      "sha256": "00d80a88a26464365ead05b191c1846da59b071d49e1e4afc45b61b93e063c20"
+    },
+    {
+      "role": "vnext_control_recovery_serial_log",
+      "sha256": "700205948967d1a8c762f56317306ffb73a31d2e7cbe1770d53a1eaee3274fac"
+    },
+    {
+      "role": "vnext_control_stage_timings",
+      "sha256": "37c46a304205886834180f25ed792bfc0397fb16b64de8963fbf2dd0857d54c8"
+    },
+    {
+      "role": "vnext_delayed_endpoint_endpoint_database",
+      "sha256": "da958ea18c05ade94580b37220ff61e575b5c6bd5246126c7eee8ea2f73a02e4"
+    },
+    {
+      "role": "vnext_delayed_endpoint_initial_serial_log",
+      "sha256": "acc1e4649844f0d9c3e97816431e23b892deae6b871f4fc804026dde2672d90c"
+    },
+    {
+      "role": "vnext_delayed_endpoint_journal_media",
+      "sha256": "713697317c8f6c58c8e1c5246efa557a53ab94c0f52fc3042d2c337997667f62"
+    },
+    {
+      "role": "vnext_delayed_endpoint_matrix_metrics",
+      "row_count": 1,
+      "sha256": "7f1b325327f9345a3d8e288164f78af2a18b810f0cdc523ee4dd4d018217faac"
+    },
+    {
+      "role": "vnext_delayed_endpoint_provider_database",
+      "sha256": "012eae212935a2913e79c38bff8816876aa80c03bd710f83d5f6b45f4f4305db"
+    },
+    {
+      "role": "vnext_delayed_endpoint_recovery_serial_log",
+      "sha256": "2606aad46ce3505fe60484caed333f50d7035cce25a096a9d7bffe9443a59870"
+    },
+    {
+      "role": "vnext_delayed_endpoint_stage_timings",
+      "sha256": "40b4b966cb29853fe2fa2611b894a5ecde6417bfef5e09ebe5082ef2204bef03"
+    },
+    {
+      "role": "vnext_endpoint_concurrency_endpoint_database",
+      "sha256": "84cbb3f54ede7d3da6f7f206979da857aee31a12d63d173a9a157bff484e2c10"
+    },
+    {
+      "role": "vnext_endpoint_concurrency_initial_serial_log",
+      "sha256": "6dfa0405693457e559b1ee6b3052f30ca63a8fc9b5a1771d370a8f9f6ffa5ed3"
+    },
+    {
+      "role": "vnext_endpoint_concurrency_journal_media",
+      "sha256": "16110da2dc236b4a35317e128ee7272f71dd302fba3d07712b66d547116f60d2"
+    },
+    {
+      "role": "vnext_endpoint_concurrency_matrix_metrics",
+      "row_count": 1,
+      "sha256": "d6125d0a059e4db23c1089868c519fb2eb3d2f98e1356fae859d7740669cefc6"
+    },
+    {
+      "role": "vnext_endpoint_concurrency_provider_database",
+      "sha256": "dca83eb6e47eeb252418315fedc42144d3a5267a55c9a3483c8786ab99c2cdd8"
+    },
+    {
+      "role": "vnext_endpoint_concurrency_recovery_serial_log",
+      "sha256": "17acecff554c2420c41d9075daff49393b6765957fe9b0bba1e5946ea5914ad0"
+    },
+    {
+      "role": "vnext_endpoint_concurrency_stage_timings",
+      "sha256": "3b6a772cc7e6ac522ca44085a9e4981945d5c71ff4f6fc15ff76cbdcc42463b6"
+    },
+    {
+      "role": "portable_core_profile_raw",
+      "row_count": 4,
+      "sha256": "9c9710f3adaed256bf627d461048db8cb111ac64f3eb6241e000598974489920"
+    }
+  ],
+  "local_raw_retention": {
+    "publication_state": "complete",
+    "published": false,
+    "raw_hmac_sha256": "1458e8d476cedf8bc8f08fa565011d98d4a11be63a147b07559a068bb16b271b",
+    "study_id": "cser-final-e68a76e"
+  },
+  "published_artifacts": [
+    {
+      "path": "README.md",
+      "role": "evidence_methodology_and_limits",
+      "sha256": "5c09183591bb5677f45b012d2af17b18a00325cbb30e451154183a692dc563cc"
+    },
+    {
+      "path": "aggregate.json",
+      "role": "bounded_applicability_aggregate",
+      "sha256": "3c6bcb2466813dcb678ae442c665b7418226736f253bbce2d16b1bf36874f30c"
+    },
+    {
+      "path": "applicability.jsonl",
+      "role": "hmac_pseudonymized_applicability_trace",
+      "row_count": 15,
+      "sha256": "280d5ae55f03532ce0f95531154d175b166a59daa5d5be9f3bb3f19ee77fc9c6"
+    },
+    {
+      "path": "applicability.jsonl.publication.json",
+      "role": "raw_authoritative_publication_marker",
+      "sha256": "c67c7e38f0bd251f10c663478251c886da7bb15952a76f35bd7885e1ff39b0b5"
+    },
+    {
+      "path": "core-state-profile.jsonl",
+      "role": "sanitized_portable_core_rows",
+      "row_count": 4,
+      "sha256": "0eddc5a85f4106be96e02f167a2caa0df5346ad294f2f74cd39459af0709ad88"
+    },
+    {
+      "path": "journal-fill.json",
+      "role": "bounded_memorydisk_fill_profile",
+      "sha256": "b040b5d98d300360cfddcc5f63bb2e12b558d81e5a3cbeaa3cc6ba8e57381284"
+    },
+    {
+      "path": "performance.jsonl",
+      "role": "sanitized_qemu_measurement_rows",
+      "row_count": 6,
+      "sha256": "11710711457176110e0d2e0e1e6ccb163dfcf5c79296ad22456f52e81ae891de"
+    },
+    {
+      "path": "source.json",
+      "role": "implementation_source_binding",
+      "sha256": "cb8ee1cf54d6ba9da40e8513ed84027ba7309c60dbe55a707c52684a413d721e"
+    },
+    {
+      "path": "summary.json",
+      "role": "validated_phase_summary",
+      "sha256": "5c78d1a220195f91441ff3e6c2b5ab71540dddef58ab7a2163e2ac1ebd42f220"
+    }
+  ],
+  "schema_version": 2,
+  "source_commit": "e68a76ea14ec9962b93e9d365011c82fa54a2313"
+}

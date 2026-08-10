@@ -1,5 +1,11 @@
 # Bounded async/vNext applicability sample
 
+> **Historical sample.** These files remain source-bound to the earlier COW
+> vNext implementation at `59dee403...`; their performance numbers do not
+> describe the final in-place append path. The current clean-source measurements
+> and bounded optimization decision are in
+> [`../cser-async-vnext-final/`](../cser-async-vnext-final/).
+
 This directory is a sanitized, source-bound development sample generated from
 Nexus commit `59dee4031ead7736275e5314c22a871bcf053aba` on 2026-08-10. It is
 evidence that the reference path and exporter work together; it is not a

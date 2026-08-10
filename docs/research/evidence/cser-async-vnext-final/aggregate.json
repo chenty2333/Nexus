@@ -1,0 +1,84 @@
+{
+  "administrative_dispositions": {
+    "observed_effects": 0
+  },
+  "denominator": {
+    "eligible_effects": 1,
+    "final_source_effects": 4,
+    "raw_effect_observations": 5,
+    "sources": 5
+  },
+  "dropped_events": 0,
+  "events_by_source": {
+    "allocator_gate": 2,
+    "device": 1,
+    "endpoint": 1,
+    "worker_provider": 1
+  },
+  "export_limits": {
+    "bridge_sink": "supervisor_status_not_effect_evidence",
+    "claim_coordinates": "exported_only_from_exact_core_gate_receipt",
+    "gate_decisions": "exported_only_from_exact_core_gate_receipt",
+    "physical_dma_quiescence": "not_inferred_from_allocator_gate"
+  },
+  "final_claims": {
+    "final_resource_coordinates": 1,
+    "released_resource_coordinates": 1,
+    "retained_resource_coordinates": 0
+  },
+  "final_gates": {
+    "admitted_resource_coordinates": 1,
+    "final_resource_coordinates": 1,
+    "rejected_resource_coordinates": 0
+  },
+  "final_outcomes": {
+    "conflicting_terminal_effects": 0,
+    "eligible_effects": 1,
+    "failed_effects": 0,
+    "outcome_observed_effects": 1,
+    "succeeded_effects": 1,
+    "terminal_effects": 1
+  },
+  "final_quiescence": {
+    "observed_effects": 0,
+    "right_censored_effects": 1
+  },
+  "final_source_effects_by_role": {
+    "allocator_gate": 1,
+    "device": 1,
+    "endpoint": 1,
+    "worker_provider": 1
+  },
+  "missing_sources": [],
+  "partial_sources": [
+    "device",
+    "guest"
+  ],
+  "provider_coordination": {
+    "idempotency_record": 2,
+    "unknown": 3
+  },
+  "raw_events": {
+    "by_kind": {
+      "claim_released": 1,
+      "gate_rejected": 1,
+      "observation_ended": 1,
+      "terminal": 2
+    },
+    "effect_observations": 5
+  },
+  "right_censored_effects": 1,
+  "schema_version": 1,
+  "scope": "bounded_source_sample_not_prevalence",
+  "source_roles": {
+    "allocator_gate": 1,
+    "device": 1,
+    "endpoint": 1,
+    "guest": 1,
+    "worker_provider": 1
+  },
+  "study_claim_boundaries": [
+    "bounded_applicability_sample_not_prevalence"
+  ],
+  "study_id": "cser-final-e68a76e"
+}

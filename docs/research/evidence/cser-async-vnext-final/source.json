@@ -1,0 +1,17 @@
+{
+  "applicability_source_tree_sha256": "abcaf69f346d41e36bf92d75be35e49adfb17c212e66c1ec7bc845a763659cf7",
+  "as_of": "2026-08-10",
+  "dirty": false,
+  "implementation_commit": "e68a76ea14ec9962b93e9d365011c82fa54a2313",
+  "implementation_git_tree": "63b45779d498a8fc8697bbe5234a61f2cfd8ccac",
+  "producers": {
+    "applicability_exporter": "qemu_applicability_export_v1",
+    "applicability_trace_schema": 1,
+    "performance_runner": "run_qemu_performance_schema_v1_with_tool_dma_perf_v2",
+    "portable_core_profile": 2,
+    "raw_publication_schema": 1
+  },
+  "repository": "Nexus",
+  "schema_version": 2,
+  "source_diff_sha256": "4e59bf27372b1304bc0b137d1be9d566ad58b154b6a6b5778af7f414b1d4b84c"
+}
