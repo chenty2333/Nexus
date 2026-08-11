@@ -6025,6 +6025,9 @@ fn apply_command(
             {
                 return Err(CoreError::HandoffGuardRequired);
             }
+            if !handoff_source_claim_matches(source, descriptor) {
+                return Err(CoreError::HandoffGuardRequired);
+            }
             let schema = catalog
                 .composite_rule(descriptor.child_kind)
                 .ok_or(CoreError::UnknownObligationClass)?;
@@ -6045,23 +6048,28 @@ fn apply_command(
                     charge_account,
                 },
             )?;
-            apply_command(
+            enroll_component_claim(
                 catalog,
                 limits,
                 state,
-                &CommandKind::AddComponentClaim {
-                    effect: child,
-                    component: descriptor.child_component,
-                    actor: origin,
-                    binding_generation,
-                    claim: descriptor.claim,
-                    kind: descriptor.claim_kind,
-                    scope: descriptor.scope,
-                    resource: descriptor.resource,
-                    resource_generation: descriptor.resource_generation,
-                    units: descriptor.units,
-                },
+                child,
+                descriptor.child_component,
+                origin,
+                binding_generation,
+                descriptor.claim,
+                descriptor.claim_kind,
+                descriptor.scope,
+                descriptor.resource,
+                descriptor.resource_generation,
+                descriptor.units,
+                None,
+                Some(descriptor),
             )?;
+            // A child is only a prepared reservation until the pivot below
+            // releases the exact source claim. Keep it out of active custody
+            // indexes and credit accounting so Exclusive ownership never has
+            // two executable custodians.
+            deactivate_prepared_handoff_target(state, child, descriptor)?;
             apply_command(
                 catalog,
                 limits,
@@ -6140,6 +6148,8 @@ fn apply_command(
                 .get_mut(&child)
                 .expect("validated target")
                 .handoff = target_role;
+            release_handoff_source_claim(state, descriptor)?;
+            activate_prepared_handoff_target(catalog, limits, state, child, descriptor)?;
             let source = state
                 .composite_effects
                 .get_mut(&descriptor.parent)
@@ -6147,6 +6157,7 @@ fn apply_command(
             source.custodian = CustodyState::Released;
             source.authority = AuthorityState::Revoked;
             for component in source.components.values_mut() {
+                component.settlement = SettlementState::Revoked;
                 component.retirement = RetirementState::Released;
             }
             Ok(intent)
@@ -6398,6 +6409,7 @@ fn apply_command(
             resource,
             resource_generation,
             units,
+            None,
             None,
         ),
         CommandKind::PrepareEffect {
@@ -7426,6 +7438,7 @@ fn apply_command(
                 generation,
                 units,
                 Some(nonce),
+                None,
             )?;
             Ok(AppliedOutput {
                 event: TransitionEvent::ResourceReuseReserved,
@@ -7835,6 +7848,275 @@ fn resource_allows_additional_custodian(
     Ok(compatible)
 }
 
+fn handoff_source_claim_matches(
+    source: &CompositeEffectRecord,
+    descriptor: ChildDescriptorV1,
+) -> bool {
+    source
+        .components
+        .get(&descriptor.parent_component)
+        .is_some_and(|component| {
+            component.claims.len() == 1
+                && component.claims.values().any(|claim| {
+                    claim.id == descriptor.claim
+                        && !claim.retired
+                        && claim.kind == descriptor.claim_kind
+                        && claim.scope == descriptor.scope
+                        && claim.resource == descriptor.resource
+                        && claim.resource_generation == descriptor.resource_generation
+                        && claim.units == descriptor.units
+                })
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handoff_target_reservation_matches(
+    state: &State,
+    effect: EffectId,
+    component: ComponentId,
+    claim: ClaimId,
+    kind: ClaimKindId,
+    scope: ClaimScope,
+    resource: ResourceId,
+    resource_generation: ResourceGeneration,
+    units: u64,
+    descriptor: Option<ChildDescriptorV1>,
+) -> bool {
+    let Some(descriptor) = descriptor else {
+        return false;
+    };
+    descriptor.child_effect() == Ok(effect)
+        && descriptor.child_component == component
+        && descriptor.claim == claim
+        && descriptor.claim_kind == kind
+        && descriptor.scope == scope
+        && descriptor.resource == resource
+        && descriptor.resource_generation == resource_generation
+        && descriptor.units == units
+        && matches!(
+            state.composite_effects.get(&descriptor.parent),
+            Some(source) if matches!(&source.handoff, SingleHopRole::Source { descriptor: saved, .. } if **saved == descriptor)
+                && handoff_source_claim_matches(source, descriptor)
+        )
+}
+
+fn deactivate_prepared_handoff_target(
+    state: &mut State,
+    child: EffectId,
+    descriptor: ChildDescriptorV1,
+) -> Result<(), CoreError> {
+    let (charge_owner, credit_class) = {
+        let composite = state
+            .composite_effects
+            .get(&child)
+            .ok_or(CoreError::UnknownEstate)?;
+        let claim = composite
+            .components
+            .get(&descriptor.child_component)
+            .and_then(|component| component.claims.get(&descriptor.claim))
+            .ok_or(CoreError::UnknownClaim)?;
+        if claim.kind != descriptor.claim_kind
+            || claim.scope != descriptor.scope
+            || claim.resource != descriptor.resource
+            || claim.resource_generation != descriptor.resource_generation
+            || claim.units != descriptor.units
+            || claim.retired
+        {
+            return Err(CoreError::HandoffGuardRequired);
+        }
+        (composite.charge_owner, claim.credit_class)
+    };
+    let charged = state
+        .charges
+        .get_mut(&(charge_owner, credit_class))
+        .ok_or(CoreError::InvariantViolation)?;
+    *charged = charged
+        .checked_sub(descriptor.units)
+        .ok_or(CoreError::InvariantViolation)?;
+    let entries = state
+        .composite_resource_index
+        .get_mut(&descriptor.resource)
+        .ok_or(CoreError::InvariantViolation)?;
+    let before = entries.len();
+    entries.retain(|entry| *entry != (child, descriptor.child_component, descriptor.claim));
+    if entries.len() + 1 != before {
+        return Err(CoreError::InvariantViolation);
+    }
+    if entries.is_empty() {
+        state.composite_resource_index.remove(&descriptor.resource);
+    }
+    Ok(())
+}
+
+fn release_handoff_source_claim(
+    state: &mut State,
+    descriptor: ChildDescriptorV1,
+) -> Result<(), CoreError> {
+    let (charge_owner, credit_class, source_claim) = {
+        let source = state
+            .composite_effects
+            .get(&descriptor.parent)
+            .ok_or(CoreError::UnknownEstate)?;
+        if !handoff_source_claim_matches(source, descriptor) {
+            return Err(CoreError::HandoffGuardRequired);
+        }
+        let claim = source.components[&descriptor.parent_component]
+            .claims
+            .get(&descriptor.claim)
+            .expect("matched sole source claim");
+        (source.charge_owner, claim.credit_class, claim.id)
+    };
+    let charged = state
+        .charges
+        .get_mut(&(charge_owner, credit_class))
+        .ok_or(CoreError::InvariantViolation)?;
+    *charged = charged
+        .checked_sub(descriptor.units)
+        .ok_or(CoreError::InvariantViolation)?;
+    let entries = state
+        .composite_resource_index
+        .get_mut(&descriptor.resource)
+        .ok_or(CoreError::InvariantViolation)?;
+    let before = entries.len();
+    entries
+        .retain(|entry| *entry != (descriptor.parent, descriptor.parent_component, source_claim));
+    if entries.len() + 1 != before {
+        return Err(CoreError::InvariantViolation);
+    }
+    if entries.is_empty() {
+        state.composite_resource_index.remove(&descriptor.resource);
+    }
+    if !state.resource_index.contains_key(&descriptor.resource)
+        && !state
+            .composite_resource_index
+            .contains_key(&descriptor.resource)
+    {
+        state
+            .resources
+            .get_mut(&descriptor.resource)
+            .ok_or(CoreError::InvariantViolation)?
+            .phase = ResourcePhase::Retired;
+    }
+    state
+        .composite_effects
+        .get_mut(&descriptor.parent)
+        .expect("validated source")
+        .components
+        .get_mut(&descriptor.parent_component)
+        .expect("validated source component")
+        .claims
+        .clear();
+    Ok(())
+}
+
+fn activate_prepared_handoff_target(
+    catalog: &DomainCatalog,
+    limits: CoreLimits,
+    state: &mut State,
+    child: EffectId,
+    descriptor: ChildDescriptorV1,
+) -> Result<(), CoreError> {
+    let (charge_owner, credit_class) = {
+        let target = state
+            .composite_effects
+            .get(&child)
+            .ok_or(CoreError::UnknownEstate)?;
+        let claim = target
+            .components
+            .get(&descriptor.child_component)
+            .and_then(|component| component.claims.get(&descriptor.claim))
+            .ok_or(CoreError::UnknownClaim)?;
+        if claim.retired
+            || claim.kind != descriptor.claim_kind
+            || claim.scope != descriptor.scope
+            || claim.resource != descriptor.resource
+            || claim.resource_generation != descriptor.resource_generation
+            || claim.units != descriptor.units
+        {
+            return Err(CoreError::HandoffGuardRequired);
+        }
+        (target.charge_owner, claim.credit_class)
+    };
+    let limit = catalog
+        .credit_rule(credit_class)
+        .ok_or(CoreError::InvariantViolation)?
+        .max_units_per_account()
+        .min(limits.max_units_per_account);
+    let charged = state
+        .charges
+        .get(&(charge_owner, credit_class))
+        .copied()
+        .unwrap_or(0);
+    let next = charged
+        .checked_add(descriptor.units)
+        .ok_or(CoreError::Backpressure)?;
+    if next > limit {
+        return Err(CoreError::Backpressure);
+    }
+    *state
+        .charges
+        .entry((charge_owner, credit_class))
+        .or_insert(0) = next;
+    let resource_record = state
+        .resources
+        .get_mut(&descriptor.resource)
+        .ok_or(CoreError::InvariantViolation)?;
+    if resource_record.scope != descriptor.scope
+        || resource_record.generation != descriptor.resource_generation
+        || !matches!(
+            resource_record.phase,
+            ResourcePhase::Retired | ResourcePhase::Claimed { .. }
+        )
+    {
+        return Err(CoreError::InvariantViolation);
+    }
+    resource_record.phase = ResourcePhase::Claimed {
+        pending_reuse: None,
+    };
+    let entries = state
+        .composite_resource_index
+        .entry(descriptor.resource)
+        .or_default();
+    match entries.binary_search(&(child, descriptor.child_component, descriptor.claim)) {
+        Ok(_) => return Err(CoreError::InvariantViolation),
+        Err(index) => entries.insert(index, (child, descriptor.child_component, descriptor.claim)),
+    }
+    Ok(())
+}
+
+fn prepared_handoff_target_claim(
+    state: &State,
+    composite: &CompositeEffectRecord,
+    component: &ComponentRecord,
+    claim: &ClaimRecord,
+) -> bool {
+    let SingleHopRole::Target {
+        parent,
+        descriptor_digest,
+    } = composite.handoff
+    else {
+        return false;
+    };
+    let Some(source) = state.composite_effects.get(&parent) else {
+        return false;
+    };
+    let SingleHopRole::Source { descriptor, .. } = &source.handoff else {
+        return false;
+    };
+    component.commit == CommitState::Prepared
+        && handoff_source_claim_matches(source, **descriptor)
+        && handoff_descriptor_digest(**descriptor) == descriptor_digest
+        && descriptor.child_effect() == Ok(composite.effect)
+        && descriptor.child_component == component.id
+        && descriptor.claim == claim.id
+        && descriptor.claim_kind == claim.kind
+        && descriptor.scope == claim.scope
+        && descriptor.resource == claim.resource
+        && descriptor.resource_generation == claim.resource_generation
+        && descriptor.units == claim.units
+        && !claim.retired
+}
+
 #[allow(clippy::too_many_arguments)]
 fn enroll_claim(
     catalog: &DomainCatalog,
@@ -8093,6 +8375,7 @@ fn enroll_component_claim(
     resource_generation: ResourceGeneration,
     units: u64,
     reservation_nonce: Option<u64>,
+    handoff_target: Option<ChildDescriptorV1>,
 ) -> Result<AppliedOutput, CoreError> {
     if units == 0 {
         return Err(CoreError::InvalidPayload);
@@ -8220,7 +8503,18 @@ fn enroll_component_claim(
                 resource,
                 resource_generation,
                 rule.conflict(),
-            )? {
+            )? && !handoff_target_reservation_matches(
+                state,
+                effect,
+                component,
+                claim,
+                kind,
+                scope,
+                resource,
+                resource_generation,
+                units,
+                handoff_target,
+            ) {
                 return Err(CoreError::ResourceRetained);
             }
         }
@@ -11290,7 +11584,9 @@ fn check_invariants(
                         return Err(CoreError::InvariantViolation);
                     }
                 }
-                if !claim.retired {
+                if !claim.retired
+                    && !prepared_handoff_target_claim(state, composite, component, claim)
+                {
                     let charged = expected_charges
                         .entry((composite.charge_owner, claim.credit_class))
                         .or_insert(0);
@@ -13780,7 +14076,9 @@ fn checkpoint_rebuild_derived(state: &mut State) -> Result<(), CoreError> {
     for (effect, composite) in &state.composite_effects {
         for (component_id, component) in &composite.components {
             for claim in component.claims.values() {
-                if !claim.retired {
+                if !claim.retired
+                    && !prepared_handoff_target_claim(state, composite, component, claim)
+                {
                     state
                         .composite_resource_index
                         .entry(claim.resource)
@@ -14864,6 +15162,7 @@ mod handoff_guard_tests {
         TOOL_HANDOFF_COMPONENT, TOOL_HANDOFF_SOURCE_COMPONENT, TOOL_HANDOFF_SOURCE_COMPOSITE,
         TOOL_VERIFIER, tool_dma_catalog,
     };
+    use alloc::vec;
 
     fn freshness() -> Freshness {
         Freshness::new(
@@ -14914,6 +15213,13 @@ mod handoff_guard_tests {
     }
 
     fn setup() -> (Engine, EffectId, PrincipalIncarnation, ChildDescriptorV1) {
+        setup_with_resources(10, 10)
+    }
+
+    fn setup_with_resources(
+        source_resource: u64,
+        child_resource: u64,
+    ) -> (Engine, EffectId, PrincipalIncarnation, ChildDescriptorV1) {
         let mut engine = Engine::new(
             tool_dma_catalog(),
             CoreLimits::bounded_default(),
@@ -14941,7 +15247,7 @@ mod handoff_guard_tests {
                 claim: ClaimId::new(1).unwrap(),
                 kind: TOOL_CLAIM_OUTCOME_SLOT,
                 scope: ClaimScope::Logical,
-                resource: ResourceId::new(10).unwrap(),
+                resource: ResourceId::new(source_resource).unwrap(),
                 resource_generation: ResourceGeneration::new(1).unwrap(),
                 units: 1,
             },
@@ -14975,10 +15281,10 @@ mod handoff_guard_tests {
             route_digest: Digest::new([1; 32]),
             child_kind: TOOL_HANDOFF_CHILD_COMPOSITE,
             child_component: TOOL_HANDOFF_COMPONENT,
-            claim: ClaimId::new(9).unwrap(),
+            claim: ClaimId::new(1).unwrap(),
             claim_kind: TOOL_CLAIM_OUTCOME_SLOT,
             scope: ClaimScope::Logical,
-            resource: ResourceId::new(99).unwrap(),
+            resource: ResourceId::new(child_resource).unwrap(),
             resource_generation: ResourceGeneration::new(1).unwrap(),
             units: 1,
             input_digest: Digest::new([2; 32]),
@@ -15342,6 +15648,154 @@ mod handoff_guard_tests {
     }
 
     #[test]
+    fn exact_coordinate_handoff_reserves_without_double_active_custody() {
+        let (mut engine, parent, actor, descriptor) = setup_with_resources(10, 10);
+        let child = descriptor.child_effect().unwrap();
+        let resource = descriptor.resource;
+        let before = engine.projection_digest();
+
+        let mut wrong_coordinate = descriptor;
+        wrong_coordinate.resource = ResourceId::new(11).unwrap();
+        assert_eq!(
+            engine
+                .transact(
+                    Command(CommandKind::InstallHandoffChild {
+                        descriptor: wrong_coordinate,
+                        origin: actor,
+                        binding_generation: 1,
+                        charge_account: ChargeAccountId::new(1).unwrap(),
+                    }),
+                    |_| Ok::<(), ()>(())
+                )
+                .unwrap_err(),
+            TxError::Core(CoreError::HandoffGuardRequired)
+        );
+        assert_eq!(engine.projection_digest(), before);
+
+        let mut tampered = descriptor;
+        tampered.units = 2;
+        assert_eq!(
+            engine
+                .transact(
+                    Command(CommandKind::InstallHandoffChild {
+                        descriptor: tampered,
+                        origin: actor,
+                        binding_generation: 1,
+                        charge_account: ChargeAccountId::new(1).unwrap(),
+                    }),
+                    |_| Ok::<(), ()>(())
+                )
+                .unwrap_err(),
+            TxError::Core(CoreError::HandoffGuardRequired)
+        );
+        assert_eq!(engine.projection_digest(), before);
+
+        transact(
+            &mut engine,
+            Command(CommandKind::InstallHandoffChild {
+                descriptor,
+                origin: actor,
+                binding_generation: 1,
+                charge_account: ChargeAccountId::new(1).unwrap(),
+            }),
+        );
+        assert_eq!(
+            engine.state.composite_resource_index.get(&resource),
+            Some(&vec![(
+                parent,
+                TOOL_HANDOFF_SOURCE_COMPONENT,
+                ClaimId::new(1).unwrap()
+            )])
+        );
+        assert_eq!(
+            engine.state.charges.get(&(
+                ChargeAccountId::new(1).unwrap(),
+                crate::CREDIT_TOOL_OUTCOME_SLOT
+            )),
+            Some(&1)
+        );
+        let recovered = recover_at_checkpoint(&mut engine);
+        assert_eq!(
+            recovered.state.composite_resource_index.get(&resource),
+            Some(&vec![(
+                parent,
+                TOOL_HANDOFF_SOURCE_COMPONENT,
+                ClaimId::new(1).unwrap()
+            )])
+        );
+
+        let unrelated = EffectId::new(parent.root(), 3).unwrap();
+        transact(
+            &mut engine,
+            CommandRequest::CreateCompositeEffect {
+                effect: unrelated,
+                origin: actor,
+                binding_generation: 1,
+                kind: TOOL_HANDOFF_CHILD_COMPOSITE,
+                charge_account: ChargeAccountId::new(1).unwrap(),
+            },
+        );
+        assert_eq!(
+            engine
+                .transact(
+                    CommandRequest::AddComponentClaim {
+                        effect: unrelated,
+                        component: TOOL_HANDOFF_COMPONENT,
+                        actor,
+                        binding_generation: 1,
+                        claim: ClaimId::new(88).unwrap(),
+                        kind: TOOL_CLAIM_OUTCOME_SLOT,
+                        scope: ClaimScope::Logical,
+                        resource,
+                        resource_generation: ResourceGeneration::new(1).unwrap(),
+                        units: 1,
+                    },
+                    |_| Ok::<(), ()>(())
+                )
+                .unwrap_err(),
+            TxError::Core(CoreError::ResourceRetained)
+        );
+
+        transact(
+            &mut engine,
+            Command(CommandKind::ReleaseHandoffSourceAndRecordTargetIntent {
+                descriptor,
+                actor,
+                binding_generation: 1,
+                operation: Digest::new([0x71; 32]),
+            }),
+        );
+        assert_eq!(
+            engine.state.composite_resource_index.get(&resource),
+            Some(&vec![(child, TOOL_HANDOFF_COMPONENT, descriptor.claim)])
+        );
+        assert_eq!(
+            engine.state.charges.get(&(
+                ChargeAccountId::new(1).unwrap(),
+                crate::CREDIT_TOOL_OUTCOME_SLOT
+            )),
+            Some(&1)
+        );
+        assert!(
+            engine
+                .state
+                .composite_effects
+                .get(&parent)
+                .unwrap()
+                .components
+                .get(&TOOL_HANDOFF_SOURCE_COMPONENT)
+                .unwrap()
+                .claims
+                .is_empty()
+        );
+        let recovered = recover_at_checkpoint(&mut engine);
+        assert_eq!(
+            recovered.state.composite_resource_index.get(&resource),
+            Some(&vec![(child, TOOL_HANDOFF_COMPONENT, descriptor.claim)])
+        );
+    }
+
+    #[test]
     fn handoff_install_is_atomic_and_checkpoint_binds_role() {
         let (mut engine, _parent, actor, descriptor) = setup();
         let mut invalid = descriptor;
@@ -15489,10 +15943,10 @@ mod handoff_guard_tests {
             route_digest: Digest::new([11; 32]),
             child_kind: TOOL_HANDOFF_CHILD_COMPOSITE,
             child_component: TOOL_HANDOFF_COMPONENT,
-            claim: ClaimId::new(40).unwrap(),
+            claim: ClaimId::new(39).unwrap(),
             claim_kind: TOOL_CLAIM_OUTCOME_SLOT,
             scope: ClaimScope::Logical,
-            resource: ResourceId::new(400).unwrap(),
+            resource: ResourceId::new(399).unwrap(),
             resource_generation: ResourceGeneration::new(1).unwrap(),
             units: 1,
             input_digest: Digest::new([12; 32]),
