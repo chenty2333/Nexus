@@ -525,10 +525,11 @@ where
         .map_err(CoordinatedPersistenceError::Protocol)?;
 
         // A whole-state checkpoint may own up to the configured checkpoint
-        // limit. Materialize the coordinator's replacement before crossing
-        // either durability boundary: cloning it after the journal append and
-        // anchor advance would leave allocation as a fallible operation in the
-        // publication-only suffix.
+        // limit. Acquire the coordinator's replacement before crossing either
+        // durability boundary. Its immutable image and encoded bytes are
+        // Arc-backed, so this clone only retains those buffers; keeping the
+        // ownership acquisition before append/anchor also preserves the
+        // post-anchor assignment-only publication suffix.
         let committed_checkpoint = record.is_whole_state_checkpoint().then(|| record.clone());
 
         self.recovery_required = true;
@@ -686,6 +687,21 @@ mod tests {
         assert_eq!(persistence.journal.records.len(), 1);
         assert_eq!(persistence.committed.revision(), receipt.revision());
         assert_eq!(persistence.committed.head(), receipt.head());
+        let committed_clone = persistence.committed_checkpoint.as_ref().unwrap().clone();
+        assert!(
+            persistence
+                .committed_checkpoint
+                .as_ref()
+                .unwrap()
+                .shares_bytes_with(&committed_clone)
+        );
+        assert!(
+            persistence
+                .committed_checkpoint
+                .as_ref()
+                .unwrap()
+                .shares_checkpoint_image_with(&committed_clone)
+        );
 
         persistence.replace_last_committed_checkpoint().unwrap();
         assert_eq!(persistence.journal.replacements, 1);

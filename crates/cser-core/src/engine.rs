@@ -3,6 +3,7 @@
 use alloc::{
     boxed::Box,
     collections::{BTreeMap, BTreeSet},
+    sync::Arc,
     vec::Vec,
 };
 #[cfg(feature = "test-support")]
@@ -2002,7 +2003,11 @@ pub(crate) enum CommandKind {
         resource_generation: ResourceGeneration,
     },
     /// Internal canonical primary-state checkpoint; no public ingress exists.
-    WholeStateCheckpointV1 { state: Vec<u8>, projection: Digest },
+    WholeStateCheckpointV1 {
+        /// Immutable canonical primary-state image shared by journal clones.
+        state: Arc<[u8]>,
+        projection: Digest,
+    },
     /// Evidence-bound acknowledgement that opens the one permitted handoff.
     AcknowledgeHandoffParent {
         fact: VerifiedEffectFact,
@@ -6187,7 +6192,7 @@ impl Engine {
             return Err(TxError::Core(CoreError::CheckpointImageTooLarge));
         }
         let command = CommandKind::WholeStateCheckpointV1 {
-            state,
+            state: Arc::from(state.into_boxed_slice()),
             projection: self.projection_digest(),
         };
         self.transact_with_freshness(Command(command), |record, freshness, projection| {
@@ -14842,12 +14847,142 @@ impl CommandKind {
     }
 
     pub(crate) fn try_encode_payload(&self) -> Result<Vec<u8>, CommandDecodeError> {
+        let encoded_len = self.try_encoded_payload_len()?;
+        let mut bytes = Vec::with_capacity(encoded_len);
+        self.encode_payload_into(&mut bytes)?;
+        debug_assert_eq!(bytes.len(), encoded_len);
+        Ok(bytes)
+    }
+
+    /// Returns the exact canonical payload length without allocating or
+    /// cloning command-owned vectors.  Journal construction uses this to
+    /// reserve its final record buffer before writing the header and payload.
+    pub(crate) fn try_encoded_payload_len(&self) -> Result<usize, CommandDecodeError> {
         self.validate_wire_limits()?;
-        let bytes = self.encode_payload_unchecked();
-        if bytes.len() > MAX_COMMAND_PAYLOAD_BYTES {
+        const COMPONENT_PROVIDER_BINDING_NONE_LEN: usize = 4 + 24 + 1;
+        const COMPONENT_PROVIDER_BINDING_ARTIFACT_LEN: usize = 4 + 24 + 1 + 8 + 32 + 32;
+        const CHILD_DESCRIPTOR_FIXED_LEN: usize =
+            2 + 8 + 16 + 4 + 32 + 4 + 4 + 8 + 4 + 1 + 8 + 8 + 8 + 32 + 32;
+        const EFFECT_FACT_FIXED_LEN: usize =
+            1 + 16 + 4 + 16 + 8 + 8 + 32 + 1 + 32 + 120 + 48 + 32 + 1;
+        let add = |base: usize, extra: usize| {
+            base.checked_add(extra)
+                .ok_or(CommandDecodeError::PayloadTooLarge)
+        };
+        let vector = |base: usize, count: usize, item: usize| {
+            count
+                .checked_mul(item)
+                .and_then(|extra| base.checked_add(extra))
+                .ok_or(CommandDecodeError::PayloadTooLarge)
+        };
+        let descriptor_len = |value: &ChildDescriptorV1| {
+            CHILD_DESCRIPTOR_FIXED_LEN
+                .checked_add(match value.scope {
+                    ClaimScope::Logical => 0,
+                    ClaimScope::Device(_) => 8,
+                })
+                .ok_or(CommandDecodeError::PayloadTooLarge)
+        };
+        let effect_fact = |fact: &VerifiedEffectFact| {
+            EFFECT_FACT_FIXED_LEN
+                .checked_add(usize::from(fact.predecessor.is_some()) * 32)
+                .ok_or(CommandDecodeError::PayloadTooLarge)
+        };
+        let len = match self {
+            Self::RegisterProviderGeneration {
+                verifier_bindings, ..
+            } => vector(61, verifier_bindings.len(), 48)?,
+            Self::BindArtifactReceiptVerifiers { .. } => 121,
+            Self::FenceProviderEffects { .. }
+            | Self::EnterProviderSettlementOnly { .. }
+            | Self::RetireProviderEffects { .. } => 33,
+            Self::AdmitScopedCompositeEffect { bindings, .. } => {
+                let mut len = 49usize;
+                for binding in bindings {
+                    len = add(
+                        len,
+                        if binding.artifact().is_some() {
+                            COMPONENT_PROVIDER_BINDING_ARTIFACT_LEN
+                        } else {
+                            COMPONENT_PROVIDER_BINDING_NONE_LEN
+                        },
+                    )?;
+                }
+                len
+            }
+            Self::AbortUnescapedEffect { .. } => 17,
+            Self::RecordArtifactPin { .. } => 221,
+            Self::AuthorizeArtifactRelease { .. } => 21,
+            Self::RecordArtifactRelease { .. } => 269,
+            Self::AcknowledgeCommit { fact }
+            | Self::RecordApplied { fact }
+            | Self::Settle { fact } => add(1, effect_fact(fact)?)?,
+            Self::FenceExecutor { .. } => 25,
+            Self::Snapshot { .. } => 49,
+            Self::Ready { .. } | Self::Rebind { .. } => 33,
+            Self::BeginRevoke { .. } => 41,
+            Self::CheckpointRecovery { .. } => 25,
+            Self::AdoptEffect { .. } => 33,
+            Self::ActivateResourceReuse { .. } => 213,
+            Self::ReclaimResourceReuse { .. } => 69,
+            Self::AddComponentClaim { scope, .. } => add(
+                73,
+                match scope {
+                    ClaimScope::Logical => 1,
+                    ClaimScope::Device(_) => 9,
+                },
+            )?,
+            Self::PrepareCompositeEffect { .. } => 33,
+            Self::RecordComponentCommitIntent { .. } => 69,
+            Self::ClaimComponentSettlement { .. } => 37,
+            Self::RecordComponentApplyIntent { .. } | Self::MarkComponentIndeterminate { .. } => 85,
+            Self::SubmitComponentEvidence { .. } => 297,
+            Self::ReleaseCompositeEffect { .. } => 17,
+            Self::ReserveComponentReuse { scope, .. } => add(
+                105,
+                match scope {
+                    ClaimScope::Logical => 1,
+                    ClaimScope::Device(_) => 9,
+                },
+            )?,
+            Self::RecordCompositeCommitIntents { operations, .. } => {
+                vector(37, operations.len(), 36)?
+            }
+            Self::RebaseCompositePrecommitClaims { .. } => 33,
+            Self::WholeStateCheckpointV1 { state, .. } => {
+                if state.len() > MAX_JOURNAL_CHECKPOINT_IMAGE_BYTES {
+                    return Err(CommandDecodeError::PayloadTooLarge);
+                }
+                add(37, state.len())?
+            }
+            Self::AcknowledgeHandoffParent {
+                fact, descriptor, ..
+            } => add(add(1, effect_fact(fact)?)?, descriptor_len(descriptor)?)?
+                .checked_add(32)
+                .ok_or(CommandDecodeError::PayloadTooLarge)?,
+            Self::InstallHandoffChild {
+                descriptor: value,
+                provider,
+                ..
+            } => add(
+                add(25, descriptor_len(value)?)?,
+                if provider.artifact().is_some() {
+                    COMPONENT_PROVIDER_BINDING_ARTIFACT_LEN
+                } else {
+                    COMPONENT_PROVIDER_BINDING_NONE_LEN
+                },
+            )?,
+            Self::ReleaseHandoffSourceAndRecordTargetIntent { descriptor, .. } => {
+                add(add(49, descriptor_len(descriptor)?)?, 0)?
+            }
+            Self::ResolveIndeterminateHandoffParent { descriptor, .. } => {
+                add(350, descriptor_len(descriptor)?)?
+            }
+        };
+        if len > MAX_COMMAND_PAYLOAD_BYTES {
             return Err(CommandDecodeError::PayloadTooLarge);
         }
-        Ok(bytes)
+        Ok(len)
     }
 
     #[allow(dead_code)]
@@ -14856,9 +14991,12 @@ impl CommandKind {
             .expect("command payload satisfies the shared wire ceiling")
     }
 
-    fn encode_payload_unchecked(&self) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        match self.clone() {
+    #[allow(clippy::needless_borrow)]
+    pub(crate) fn encode_payload_into(
+        &self,
+        mut bytes: &mut Vec<u8>,
+    ) -> Result<(), CommandDecodeError> {
+        match self {
             Self::RegisterProviderGeneration {
                 coordinate,
                 catalog_digest,
@@ -15281,7 +15419,7 @@ impl CommandKind {
                 put_handoff_recovery_fact(&mut bytes, fact);
             }
         }
-        bytes
+        Ok(())
     }
 
     pub(crate) fn decode_payload(bytes: &[u8]) -> Result<Self, CommandDecodeError> {
@@ -15620,7 +15758,7 @@ impl CommandKind {
                 if len > MAX_JOURNAL_CHECKPOINT_IMAGE_BYTES {
                     return Err(CommandDecodeError::UnexpectedEof);
                 }
-                let state = cursor.take(len)?.to_vec();
+                let state = Arc::from(cursor.take(len)?.to_vec().into_boxed_slice());
                 Self::WholeStateCheckpointV1 { state, projection }
             }
             38 => Self::AcknowledgeHandoffParent {
@@ -15672,18 +15810,26 @@ fn checked_vector_count(
     Ok(count)
 }
 
-fn put_u8(bytes: &mut Vec<u8>, value: u8) {
-    bytes.push(value);
+fn put_u8<V: core::borrow::Borrow<u8>>(bytes: &mut Vec<u8>, value: V) {
+    bytes.push(*value.borrow());
 }
 
-fn put_verifier_identity(bytes: &mut Vec<u8>, identity: VerifierIdentity) {
+fn put_verifier_identity<V: core::borrow::Borrow<VerifierIdentity>>(
+    bytes: &mut Vec<u8>,
+    identity: V,
+) {
+    let identity = identity.borrow();
     put_u32(bytes, identity.verifier().get());
     put_u64(bytes, identity.epoch());
     put_u32(bytes, identity.receipt_schema().get());
     put_digest(bytes, identity.implementation_digest());
 }
 
-fn put_handoff_recovery_fact(bytes: &mut Vec<u8>, fact: VerifiedHandoffRecoveryFact) {
+fn put_handoff_recovery_fact<V: core::borrow::Borrow<VerifiedHandoffRecoveryFact>>(
+    bytes: &mut Vec<u8>,
+    fact: V,
+) {
+    let fact = fact.borrow();
     put_u8(
         bytes,
         match fact.role {
@@ -15914,10 +16060,9 @@ fn decode_whole_state_checkpoint(
         let epoch = cursor
             .nonzero_u64()
             .map_err(|_| CoreError::InvariantViolation)?;
-        let live_component_bindings = usize::try_from(
-            cursor.u64().map_err(|_| CoreError::InvariantViolation)?,
-        )
-        .map_err(|_| CoreError::InvariantViolation)?;
+        let live_component_bindings =
+            usize::try_from(cursor.u64().map_err(|_| CoreError::InvariantViolation)?)
+                .map_err(|_| CoreError::InvariantViolation)?;
         let provider_state = match state_tag {
             1 if epoch == 1 => ProviderEffectState::Active,
             2 if epoch >= 2 => ProviderEffectState::EffectFenced { epoch },
@@ -17224,34 +17369,43 @@ fn checkpoint_read_operations_count(
     Ok(operations)
 }
 
-fn put_u16(bytes: &mut Vec<u8>, value: u16) {
-    bytes.extend_from_slice(&value.to_le_bytes());
+fn put_u16<V: core::borrow::Borrow<u16>>(bytes: &mut Vec<u8>, value: V) {
+    bytes.extend_from_slice(&value.borrow().to_le_bytes());
 }
 
-fn put_u32(bytes: &mut Vec<u8>, value: u32) {
-    bytes.extend_from_slice(&value.to_le_bytes());
+fn put_u32<V: core::borrow::Borrow<u32>>(bytes: &mut Vec<u8>, value: V) {
+    bytes.extend_from_slice(&value.borrow().to_le_bytes());
 }
 
-fn put_u64(bytes: &mut Vec<u8>, value: u64) {
-    bytes.extend_from_slice(&value.to_le_bytes());
+fn put_u64<V: core::borrow::Borrow<u64>>(bytes: &mut Vec<u8>, value: V) {
+    bytes.extend_from_slice(&value.borrow().to_le_bytes());
 }
 
-fn put_digest(bytes: &mut Vec<u8>, digest: Digest) {
-    bytes.extend_from_slice(&digest.bytes());
+fn put_digest<V: core::borrow::Borrow<Digest>>(bytes: &mut Vec<u8>, digest: V) {
+    bytes.extend_from_slice(&digest.borrow().bytes());
 }
 
-fn put_effect(bytes: &mut Vec<u8>, effect: EffectId) {
+fn put_effect<V: core::borrow::Borrow<EffectId>>(bytes: &mut Vec<u8>, effect: V) {
+    let effect = effect.borrow();
     put_u64(bytes, effect.operation().get());
     put_u64(bytes, effect.sequence());
 }
 
-fn put_provider_coordinate(bytes: &mut Vec<u8>, coordinate: ProviderCoordinate) {
+fn put_provider_coordinate<V: core::borrow::Borrow<ProviderCoordinate>>(
+    bytes: &mut Vec<u8>,
+    coordinate: V,
+) {
+    let coordinate = coordinate.borrow();
     put_u64(bytes, coordinate.world().get());
     put_u64(bytes, coordinate.provider().get());
     put_u64(bytes, coordinate.generation().get());
 }
 
-fn put_component_provider_binding(bytes: &mut Vec<u8>, binding: ComponentProviderBinding) {
+fn put_component_provider_binding<V: core::borrow::Borrow<ComponentProviderBinding>>(
+    bytes: &mut Vec<u8>,
+    binding: V,
+) {
+    let binding = binding.borrow();
     put_u32(bytes, binding.component().get());
     put_provider_coordinate(bytes, binding.provider());
     match binding.artifact() {
@@ -17265,14 +17419,16 @@ fn put_component_provider_binding(bytes: &mut Vec<u8>, binding: ComponentProvide
     }
 }
 
-fn put_verifier_binding(bytes: &mut Vec<u8>, binding: VerifierBinding) {
+fn put_verifier_binding<V: core::borrow::Borrow<VerifierBinding>>(bytes: &mut Vec<u8>, binding: V) {
+    let binding = binding.borrow();
     put_u32(bytes, binding.verifier().get());
     put_u64(bytes, binding.generation().get());
     put_u32(bytes, binding.receipt_schema().get());
     put_digest(bytes, binding.implementation_digest());
 }
 
-fn put_artifact_binding(bytes: &mut Vec<u8>, binding: ArtifactBinding) {
+fn put_artifact_binding<V: core::borrow::Borrow<ArtifactBinding>>(bytes: &mut Vec<u8>, binding: V) {
+    let binding = binding.borrow();
     put_u64(bytes, binding.artifact_id().get());
     put_provider_coordinate(bytes, binding.provider());
     put_u64(bytes, binding.operation().get());
@@ -17284,7 +17440,8 @@ fn put_artifact_binding(bytes: &mut Vec<u8>, binding: ArtifactBinding) {
     put_digest(bytes, binding.closure_digest());
 }
 
-fn put_child_descriptor(bytes: &mut Vec<u8>, value: ChildDescriptorV1) {
+fn put_child_descriptor<V: core::borrow::Borrow<ChildDescriptorV1>>(bytes: &mut Vec<u8>, value: V) {
+    let value = value.borrow();
     put_u16(bytes, value.schema);
     put_u64(bytes, value.sequence);
     put_effect(bytes, value.parent);
@@ -17302,13 +17459,14 @@ fn put_child_descriptor(bytes: &mut Vec<u8>, value: ChildDescriptorV1) {
     put_digest(bytes, value.catalog_digest);
 }
 
-fn put_incarnation(bytes: &mut Vec<u8>, executor: ExecutorCoordinate) {
+fn put_incarnation<V: core::borrow::Borrow<ExecutorCoordinate>>(bytes: &mut Vec<u8>, executor: V) {
+    let executor = executor.borrow();
     put_u64(bytes, executor.executor().get());
     put_u64(bytes, executor.generation().get());
 }
 
-fn put_claim_scope(bytes: &mut Vec<u8>, scope: ClaimScope) {
-    match scope {
+fn put_claim_scope<V: core::borrow::Borrow<ClaimScope>>(bytes: &mut Vec<u8>, scope: V) {
+    match scope.borrow() {
         ClaimScope::Logical => put_u8(bytes, 1),
         ClaimScope::Device(device) => {
             put_u8(bytes, 2);
@@ -17317,14 +17475,16 @@ fn put_claim_scope(bytes: &mut Vec<u8>, scope: ClaimScope) {
     }
 }
 
-fn put_freshness(bytes: &mut Vec<u8>, freshness: Freshness) {
+fn put_freshness<V: core::borrow::Borrow<Freshness>>(bytes: &mut Vec<u8>, freshness: V) {
+    let freshness = freshness.borrow();
     put_u64(bytes, freshness.boot().get());
     put_u64(bytes, freshness.registry().get());
     put_u64(bytes, freshness.device().get());
     put_u64(bytes, freshness.journal().get());
 }
 
-fn put_effect_fact(bytes: &mut Vec<u8>, fact: VerifiedEffectFact) {
+fn put_effect_fact<V: core::borrow::Borrow<VerifiedEffectFact>>(bytes: &mut Vec<u8>, fact: V) {
+    let fact = fact.borrow();
     put_u8(bytes, fact.kind.tag());
     put_effect(bytes, fact.effect);
     put_u32(bytes, fact.component.get());
@@ -17350,7 +17510,11 @@ fn put_effect_fact(bytes: &mut Vec<u8>, fact: VerifiedEffectFact) {
     );
 }
 
-fn put_provider_verification_scope(bytes: &mut Vec<u8>, scope: ProviderVerificationScope) {
+fn put_provider_verification_scope<V: core::borrow::Borrow<ProviderVerificationScope>>(
+    bytes: &mut Vec<u8>,
+    scope: V,
+) {
+    let scope = scope.borrow();
     put_u64(bytes, scope.world.get());
     put_provider_coordinate(bytes, scope.provider);
     put_u64(bytes, scope.operation.get());
@@ -17916,7 +18080,7 @@ mod whole_state_checkpoint_tests {
 
     fn append_checkpoint(engine: &mut Engine, journal: &mut Vec<u8>) {
         let command = Command(CommandKind::WholeStateCheckpointV1 {
-            state: encode_whole_state_checkpoint(&engine.state),
+            state: Arc::from(encode_whole_state_checkpoint(&engine.state).into_boxed_slice()),
             projection: engine.projection_digest(),
         });
         engine

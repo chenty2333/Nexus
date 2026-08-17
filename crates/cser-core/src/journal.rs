@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use alloc::vec::Vec;
+use alloc::{sync::Arc, vec::Vec};
 
 use sha2::{Digest as _, Sha256};
 
@@ -117,7 +117,7 @@ pub struct JournalCheckpoint {
     revision: u64,
     head: Digest,
     projection: Digest,
-    image: Vec<u8>,
+    image: Arc<[u8]>,
     envelope: Digest,
 }
 
@@ -175,7 +175,7 @@ impl JournalCheckpoint {
             revision,
             head,
             projection,
-            image: image.to_vec(),
+            image: Arc::from(image.to_vec().into_boxed_slice()),
             envelope,
         })
     }
@@ -281,7 +281,7 @@ impl JournalCheckpoint {
             revision,
             head,
             projection,
-            image: bytes[180..image_end].to_vec(),
+            image: Arc::from(bytes[180..image_end].to_vec().into_boxed_slice()),
             envelope: expected,
         })
     }
@@ -472,7 +472,7 @@ pub struct JournalRecord {
     predecessor: Digest,
     command: CommandKind,
     digest: Digest,
-    bytes: Vec<u8>,
+    bytes: Arc<[u8]>,
 }
 
 impl JournalRecord {
@@ -491,16 +491,16 @@ impl JournalRecord {
         if base_projection.is_zero() || freshness.registry() != binding.registry() {
             return Err(JournalDecodeError::InvalidBinding);
         }
-        let payload = command
-            .try_encode_payload()
+        let payload_len = command
+            .try_encoded_payload_len()
             .map_err(JournalDecodeError::Command)?;
         let total_len = MIN_RECORD_LEN
-            .checked_add(payload.len())
+            .checked_add(payload_len)
             .ok_or(JournalDecodeError::LengthOverflow)?;
         let total_len_u32 =
             u32::try_from(total_len).map_err(|_| JournalDecodeError::LengthOverflow)?;
-        let payload_len =
-            u32::try_from(payload.len()).map_err(|_| JournalDecodeError::LengthOverflow)?;
+        let payload_len_u32 =
+            u32::try_from(payload_len).map_err(|_| JournalDecodeError::LengthOverflow)?;
 
         let mut bytes = Vec::with_capacity(total_len);
         bytes.extend_from_slice(&JOURNAL_MAGIC);
@@ -518,8 +518,16 @@ impl JournalRecord {
         bytes.extend_from_slice(&freshness.device().get().to_le_bytes());
         bytes.extend_from_slice(&base_projection.bytes());
         bytes.extend_from_slice(&predecessor.bytes());
-        bytes.extend_from_slice(&payload_len.to_le_bytes());
-        bytes.extend_from_slice(&payload);
+        bytes.extend_from_slice(&payload_len_u32.to_le_bytes());
+        command
+            .encode_payload_into(&mut bytes)
+            .map_err(JournalDecodeError::Command)?;
+        if bytes.len() != total_len - DIGEST_LEN {
+            return Err(JournalDecodeError::PayloadLengthMismatch {
+                expected: total_len - DIGEST_LEN,
+                actual: bytes.len(),
+            });
+        }
         debug_assert_eq!(bytes.len(), total_len - DIGEST_LEN);
 
         let digest = Digest::new(Sha256::digest(&bytes).into());
@@ -539,7 +547,7 @@ impl JournalRecord {
             predecessor,
             command,
             digest,
-            bytes,
+            bytes: Arc::from(bytes.into_boxed_slice()),
         })
     }
 
@@ -623,6 +631,22 @@ impl JournalRecord {
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
+
+    #[cfg(test)]
+    pub(crate) fn shares_bytes_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.bytes, &other.bytes)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shares_checkpoint_image_with(&self, other: &Self) -> bool {
+        match (&self.command, &other.command) {
+            (
+                CommandKind::WholeStateCheckpointV1 { state: left, .. },
+                CommandKind::WholeStateCheckpointV1 { state: right, .. },
+            ) => Arc::ptr_eq(left, right),
+            _ => false,
+        }
+    }
 }
 
 /// Failure while decoding a durable journal stream.
@@ -655,6 +679,13 @@ pub enum JournalDecodeError {
     InvalidBinding,
     /// The payload does not encode a known command.
     Command(CommandDecodeError),
+    /// The canonical payload length calculation disagrees with encoding.
+    PayloadLengthMismatch {
+        /// Number of bytes reserved by the canonical length calculation.
+        expected: usize,
+        /// Number of bytes actually written by the encoder.
+        actual: usize,
+    },
     /// The trailing digest does not match the record bytes.
     ChecksumMismatch {
         /// Byte offset of the corrupt record.
@@ -900,7 +931,7 @@ fn scan_journal_inner(
             predecessor,
             command,
             digest: expected,
-            bytes: record_bytes.to_vec(),
+            bytes: Arc::from(record_bytes.to_vec().into_boxed_slice()),
         });
         offset = offset
             .checked_add(total_len)

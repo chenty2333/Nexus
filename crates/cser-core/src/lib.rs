@@ -66,9 +66,6 @@ pub use domain::{
     VerifierClassBinding, VerifierSetError, canonical_verifier_set_digest, validate_verifier_set,
 };
 pub use engine::{
-    CHILD_DESCRIPTOR_V1_WIRE_LEN, MAX_COMMAND_PAYLOAD_BYTES, MAX_COMMAND_VECTOR_ITEMS,
-};
-pub use engine::{
     ArtifactAdmission, ArtifactRecoveryItem, AuthorityState, ChargeProjection,
     ChildDescriptorDecodeError, ChildDescriptorV1, ChildDescriptorVerifier, ClaimCustodian,
     ClaimProjection, ClaimScope, ClaimUseError, Command, CommandDecodeError, CommandRequest,
@@ -88,6 +85,9 @@ pub use engine::{
     VerifiedChildDescriptor, VerifiedCommitOutcome, VerifiedEffectObservation,
     VerifiedHandoffChildResolution, VerifiedHandoffResolution, VerifiedObservation,
     VerifiedRetirementEvidence, VerifiedSettlementAck, VerifierIdentity, VerifierStamp,
+};
+pub use engine::{
+    CHILD_DESCRIPTOR_V1_WIRE_LEN, MAX_COMMAND_PAYLOAD_BYTES, MAX_COMMAND_VECTOR_ITEMS,
 };
 pub use identity::{
     BootGeneration, ChargeAccountId, ClaimId, ClaimKindId, ComponentId, CompositeKindId,
