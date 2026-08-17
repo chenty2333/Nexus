@@ -6,6 +6,17 @@ repo_root=$(cd -- "$script_dir/../.." && pwd)
 production=${1:-$repo_root/crates/nexus-ostd-virtio/src/production.rs}
 lib=${2:-$repo_root/crates/nexus-ostd-virtio/src/lib.rs}
 pci=${3:-$repo_root/crates/nexus-ostd-virtio/src/pci.rs}
+if (($# >= 4)); then
+    boot=$4
+elif [[ -f $(dirname -- "$production")/boot_quarantine.rs ]]; then
+    # In the patched Docker image this script is installed outside the source
+    # tree, so derive sibling sources from the explicitly supplied path.
+    boot=$(dirname -- "$production")/boot_quarantine.rs
+else
+    # Keep source-mutation callers (which pass a temporary production path)
+    # anchored at the repository copy.
+    boot=$repo_root/crates/nexus-ostd-virtio/src/boot_quarantine.rs
+fi
 
 fail() {
     echo "production VirtIO substrate assertion failed: $*" >&2
@@ -99,7 +110,7 @@ has_manual_clone_or_copy() {
     ' "$source"
 }
 
-for source in "$production" "$lib" "$pci"; do
+for source in "$production" "$lib" "$pci" "$boot"; do
     [[ -f $source && ! -L $source ]] || fail "missing regular source: $source"
 done
 
@@ -267,6 +278,69 @@ ownership_state=$(rust_block '^enum IntxOwnershipState' "$pci") \
     || fail 'cannot isolate INTx ownership state'
 grep -Fq 'Poisoned { epoch: u64, observed_masked: bool }' <<<"$ownership_state" \
     || fail 'INTx ownership state cannot retain a poisoned readback'
+
+# A live production transport must retain the BAR lease independently of the
+# PCI Root.  The external virtio-drivers type cannot carry that lease, so the
+# local wrapper is the only construction surface and its Drop order is an
+# explicit safety boundary.
+bar_registry=$(rust_block '^struct BarRegistry [{]' "$pci") \
+    || fail 'cannot isolate BAR registry'
+for field in \
+    'installed: bool,' \
+    'transport_claims_active: bool,' \
+    'transport_owner_id: Option<u64>,' \
+    'discovery_in_progress: bool,'; do
+    grep -Fq "$field" <<<"$bar_registry" \
+        || fail "BAR registry lacks ownership state: $field"
+done
+transport_owner=$(rust_block '^pub\\(crate\\) struct TransportOwner [{]' "$pci") \
+    || fail 'cannot isolate linear transport owner token'
+grep -Fq 'owner_id: u64,' <<<"$transport_owner" \
+    || fail 'transport owner token lacks its private identity'
+transport_wrapper=$(rust_block '^pub\\(crate\\) struct OwnedPciTransport [{]' "$pci") \
+    || fail 'cannot isolate owned PCI transport wrapper'
+for field in \
+    'transport: ManuallyDrop<RawPciTransport>,' \
+    'owner: ManuallyDrop<TransportOwner>,'; do
+    grep -Fq "$field" <<<"$transport_wrapper" \
+        || fail "owned transport wrapper lacks: $field"
+done
+owned_drop=$(rust_block '^impl Drop for OwnedPciTransport [{]' "$pci") \
+    || fail 'cannot isolate owned transport destructor'
+transport_drop_line=$(grep -nF 'ManuallyDrop::drop(&mut self.transport)' <<<"$owned_drop" | cut -d: -f1)
+owner_drop_line=$(grep -nF 'ManuallyDrop::drop(&mut self.owner)' <<<"$owned_drop" | cut -d: -f1)
+[[ -n $transport_drop_line && -n $owner_drop_line && $transport_drop_line -lt $owner_drop_line ]] \
+    || fail 'owned transport releases registry owner before external transport'
+grep -Fq 'registry.transport_owner_id == Some(self.owner_id)' "$pci" \
+    || fail 'transport owner destructor can clear a foreign lease'
+
+production_prefix=$(awk '/^#\[cfg\(test\)\]$/ { exit } { print }' "$production")
+grep -Fq 'type PciTransport = OwnedPciTransport;' <<<"$production_prefix" \
+    || fail 'production paths do not use the owned transport wrapper'
+grep -Fq 'let transport_owner = match pci::try_begin_transport_claims()' <<<"$production_prefix" \
+    || fail 'production transport path does not acquire a linear owner token'
+grep -Fq 'PciTransport::new(transport, transport_owner)' <<<"$production_prefix" \
+    || fail 'production raw transport is not coupled to its owner token'
+if grep -Eq 'release_(unexposed_)?transport_claims|release_transport_claims' \
+    <<<"$production_prefix"; then
+    fail 'production paths retain obsolete manual transport-claim release'
+fi
+
+boot_impl=$(awk '
+    /^#\[cfg\(any\(test, ktest\)\)\]$/ { exit }
+    { print }
+' "$boot")
+grep -Fq 'type PciTransport = OwnedPciTransport;' <<<"$boot_impl" \
+    || fail 'boot quarantine does not use the owned transport wrapper'
+grep -Fq 'let transport_owner = match pci::try_begin_transport_claims()' <<<"$boot_impl" \
+    || fail 'boot quarantine does not acquire a linear owner token'
+grep -Fq 'PciTransport::new(transport, transport_owner)' <<<"$boot_impl" \
+    || fail 'boot raw transport is not coupled to its owner token'
+if grep -Eq 'release_(unexposed_)?transport_claims|release_transport_claims' \
+    <<<"$boot_impl"; then
+    fail 'boot paths retain obsolete manual transport-claim release'
+fi
+
 validate_intx=$(rust_block '^    fn validate_intx_token' "$pci") \
     || fail 'cannot isolate owner/route/epoch validation'
 for required in \
@@ -318,6 +392,7 @@ done
 discover_root=$(rust_block '^pub fn discover_and_own_bars' "$pci") \
     || fail 'cannot isolate boot-time PCI discovery'
 for required in \
+    'let _discovery = reserve_discovery()?;' \
     'if INITIAL_FENCE_POISONED.load(Ordering::Acquire) {' \
     'let identity = configuration.read_word(EXPECTED_DEVICE, 0);' \
     'let expected = command_with_boot_fence(before);' \
@@ -328,6 +403,14 @@ for required in \
     grep -Fq "$required" <<<"$discover_root" \
         || fail "boot-time PCI discovery fence lacks: $required"
 done
+reserve_discovery=$(rust_block '^fn reserve_discovery' "$pci") \
+    || fail 'cannot isolate pre-I/O discovery reservation'
+grep -Fq 'bar_registry_is_unavailable(&registry)' <<<"$reserve_discovery" \
+    || fail 'discovery reservation does not reject installed/live registry state'
+reservation_line=$(grep -nF 'let _discovery = reserve_discovery()?;' <<<"$discover_root" | cut -d: -f1)
+fence_line=$(grep -nF 'root.set_command(EXPECTED_DEVICE, expected);' <<<"$discover_root" | cut -d: -f1)
+[[ -n $reservation_line && -n $fence_line && $reservation_line -lt $fence_line ]] \
+    || fail 'duplicate discovery can fence before reserving the BAR registry'
 unmask_intx=$(rust_block '^    pub fn unmask_intx' "$pci") \
     || fail 'cannot isolate INTx unmask transition'
 mask_intx=$(rust_block '^    pub fn mask_intx' "$pci") \
@@ -617,12 +700,14 @@ for rollback_step in \
     'forget(buffers);' \
     'drop(queue);' \
     'drop(transport);' \
-    'pci::release_unexposed_transport_claims_checked()' \
     'pci::restore_device_command_checked(root, device_function, original_command);' \
     'dma::abort_unexposed_generation(generation);'; do
     grep -Fq "$rollback_step" <<<"$rollback" \
         || fail "preparation rollback omits: $rollback_step"
 done
+if grep -Eq 'release_(unexposed_)?transport_claims|release_transport_claims' <<<"$rollback"; then
+    fail 'rollback retains obsolete manual transport-claim release'
+fi
 
 preflight=$(rust_block '^    pub fn preflight_publish' "$production") \
     || fail 'cannot isolate publication preflight'
@@ -1103,7 +1188,6 @@ for required in \
     'abandon_queue_after_reset(queue)' \
     'dma::seal_queue_retirement(reset)' \
     'drop(session.transport.take().expect("retained transport"));' \
-    'pci::release_transport_claims()' \
     'assert_eq!(dma::retained_pages(generation), 3);' \
     'Ok(ProductionResetAck {'; do
     grep -Fq -- "$required" <<<"$reset_finalize" \
@@ -1119,11 +1203,14 @@ for unique_step in \
     'dma::acknowledge_device_reset(generation)' \
     'abandon_queue_after_reset(queue)' \
     'dma::seal_queue_retirement(reset)' \
-    'pci::release_transport_claims()'; do
+    'drop(session.transport.take().expect("retained transport"));'; do
     step_count=$(grep -F -c "$unique_step" <<<"$reset_tombstone_impl" || true)
     [[ $step_count == 1 ]] \
         || fail "reset tombstone duplicated finalization step: $unique_step (count=$step_count)"
 done
+if grep -Eq 'release_(unexposed_)?transport_claims|release_transport_claims' <<<"$reset_tombstone_impl"; then
+    fail 'reset finalization retains obsolete manual transport-claim release'
+fi
 
 generation_preflight=$(rust_block '^    pub fn prepare_generation_advance' "$production") \
     || fail 'cannot isolate generation prevalidation'
@@ -1199,4 +1286,4 @@ for export in \
     grep -Fq "$export" "$lib" || fail "public facade omits $export"
 done
 
-echo 'production VirtIO substrate: PASS authority=core-external identity=descriptive+reconstructible physical_owner=one-bdf+one-active-session intx=descriptive-route+linear-owner-epoch+masked-unmasked preparation=owner-bound-preflight+polling+irq+typed-rollback-or-indeterminate+sequence-atomic receipt=opaque+owner-coupled linear_owner=non-clone+fail-closed preflight=failure-atomic publication=receipt-revalidated+intent-only+infallible+post-release-moves-only hardware_intent=real-owner+non-clone+failure-returns-owner+infallible-reset+completion-state-pop-aware notification=kick-or-suppressed+replay-safe completion=polling+irq+one-step-actor+one-validator+exact-used-length+pending-or-failed-resettable+pop-state reset_ack=one-step-actor+bounded-retry+unique-finalize cancel=exact-buffers generation=prevalidate+infallible-apply quiescence=prevalidate+infallible-apply legacy_portal=absent'
+echo 'production VirtIO substrate: PASS authority=core-external identity=descriptive+reconstructible physical_owner=one-bdf+one-active-session transport_owner=linear-wrapper+raw-drop-before-owner+forget-coupled discovery=pre-io-registry-reservation intx=descriptive-route+linear-owner-epoch+masked-unmasked preparation=owner-bound-preflight+polling+irq+typed-rollback-or-indeterminate+sequence-atomic receipt=opaque+owner-coupled linear_owner=non-clone+fail-closed preflight=failure-atomic publication=receipt-revalidated+intent-only+infallible+post-release-moves-only hardware_intent=real-owner+non-clone+failure-returns-owner+infallible-reset+completion-state-pop-aware notification=kick-or-suppressed+replay-safe completion=polling+irq+one-step-actor+one-validator+exact-used-length+pending-or-failed-resettable+pop-state reset_ack=one-step-actor+bounded-retry+unique-finalize cancel=exact-buffers generation=prevalidate+infallible-apply quiescence=prevalidate+infallible-apply legacy_portal=absent'

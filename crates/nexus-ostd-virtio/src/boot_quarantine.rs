@@ -23,7 +23,7 @@ use core::hint::spin_loop;
 
 use virtio_drivers::transport::{
     DeviceStatus, DeviceType, InterruptStatus, Transport,
-    pci::{PciTransport, VirtioPciError},
+    pci::{PciTransport as RawPciTransport, VirtioPciError},
 };
 
 use crate::{
@@ -33,10 +33,12 @@ use crate::{
         OstdHal,
     },
     pci::{
-        self, BootPciFenceError, BootPciFenceObservation, DeviceBdf, MaskedIntx, PciDiscoveryError,
-        Root,
+        self, BootPciFenceError, BootPciFenceObservation, DeviceBdf, MaskedIntx, OwnedPciTransport,
+        PciDiscoveryError, Root,
     },
 };
+
+type PciTransport = OwnedPciTransport;
 
 const RESET_POLL_LIMIT: usize = 10_000_000;
 const IRQ_DRAIN_POLL_LIMIT: usize = 10_000;
@@ -672,7 +674,6 @@ pub enum BootQuarantineError {
     ResetNotAcknowledged,
     PciFenceLostAfterReset,
     IrqDrainNotConfirmed,
-    TransportClaimsNotReleased,
     IotlbAllocationFailed,
     IommuRemappingUnavailable,
     IotlbPending,
@@ -789,6 +790,11 @@ impl ActivatedBootDevice {
     }
 
     /// Transfers all three linear owners to the production composition root.
+    ///
+    /// The returned `ProductionDevice` creates only coupled transport-owner
+    /// values for live requests. Those values retain the BAR owner
+    /// independently of this `Root`, so dropping the root after this split
+    /// cannot release or invalidate a live request's MMIO ownership.
     pub fn into_parts(self) -> (Root, MaskedIntx, ProductionDevice) {
         (self.root, self.masked_intx, self.device)
     }
@@ -823,27 +829,21 @@ fn begin_reset(
     request: BootQuarantineRequest,
     pci_observation: BootPciFenceObservation,
 ) -> Result<ResetBootOwner, BootQuarantineFailure> {
-    if pci::try_begin_transport_claims().is_err() {
-        return Err(BootQuarantineFailure {
-            error: BootQuarantineError::TransportClaimsUnavailable,
-            retained: Some(FailedBootOwner::Fenced(fenced)),
-        });
-    }
+    let transport_owner = match pci::try_begin_transport_claims() {
+        Ok(owner) => owner,
+        Err(_) => {
+            return Err(BootQuarantineFailure {
+                error: BootQuarantineError::TransportClaimsUnavailable,
+                retained: Some(FailedBootOwner::Fenced(fenced)),
+            });
+        }
+    };
     let device_function = fenced.root.device_function();
-    let transport = PciTransport::new::<OstdHal, _>(fenced.root.raw_mut(), device_function);
+    let transport = RawPciTransport::new::<OstdHal, _>(fenced.root.raw_mut(), device_function)
+        .map(|transport| PciTransport::new(transport, transport_owner));
     let transport = match transport {
         Ok(transport) => transport,
         Err(error) => {
-            // SAFETY: construction returned no transport owner or raw pointer
-            // to the caller. Any partially installed MMIO subrange claims are
-            // therefore safe to discard while the PCI fence remains active.
-            let released = unsafe { pci::release_unexposed_transport_claims_checked() };
-            if !released {
-                return Err(BootQuarantineFailure {
-                    error: BootQuarantineError::TransportClaimsNotReleased,
-                    retained: Some(FailedBootOwner::Fenced(fenced)),
-                });
-            }
             return Err(BootQuarantineFailure {
                 error: BootQuarantineError::Transport(error),
                 retained: Some(FailedBootOwner::Fenced(fenced)),
@@ -876,15 +876,6 @@ fn finish_reset(
         }
     };
     drop(owner.transport);
-    // SAFETY: the sole transport was destroyed immediately above and no queue
-    // or raw capability pointer was ever created by this boot path.
-    let released = unsafe { pci::release_unexposed_transport_claims_checked() };
-    if !released {
-        return Err(BootQuarantineFailure {
-            error: BootQuarantineError::TransportClaimsNotReleased,
-            retained: Some(FailedBootOwner::Fenced(owner.fenced)),
-        });
-    }
     Ok(ResetCompleteBootOwner {
         fenced: owner.fenced,
         request: owner.request,
@@ -1230,5 +1221,23 @@ mod tests {
         assert!(!implementation.contains("impl Clone for BootVirtioIsrEmptyReceipt"));
         assert!(!implementation.contains("impl Clone for BootGlobalIotlbInvalidationReceipt"));
         assert!(!implementation.contains("pub unsafe"));
+    }
+
+    #[cfg_attr(test, test)]
+    #[cfg_attr(ktest, ktest)]
+    fn activation_uses_transport_owner_coupling_before_live_requests() {
+        let implementation = SOURCE
+            .split_once("#[cfg(any(test, ktest))]")
+            .expect("test module follows implementation")
+            .0;
+        assert!(implementation.contains("OwnedPciTransport"));
+        let claim = implementation
+            .find("let transport_owner = match pci::try_begin_transport_claims()")
+            .expect("activation reset claims a linear transport owner");
+        let construct = implementation
+            .find("PciTransport::new(transport, transport_owner)")
+            .expect("raw transport is coupled to the owner");
+        assert!(claim < construct);
+        assert!(!implementation.contains("release_unexposed_transport_claims_checked"));
     }
 }

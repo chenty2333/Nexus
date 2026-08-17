@@ -5,6 +5,8 @@
 use alloc::sync::Arc;
 use core::{
     fmt,
+    mem::ManuallyDrop,
+    ops::{Deref, DerefMut},
     ptr::NonNull,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
@@ -15,15 +17,17 @@ use ostd::{
     sync::SpinLock,
 };
 use virtio_drivers::{
-    PhysAddr,
+    Error as VirtioError, PhysAddr,
     transport::{
-        DeviceType,
+        DeviceStatus, DeviceType, InterruptStatus, Transport,
         pci::{
+            PciTransport as RawPciTransport,
             bus::{BarInfo, Command, ConfigurationAccess, DeviceFunction, PciRoot},
             virtio_device_type,
         },
     },
 };
+use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 const CONFIG_ADDRESS: u16 = 0x0cf8;
 const CONFIG_DATA: u16 = 0x0cfc;
@@ -38,6 +42,8 @@ const INTX_NOT_CONNECTED: u8 = 0xff;
 const EXPECTED_INTX_PIN: u8 = 1;
 
 static NEXT_INTX_OWNER_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_TRANSPORT_OWNER_ID: AtomicU64 = AtomicU64::new(1);
+static TRANSPORT_OWNER_ID_EXHAUSTED: AtomicBool = AtomicBool::new(false);
 static INITIAL_FENCE_POISONED: AtomicBool = AtomicBool::new(false);
 
 struct ConfigPorts {
@@ -442,6 +448,12 @@ impl fmt::Display for DeviceBdf {
 /// The raw `PciRoot<PioConfigurationAccess>` is deliberately private: callers
 /// can neither clone the configuration accessor nor manufacture an MMIO
 /// capability outside the facade lifecycle.
+///
+/// Dropping this value does not release the process-wide BAR registry. That
+/// registry is the hardware owner for all MMIO pointers issued to a transport,
+/// and therefore must outlive a `Root` when a production request still holds a
+/// live transport. A later discovery is rejected by the registry reservation
+/// before it can write the PCI command register.
 pub struct Root {
     inner: RawRoot,
     device_function: DeviceFunction,
@@ -883,6 +895,8 @@ struct BarRegistry {
     owners: [Option<BarOwner>; 6],
     installed: bool,
     transport_claims_active: bool,
+    transport_owner_id: Option<u64>,
+    discovery_in_progress: bool,
     claims: [Option<MmioClaim>; 4],
 }
 
@@ -898,13 +912,49 @@ impl BarRegistry {
             owners: [const { None }; 6],
             installed: false,
             transport_claims_active: false,
+            transport_owner_id: None,
+            discovery_in_progress: false,
             claims: [const { None }; 4],
         }
     }
 }
 
-pub fn begin_transport_claims() {
-    try_begin_transport_claims().expect("transport claim lifecycle is quiescent");
+/// A process-wide reservation for the discovery transaction.
+///
+/// Discovery must reserve the registry before it reads or writes the PCI
+/// command register.  Otherwise two callers can both observe an apparently
+/// empty registry, and the losing caller can still fence a live transport
+/// before its later BAR-registry check rejects the duplicate.  The reservation
+/// is deliberately independent from the installed BAR owners: it covers the
+/// interval in which BAR owners are being acquired and published.
+struct DiscoveryReservation;
+
+impl Drop for DiscoveryReservation {
+    fn drop(&mut self) {
+        let mut registry = BAR_REGISTRY.lock();
+        assert!(
+            registry.discovery_in_progress,
+            "PCI discovery reservation dropped without an active reservation"
+        );
+        registry.discovery_in_progress = false;
+    }
+}
+
+fn reserve_discovery() -> Result<DiscoveryReservation, PciDiscoveryError> {
+    let mut registry = BAR_REGISTRY.lock();
+    if bar_registry_is_unavailable(&registry) {
+        return Err(PciDiscoveryError::BarOwnersAlreadyInstalled);
+    }
+    registry.discovery_in_progress = true;
+    Ok(DiscoveryReservation)
+}
+
+fn bar_registry_is_unavailable(registry: &BarRegistry) -> bool {
+    registry.installed
+        || registry.transport_claims_active
+        || registry.discovery_in_progress
+        || !registry.owners.iter().all(Option::is_none)
+        || !registry.claims.iter().all(Option::is_none)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -912,9 +962,177 @@ pub(crate) enum TransportClaimStartError {
     BarOwnersUnavailable,
     AlreadyActive,
     StaleClaims,
+    OwnerIdentityExhausted,
 }
 
-pub(crate) fn try_begin_transport_claims() -> Result<(), TransportClaimStartError> {
+/// Linear owner of the BAR subclaims issued to one transport.
+///
+/// This token is intentionally held by [`OwnedPciTransport`]. Its destructor
+/// only releases the process-wide BAR subclaims after the wrapped external
+/// `PciTransport` has been destroyed. Forgetting the wrapper therefore retains
+/// both the transport and this owner, which is the safe result for an
+/// indeterminate hardware lifecycle.
+#[must_use = "retain the BAR owner until its coupled transport is dropped"]
+pub(crate) struct TransportOwner {
+    owner_id: u64,
+}
+
+impl Drop for TransportOwner {
+    fn drop(&mut self) {
+        let mut registry = BAR_REGISTRY.lock();
+        if registry.transport_claims_active && registry.transport_owner_id == Some(self.owner_id) {
+            registry.claims.fill(None);
+            registry.transport_claims_active = false;
+            registry.transport_owner_id = None;
+        }
+    }
+}
+
+/// A production transport coupled to the exact BAR owner that made its MMIO
+/// pointers valid.
+///
+/// The wrapped virtio-drivers transport is an external type and cannot carry
+/// Nexus's registry lease itself. This private wrapper closes that ownership
+/// gap. `Drop` explicitly destroys the transport first (which resets the
+/// device and releases its raw MMIO use) and only then drops `TransportOwner`.
+///
+/// The fields are `ManuallyDrop` so the order remains an explicit invariant,
+/// rather than depending on struct-field drop order. The wrapper is not
+/// cloneable or constructible outside this module.
+#[must_use = "retain the coupled transport until reset or fail-closed quarantine"]
+pub(crate) struct OwnedPciTransport {
+    transport: ManuallyDrop<RawPciTransport>,
+    owner: ManuallyDrop<TransportOwner>,
+}
+
+impl OwnedPciTransport {
+    pub(crate) fn new(transport: RawPciTransport, owner: TransportOwner) -> Self {
+        Self {
+            transport: ManuallyDrop::new(transport),
+            owner: ManuallyDrop::new(owner),
+        }
+    }
+}
+
+impl Deref for OwnedPciTransport {
+    type Target = RawPciTransport;
+
+    fn deref(&self) -> &Self::Target {
+        &self.transport
+    }
+}
+
+impl DerefMut for OwnedPciTransport {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.transport
+    }
+}
+
+impl Drop for OwnedPciTransport {
+    fn drop(&mut self) {
+        // SAFETY: the transport is initialized and has not been taken. This
+        // is deliberately before the owner drop below.
+        unsafe { ManuallyDrop::drop(&mut self.transport) };
+        // SAFETY: the owner is initialized and is dropped exactly once after
+        // the external transport has completed its destructor.
+        unsafe { ManuallyDrop::drop(&mut self.owner) };
+    }
+}
+
+impl Transport for OwnedPciTransport {
+    fn device_type(&self) -> DeviceType {
+        self.deref().device_type()
+    }
+
+    fn read_device_features(&mut self) -> u64 {
+        self.deref_mut().read_device_features()
+    }
+
+    fn write_driver_features(&mut self, driver_features: u64) {
+        self.deref_mut().write_driver_features(driver_features);
+    }
+
+    fn max_queue_size(&mut self, queue: u16) -> u32 {
+        self.deref_mut().max_queue_size(queue)
+    }
+
+    fn notify(&mut self, queue: u16) {
+        self.deref_mut().notify(queue);
+    }
+
+    fn get_status(&self) -> DeviceStatus {
+        self.deref().get_status()
+    }
+
+    fn set_status(&mut self, status: DeviceStatus) {
+        self.deref_mut().set_status(status);
+    }
+
+    fn set_guest_page_size(&mut self, guest_page_size: u32) {
+        self.deref_mut().set_guest_page_size(guest_page_size);
+    }
+
+    fn requires_legacy_layout(&self) -> bool {
+        self.deref().requires_legacy_layout()
+    }
+
+    fn queue_set(
+        &mut self,
+        queue: u16,
+        size: u32,
+        descriptors: PhysAddr,
+        driver_area: PhysAddr,
+        device_area: PhysAddr,
+    ) {
+        self.deref_mut()
+            .queue_set(queue, size, descriptors, driver_area, device_area);
+    }
+
+    fn queue_unset(&mut self, queue: u16) {
+        self.deref_mut().queue_unset(queue);
+    }
+
+    fn queue_used(&mut self, queue: u16) -> bool {
+        self.deref_mut().queue_used(queue)
+    }
+
+    fn ack_interrupt(&mut self) -> InterruptStatus {
+        self.deref_mut().ack_interrupt()
+    }
+
+    fn read_config_generation(&self) -> u32 {
+        self.deref().read_config_generation()
+    }
+
+    fn read_config_space<T: FromBytes + IntoBytes>(&self, offset: usize) -> Result<T, VirtioError> {
+        self.deref().read_config_space(offset)
+    }
+
+    fn write_config_space<T: IntoBytes + Immutable>(
+        &mut self,
+        offset: usize,
+        value: T,
+    ) -> Result<(), VirtioError> {
+        self.deref_mut().write_config_space(offset, value)
+    }
+}
+
+fn allocate_transport_owner_id() -> Result<u64, TransportClaimStartError> {
+    if TRANSPORT_OWNER_ID_EXHAUSTED.load(Ordering::Acquire) {
+        return Err(TransportClaimStartError::OwnerIdentityExhausted);
+    }
+    let owner_id = NEXT_TRANSPORT_OWNER_ID.fetch_add(1, Ordering::Relaxed);
+    if owner_id == 0 {
+        TRANSPORT_OWNER_ID_EXHAUSTED.store(true, Ordering::Release);
+        return Err(TransportClaimStartError::OwnerIdentityExhausted);
+    }
+    if owner_id == u64::MAX {
+        TRANSPORT_OWNER_ID_EXHAUSTED.store(true, Ordering::Release);
+    }
+    Ok(owner_id)
+}
+
+pub(crate) fn try_begin_transport_claims() -> Result<TransportOwner, TransportClaimStartError> {
     let mut registry = BAR_REGISTRY.lock();
     if !registry.installed {
         return Err(TransportClaimStartError::BarOwnersUnavailable);
@@ -925,44 +1143,10 @@ pub(crate) fn try_begin_transport_claims() -> Result<(), TransportClaimStartErro
     if !registry.claims.iter().all(Option::is_none) {
         return Err(TransportClaimStartError::StaleClaims);
     }
+    let owner_id = allocate_transport_owner_id()?;
     registry.transport_claims_active = true;
-    Ok(())
-}
-
-/// Releases the raw capability subranges claimed by one destroyed transport.
-///
-/// # Safety
-///
-/// Every `PciTransport` and raw MMIO pointer for the transport generation must
-/// already have been destroyed. A quarantined live transport must retain its
-/// claims so a replacement cannot alias its capability mappings.
-pub(crate) unsafe fn release_transport_claims() {
-    let mut registry = BAR_REGISTRY.lock();
-    assert!(registry.transport_claims_active);
-    registry.claims.fill(None);
-    registry.transport_claims_active = false;
-}
-
-/// Attempts to release the claims of a transport which never became exposed.
-///
-/// This is the production-constructor rollback counterpart of
-/// [`release_transport_claims`]. It deliberately does not assert: an
-/// inconsistent registry means rollback cannot be certified, so the static
-/// claim state is retained and the caller must quarantine the preparation.
-///
-/// # Safety
-///
-/// Every `PciTransport` and raw MMIO pointer for the attempted transport must
-/// already have been destroyed. This function is only valid before the device
-/// reached `DRIVER_OK`.
-pub(crate) unsafe fn release_unexposed_transport_claims_checked() -> bool {
-    let mut registry = BAR_REGISTRY.lock();
-    if !registry.installed || !registry.transport_claims_active {
-        return false;
-    }
-    registry.claims.fill(None);
-    registry.transport_claims_active = false;
-    true
+    registry.transport_owner_id = Some(owner_id);
+    Ok(TransportOwner { owner_id })
 }
 
 static BAR_REGISTRY: SpinLock<BarRegistry> = SpinLock::new(BarRegistry::new());
@@ -989,6 +1173,10 @@ pub(crate) fn transport_claim_observation() -> TransportClaimObservation {
 /// Discovers exactly one modern VirtIO block device on bus 0 and installs one
 /// owner for each of its memory BARs before raw capability pointers are made.
 pub fn discover_and_own_bars() -> Result<Root, PciDiscoveryError> {
+    // This check is intentionally before configuration-port acquisition and
+    // before every PCI command read/write.  A duplicate discovery must not
+    // fence a function whose BAR owner or transport is already live.
+    let _discovery = reserve_discovery()?;
     if INITIAL_FENCE_POISONED.load(Ordering::Acquire) {
         return Err(PciDiscoveryError::InitialFencePoisoned);
     }
@@ -1392,5 +1580,78 @@ mod tests {
             .unwrap();
         let mask_write = implementation.rfind("set_intx_mask(self, true);").unwrap();
         assert!(mask_epoch < mask_write);
+    }
+
+    #[cfg_attr(test, test)]
+    #[cfg_attr(ktest, ktest)]
+    fn duplicate_discovery_is_rejected_before_the_initial_fence() {
+        let implementation = SOURCE
+            .split_once("#[cfg(any(test, ktest))]")
+            .expect("test module follows implementation")
+            .0;
+        let reservation = implementation
+            .find("let _discovery = reserve_discovery()?;")
+            .expect("discovery reserves the BAR registry before hardware access");
+        let first_command_write = implementation
+            .find("root.set_command(EXPECTED_DEVICE, expected);")
+            .expect("discovery has an explicit initial fence write");
+        assert!(reservation < first_command_write);
+        assert!(implementation.contains("registry.transport_claims_active"));
+        assert!(implementation.contains("registry.discovery_in_progress"));
+        assert!(implementation.contains("PciDiscoveryError::BarOwnersAlreadyInstalled"));
+    }
+
+    #[cfg_attr(test, test)]
+    #[cfg_attr(ktest, ktest)]
+    fn live_transport_lease_blocks_rediscovery_after_root_drop() {
+        let mut registry = BarRegistry::new();
+        assert!(!bar_registry_is_unavailable(&registry));
+
+        // Activation has installed the BAR owners; the production request has
+        // acquired the transport lease. Dropping the external `Root` does not
+        // touch this registry state, because the live transport still needs
+        // the owner-backed MMIO mappings.
+        registry.installed = true;
+        registry.transport_claims_active = true;
+        assert!(bar_registry_is_unavailable(&registry));
+
+        registry.transport_claims_active = false;
+        registry.discovery_in_progress = true;
+        assert!(bar_registry_is_unavailable(&registry));
+    }
+
+    #[cfg_attr(test, test)]
+    #[cfg_attr(ktest, ktest)]
+    fn transport_wrapper_drops_external_transport_before_registry_owner() {
+        let implementation = SOURCE
+            .split_once("#[cfg(any(test, ktest))]")
+            .expect("test module follows implementation")
+            .0;
+        let wrapper = implementation
+            .find("pub(crate) struct OwnedPciTransport")
+            .expect("production transport wrapper");
+        let transport_field = implementation[wrapper..]
+            .find("transport: ManuallyDrop<RawPciTransport>")
+            .map(|offset| wrapper + offset)
+            .expect("raw transport retained by wrapper");
+        let owner_field = implementation[wrapper..]
+            .find("owner: ManuallyDrop<TransportOwner>")
+            .map(|offset| wrapper + offset)
+            .expect("registry owner retained by wrapper");
+        let drop_impl = implementation[wrapper..]
+            .find("impl Drop for OwnedPciTransport")
+            .map(|offset| wrapper + offset)
+            .expect("explicit wrapper drop");
+        let transport_drop = implementation[drop_impl..]
+            .find("ManuallyDrop::drop(&mut self.transport)")
+            .map(|offset| drop_impl + offset)
+            .expect("external transport drops first");
+        let owner_drop = implementation[drop_impl..]
+            .find("ManuallyDrop::drop(&mut self.owner)")
+            .map(|offset| drop_impl + offset)
+            .expect("registry owner drops second");
+        assert!(transport_field < owner_field);
+        assert!(drop_impl < transport_drop && transport_drop < owner_drop);
+        assert!(implementation.contains("registry.transport_owner_id == Some(self.owner_id)"));
     }
 }

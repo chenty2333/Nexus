@@ -27,7 +27,7 @@ use virtio_drivers::{
     transport::{
         DeviceStatus, DeviceType, InterruptStatus, Transport,
         pci::{
-            PciTransport, VirtioPciError,
+            PciTransport as RawPciTransport, VirtioPciError,
             bus::{Command, DeviceFunction},
         },
     },
@@ -35,7 +35,7 @@ use virtio_drivers::{
 
 use crate::{
     dma::{self, OstdHal},
-    pci::{self, DeviceBdf, Root},
+    pci::{self, DeviceBdf, OwnedPciTransport, Root},
 };
 
 const QUEUE_INDEX: u16 = 0;
@@ -72,6 +72,7 @@ const REQUIRED_FEATURES: NexusBlkFeatures = NexusBlkFeatures::RO
 
 type Queue = VirtQueue<OstdHal, QUEUE_SIZE>;
 type PreparedQueue = PreparedVirtQueue<OstdHal, QUEUE_SIZE>;
+type PciTransport = OwnedPciTransport;
 
 /// Completion-delivery mode selected before the queue becomes device-visible.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1852,21 +1853,32 @@ impl ProductionDevice {
                 hardware_certain,
             ));
         }
-        if pci::try_begin_transport_claims().is_err() {
-            let mut hardware_certain = dma::abort_unexposed_generation(self.device_generation);
-            hardware_certain &=
-                pci::restore_device_command_checked(root, self.device_function, original_command);
-            return Err(self.finish_failed_preparation(
-                attempt,
-                PrepareReadError::TransportPreparationBusy,
-                hardware_certain,
-            ));
-        }
+        let transport_owner = match pci::try_begin_transport_claims() {
+            Ok(owner) => owner,
+            Err(_) => {
+                let mut hardware_certain = dma::abort_unexposed_generation(self.device_generation);
+                hardware_certain &= pci::restore_device_command_checked(
+                    root,
+                    self.device_function,
+                    original_command,
+                );
+                return Err(self.finish_failed_preparation(
+                    attempt,
+                    PrepareReadError::TransportPreparationBusy,
+                    hardware_certain,
+                ));
+            }
+        };
 
         let mut transport =
-            match PciTransport::new::<OstdHal, _>(root.raw_mut(), self.device_function) {
-                Ok(transport) => transport,
+            match RawPciTransport::new::<OstdHal, _>(root.raw_mut(), self.device_function) {
+                Ok(transport) => PciTransport::new(transport, transport_owner),
                 Err(error) => {
+                    // No external transport was returned. Release the
+                    // preparation lease before constructing rollback
+                    // evidence so the evidence observes a quiescent claim
+                    // registry rather than a merely dead constructor token.
+                    drop(transport_owner);
                     return Err(self.rollback_failed_preparation(
                         root,
                         original_command,
@@ -2434,10 +2446,11 @@ fn rollback_unexposed_preparation(
 
     drop(queue);
     drop(transport);
-    // SAFETY: no transport was returned from the failed constructor, or the
-    // only returned transport was destroyed immediately above. The queue was
+    // Any present `OwnedPciTransport` has destroyed the external transport and
+    // then released its exact BAR owner token. The constructor-error path
+    // releases its owner before entering this rollback helper. The queue was
     // never exposed to a DRIVER_OK device and no raw MMIO pointer remains.
-    let mut hardware_certain = unsafe { pci::release_unexposed_transport_claims_checked() };
+    let mut hardware_certain = true;
     hardware_certain &=
         pci::restore_device_command_checked(root, device_function, original_command);
     drop(buffers);
@@ -3652,9 +3665,8 @@ impl ProductionResetTombstone {
         unsafe { abandon_queue_after_reset(queue) };
         let closure_authority = dma::seal_queue_retirement(reset);
         drop(session.transport.take().expect("retained transport"));
-        // SAFETY: queue and transport are both gone, so no raw BAR capability
-        // pointer remains live.
-        unsafe { pci::release_transport_claims() };
+        // `OwnedPciTransport` releases its BAR owner token only after the
+        // external transport destructor has completed.
         assert_eq!(dma::retained_pages(generation), 3);
 
         Ok(ProductionResetAck {
@@ -4989,9 +5001,10 @@ mod tests {
             .find("return false")
             .expect("typed indeterminate path");
         let drop_queue = rollback.find("drop(queue)").expect("safe teardown");
-        let release_claims = rollback
-            .find("release_unexposed_transport_claims_checked")
-            .expect("checked claim release");
+        let transport_drop = rollback.find("drop(transport)").expect("drop transport");
+        let restore_command = rollback
+            .find("restore_device_command_checked")
+            .expect("restore command");
         let abort_dma = rollback
             .find("abort_unexposed_generation")
             .expect("checked DMA release");
@@ -5002,8 +5015,9 @@ mod tests {
                 && forget_transport < forget_buffers
                 && forget_buffers < reject
                 && reject < drop_queue
-                && drop_queue < release_claims
-                && release_claims < abort_dma
+                && drop_queue < transport_drop
+                && transport_drop < restore_command
+                && restore_command < abort_dma
         );
 
         let started = function_body(SOURCE, "fn prepare_read_sector0_with_mode(");
