@@ -95,6 +95,7 @@ RUN cargo test --manifest-path /opt/nexus-virtio/virtio-drivers-0.13.0/Cargo.tom
         --lib --no-default-features \
     && rm -rf /opt/nexus-virtio/virtio-drivers-0.13.0/target
 
+COPY kernel/nexus-ostd/src/lib.rs /kernel/nexus-ostd/src/lib.rs
 COPY kernel/nexus-ostd/src/cser/core_device_quarantine.rs \
     kernel/nexus-ostd/src/cser/core_dma_adapter.rs \
     kernel/nexus-ostd/src/cser/core_dma_arena_allocator.rs \

@@ -2968,10 +2968,11 @@ mod tests {
         let payload = vec![0x5a; VNEXT_SEGMENT_CAPACITY];
         let mut previous_head = [0; 32];
         let mut endpoint = None;
-        for generation in 1..=4 {
+        for segment in 0_u32..4 {
+            let generation = u64::from(segment) + 1;
             let header = journal
                 .publish_segment(
-                    generation - 1,
+                    segment,
                     generation,
                     generation,
                     previous_head,
