@@ -1291,6 +1291,7 @@ fn run_activation_boot(boot: PersistentBoot) -> ! {
          profile=6 composite_effect=true effect_identity=shared component_ids=reply+dma \
          api_profile={} catalog_version={} projection_version={} snapshot_version={} \
          journal_schema={} catalog_set_digest={} projection_digest={} \
+         production_world={} reply_provider={}:{}:{} dma_provider={}:{}:{} \
          operation_id={} effect_sequence={} \
          reply_component_id={} dma_component_id={} arena_contract_digest={} \
          portal=nxp3 supervisor=core-v1 reply=committed-unsettled \
@@ -1311,6 +1312,13 @@ fn run_activation_boot(boot: PersistentBoot) -> ! {
         JOURNAL_SCHEMA_VERSION,
         HexDigest(catalog_set_digest),
         HexDigest(projection_digest),
+        PRODUCTION_WORLD.get(),
+        STANDARD_REPLY_PROVIDER.world().get(),
+        STANDARD_REPLY_PROVIDER.provider().get(),
+        STANDARD_REPLY_PROVIDER.generation().get(),
+        STANDARD_DMA_PROVIDER.world().get(),
+        STANDARD_DMA_PROVIDER.provider().get(),
+        STANDARD_DMA_PROVIDER.generation().get(),
         operation_effect().operation().get(),
         operation_effect().sequence(),
         AGENT_COMPONENT_REPLY.get(),
@@ -1641,6 +1649,7 @@ fn run_reuse_activation_boot(
         "CSER_CORE_PERSISTENT_BOOT3 PASS shared_runtime=true production_registry=single \
          api_profile={} catalog_version={} projection_version={} snapshot_version={} \
          journal_schema={} catalog_set_digest={} projection_digest={} \
+         production_world={} reply_provider={}:{}:{} dma_provider={}:{}:{} \
          operation_id={} effect_sequence={} \
          reply_component_id={} dma_component_id={} reuse_operation_id={} \
          reuse_effect_sequence={} arena_contract_digest={} \
@@ -1666,6 +1675,13 @@ fn run_reuse_activation_boot(
         JOURNAL_SCHEMA_VERSION,
         HexDigest(catalog_set_digest),
         HexDigest(projection_digest),
+        PRODUCTION_WORLD.get(),
+        STANDARD_REPLY_PROVIDER.world().get(),
+        STANDARD_REPLY_PROVIDER.provider().get(),
+        STANDARD_REPLY_PROVIDER.generation().get(),
+        STANDARD_DMA_PROVIDER.world().get(),
+        STANDARD_DMA_PROVIDER.provider().get(),
+        STANDARD_DMA_PROVIDER.generation().get(),
         operation_effect().operation().get(),
         operation_effect().sequence(),
         AGENT_COMPONENT_REPLY.get(),
@@ -2437,6 +2453,7 @@ fn run_quarantined_boot(boot: PersistentBoot) -> ! {
                 "CSER_CORE_PERSISTENT_BOOT2 PASS shared_runtime=true production_registry=single \
                  api_profile={} catalog_version={} projection_version={} snapshot_version={} \
                  journal_schema={} catalog_set_digest={} projection_digest={} \
+                 production_world={} reply_provider={}:{}:{} dma_provider={}:{}:{} \
                  operation_id={} effect_sequence={} \
                  reply_component_id={} dma_component_id={} \
                  portal=nxp3 supervisor=core-v1 reply=reconciliation-required \
@@ -2446,7 +2463,7 @@ fn run_quarantined_boot(boot: PersistentBoot) -> ! {
                  dma_pages_iova=retired dma_component=retired retained={} dma_retained=0 \
                  activation=deferred resource_reuse_authorized=true \
                  reset_submitted={} irq_submitted={} iotlb_submitted={} \
-                 service_executor_generation={} successor_generation={} \
+                 service_executor_generation={} executor_generation={} \
                  fresh_service_task=true ready_in_fresh_task=true production_rebind=true \
                  service_death=task-return exact_reap=true same_boot_fence=true ingress_latch=closed \
                  closed_ingress_rejected=true resumed_prefix={} \
@@ -2462,6 +2479,13 @@ fn run_quarantined_boot(boot: PersistentBoot) -> ! {
                 JOURNAL_SCHEMA_VERSION,
                 HexDigest(catalog_set_digest),
                 HexDigest(projection_digest),
+                PRODUCTION_WORLD.get(),
+                STANDARD_REPLY_PROVIDER.world().get(),
+                STANDARD_REPLY_PROVIDER.provider().get(),
+                STANDARD_REPLY_PROVIDER.generation().get(),
+                STANDARD_DMA_PROVIDER.world().get(),
+                STANDARD_DMA_PROVIDER.provider().get(),
+                STANDARD_DMA_PROVIDER.generation().get(),
                 operation_effect().operation().get(),
                 operation_effect().sequence(),
                 AGENT_COMPONENT_REPLY.get(),
@@ -2541,6 +2565,7 @@ fn run_quarantined_boot(boot: PersistentBoot) -> ! {
                 "CSER_CORE_PERSISTENT_BOOT4 PASS shared_runtime=true production_registry=single \
                  api_profile={} catalog_version={} projection_version={} snapshot_version={} \
                  journal_schema={} catalog_set_digest={} projection_digest={} \
+                 production_world={} reply_provider={}:{}:{} dma_provider={}:{}:{} \
                  operation_id={} effect_sequence={} \
                  reply_component_id={} dma_component_id={} reuse_operation_id={} \
                  reuse_effect_sequence={} \
@@ -2549,7 +2574,7 @@ fn run_quarantined_boot(boot: PersistentBoot) -> ! {
                  dma_pages_iova=retired reuse_generation=2 retained={} dma_retained=0 \
                  activation=deferred resource_reuse_authorized=true \
                  reset_submitted={} irq_submitted={} iotlb_submitted={} \
-                 service_executor_generation={} successor_generation={} \
+                 service_executor_generation={} executor_generation={} \
                  fresh_service_task=true ready_in_fresh_task=true production_rebind=true \
                  service_state=live ingress_latch=open prior_service_fence=boot-checkpoint \
                  revision={} boot={} journal={} device={} journal_provider=ata-pio \
@@ -2564,6 +2589,13 @@ fn run_quarantined_boot(boot: PersistentBoot) -> ! {
                 JOURNAL_SCHEMA_VERSION,
                 HexDigest(catalog_set_digest),
                 HexDigest(projection_digest),
+                PRODUCTION_WORLD.get(),
+                STANDARD_REPLY_PROVIDER.world().get(),
+                STANDARD_REPLY_PROVIDER.provider().get(),
+                STANDARD_REPLY_PROVIDER.generation().get(),
+                STANDARD_DMA_PROVIDER.world().get(),
+                STANDARD_DMA_PROVIDER.provider().get(),
+                STANDARD_DMA_PROVIDER.generation().get(),
                 operation_effect().operation().get(),
                 operation_effect().sequence(),
                 AGENT_COMPONENT_REPLY.get(),

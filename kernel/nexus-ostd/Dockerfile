@@ -236,6 +236,14 @@ RUN --network=none \
         printf '%s\n' nexus.cser.image-source-proof.v1; \
         /usr/bin/sha256sum \
             /candidate-root/kernel/nexus-ostd/cser-production-sources.txt; \
+        test -f /expected-kernel/src/lib.rs; \
+        test ! -L /expected-kernel/src/lib.rs; \
+        test -f /candidate-root/kernel/nexus-ostd/src/lib.rs; \
+        test ! -L /candidate-root/kernel/nexus-ostd/src/lib.rs; \
+        /usr/bin/cmp /expected-kernel/src/lib.rs \
+            /candidate-root/kernel/nexus-ostd/src/lib.rs; \
+        /usr/bin/sha256sum \
+            /candidate-root/kernel/nexus-ostd/src/lib.rs; \
     } > /tmp/nexus-cser-proof-input; \
     while IFS= read -r relative; do \
         test -f "/expected-kernel/src/cser/$relative"; \

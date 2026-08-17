@@ -74,6 +74,7 @@ compute_image_identity() {
         "$root/Cargo.toml" \
         "$root/Cargo.lock" \
         "$root/crates/cser-core/Cargo.toml" \
+        "$root/crates/cser-core/src/lib.rs" \
         "$root/crates/cser-model/Cargo.toml" \
         "$root/tools/xtask/Cargo.toml" \
         "$root/tools/xtask/Cargo.lock" | cut -d ' ' -f1 | sha256sum | cut -c1-16)

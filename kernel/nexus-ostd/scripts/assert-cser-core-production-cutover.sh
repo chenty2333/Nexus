@@ -55,6 +55,23 @@ require_ordered_tokens() {
     done
 }
 
+require_exact_marker_tokens() {
+    local marker=$1
+    local contract=$2
+    shift 2
+    local expected token count
+    for expected in "$@"; do
+        count=0
+        for token in $marker; do
+            if [[ $token == "$expected" ]]; then
+                ((count += 1))
+            fi
+        done
+        (( count == 1 )) \
+            || fail "$contract lacks exactly one marker token: $expected"
+    done
+}
+
 if (( $# > 1 )); then
     fail 'usage: assert-cser-core-production-cutover.sh [REPOSITORY_ROOT]'
 fi
@@ -65,6 +82,7 @@ repo_root=$(cd -- "$repo_root" && pwd)
 manifest=$repo_root/kernel/nexus-ostd/cser-production-sources.txt
 cser_source_root=$repo_root/kernel/nexus-ostd/src/cser
 kernel_manifest=$repo_root/kernel/nexus-ostd/Cargo.toml
+kernel_dockerfile=$repo_root/kernel/nexus-ostd/Dockerfile
 root_manifest=$repo_root/Cargo.toml
 kernel_entry=$repo_root/kernel/nexus-ostd/src/lib.rs
 root_workflow=$repo_root/x
@@ -83,6 +101,7 @@ for input in \
     "$manifest" \
     "$root_manifest" \
     "$kernel_manifest" \
+    "$kernel_dockerfile" \
     "$kernel_entry" \
     "$root_workflow" \
     "$kernel_workflow" \
@@ -99,6 +118,45 @@ for input in \
 done
 [[ -d $cser_source_root && ! -L $cser_source_root ]] \
     || fail "CSER source root is not a directory: $cser_source_root"
+
+grep -Fq 'pub(crate) const PRODUCTION_WORLD: WorldId = match WorldId::new(1) {' \
+    "$production_registry" \
+    || fail 'production registry world coordinate is not exactly 1'
+grep -Fq 'pub(crate) const STANDARD_REPLY_PROVIDER_ID: ProviderId = match ProviderId::new(1) {' \
+    "$production_registry" \
+    || fail 'production reply provider coordinate is not exactly 1'
+grep -Fq 'pub(crate) const STANDARD_DMA_PROVIDER_ID: ProviderId = match ProviderId::new(2) {' \
+    "$production_registry" \
+    || fail 'production DMA provider coordinate is not exactly 2'
+grep -Fq 'pub(crate) const STANDARD_PROVIDER_GENERATION: ProviderGeneration = match ProviderGeneration::new(1)' \
+    "$production_registry" \
+    || fail 'production provider generation coordinate is not exactly 1'
+grep -Fq 'ProviderCoordinate::new(' "$production_registry" \
+    || fail 'production registry lacks exact provider coordinates'
+reply_provider_coordinate=$(sed -n \
+    '/^pub(crate) const STANDARD_REPLY_PROVIDER: ProviderCoordinate = ProviderCoordinate::new(/,/^);$/p' \
+    "$production_registry")
+[[ -n $reply_provider_coordinate ]] \
+    || fail 'cannot isolate exact reply provider coordinate'
+for provider_coordinate in \
+    '    PRODUCTION_WORLD,' \
+    '    STANDARD_REPLY_PROVIDER_ID,' \
+    '    STANDARD_PROVIDER_GENERATION,'; do
+    grep -Fxq "$provider_coordinate" <<<"$reply_provider_coordinate" \
+        || fail "production reply provider coordinate lacks exact owner: $provider_coordinate"
+done
+dma_provider_coordinate=$(sed -n \
+    '/^pub(crate) const STANDARD_DMA_PROVIDER: ProviderCoordinate = ProviderCoordinate::new(/,/^);$/p' \
+    "$production_registry")
+[[ -n $dma_provider_coordinate ]] \
+    || fail 'cannot isolate exact DMA provider coordinate'
+for provider_coordinate in \
+    '    PRODUCTION_WORLD,' \
+    '    STANDARD_DMA_PROVIDER_ID,' \
+    '    STANDARD_PROVIDER_GENERATION,'; do
+    grep -Fxq "$provider_coordinate" <<<"$dma_provider_coordinate" \
+        || fail "production DMA provider coordinate lacks exact owner: $provider_coordinate"
+done
 
 extract_coordinate() {
     local name=$1 input=$2 value
@@ -228,6 +286,35 @@ for entry in "${!manifest_entries[@]}"; do
     grep -Fq 'feature = "cser-production"' <<<"$declaration_prefix" \
         || fail "manifest source is not selected by cser-production: $entry"
 done
+
+# The manifest is a closed production-source allowlist in both directions:
+# every listed source must be selected exactly once, and every path module
+# selected by the cser-production cfg must be listed.  Feature-gated
+# experiment modules may remain in lib.rs, but they must not silently enter
+# this production closure.
+production_path_count=0
+while IFS= read -r production_entry; do
+    [[ -n $production_entry ]] || continue
+    path_marker="#[path = \"cser/$production_entry\"]"
+    declaration_prefix=$(awk -v marker="$path_marker" '
+        index($0, marker) {
+            start = NR - 1
+            while (start > 0 && lines[start] !~ /^[[:space:]]*$/) start--
+            for (line = start + 1; line < NR; line++) print lines[line]
+            found = 1
+            exit
+        }
+        { lines[NR] = $0 }
+        END { if (!found) exit 1 }
+    ' "$kernel_entry") || fail "cannot isolate production cfg for path module: $production_entry"
+    if grep -Fq 'feature = "cser-production"' <<<"$declaration_prefix"; then
+        ((production_path_count += 1))
+        [[ -v "manifest_entries[$production_entry]" ]] \
+            || fail "cser-production path module is outside the source manifest: $production_entry"
+    fi
+done < <(sed -n -E 's/^[[:space:]]*#\[path = "cser\/([^"]+)"\][[:space:]]*$/\1/p' "$kernel_entry")
+(( production_path_count == ${#closure_sources[@]} )) \
+    || fail "cser-production path-module closure differs from the source manifest: selected=$production_path_count manifest=${#closure_sources[@]}"
 
 forbidden_tokens=(
     EffectRegistry
@@ -863,6 +950,9 @@ for boot in 1 2 3 4; do
                 'composite_effect=true'
                 'effect_identity=shared'
                 'component_ids=reply+dma'
+                'production_world={}'
+                'reply_provider={}:{}:{}'
+                'dma_provider={}:{}:{}'
                 'service_executor_generation={}'
                 'executor_generation={}'
                 'production_service_tasks=1'
@@ -876,8 +966,11 @@ for boot in 1 2 3 4; do
             ;;
         2)
             boot_contract=(
+                'production_world={}'
+                'reply_provider={}:{}:{}'
+                'dma_provider={}:{}:{}'
                 'service_executor_generation={}'
-                'successor_generation={}'
+                'executor_generation={}'
                 'second_crash=service-exact-reap'
                 'fresh_service_task=true'
                 'ready_in_fresh_task=true'
@@ -891,6 +984,9 @@ for boot in 1 2 3 4; do
             ;;
         3)
             boot_contract=(
+                'production_world={}'
+                'reply_provider={}:{}:{}'
+                'dma_provider={}:{}:{}'
                 'service_executor_generation={}'
                 'executor_generation={}'
                 'fresh_service_task=true'
@@ -903,6 +999,9 @@ for boot in 1 2 3 4; do
             ;;
         4)
             boot_contract=(
+                'production_world={}'
+                'reply_provider={}:{}:{}'
+                'dma_provider={}:{}:{}'
                 'service_executor_generation={}'
                 'executor_generation={}'
                 'fresh_service_task=true'
@@ -914,10 +1013,28 @@ for boot in 1 2 3 4; do
             )
             ;;
     esac
-    for token in "${boot_contract[@]}"; do
-        grep -Fq "$token" <<<"$boot_marker" \
-            || fail "persistent boot$boot marker lacks production task/rebind semantic: $token"
-    done
+    require_exact_marker_tokens "$boot_marker" \
+        "persistent boot$boot production marker" "${boot_contract[@]}"
+done
+
+for marker_coordinate in \
+    'production_world={}' \
+    'reply_provider={}:{}:{}' \
+    'dma_provider={}:{}:{}'; do
+    grep -Fq "$marker_coordinate" "$persistent_runtime" \
+        || fail "persistent production marker does not emit exact coordinate field: $marker_coordinate"
+done
+for coordinate_expression in \
+    'PRODUCTION_WORLD.get()' \
+    'STANDARD_REPLY_PROVIDER.world().get()' \
+    'STANDARD_REPLY_PROVIDER.provider().get()' \
+    'STANDARD_REPLY_PROVIDER.generation().get()' \
+    'STANDARD_DMA_PROVIDER.world().get()' \
+    'STANDARD_DMA_PROVIDER.provider().get()' \
+    'STANDARD_DMA_PROVIDER.generation().get()'; do
+    coordinate_count=$(grep -Fc "$coordinate_expression" "$persistent_runtime" || true)
+    (( coordinate_count == 4 )) \
+        || fail "persistent production markers do not use the authoritative coordinate expression exactly four times: $coordinate_expression"
 done
 
 dependencies=$(awk '
@@ -995,9 +1112,37 @@ root_verify=$(awk '
     in_function && /^\}[[:space:]]*$/ { found_end = 1; exit }
     END { if (!in_function || !found_end) exit 1 }
 ' "$root_workflow") || fail 'cannot isolate root verify_all workflow'
-grep -Eq '^[[:space:]]*run_backend[[:space:]]+"\$kernel_backend"[[:space:]]+seal-core-persistent-recovery([[:space:]]|$)' \
-    <<<"$root_verify" \
-    || fail 'root verify_all does not directly invoke the clean-source sealed recovery backend'
+sealed_recovery_call_count=$(grep -Ec \
+    '^[[:space:]]*run_backend[[:space:]]+"\$kernel_backend"[[:space:]]+seal-core-persistent-recovery[[:space:]]+' \
+    <<<"$root_verify" || true)
+(( sealed_recovery_call_count == 1 )) \
+    || fail 'root verify_all must directly and unconditionally invoke the sealed recovery backend exactly once'
+for marker_parser_token in \
+    'core_persistent_marker_value() {' \
+    'core_persistent_marker_u64() {' \
+    'core_persistent_marker_digest() {' \
+    'core_persistent_marker_bounded_decimal() {'; do
+    grep -Fq "$marker_parser_token" "$kernel_workflow" \
+        || fail "kernel workflow lacks exact marker parser boundary: $marker_parser_token"
+done
+if grep -Fq '!= *" $field "*' "$kernel_workflow"; then
+    fail 'kernel workflow still accepts marker fields by substring matching'
+fi
+grep -Fq '"$root/crates/cser-core/src/lib.rs"' "$root_workflow" \
+    || fail 'root image cache identity does not include cser-core/src/lib.rs'
+grep -Fq '"$root/src/lib.rs"' "$kernel_workflow" \
+    || fail 'kernel image cache identity does not include src/lib.rs'
+kernel_workflow_source=$(<"$kernel_workflow")
+require_ordered_tokens "$kernel_workflow_source" 'CSER image source proof validation' \
+    'current_cser_source_proof' \
+    'image_source_proof=$(container cat /nexus-cser-verified)' \
+    'current_source_proof=$(current_cser_source_proof)' \
+    'pinned image CSER source proof does not match the current production closure'
+require_ordered_tokens "$(<"$kernel_dockerfile")" \
+    'CSER Docker source proof closure' \
+    '/candidate-root/kernel/nexus-ostd/cser-production-sources.txt;' \
+    '/candidate-root/kernel/nexus-ostd/src/lib.rs;' \
+    '/candidate-root/kernel/nexus-ostd/src/cser/$relative"'
 
 kernel_command_definition_count=$(grep -Ec \
     '^[[:space:]]*(function[[:space:]]+)?run_production_recovery([[:space:]]*\(\))?[[:space:]]*\{' \
@@ -1028,6 +1173,7 @@ kernel_command=$(awk '
 ' "$kernel_workflow") || fail 'cannot isolate unique kernel production recovery command'
 mapfile -t kernel_calls <<<"$kernel_command"
 expected_kernel_calls=(
+    'selftest_core_persistent_marker_parser'
     'prepare_core_persistent_artifacts'
     'bash "$root/scripts/assert-cser-core-production-cutover.sh" "$repo_root"'
     'capture_core_reply_evidence'
@@ -1354,4 +1500,4 @@ for forbidden_container_option in --privileged --cap-add --device; do
     fi
 done
 
-echo "CSER_CORE_PRODUCTION_CUTOVER PASS manifest_sources=${#closure_sources[@]} portable_core=nonoptional api_profile=$api_profile catalog_version=$catalog_version projection_version=$projection_version snapshot_version=$snapshot_version journal_schema=$journal_schema default=cser-production registry=single operation_identity=operation_id+effect_sequence provider_scope=closed component_custody=reply+dma production_service_tasks=1 legacy_runtime_estates=false task_bound_ingress=true post_exit_fence=true production_rebind=true executor_coordinate=true catalog_set=true scoped_admission=true exact_verifier_binding=true vnext_portal=true vnext_supervisor=true volatile_transitions=false evidence_schemes=reply+dma boots=4 shared_media=true tpm_fixture_policy=scoped"
+echo "CSER_CORE_PRODUCTION_CUTOVER PASS manifest_sources=${#closure_sources[@]} portable_core=nonoptional api_profile=$api_profile catalog_version=$catalog_version projection_version=$projection_version snapshot_version=$snapshot_version journal_schema=$journal_schema default=cser-production registry=single operation_identity=operation_id+effect_sequence production_world=1 reply_provider=1:1:1 dma_provider=1:2:1 provider_scope=closed component_custody=reply+dma production_service_tasks=1 legacy_runtime_estates=false task_bound_ingress=true post_exit_fence=true production_rebind=true executor_coordinate=true catalog_set=true scoped_admission=true exact_verifier_binding=true vnext_portal=true vnext_supervisor=true volatile_transitions=false evidence_schemes=reply+dma boots=4 shared_media=true tpm_fixture_policy=scoped"

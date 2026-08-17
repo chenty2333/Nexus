@@ -103,6 +103,7 @@ image_key=$(sha256sum \
     "$root/scripts/assert-runtime-fs-artifacts.sh" \
     "$root/scripts/build-runtime-fs-block-image.sh" \
     "$root/scripts/assert-runtime-fs-block-image.sh" \
+    "$root/src/lib.rs" \
     "$repo_root/crates/cser-core/Cargo.toml" \
     "$repo_root/crates/cser-core/src/domain.rs" \
     "$repo_root/crates/cser-core/src/engine.rs" \
@@ -135,6 +136,29 @@ image_key=$(sha256sum \
 image="nexus/nexus-ostd:$image_key"
 runner_base="$root/osdk-runner-base"
 runner_target="$root/target/osdk/nexus-kernel-run-base"
+
+current_cser_source_proof() (
+    set -euo pipefail
+    local proof_input relative digest
+    proof_input=$(mktemp)
+    trap 'rm -f -- "$proof_input"' EXIT
+    printf '%s\n' nexus.cser.image-source-proof.v1 >"$proof_input"
+    digest=$(sha256sum -- "$production_source_manifest" | cut -d ' ' -f1)
+    printf '%s  %s\n' "$digest" \
+        /candidate-root/kernel/nexus-ostd/cser-production-sources.txt \
+        >>"$proof_input"
+    digest=$(sha256sum -- "$root/src/lib.rs" | cut -d ' ' -f1)
+    printf '%s  %s\n' "$digest" \
+        /candidate-root/kernel/nexus-ostd/src/lib.rs \
+        >>"$proof_input"
+    while IFS= read -r relative; do
+        digest=$(sha256sum -- "$root/src/cser/$relative" | cut -d ' ' -f1)
+        printf '%s  %s\n' "$digest" \
+            "/candidate-root/kernel/nexus-ostd/src/cser/$relative" \
+            >>"$proof_input"
+    done <"$production_source_manifest"
+    sha256sum -- "$proof_input" | cut -d ' ' -f1
+)
 
 build_image() {
     local -a rebuild_args=()
@@ -1242,7 +1266,7 @@ assert_core_schema8_post_quarantine_trace() {
         'reset_status_zero=true' \
         'observed_isr_bits=0' \
         'iotlb_used_remapped_iova=true'; do
-        if [[ " $marker " != *" $field "* ]]; then
+        if ! core_marker_has_exact_token "$marker" "$field"; then
             echo "schema-8 quarantine marker lacks $field" >&2
             return 1
         fi
@@ -1397,13 +1421,24 @@ assert_core_schema8_post_quarantine_trace() {
     ' "$trace"
 }
 
+core_marker_has_exact_token() {
+    local marker=$1
+    local expected=$2
+    local token
+    for token in $marker; do
+        [[ $token == "$expected" ]] && return 0
+    done
+    return 1
+}
+
 core_schema8_marker_decimal_at_least() {
     local marker=$1
     local field=$2
     local minimum=$3
-    local token value= count=0
+    local token key value= count=0
     for token in $marker; do
-        if [[ $token == "$field="* ]]; then
+        key=${token%%=*}
+        if [[ $token == *=* && $key == "$field" ]]; then
             value=${token#*=}
             ((count += 1))
         fi
@@ -2056,29 +2091,68 @@ require_core_persistent_marker() {
     local marker=$2
     shift 2
     local line field
-    if ! line=$(tr -d '\r' <"$serial" | grep -F "$marker" | tail -n 1); then
+    if ! line=$(tr -d '\r' <"$serial" | awk -v marker="$marker" '
+        function marker_matches(line,    expected_count, line_count, i, j) {
+            expected_count = split(marker, expected, /[[:space:]]+/)
+            line_count = split(line, tokens, /[[:space:]]+/)
+            for (i = 1; i <= line_count - expected_count + 1; i++) {
+                for (j = 1; j <= expected_count; j++) {
+                    if (tokens[i + j - 1] != expected[j])
+                        break
+                }
+                if (j > expected_count)
+                    return 1
+            }
+            return 0
+        }
+        marker_matches($0) { found = $0 }
+        END {
+            if (found == "")
+                exit 1
+            print found
+        }
+    '); then
         echo "missing persistent recovery marker '$marker' in $serial" >&2
         return 1
     fi
     for field in "$@"; do
-        if [[ " $line " != *" $field "* ]]; then
-            echo "persistent recovery marker '$marker' lacks '$field'" >&2
+        local token count=0
+        for token in $line; do
+            if [[ $token == *=* && $token == "$field" ]]; then
+                ((count += 1))
+            fi
+        done
+        if (( count != 1 )); then
+            echo "persistent recovery marker '$marker' lacks exact token '$field'" >&2
             return 1
         fi
     done
 }
 
-core_persistent_marker_u64() {
+core_persistent_marker_value() {
     local line=$1
     local field=$2
-    local token value= count=0
+    local token key value= count=0
     for token in $line; do
-        if [[ $token == "$field="* ]]; then
+        key=${token%%=*}
+        if [[ $token == *=* && $key == "$field" ]]; then
             value=${token#*=}
             ((count += 1))
         fi
     done
-    if (( count != 1 )) || [[ ! $value =~ ^[1-9][0-9]*$ ]]; then
+    if (( count != 1 )); then
+        echo "persistent recovery marker has a non-unique $field coordinate: $line" >&2
+        return 1
+    fi
+    printf '%s\n' "$value"
+}
+
+core_persistent_marker_u64() {
+    local line=$1
+    local field=$2
+    local value
+    value=$(core_persistent_marker_value "$line" "$field") || return 1
+    if [[ ! $value =~ ^[1-9][0-9]*$ ]]; then
         echo "persistent recovery marker has an invalid $field coordinate: $line" >&2
         return 1
     fi
@@ -2088,14 +2162,9 @@ core_persistent_marker_u64() {
 core_persistent_marker_digest() {
     local line=$1
     local field=$2
-    local token value= count=0
-    for token in $line; do
-        if [[ $token == "$field="* ]]; then
-            value=${token#*=}
-            ((count += 1))
-        fi
-    done
-    if (( count != 1 )) || [[ ! $value =~ ^[0-9a-f]{64}$ ]]; then
+    local value
+    value=$(core_persistent_marker_value "$line" "$field") || return 1
+    if [[ ! $value =~ ^[0-9a-f]{64}$ ]]; then
         echo "persistent recovery marker has an invalid $field digest: $line" >&2
         return 1
     fi
@@ -2104,9 +2173,13 @@ core_persistent_marker_digest() {
 
 assert_core_persistent_semantic_coordinates() {
     local expected_catalog=$1
-    shift
+    local expected_world=$2
+    local expected_reply_provider=$3
+    local expected_dma_provider=$4
+    shift 4
     local -a markers=("$@") projections=()
-    local marker observed_catalog projection arena_boot1 arena_boot3
+    local marker observed_catalog observed_world observed_reply_provider
+    local observed_dma_provider projection arena_boot1 arena_boot3
     local -A distinct_projections=()
     if (( ${#markers[@]} != 4 )); then
         echo 'persistent semantic-coordinate proof requires exactly four markers' >&2
@@ -2117,6 +2190,18 @@ assert_core_persistent_semantic_coordinates() {
             "$marker" catalog_set_digest) || return 1
         if [[ $observed_catalog != "$expected_catalog" ]]; then
             echo 'guest catalog-set digest differs from the pinned host catalog-set digest' >&2
+            return 1
+        fi
+        observed_world=$(core_persistent_marker_value \
+            "$marker" production_world) || return 1
+        observed_reply_provider=$(core_persistent_marker_value \
+            "$marker" reply_provider) || return 1
+        observed_dma_provider=$(core_persistent_marker_value \
+            "$marker" dma_provider) || return 1
+        if [[ $observed_world != "$expected_world" \
+            || $observed_reply_provider != "$expected_reply_provider" \
+            || $observed_dma_provider != "$expected_dma_provider" ]]; then
+            echo 'persistent recovery marker has an unexpected production world/provider coordinate' >&2
             return 1
         fi
         projection=$(core_persistent_marker_digest \
@@ -2136,8 +2221,11 @@ assert_core_persistent_semantic_coordinates() {
         echo 'persistent DMA arena provider contract changed across generation reuse' >&2
         return 1
     fi
-    printf 'catalog_set_digest=%s projection_digests=%s arena_contract_digest=%s\n' \
+    printf 'catalog_set_digest=%s production_world=%s reply_provider=%s dma_provider=%s projection_digests=%s arena_contract_digest=%s\n' \
         "$expected_catalog" \
+        "$expected_world" \
+        "$expected_reply_provider" \
+        "$expected_dma_provider" \
         "$(IFS=,; echo "${projections[*]}")" \
         "$arena_boot1"
 }
@@ -2147,14 +2235,9 @@ core_persistent_marker_bounded_decimal() {
     local field=$2
     local maximum=$3
     local LC_ALL=C
-    local token value= count=0
-    for token in $line; do
-        if [[ $token == "$field="* ]]; then
-            value=${token#*=}
-            ((count += 1))
-        fi
-    done
-    if (( count != 1 )) || [[ ! $value =~ ^[1-9][0-9]*$ ]]; then
+    local value
+    value=$(core_persistent_marker_value "$line" "$field") || return 1
+    if [[ ! $value =~ ^[1-9][0-9]*$ ]]; then
         echo "persistent recovery marker has an invalid $field decimal: $line" >&2
         return 1
     fi
@@ -2165,6 +2248,41 @@ core_persistent_marker_bounded_decimal() {
     fi
     printf '%s\n' "$value"
 }
+
+selftest_core_persistent_marker_parser() (
+    set -euo pipefail
+    local valid invalid tmp serial
+    valid='CSER_CORE_PERSISTENT_BOOT1 PASS executor_generation=1 service_executor_generation=1'
+    invalid='CSER_CORE_PERSISTENT_BOOT1 PASS executor_generation=1x service_executor_generation=1'
+    if [[ ! $(core_persistent_marker_value "$valid" executor_generation) == 1 ]]; then
+        echo 'persistent marker parser self-test could not read the exact executor field' >&2
+        return 1
+    fi
+    if core_persistent_marker_u64 "$invalid" executor_generation >/dev/null 2>&1; then
+        echo 'persistent marker parser accepted an invalid executor-generation value' >&2
+        return 1
+    fi
+    if core_persistent_marker_value \
+        'CSER_CORE_PERSISTENT_BOOT1 PASS service_executor_generation=1' \
+        executor_generation >/dev/null 2>&1; then
+        echo 'persistent marker parser accepted a service-generation suffix as executor generation' >&2
+        return 1
+    fi
+    tmp=$(mktemp -d)
+    trap 'rm -rf -- "$tmp"' EXIT
+    serial="$tmp/serial.log"
+    printf '%s\n' "$valid" >"$serial"
+    require_core_persistent_marker \
+        "$serial" 'CSER_CORE_PERSISTENT_BOOT1 PASS' \
+        executor_generation=1 service_executor_generation=1
+    if require_core_persistent_marker \
+        "$serial" 'CSER_CORE_PERSISTENT_BOOT1 PASS' executor_generation=1x \
+        >/dev/null 2>&1; then
+        echo 'persistent marker parser accepted a non-exact key=value token' >&2
+        return 1
+    fi
+    echo 'persistent marker parser self-test: PASS exact_key_value=true suffix_rejected=true'
+)
 
 core_persistent_trace_has_exact_dma_mapping() {
     local trace=$1
@@ -2364,11 +2482,8 @@ assert_core_persistent_executor_identity_progression() {
         coordinate=$(core_persistent_marker_u64 \
             "$marker" service_executor_generation) || return 1
         service_generations+=("$coordinate")
-        if ! coordinate=$(core_persistent_marker_u64 \
-            "$marker" executor_generation 2>/dev/null); then
-            coordinate=$(core_persistent_marker_u64 \
-                "$marker" successor_generation) || return 1
-        fi
+        coordinate=$(core_persistent_marker_u64 \
+            "$marker" executor_generation) || return 1
         executor_generations+=("$coordinate")
     done
     for index in 0 1 2 3; do
@@ -2471,6 +2586,12 @@ capture_core_persistent_run() {
         echo 'pinned image returned an invalid CSER source proof' >&2
         return 1
     fi
+    local current_source_proof
+    current_source_proof=$(current_cser_source_proof)
+    if [[ ${image_source_proof_lines[1]} != "$current_source_proof" ]]; then
+        echo 'pinned image CSER source proof does not match the current production closure' >&2
+        return 1
+    fi
     capture_core_schema8_negative_boot "$catalog_digest"
     ram_backing_size=$(stat -c %s -- "$core_persistent_ram")
     ram_backing_identity=$(stat -c '%d:%i' -- "$core_persistent_ram")
@@ -2503,6 +2624,9 @@ capture_core_persistent_run() {
         "projection_version=$projection_version" \
         "snapshot_version=$snapshot_version" \
         "journal_schema=$journal_schema" \
+        'production_world=1' \
+        'reply_provider=1:1:1' \
+        'dma_provider=1:2:1' \
         'operation_id=1' \
         'effect_sequence=1' \
         'reply_component_id=1' \
@@ -2532,6 +2656,9 @@ capture_core_persistent_run() {
         "projection_version=$projection_version" \
         "snapshot_version=$snapshot_version" \
         "journal_schema=$journal_schema" \
+        'production_world=1' \
+        'reply_provider=1:1:1' \
+        'dma_provider=1:2:1' \
         'operation_id=1' \
         'effect_sequence=1' \
         'reply_component_id=1' \
@@ -2553,7 +2680,7 @@ capture_core_persistent_run() {
         'irq_submitted=1' \
         'iotlb_submitted=2' \
         'service_executor_generation=2' \
-        'successor_generation=2' \
+        'executor_generation=2' \
         'fresh_service_task=true' \
         'ready_in_fresh_task=true' \
         'production_rebind=true' \
@@ -2570,6 +2697,9 @@ capture_core_persistent_run() {
         "projection_version=$projection_version" \
         "snapshot_version=$snapshot_version" \
         "journal_schema=$journal_schema" \
+        'production_world=1' \
+        'reply_provider=1:1:1' \
+        'dma_provider=1:2:1' \
         'operation_id=1' \
         'effect_sequence=1' \
         'reply_component_id=1' \
@@ -2604,6 +2734,9 @@ capture_core_persistent_run() {
         "projection_version=$projection_version" \
         "snapshot_version=$snapshot_version" \
         "journal_schema=$journal_schema" \
+        'production_world=1' \
+        'reply_provider=1:1:1' \
+        'dma_provider=1:2:1' \
         'operation_id=1' \
         'effect_sequence=1' \
         'reply_component_id=1' \
@@ -2625,7 +2758,7 @@ capture_core_persistent_run() {
         'irq_submitted=1' \
         'iotlb_submitted=2' \
         'service_executor_generation=4' \
-        'successor_generation=4' \
+        'executor_generation=4' \
         'fresh_service_task=true' \
         'ready_in_fresh_task=true' \
         'production_rebind=true' \
@@ -2752,6 +2885,9 @@ capture_core_persistent_run() {
         "$boot1_marker" "$boot2_marker" "$boot3_marker" "$boot4_marker")
     semantic_coordinates=$(assert_core_persistent_semantic_coordinates \
         "$catalog_digest" \
+        1 \
+        1:1:1 \
+        1:2:1 \
         "$boot1_marker" "$boot2_marker" "$boot3_marker" "$boot4_marker")
     dma_arena_reuse=$(assert_core_persistent_dma_arena_reuse \
         "$boot1_marker" "$boot3_marker" \
@@ -2803,6 +2939,7 @@ capture_core_persistent_run() {
         "$core_schema8_tpm_after" lease_selected_slot '^[01]$')
 
     combined_receipt="CSER_CORE_PERSISTENT_QEMU_RESTART PASS boots=4 schema8_negative_boot=true schema8_selected_revision=5 schema8_selected_catalog=$core_schema8_fixture_catalog schema8_expected_catalog=$catalog_digest schema8_trusted_tpm_candidate_selected=true schema8_current_binding_authorized=false schema8_anchor_binding_match=false schema8_typed_rejection=migration-required schema8_semantic_replay=false schema8_pairing_inference=false schema8_registry_publication=false schema8_device_activation=false schema8_device_guard_retained=true schema8_arena_withheld=true schema8_bus_master_disabled=true schema8_intx_masked=true schema8_reset_status_zero=true schema8_observed_isr_bits=0 schema8_isr_reads_at_least=2 schema8_consecutive_empty_isr_reads=2 schema8_iotlb_used_remapped_iova=true schema8_iotlb_completed_trigger_pages_at_least=1 schema8_pci_bus_master_fence_readback=true schema8_iotlb_completion=true schema8_tpm_selected_nv_unchanged=true schema8_tpm_selected_coordinate_digest=$schema8_tpm_coordinate_digest schema8_tpm_tip_counter_hex=$schema8_tpm_tip_counter schema8_tpm_tip_selected_slot=$schema8_tpm_tip_slot schema8_tpm_lease_counter_hex=$schema8_tpm_lease_counter schema8_tpm_lease_selected_slot=$schema8_tpm_lease_slot shared_runtime=true shared_media=journal+swtpm+ram api_profile=$core_api_profile catalog_version=$catalog_version projection_version=$projection_version snapshot_version=$snapshot_version journal_schema=$journal_schema predecessor_api_profile=4 predecessor_schema=8 predecessor_journal_schema=8 composite_effect=shared operation_id=1 effect_sequence=1 component_ids=1,2 evidence_schemes=reply+dma production_registry=single portal=nxp3 supervisor=core-v1 journal=ata-pio outbox=ata-pio-secondary ram_backend=memory-backend-file ram_backend_offset=0 qemu_ram_mapping=guest-paddr-equals-file-offset anchor=tpm2-nv quarantine=pre-replay-virtio+vtd reply=committed-then-intent-crash-then-settled second_crash=after-durable-apply-intent reconciliation=without-second-intent stable_recovery=true freshness=strictly-increasing projection_sequence=boot-distinct service_executor_generations=1,2,3,4 executor_generations=1,2,3,4 boot1_composite_task_death_exact_reap=true boot1_ingress_closed_rejected=true boot2_fresh_ready_rebind_death_exact_reap=true boot2_ingress_closed_rejected=true boot3_fresh_ready_rebind_live_open=true boot4_fresh_ready_rebind_live_open=true boot3_prior_service_fence=same-boot-exact-reap boot4_prior_service_fence=boot-checkpoint dma_generation_reuse=1->2 dma_generation1_retired=true dma_generation2_retired=true dma_queue=retired retained=0 resource_reuse_authorized=true arena_provider_contract=stable guest_pfn_reuse=true emulated_iova_reuse=true host_backing_file_offset_reuse=true qemu=true physical_hardware=false host_physical_pfn_identity=false physical_dma_drain=false physical_antirollback=false physical_powerloss=false"
+    combined_receipt+=" production_world=1 reply_provider=1:1:1 dma_provider=1:2:1"
     combined_receipt+=" focused_test_profiles=profile4-predecessor focused_test_profiles_are_production=false"
     receipt_header=nexus.cser.production-receipt.v1
     receipt_basename=combined-receipt.txt
@@ -2841,6 +2978,9 @@ capture_core_persistent_run() {
         printf 'projection_version=%s\n' "$projection_version"
         printf 'recovery_snapshot_version=%s\n' "$snapshot_version"
         printf 'journal_schema=%s\n' "$journal_schema"
+        printf 'production_world=%s\n' 1
+        printf 'reply_provider=%s\n' 1:1:1
+        printf 'dma_provider=%s\n' 1:2:1
         printf 'production_kernel_iso_sha256=%s\n' "$(sha256sum \
             "$core_persistent_artifact_dir/production-kernel.iso" \
             | cut -d ' ' -f1)"
@@ -2989,6 +3129,7 @@ capture_core_persistent_run() {
 
 
 run_production_recovery() {
+    selftest_core_persistent_marker_parser
     prepare_core_persistent_artifacts
     bash "$root/scripts/assert-cser-core-production-cutover.sh" "$repo_root"
     capture_core_reply_evidence
@@ -3084,6 +3225,9 @@ case "$command" in
     test-core-persistent-arena-checker)
         selftest_core_persistent_dma_arena_reuse
         ;;
+    test-core-marker-parser)
+        selftest_core_persistent_marker_parser
+        ;;
     test-core-schema8-negative-oracles)
         selftest_core_schema8_negative_oracles
         ;;
@@ -3097,10 +3241,10 @@ case "$command" in
         rm -rf "$root/target" "$root/artifacts"
         ;;
     -h|--help|help)
-        echo "usage: ./x {doctor|image|fmt|check|clippy|build|run|test|build-core-persistent-recovery|build-tool-dma-experiments|build-tool-handoff-experiments|build-tool-handoff-baseline-experiments|build-cser-smp-smoke|run-cser-smp-smoke|test-pio-journal|test-baseline-handoff|run-tool-dma-boot|run-core-persistent-recovery|seal-core-persistent-recovery|test-core-persistent-arena-checker|test-core-schema8-negative-oracles|test-core-schema8-fixture|clean}"
+        echo "usage: ./x {doctor|image|fmt|check|clippy|build|run|test|build-core-persistent-recovery|build-tool-dma-experiments|build-tool-handoff-experiments|build-tool-handoff-baseline-experiments|build-cser-smp-smoke|run-cser-smp-smoke|test-pio-journal|test-baseline-handoff|run-tool-dma-boot|run-core-persistent-recovery|seal-core-persistent-recovery|test-core-persistent-arena-checker|test-core-marker-parser|test-core-schema8-negative-oracles|test-core-schema8-fixture|clean}"
         ;;
     *)
-        echo "usage: ./x {doctor|image|fmt|check|clippy|build|run|test|build-core-persistent-recovery|build-tool-dma-experiments|build-tool-handoff-experiments|build-tool-handoff-baseline-experiments|build-cser-smp-smoke|run-cser-smp-smoke|test-pio-journal|test-baseline-handoff|run-tool-dma-boot|run-core-persistent-recovery|seal-core-persistent-recovery|test-core-persistent-arena-checker|test-core-schema8-negative-oracles|test-core-schema8-fixture|clean}" >&2
+        echo "usage: ./x {doctor|image|fmt|check|clippy|build|run|test|build-core-persistent-recovery|build-tool-dma-experiments|build-tool-handoff-experiments|build-tool-handoff-baseline-experiments|build-cser-smp-smoke|run-cser-smp-smoke|test-pio-journal|test-baseline-handoff|run-tool-dma-boot|run-core-persistent-recovery|seal-core-persistent-recovery|test-core-persistent-arena-checker|test-core-marker-parser|test-core-schema8-negative-oracles|test-core-schema8-fixture|clean}" >&2
         exit 2
         ;;
 esac
