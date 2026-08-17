@@ -60,8 +60,9 @@ impl FileJournal {
             sync_parent_directory(&path)?;
         }
 
-        let bytes = read_all_file(&mut file)?;
+        let bytes = read_bounded_file(&mut file)?;
         let scan = scan_journal(&bytes).map_err(invalid_journal)?;
+        validate_record_chain(scan.records())?;
         let (revision, head) = scan.records().last().map_or((0, Digest::ZERO), |record| {
             (record.revision(), record.digest())
         });
@@ -161,6 +162,7 @@ impl FileJournal {
             ));
         }
         let observed_len = self.file.metadata()?.len();
+        validate_record_revision(record)?;
         if observed_len != self.durable_len
             || record.base_revision() != self.revision
             || record.predecessor() != self.head
@@ -170,16 +172,21 @@ impl FileJournal {
                 "journal head changed or append record is stale",
             ));
         }
+        let record_len = u64::try_from(record.bytes().len())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "record length exceeds u64"))?;
+        let next_len = observed_len
+            .checked_add(record_len)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "journal length overflow"))?;
+        if next_len > MAX_JOURNAL_SCAN_BYTES as u64 {
+            return Err(invalid_journal(crate::JournalDecodeError::InputTooLarge {
+                limit: MAX_JOURNAL_SCAN_BYTES,
+            }));
+        }
         self.file.seek(SeekFrom::End(0))?;
         self.recovery_required = true;
         self.file.write_all(record.bytes())?;
         self.file.sync_all()?;
-        self.durable_len = self
-            .durable_len
-            .checked_add(u64::try_from(record.bytes().len()).map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidData, "record length exceeds u64")
-            })?)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "journal length overflow"))?;
+        self.durable_len = next_len;
         self.revision = record.revision();
         self.head = record.digest();
         self.journal_repair = None;
@@ -265,7 +272,7 @@ impl FileJournal {
 
     /// Reads the complete current byte stream through the locked descriptor.
     pub fn read_all(&mut self) -> io::Result<Vec<u8>> {
-        read_all_file(&mut self.file)
+        read_bounded_file(&mut self.file)
     }
 
     /// Returns the complete-record revision validated by this handle.
@@ -314,15 +321,31 @@ impl crate::DurableJournalBackend for FileJournal {
 
 /// Reads an entire journal file.
 pub fn read_all(path: impl AsRef<Path>) -> io::Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    File::open(path)?.read_to_end(&mut bytes)?;
-    Ok(bytes)
+    let mut file = File::open(path)?;
+    read_bounded_file(&mut file)
 }
 
-fn read_all_file(file: &mut File) -> io::Result<Vec<u8>> {
+fn read_bounded_file(file: &mut File) -> io::Result<Vec<u8>> {
+    let declared_len = file.metadata()?.len();
+    if declared_len > MAX_JOURNAL_SCAN_BYTES as u64 {
+        return Err(invalid_journal(crate::JournalDecodeError::InputTooLarge {
+            limit: MAX_JOURNAL_SCAN_BYTES,
+        }));
+    }
+    let capacity = usize::try_from(declared_len)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "journal length exceeds usize"))?;
     let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(capacity)
+        .map_err(|_| journal_allocation_failed())?;
     file.seek(SeekFrom::Start(0))?;
-    file.read_to_end(&mut bytes)?;
+    file.take((MAX_JOURNAL_SCAN_BYTES as u64).saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_JOURNAL_SCAN_BYTES {
+        return Err(invalid_journal(crate::JournalDecodeError::InputTooLarge {
+            limit: MAX_JOURNAL_SCAN_BYTES,
+        }));
+    }
     Ok(bytes)
 }
 
@@ -393,14 +416,9 @@ fn read_anchored_prefix<R: Read>(
         let scan = scan_journal(&record).map_err(invalid_journal)?;
         let current = scan.records().first().ok_or_else(anchor_not_found)?;
         if let Some((previous_revision, previous_head)) = previous {
-            if current.base_revision() != previous_revision
-                || current.predecessor() != previous_head
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "journal record chain is discontinuous",
-                ));
-            }
+            validate_record_successor(current, previous_revision, previous_head)?;
+        } else {
+            validate_record_start(current)?;
         }
         prefix_len = prefix_len
             .checked_add(total_len)
@@ -417,11 +435,71 @@ fn read_anchored_prefix<R: Read>(
     }
 }
 
+/// Validates the semantic chain which the byte scanner deliberately leaves to
+/// the embedding adapter. A checksum-valid record is not appendable merely
+/// because its envelope parsed: every revision must advance exactly one, the
+/// first ordinary record must be genesis, and each later record must name the
+/// immediately preceding record. A leading whole-state checkpoint is the
+/// sole exception to the genesis rule because it may rebuild a compressed
+/// prefix; the engine and trusted anchor validate that checkpoint's image and
+/// coordinates during recovery.
+fn validate_record_chain(records: &[JournalRecord]) -> io::Result<()> {
+    let Some(first) = records.first() else {
+        return Ok(());
+    };
+    validate_record_start(first)?;
+    for pair in records.windows(2) {
+        validate_record_successor(&pair[1], pair[0].revision(), pair[0].digest())?;
+    }
+    Ok(())
+}
+
+fn validate_record_start(record: &JournalRecord) -> io::Result<()> {
+    validate_record_revision(record)?;
+    if !record.is_whole_state_checkpoint()
+        && (record.base_revision() != 0 || !record.predecessor().is_zero())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "journal record chain does not begin at genesis",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_record_successor(
+    record: &JournalRecord,
+    previous_revision: u64,
+    previous_head: Digest,
+) -> io::Result<()> {
+    validate_record_revision(record)?;
+    if record.base_revision() != previous_revision || record.predecessor() != previous_head {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "journal record chain is discontinuous",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_record_revision(record: &JournalRecord) -> io::Result<()> {
+    let expected = record.base_revision().checked_add(1).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "journal record base revision overflows",
+        )
+    })?;
+    if record.revision() != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "journal record revision does not advance its base revision",
+        ));
+    }
+    Ok(())
+}
+
 fn journal_allocation_failed() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::Other,
-        "journal record allocation failed during anchored recovery",
-    )
+    io::Error::other("journal record allocation failed during anchored recovery")
 }
 
 /// Rejects a recognized predecessor schema using only its fixed magic prefix.
@@ -471,7 +549,10 @@ mod tests {
     use std::{
         io::{Cursor, Read},
         path::PathBuf,
-        sync::atomic::{AtomicU64, Ordering},
+        sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        },
     };
 
     use crate::journal::{MAX_JOURNAL_SCAN_BYTES, MAX_JOURNAL_SCAN_RECORDS};
@@ -564,6 +645,34 @@ mod tests {
         .unwrap()
     }
 
+    fn checkpoint_record(base_revision: u64, predecessor: Digest) -> JournalRecord {
+        let freshness = crate::Freshness::new(
+            BootGeneration::new(1).unwrap(),
+            RegistryInstance::new(1).unwrap(),
+            DeviceGeneration::new(1).unwrap(),
+            JournalGeneration::new(1).unwrap(),
+        );
+        let binding = crate::RecoveryBinding::new(
+            crate::RecoveryProfile::current(),
+            crate::WorldId::new(1).unwrap(),
+            digest(9),
+            RegistryInstance::new(1).unwrap(),
+        )
+        .unwrap();
+        JournalRecord::build(
+            base_revision,
+            freshness,
+            binding,
+            digest(7),
+            predecessor,
+            CommandKind::WholeStateCheckpointV1 {
+                state: Arc::from(Vec::<u8>::new().into_boxed_slice()),
+                projection: digest(8),
+            },
+        )
+        .unwrap()
+    }
+
     #[test]
     fn profile_one_v5_schema_is_rejected_explicitly() {
         let mut bytes = record(0, Digest::ZERO).bytes().to_vec();
@@ -600,6 +709,109 @@ mod tests {
         let reopened = FileJournal::open(&temp.path).unwrap();
         assert_eq!(reopened.revision(), 0);
         assert_eq!(reopened.head(), Digest::ZERO);
+    }
+
+    #[test]
+    fn open_rejects_a_sparse_file_before_reading_past_the_scan_budget() {
+        let temp = TempJournal::new("sparse-budget");
+        let file = std::fs::File::create(&temp.path).unwrap();
+        file.set_len((MAX_JOURNAL_SCAN_BYTES as u64) + 1).unwrap();
+        drop(file);
+
+        let error = FileJournal::open(&temp.path).expect_err("oversized input must fail closed");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("InputTooLarge"));
+        let error = super::read_all(&temp.path).expect_err("unbounded read must fail closed");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("InputTooLarge"));
+    }
+
+    #[test]
+    fn append_rejects_a_budget_overflow_before_mutating_file_or_coordinates() {
+        let temp = TempJournal::new("append-budget");
+        let first = record(0, Digest::ZERO);
+        let record_len = u64::try_from(first.bytes().len()).unwrap();
+        let durable_len = (MAX_JOURNAL_SCAN_BYTES as u64)
+            .checked_sub(record_len)
+            .unwrap()
+            .checked_add(1)
+            .unwrap();
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&temp.path)
+            .unwrap();
+        file.set_len(durable_len).unwrap();
+        let mut journal = super::FileJournal {
+            path: temp.path.clone(),
+            file,
+            durable_len,
+            revision: 0,
+            head: Digest::ZERO,
+            journal_repair: None,
+            recovery_required: false,
+        };
+
+        let error = journal
+            .append(&first)
+            .expect_err("append must not create an un-reopenable journal");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("InputTooLarge"));
+        assert_eq!(journal.file.metadata().unwrap().len(), durable_len);
+        assert_eq!(journal.durable_len, durable_len);
+        assert_eq!(journal.revision, 0);
+        assert_eq!(journal.head, Digest::ZERO);
+        assert!(!journal.recovery_required);
+    }
+
+    #[test]
+    fn open_rejects_a_non_genesis_first_record() {
+        let temp = TempJournal::new("non-genesis-first-record");
+        let first = record(7, digest(42));
+        std::fs::write(&temp.path, first.bytes()).unwrap();
+
+        let error =
+            FileJournal::open(&temp.path).expect_err("ordinary journal must begin at genesis");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "journal record chain does not begin at genesis"
+        );
+    }
+
+    #[test]
+    fn open_rejects_revision_gap_and_wrong_predecessor() {
+        for (label, second) in [
+            ("revision-gap", record(2, digest(7))),
+            ("wrong-predecessor", record(1, digest(0xaa))),
+        ] {
+            let temp = TempJournal::new(label);
+            let first = record(0, Digest::ZERO);
+            let mut bytes = first.bytes().to_vec();
+            bytes.extend_from_slice(second.bytes());
+            std::fs::write(&temp.path, bytes).unwrap();
+
+            let error =
+                FileJournal::open(&temp.path).expect_err("broken journal chain must fail closed");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+            assert_eq!(error.to_string(), "journal record chain is discontinuous");
+        }
+    }
+
+    #[test]
+    fn open_accepts_a_leading_checkpoint_with_a_compressed_base() {
+        let temp = TempJournal::new("checkpoint-base");
+        let first = checkpoint_record(42, digest(42));
+        let second = record(first.revision(), first.digest());
+        let mut bytes = first.bytes().to_vec();
+        bytes.extend_from_slice(second.bytes());
+        std::fs::write(&temp.path, bytes).unwrap();
+
+        let journal = FileJournal::open(&temp.path).expect("engine validates the checkpoint image");
+        assert_eq!(journal.revision(), second.revision());
+        assert_eq!(journal.head(), second.digest());
     }
 
     #[test]
@@ -699,6 +911,11 @@ mod tests {
 
         let mut journal = FileJournal::open_anchored(&temp.path, first.revision(), first.digest())
             .expect("trusted prefix is independent of suffix contents");
+        let error = journal
+            .read_all()
+            .expect_err("reading an oversized unanchored suffix must fail closed");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("InputTooLarge"));
         assert_eq!(
             journal.journal_repair(),
             Some(JournalRepair::UnanchoredSuffix {
@@ -744,6 +961,33 @@ mod tests {
             .expect_err("anchored prefix must be one contiguous chain");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert_eq!(error.to_string(), "journal record chain is discontinuous");
+    }
+
+    #[test]
+    fn anchored_prefix_rejects_a_non_genesis_first_record() {
+        let temp = TempJournal::new("anchored-non-genesis");
+        let first = record(7, digest(42));
+        std::fs::write(&temp.path, first.bytes()).unwrap();
+
+        let error = FileJournal::open_anchored(&temp.path, first.revision(), first.digest())
+            .expect_err("ordinary anchored journal must begin at genesis");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "journal record chain does not begin at genesis"
+        );
+    }
+
+    #[test]
+    fn anchored_prefix_accepts_a_leading_checkpoint_with_a_compressed_base() {
+        let temp = TempJournal::new("anchored-checkpoint-base");
+        let first = checkpoint_record(42, digest(42));
+        std::fs::write(&temp.path, first.bytes()).unwrap();
+
+        let journal = FileJournal::open_anchored(&temp.path, first.revision(), first.digest())
+            .expect("the trusted anchor and engine validate the checkpoint base");
+        assert_eq!(journal.revision(), first.revision());
+        assert_eq!(journal.head(), first.digest());
     }
 
     #[test]
