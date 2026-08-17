@@ -86,7 +86,7 @@ impl PreparedQemuPersistentBoot {
     /// catalog.  The caller owns the returned linear envelope and can consume
     /// it exactly once through [`Self::recover`].
     pub(crate) fn acquire() -> Result<Self, QemuPersistentBootError> {
-        Self::acquire_with(AtaPioJournal::acquire(AtaJournalFixture::PrimaryMaster))
+        Self::acquire_with(|| AtaPioJournal::acquire(AtaJournalFixture::PrimaryMaster))
     }
 
     /// Enables the experiment-only, default-off provider counters before
@@ -102,9 +102,7 @@ impl PreparedQemuPersistentBootVNext {
     /// fresh append/checkpoint journal.  Callers must give it a separate blank
     /// artifact path; there is intentionally no migration or auto-detection.
     pub(crate) fn acquire() -> Result<Self, QemuPersistentBootError> {
-        Self::acquire_with(AtaPioJournalVNext::acquire(
-            AtaJournalFixture::PrimaryMaster,
-        ))
+        Self::acquire_with(|| AtaPioJournalVNext::acquire(AtaJournalFixture::PrimaryMaster))
     }
 
     /// Enables the experiment-only, default-off provider counters before
@@ -119,9 +117,10 @@ impl<J> PreparedQemuPersistentBootFor<J>
 where
     J: OstdBootJournal,
 {
-    fn acquire_with(
-        journal: Result<J, super::core_pio_journal::AtaPioJournalError>,
-    ) -> Result<Self, QemuPersistentBootError> {
+    fn acquire_with<F>(journal: F) -> Result<Self, QemuPersistentBootError>
+    where
+        F: FnOnce() -> Result<J, super::core_pio_journal::AtaPioJournalError>,
+    {
         if !persistent_dma_arena_ready() {
             return Err(QemuPersistentBootError::ArenaNotWithheld);
         }
@@ -150,10 +149,14 @@ where
             .ok_or(QemuPersistentBootError::DeviceGenerationOverflow)?;
         let observed_generation = DeviceGeneration::new(next)
             .map_err(|_| QemuPersistentBootError::DeviceGenerationInvalid)?;
-        let guard = OstdVirtioBootQuarantine::new(observed_generation)
-            .quarantine_all()
-            .map_err(|_| QemuPersistentBootError::DeviceQuarantine)?;
-        let journal = journal.map_err(|_| QemuPersistentBootError::AtaJournalUnavailable)?;
+        let (guard, journal) = quarantine_before_journal(
+            || {
+                OstdVirtioBootQuarantine::new(observed_generation)
+                    .quarantine_all()
+                    .map_err(|_| QemuPersistentBootError::DeviceQuarantine)
+            },
+            || journal().map_err(|_| QemuPersistentBootError::AtaJournalUnavailable),
+        )?;
         Ok(Self {
             arena,
             candidate,
@@ -216,6 +219,71 @@ where
             BootRecoveryError::Checkpoint(_) => QemuPersistentBootError::RecoveryCheckpoint,
             _ => QemuPersistentBootError::Recovery,
         })
+    }
+}
+
+/// Keeps the physical fence and the first durable-journal read in a single,
+/// auditable sequence. Both operations are closures deliberately: passing a
+/// pre-evaluated journal result here would reintroduce Rust's argument
+/// evaluation-order hazard and let a bank read happen before quarantine.
+fn quarantine_before_journal<Q, J, FQ, FJ>(
+    quarantine: FQ,
+    journal: FJ,
+) -> Result<(Q, J), QemuPersistentBootError>
+where
+    FQ: FnOnce() -> Result<Q, QemuPersistentBootError>,
+    FJ: FnOnce() -> Result<J, QemuPersistentBootError>,
+{
+    let guard = quarantine()?;
+    let journal = journal()?;
+    Ok((guard, journal))
+}
+
+#[cfg(ktest)]
+mod tests {
+    use super::*;
+    use alloc::vec::Vec;
+    use core::cell::RefCell;
+    use ostd::prelude::ktest;
+
+    #[ktest]
+    fn physical_quarantine_completes_before_first_journal_read() {
+        let events = RefCell::new(Vec::new());
+        let (guard, journal) = quarantine_before_journal(
+            || {
+                events.borrow_mut().push("quarantine-complete");
+                Ok::<_, QemuPersistentBootError>(())
+            },
+            || {
+                events.borrow_mut().push("journal-first-read");
+                Ok::<_, QemuPersistentBootError>(())
+            },
+        )
+        .expect("test acquisition sequence succeeds");
+
+        assert_eq!((guard, journal), ((), ()));
+        assert_eq!(
+            events.into_inner(),
+            ["quarantine-complete", "journal-first-read"]
+        );
+    }
+
+    #[ktest]
+    fn journal_is_not_opened_when_physical_quarantine_fails() {
+        let events = RefCell::new(Vec::new());
+        let result = quarantine_before_journal(
+            || {
+                events.borrow_mut().push("quarantine-failed");
+                Err(QemuPersistentBootError::DeviceQuarantine)
+            },
+            || {
+                events.borrow_mut().push("journal-first-read");
+                Ok::<_, QemuPersistentBootError>(())
+            },
+        );
+
+        assert_eq!(result, Err(QemuPersistentBootError::DeviceQuarantine));
+        assert_eq!(events.into_inner(), ["quarantine-failed"]);
     }
 }
 
