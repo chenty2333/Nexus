@@ -603,7 +603,7 @@ fn run_task_recovery_slice() {
          revoke_adopt_orders=2 legacy_runtime=false live_dual_write=false \
          rebind=task-bound-core production_rebind=false \
          receipt_provider=commit-probe+physical-reply real_reply=true \
-         api_profile=5 production_profile=false scoped_providers=true \
+         api_profile=6 production_profile=false scoped_providers=true \
          exact_verifier_binding=true \
          journal=same-boot-memory durability_boundary=transition-trait \
          reboot_persistence=false"
