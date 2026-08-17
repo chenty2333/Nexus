@@ -2625,7 +2625,7 @@ capture_core_persistent_run() {
         'irq_submitted=1' \
         'iotlb_submitted=2' \
         'service_executor_generation=4' \
-        'executor_generation=4' \
+        'successor_generation=4' \
         'fresh_service_task=true' \
         'ready_in_fresh_task=true' \
         'production_rebind=true' \
