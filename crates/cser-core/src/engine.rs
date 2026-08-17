@@ -12028,6 +12028,13 @@ fn check_invariants(
     if state.world().get() == 0 {
         return Err(CoreError::InvariantViolation);
     }
+    if state
+        .device_quarantine()
+        .iter()
+        .any(|scope| !state.device_generations().contains_key(scope))
+    {
+        return Err(CoreError::InvariantViolation);
+    }
     for (coordinate, record) in state.provider_generations() {
         let catalog = catalogs
             .get(record.catalog_digest)
@@ -15038,6 +15045,18 @@ impl CommandKind {
                 let charge_account = ChargeAccountId::new(cursor.u64()?)
                     .map_err(|_| CommandDecodeError::InvalidIdentity)?;
                 let count = cursor.u32()? as usize;
+                // Every binding has at least a component id, a provider
+                // coordinate, and the artifact tag.  Bound the count before
+                // reserving attacker-controlled capacity; the semantic
+                // catalog/cardinality check still runs when the command is
+                // applied.
+                const MIN_COMPONENT_PROVIDER_BINDING_BYTES: usize = 4 + 24 + 1;
+                let encoded_len = count
+                    .checked_mul(MIN_COMPONENT_PROVIDER_BINDING_BYTES)
+                    .ok_or(CommandDecodeError::UnexpectedEof)?;
+                if cursor.remaining() < encoded_len {
+                    return Err(CommandDecodeError::UnexpectedEof);
+                }
                 let mut bindings = Vec::with_capacity(count);
                 for _ in 0..count {
                     let component = ComponentId::new(cursor.u32()?)
@@ -15527,9 +15546,11 @@ fn decode_whole_state_checkpoint(
         return Err(CoreError::InvariantViolation);
     }
     let mut provider_high_water = BTreeMap::new();
+    let mut previous_provider = None;
     for _ in 0..high_water_count {
         let provider = ProviderId::new(cursor.u64().map_err(|_| CoreError::InvariantViolation)?)
             .map_err(|_| CoreError::InvariantViolation)?;
+        checkpoint_require_strictly_increasing(&mut previous_provider, provider)?;
         let generation =
             ProviderGeneration::new(cursor.u64().map_err(|_| CoreError::InvariantViolation)?)
                 .map_err(|_| CoreError::InvariantViolation)?;
@@ -15542,17 +15563,28 @@ fn decode_whole_state_checkpoint(
         return Err(CoreError::InvariantViolation);
     }
     let mut provider_generations = BTreeMap::new();
+    let mut previous_provider_generation = None;
     for _ in 0..provider_count {
         let coordinate = cursor
             .provider_coordinate()
             .map_err(|_| CoreError::InvariantViolation)?;
+        checkpoint_require_strictly_increasing(&mut previous_provider_generation, coordinate)?;
         let catalog_digest = cursor.digest().map_err(|_| CoreError::InvariantViolation)?;
-        if !catalogs.contains(catalog_digest) {
-            return Err(CoreError::SchemaMismatch);
-        }
+        let provider_catalog = catalogs
+            .get(catalog_digest)
+            .ok_or(CoreError::SchemaMismatch)?;
         let verifier_set_digest = cursor.digest().map_err(|_| CoreError::InvariantViolation)?;
         let verifier_count = cursor.u32().map_err(|_| CoreError::InvariantViolation)? as usize;
-        let mut verifier_bindings = Vec::new();
+        let required_verifiers = provider_catalog.verifier_class_bindings();
+        if verifier_count > limits.max_effects
+            || verifier_count != required_verifiers.len()
+            || verifier_count
+                .checked_mul(4 + 8 + 4 + 32)
+                .is_none_or(|encoded_len| cursor.remaining() < encoded_len)
+        {
+            return Err(CoreError::InvariantViolation);
+        }
+        let mut verifier_bindings = Vec::with_capacity(verifier_count);
         for _ in 0..verifier_count {
             verifier_bindings.push(
                 cursor
@@ -15576,8 +15608,10 @@ fn decode_whole_state_checkpoint(
         let epoch = cursor
             .nonzero_u64()
             .map_err(|_| CoreError::InvariantViolation)?;
-        let live_component_bindings =
-            cursor.u64().map_err(|_| CoreError::InvariantViolation)? as usize;
+        let live_component_bindings = usize::try_from(
+            cursor.u64().map_err(|_| CoreError::InvariantViolation)?,
+        )
+        .map_err(|_| CoreError::InvariantViolation)?;
         let provider_state = match state_tag {
             1 if epoch == 1 => ProviderEffectState::Active,
             2 if epoch >= 2 => ProviderEffectState::EffectFenced { epoch },
@@ -15608,18 +15642,30 @@ fn decode_whole_state_checkpoint(
         return Err(CoreError::InvariantViolation);
     }
     let mut scoped_composites = BTreeMap::new();
+    let mut previous_scoped_effect = None;
     for _ in 0..scoped_count {
         let effect = cursor.effect().map_err(|_| CoreError::InvariantViolation)?;
+        checkpoint_require_strictly_increasing(&mut previous_scoped_effect, effect)?;
         let catalog_digest = cursor.digest().map_err(|_| CoreError::InvariantViolation)?;
         if !catalogs.contains(catalog_digest) {
             return Err(CoreError::SchemaMismatch);
         }
         let binding_count = cursor.u32().map_err(|_| CoreError::InvariantViolation)? as usize;
+        const CHECKPOINT_COMPONENT_BINDING_BYTES: usize = 4 + 24;
+        if binding_count > limits.max_effects
+            || binding_count
+                .checked_mul(CHECKPOINT_COMPONENT_BINDING_BYTES)
+                .is_none_or(|encoded_len| cursor.remaining() < encoded_len)
+        {
+            return Err(CoreError::InvariantViolation);
+        }
         let mut bindings = BTreeMap::new();
+        let mut previous_binding_component = None;
         for _ in 0..binding_count {
             let component =
                 ComponentId::new(cursor.u32().map_err(|_| CoreError::InvariantViolation)?)
                     .map_err(|_| CoreError::InvariantViolation)?;
+            checkpoint_require_strictly_increasing(&mut previous_binding_component, component)?;
             let provider = cursor
                 .provider_coordinate()
                 .map_err(|_| CoreError::InvariantViolation)?;
@@ -15631,11 +15677,20 @@ fn decode_whole_state_checkpoint(
         if artifact_count > binding_count {
             return Err(CoreError::InvariantViolation);
         }
+        const CHECKPOINT_ARTIFACT_BINDING_BYTES: usize = 8 + 24 + 8 + 16 + 4 + (4 * 32);
+        if artifact_count
+            .checked_mul(4 + CHECKPOINT_ARTIFACT_BINDING_BYTES)
+            .is_none_or(|encoded_len| cursor.remaining() < encoded_len)
+        {
+            return Err(CoreError::InvariantViolation);
+        }
         let mut artifacts = BTreeMap::new();
+        let mut previous_artifact_component = None;
         for _ in 0..artifact_count {
             let component =
                 ComponentId::new(cursor.u32().map_err(|_| CoreError::InvariantViolation)?)
                     .map_err(|_| CoreError::InvariantViolation)?;
+            checkpoint_require_strictly_increasing(&mut previous_artifact_component, component)?;
             let binding = cursor
                 .artifact_binding()
                 .map_err(|_| CoreError::InvariantViolation)?;
@@ -15662,11 +15717,13 @@ fn decode_whole_state_checkpoint(
         return Err(CoreError::InvariantViolation);
     }
     let mut artifact_leases = BTreeMap::new();
+    let mut previous_artifact_lease = None;
     for _ in 0..artifact_lease_count {
         let artifact = crate::RecoveryArtifactId::new(
             cursor.u64().map_err(|_| CoreError::InvariantViolation)?,
         )
         .map_err(|_| CoreError::InvariantViolation)?;
+        checkpoint_require_strictly_increasing(&mut previous_artifact_lease, artifact)?;
         let tag = cursor.u8().map_err(|_| CoreError::InvariantViolation)?;
         let binding = cursor
             .artifact_binding()
@@ -15707,13 +15764,16 @@ fn decode_whole_state_checkpoint(
     }
     let composites =
         checkpoint_read_composites_count(&mut cursor, catalogs, composite_count, limits)?;
+    checkpoint_validate_scoped_cardinality(&scoped_composites, &composites, catalogs)?;
     let resource_count = cursor.u32().map_err(|_| CoreError::InvariantViolation)? as usize;
     if resource_count > limits.max_resource_records {
         return Err(CoreError::InvariantViolation);
     }
     let mut resources = BTreeMap::new();
+    let mut previous_resource = None;
     for _ in 0..resource_count {
         let (resource, record) = checkpoint_read_resource(&mut cursor)?;
+        checkpoint_require_strictly_increasing(&mut previous_resource, resource)?;
         if resources.insert(resource, record).is_some() {
             return Err(CoreError::InvariantViolation);
         }
@@ -15723,9 +15783,11 @@ fn decode_whole_state_checkpoint(
         return Err(CoreError::InvariantViolation);
     }
     let mut device_generations = BTreeMap::new();
+    let mut previous_device_scope = None;
     for _ in 0..device_count {
         let scope = DeviceScopeId::new(cursor.u64().map_err(|_| CoreError::InvariantViolation)?)
             .map_err(|_| CoreError::InvariantViolation)?;
+        checkpoint_require_strictly_increasing(&mut previous_device_scope, scope)?;
         let generation =
             DeviceGeneration::new(cursor.u64().map_err(|_| CoreError::InvariantViolation)?)
                 .map_err(|_| CoreError::InvariantViolation)?;
@@ -15738,9 +15800,14 @@ fn decode_whole_state_checkpoint(
         return Err(CoreError::InvariantViolation);
     }
     let mut device_quarantine = BTreeSet::new();
+    let mut previous_quarantine_scope = None;
     for _ in 0..quarantine_count {
         let scope = DeviceScopeId::new(cursor.u64().map_err(|_| CoreError::InvariantViolation)?)
             .map_err(|_| CoreError::InvariantViolation)?;
+        checkpoint_require_strictly_increasing(&mut previous_quarantine_scope, scope)?;
+        if !device_generations.contains_key(&scope) {
+            return Err(CoreError::InvariantViolation);
+        }
         if !device_quarantine.insert(scope) {
             return Err(CoreError::InvariantViolation);
         }
@@ -15778,6 +15845,62 @@ fn decode_whole_state_checkpoint(
     state.projection_cache = projection;
     check_invariants_for_catalog_set(catalogs, limits, &state)?;
     Ok(state)
+}
+
+fn checkpoint_require_strictly_increasing<K: Copy + Ord>(
+    previous: &mut Option<K>,
+    current: K,
+) -> Result<(), CoreError> {
+    if previous.is_some_and(|previous| current <= previous) {
+        return Err(CoreError::InvariantViolation);
+    }
+    *previous = Some(current);
+    Ok(())
+}
+
+fn checkpoint_validate_scoped_cardinality(
+    scoped_composites: &BTreeMap<EffectId, ScopedCompositeRecord>,
+    composites: &BTreeMap<EffectId, CompositeEffectRecord>,
+    catalogs: &CatalogSet,
+) -> Result<(), CoreError> {
+    for (effect, scoped) in scoped_composites {
+        let composite = composites
+            .get(effect)
+            .ok_or(CoreError::InvariantViolation)?;
+        let catalog = catalogs
+            .get(composite.catalog_digest)
+            .ok_or(CoreError::SchemaMismatch)?;
+        let schema = catalog
+            .composite_rule(composite.kind)
+            .ok_or(CoreError::InvariantViolation)?;
+        let required_artifacts = schema
+            .components()
+            .iter()
+            .filter(|component| {
+                component.artifact_policy() == crate::RecoveryArtifactPolicy::Required
+            })
+            .count();
+        if scoped.catalog_digest != composite.catalog_digest
+            || scoped.bindings.len() != schema.components().len()
+            || scoped
+                .bindings
+                .keys()
+                .any(|component| schema.component(*component).is_none())
+            || scoped.artifacts.len() > required_artifacts
+            || scoped
+                .artifacts
+                .keys()
+                .any(|component| !scoped.bindings.contains_key(component))
+            || scoped.artifacts.keys().any(|component| {
+                schema.component(*component).is_none_or(|declared| {
+                    declared.artifact_policy() != crate::RecoveryArtifactPolicy::Required
+                })
+            })
+        {
+            return Err(CoreError::InvariantViolation);
+        }
+    }
+    Ok(())
 }
 
 fn checkpoint_put_composite(bytes: &mut Vec<u8>, effect: EffectId, record: &CompositeEffectRecord) {
@@ -15822,7 +15945,7 @@ fn checkpoint_put_released_provenance(
 fn checkpoint_read_released_provenance(
     cursor: &mut Cursor<'_>,
     catalogs: &CatalogSet,
-    limits: CoreLimits,
+    schema: &crate::CompositeRule,
 ) -> Result<Option<ReleasedCompositeProvenance>, CoreError> {
     match cursor.u8().map_err(|_| CoreError::InvariantViolation)? {
         0 => Ok(None),
@@ -15832,14 +15955,22 @@ fn checkpoint_read_released_provenance(
                 return Err(CoreError::SchemaMismatch);
             }
             let binding_count = cursor.u32().map_err(|_| CoreError::InvariantViolation)? as usize;
-            if binding_count > limits.max_effects {
+            if binding_count != schema.components().len() {
+                return Err(CoreError::InvariantViolation);
+            }
+            if binding_count
+                .checked_mul(4 + 24)
+                .is_none_or(|encoded_len| cursor.remaining() < encoded_len)
+            {
                 return Err(CoreError::InvariantViolation);
             }
             let mut bindings = BTreeMap::new();
+            let mut previous_binding_component = None;
             for _ in 0..binding_count {
                 let component =
                     ComponentId::new(cursor.u32().map_err(|_| CoreError::InvariantViolation)?)
                         .map_err(|_| CoreError::InvariantViolation)?;
+                checkpoint_require_strictly_increasing(&mut previous_binding_component, component)?;
                 let provider = cursor
                     .provider_coordinate()
                     .map_err(|_| CoreError::InvariantViolation)?;
@@ -15848,14 +15979,33 @@ fn checkpoint_read_released_provenance(
                 }
             }
             let artifact_count = cursor.u32().map_err(|_| CoreError::InvariantViolation)? as usize;
-            if artifact_count > binding_count {
+            let required_artifacts = schema
+                .components()
+                .iter()
+                .filter(|component| {
+                    component.artifact_policy() == crate::RecoveryArtifactPolicy::Required
+                })
+                .count();
+            if artifact_count > required_artifacts {
+                return Err(CoreError::InvariantViolation);
+            }
+            const CHECKPOINT_ARTIFACT_BINDING_BYTES: usize = 8 + 24 + 8 + 16 + 4 + (4 * 32);
+            if artifact_count
+                .checked_mul(4 + CHECKPOINT_ARTIFACT_BINDING_BYTES)
+                .is_none_or(|encoded_len| cursor.remaining() < encoded_len)
+            {
                 return Err(CoreError::InvariantViolation);
             }
             let mut artifacts = BTreeMap::new();
+            let mut previous_artifact_component = None;
             for _ in 0..artifact_count {
                 let component =
                     ComponentId::new(cursor.u32().map_err(|_| CoreError::InvariantViolation)?)
                         .map_err(|_| CoreError::InvariantViolation)?;
+                checkpoint_require_strictly_increasing(
+                    &mut previous_artifact_component,
+                    component,
+                )?;
                 let binding = cursor
                     .artifact_binding()
                     .map_err(|_| CoreError::InvariantViolation)?;
@@ -15939,8 +16089,10 @@ fn checkpoint_read_composites_count(
 ) -> Result<BTreeMap<EffectId, CompositeEffectRecord>, CoreError> {
     let mut total_claims = 0usize;
     let mut composites = BTreeMap::new();
+    let mut previous_effect = None;
     for _ in 0..count {
         let effect = cursor.effect().map_err(|_| CoreError::InvariantViolation)?;
+        checkpoint_require_strictly_increasing(&mut previous_effect, effect)?;
         let kind = CompositeKindId::new(cursor.u32().map_err(|_| CoreError::InvariantViolation)?)
             .map_err(|_| CoreError::InvariantViolation)?;
         let catalog_digest = cursor.digest().map_err(|_| CoreError::InvariantViolation)?;
@@ -15959,17 +16111,25 @@ fn checkpoint_read_composites_count(
             .nonzero_u64()
             .map_err(|_| CoreError::InvariantViolation)?;
         let handoff = checkpoint_read_handoff(cursor)?;
-        let released_provenance = checkpoint_read_released_provenance(cursor, catalogs, limits)?;
-        let component_count = cursor.u32().map_err(|_| CoreError::InvariantViolation)? as usize;
         let schema = catalog
             .composite_rule(kind)
             .ok_or(CoreError::SchemaMismatch)?;
+        let released_provenance = checkpoint_read_released_provenance(cursor, catalogs, schema)?;
+        let component_count = cursor.u32().map_err(|_| CoreError::InvariantViolation)? as usize;
         if component_count != schema.components().len() {
             return Err(CoreError::InvariantViolation);
         }
+        if component_count
+            .checked_mul(4)
+            .is_none_or(|encoded_len| cursor.remaining() < encoded_len)
+        {
+            return Err(CoreError::InvariantViolation);
+        }
         let mut components = BTreeMap::new();
+        let mut previous_component = None;
         for _ in 0..component_count {
             let component = checkpoint_read_component(cursor, catalog, schema, limits)?;
+            checkpoint_require_strictly_increasing(&mut previous_component, component.id)?;
             total_claims = total_claims
                 .checked_add(component.claims.len())
                 .ok_or(CoreError::InvariantViolation)?;
@@ -16072,9 +16232,17 @@ fn checkpoint_read_component_dynamic(
     if count > limits.max_claims_per_effect {
         return Err(CoreError::InvariantViolation);
     }
+    if count
+        .checked_mul(8)
+        .is_none_or(|encoded_len| cursor.remaining() < encoded_len)
+    {
+        return Err(CoreError::InvariantViolation);
+    }
     let mut claims = BTreeMap::new();
+    let mut previous_claim = None;
     for _ in 0..count {
         let claim = checkpoint_read_claim(cursor, domain, catalog)?;
+        checkpoint_require_strictly_increasing(&mut previous_claim, claim.id)?;
         if claims.insert(claim.id, claim).is_some() {
             return Err(CoreError::InvariantViolation);
         }
@@ -16681,9 +16849,11 @@ fn checkpoint_read_operations_count(
     count: usize,
 ) -> Result<BTreeMap<OperationId, CompositeRecoveryRecord>, CoreError> {
     let mut operations = BTreeMap::new();
+    let mut previous_id = None;
     for _ in 0..count {
         let id = OperationId::new(cursor.u64().map_err(|_| CoreError::InvariantViolation)?)
             .map_err(|_| CoreError::InvariantViolation)?;
+        checkpoint_require_strictly_increasing(&mut previous_id, id)?;
         let origin = cursor
             .executor()
             .map_err(|_| CoreError::InvariantViolation)?;
@@ -17793,6 +17963,110 @@ mod whole_state_checkpoint_tests {
             CommandKind::decode_payload(&payload),
             Err(CommandDecodeError::UnexpectedEof)
         ));
+    }
+
+    #[test]
+    fn tag_46_rejects_huge_binding_count_before_reserving() {
+        let mut payload = vec![46];
+        put_effect(
+            &mut payload,
+            EffectId::new(OperationId::new(1).unwrap(), 1).unwrap(),
+        );
+        put_incarnation(
+            &mut payload,
+            ExecutorCoordinate::new(
+                crate::ExecutorId::new(1).unwrap(),
+                crate::ExecutorGeneration::new(1).unwrap(),
+            ),
+        );
+        put_u32(&mut payload, AGENT_OPERATION_COMPOSITE.get());
+        put_u64(&mut payload, 1);
+        put_u32(&mut payload, u32::MAX);
+        assert_eq!(
+            CommandKind::decode_payload(&payload),
+            Err(CommandDecodeError::UnexpectedEof)
+        );
+    }
+
+    #[test]
+    fn checkpoint_rejects_nested_counts_and_noncanonical_wire_order() {
+        let mut journal = Vec::new();
+        let (engine, _, _) = seed(&mut journal);
+        let image = encode_whole_state_checkpoint(&engine.state);
+
+        // The provider verifier count is checked against the exact catalog
+        // verifier set before the decoder reserves or enters that loop.
+        let high_water_count_offset = 8 + 2 + 8 + 32 + 8 + 32 + 1 + 8;
+        let high_water_count = u32::from_le_bytes(
+            image[high_water_count_offset..high_water_count_offset + 4]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let provider_count_offset = high_water_count_offset + 4 + high_water_count * 16;
+        assert_eq!(
+            u32::from_le_bytes(
+                image[provider_count_offset..provider_count_offset + 4]
+                    .try_into()
+                    .unwrap()
+            ),
+            1
+        );
+        let verifier_count_offset = provider_count_offset + 4 + 24 + 32 + 32;
+        let mut oversized_verifiers = image.clone();
+        oversized_verifiers[verifier_count_offset..verifier_count_offset + 4]
+            .copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(
+            decode_whole_state_checkpoint(
+                &oversized_verifiers,
+                engine.catalog_set(),
+                engine.limits
+            )
+            .is_err()
+        );
+
+        // Reversing two high-water keys is a non-canonical BTree wire image,
+        // even though the key set itself is otherwise valid.
+        let mut noncanonical = image.clone();
+        let inserted_at = provider_count_offset;
+        let mut extra = Vec::new();
+        put_u64(&mut extra, 2);
+        put_u64(&mut extra, 1);
+        noncanonical.splice(inserted_at..inserted_at, extra);
+        noncanonical[high_water_count_offset..high_water_count_offset + 4]
+            .copy_from_slice(&2u32.to_le_bytes());
+        let (first, rest) = noncanonical[high_water_count_offset + 4..].split_at_mut(16);
+        let second = &mut rest[..16];
+        first.swap_with_slice(second);
+        assert!(
+            decode_whole_state_checkpoint(&noncanonical, engine.catalog_set(), engine.limits)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn checkpoint_rejects_quarantine_without_device_generation() {
+        let mut journal = Vec::new();
+        let (engine, _, _) = seed(&mut journal);
+        let mut image = encode_whole_state_checkpoint(&engine.state);
+        assert_eq!(
+            u32::from_le_bytes(image[image.len() - 4..].try_into().unwrap()),
+            0
+        );
+        image.truncate(image.len() - 4);
+        put_u32(&mut image, 1);
+        put_u64(&mut image, 99);
+        assert!(
+            decode_whole_state_checkpoint(&image, engine.catalog_set(), engine.limits).is_err()
+        );
+
+        let mut invalid_state = engine.state.clone();
+        invalid_state
+            .device_quarantine_mut()
+            .insert_mut(DeviceScopeId::new(99).unwrap());
+        assert!(
+            check_invariants_for_catalog_set(engine.catalog_set(), engine.limits, &invalid_state)
+                .is_err()
+        );
     }
 
     #[test]
