@@ -2162,7 +2162,7 @@ impl AtaPioJournal {
     pub(crate) fn acquire(fixture: AtaJournalFixture) -> Result<Self, AtaPioJournalError> {
         let disk = AtaPioDisk::acquire(fixture).map_err(BankedJournalError::Storage)?;
         Ok(Self {
-            journal: BankedJournal::open(disk)?,
+            journal: BankedJournal::open_strict(disk)?,
         })
     }
 
@@ -2462,6 +2462,21 @@ mod tests {
         BankedJournal::open(MemoryDisk::fixture()).expect("open memory disk")
     }
 
+    fn production_open(
+        backend: MemoryDisk,
+    ) -> Result<BankedJournal<MemoryDisk>, BankedJournalError<MemoryError>> {
+        BankedJournal::open_strict(backend)
+    }
+
+    fn inject_invalid_bank(journal: &mut BankedJournal<MemoryDisk>, bank: u32) {
+        let mut corrupt = [0u8; SECTOR_BYTES];
+        corrupt[..10].copy_from_slice(b"not-a-bank");
+        journal
+            .backend_mut()
+            .write_sector(bank_header_lba(bank), &corrupt)
+            .expect("inject malformed bank header");
+    }
+
     #[ktest]
     fn pio_journal_format_appends_exact_bytes_and_uses_two_barriers() {
         let mut journal = journal();
@@ -2544,12 +2559,7 @@ mod tests {
     #[ktest]
     fn strict_double_bank_rejects_a_lone_corrupt_bank() {
         let mut journal = journal();
-        let mut corrupt = [0u8; SECTOR_BYTES];
-        corrupt[..10].copy_from_slice(b"not-a-bank");
-        journal
-            .backend_mut()
-            .write_sector(bank_header_lba(0), &corrupt)
-            .expect("inject malformed lone header");
+        inject_invalid_bank(&mut journal, 0);
 
         assert!(matches!(
             journal.read_active_strict(),
@@ -2563,12 +2573,7 @@ mod tests {
         journal
             .append_exact(b"committed")
             .expect("publish predecessor");
-        let mut corrupt = [0u8; SECTOR_BYTES];
-        corrupt[..10].copy_from_slice(b"not-a-bank");
-        journal
-            .backend_mut()
-            .write_sector(bank_header_lba(1), &corrupt)
-            .expect("inject malformed inactive header");
+        inject_invalid_bank(&mut journal, 1);
 
         assert_eq!(
             journal
@@ -2577,6 +2582,41 @@ mod tests {
                 .bytes,
             b"committed"
         );
+    }
+
+    #[ktest]
+    fn production_open_rejects_blank_left_invalid_right() {
+        let mut journal = journal();
+        inject_invalid_bank(&mut journal, 1);
+
+        assert!(matches!(
+            production_open(journal.into_backend()),
+            Err(BankedJournalError::CorruptBankMetadata)
+        ));
+    }
+
+    #[ktest]
+    fn production_open_rejects_invalid_left_blank_right() {
+        let mut journal = journal();
+        inject_invalid_bank(&mut journal, 0);
+
+        assert!(matches!(
+            production_open(journal.into_backend()),
+            Err(BankedJournalError::CorruptBankMetadata)
+        ));
+    }
+
+    #[ktest]
+    fn production_open_keeps_valid_peer_after_malformed_bank() {
+        let mut journal = journal();
+        journal
+            .append_exact(b"committed")
+            .expect("publish valid peer");
+        inject_invalid_bank(&mut journal, 1);
+
+        let reopened =
+            production_open(journal.into_backend()).expect("valid peer remains authoritative");
+        assert_eq!(reopened.active.bytes, b"committed");
     }
 
     #[ktest]
