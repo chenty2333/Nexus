@@ -1061,6 +1061,37 @@ fn loom_late_old_irq_cannot_mutate_generation_plus_one_activation() {
         assert_eq!(new_claims.len(), 1);
         assert_eq!(new_claims[0].resource_generation, resource_generation(2));
         assert!(!new_claims[0].retired);
+        // A generation+1 activation is a complete target projection, not
+        // merely a non-zero claim count. Check every authority and lifecycle
+        // coordinate that a recovery adapter would consume so a stale old
+        // generation cannot masquerade as a valid successor.
+        let target = engine.composite_effect(reuse).unwrap();
+        assert_eq!(target.effect, reuse);
+        assert_eq!(target.kind, DMA_ARENA_REUSE_COMPOSITE);
+        assert_eq!(target.operation, reuse.operation());
+        assert_eq!(target.causal_owner, successor);
+        assert_eq!(target.custodian, CustodyState::Executor(successor));
+        assert_eq!(target.authority, AuthorityState::Active);
+        assert_eq!(target.authority_epoch, 1);
+        assert_eq!(target.component_count, 1);
+        assert_eq!(target.retained_claims, 1);
+        assert_eq!(
+            target.provider_bindings,
+            vec![ComponentProviderBinding::new(
+                AGENT_COMPONENT_DMA,
+                support::provider(),
+            )]
+        );
+        let target_component = engine.component(reuse, AGENT_COMPONENT_DMA).unwrap();
+        assert_eq!(target_component.commit, CommitState::Registered);
+        assert_eq!(target_component.outcome, OutcomeState::Pending);
+        assert_eq!(target_component.settlement, SettlementState::Unavailable);
+        assert_eq!(
+            target_component.retirement,
+            cser_core::RetirementState::Held
+        );
+        assert_eq!(target_component.claim_count, 1);
+        assert_eq!(target_component.retained_claims, 1);
         assert!(
             engine
                 .component_claims(original, AGENT_COMPONENT_DMA)

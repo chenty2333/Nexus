@@ -96,6 +96,7 @@ enum NormalizedEscape {
     Escaped,
     PartiallyDischarged,
     Retired,
+    Released,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -144,10 +145,25 @@ struct NormalizedProjection {
     authority_epoch: u64,
     reply_committed: bool,
     dma_committed: bool,
+    /// Core's component-local logical outcome, normalized against the
+    /// clean-room DMA oracle outcome below.  Keep this separate from
+    /// retirement evidence: a successfully observed completion must not
+    /// collapse into reset-induced indeterminacy.
+    dma_logical_outcome: NormalizedLogicalOutcome,
+    dma_outcome: OracleDmaOutcome,
     reply: NormalizedReply,
     dma: NormalizedDmaClosure,
     claims: [NormalizedClaim; 4],
     escape: NormalizedEscape,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NormalizedLogicalOutcome {
+    Staged,
+    Pending,
+    KnownSuccess,
+    KnownFailure,
+    Indeterminate,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -396,6 +412,48 @@ fn core_reply(committed: bool, settlement: SettlementState) -> NormalizedReply {
     }
 }
 
+fn core_dma_outcome(commit: CommitState, outcome: cser_core::OutcomeState) -> OracleDmaOutcome {
+    if commit != CommitState::Committed {
+        return OracleDmaOutcome::Staged;
+    }
+    match outcome {
+        cser_core::OutcomeState::Pending => OracleDmaOutcome::Pending,
+        cser_core::OutcomeState::KnownSuccess(_) => OracleDmaOutcome::Completed,
+        // The composite oracle has no provider-specific failure receipt.  A
+        // known failure is nevertheless a terminal, known outcome and must
+        // not be mistaken for a successful completion or a pending request.
+        // Keep it distinct by treating it as the conservative reset outcome
+        // for the bounded DMA projection.
+        cser_core::OutcomeState::KnownFailure(_) => OracleDmaOutcome::IndeterminateAfterReset,
+        cser_core::OutcomeState::Indeterminate(_) => OracleDmaOutcome::IndeterminateAfterReset,
+    }
+}
+
+fn core_logical_outcome(
+    commit: CommitState,
+    outcome: cser_core::OutcomeState,
+) -> NormalizedLogicalOutcome {
+    if commit != CommitState::Committed {
+        return NormalizedLogicalOutcome::Staged;
+    }
+    match outcome {
+        cser_core::OutcomeState::Pending => NormalizedLogicalOutcome::Pending,
+        cser_core::OutcomeState::KnownSuccess(_) => NormalizedLogicalOutcome::KnownSuccess,
+        cser_core::OutcomeState::KnownFailure(_) => NormalizedLogicalOutcome::KnownFailure,
+        cser_core::OutcomeState::Indeterminate(_) => NormalizedLogicalOutcome::Indeterminate,
+    }
+}
+
+fn oracle_logical_outcome(outcome: OracleDmaOutcome) -> NormalizedLogicalOutcome {
+    match outcome {
+        OracleDmaOutcome::Staged => NormalizedLogicalOutcome::Staged,
+        OracleDmaOutcome::Pending => NormalizedLogicalOutcome::Pending,
+        OracleDmaOutcome::Completed => NormalizedLogicalOutcome::KnownSuccess,
+        OracleDmaOutcome::IndeterminateAfterReset => NormalizedLogicalOutcome::Indeterminate,
+        OracleDmaOutcome::Aborted => NormalizedLogicalOutcome::Indeterminate,
+    }
+}
+
 fn oracle_reply(reply: OracleReplyState) -> NormalizedReply {
     match reply {
         OracleReplyState::Staged => NormalizedReply::Staged,
@@ -612,16 +670,23 @@ fn normalize_core(
         // IOTLB receipt; the oracle deliberately names the allocator boundary.
         allocator_released: evidence(claim(PAGE_CLAIM_RAW), DEVICE_EVIDENCE_IOTLB),
     };
+    let escape = if parent.escape == cser_core::EffectEscapeState::Released {
+        NormalizedEscape::Released
+    } else {
+        normalized_escape(reply_committed, dma_committed, reply, &claims)
+    };
     NormalizedProjection {
         effect: (original.operation().get(), original.sequence()),
         authority: core_authority(parent.authority),
         authority_epoch: parent.authority_epoch,
         reply_committed,
         dma_committed,
+        dma_logical_outcome: core_logical_outcome(dma_component.commit, dma_component.outcome),
+        dma_outcome: core_dma_outcome(dma_component.commit, dma_component.outcome),
         reply,
         dma,
         claims,
-        escape: normalized_escape(reply_committed, dma_committed, reply, &claims),
+        escape,
     }
 }
 
@@ -643,21 +708,36 @@ fn normalize_oracle(
         iotlb_invalidated: projection.iotlb_invalidated,
         allocator_released: projection.allocator_released,
     };
-    NormalizedProjection {
-        effect: (original.operation().get(), original.sequence()),
-        authority: oracle_authority(projection.authority),
-        authority_epoch: projection.authority_epoch,
-        reply_committed: reply_component.committed,
-        dma_committed: dma_component.committed,
-        reply,
-        dma,
-        claims,
-        escape: normalized_escape(
+    let escape = if projection.escape == OracleEscape::Released {
+        NormalizedEscape::Released
+    } else {
+        normalized_escape(
             reply_component.committed,
             dma_component.committed,
             reply,
             &claims,
-        ),
+        )
+    };
+    let authority = if projection.escape == OracleEscape::Released {
+        // Release is an authority terminal in core. Keep the normal form
+        // fail-closed even if an older clean-room oracle build retained its
+        // pre-release Fenced label internally.
+        NormalizedAuthority::Revoked
+    } else {
+        oracle_authority(projection.authority)
+    };
+    NormalizedProjection {
+        effect: (original.operation().get(), original.sequence()),
+        authority,
+        authority_epoch: projection.authority_epoch,
+        reply_committed: reply_component.committed,
+        dma_committed: dma_component.committed,
+        dma_logical_outcome: oracle_logical_outcome(projection.dma),
+        dma_outcome: projection.dma,
+        reply,
+        dma,
+        claims,
+        escape,
     }
 }
 
@@ -735,6 +815,172 @@ fn recover_prefix(harness: &Harness, label: &str) -> Engine {
     first
 }
 
+fn prepare_dma_differential_case(
+    harness: &mut Harness,
+    effect: EffectId,
+    origin: ExecutorCoordinate,
+) {
+    harness
+        .tx(admit_composite(effect, origin, AGENT_OPERATION_COMPOSITE))
+        .unwrap();
+    for (component, claim_id, kind, scope, resource_id) in [
+        (
+            AGENT_COMPONENT_REPLY,
+            claim(REPLY_CLAIM_RAW),
+            REPLY_CLAIM_PUBLICATION_SLOT,
+            ClaimScope::Logical,
+            resource(REPLY_RESOURCE_RAW),
+        ),
+        (
+            AGENT_COMPONENT_DMA,
+            claim(QUEUE_CLAIM_RAW),
+            DEVICE_CLAIM_QUEUE_SLOT,
+            ClaimScope::Device(device_scope()),
+            resource(QUEUE_RESOURCE_RAW),
+        ),
+        (
+            AGENT_COMPONENT_DMA,
+            claim(PAGE_CLAIM_RAW),
+            DEVICE_CLAIM_PINNED_PAGE,
+            ClaimScope::Device(device_scope()),
+            resource(PAGE_RESOURCE_RAW),
+        ),
+        (
+            AGENT_COMPONENT_DMA,
+            claim(IOVA_CLAIM_RAW),
+            DEVICE_CLAIM_IOVA,
+            ClaimScope::Device(device_scope()),
+            resource(IOVA_RESOURCE_RAW),
+        ),
+    ] {
+        harness
+            .tx(Command::AddComponentClaim {
+                effect,
+                component,
+                actor: origin,
+                claim: claim_id,
+                kind,
+                scope,
+                resource: resource_id,
+                resource_generation: resource_generation(1),
+                units: 1,
+            })
+            .unwrap();
+    }
+    harness
+        .tx(Command::PrepareCompositeEffect {
+            effect,
+            actor: origin,
+        })
+        .unwrap();
+}
+
+#[test]
+fn dma_completion_and_reset_are_distinct_differential_outcomes() {
+    let mut normalized = Vec::new();
+    for (case, completion_first) in [true, false].into_iter().enumerate() {
+        let operation = OPERATION + 0x40 + case as u64;
+        let original = effect(operation, 1);
+        let origin = executor(operation, 1);
+        let mut harness = Harness::standard();
+        prepare_dma_differential_case(&mut harness, original, origin);
+        let mut oracle = CompositeEffectOracle::new(
+            oracle_effect(original),
+            oracle_executor(origin),
+            1,
+            1,
+            oracle_resources(),
+        );
+
+        let mut intents = match harness.output(Command::RecordCompositeCommitIntents {
+            effect: original,
+            actor: origin,
+            operations: vec![
+                ComponentCommitOperation::new(AGENT_COMPONENT_REPLY, digest(80)),
+                ComponentCommitOperation::new(AGENT_COMPONENT_DMA, digest(81)),
+            ],
+        }) {
+            TransitionOutput::CompositeCommitIntents(intents) => intents,
+            other => panic!("expected atomic DMA differential intents, got {other:?}"),
+        };
+
+        oracle
+            .commit_reply(oracle.observe_authority().unwrap())
+            .unwrap();
+        oracle
+            .commit_dma(oracle.observe_authority().unwrap())
+            .unwrap();
+        if completion_first {
+            for (intent, verifier, schema, marker) in [
+                (
+                    intents.remove(0),
+                    REPLY_VERIFIER,
+                    REPLY_COMMIT_RECEIPT_SCHEMA,
+                    82,
+                ),
+                (
+                    intents.remove(0),
+                    DEVICE_VERIFIER,
+                    DEVICE_COMMIT_RECEIPT_SCHEMA,
+                    83,
+                ),
+            ] {
+                let outcome = verified_commit_outcome(
+                    &harness,
+                    &intent,
+                    verifier,
+                    schema,
+                    ExternalOutcome::Success,
+                    digest(marker),
+                );
+                harness.tx(intent.acknowledge(outcome).unwrap()).unwrap();
+            }
+            oracle
+                .accept_dma_completion(oracle.dma_completion_event().unwrap())
+                .unwrap();
+        } else {
+            harness
+                .tx(Command::FenceExecutor {
+                    operation: original.operation(),
+                    crashed: origin,
+                })
+                .unwrap();
+            oracle.fence_executor(oracle_executor(origin)).unwrap();
+        }
+        harness
+            .tx(reset_component_command(
+                &harness,
+                original,
+                claim(QUEUE_CLAIM_RAW),
+                84 + case as u8,
+            ))
+            .unwrap();
+        oracle.advance_device_generation(2).unwrap();
+        oracle
+            .accept_reset(oracle.dma_retirement_evidence())
+            .unwrap();
+
+        let core_outcome = harness
+            .engine
+            .component(original, AGENT_COMPONENT_DMA)
+            .unwrap()
+            .outcome;
+        let normalized_core = core_dma_outcome(
+            harness
+                .engine
+                .component(original, AGENT_COMPONENT_DMA)
+                .unwrap()
+                .commit,
+            core_outcome,
+        );
+        assert_eq!(normalized_core, oracle.projection().dma);
+        normalized.push(normalized_core);
+    }
+    assert_eq!(normalized[0], OracleDmaOutcome::Completed);
+    assert_eq!(normalized[1], OracleDmaOutcome::IndeterminateAfterReset);
+    assert_ne!(normalized[0], normalized[1]);
+}
+
 fn assert_checkpoint(
     harness: &Harness,
     oracle: &CompositeEffectOracle,
@@ -742,6 +988,7 @@ fn assert_checkpoint(
     context: DifferentialContext,
     label: &str,
 ) {
+    assert!(oracle.check_invariants(), "{label}: oracle invariants");
     let expected = normalize_oracle(oracle, original, context);
     assert_eq!(
         normalize_core(&harness.engine, original, context),
@@ -1089,6 +1336,13 @@ fn provider_scoped_core_and_independent_oracle_match_every_durable_prefix() {
     oracle
         .commit_dma(oracle.observe_authority().unwrap())
         .unwrap();
+    // The core's successful commit receipt is the logical DMA completion
+    // fact for this bounded profile. Feed the equivalent exact event into
+    // the independent oracle before exercising reset evidence; otherwise a
+    // normal completion followed by physical quiescence would be
+    // incorrectly normalized as reset-induced indeterminacy.
+    let dma_completion = oracle.dma_completion_event().unwrap();
+    oracle.accept_dma_completion(dma_completion).unwrap();
     assert!(intents.is_empty());
     assert_checkpoint(
         &harness,
@@ -1657,10 +1911,7 @@ fn provider_scoped_core_and_independent_oracle_match_every_durable_prefix() {
         cser_core::EffectEscapeState::Retired
     );
     assert_eq!(oracle.projection().escape, OracleEscape::Retired);
-    assert_eq!(
-        oracle.projection().dma,
-        OracleDmaOutcome::IndeterminateAfterReset
-    );
+    assert_eq!(oracle.projection().dma, OracleDmaOutcome::Completed);
     for coordinates in reuse_specs {
         let claim = harness
             .engine
@@ -1672,4 +1923,15 @@ fn provider_scoped_core_and_independent_oracle_match_every_durable_prefix() {
         assert_eq!(claim.resource_generation, resource_generation(2));
         assert!(!claim.retired);
     }
+
+    harness
+        .tx(Command::ReleaseCompositeEffect { effect: original })
+        .unwrap();
+    oracle.release_effect().unwrap();
+    assert_checkpoint(&harness, &oracle, original, context, "parent-released");
+    assert_eq!(
+        harness.engine.composite_effect(original).unwrap().escape,
+        cser_core::EffectEscapeState::Released
+    );
+    assert_eq!(oracle.projection().escape, OracleEscape::Released);
 }

@@ -41,6 +41,19 @@ enum NormalizedSettlement {
     Tombstoned,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NormalizedLogicalOutcome {
+    Pending,
+    KnownSuccess,
+    Indeterminate,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NormalizedComponentProjection {
+    settlement: NormalizedSettlement,
+    logical_outcome: NormalizedLogicalOutcome,
+}
+
 fn oracle_resources() -> cser_model::composite_effect_oracle::CompositeResources {
     use cser_model::composite_effect_oracle::{CompositeResources, ResourceId};
 
@@ -68,12 +81,26 @@ fn oracle_effect(effect: EffectId) -> OracleEffectId {
     .expect("property effect sequences are non-zero")
 }
 
-fn normalize_settlement(harness: &Harness, effect: EffectId) -> NormalizedSettlement {
+fn normalize_settlement(harness: &Harness, effect: EffectId) -> NormalizedComponentProjection {
     let composite = harness.engine.composite_effect(effect).unwrap();
+    let component = harness
+        .engine
+        .component(effect, EFFECT_COMPONENT)
+        .expect("the one-component composite keeps its reply component");
+    let logical_outcome = match component.outcome {
+        cser_core::OutcomeState::Pending => NormalizedLogicalOutcome::Pending,
+        cser_core::OutcomeState::KnownSuccess(_) => NormalizedLogicalOutcome::KnownSuccess,
+        cser_core::OutcomeState::KnownFailure(_) | cser_core::OutcomeState::Indeterminate(_) => {
+            NormalizedLogicalOutcome::Indeterminate
+        }
+    };
     if composite.authority == AuthorityState::Revoked {
-        return NormalizedSettlement::Tombstoned;
+        return NormalizedComponentProjection {
+            settlement: NormalizedSettlement::Tombstoned,
+            logical_outcome,
+        };
     }
-    match harness
+    let settlement = match harness
         .engine
         .component(effect, EFFECT_COMPONENT)
         .expect("the one-component composite keeps its reply component")
@@ -113,11 +140,25 @@ fn normalize_settlement(harness: &Harness, effect: EffectId) -> NormalizedSettle
         SettlementState::Unavailable | SettlementState::NotRequired => {
             panic!("property fixture requires successor settlement")
         }
+    };
+    NormalizedComponentProjection {
+        settlement,
+        logical_outcome,
     }
 }
 
-fn normalize_oracle(oracle: &CompositeEffectOracle) -> NormalizedSettlement {
-    match oracle.projection().reply {
+fn normalize_oracle(oracle: &CompositeEffectOracle) -> NormalizedComponentProjection {
+    let logical_outcome = match oracle.projection().reply {
+        ReplyState::Staged | ReplyState::Aborted => NormalizedLogicalOutcome::Pending,
+        ReplyState::Tombstoned => NormalizedLogicalOutcome::Indeterminate,
+        ReplyState::Open { .. }
+        | ReplyState::Claimed { .. }
+        | ReplyState::ApplyIntentDurable { .. }
+        | ReplyState::AppliedUnacknowledged { .. }
+        | ReplyState::ReconciliationRequired { .. }
+        | ReplyState::Settled => NormalizedLogicalOutcome::KnownSuccess,
+    };
+    let settlement = match oracle.projection().reply {
         ReplyState::Open { generation } => NormalizedSettlement::Open(generation),
         ReplyState::Claimed {
             claimant,
@@ -150,6 +191,10 @@ fn normalize_oracle(oracle: &CompositeEffectOracle) -> NormalizedSettlement {
         ReplyState::Settled => NormalizedSettlement::Settled,
         ReplyState::Tombstoned | ReplyState::Aborted => NormalizedSettlement::Tombstoned,
         ReplyState::Staged => panic!("property fixture commits the reply component"),
+    };
+    NormalizedComponentProjection {
+        settlement,
+        logical_outcome,
     }
 }
 

@@ -1,16 +1,30 @@
 use cser_core::{
-    AdoptionPolicy, ArtifactAdmission, ArtifactPinChallenge, ArtifactPinVerifier,
-    ArtifactReceiptBindings, ArtifactReleaseChallenge, ArtifactReleaseVerifier, BootGeneration,
-    CatalogSet, ClaimCardinality, ClaimKindId, ClaimScope, CommandRequest, CommitState,
-    ComponentId, ComponentProviderBinding, CompositeComponentSpec, CompositeKindId, CoreError,
-    CoreLimits, CreditClassId, DeviceGeneration, DeviceGenerationEffect, Digest, DomainCatalog,
-    DomainCatalogBuilder, DomainId, EffectId, Engine, EvidenceKindId, EvidenceRule,
-    ExecutorCoordinate, ExecutorGeneration, ExecutorId, Freshness, FreshnessAxes,
-    JournalGeneration, ObligationKindId, ObligationPolicy, ObligationReceipts, ObligationSpec,
-    OperationId, ProviderCoordinate, ProviderGeneration, ProviderId, ReceiptBinding,
-    ReceiptSchemaId, RecoveryArtifactId, RecoveryArtifactPolicy, RegistryInstance,
-    ResourceGeneration, ResourceId, TransitionEvent, TransitionOutput, VerificationError,
-    VerifierBinding, VerifierGeneration, VerifierIdentity, WorldId,
+    AdoptionPolicy, ArtifactAdmission, ArtifactLeaseState as CoreArtifactLeaseState,
+    ArtifactPinChallenge, ArtifactPinVerifier, ArtifactReceiptBindings, ArtifactReleaseChallenge,
+    ArtifactReleaseVerifier, BootGeneration, CatalogSet, ClaimCardinality, ClaimId, ClaimKindId,
+    ClaimScope, CommandRequest, CommitState, ComponentId, ComponentProviderBinding,
+    CompositeComponentSpec, CompositeKindId, CoreError, CoreLimits, CreditClassId, CustodyState,
+    DeviceGeneration, DeviceGenerationEffect, Digest, DomainCatalog, DomainCatalogBuilder,
+    DomainId, EffectFactChallenge, EffectId, EffectReceiptVerifier, Engine, EvidenceKindId,
+    EvidenceRule, ExecutorCoordinate, ExecutorGeneration, ExecutorId, ExternalOutcome, Freshness,
+    FreshnessAxes, JournalGeneration, ObligationKindId, ObligationPolicy, ObligationReceipts,
+    ObligationSpec, OperationId, OutcomeState, ProviderCoordinate, ProviderEffectState,
+    ProviderGeneration, ProviderId, ReceiptBinding, ReceiptSchemaId, ReceiptVerifier,
+    RecoveryAnchor, RecoveryArtifactId, RecoveryArtifactPolicy, RecoveryBinding, RecoveryProfile,
+    RegistryInstance, ResourceGeneration, ResourceId, RetirementState, SettlementState,
+    TransitionEvent, TransitionOutput, VerificationError, VerifiedEffectObservation,
+    VerifiedObservation, VerifierBinding, VerifierGeneration, VerifierIdentity, WorldId,
+};
+
+use cser_model::recovery_artifact_oracle::{
+    ArtifactLeaseState as OracleArtifactLeaseState, ArtifactOwner,
+    ComponentPhase as OracleComponentPhase, ProviderPhase as OracleProviderPhase,
+    RecoveryArtifactOracle,
+};
+use cser_model::{
+    ArtifactId as OracleArtifactId, ComponentId as OracleComponentId, EffectId as OracleEffectId,
+    OperationId as OracleOperationId, ProviderGeneration as OracleProviderGeneration,
+    ProviderId as OracleProviderId, WorldId as OracleWorldId,
 };
 
 const WORLD: u64 = 7_001;
@@ -392,11 +406,858 @@ impl ArtifactReleaseVerifier for AcceptRelease {
     }
 }
 
+#[derive(Clone, Copy)]
+struct AcceptEffectFact {
+    identity: VerifierIdentity,
+    outcome: Option<ExternalOutcome>,
+    digest: Digest,
+}
+
+impl EffectReceiptVerifier for AcceptEffectFact {
+    type Receipt = ();
+
+    fn identity(&self) -> VerifierIdentity {
+        self.identity
+    }
+
+    fn verify(
+        &self,
+        challenge: &EffectFactChallenge,
+        _receipt: &Self::Receipt,
+    ) -> Result<VerifiedEffectObservation, VerificationError> {
+        Ok(match self.outcome {
+            Some(outcome) => VerifiedEffectObservation::commit(
+                challenge.current_observation(),
+                outcome,
+                self.digest,
+            ),
+            None => VerifiedEffectObservation::fact(challenge.current_observation(), self.digest),
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+struct AcceptEvidence(VerifierIdentity);
+
+impl ReceiptVerifier for AcceptEvidence {
+    type Receipt = ();
+
+    fn identity(&self) -> VerifierIdentity {
+        self.0
+    }
+
+    fn verify(
+        &self,
+        challenge: &cser_core::EvidenceChallenge,
+        _receipt: &Self::Receipt,
+    ) -> Result<VerifiedObservation, VerificationError> {
+        Ok(VerifiedObservation::new(
+            challenge.subject(),
+            challenge.current_observation(),
+            Digest::new([0x79; 32]),
+        ))
+    }
+}
+
+fn scoped_identity(
+    catalog: &DomainCatalog,
+    verifier: cser_core::VerifierId,
+    schema: ReceiptSchemaId,
+) -> VerifierIdentity {
+    let index = catalog
+        .verifier_class_bindings()
+        .into_iter()
+        .enumerate()
+        .find(|(_, binding)| binding.verifier() == verifier && binding.receipt_schema() == schema)
+        .map(|(index, _)| index)
+        .unwrap();
+    VerifierIdentity::new_exact(
+        VerifierBinding::new(
+            verifier,
+            VerifierGeneration::new(1).unwrap(),
+            schema,
+            Digest::new([0x20 + index as u8; 32]),
+        )
+        .unwrap(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn assert_recovery_artifact_differential(
+    engine: &Engine,
+    oracle: &RecoveryArtifactOracle,
+    provider: ProviderCoordinate,
+    effect: EffectId,
+    component: ComponentId,
+    artifact: RecoveryArtifactId,
+    binding: cser_core::ArtifactBinding,
+    owner: ArtifactOwner,
+    expected_provider: OracleProviderPhase,
+    expected_component: OracleComponentPhase,
+    expected_artifact: OracleArtifactLeaseState,
+) {
+    let projection = oracle.projection();
+    let model_provider = projection
+        .providers
+        .iter()
+        .find(|record| {
+            record.provider.get() == provider.provider().get()
+                && record.generation.get() == provider.generation().get()
+        })
+        .unwrap();
+    assert_eq!(model_provider.phase, expected_provider);
+    let core_provider = engine.provider_generation_projection(provider).unwrap();
+    assert_eq!(
+        core_provider.live_component_bindings as u64,
+        model_provider.live_components
+    );
+    assert_eq!(
+        model_provider.live_effects,
+        u64::from(model_provider.live_components != 0)
+    );
+    match expected_provider {
+        OracleProviderPhase::Active => {
+            assert!(matches!(core_provider.state, ProviderEffectState::Active))
+        }
+        OracleProviderPhase::EffectFenced => assert!(matches!(
+            core_provider.state,
+            ProviderEffectState::EffectFenced { .. }
+        )),
+        OracleProviderPhase::SettlementOnly => assert!(matches!(
+            core_provider.state,
+            ProviderEffectState::SettlementOnly { .. }
+        )),
+        OracleProviderPhase::Retired => assert!(matches!(
+            core_provider.state,
+            ProviderEffectState::Retired { .. }
+        )),
+    }
+
+    let model_component = projection
+        .components
+        .iter()
+        .find(|record| {
+            record.effect.operation().get() == effect.operation().get()
+                && record.effect.sequence() == effect.sequence()
+                && record.component.get() == component.get()
+        })
+        .unwrap();
+    assert_eq!(model_component.phase, expected_component);
+    let core_component = engine.component(effect, component).unwrap();
+    match expected_component {
+        OracleComponentPhase::Staged => assert!(matches!(
+            core_component.commit,
+            CommitState::Registered | CommitState::Prepared
+        )),
+        OracleComponentPhase::CommitIntent => {
+            assert_eq!(core_component.commit, CommitState::CommitIntentDurable);
+        }
+        OracleComponentPhase::Executed => {
+            assert_eq!(core_component.commit, CommitState::CommitIntentDurable);
+        }
+        OracleComponentPhase::Outcome => {
+            assert_eq!(core_component.commit, CommitState::Committed);
+            assert!(matches!(
+                core_component.outcome,
+                OutcomeState::KnownSuccess(_)
+            ));
+        }
+        OracleComponentPhase::Settled => {
+            assert_eq!(core_component.commit, CommitState::Committed);
+            assert!(matches!(
+                core_component.outcome,
+                OutcomeState::KnownSuccess(_)
+            ));
+            assert!(matches!(
+                core_component.settlement,
+                SettlementState::Settled
+            ));
+        }
+        OracleComponentPhase::Aborted => {
+            assert_eq!(core_component.settlement, SettlementState::Revoked);
+        }
+        OracleComponentPhase::Released => {
+            assert_eq!(core_component.retirement, RetirementState::Released);
+        }
+    }
+    assert_eq!(
+        core_component.retirement == RetirementState::Retired
+            || core_component.retirement == RetirementState::Released,
+        model_component.physical_retired
+    );
+    if core_component.claim_count == 0 {
+        assert!(!model_component.claims_retired);
+    } else {
+        assert_eq!(
+            core_component.retained_claims == 0,
+            model_component.claims_retired
+        );
+    }
+
+    assert_eq!(
+        model_component.effect.operation().get(),
+        effect.operation().get()
+    );
+    assert_eq!(model_component.effect.sequence(), effect.sequence());
+
+    let model_artifact = projection
+        .artifacts
+        .iter()
+        .find(|record| record.lease.get() == artifact.get())
+        .unwrap();
+    assert_eq!(model_artifact.owner, owner);
+    assert_eq!(
+        model_artifact.catalog_digest,
+        binding.catalog_digest().bytes()
+    );
+    assert_eq!(
+        model_artifact.schema_digest,
+        binding.schema_digest().bytes()
+    );
+    assert_eq!(
+        model_artifact.verifier_set_digest,
+        binding.verifier_set_digest().bytes()
+    );
+    assert_eq!(model_artifact.state, expected_artifact);
+    assert_eq!(binding.artifact_id(), artifact);
+    assert_eq!(binding.provider(), provider);
+    assert_eq!(binding.operation(), effect.operation());
+    assert_eq!(binding.effect(), effect);
+    assert_eq!(binding.component(), component);
+    assert_eq!(owner.catalog_digest, binding.catalog_digest().bytes());
+    assert_eq!(owner.schema_digest, binding.schema_digest().bytes());
+    assert_eq!(
+        owner.verifier_set_digest,
+        binding.verifier_set_digest().bytes()
+    );
+    assert_eq!(owner.closure_digest, binding.closure_digest().bytes());
+    match expected_artifact {
+        OracleArtifactLeaseState::Declared => {
+            assert!(engine.artifact_lease(artifact).is_none());
+        }
+        OracleArtifactLeaseState::Pinned => assert!(matches!(
+            engine.artifact_lease(artifact),
+            Some(CoreArtifactLeaseState::Pinned { .. })
+        )),
+        OracleArtifactLeaseState::ReleaseAuthorized => assert!(matches!(
+            engine.artifact_lease(artifact),
+            Some(CoreArtifactLeaseState::ReleaseAuthorized { .. })
+        )),
+        OracleArtifactLeaseState::Released => assert!(matches!(
+            engine.artifact_lease(artifact),
+            Some(CoreArtifactLeaseState::Released { .. })
+        )),
+    }
+    if expected_component == OracleComponentPhase::Released {
+        let composite = engine.composite_effect(effect).unwrap();
+        assert_eq!(composite.custodian, CustodyState::Released);
+        assert!(engine.provider_obligations(provider).is_empty());
+        let retained = engine
+            .artifact_recovery_items()
+            .into_iter()
+            .find(|item| item.binding.artifact_id() == artifact)
+            .expect("released provenance must retain the artifact binding");
+        assert_eq!(retained.binding, binding);
+        assert_eq!(retained.lease, engine.artifact_lease(artifact).unwrap());
+    }
+    assert!(oracle.check_invariants());
+}
+
 fn tx<C: Into<cser_core::Command>>(
     engine: &mut Engine,
     request: C,
 ) -> Result<cser_core::TransitionReceipt, CoreError> {
     engine.transact_volatile(request)
+}
+
+fn durable_tx<C: Into<cser_core::Command>>(
+    engine: &mut Engine,
+    journal: &mut Vec<u8>,
+    request: C,
+) -> cser_core::TransitionReceipt {
+    engine
+        .transact(request, |record| {
+            journal.extend_from_slice(record.bytes());
+            Ok::<(), ()>(())
+        })
+        .unwrap()
+}
+
+#[test]
+fn required_artifact_core_matches_oracle_through_pin_settle_release_and_retire() {
+    let value = 78_001;
+    let catalog = catalog();
+    let world_core = WorldId::new(WORLD).unwrap();
+    let provider = provider(world_core);
+    let mut engine = Engine::new(
+        world_core,
+        CatalogSet::new(std::slice::from_ref(&catalog)).unwrap(),
+        CoreLimits::bounded_default(),
+        freshness(),
+    );
+    let mut journal = Vec::new();
+    durable_tx(
+        &mut engine,
+        &mut journal,
+        CommandRequest::RegisterProviderGeneration {
+            coordinate: provider,
+            catalog_digest: catalog.digest(),
+            verifier_bindings: provider_verifiers(&catalog),
+        },
+    );
+    durable_tx(
+        &mut engine,
+        &mut journal,
+        CommandRequest::BindArtifactReceiptVerifiers {
+            coordinate: provider,
+            receipts: artifact_receipts(),
+        },
+    );
+    let effect = EffectId::new(OperationId::new(value).unwrap(), 1).unwrap();
+    let actor = ExecutorCoordinate::new(
+        ExecutorId::new(value).unwrap(),
+        ExecutorGeneration::new(1).unwrap(),
+    );
+    durable_tx(
+        &mut engine,
+        &mut journal,
+        CommandRequest::AdmitScopedCompositeEffect {
+            effect,
+            origin: actor,
+            kind: id(COMPOSITE, CompositeKindId::new),
+            charge_account: cser_core::ChargeAccountId::new(value).unwrap(),
+            bindings: vec![
+                ComponentProviderBinding::new(id(COMPONENT, ComponentId::new), provider)
+                    .with_artifact(ArtifactAdmission::new(
+                        RecoveryArtifactId::new(value + 2).unwrap(),
+                        Digest::new([0x51; 32]),
+                        Digest::new([0x52; 32]),
+                    )),
+            ],
+        },
+    );
+    let component = id(COMPONENT, ComponentId::new);
+    let artifact = RecoveryArtifactId::new(value + 2).unwrap();
+    let world = OracleWorldId::new(WORLD).unwrap();
+    let oracle_provider = OracleProviderId::new(provider.provider().get()).unwrap();
+    let oracle_generation = OracleProviderGeneration::new(provider.generation().get()).unwrap();
+    let oracle_effect = OracleEffectId::new(
+        OracleOperationId::new(effect.operation().get()).unwrap(),
+        effect.sequence(),
+    )
+    .unwrap();
+    let oracle_component = OracleComponentId::new(component.get()).unwrap();
+    let oracle_artifact = OracleArtifactId::new(artifact.get()).unwrap();
+    let mut oracle = RecoveryArtifactOracle::new(world);
+    oracle
+        .register_provider(oracle_provider, oracle_generation)
+        .unwrap();
+    oracle
+        .admit_effect(
+            oracle_effect,
+            oracle_provider,
+            oracle_generation,
+            &[oracle_component],
+        )
+        .unwrap();
+
+    let pin_challenge = engine.artifact_pin_challenge(effect, component).unwrap();
+    let binding = pin_challenge.binding();
+    let verifier_set_digest = engine
+        .provider_generation_projection(provider)
+        .unwrap()
+        .verifier_set_digest;
+    let owner = ArtifactOwner {
+        world,
+        provider: oracle_provider,
+        generation: oracle_generation,
+        operation: OracleOperationId::new(effect.operation().get()).unwrap(),
+        effect: oracle_effect,
+        component: oracle_component,
+        catalog_digest: binding.catalog_digest().bytes(),
+        schema_digest: binding.schema_digest().bytes(),
+        verifier_set_digest: verifier_set_digest.bytes(),
+        closure_digest: binding.closure_digest().bytes(),
+    };
+    oracle.require_artifact(oracle_artifact, owner).unwrap();
+    assert_recovery_artifact_differential(
+        &engine,
+        &oracle,
+        provider,
+        effect,
+        component,
+        artifact,
+        binding,
+        owner,
+        OracleProviderPhase::Active,
+        OracleComponentPhase::Staged,
+        OracleArtifactLeaseState::Declared,
+    );
+
+    durable_tx(
+        &mut engine,
+        &mut journal,
+        CommandRequest::AddComponentClaim {
+            effect,
+            component,
+            actor,
+            claim: ClaimId::new(value + 2).unwrap(),
+            kind: id(CLAIM, ClaimKindId::new),
+            scope: ClaimScope::Logical,
+            resource: ResourceId::new(value + 2).unwrap(),
+            resource_generation: ResourceGeneration::new(1).unwrap(),
+            units: 1,
+        },
+    );
+    durable_tx(
+        &mut engine,
+        &mut journal,
+        CommandRequest::PrepareCompositeEffect { effect, actor },
+    );
+    assert_recovery_artifact_differential(
+        &engine,
+        &oracle,
+        provider,
+        effect,
+        component,
+        artifact,
+        binding,
+        owner,
+        OracleProviderPhase::Active,
+        OracleComponentPhase::Staged,
+        OracleArtifactLeaseState::Declared,
+    );
+
+    assert_eq!(
+        tx(
+            &mut engine,
+            CommandRequest::RecordComponentCommitIntent {
+                effect,
+                component,
+                actor,
+                operation: Digest::new([0x78; 32]),
+            },
+        ),
+        Err(CoreError::ArtifactNotPinned)
+    );
+    assert_eq!(
+        oracle.commit_intent(oracle_effect, oracle_component),
+        Err(cser_model::recovery_artifact_oracle::ArtifactError::ArtifactNotPinned)
+    );
+    assert_recovery_artifact_differential(
+        &engine,
+        &oracle,
+        provider,
+        effect,
+        component,
+        artifact,
+        binding,
+        owner,
+        OracleProviderPhase::Active,
+        OracleComponentPhase::Staged,
+        OracleArtifactLeaseState::Declared,
+    );
+
+    let pin = engine
+        .verify_artifact_pin(
+            effect,
+            component,
+            &AcceptPin(artifact_receipts().pin()),
+            &(),
+        )
+        .unwrap();
+    durable_tx(&mut engine, &mut journal, pin.record());
+    oracle.pin_artifact(oracle_artifact, owner).unwrap();
+    assert_recovery_artifact_differential(
+        &engine,
+        &oracle,
+        provider,
+        effect,
+        component,
+        artifact,
+        binding,
+        owner,
+        OracleProviderPhase::Active,
+        OracleComponentPhase::Staged,
+        OracleArtifactLeaseState::Pinned,
+    );
+
+    let intent = match durable_tx(
+        &mut engine,
+        &mut journal,
+        CommandRequest::RecordComponentCommitIntent {
+            effect,
+            component,
+            actor,
+            operation: Digest::new([0x78; 32]),
+        },
+    )
+    .into_output()
+    {
+        TransitionOutput::CommitIntent(intent) => intent,
+        other => panic!("expected commit intent, got {other:?}"),
+    };
+    oracle
+        .commit_intent(oracle_effect, oracle_component)
+        .unwrap();
+    assert_recovery_artifact_differential(
+        &engine,
+        &oracle,
+        provider,
+        effect,
+        component,
+        artifact,
+        binding,
+        owner,
+        OracleProviderPhase::Active,
+        OracleComponentPhase::CommitIntent,
+        OracleArtifactLeaseState::Pinned,
+    );
+
+    let commit_verifier = AcceptEffectFact {
+        identity: scoped_identity(
+            &catalog,
+            id(COMMIT_VERIFIER, cser_core::VerifierId::new),
+            id(COMMIT_SCHEMA, ReceiptSchemaId::new),
+        ),
+        outcome: Some(ExternalOutcome::Success),
+        digest: Digest::new([0x7a; 32]),
+    };
+    let outcome = engine
+        .verify_commit_outcome(&intent, &commit_verifier, &())
+        .unwrap();
+    durable_tx(
+        &mut engine,
+        &mut journal,
+        intent.acknowledge(outcome).unwrap(),
+    );
+    oracle.execute(oracle_effect, oracle_component).unwrap();
+    oracle
+        .record_outcome(oracle_effect, oracle_component)
+        .unwrap();
+    assert_recovery_artifact_differential(
+        &engine,
+        &oracle,
+        provider,
+        effect,
+        component,
+        artifact,
+        binding,
+        owner,
+        OracleProviderPhase::Active,
+        OracleComponentPhase::Outcome,
+        OracleArtifactLeaseState::Pinned,
+    );
+
+    durable_tx(
+        &mut engine,
+        &mut journal,
+        CommandRequest::FenceProviderEffects {
+            coordinate: provider,
+            expected_epoch: 1,
+        },
+    );
+    oracle
+        .fence_provider(oracle_provider, oracle_generation)
+        .unwrap();
+    assert_recovery_artifact_differential(
+        &engine,
+        &oracle,
+        provider,
+        effect,
+        component,
+        artifact,
+        binding,
+        owner,
+        OracleProviderPhase::EffectFenced,
+        OracleComponentPhase::Outcome,
+        OracleArtifactLeaseState::Pinned,
+    );
+    durable_tx(
+        &mut engine,
+        &mut journal,
+        CommandRequest::EnterProviderSettlementOnly {
+            coordinate: provider,
+            expected_epoch: 2,
+        },
+    );
+    oracle
+        .enter_settlement_only(oracle_provider, oracle_generation)
+        .unwrap();
+
+    let settlement = match durable_tx(
+        &mut engine,
+        &mut journal,
+        CommandRequest::ClaimComponentSettlement {
+            effect,
+            component,
+            claimant: actor,
+        },
+    )
+    .into_output()
+    {
+        TransitionOutput::SettlementClaim(claim) => claim,
+        other => panic!("expected settlement claim, got {other:?}"),
+    };
+    let settlement = match durable_tx(
+        &mut engine,
+        &mut journal,
+        settlement
+            .record_apply_intent(Digest::new([0x7b; 32]))
+            .unwrap(),
+    )
+    .into_output()
+    {
+        TransitionOutput::SettlementClaim(claim) => claim,
+        other => panic!("expected apply-intent claim, got {other:?}"),
+    };
+    let apply_verifier = AcceptEffectFact {
+        identity: commit_verifier.identity,
+        outcome: None,
+        digest: Digest::new([0x7c; 32]),
+    };
+    let applied = engine
+        .verify_apply_completion(&settlement, &apply_verifier, &())
+        .unwrap();
+    let settlement = match durable_tx(
+        &mut engine,
+        &mut journal,
+        settlement.record_applied(applied).unwrap(),
+    )
+    .into_output()
+    {
+        TransitionOutput::SettlementClaim(claim) => claim,
+        other => panic!("expected applied claim, got {other:?}"),
+    };
+    let acknowledgement = engine
+        .verify_settlement_ack(&settlement, &apply_verifier, &())
+        .unwrap();
+    durable_tx(
+        &mut engine,
+        &mut journal,
+        settlement.settle(acknowledgement).unwrap(),
+    );
+    oracle.settle(oracle_effect, oracle_component).unwrap();
+    assert_recovery_artifact_differential(
+        &engine,
+        &oracle,
+        provider,
+        effect,
+        component,
+        artifact,
+        binding,
+        owner,
+        OracleProviderPhase::SettlementOnly,
+        OracleComponentPhase::Settled,
+        OracleArtifactLeaseState::Pinned,
+    );
+
+    let committed_freshness = engine.freshness();
+    let next_freshness = Freshness::new(
+        BootGeneration::new(2).unwrap(),
+        committed_freshness.registry(),
+        committed_freshness.device(),
+        JournalGeneration::new(2).unwrap(),
+    );
+    let recovery_binding = RecoveryBinding::new(
+        RecoveryProfile::current(),
+        world_core,
+        CatalogSet::new(std::slice::from_ref(&catalog))
+            .unwrap()
+            .digest(),
+        committed_freshness.registry(),
+    )
+    .unwrap();
+    let anchor = RecoveryAnchor::from_trusted_provider(
+        recovery_binding,
+        committed_freshness,
+        next_freshness,
+        engine.revision(),
+        engine.head(),
+        engine.projection_digest(),
+    )
+    .unwrap();
+    engine = Engine::recover(
+        CatalogSet::new(std::slice::from_ref(&catalog)).unwrap(),
+        CoreLimits::bounded_default(),
+        anchor,
+        &journal,
+    )
+    .unwrap()
+    .into_engine();
+    durable_tx(
+        &mut engine,
+        &mut journal,
+        CommandRequest::CheckpointRecovery {
+            boot: next_freshness.boot(),
+            journal: next_freshness.journal(),
+            device: next_freshness.device(),
+        },
+    );
+    assert_recovery_artifact_differential(
+        &engine,
+        &oracle,
+        provider,
+        effect,
+        component,
+        artifact,
+        binding,
+        owner,
+        OracleProviderPhase::SettlementOnly,
+        OracleComponentPhase::Settled,
+        OracleArtifactLeaseState::Pinned,
+    );
+
+    let evidence_verifier = AcceptEvidence(scoped_identity(
+        &catalog,
+        id(EVIDENCE_VERIFIER, cser_core::VerifierId::new),
+        id(EVIDENCE_SCHEMA, ReceiptSchemaId::new),
+    ));
+    let evidence = engine
+        .verify_component_retirement_evidence(
+            effect,
+            component,
+            ClaimId::new(value + 2).unwrap(),
+            id(EVIDENCE_KIND, EvidenceKindId::new),
+            &evidence_verifier,
+            &(),
+        )
+        .unwrap();
+    durable_tx(&mut engine, &mut journal, evidence.submit());
+    oracle
+        .retire_physical(oracle_effect, oracle_component)
+        .unwrap();
+    oracle
+        .retire_claims(oracle_effect, oracle_component)
+        .unwrap();
+    assert_recovery_artifact_differential(
+        &engine,
+        &oracle,
+        provider,
+        effect,
+        component,
+        artifact,
+        binding,
+        owner,
+        OracleProviderPhase::SettlementOnly,
+        OracleComponentPhase::Settled,
+        OracleArtifactLeaseState::Pinned,
+    );
+
+    let core_permit = match durable_tx(
+        &mut engine,
+        &mut journal,
+        CommandRequest::AuthorizeArtifactRelease { effect, component },
+    )
+    .into_output()
+    {
+        TransitionOutput::ArtifactReleasePermit(permit) => permit,
+        other => panic!("expected artifact release permit, got {other:?}"),
+    };
+    let oracle_permit = oracle
+        .authorize_artifact_release(oracle_artifact, owner)
+        .unwrap();
+    assert_eq!(core_permit.binding(), binding);
+    let reissued_core_permit = engine.artifact_release_permit(effect, component).unwrap();
+    assert_eq!(reissued_core_permit.binding(), core_permit.binding());
+    assert_eq!(reissued_core_permit.pin_stamp(), core_permit.pin_stamp());
+    assert_eq!(
+        reissued_core_permit.release_operation(),
+        core_permit.release_operation()
+    );
+    assert_eq!(reissued_core_permit.nonce(), core_permit.nonce());
+    assert_eq!(oracle_permit.owner(), owner);
+    assert_eq!(oracle_permit.lease().get(), artifact.get());
+    assert_eq!(
+        oracle
+            .reissue_release_permit(oracle_artifact, owner)
+            .unwrap(),
+        oracle_permit
+    );
+    assert_recovery_artifact_differential(
+        &engine,
+        &oracle,
+        provider,
+        effect,
+        component,
+        artifact,
+        binding,
+        owner,
+        OracleProviderPhase::SettlementOnly,
+        OracleComponentPhase::Settled,
+        OracleArtifactLeaseState::ReleaseAuthorized,
+    );
+
+    let verified = engine
+        .verify_artifact_release(
+            effect,
+            component,
+            &AcceptRelease(artifact_receipts().release()),
+            &(),
+        )
+        .unwrap();
+    durable_tx(&mut engine, &mut journal, verified.confirm());
+    oracle.confirm_artifact_released(oracle_permit).unwrap();
+    assert_recovery_artifact_differential(
+        &engine,
+        &oracle,
+        provider,
+        effect,
+        component,
+        artifact,
+        binding,
+        owner,
+        OracleProviderPhase::SettlementOnly,
+        OracleComponentPhase::Settled,
+        OracleArtifactLeaseState::Released,
+    );
+
+    durable_tx(
+        &mut engine,
+        &mut journal,
+        CommandRequest::ReleaseCompositeEffect { effect },
+    );
+    oracle
+        .release_component(oracle_effect, oracle_component)
+        .unwrap();
+    assert_recovery_artifact_differential(
+        &engine,
+        &oracle,
+        provider,
+        effect,
+        component,
+        artifact,
+        binding,
+        owner,
+        OracleProviderPhase::SettlementOnly,
+        OracleComponentPhase::Released,
+        OracleArtifactLeaseState::Released,
+    );
+
+    durable_tx(
+        &mut engine,
+        &mut journal,
+        CommandRequest::RetireProviderEffects {
+            coordinate: provider,
+            expected_epoch: 3,
+        },
+    );
+    oracle
+        .retire_provider(oracle_provider, oracle_generation)
+        .unwrap();
+    assert_recovery_artifact_differential(
+        &engine,
+        &oracle,
+        provider,
+        effect,
+        component,
+        artifact,
+        binding,
+        owner,
+        OracleProviderPhase::Retired,
+        OracleComponentPhase::Released,
+        OracleArtifactLeaseState::Released,
+    );
 }
 
 #[test]
