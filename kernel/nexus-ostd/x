@@ -2114,9 +2114,9 @@ assert_core_persistent_semantic_coordinates() {
     fi
     for marker in "${markers[@]}"; do
         observed_catalog=$(core_persistent_marker_digest \
-            "$marker" catalog_digest) || return 1
+            "$marker" catalog_set_digest) || return 1
         if [[ $observed_catalog != "$expected_catalog" ]]; then
-            echo 'guest catalog digest differs from the pinned host catalog digest' >&2
+            echo 'guest catalog-set digest differs from the pinned host catalog-set digest' >&2
             return 1
         fi
         projection=$(core_persistent_marker_digest \
@@ -2136,7 +2136,7 @@ assert_core_persistent_semantic_coordinates() {
         echo 'persistent DMA arena provider contract changed across generation reuse' >&2
         return 1
     fi
-    printf 'catalog_digest=%s projection_digests=%s arena_contract_digest=%s\n' \
+    printf 'catalog_set_digest=%s projection_digests=%s arena_contract_digest=%s\n' \
         "$expected_catalog" \
         "$(IFS=,; echo "${projections[*]}")" \
         "$arena_boot1"
