@@ -238,14 +238,33 @@ domain fact; the core cannot manufacture it from software state.
 
 ## Open terrain
 
-The current profile has one composite grammar, typed world/provider/operation/
-effect/executor/charge coordinates, exact immutable verifier authority,
-provider-generation retirement, recovery-artifact pinning, retained released
-provenance, and exact prepared-delta publication. Predecessor profiles are
-recognized only to reject them. The next core questions are empirical: where
-remaining per-effect record cloning or authenticated-path allocation matters,
-whether persistence dominates enough to keep one writer, and which workload
-families justify further batching or storage-layout changes.
+Profile 6 is now the clean-source baseline. It has one composite grammar, typed
+world/provider/operation/effect/executor/charge coordinates, exact immutable
+verifier authority, provider-generation retirement, recovery-artifact pinning,
+retained released provenance, and exact prepared-delta publication.
+Predecessor profiles are recognized only to reject them.
+
+Before further optimization, the full Nexus/CSER authority closure needs to be
+reviewed as one system: delta mutation and projection coverage, durable
+linearization, checkpoint and recovery reconstruction, provider and artifact
+retirement, handoff provenance, executor replacement, and the OSTD reply, DMA,
+journal, and TPM boundaries. Review can find defects and strengthen the
+baseline; it cannot prove the absence of all defects.
+
+The next performance questions are empirical: where bounded per-effect record
+cloning or authenticated-path allocation matters, whether journal ownership
+and encoding dominate ordinary transitions, whether checkpoint encoding can
+become canonical and single-pass, whether root reclamation contributes tail
+latency, and whether persistence dominates enough to keep one writer. Record
+decomposition, streaming serialization, batching, and storage-layout changes
+remain measured techniques rather than architectural commitments.
+
+Any such optimization must preserve the Profile 6 durability boundary. Every
+fallible check, allocation, ownership acquisition, encoding decision, and
+result construction finishes before journal and trusted-anchor authority
+advance. The post-anchor path only publishes already-owned prepared values.
+Checkpoint optimization must retain full derived-index and projection
+reconstruction rather than creating an unchecked second state model.
 
 Clean, source-bound measurements must continue to distinguish hot-path delta
 cost from deliberate recovery/checkpoint reconstruction and from diagnostic

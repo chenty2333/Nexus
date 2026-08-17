@@ -4,77 +4,75 @@ rather than changing it merely because work progressed.
 
 # Nexus route
 
-Nexus will finish the CSER Core before optional integration with external
-consumers. The provider-scoped Profile 5 rebaseline is the starting point. The
-selected outcome is one typed semantic grammar, an exact prepared-delta engine,
-and clean source-bound evidence showing how its transition cost and recovery
-behavior differ from that baseline.
+Profile 6 is the new CSER Core baseline. The next route is to harden the entire
+Nexus/CSER system before pursuing another round of aggressive optimization,
+then reduce the measured costs of bounded records, persistence, and checkpoints
+without weakening exact authority, crash recovery, or infallible prepared
+publication.
 
-Breaking API and on-disk format changes are permitted during this pre-consumer
-phase when they produce a clearer foundation or measured benefit. Old profiles
-will be rejected rather than preserved through compatibility shims. Existing
-evidence remains immutable and source-bound; the new profile earns new evidence
-after its semantics and implementation stabilize.
+Breaking APIs and on-disk formats remain acceptable during this pre-consumer
+phase when a verified defect or measured benefit justifies them. Optimization
+must not restore a compatibility model, a whole-state transition candidate, or
+fallible work after durable authority advances.
 
-## 1. Freeze the clean Profile 5 baseline
+## 1. Review the complete authority closure
 
-Before changing semantics, capture comparable transition and QEMU recovery
-measurements from the clean Profile 5 source. Bind them to their exact source
-and environment without rewriting the older public evidence bundles. Use the
-same bounded logical-effect, physical-claim, provider-drain, persistence, and
-recovery workloads for the final comparison.
+Review the portable core, independent model, journal and checkpoint recovery,
+provider and artifact retirement, bounded handoff, OSTD production owner,
+reply and DMA adapters, TPM anchor, build gates, and their concurrency and
+failure boundaries as one system. Pay particular attention to exact identity
+and verifier provenance, delta completeness, derived-index conservation,
+canonical projection reconstruction, hostile durable input, and every crash
+cut around journal, anchor, and in-memory publication.
 
-## 2. Delete the old model and complete the coordinates
+## 2. Resolve verified correctness findings
 
-Remove the legacy engine mode, compatibility constructors, singleton estate
-and effect command chains, legacy portal policy, and active predecessor replay.
-A single obligation becomes a one-component bounded composite. Replace root,
-principal-incarnation, and raw binding-generation authority with typed
-operation, effect, executor, provider, world, and charge coordinates.
+Fix concrete findings before changing storage granularity. Preserve failure
+atomicity and fail-closed recovery, add focused regressions for each defect,
+and keep full reconstruction and independent oracles as checks on the
+incremental implementation. The review is not a claim that bugs are
+absent; it establishes a better-understood baseline for optimization.
 
-Remove the global verifier-epoch fallback so every accepted receipt resolves
-through an exact immutable provider verifier binding. Let a world supply the
-set of immutable catalogs required by overlapping provider generations. Bump
-the public and persistence formats together and reject the predecessor without
-a compatibility shim.
+## 3. Measure the remaining cost structure
 
-## 3. Complete the pure delta engine
+Separate bounded record cloning, persistent-map path allocation, journal
+encoding and ownership, checkpoint encoding and hashing, recovery rebuilding,
+and post-publication reclamation. Compare fixed touched effects across growing
+unrelated state and across small, medium, and large bounded composites. Let the
+measurements decide whether record layout, authenticated paths, batching, or a
+single writer is the limiting factor.
 
-Replace the structurally shared whole-state candidate with a prepared value
-containing the durable record, exact state/index/projection delta, all reserved
-replacement values, and the transition result. Complete every fallible check
-and allocation before persistence; after persistence, apply only the prepared
-publication and make it infallible.
+## 4. Reduce bounded record cloning
 
-Keep full invariant, index, and canonical-projection reconstruction in recovery,
-checkpoint admission, and independent test oracles. Use measurements to decide
-remaining allocation, authenticated-map, journal, batching, or writer changes;
-structural sharing and concurrency are techniques rather than goals.
+Change record granularity only where measurements show that cloning a bounded
+effect dominates ordinary transitions. A more local component or claim layout
+may replace coarse composite cloning, but the authoritative grammar, atomic
+multi-component transitions, canonical projection, and reconstructable derived
+indexes remain unchanged.
 
-## 4. Migrate and simplify the embedding
+## 5. Reduce persistence cost
 
-Migrate the OSTD production owner, reply/DMA paths, asynchronous endpoint, and
-bounded handoff to the single grammar. Keep the root `x` interface as a thin
-public coordinator and reduce the kernel backend and static gates to the
-current build, recovery, and evidence paths. Retain active target configuration,
-toolchains, and dependency patching; preserve historical citation and evidence
-material as historical rather than making it a current semantic owner.
+Prepare ownership and serialization before entering the durable boundary.
+Reduce redundant record and buffer copies, and consider streaming or vectored
+encoding where it preserves canonical bytes. Journal append must still precede
+trusted-anchor advancement, and the post-anchor suffix must remain an
+assignment-only publication of already-owned values.
 
-## 5. Earn final clean-source evidence
+## 6. Reduce checkpoint cost
 
-Run the scoped core, independent oracles, persistence/recovery cuts, provider
-retirement, reply/DMA QEMU boots, and the fixed performance workloads from a
-clean final source tree. Compare against the clean Profile 5 baseline and bind
-the result to the final profile and source. Report QEMU and logical-effect
-evidence literally; do not extend it into physical DMA quiescence, production
-readiness, remote trust, or general workload claims.
+Prefer a canonical single-pass encoder and hasher, bounded scratch storage, and
+direct publication to inactive durable storage before introducing a second
+incremental checkpoint grammar. Checkpoints must remain self-validating and
+recovery must still rebuild all derived indexes and the complete projection.
 
-DeepSeek Harness or another agent runtime may later consume the resulting
-effect authority through an external capability adapter. Plugin loading,
-dependency injection, semantic resolution, general workflow DAGs, remote trust
-transport, artifact storage, and hardware evidence production remain owned by
-their respective systems rather than absorbed into CSER Core.
+## 7. Re-establish clean-source evidence
 
-The sibling HotOS paper remains outside this route. Remote configuration,
-synchronization, publication, and submission require separate explicit user
-authorization.
+After review and optimization stabilize, rerun the Core and independent
+oracles, persistence and recovery cuts, production OSTD gates, bounded QEMU
+workloads, and comparable performance profiles from one clean source. Keep
+logical, emulated, durable-I/O, and physical-hardware claims distinct.
+
+External Harness integration, plugin loading, dependency injection, provider
+resolution, general workflow DAGs, remote trust, and physical evidence
+production remain outside this route. The sibling HotOS paper also remains
+outside repository authority unless the user separately authorizes it.

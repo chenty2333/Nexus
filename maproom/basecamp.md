@@ -41,16 +41,24 @@ on Rust 1.95; OSTD retains its pinned nightly toolchain.
 ## Current completion boundary
 
 The semantic, transition-engine, persistence-format, model, and OSTD migration
-work selected for this rebaseline is implemented. Full Core oracles and the
-containerized quick production gate pass on the working tree. Production-path
-profiles show that fixed provider transitions scale with touched paths rather
-than unrelated state and that large-state delta publication costs less than
-the clean Profile 5 baseline.
+selected for the Profile 6 rebaseline is complete on `main`. Clean-source Core
+and independent-model checks, concurrency oracles, production cutover gates,
+reply and DMA QEMU paths, predecessor rejection, TPM-backed recovery, and the
+four-boot persistent workload pass against the same final source.
 
-The remaining closeout is operational: commit the coherent change, rerun the
-clean-revision verification and bounded QEMU recovery workloads from that exact
-HEAD, and keep the resulting claims source-bound. Further optimization is a
-new measured phase, not unfinished legacy deletion.
+The portable no-persistence profile shows a decision-relevant improvement at
+the largest fixed comparison point: prepared publication costs about sixty-two
+percent less than the clean Profile 5 baseline, while the complete measured
+transition costs about twenty-eight percent less. These measurements support
+the delta architecture; they do not characterize durable I/O or physical
+hardware behavior.
+
+Legacy deletion and the prepared-delta conversion are no longer unfinished
+work. The next phase begins from Profile 6 as the new baseline: review the full
+Nexus/CSER authority and recovery closure for latent correctness defects, fix
+verified findings, then use measured costs to reduce bounded record cloning,
+persistence overhead, and checkpoint overhead without weakening the durable
+publication boundary.
 
 DeepSeek Harness is a possible later consumer and a useful logical-effect
 design pressure, not a dependency of this route. The self-owned reference
@@ -72,10 +80,10 @@ bundle is not represented as a rerun of the later source. The handoff workload
 is logical-only and provides no physical-device result.
 
 These evidence bodies apply only to their recorded older source. They do not
-validate Profile 6 or the prepared-delta engine. Working-tree tests and local
-profiles are development evidence, not a new sealed public evidence body. New
-public claims require execution bound to the final clean revision. The
-archived v0.1.0 release remains the historical record.
+validate Profile 6 or the prepared-delta engine. The clean-source Profile 6
+verification and local performance comparison are current development and
+system evidence, not a new sealed public evidence body. The archived v0.1.0
+release remains the historical record.
 
 ## Repository position
 
