@@ -5,6 +5,18 @@ use std::process::Command;
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
+const BARE_METAL_TARGET: &str = "x86_64-unknown-none";
+const CSER_MODEL_NO_STD_CHECK_ARGS: &[&str] = &[
+    "check",
+    "--locked",
+    "-p",
+    "cser-model",
+    "--no-default-features",
+    "--lib",
+    "--target",
+    BARE_METAL_TARGET,
+];
+
 const REQUIRED_PATHS: &[&str] = &[
     "Cargo.toml",
     "Cargo.lock",
@@ -108,7 +120,7 @@ fn build(root: &Path) -> Result<()> {
             "--no-default-features",
             "--lib",
             "--target",
-            "x86_64-unknown-none",
+            BARE_METAL_TARGET,
         ],
     )?;
     section("build independent oracle for bare metal without std");
@@ -122,7 +134,7 @@ fn build(root: &Path) -> Result<()> {
             "--no-default-features",
             "--lib",
             "--target",
-            "x86_64-unknown-none",
+            BARE_METAL_TARGET,
         ],
     )
 }
@@ -163,9 +175,10 @@ fn check(root: &Path) -> Result<()> {
             "--no-default-features",
             "--lib",
             "--target",
-            "x86_64-unknown-none",
+            BARE_METAL_TARGET,
         ],
     )?;
+    check_cser_model_no_std(root)?;
     cargo_package(root, "check", "cser-model", true)?;
     section("check the production workflow runner");
     cargo(
@@ -200,6 +213,13 @@ fn clippy(root: &Path) -> Result<()> {
 }
 
 fn test(root: &Path) -> Result<()> {
+    test_with_model_no_std(root, true)
+}
+
+fn test_with_model_no_std(root: &Path, include_model_no_std: bool) -> Result<()> {
+    if include_model_no_std {
+        check_cser_model_no_std(root)?;
+    }
     test_package(root, "cser-core", true)?;
     test_package(root, "cser-model", true)?;
     section("test the production workflow runner");
@@ -218,11 +238,16 @@ fn verify(root: &Path) -> Result<()> {
     fmt_check(root)?;
     check(root)?;
     clippy(root)?;
-    test(root)?;
+    test_with_model_no_std(root, false)?;
     println!(
         "CSER CORE VERIFY PASS portable_core=true independent_oracle=true loom=true journal_recovery=true"
     );
     Ok(())
+}
+
+fn check_cser_model_no_std(root: &Path) -> Result<()> {
+    section("check independent oracle for bare metal without std");
+    cargo(root, CSER_MODEL_NO_STD_CHECK_ARGS)
 }
 
 fn cargo_package(root: &Path, verb: &str, package: &str, all_features: bool) -> Result<()> {
@@ -280,4 +305,26 @@ fn run(root: &Path, program: &str, args: &[&str]) -> Result<()> {
 
 fn section(title: &str) {
     println!("\n==> {title}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BARE_METAL_TARGET, CSER_MODEL_NO_STD_CHECK_ARGS};
+
+    #[test]
+    fn model_no_std_check_plan_is_locked_and_targeted() {
+        assert_eq!(
+            CSER_MODEL_NO_STD_CHECK_ARGS,
+            [
+                "check",
+                "--locked",
+                "-p",
+                "cser-model",
+                "--no-default-features",
+                "--lib",
+                "--target",
+                BARE_METAL_TARGET,
+            ]
+        );
+    }
 }
