@@ -9347,15 +9347,33 @@ fn handoff_child_resolution_eligible(
     let Some(composite) = state.composite_effects().get(&child) else {
         return false;
     };
+    let Some(source) = state.composite_effects().get(&descriptor.parent) else {
+        return false;
+    };
+    let Some(source_provenance) = source.released_provenance.as_ref() else {
+        return false;
+    };
+    // The child recovery branch is reachable only after the atomic pivot.
+    // That pivot keeps the installed child live-scoped but releases the
+    // parent provider accounting into immutable provenance. Requiring the
+    // parent to remain in `scoped_composites` selects the exact opposite state
+    // and makes every legitimate post-pivot cold recovery fail closed.
     if !state.scoped_composites().contains_key(&child)
-        || !state.scoped_composites().contains_key(&descriptor.parent)
+        || state.scoped_composites().contains_key(&descriptor.parent)
+        || source.authority != AuthorityState::Revoked
+        || source.custodian != CustodyState::Released
+        || source_provenance.catalog_digest != descriptor.catalog_digest
+        || !source_provenance
+            .bindings
+            .contains_key(&descriptor.parent_component)
+        || source
+            .components
+            .values()
+            .any(|component| component.retirement != RetirementState::Released)
     {
         return false;
     }
     let Some(component) = composite.components.get(&descriptor.child_component) else {
-        return false;
-    };
-    let Some(source) = state.composite_effects().get(&descriptor.parent) else {
         return false;
     };
     let Some(commit_operation) = component.commit_operation else {
