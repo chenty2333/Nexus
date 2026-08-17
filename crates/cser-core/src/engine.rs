@@ -8241,11 +8241,6 @@ fn apply_command_internal<S: StateAccessMut>(
                 None,
                 Some(descriptor),
             )?;
-            // A child is only a prepared reservation until the pivot below
-            // releases the exact source claim. Keep it out of active custody
-            // indexes and credit accounting so Exclusive ownership never has
-            // two executable custodians.
-            deactivate_prepared_handoff_target(state, child, descriptor)?;
             apply_command(
                 catalogs,
                 Some(catalog),
@@ -9768,8 +9763,7 @@ fn handoff_target_reservation_matches(
 /// Returns the descriptor for an installed child which is still only a
 /// prepared, non-executable reservation. Such a child is the one handoff
 /// state that cannot use the ordinary pre-commit abort path: its claim has
-/// already been removed from the live resource index and charge aggregate by
-/// [`deactivate_prepared_handoff_target`].
+/// was admitted directly outside the live resource index and charge aggregate.
 fn prepared_handoff_target_for_abort(
     state: &impl StateAccess,
     child: EffectId,
@@ -9919,56 +9913,6 @@ fn component_is_prepared_handoff_target(
         .any(|claim| prepared_handoff_target_claim(state, composite, component, claim))
 }
 
-fn deactivate_prepared_handoff_target(
-    state: &mut impl StateAccessMut,
-    child: EffectId,
-    descriptor: ChildDescriptorV1,
-) -> Result<(), CoreError> {
-    let (charge_owner, credit_class) = {
-        let composite = state
-            .composite_effects()
-            .get(&child)
-            .ok_or(CoreError::UnknownEffect)?;
-        let claim = composite
-            .components
-            .get(&descriptor.child_component)
-            .and_then(|component| component.claims.get(&descriptor.claim))
-            .ok_or(CoreError::UnknownClaim)?;
-        if claim.kind != descriptor.claim_kind
-            || claim.scope != descriptor.scope
-            || claim.resource != descriptor.resource
-            || claim.resource_generation != descriptor.resource_generation
-            || claim.units != descriptor.units
-            || claim.retired
-        {
-            return Err(CoreError::HandoffGuardRequired);
-        }
-        (composite.charge_owner, claim.credit_class)
-    };
-    let charged = state
-        .charges_mut()
-        .get_mut(&(charge_owner, credit_class))
-        .ok_or(CoreError::InvariantViolation)?;
-    *charged = charged
-        .checked_sub(descriptor.units)
-        .ok_or(CoreError::InvariantViolation)?;
-    let entries = state
-        .composite_resource_index_mut()
-        .get_mut(&descriptor.resource)
-        .ok_or(CoreError::InvariantViolation)?;
-    let before = entries.len();
-    entries.retain(|entry| *entry != (child, descriptor.child_component, descriptor.claim));
-    if entries.len() + 1 != before {
-        return Err(CoreError::InvariantViolation);
-    }
-    if entries.is_empty() {
-        state
-            .composite_resource_index_mut()
-            .remove_mut(&descriptor.resource);
-    }
-    Ok(())
-}
-
 fn release_handoff_source_claim(
     state: &mut impl StateAccessMut,
     descriptor: ChildDescriptorV1,
@@ -10074,12 +10018,17 @@ fn activate_prepared_handoff_target(
         .ok_or(CoreError::InvariantViolation)?
         .max_units_per_account()
         .min(limits.max_units_per_account);
-    let charged_catalog = charged_for_catalog(state, catalog.digest(), charge_owner, credit_class)?;
+    let charged_catalog = charged_for_catalog(state, catalog.digest(), charge_owner, credit_class)?
+        .checked_sub(descriptor.units)
+        .ok_or(CoreError::InvariantViolation)?;
     // The source claim has already been released and the target reservation
-    // is still excluded from the catalog-local scan while it is prepared.
-    // Check the catalog-local limit with the target's units, then add exactly
-    // those units to the cross-catalog aggregate cache. Never replace the
-    // aggregate with the local catalog subtotal.
+    // is transiently no longer recognizable by the stable-state reservation
+    // helper: that helper deliberately requires the source claim to remain
+    // present. The exact target claim was validated above and is still absent
+    // from the reverse index, so remove its already-counted units before
+    // checking the post-pivot catalog subtotal. Then add exactly those units
+    // to the cross-catalog aggregate cache; never replace the aggregate with
+    // the local catalog subtotal.
     let next_catalog = charged_catalog
         .checked_add(descriptor.units)
         .ok_or(CoreError::Backpressure)?;
@@ -10313,6 +10262,7 @@ fn enroll_component_claim(
         .ok_or(CoreError::InvariantViolation)?
         .max_units_per_account()
         .min(limits.max_units_per_account);
+    let inactive_handoff_reservation = handoff_target.is_some();
 
     match (state.resources().get(&resource), reservation_nonce) {
         (None, None) if resource_generation.get() == 1 => {
@@ -10409,20 +10359,34 @@ fn enroll_component_claim(
         return Err(CoreError::CapacityExceeded);
     }
     let charged = charged_for_catalog(state, catalog.digest(), charge_owner, credit_class)?;
-    let next_catalog = charged.checked_add(units).ok_or(CoreError::Backpressure)?;
-    if next_catalog > credit_limit {
-        return Err(CoreError::Backpressure);
-    }
-    let next_global = state
+    let current_global = state
         .charges()
         .get(&(charge_owner, credit_class))
         .copied()
-        .unwrap_or(0)
-        .checked_add(units)
-        .ok_or(CoreError::Backpressure)?;
-    if next_global > limits.max_units_per_account {
-        return Err(CoreError::Backpressure);
-    }
+        .unwrap_or(0);
+    let next_global = if inactive_handoff_reservation {
+        // The child is durable topology but not yet a live custodian. Do not
+        // transiently charge or index it only to subtract those derived values
+        // later in the same transition: that can overflow or falsely reject a
+        // replacement at the exact account ceiling. The pivot performs the
+        // real post-source-release capacity check before activating custody.
+        if units > credit_limit {
+            return Err(CoreError::Backpressure);
+        }
+        current_global
+    } else {
+        let next_catalog = charged.checked_add(units).ok_or(CoreError::Backpressure)?;
+        if next_catalog > credit_limit {
+            return Err(CoreError::Backpressure);
+        }
+        let next = current_global
+            .checked_add(units)
+            .ok_or(CoreError::Backpressure)?;
+        if next > limits.max_units_per_account {
+            return Err(CoreError::Backpressure);
+        }
+        next
+    };
     state.touch_composite(effect);
     let composite = state
         .composite_effects_mut()
@@ -10481,17 +10445,19 @@ fn enroll_component_claim(
             retired: false,
         },
     );
-    *state
-        .charges_mut()
-        .get_or_insert_with_mut((charge_owner, credit_class), || 0) = next_global;
-    let entries = state
-        .composite_resource_index_mut()
-        .get_or_insert_with_mut(resource, Vec::new);
-    match entries.binary_search(&(effect, component, claim)) {
-        Ok(_) => return Err(CoreError::InvariantViolation),
-        Err(index) => entries.insert(index, (effect, component, claim)),
+    if !inactive_handoff_reservation {
+        *state
+            .charges_mut()
+            .get_or_insert_with_mut((charge_owner, credit_class), || 0) = next_global;
+        let entries = state
+            .composite_resource_index_mut()
+            .get_or_insert_with_mut(resource, Vec::new);
+        match entries.binary_search(&(effect, component, claim)) {
+            Ok(_) => return Err(CoreError::InvariantViolation),
+            Err(index) => entries.insert(index, (effect, component, claim)),
+        }
     }
-    if reservation_nonce.is_none() {
+    if reservation_nonce.is_none() && !inactive_handoff_reservation {
         state.touch_resource(resource);
         state.resources_mut().insert_mut(
             resource,

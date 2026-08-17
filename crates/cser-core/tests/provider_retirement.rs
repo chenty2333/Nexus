@@ -426,7 +426,7 @@ fn handoff_source_release_removes_scoped_binding_at_the_pivot() {
     let mut engine = Engine::new(
         world,
         CatalogSet::new(std::slice::from_ref(&catalog)).unwrap(),
-        CoreLimits::bounded_default(),
+        CoreLimits::new(64, 1024, 4096, 4096, 32, 1, 1024).unwrap(),
         freshness(),
     );
     let mut journal = Vec::new();
@@ -525,6 +525,8 @@ fn handoff_source_release_removes_scoped_binding_at_the_pivot() {
         .unwrap();
     durable!(verified.install(
         actor,
+        // At an exact account ceiling, the inactive child must not be
+        // transiently double-charged during install or pivot.
         cser_core::ChargeAccountId::new(7401).unwrap(),
         ComponentProviderBinding::new(TOOL_HANDOFF_COMPONENT, target_provider),
     ));
