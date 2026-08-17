@@ -350,6 +350,9 @@ pub(crate) enum ProductionRegistryError<E> {
 /// The one Registry published by a production boot.
 pub(crate) struct ProductionCoreOwner<S> {
     installed: S,
+    // This vector is allocated at the fixed custody bound during owner
+    // construction. Bearer publication must never allocate after the durable
+    // transaction has returned.
     linear_custody: Mutex<Vec<TransitionOutput>>,
     ingress: ProductionIngressGate,
 }
@@ -360,9 +363,11 @@ impl<S> ProductionCoreOwner<S> {
     where
         S: InstalledCore,
     {
+        let linear_custody = Vec::with_capacity(MAX_LINEAR_PORTAL_BEARERS);
+        debug_assert!(linear_custody.capacity() >= MAX_LINEAR_PORTAL_BEARERS);
         Ok(Self {
             installed,
-            linear_custody: Mutex::new(Vec::with_capacity(MAX_LINEAR_PORTAL_BEARERS)),
+            linear_custody: Mutex::new(linear_custody),
             ingress: ProductionIngressGate::closed(),
         })
     }
@@ -605,55 +610,79 @@ impl<S: InstalledCore + 'static> CoreRegistry for ProductionCoreOwner<S> {
             ));
         }
         let expected_intent = command_commit_intent_identity(&request);
+        let reserves_linear_custody = command_requires_linear_custody(&request);
+        debug_assert_eq!(reserves_linear_custody, expected_intent.is_some());
 
-        let mut custody = self.linear_custody.lock();
-        if custody.len() == MAX_LINEAR_PORTAL_BEARERS {
-            return Err(ProductionRegistryError::LinearCustodyFull);
-        }
-        let receipt = self
-            .installed
-            .transact(request.into())
-            .map_err(ProductionRegistryError::Transaction)?;
-        let view = CoreTransitionView::from_receipt(&receipt);
-        match receipt.into_output() {
-            TransitionOutput::None if expected_intent.is_some() => {
-                Err(ProductionRegistryError::MissingCommitIntent)
+        // The command grammar fixes which successful client transitions can
+        // return a linear bearer.  Reserve one custody slot while the
+        // corresponding durable transaction is in flight.  Commands with a
+        // statically empty output do not need custody capacity and must not
+        // be blocked by an unrelated full bearer queue.
+        if reserves_linear_custody {
+            let mut custody = self.linear_custody.lock();
+            if !linear_custody_has_capacity(custody.len(), true) {
+                return Err(ProductionRegistryError::LinearCustodyFull);
             }
-            TransitionOutput::None => Ok(view),
-            TransitionOutput::CommitIntent(intent) => {
-                let matches_request = matches!(
-                    expected_intent,
-                    Some(ExpectedCommitIntent::Single(effect, component))
-                        if effect == intent.effect() && component == intent.component()
-                );
-                custody.push(TransitionOutput::CommitIntent(intent));
-                if matches_request {
-                    Ok(view)
-                } else {
-                    Err(ProductionRegistryError::UnexpectedLinearOutput)
-                }
-            }
-            TransitionOutput::CompositeCommitIntents(intents) => {
-                let matches_request = match &expected_intent {
-                    Some(ExpectedCommitIntent::Composite { effect, components }) => {
-                        !intents.is_empty()
-                            && intents.len() == components.len()
-                            && intents.iter().zip(components).all(|(intent, component)| {
-                                intent.effect() == *effect && intent.component() == *component
-                            })
+            let receipt = self
+                .installed
+                .transact(request.into())
+                .map_err(ProductionRegistryError::Transaction)?;
+            let view = CoreTransitionView::from_receipt(&receipt);
+            match receipt.into_output() {
+                TransitionOutput::None => Err(ProductionRegistryError::MissingCommitIntent),
+                TransitionOutput::CommitIntent(intent) => {
+                    let matches_request = matches!(
+                        expected_intent,
+                        Some(ExpectedCommitIntent::Single(effect, component))
+                            if effect == intent.effect() && component == intent.component()
+                    );
+                    custody.push(TransitionOutput::CommitIntent(intent));
+                    if matches_request {
+                        Ok(view)
+                    } else {
+                        Err(ProductionRegistryError::UnexpectedLinearOutput)
                     }
-                    _ => false,
-                };
-                custody.push(TransitionOutput::CompositeCommitIntents(intents));
-                if matches_request {
-                    Ok(view)
-                } else {
+                }
+                TransitionOutput::CompositeCommitIntents(intents) => {
+                    let matches_request = match &expected_intent {
+                        Some(ExpectedCommitIntent::Composite { effect, components }) => {
+                            !intents.is_empty()
+                                && intents.len() == components.len()
+                                && intents.iter().zip(components).all(|(intent, component)| {
+                                    intent.effect() == *effect && intent.component() == *component
+                                })
+                        }
+                        _ => false,
+                    };
+                    custody.push(TransitionOutput::CompositeCommitIntents(intents));
+                    if matches_request {
+                        Ok(view)
+                    } else {
+                        Err(ProductionRegistryError::UnexpectedLinearOutput)
+                    }
+                }
+                output => {
+                    custody.push(output);
                     Err(ProductionRegistryError::UnexpectedLinearOutput)
                 }
             }
-            output => {
-                custody.push(output);
-                Err(ProductionRegistryError::UnexpectedLinearOutput)
+        } else {
+            let receipt = self
+                .installed
+                .transact(request.into())
+                .map_err(ProductionRegistryError::Transaction)?;
+            let view = CoreTransitionView::from_receipt(&receipt);
+            match receipt.into_output() {
+                TransitionOutput::None => Ok(view),
+                output @ (TransitionOutput::CommitIntent(_)
+                | TransitionOutput::CompositeCommitIntents(_)
+                | TransitionOutput::SettlementClaim(_)
+                | TransitionOutput::ReusePermit(_)
+                | TransitionOutput::ArtifactReleasePermit(_)) => {
+                    let mut custody = self.linear_custody.lock();
+                    retain_or_forget_unexpected_output(&mut custody, output);
+                    Err(ProductionRegistryError::UnexpectedLinearOutput)
+                }
             }
         }
     }
@@ -731,6 +760,151 @@ fn command_commit_intent_identity(request: &CommandRequest) -> Option<ExpectedCo
                 .collect(),
         }),
         _ => None,
+    }
+}
+
+/// Returns whether a client command's successful output must be retained in
+/// the kernel-owned linear bearer custody.
+fn command_requires_linear_custody(request: &CommandRequest) -> bool {
+    matches!(
+        request,
+        CommandRequest::RecordComponentCommitIntent { .. }
+            | CommandRequest::RecordCompositeCommitIntents { .. }
+    )
+}
+
+/// Checks the fixed custody reservation without conflating no-output
+/// transitions with bearer-producing transitions.
+fn linear_custody_has_capacity(current_len: usize, reserves_slot: bool) -> bool {
+    !reserves_slot || current_len < MAX_LINEAR_PORTAL_BEARERS
+}
+
+/// Retains an unexpected bearer whenever the fixed custody has a spare slot.
+///
+/// A no-output command must never produce a bearer, but this is a trusted-core
+/// invariant rather than a reason to drop authority if it is violated. When
+/// custody is already full, forgetting the bearer deliberately leaks it while
+/// keeping the publication path fail-closed; dropping it could run a future
+/// authority destructor or otherwise release it to an untrusted context.
+fn retain_or_forget_unexpected_output(
+    custody: &mut Vec<TransitionOutput>,
+    output: TransitionOutput,
+) {
+    if custody.len() < MAX_LINEAR_PORTAL_BEARERS && custody.capacity() >= MAX_LINEAR_PORTAL_BEARERS
+    {
+        custody.push(output);
+    } else {
+        core::mem::forget(output);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn effect() -> EffectId {
+        EffectId::new(OperationId::new(1).unwrap(), 1).unwrap()
+    }
+
+    fn actor() -> ExecutorCoordinate {
+        ExecutorCoordinate::new(
+            ExecutorId::new(1).unwrap(),
+            ExecutorGeneration::new(1).unwrap(),
+        )
+    }
+
+    fn add_claim() -> CommandRequest {
+        CommandRequest::AddComponentClaim {
+            effect: effect(),
+            component: cser_core::ComponentId::new(1).unwrap(),
+            actor: actor(),
+            claim: cser_core::ClaimId::new(1).unwrap(),
+            kind: cser_core::ClaimKindId::new(1).unwrap(),
+            scope: cser_core::ClaimScope::Logical,
+            resource: cser_core::ResourceId::new(1).unwrap(),
+            resource_generation: cser_core::ResourceGeneration::new(1).unwrap(),
+            units: 1,
+        }
+    }
+
+    fn prepare() -> CommandRequest {
+        CommandRequest::PrepareCompositeEffect {
+            effect: effect(),
+            actor: actor(),
+        }
+    }
+
+    fn component_intent() -> CommandRequest {
+        CommandRequest::RecordComponentCommitIntent {
+            effect: effect(),
+            component: cser_core::ComponentId::new(1).unwrap(),
+            actor: actor(),
+            operation: Digest::new([1; 32]),
+        }
+    }
+
+    fn composite_intents() -> CommandRequest {
+        CommandRequest::RecordCompositeCommitIntents {
+            effect: effect(),
+            actor: actor(),
+            operations: vec![cser_core::ComponentCommitOperation::new(
+                cser_core::ComponentId::new(1).unwrap(),
+                Digest::new([1; 32]),
+            )],
+        }
+    }
+
+    #[test]
+    fn full_custody_does_not_block_no_output_commands() {
+        assert!(!command_requires_linear_custody(&add_claim()));
+        assert!(!command_requires_linear_custody(&prepare()));
+        assert!(linear_custody_has_capacity(
+            MAX_LINEAR_PORTAL_BEARERS,
+            false
+        ));
+    }
+
+    #[test]
+    fn full_custody_rejects_bearer_commands_before_durable_admission() {
+        assert!(command_requires_linear_custody(&component_intent()));
+        assert!(command_requires_linear_custody(&composite_intents()));
+        assert!(!linear_custody_has_capacity(
+            MAX_LINEAR_PORTAL_BEARERS,
+            true
+        ));
+    }
+
+    #[test]
+    fn consuming_a_bearer_reopens_one_reserved_slot() {
+        assert!(!linear_custody_has_capacity(
+            MAX_LINEAR_PORTAL_BEARERS,
+            true
+        ));
+        assert!(linear_custody_has_capacity(
+            MAX_LINEAR_PORTAL_BEARERS - 1,
+            true
+        ));
+    }
+
+    #[test]
+    fn unexpected_bearer_is_retained_or_forgotten_without_drop() {
+        let mut custody = Vec::with_capacity(MAX_LINEAR_PORTAL_BEARERS);
+        let intent = TransitionOutput::CompositeCommitIntents(Vec::new());
+        retain_or_forget_unexpected_output(&mut custody, intent);
+        assert_eq!(custody.len(), 1);
+
+        custody.resize_with(MAX_LINEAR_PORTAL_BEARERS, || {
+            TransitionOutput::CompositeCommitIntents(Vec::new())
+        });
+        let full_intent = TransitionOutput::CompositeCommitIntents(Vec::new());
+        retain_or_forget_unexpected_output(&mut custody, full_intent);
+        assert_eq!(custody.len(), MAX_LINEAR_PORTAL_BEARERS);
+    }
+
+    #[test]
+    fn custody_reservation_is_preallocated_to_the_publication_bound() {
+        let custody = Vec::<TransitionOutput>::with_capacity(MAX_LINEAR_PORTAL_BEARERS);
+        assert!(custody.capacity() >= MAX_LINEAR_PORTAL_BEARERS);
     }
 }
 
