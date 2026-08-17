@@ -1773,9 +1773,25 @@ where
             }
             next_head = images[found].header.previous_head;
             next_generation = images[found].header.generation;
+            let segment_count = chain
+                .len()
+                .checked_add(2)
+                .ok_or(BankedJournalError::CorruptBankMetadata)?;
+            if segment_count > VNEXT_LIVE_SEGMENT_LIMIT {
+                return Err(BankedJournalError::CorruptBankMetadata);
+            }
             chain.push(found);
         }
         chain.reverse();
+        let mut total_len = current.bytes.len();
+        for &index in &chain {
+            total_len = total_len
+                .checked_add(images[index].bytes.len())
+                .ok_or(BankedJournalError::CorruptBankMetadata)?;
+        }
+        if total_len > VNEXT_CAPACITY {
+            return Err(BankedJournalError::CorruptBankMetadata);
+        }
         let mut bytes = Vec::new();
         let mut occupied = [false; VNEXT_SEGMENT_COUNT as usize];
         for index in chain {
@@ -2904,6 +2920,36 @@ mod tests {
             twice.read_all_image().expect("second recovery").len(),
             3 * usable
         );
+    }
+
+    #[ktest]
+    fn pio_vnext_recovery_rejects_valid_four_segment_chain() {
+        let mut journal = vnext_journal();
+        let payload = vec![0x5a; VNEXT_SEGMENT_CAPACITY];
+        let mut previous_head = [0; 32];
+        let mut endpoint = None;
+        for generation in 1..=4 {
+            let header = journal
+                .publish_segment(
+                    generation - 1,
+                    generation,
+                    generation,
+                    previous_head,
+                    &payload,
+                    0,
+                )
+                .expect("publish valid segment");
+            previous_head = header.head;
+            endpoint = Some(header);
+        }
+        journal
+            .publish_manifest(&endpoint.expect("four-segment endpoint"))
+            .expect("publish valid manifest");
+
+        assert!(matches!(
+            SegmentedJournalVNext::open(journal.into_backend()),
+            Err(BankedJournalError::CorruptBankMetadata)
+        ));
     }
 
     #[ktest]
