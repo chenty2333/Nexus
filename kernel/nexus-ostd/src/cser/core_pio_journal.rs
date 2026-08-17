@@ -2971,14 +2971,7 @@ mod tests {
         for segment in 0_u32..4 {
             let generation = u64::from(segment) + 1;
             let header = journal
-                .publish_segment(
-                    segment,
-                    generation,
-                    generation,
-                    previous_head,
-                    &payload,
-                    0,
-                )
+                .publish_segment(segment, generation, generation, previous_head, &payload, 0)
                 .expect("publish valid segment");
             previous_head = header.head;
             endpoint = Some(header);
