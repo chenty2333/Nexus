@@ -100,6 +100,15 @@ pub struct ChildDescriptorV1 {
 pub const CHILD_DESCRIPTOR_V1_WIRE_LEN: usize = 187;
 const CHILD_DESCRIPTOR_V1_MAGIC: &[u8; 8] = b"NXSCHD03";
 
+/// Hard codec ceiling for every variable-length command vector.  This is a
+/// wire-level bound shared by live command admission and journal decoding;
+/// semantic catalog and [`CoreLimits`] checks may impose a smaller bound.
+pub const MAX_COMMAND_VECTOR_ITEMS: usize = 4096;
+/// Hard payload ceiling used when constructing and decoding journal commands.
+/// Whole-state checkpoint images remain independently bounded by
+/// [`MAX_JOURNAL_CHECKPOINT_IMAGE_BYTES`].
+pub const MAX_COMMAND_PAYLOAD_BYTES: usize = MAX_JOURNAL_CHECKPOINT_IMAGE_BYTES + 256;
+
 /// A malformed or non-canonical child descriptor wire record.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ChildDescriptorDecodeError {
@@ -660,6 +669,79 @@ pub enum OperationRecoveryState {
     },
 }
 
+/// Durable history bounds for one core instance.
+///
+/// These collections intentionally retain tombstones and immutable release
+/// provenance rather than silently garbage-collecting authority history.  A
+/// deployment that needs a different churn budget supplies this policy when
+/// constructing [`CoreLimits`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HistoryLimits {
+    /// Maximum provider-generation records, including retired generations.
+    pub provider_generations: usize,
+    /// Maximum provider identities with a retained generation high-water mark.
+    pub providers: usize,
+    /// Maximum artifact leases, including released leases.
+    pub artifact_leases: usize,
+    /// Maximum device-scope generations, including historical scopes.
+    pub device_generations: usize,
+    /// Maximum catalog-defined components in one composite effect.
+    pub components_per_effect: usize,
+}
+
+const fn min_usize(left: usize, right: usize) -> usize {
+    if left < right { left } else { right }
+}
+
+const fn max_usize(left: usize, right: usize) -> usize {
+    if left > right { left } else { right }
+}
+
+impl HistoryLimits {
+    /// Creates a non-zero durable history policy.
+    pub const fn new(
+        provider_generations: usize,
+        providers: usize,
+        artifact_leases: usize,
+        device_generations: usize,
+        components_per_effect: usize,
+    ) -> Result<Self, CoreError> {
+        Self {
+            provider_generations,
+            providers,
+            artifact_leases,
+            device_generations,
+            components_per_effect,
+        }
+        .validate()
+    }
+
+    const fn validate(self) -> Result<Self, CoreError> {
+        let Self {
+            provider_generations,
+            providers,
+            artifact_leases,
+            device_generations,
+            components_per_effect,
+        } = self;
+        if provider_generations == 0
+            || providers == 0
+            || artifact_leases == 0
+            || device_generations == 0
+            || components_per_effect == 0
+            || provider_generations > u32::MAX as usize
+            || providers > u32::MAX as usize
+            || artifact_leases > u32::MAX as usize
+            || device_generations > u32::MAX as usize
+            || components_per_effect > u32::MAX as usize
+            || components_per_effect > MAX_COMMAND_VECTOR_ITEMS
+        {
+            return Err(CoreError::InvalidLimits);
+        }
+        Ok(self)
+    }
+}
+
 /// Bounded capacity and pressure policy for one core instance.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CoreLimits {
@@ -670,6 +752,19 @@ pub struct CoreLimits {
     max_claims_per_effect: usize,
     max_units_per_account: u64,
     max_crashes_per_operation: u64,
+    /// Maximum durable provider-generation records, including retired history.
+    max_provider_generations: usize,
+    /// Maximum durable provider high-water entries, including providers with
+    /// no currently live generation.
+    max_provider_high_water: usize,
+    /// Maximum durable artifact leases, including released leases retained as
+    /// immutable provenance history.
+    max_artifact_leases: usize,
+    /// Maximum durable device-scope generations, including quarantined or
+    /// otherwise historical scopes.
+    max_device_generations: usize,
+    /// Maximum catalog-defined component records in one composite effect.
+    max_components_per_effect: usize,
 }
 
 impl CoreLimits {
@@ -690,9 +785,30 @@ impl CoreLimits {
             || max_claims_per_effect == 0
             || max_units_per_account == 0
             || max_crashes_per_operation == 0
+            || max_operations > u32::MAX as usize
+            || max_effects > u32::MAX as usize
+            || max_total_claims > u32::MAX as usize
+            || max_resource_records > u32::MAX as usize
+            || max_claims_per_effect > u32::MAX as usize
         {
             return Err(CoreError::InvalidLimits);
         }
+        let history = HistoryLimits {
+            provider_generations: max_usize(
+                min_usize(max_effects.saturating_mul(4), u32::MAX as usize),
+                max_effects,
+            ),
+            providers: max_effects,
+            artifact_leases: max_usize(max_total_claims, max_effects),
+            device_generations: max_resource_records,
+            // This is deliberately independent of the per-component claim
+            // budget so adding component cardinality does not silently make
+            // an existing seven-argument profile reject its catalog.
+            components_per_effect: min_usize(
+                max_usize(max_claims_per_effect, 32),
+                MAX_COMMAND_VECTOR_ITEMS,
+            ),
+        };
         Ok(Self {
             max_operations,
             max_effects,
@@ -701,7 +817,30 @@ impl CoreLimits {
             max_claims_per_effect,
             max_units_per_account,
             max_crashes_per_operation,
+            max_provider_generations: history.provider_generations,
+            max_provider_high_water: history.providers,
+            max_artifact_leases: history.artifact_leases,
+            max_device_generations: history.device_generations,
+            max_components_per_effect: history.components_per_effect,
         })
+    }
+
+    /// Replaces the durable history policy while preserving the ordinary
+    /// operation, effect, claim, resource, charging, and crash limits.
+    pub const fn with_durable_history_limits(
+        mut self,
+        history: HistoryLimits,
+    ) -> Result<Self, CoreError> {
+        let history = match history.validate() {
+            Ok(history) => history,
+            Err(error) => return Err(error),
+        };
+        self.max_provider_generations = history.provider_generations;
+        self.max_provider_high_water = history.providers;
+        self.max_artifact_leases = history.artifact_leases;
+        self.max_device_generations = history.device_generations;
+        self.max_components_per_effect = history.components_per_effect;
+        Ok(self)
     }
 
     /// Returns a conservative test and single-service profile.
@@ -714,7 +853,37 @@ impl CoreLimits {
             max_claims_per_effect: 32,
             max_units_per_account: 1 << 20,
             max_crashes_per_operation: 1024,
+            max_provider_generations: 4096,
+            max_provider_high_water: 1024,
+            max_artifact_leases: 4096,
+            max_device_generations: 4096,
+            max_components_per_effect: 32,
         }
+    }
+
+    /// Maximum durable provider-generation records, including retired history.
+    pub const fn max_provider_generations(self) -> usize {
+        self.max_provider_generations
+    }
+
+    /// Maximum durable provider high-water entries.
+    pub const fn max_provider_high_water(self) -> usize {
+        self.max_provider_high_water
+    }
+
+    /// Maximum durable artifact leases, including released history.
+    pub const fn max_artifact_leases(self) -> usize {
+        self.max_artifact_leases
+    }
+
+    /// Maximum durable device-scope generations, including historical scopes.
+    pub const fn max_device_generations(self) -> usize {
+        self.max_device_generations
+    }
+
+    /// Maximum component records in one composite effect.
+    pub const fn max_components_per_effect(self) -> usize {
+        self.max_components_per_effect
     }
 }
 
@@ -4625,6 +4794,24 @@ fn checkpoint_state_matches<S: StateAccess>(state: &S, rebuilt: &State) -> bool 
         && state.recovery_target() == rebuilt.recovery_target
 }
 
+fn state_within_limits(state: &impl StateAccess, limits: CoreLimits) -> bool {
+    state.recovery_operations().len() <= limits.max_operations
+        && state.composite_effects().len() <= limits.max_effects
+        && state.resources().len() <= limits.max_resource_records
+        && state.provider_generations().len() <= limits.max_provider_generations
+        && state.provider_high_water().len() <= limits.max_provider_high_water
+        && state.artifact_leases().len() <= limits.max_artifact_leases
+        && state.device_generations().len() <= limits.max_device_generations
+        && state.total_claims() <= limits.max_total_claims
+        && state.composite_effects().values().all(|effect| {
+            effect.components.len() <= limits.max_components_per_effect
+                && effect
+                    .components
+                    .values()
+                    .all(|component| component.claims.len() <= limits.max_claims_per_effect)
+        })
+}
+
 fn charges_equal_ignoring_zero(
     left: &StateMap<(ChargeAccountId, CreditClassId), u64>,
     right: &StateMap<(ChargeAccountId, CreditClassId), u64>,
@@ -4664,6 +4851,9 @@ fn initialize_composite_effect(
         .ok_or(CoreError::UnknownObligationClass)?
         .components()
         .to_vec();
+    if component_specs.len() > limits.max_components_per_effect {
+        return Err(CoreError::CapacityExceeded);
+    }
     if state.composite_effects().contains_key(&effect) {
         return Err(CoreError::DuplicateEffect);
     }
@@ -5989,6 +6179,9 @@ impl Engine {
         if self.state.recovery_target().is_some() {
             return Err(TxError::Core(CoreError::RecoveryPending));
         }
+        if !state_within_limits(&self.state, self.limits) {
+            return Err(TxError::Core(CoreError::CapacityExceeded));
+        }
         let state = encode_whole_state_checkpoint(&self.state);
         if state.len() > MAX_JOURNAL_CHECKPOINT_IMAGE_BYTES {
             return Err(TxError::Core(CoreError::CheckpointImageTooLarge));
@@ -6017,15 +6210,36 @@ impl Engine {
                 PrepareError::Core(error) => TxError::Core(error),
                 PrepareError::Journal(error) => TxError::Journal(error),
             })?;
-        if let Err(error) = persist(
+        // Arm before entering user-controlled persistence.  A provider can
+        // panic before writing anything, after appending bytes, or after its
+        // barrier; all three cases are ambiguous to the core.  The latch is
+        // cleared only after assignment-only publication has completed.
+        self.persistence_recovery_required = true;
+        #[cfg(feature = "std")]
+        let persisted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            persist(
+                &prepared.record,
+                prepared.delta.freshness(self.state.freshness()),
+                prepared.receipt.projection,
+            )
+        }));
+        #[cfg(feature = "std")]
+        let persisted = match persisted {
+            Ok(result) => result,
+            Err(payload) => std::panic::resume_unwind(payload),
+        };
+        #[cfg(not(feature = "std"))]
+        let persisted = persist(
             &prepared.record,
             prepared.delta.freshness(self.state.freshness()),
             prepared.receipt.projection,
-        ) {
-            self.persistence_recovery_required = true;
+        );
+        if let Err(error) = persisted {
             return Err(TxError::Persist(error));
         }
-        Ok(self.apply_prepared(prepared))
+        let receipt = self.apply_prepared(prepared);
+        self.persistence_recovery_required = false;
+        Ok(receipt)
     }
 
     /// Executes all fallible semantic work for one transition.
@@ -6052,6 +6266,9 @@ impl Engine {
         {
             return Err(PrepareError::Core(CoreError::RecoveryPending));
         }
+        command
+            .validate_wire_limits()
+            .map_err(|_| PrepareError::Core(CoreError::CapacityExceeded))?;
         let command_catalog = self.command_catalog(&command).map_err(PrepareError::Core)?;
         let mut delta = DeltaBuilder::new(&self.state);
         let output = apply_command(
@@ -7332,6 +7549,14 @@ fn apply_command_internal<S: StateAccessMut>(
             {
                 return Err(CoreError::ProviderGenerationStale);
             }
+            if state.provider_generations().len() >= limits.max_provider_generations
+                || (!state
+                    .provider_high_water()
+                    .contains_key(&coordinate.provider())
+                    && state.provider_high_water().len() >= limits.max_provider_high_water)
+            {
+                return Err(CoreError::CapacityExceeded);
+            }
             let required = catalog.verifier_class_bindings();
             let required: Vec<_> = required.into_iter().collect();
             let verifier_set_digest = validate_verifier_set(&verifier_bindings, &required)
@@ -7390,6 +7615,9 @@ fn apply_command_internal<S: StateAccessMut>(
             validate_artifact_binding(catalog, state, binding)?;
             if state.artifact_leases().contains_key(&binding.artifact_id()) {
                 return Err(CoreError::ArtifactBindingMismatch);
+            }
+            if state.artifact_leases().len() >= limits.max_artifact_leases {
+                return Err(CoreError::CapacityExceeded);
             }
             let lease = ArtifactLeaseState::pin(binding, pin_stamp)
                 .map_err(|_| CoreError::ArtifactBindingMismatch)?;
@@ -7729,11 +7957,14 @@ fn apply_command_internal<S: StateAccessMut>(
             let effect_catalog_digest = effect_catalog_digest.ok_or(CoreError::CatalogMismatch)?;
             for provider in bound.values() {
                 state.touch_provider_generation(*provider);
-                state
+                let record = state
                     .provider_generations_mut()
                     .get_mut(provider)
-                    .expect("validated provider")
-                    .live_component_bindings += 1;
+                    .expect("validated provider");
+                record.live_component_bindings = record
+                    .live_component_bindings
+                    .checked_add(1)
+                    .ok_or(CoreError::CapacityExceeded)?;
             }
             state.touch_scoped_composite(effect);
             state.scoped_composites_mut().insert_mut(
@@ -8028,11 +8259,14 @@ fn apply_command_internal<S: StateAccessMut>(
                 charge_account,
             )?;
             state.touch_provider_generation(provider.provider());
-            state
+            let provider_record = state
                 .provider_generations_mut()
                 .get_mut(&provider.provider())
-                .expect("validated provider")
-                .live_component_bindings += 1;
+                .expect("validated provider");
+            provider_record.live_component_bindings = provider_record
+                .live_component_bindings
+                .checked_add(1)
+                .ok_or(CoreError::CapacityExceeded)?;
             let mut bindings = BTreeMap::new();
             bindings.insert(descriptor.child_component, provider.provider());
             state.touch_scoped_composite(child);
@@ -9951,6 +10185,9 @@ fn enroll_component_claim(
     }
     if let ClaimScope::Device(device_scope) = scope {
         if !state.device_generations().contains_key(&device_scope) {
+            if state.device_generations().len() >= limits.max_device_generations {
+                return Err(CoreError::CapacityExceeded);
+            }
             let device_generation = state.freshness().device();
             state.touch_device(device_scope);
             state
@@ -12210,6 +12447,10 @@ fn check_invariants(
     if state.recovery_operations().len() > limits.max_operations
         || state.composite_effects().len() > limits.max_effects
         || state.resources().len() > limits.max_resource_records
+        || state.provider_generations().len() > limits.max_provider_generations
+        || state.provider_high_water().len() > limits.max_provider_high_water
+        || state.artifact_leases().len() > limits.max_artifact_leases
+        || state.device_generations().len() > limits.max_device_generations
     {
         return Err(CoreError::InvariantViolation);
     }
@@ -12252,6 +12493,7 @@ fn check_invariants(
         if operation.origin.executor() != composite.causal_owner.executor()
             || composite.authority_epoch == 0
             || composite.components.len() != composite_rule.components().len()
+            || composite.components.len() > limits.max_components_per_effect
             || !composite_rule.components().iter().all(|declared| {
                 composite
                     .components
@@ -14551,6 +14793,10 @@ const fn claim_stage_tag(stage: ClaimStage) -> u8 {
 pub enum CommandDecodeError {
     /// The payload ended before a complete field.
     UnexpectedEof,
+    /// A command payload or variable-length vector exceeds the codec bound.
+    PayloadTooLarge,
+    /// A variable-length command vector exceeds the codec bound.
+    CountTooLarge,
     /// A command or outcome discriminant is unknown.
     InvalidTag,
     /// A stable identity or generation decoded as zero.
@@ -14560,7 +14806,57 @@ pub enum CommandDecodeError {
 }
 
 impl CommandKind {
+    fn validate_wire_limits(&self) -> Result<(), CommandDecodeError> {
+        let count = |count: usize, item_bytes: usize| {
+            if count > MAX_COMMAND_VECTOR_ITEMS {
+                return Err(CommandDecodeError::CountTooLarge);
+            }
+            let encoded_len = count
+                .checked_mul(item_bytes)
+                .ok_or(CommandDecodeError::CountTooLarge)?;
+            if encoded_len > MAX_COMMAND_PAYLOAD_BYTES {
+                return Err(CommandDecodeError::PayloadTooLarge);
+            }
+            Ok(())
+        };
+        match self {
+            Self::RegisterProviderGeneration {
+                verifier_bindings, ..
+            } => count(verifier_bindings.len(), 4 + 8 + 4 + 32)?,
+            Self::AdmitScopedCompositeEffect { bindings, .. } => {
+                // This is the smallest wire representation; the decoder also
+                // checks the remaining bytes before reserving capacity.
+                count(bindings.len(), 4 + 24 + 1 + 8 + 32 + 32)?
+            }
+            Self::RecordCompositeCommitIntents { operations, .. } => {
+                count(operations.len(), 4 + 32)?
+            }
+            Self::WholeStateCheckpointV1 { state, .. }
+                if state.len() > MAX_JOURNAL_CHECKPOINT_IMAGE_BYTES =>
+            {
+                return Err(CommandDecodeError::PayloadTooLarge);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    pub(crate) fn try_encode_payload(&self) -> Result<Vec<u8>, CommandDecodeError> {
+        self.validate_wire_limits()?;
+        let bytes = self.encode_payload_unchecked();
+        if bytes.len() > MAX_COMMAND_PAYLOAD_BYTES {
+            return Err(CommandDecodeError::PayloadTooLarge);
+        }
+        Ok(bytes)
+    }
+
+    #[allow(dead_code)]
     pub(crate) fn encode_payload(&self) -> Vec<u8> {
+        self.try_encode_payload()
+            .expect("command payload satisfies the shared wire ceiling")
+    }
+
+    fn encode_payload_unchecked(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
         match self.clone() {
             Self::RegisterProviderGeneration {
@@ -14989,18 +15285,15 @@ impl CommandKind {
     }
 
     pub(crate) fn decode_payload(bytes: &[u8]) -> Result<Self, CommandDecodeError> {
+        if bytes.len() > MAX_COMMAND_PAYLOAD_BYTES {
+            return Err(CommandDecodeError::PayloadTooLarge);
+        }
         let mut cursor = Cursor::new(bytes);
         let command = match cursor.u8()? {
             42 => {
                 let coordinate = cursor.provider_coordinate()?;
                 let catalog_digest = cursor.digest()?;
-                let count = cursor.u32()? as usize;
-                let encoded_len = count
-                    .checked_mul(4 + 8 + 4 + 32)
-                    .ok_or(CommandDecodeError::UnexpectedEof)?;
-                if cursor.remaining() < encoded_len {
-                    return Err(CommandDecodeError::UnexpectedEof);
-                }
+                let count = checked_vector_count(&mut cursor, 4 + 8 + 4 + 32)?;
                 let mut verifier_bindings = Vec::with_capacity(count);
                 for _ in 0..count {
                     let verifier = VerifierId::new(cursor.u32()?)
@@ -15044,7 +15337,7 @@ impl CommandKind {
                     .map_err(|_| CommandDecodeError::InvalidIdentity)?;
                 let charge_account = ChargeAccountId::new(cursor.u64()?)
                     .map_err(|_| CommandDecodeError::InvalidIdentity)?;
-                let count = cursor.u32()? as usize;
+                let count = checked_vector_count(&mut cursor, 4 + 24 + 1)?;
                 // Every binding has at least a component id, a provider
                 // coordinate, and the artifact tag.  Bound the count before
                 // reserving attacker-controlled capacity; the semantic
@@ -15302,13 +15595,7 @@ impl CommandKind {
             35 => {
                 let effect = cursor.effect()?;
                 let actor = cursor.executor()?;
-                let count = cursor.u32()? as usize;
-                let encoded_len = count
-                    .checked_mul(core::mem::size_of::<u32>() + 32)
-                    .ok_or(CommandDecodeError::UnexpectedEof)?;
-                if cursor.remaining() < encoded_len {
-                    return Err(CommandDecodeError::UnexpectedEof);
-                }
+                let count = checked_vector_count(&mut cursor, core::mem::size_of::<u32>() + 32)?;
                 let mut operations = Vec::with_capacity(count);
                 for _ in 0..count {
                     operations.push(ComponentCommitOperation::new(
@@ -15363,6 +15650,26 @@ impl CommandKind {
         cursor.finish()?;
         Ok(command)
     }
+}
+
+fn checked_vector_count(
+    cursor: &mut Cursor<'_>,
+    minimum_item_bytes: usize,
+) -> Result<usize, CommandDecodeError> {
+    let count = usize::try_from(cursor.u32()?).map_err(|_| CommandDecodeError::CountTooLarge)?;
+    if count > MAX_COMMAND_VECTOR_ITEMS {
+        return Err(CommandDecodeError::CountTooLarge);
+    }
+    let encoded_len = count
+        .checked_mul(minimum_item_bytes)
+        .ok_or(CommandDecodeError::CountTooLarge)?;
+    if encoded_len > MAX_COMMAND_PAYLOAD_BYTES {
+        return Err(CommandDecodeError::PayloadTooLarge);
+    }
+    if cursor.remaining() < encoded_len {
+        return Err(CommandDecodeError::UnexpectedEof);
+    }
+    Ok(count)
 }
 
 fn put_u8(bytes: &mut Vec<u8>, value: u8) {
@@ -15542,7 +15849,7 @@ fn decode_whole_state_checkpoint(
     let world = WorldId::new(cursor.u64().map_err(|_| CoreError::InvariantViolation)?)
         .map_err(|_| CoreError::InvariantViolation)?;
     let high_water_count = cursor.u32().map_err(|_| CoreError::InvariantViolation)? as usize;
-    if high_water_count > limits.max_effects {
+    if high_water_count > limits.max_provider_high_water {
         return Err(CoreError::InvariantViolation);
     }
     let mut provider_high_water = BTreeMap::new();
@@ -15559,7 +15866,7 @@ fn decode_whole_state_checkpoint(
         }
     }
     let provider_count = cursor.u32().map_err(|_| CoreError::InvariantViolation)? as usize;
-    if provider_count > limits.max_effects {
+    if provider_count > limits.max_provider_generations {
         return Err(CoreError::InvariantViolation);
     }
     let mut provider_generations = BTreeMap::new();
@@ -15576,8 +15883,7 @@ fn decode_whole_state_checkpoint(
         let verifier_set_digest = cursor.digest().map_err(|_| CoreError::InvariantViolation)?;
         let verifier_count = cursor.u32().map_err(|_| CoreError::InvariantViolation)? as usize;
         let required_verifiers = provider_catalog.verifier_class_bindings();
-        if verifier_count > limits.max_effects
-            || verifier_count != required_verifiers.len()
+        if verifier_count != required_verifiers.len()
             || verifier_count
                 .checked_mul(4 + 8 + 4 + 32)
                 .is_none_or(|encoded_len| cursor.remaining() < encoded_len)
@@ -15652,7 +15958,7 @@ fn decode_whole_state_checkpoint(
         }
         let binding_count = cursor.u32().map_err(|_| CoreError::InvariantViolation)? as usize;
         const CHECKPOINT_COMPONENT_BINDING_BYTES: usize = 4 + 24;
-        if binding_count > limits.max_effects
+        if binding_count > limits.max_components_per_effect
             || binding_count
                 .checked_mul(CHECKPOINT_COMPONENT_BINDING_BYTES)
                 .is_none_or(|encoded_len| cursor.remaining() < encoded_len)
@@ -15713,7 +16019,7 @@ fn decode_whole_state_checkpoint(
         }
     }
     let artifact_lease_count = cursor.u32().map_err(|_| CoreError::InvariantViolation)? as usize;
-    if artifact_lease_count > limits.max_total_claims {
+    if artifact_lease_count > limits.max_artifact_leases {
         return Err(CoreError::InvariantViolation);
     }
     let mut artifact_leases = BTreeMap::new();
@@ -15779,7 +16085,7 @@ fn decode_whole_state_checkpoint(
         }
     }
     let device_count = cursor.u32().map_err(|_| CoreError::InvariantViolation)? as usize;
-    if device_count > limits.max_resource_records {
+    if device_count > limits.max_device_generations {
         return Err(CoreError::InvariantViolation);
     }
     let mut device_generations = BTreeMap::new();
@@ -16116,7 +16422,9 @@ fn checkpoint_read_composites_count(
             .ok_or(CoreError::SchemaMismatch)?;
         let released_provenance = checkpoint_read_released_provenance(cursor, catalogs, schema)?;
         let component_count = cursor.u32().map_err(|_| CoreError::InvariantViolation)? as usize;
-        if component_count != schema.components().len() {
+        if component_count > limits.max_components_per_effect
+            || component_count != schema.components().len()
+        {
             return Err(CoreError::InvariantViolation);
         }
         if component_count
@@ -17453,7 +17761,7 @@ mod handoff_recovery_fact_tests {
             fact,
         };
         assert_eq!(
-            CommandKind::decode_payload(&command.encode_payload()).unwrap(),
+            CommandKind::decode_payload(&command.try_encode_payload().unwrap()).unwrap(),
             command
         );
 
@@ -17984,8 +18292,91 @@ mod whole_state_checkpoint_tests {
         put_u32(&mut payload, u32::MAX);
         assert_eq!(
             CommandKind::decode_payload(&payload),
-            Err(CommandDecodeError::UnexpectedEof)
+            Err(CommandDecodeError::CountTooLarge)
         );
+    }
+
+    #[test]
+    fn tags_42_and_35_reject_huge_vector_counts_before_reserving() {
+        let provider = ProviderCoordinate::new(
+            WorldId::new(1).unwrap(),
+            ProviderId::new(1).unwrap(),
+            ProviderGeneration::new(1).unwrap(),
+        );
+        let mut registration = vec![42];
+        put_provider_coordinate(&mut registration, provider);
+        put_digest(&mut registration, Digest::new([1; 32]));
+        put_u32(&mut registration, u32::MAX);
+        assert_eq!(
+            CommandKind::decode_payload(&registration),
+            Err(CommandDecodeError::CountTooLarge)
+        );
+
+        let mut cohort = vec![35];
+        put_effect(
+            &mut cohort,
+            EffectId::new(OperationId::new(1).unwrap(), 1).unwrap(),
+        );
+        put_incarnation(
+            &mut cohort,
+            ExecutorCoordinate::new(
+                crate::ExecutorId::new(1).unwrap(),
+                crate::ExecutorGeneration::new(1).unwrap(),
+            ),
+        );
+        put_u32(&mut cohort, u32::MAX);
+        assert_eq!(
+            CommandKind::decode_payload(&cohort),
+            Err(CommandDecodeError::CountTooLarge)
+        );
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn persistence_panic_latches_before_any_bytes_are_persisted() {
+        let mut journal = Vec::new();
+        let (mut engine, effect, actor) = seed(&mut journal);
+        let command = CommandRequest::FenceExecutor {
+            operation: effect.operation(),
+            crashed: actor,
+        };
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = engine.transact(command, |_record| -> Result<(), ()> {
+                panic!("persistence failed before append");
+            });
+        }));
+        assert!(panic.is_err());
+        assert!(engine.persistence_recovery_required());
+        assert!(matches!(
+            engine.transact(
+                CommandRequest::FenceExecutor {
+                    operation: effect.operation(),
+                    crashed: actor,
+                },
+                |_| Ok::<(), ()>(()),
+            ),
+            Err(TxError::Core(CoreError::PersistenceRecoveryRequired))
+        ));
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn persistence_panic_after_append_keeps_the_recovery_latch_armed() {
+        let mut journal = Vec::new();
+        let (mut engine, effect, actor) = seed(&mut journal);
+        let command = CommandRequest::FenceExecutor {
+            operation: effect.operation(),
+            crashed: actor,
+        };
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = engine.transact(command, |record| -> Result<(), ()> {
+                journal.extend_from_slice(record.bytes());
+                panic!("persistence failed after append");
+            });
+        }));
+        assert!(panic.is_err());
+        assert!(!journal.is_empty());
+        assert!(engine.persistence_recovery_required());
     }
 
     #[test]

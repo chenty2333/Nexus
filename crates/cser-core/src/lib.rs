@@ -65,7 +65,9 @@ pub use domain::{
     ReceiptBinding, RecoveryArtifactPolicy, SingleHopHandoffRule, VerifierBinding,
     VerifierClassBinding, VerifierSetError, canonical_verifier_set_digest, validate_verifier_set,
 };
-pub use engine::CHILD_DESCRIPTOR_V1_WIRE_LEN;
+pub use engine::{
+    CHILD_DESCRIPTOR_V1_WIRE_LEN, MAX_COMMAND_PAYLOAD_BYTES, MAX_COMMAND_VECTOR_ITEMS,
+};
 pub use engine::{
     ArtifactAdmission, ArtifactRecoveryItem, AuthorityState, ChargeProjection,
     ChildDescriptorDecodeError, ChildDescriptorV1, ChildDescriptorVerifier, ClaimCustodian,
@@ -76,7 +78,7 @@ pub use engine::{
     CompositeRecoveryItem, CoreError, CoreLimits, CustodyState, EffectEscapeState,
     EffectFactChallenge, EffectFactKind, EffectReceiptVerifier, Engine, EvidenceChallenge,
     ExternalOutcome, HandoffChildResolutionVerifier, HandoffResolutionChallenge,
-    HandoffResolutionVerifier, JournalFailure, OperationRecoveryState, OutcomeState,
+    HandoffResolutionVerifier, HistoryLimits, JournalFailure, OperationRecoveryState, OutcomeState,
     PressureProjection, ProviderEffectState, ProviderGenerationProjection, ProviderObligation,
     ProviderVerificationScope, ReceiptVerifier, RecoveryAnchor, RecoveryAnchorError,
     RecoveryEvidenceItem, RecoveryReport, RecoverySnapshot, RetirementState, ReusePermit,

@@ -7,7 +7,7 @@ use sha2::{Digest as _, Sha256};
 use crate::{
     BootGeneration, CSER_CORE_API_PROFILE_VERSION, DeviceGeneration, Digest, JournalGeneration,
     RecoveryBinding, RecoveryProfile, RegistryInstance, WorldId,
-    engine::{CommandDecodeError, CommandKind},
+    engine::{CommandDecodeError, CommandKind, MAX_COMMAND_PAYLOAD_BYTES},
 };
 
 /// Magic prefix of every CSER journal record.
@@ -491,7 +491,9 @@ impl JournalRecord {
         if base_projection.is_zero() || freshness.registry() != binding.registry() {
             return Err(JournalDecodeError::InvalidBinding);
         }
-        let payload = command.encode_payload();
+        let payload = command
+            .try_encode_payload()
+            .map_err(JournalDecodeError::Command)?;
         let total_len = MIN_RECORD_LEN
             .checked_add(payload.len())
             .ok_or(JournalDecodeError::LengthOverflow)?;
@@ -822,6 +824,11 @@ fn scan_journal_inner(
         }
         let record_bytes = &remaining[..total_len];
         let payload_len = read_u32(record_bytes, 176) as usize;
+        if payload_len > MAX_COMMAND_PAYLOAD_BYTES {
+            return Err(JournalDecodeError::Command(
+                CommandDecodeError::PayloadTooLarge,
+            ));
+        }
         if FIXED_WITHOUT_DIGEST
             .checked_add(payload_len)
             .and_then(|value| value.checked_add(DIGEST_LEN))
