@@ -189,9 +189,12 @@ fn incomplete_final_record_recovers_only_the_acknowledged_prefix_and_quarantines
         accepted_projection,
     )
     .unwrap();
+    // Anchored recovery deliberately stops at the trusted head. It does not
+    // inspect attacker-controlled residue merely to distinguish a torn write
+    // from another unanchored suffix.
     assert_eq!(
         report.journal_repair(),
-        Some(JournalRepair::TornTail { offset: accepted })
+        Some(JournalRepair::UnanchoredSuffix { offset: accepted })
     );
     let mut engine = report.into_engine();
     assert!(engine.pressure().quarantined);

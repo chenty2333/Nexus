@@ -44,6 +44,10 @@ const LEGACY_JOURNAL_SCHEMA_VERSION: u16 = 4;
 const FIXED_WITHOUT_DIGEST: usize = 180;
 const DIGEST_LEN: usize = 32;
 const MIN_RECORD_LEN: usize = FIXED_WITHOUT_DIGEST + DIGEST_LEN;
+#[cfg(feature = "std")]
+pub(crate) const JOURNAL_RECORD_HEADER_LEN: usize = 16;
+pub(crate) const MAX_JOURNAL_RECORD_BYTES: usize =
+    FIXED_WITHOUT_DIGEST + MAX_COMMAND_PAYLOAD_BYTES + DIGEST_LEN;
 const CHECKPOINT_FIXED_WITHOUT_DIGEST: usize =
     8 + 2 + 2 + 4 + 8 + 8 + 32 + 8 + 8 + 32 + 32 + 32 + 4;
 const CHECKPOINT_MIN_LEN: usize = CHECKPOINT_FIXED_WITHOUT_DIGEST + DIGEST_LEN;
@@ -52,6 +56,20 @@ const CHECKPOINT_MIN_LEN: usize = CHECKPOINT_FIXED_WITHOUT_DIGEST + DIGEST_LEN;
 /// This is deliberately a conservative bounded recovery input, not a claim
 /// that a checkpoint compacts journal history.
 pub const MAX_JOURNAL_CHECKPOINT_IMAGE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Portable byte ceiling for one in-memory journal scan.
+///
+/// This is four times the bounded checkpoint image budget, allowing a small
+/// amount of ordinary replay history while keeping malformed recovery input
+/// from forcing unbounded record materialization. Host backends must compact
+/// or rotate before exceeding this admission limit.
+pub(crate) const MAX_JOURNAL_SCAN_BYTES: usize = 64 * 1024 * 1024;
+
+/// Portable record-count ceiling for one in-memory journal scan.
+///
+/// The count bound complements [`MAX_JOURNAL_SCAN_BYTES`] for minimal records,
+/// limiting the `JournalScan` record vector to 65,536 entries.
+pub(crate) const MAX_JOURNAL_SCAN_RECORDS: usize = 65_536;
 
 /// Exact trusted coordinates bound by a [`JournalCheckpoint`].
 ///
@@ -669,6 +687,16 @@ pub enum JournalDecodeError {
     },
     /// A declared record length is structurally invalid.
     InvalidLength,
+    /// The complete scan input exceeds the portable byte budget.
+    InputTooLarge {
+        /// Maximum accepted scan input in bytes.
+        limit: usize,
+    },
+    /// The complete scan contains more records than the portable budget.
+    RecordCountExceeded {
+        /// Maximum accepted record count.
+        limit: usize,
+    },
     /// A length cannot be represented by the journal format.
     LengthOverflow,
     /// A revision increment overflowed.
@@ -754,8 +782,15 @@ impl JournalScan {
 /// Scans a journal byte stream.
 ///
 /// Only an incomplete final record is classified as a torn tail. A malformed
-/// or checksum-invalid complete record fails closed.
+/// or checksum-invalid complete record fails closed. The complete input is
+/// admitted only within [`MAX_JOURNAL_SCAN_BYTES`] and
+/// [`MAX_JOURNAL_SCAN_RECORDS`].
 pub fn scan_journal(bytes: &[u8]) -> Result<JournalScan, JournalDecodeError> {
+    if bytes.len() > MAX_JOURNAL_SCAN_BYTES {
+        return Err(JournalDecodeError::InputTooLarge {
+            limit: MAX_JOURNAL_SCAN_BYTES,
+        });
+    }
     scan_journal_inner(bytes, None).map(|(scan, _)| scan)
 }
 
@@ -764,7 +799,9 @@ pub fn scan_journal(bytes: &[u8]) -> Result<JournalScan, JournalDecodeError> {
 /// Bytes after the selected record are deliberately not decoded. They may be
 /// a complete append whose freshness anchor never committed, a torn append, or
 /// arbitrary failed-write residue. The returned suffix offset must be repaired
-/// before the recovered engine can accept another transition.
+/// before the recovered engine can accept another transition. The byte and
+/// record limits apply only to the validated prefix, so an oversized suffix
+/// does not prevent finding an early trusted head.
 ///
 /// Returns `None` when the exact head does not occur in the validated prefix.
 pub fn scan_journal_to_head(
@@ -775,6 +812,57 @@ pub fn scan_journal_to_head(
     Ok(found.then_some(scan))
 }
 
+/// Returns the schema version for a recognized predecessor journal magic.
+///
+/// This deliberately examines only the fixed magic prefix. Host recovery can
+/// reject a legacy journal while the trusted anchor names genesis without
+/// materializing an unbounded failed-write suffix.
+#[cfg(feature = "std")]
+pub(crate) fn recognized_legacy_journal_version(bytes: &[u8]) -> Option<u16> {
+    if bytes.len() < JOURNAL_MAGIC.len() {
+        return None;
+    }
+    match &bytes[..JOURNAL_MAGIC.len()] {
+        b"CSERJR9\0" => Some(PREVIOUS_JOURNAL_SCHEMA_VERSION),
+        b"CSERJR8\0" => Some(PREVIOUS_PREVIOUS_JOURNAL_SCHEMA_VERSION),
+        b"CSERJR7\0" => Some(PRE_HANDOFF_RESOLUTION_JOURNAL_SCHEMA_VERSION),
+        b"CSERJR6\0" => Some(6),
+        b"CSERJR5\0" => Some(PROFILE_ONE_JOURNAL_SCHEMA_VERSION),
+        b"CSERJR4\0" => Some(LEGACY_JOURNAL_SCHEMA_VERSION),
+        _ => None,
+    }
+}
+
+/// Validates a record envelope header and returns its bounded total length.
+///
+/// The caller must still read and validate the complete record with
+/// [`scan_journal`]. This helper only admits the fixed header grammar before
+/// allocating for an attacker-controlled record body.
+#[cfg(feature = "std")]
+pub(crate) fn journal_record_total_len(
+    header: &[u8; JOURNAL_RECORD_HEADER_LEN],
+) -> Result<usize, JournalDecodeError> {
+    if let Some(version) = recognized_legacy_journal_version(header) {
+        return Err(JournalDecodeError::UnsupportedVersion { version });
+    }
+    if header[..8] != JOURNAL_MAGIC {
+        return Err(JournalDecodeError::BadMagic { offset: 0 });
+    }
+    let version = read_u16(header, 8);
+    if version != JOURNAL_SCHEMA_VERSION {
+        return Err(JournalDecodeError::UnsupportedVersion { version });
+    }
+    let profile = read_u16(header, 10);
+    if profile != JOURNAL_CORE_API_PROFILE {
+        return Err(JournalDecodeError::UnsupportedApiProfile { profile });
+    }
+    let total_len = read_u32(header, 12) as usize;
+    if !(MIN_RECORD_LEN..=MAX_JOURNAL_RECORD_BYTES).contains(&total_len) {
+        return Err(JournalDecodeError::InvalidLength);
+    }
+    Ok(total_len)
+}
+
 fn scan_journal_inner(
     bytes: &[u8],
     expected_head: Option<Digest>,
@@ -782,6 +870,11 @@ fn scan_journal_inner(
     let mut records = Vec::new();
     let mut offset = 0usize;
     while offset < bytes.len() {
+        if records.len() >= MAX_JOURNAL_SCAN_RECORDS {
+            return Err(JournalDecodeError::RecordCountExceeded {
+                limit: MAX_JOURNAL_SCAN_RECORDS,
+            });
+        }
         let remaining = &bytes[offset..];
         if remaining.len() < JOURNAL_MAGIC.len() {
             return Ok((
@@ -842,6 +935,14 @@ fn scan_journal_inner(
         let total_len = read_u32(remaining, 12) as usize;
         if total_len < MIN_RECORD_LEN {
             return Err(JournalDecodeError::InvalidLength);
+        }
+        if total_len > MAX_JOURNAL_RECORD_BYTES {
+            return Err(JournalDecodeError::InvalidLength);
+        }
+        if offset > MAX_JOURNAL_SCAN_BYTES - total_len {
+            return Err(JournalDecodeError::InputTooLarge {
+                limit: MAX_JOURNAL_SCAN_BYTES,
+            });
         }
         if remaining.len() < total_len {
             return Ok((

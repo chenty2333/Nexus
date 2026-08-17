@@ -474,9 +474,11 @@ fn crash_windows_reconcile_to_the_exact_trusted_prefix() {
     assert!(matches!(result, Err(TxError::Persist(_))));
     drop(opened);
     let repaired = cold_reopen(&torn.directory, 1).unwrap();
+    // The streaming anchored reader classifies all unread residue uniformly;
+    // repair still truncates to the exact trusted prefix.
     assert!(matches!(
         repaired.observed_repair,
-        Some(JournalRepair::TornTail { .. })
+        Some(JournalRepair::UnanchoredSuffix { .. })
     ));
     assert!(repaired.engine.composite_effect(effect(101, 1)).is_none());
 

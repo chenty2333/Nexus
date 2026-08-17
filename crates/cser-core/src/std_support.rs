@@ -9,8 +9,12 @@ use std::{
 };
 
 use crate::{
-    Digest, JournalRecord, JournalRepair, engine::reject_recognized_legacy_journal_prefix,
-    scan_journal, scan_journal_to_head,
+    Digest, JournalRecord, JournalRepair,
+    journal::{
+        JOURNAL_RECORD_HEADER_LEN, MAX_JOURNAL_SCAN_BYTES, MAX_JOURNAL_SCAN_RECORDS,
+        journal_record_total_len, recognized_legacy_journal_version,
+    },
+    scan_journal,
 };
 
 mod persistence;
@@ -95,79 +99,40 @@ impl FileJournal {
             .write(true)
             .open(&path)?;
         file.try_lock()?;
-        let bytes = read_all_file(&mut file)?;
+        let durable_len = file.metadata()?.len();
         if accepted_revision == 0 || accepted_head.is_zero() {
             if accepted_revision != 0 || !accepted_head.is_zero() {
                 return Err(anchor_not_found());
             }
-            reject_recognized_legacy_journal_prefix(&bytes).map_err(invalid_journal)?;
-            let durable_len = u64::try_from(bytes.len()).map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidData, "journal length exceeds u64")
-            })?;
+            reject_genesis_legacy_prefix(&mut file, durable_len)?;
+            let durable_len = file.metadata()?.len();
             return Ok(Self {
                 path,
                 file,
                 durable_len,
                 revision: 0,
                 head: Digest::ZERO,
-                journal_repair: (!bytes.is_empty())
+                journal_repair: (durable_len != 0)
                     .then_some(JournalRepair::UnanchoredSuffix { offset: 0 }),
                 recovery_required: false,
             });
         }
-        let full_scan = scan_journal(&bytes);
-        let (accepted_len, journal_repair) = match full_scan {
-            Ok(scan) => {
-                let accepted_index = scan
-                    .records()
-                    .iter()
-                    .position(|record| {
-                        record.revision() == accepted_revision && record.digest() == accepted_head
-                    })
-                    .ok_or_else(anchor_not_found)?;
-                let accepted_count = accepted_index + 1;
-                let accepted_len = scan.records()[..accepted_count]
-                    .iter()
-                    .map(|record| record.bytes().len())
-                    .sum();
-                let repair = if accepted_count < scan.records().len() {
-                    Some(JournalRepair::UnanchoredSuffix {
-                        offset: accepted_len,
-                    })
-                } else {
-                    scan.torn_tail()
-                        .map(|offset| JournalRepair::TornTail { offset })
-                };
-                (accepted_len, repair)
-            }
-            Err(full_error) => {
-                let scan = scan_journal_to_head(&bytes, accepted_head)
-                    .map_err(invalid_journal)?
-                    .ok_or_else(|| invalid_journal(full_error))?;
-                let record = scan.records().last().ok_or_else(anchor_not_found)?;
-                if record.revision() != accepted_revision {
-                    return Err(anchor_not_found());
-                }
-                let accepted_len = scan.unanchored_suffix().unwrap_or_else(|| {
-                    scan.records()
-                        .iter()
-                        .map(|record| record.bytes().len())
-                        .sum()
-                });
-                (
-                    accepted_len,
-                    Some(JournalRepair::UnanchoredSuffix {
-                        offset: accepted_len,
-                    }),
-                )
-            }
-        };
-        let durable_len = u64::try_from(bytes.len()).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidData, "journal length exceeds u64")
+        file.seek(SeekFrom::Start(0))?;
+        let accepted_len = read_anchored_prefix(&mut file, accepted_revision, accepted_head)?;
+        let durable_len = file.metadata()?.len();
+        let accepted_len_u64 = u64::try_from(accepted_len).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "accepted journal length exceeds u64",
+            )
         })?;
-        if accepted_len > bytes.len() {
+        if accepted_len_u64 > durable_len {
             return Err(anchor_not_found());
         }
+        let journal_repair =
+            (durable_len > accepted_len_u64).then_some(JournalRepair::UnanchoredSuffix {
+                offset: accepted_len,
+            });
         Ok(Self {
             path,
             file,
@@ -244,7 +209,6 @@ impl FileJournal {
                 "journal length changed after open",
             ));
         }
-        let bytes = read_all_file(&mut self.file)?;
         let repair = self.journal_repair.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -260,12 +224,16 @@ impl FileJournal {
         let (revision, head) = if accepted_revision == 0 && accepted_head.is_zero() {
             (0, Digest::ZERO)
         } else {
-            let scan = scan_journal_to_head(&bytes, accepted_head)
-                .map_err(invalid_journal)?
-                .ok_or_else(anchor_not_found)?;
-            scan.records().last().map_or((0, Digest::ZERO), |record| {
-                (record.revision(), record.digest())
-            })
+            self.file.seek(SeekFrom::Start(0))?;
+            let validated_len =
+                read_anchored_prefix(&mut self.file, accepted_revision, accepted_head)?;
+            if validated_len != accepted_len {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "accepted offset is not the validated repair boundary",
+                ));
+            }
+            (accepted_revision, accepted_head)
         };
         if revision != accepted_revision || head != accepted_head {
             return Err(io::Error::new(
@@ -358,6 +326,120 @@ fn read_all_file(file: &mut File) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// Reads and validates only the complete prefix ending at `expected_head`.
+///
+/// The fixed envelope header is admitted before allocating one bounded record
+/// body, and the reader is never advanced beyond the accepted record. The
+/// returned length is bounded by the same portable scan limits as
+/// [`scan_journal`].
+fn read_anchored_prefix<R: Read>(
+    reader: &mut R,
+    accepted_revision: u64,
+    accepted_head: Digest,
+) -> io::Result<usize> {
+    let mut prefix_len = 0usize;
+    let mut record_count = 0usize;
+    let mut previous = None;
+
+    loop {
+        if record_count >= MAX_JOURNAL_SCAN_RECORDS {
+            return Err(invalid_journal(
+                crate::JournalDecodeError::RecordCountExceeded {
+                    limit: MAX_JOURNAL_SCAN_RECORDS,
+                },
+            ));
+        }
+
+        let mut header = [0u8; JOURNAL_RECORD_HEADER_LEN];
+        match reader.read_exact(&mut header[..8]) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
+                return Err(anchor_not_found());
+            }
+            Err(error) => return Err(error),
+        }
+        if let Some(version) = recognized_legacy_journal_version(&header[..8]) {
+            return Err(invalid_journal(
+                crate::JournalDecodeError::UnsupportedVersion { version },
+            ));
+        }
+        match reader.read_exact(&mut header[8..]) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
+                return Err(anchor_not_found());
+            }
+            Err(error) => return Err(error),
+        }
+        let total_len = journal_record_total_len(&header).map_err(invalid_journal)?;
+        if total_len > MAX_JOURNAL_SCAN_BYTES || prefix_len > MAX_JOURNAL_SCAN_BYTES - total_len {
+            return Err(invalid_journal(crate::JournalDecodeError::InputTooLarge {
+                limit: MAX_JOURNAL_SCAN_BYTES,
+            }));
+        }
+
+        let mut record = Vec::new();
+        record
+            .try_reserve_exact(total_len)
+            .map_err(|_| journal_allocation_failed())?;
+        record.resize(total_len, 0);
+        record[..JOURNAL_RECORD_HEADER_LEN].copy_from_slice(&header);
+        match reader.read_exact(&mut record[JOURNAL_RECORD_HEADER_LEN..]) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
+                return Err(anchor_not_found());
+            }
+            Err(error) => return Err(error),
+        }
+        let scan = scan_journal(&record).map_err(invalid_journal)?;
+        let current = scan.records().first().ok_or_else(anchor_not_found)?;
+        if let Some((previous_revision, previous_head)) = previous {
+            if current.base_revision() != previous_revision
+                || current.predecessor() != previous_head
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "journal record chain is discontinuous",
+                ));
+            }
+        }
+        prefix_len = prefix_len
+            .checked_add(total_len)
+            .ok_or_else(|| invalid_journal(crate::JournalDecodeError::LengthOverflow))?;
+        record_count += 1;
+
+        if current.digest() == accepted_head {
+            if current.revision() != accepted_revision {
+                return Err(anchor_not_found());
+            }
+            return Ok(prefix_len);
+        }
+        previous = Some((current.revision(), current.digest()));
+    }
+}
+
+fn journal_allocation_failed() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Other,
+        "journal record allocation failed during anchored recovery",
+    )
+}
+
+/// Rejects a recognized predecessor schema using only its fixed magic prefix.
+fn reject_genesis_legacy_prefix(file: &mut File, durable_len: u64) -> io::Result<()> {
+    if durable_len < JOURNAL_RECORD_HEADER_LEN as u64 / 2 {
+        return Ok(());
+    }
+    file.seek(SeekFrom::Start(0))?;
+    let mut prefix = [0u8; JOURNAL_RECORD_HEADER_LEN];
+    file.read_exact(&mut prefix[..JOURNAL_RECORD_HEADER_LEN / 2])?;
+    if let Some(version) = recognized_legacy_journal_version(&prefix) {
+        return Err(invalid_journal(
+            crate::JournalDecodeError::UnsupportedVersion { version },
+        ));
+    }
+    Ok(())
+}
+
 fn recovery_required() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
@@ -387,13 +469,16 @@ fn sync_parent_directory(path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use std::{
+        io::{Cursor, Read},
         path::PathBuf,
         sync::atomic::{AtomicU64, Ordering},
     };
 
+    use crate::journal::{MAX_JOURNAL_SCAN_BYTES, MAX_JOURNAL_SCAN_RECORDS};
     use crate::{
         BootGeneration, DeviceGeneration, Digest, JournalDecodeError, JournalGeneration,
         JournalRecord, JournalRepair, RegistryInstance, engine::CommandKind, scan_journal,
+        scan_journal_to_head,
     };
 
     use super::FileJournal;
@@ -426,6 +511,28 @@ mod tests {
 
     fn digest(value: u8) -> Digest {
         Digest::new([value; 32])
+    }
+
+    struct CountingReader {
+        inner: Cursor<Vec<u8>>,
+        bytes_read: usize,
+    }
+
+    impl CountingReader {
+        fn new(bytes: Vec<u8>) -> Self {
+            Self {
+                inner: Cursor::new(bytes),
+                bytes_read: 0,
+            }
+        }
+    }
+
+    impl Read for CountingReader {
+        fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+            let count = self.inner.read(bytes)?;
+            self.bytes_read += count;
+            Ok(count)
+        }
     }
 
     fn record(base_revision: u64, predecessor: Digest) -> JournalRecord {
@@ -579,6 +686,102 @@ mod tests {
             assert_eq!(reopened.revision(), second.revision());
             assert_eq!(reopened.head(), second.digest());
         }
+    }
+
+    #[test]
+    fn anchored_open_does_not_read_or_validate_a_large_unanchored_suffix() {
+        let temp = TempJournal::new("large-unanchored-suffix");
+        let first = record(0, Digest::ZERO);
+        let suffix = vec![0xa5; MAX_JOURNAL_SCAN_BYTES + 1];
+        let mut bytes = first.bytes().to_vec();
+        bytes.extend_from_slice(&suffix);
+        std::fs::write(&temp.path, &bytes).unwrap();
+
+        let mut journal = FileJournal::open_anchored(&temp.path, first.revision(), first.digest())
+            .expect("trusted prefix is independent of suffix contents");
+        assert_eq!(
+            journal.journal_repair(),
+            Some(JournalRepair::UnanchoredSuffix {
+                offset: first.bytes().len()
+            })
+        );
+        assert!(
+            journal
+                .append(&record(first.revision(), first.digest()))
+                .is_err()
+        );
+        journal
+            .repair_to_anchored_prefix(first.bytes().len(), first.revision(), first.digest())
+            .unwrap();
+        assert_eq!(journal.read_all().unwrap(), first.bytes());
+    }
+
+    #[test]
+    fn anchored_prefix_reader_stops_at_the_trusted_record() {
+        let first = record(0, Digest::ZERO);
+        let second = record(first.revision(), first.digest());
+        let mut bytes = first.bytes().to_vec();
+        bytes.extend_from_slice(second.bytes());
+        bytes.extend_from_slice(&[0xff; 1024 * 1024]);
+        let mut reader = CountingReader::new(bytes);
+
+        let accepted_len =
+            super::read_anchored_prefix(&mut reader, first.revision(), first.digest()).unwrap();
+        assert_eq!(accepted_len, first.bytes().len());
+        assert_eq!(reader.bytes_read, first.bytes().len());
+    }
+
+    #[test]
+    fn anchored_prefix_rejects_a_discontinuous_record_chain() {
+        let temp = TempJournal::new("discontinuous-chain");
+        let first = record(0, Digest::ZERO);
+        let second = record(first.revision() + 1, first.digest());
+        let mut bytes = first.bytes().to_vec();
+        bytes.extend_from_slice(second.bytes());
+        std::fs::write(&temp.path, &bytes).unwrap();
+
+        let error = FileJournal::open_anchored(&temp.path, second.revision(), second.digest())
+            .expect_err("anchored prefix must be one contiguous chain");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "journal record chain is discontinuous");
+    }
+
+    #[test]
+    fn scan_rejects_a_declared_record_larger_than_the_portable_record_budget() {
+        let mut bytes = record(0, Digest::ZERO).bytes().to_vec();
+        bytes[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
+
+        assert!(matches!(
+            scan_journal(&bytes),
+            Err(JournalDecodeError::InvalidLength)
+        ));
+    }
+
+    #[test]
+    fn scan_rejects_too_many_minimal_valid_records_before_materializing_more() {
+        let one = record(0, Digest::ZERO);
+        let bytes = one.bytes().repeat(MAX_JOURNAL_SCAN_RECORDS + 1);
+
+        assert!(matches!(
+            scan_journal(&bytes),
+            Err(JournalDecodeError::RecordCountExceeded {
+                limit: MAX_JOURNAL_SCAN_RECORDS
+            })
+        ));
+    }
+
+    #[test]
+    fn scan_to_head_stops_before_a_suffix_over_the_full_scan_budget() {
+        let first = record(0, Digest::ZERO);
+        let mut bytes = first.bytes().to_vec();
+        bytes.resize(MAX_JOURNAL_SCAN_BYTES + 1, 0xa5);
+
+        let scan = scan_journal_to_head(&bytes, first.digest())
+            .unwrap()
+            .expect("anchor occurs before oversized suffix");
+        assert_eq!(scan.records().len(), 1);
+        assert_eq!(scan.records()[0].digest(), first.digest());
+        assert_eq!(scan.unanchored_suffix(), Some(first.bytes().len()));
     }
 
     #[test]
