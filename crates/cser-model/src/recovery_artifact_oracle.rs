@@ -31,6 +31,12 @@ pub struct ArtifactOwner {
     pub effect: EffectId,
     /// Component identity.
     pub component: ComponentId,
+    /// Catalog digest used to interpret the effect.
+    pub catalog_digest: ClosureDigest,
+    /// Receipt-schema digest required for recovery.
+    pub schema_digest: ClosureDigest,
+    /// Verifier-set digest required for recovery.
+    pub verifier_set_digest: ClosureDigest,
     /// Exact retained artifact closure digest.
     pub closure_digest: ClosureDigest,
 }
@@ -94,6 +100,8 @@ impl ComponentPhase {
 /// Recovery-artifact lease lifecycle.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ArtifactLeaseState {
+    /// The artifact root is declared but has not been pinned.
+    Declared,
     /// The artifact root is durably pinned before effect commit intent.
     Pinned,
     /// Release was authorized after all logical and physical obligations
@@ -153,6 +161,12 @@ pub struct ArtifactProjection {
     pub lease: ArtifactId,
     /// Exact lease owner tuple.
     pub owner: ArtifactOwner,
+    /// Catalog digest retained by the artifact provenance.
+    pub catalog_digest: ClosureDigest,
+    /// Receipt-schema digest retained by the artifact provenance.
+    pub schema_digest: ClosureDigest,
+    /// Verifier-set digest retained by the artifact provenance.
+    pub verifier_set_digest: ClosureDigest,
     /// Current lease lifecycle.
     pub state: ArtifactLeaseState,
 }
@@ -269,7 +283,6 @@ struct EffectRecord {
 struct ArtifactRecord {
     owner: ArtifactOwner,
     state: ArtifactLeaseState,
-    pinned: bool,
     permit: Option<ArtifactReleasePermit>,
 }
 
@@ -422,8 +435,7 @@ impl RecoveryArtifactOracle {
             lease,
             ArtifactRecord {
                 owner,
-                state: ArtifactLeaseState::Pinned,
-                pinned: false,
+                state: ArtifactLeaseState::Declared,
                 permit: None,
             },
         );
@@ -438,10 +450,10 @@ impl RecoveryArtifactOracle {
         owner: ArtifactOwner,
     ) -> Result<(), ArtifactError> {
         let record = self.artifact_record_mut(lease, owner)?;
-        if record.state != ArtifactLeaseState::Pinned || record.pinned || record.permit.is_some() {
+        if record.state != ArtifactLeaseState::Declared || record.permit.is_some() {
             return Err(ArtifactError::WrongArtifactState);
         }
-        record.pinned = true;
+        record.state = ArtifactLeaseState::Pinned;
         record.permit = Some(ArtifactReleasePermit {
             lease,
             owner,
@@ -472,7 +484,7 @@ impl RecoveryArtifactOracle {
         if record.artifacts.iter().any(|lease| {
             self.artifacts
                 .get(lease)
-                .is_none_or(|artifact| !artifact.pinned)
+                .is_none_or(|artifact| artifact.state != ArtifactLeaseState::Pinned)
         }) {
             return Err(ArtifactError::ArtifactNotPinned);
         }
@@ -609,7 +621,7 @@ impl RecoveryArtifactOracle {
         let record = self.artifact_record_mut(lease, owner)?;
         match record.state {
             ArtifactLeaseState::Pinned => {
-                if !record.pinned || record.permit.is_none() {
+                if record.permit.is_none() {
                     return Err(ArtifactError::ArtifactNotPinned);
                 }
                 let permit = ArtifactReleasePermit {
@@ -625,7 +637,9 @@ impl RecoveryArtifactOracle {
             ArtifactLeaseState::ReleaseAuthorized => {
                 record.permit.ok_or(ArtifactError::InvalidReleasePermit)
             }
-            ArtifactLeaseState::Released => Err(ArtifactError::WrongArtifactState),
+            ArtifactLeaseState::Declared | ArtifactLeaseState::Released => {
+                Err(ArtifactError::WrongArtifactState)
+            }
         }
     }
 
@@ -810,6 +824,9 @@ impl RecoveryArtifactOracle {
             .map(|(lease, artifact)| ArtifactProjection {
                 lease: *lease,
                 owner: artifact.owner,
+                catalog_digest: artifact.owner.catalog_digest,
+                schema_digest: artifact.owner.schema_digest,
+                verifier_set_digest: artifact.owner.verifier_set_digest,
                 state: artifact.state,
             })
             .collect();
@@ -847,6 +864,13 @@ impl RecoveryArtifactOracle {
             if artifact.owner.world != self.world {
                 return false;
             }
+            if artifact.owner.catalog_digest == [0; 32]
+                || artifact.owner.schema_digest == [0; 32]
+                || artifact.owner.verifier_set_digest == [0; 32]
+                || artifact.owner.closure_digest == [0; 32]
+            {
+                return false;
+            }
             let Some(effect) = self.effects.get(&artifact.owner.effect) else {
                 return false;
             };
@@ -860,23 +884,22 @@ impl RecoveryArtifactOracle {
             {
                 return false;
             }
-            if let Some(permit) = artifact.permit {
-                if permit.lease != *lease || permit.owner != artifact.owner {
-                    return false;
+            match (artifact.state, artifact.permit) {
+                (ArtifactLeaseState::Declared, None) => {}
+                (ArtifactLeaseState::Pinned, Some(permit)) if permit.authorization_epoch == 0 => {
+                    if permit.lease != *lease || permit.owner != artifact.owner {
+                        return false;
+                    }
                 }
-                if artifact.state == ArtifactLeaseState::Pinned && permit.authorization_epoch != 0 {
-                    return false;
+                (
+                    ArtifactLeaseState::ReleaseAuthorized | ArtifactLeaseState::Released,
+                    Some(permit),
+                ) if permit.authorization_epoch != 0 => {
+                    if permit.lease != *lease || permit.owner != artifact.owner {
+                        return false;
+                    }
                 }
-            }
-            if artifact.state != ArtifactLeaseState::Pinned && !artifact.pinned {
-                return false;
-            }
-            if artifact.state == ArtifactLeaseState::ReleaseAuthorized
-                && artifact
-                    .permit
-                    .is_none_or(|permit| permit.authorization_epoch == 0)
-            {
-                return false;
+                _ => return false,
             }
         }
         true
@@ -923,6 +946,13 @@ impl RecoveryArtifactOracle {
     fn check_owner_effect(&self, owner: ArtifactOwner) -> Result<(), ArtifactError> {
         if owner.world != self.world {
             return Err(ArtifactError::WrongWorld);
+        }
+        if owner.catalog_digest == [0; 32]
+            || owner.schema_digest == [0; 32]
+            || owner.verifier_set_digest == [0; 32]
+            || owner.closure_digest == [0; 32]
+        {
+            return Err(ArtifactError::InvalidIdentity);
         }
         let effect = self
             .effects
@@ -1044,6 +1074,9 @@ mod tests {
                 operation,
                 effect,
                 component,
+                catalog_digest: [0x11; 32],
+                schema_digest: [0x22; 32],
+                verifier_set_digest: [0x33; 32],
                 closure_digest: [0xabu8; 32],
             },
         }
@@ -1104,14 +1137,40 @@ mod tests {
             .require_artifact(fixture.lease, fixture.owner)
             .unwrap();
         assert_eq!(
+            oracle.projection().artifacts[0].state,
+            ArtifactLeaseState::Declared
+        );
+        assert_eq!(
             oracle.commit_intent(fixture.effect, fixture.component),
             Err(ArtifactError::ArtifactNotPinned)
         );
         assert!(oracle.check_invariants());
         oracle.pin_artifact(fixture.lease, fixture.owner).unwrap();
+        assert_eq!(
+            oracle.projection().artifacts[0].state,
+            ArtifactLeaseState::Pinned
+        );
         oracle
             .commit_intent(fixture.effect, fixture.component)
             .unwrap();
+        assert!(oracle.check_invariants());
+    }
+
+    #[test]
+    fn provenance_digest_mismatch_cannot_pin_declared_lease() {
+        let fixture = fixture();
+        let mut oracle = admitted(&fixture);
+        oracle
+            .require_artifact(fixture.lease, fixture.owner)
+            .unwrap();
+        let mut wrong = fixture.owner;
+        wrong.verifier_set_digest = [0x44; 32];
+        let before = oracle.projection();
+        assert_eq!(
+            oracle.pin_artifact(fixture.lease, wrong),
+            Err(ArtifactError::WrongArtifactOwner)
+        );
+        assert_eq!(oracle.projection(), before);
         assert!(oracle.check_invariants());
     }
 

@@ -102,6 +102,8 @@ pub struct EffectProjection {
     pub effect: EffectId,
     /// Provider generation bound at admission.
     pub provider: ProviderCoordinate,
+    /// Component identities in stable catalog order.
+    pub component_ids: [ComponentId; MAX_COMPONENTS],
     /// Number of active component slots in this effect.
     pub component_count: u8,
     /// Component states in stable bounded slot order.
@@ -317,7 +319,7 @@ impl ProviderLifecycleOracle {
         &mut self,
         effect: EffectId,
         coordinate: ProviderCoordinate,
-        component_count: u8,
+        components: &[ComponentId],
     ) -> Result<(), LifecycleError> {
         if self.effects.contains_key(&effect) {
             return Err(LifecycleError::EffectAlreadyExists);
@@ -329,9 +331,19 @@ impl ProviderLifecycleOracle {
         if coordinate.world() != self.world {
             return Err(LifecycleError::WrongWorld);
         }
-        if component_count == 0 || component_count as usize > MAX_COMPONENTS {
+        if components.is_empty() || components.len() > MAX_COMPONENTS {
             return Err(LifecycleError::ComponentOutOfBounds);
         }
+        if (0..components.len()).any(|left| {
+            components[left + 1..]
+                .iter()
+                .any(|component| *component == components[left])
+        }) {
+            return Err(LifecycleError::InvalidIdentity);
+        }
+        let component_count = components.len() as u8;
+        let mut component_ids = [ComponentId::Reply; MAX_COMPONENTS];
+        component_ids[..components.len()].copy_from_slice(components);
         let record = self.current_record_mut(coordinate)?;
         if !record.phase.admits_execution() {
             return Err(LifecycleError::WrongProviderPhase);
@@ -339,6 +351,7 @@ impl ProviderLifecycleOracle {
         let projection = EffectProjection {
             effect,
             provider: coordinate,
+            component_ids,
             component_count,
             components: [ComponentLifecycle::Staged; MAX_COMPONENTS],
         };
@@ -565,7 +578,7 @@ impl ProviderLifecycleOracle {
             } => self.admit_effect(
                 effect,
                 ProviderCoordinate::new(self.world, provider, generation),
-                components,
+                &components,
             ),
             LifecycleCommand::CommitIntent { effect, component } => {
                 self.commit_intent(effect, component)
@@ -600,6 +613,17 @@ impl ProviderLifecycleOracle {
         let mut computed_released = BTreeMap::<ProviderCoordinate, u64>::new();
         for effect in self.effects.values() {
             let coordinate = effect.projection.provider;
+            let active_ids =
+                &effect.projection.component_ids[..effect.projection.component_count as usize];
+            if active_ids.iter().any(|component| component.get() == 0)
+                || (0..active_ids.len()).any(|left| {
+                    active_ids[left + 1..]
+                        .iter()
+                        .any(|component| *component == active_ids[left])
+                })
+            {
+                return false;
+            }
             let mut live = 0_u64;
             let mut released = 0_u64;
             for state in effect.projection.components[..effect.projection.component_count as usize]
@@ -696,10 +720,10 @@ impl ProviderLifecycleOracle {
             .effects
             .get(&effect)
             .ok_or(LifecycleError::UnknownEffect)?;
-        let index = component.get().saturating_sub(1) as usize;
-        if index >= record.projection.component_count as usize {
-            return Err(LifecycleError::ComponentOutOfBounds);
-        }
+        let index = record.projection.component_ids[..record.projection.component_count as usize]
+            .iter()
+            .position(|candidate| *candidate == component)
+            .ok_or(LifecycleError::ComponentOutOfBounds)?;
         Ok(record.projection.components[index])
     }
 
@@ -709,8 +733,13 @@ impl ProviderLifecycleOracle {
         component: ComponentId,
         state: ComponentLifecycle,
     ) {
-        if let Some(record) = self.effects.get_mut(&effect) {
-            record.projection.components[component.get().saturating_sub(1) as usize] = state;
+        if let Some(record) = self.effects.get_mut(&effect)
+            && let Some(index) = record.projection.component_ids
+                [..record.projection.component_count as usize]
+                .iter()
+                .position(|candidate| *candidate == component)
+        {
+            record.projection.components[index] = state;
         }
     }
 
@@ -732,7 +761,7 @@ impl ProviderLifecycleOracle {
 }
 
 /// Independent command set used by sequence/property tests.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LifecycleCommand {
     /// Register a provider generation.
     Register {
@@ -749,8 +778,8 @@ pub enum LifecycleCommand {
         provider: ProviderId,
         /// Exact provider generation.
         generation: ProviderGeneration,
-        /// Number of bounded component slots.
-        components: u8,
+        /// Explicit component identities in catalog order.
+        components: Vec<ComponentId>,
     },
     /// Record commit intent for one component.
     CommitIntent {
@@ -867,13 +896,17 @@ mod tests {
         let mut fence_first = ProviderLifecycleOracle::new(world);
         fence_first.register_provider(provider, generation).unwrap();
         fence_first.fence_provider(coordinate).unwrap();
-        fence_first.admit_effect(effect, coordinate, 1).unwrap_err();
+        fence_first
+            .admit_effect(effect, coordinate, &[component])
+            .unwrap_err();
 
         let mut intent_first = ProviderLifecycleOracle::new(world);
         intent_first
             .register_provider(provider, generation)
             .unwrap();
-        intent_first.admit_effect(effect, coordinate, 1).unwrap();
+        intent_first
+            .admit_effect(effect, coordinate, &[component])
+            .unwrap();
         intent_first.commit_intent(effect, component).unwrap();
         intent_first.fence_provider(coordinate).unwrap();
         assert_eq!(
@@ -894,7 +927,9 @@ mod tests {
         let component = ComponentId::new(1).unwrap();
         let mut oracle = ProviderLifecycleOracle::new(world);
         oracle.register_provider(provider, generation).unwrap();
-        oracle.admit_effect(effect, coordinate, 1).unwrap();
+        oracle
+            .admit_effect(effect, coordinate, &[component])
+            .unwrap();
         oracle.commit_intent(effect, component).unwrap();
         oracle.fence_provider(coordinate).unwrap();
         assert_eq!(
@@ -926,11 +961,15 @@ mod tests {
             .admit_effect(
                 EffectId::new(OperationId::new(51).unwrap(), 1).unwrap(),
                 coordinate,
-                3,
+                &[ComponentId::new(3).unwrap(), ComponentId::new(7).unwrap()],
             )
             .unwrap();
-        assert_eq!(oracle.projection().providers[0].live_components, 3);
-        for raw in 1..=3 {
+        let projection = &oracle.projection().effects[0];
+        assert_eq!(projection.component_count, 2);
+        assert_eq!(projection.component_ids[0].get(), 3);
+        assert_eq!(projection.component_ids[1].get(), 7);
+        assert_eq!(oracle.projection().providers[0].live_components, 2);
+        for raw in [3, 7] {
             oracle
                 .release(
                     EffectId::new(OperationId::new(51).unwrap(), 1).unwrap(),

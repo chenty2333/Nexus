@@ -1495,6 +1495,9 @@ impl CompositeEffectOracle {
 
     /// Consumes an exact permit and records successor-generation activation.
     pub fn activate_reuse(&mut self, permit: ReusePermit) -> Result<(), CompositeError> {
+        if self.released {
+            return Err(CompositeError::GateClosed);
+        }
         if !permit.kind.is_physical() {
             return Err(CompositeError::StaleReusePermit);
         }
@@ -1860,5 +1863,56 @@ const fn next_generation_of(generation: u64) -> u64 {
     match generation.checked_add(1) {
         Some(next) => next,
         None => panic!("bounded composite oracle generation exhausted"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn executor(id: u64, generation: u64) -> ExecutorCoordinate {
+        ExecutorCoordinate::new(
+            ExecutorId::new(id).unwrap(),
+            crate::ExecutorGeneration::new(generation).unwrap(),
+        )
+    }
+
+    #[test]
+    fn release_closes_a_durable_reuse_permit() {
+        let effect = EffectId::new(OperationId::new(1).unwrap(), 1).unwrap();
+        let mut oracle = CompositeEffectOracle::new(
+            effect,
+            executor(1, 1),
+            1,
+            1,
+            CompositeResources {
+                reply_output: ResourceId::new(11),
+                queue_slot: ResourceId::new(12),
+                pinned_page: ResourceId::new(13),
+                iova_mapping: ResourceId::new(14),
+            },
+        );
+        let authority = oracle.observe_authority().unwrap();
+        oracle.commit_dma(authority).unwrap();
+        oracle.commit_reply(authority).unwrap();
+        oracle.fence_executor(executor(1, 1)).unwrap();
+        oracle.tombstone_reply().unwrap();
+        oracle.advance_device_generation(2).unwrap();
+        let evidence = oracle.dma_retirement_evidence();
+        oracle.accept_reset(evidence).unwrap();
+        oracle.accept_irq_drain(evidence).unwrap();
+        oracle.accept_iotlb_invalidation(evidence).unwrap();
+        oracle.accept_allocator_release(evidence).unwrap();
+        oracle.rebind(executor(1, 2)).unwrap();
+        let authority = oracle.observe_authority().unwrap();
+        let permit = oracle
+            .issue_reuse_permit(authority, ClaimKind::QueueSlot, 2)
+            .unwrap();
+        oracle.release_effect().unwrap();
+        assert_eq!(
+            oracle.activate_reuse(permit),
+            Err(CompositeError::GateClosed)
+        );
+        assert!(oracle.check_invariants());
     }
 }
