@@ -100,25 +100,26 @@ done
 [[ -d $cser_source_root && ! -L $cser_source_root ]] \
     || fail "CSER source root is not a directory: $cser_source_root"
 
-grep -Fxq 'pub const CSER_CORE_API_PROFILE_VERSION: u16 = 5;' "$core_lib" \
-    || fail 'portable core API profile 5 is not frozen at the cutover'
-grep -Fxq 'pub const STANDARD_CATALOG_VERSION: u16 = 8;' "$core_lib" \
-    || fail 'portable standard catalog v8 is not frozen at the cutover'
-grep -Fxq 'pub const PROJECTION_VERSION: u16 = 9;' "$core_lib" \
-    || fail 'portable projection v9 is not frozen at the cutover'
-grep -Fxq 'pub const RECOVERY_SNAPSHOT_VERSION: u16 = 5;' "$core_lib" \
-    || fail 'portable recovery snapshot v5 is not frozen at the cutover'
-grep -Fxq 'pub const JOURNAL_MAGIC: [u8; 8] = *b"CSERJR9\0";' "$core_journal" \
-    || fail 'portable core journal magic is not bound to schema 9'
-grep -Fxq 'pub const JOURNAL_SCHEMA_VERSION: u16 = 9;' "$core_journal" \
-    || fail 'portable core journal schema 9 is not frozen at the cutover'
-for profile2_engine_guard in \
-    'world: WorldId,' \
-    'Some(world),' \
-    'if self.api_mode == EngineApiMode::ProfileTwo && !command.is_profile_two_compatible() {' \
-    '&& !record.command().is_profile_two_compatible()'; do
-    grep -Fq "$profile2_engine_guard" "$core_engine" \
-        || fail "portable profile-2 Engine lacks a fail-closed grammar guard: $profile2_engine_guard"
+extract_coordinate() {
+    local name=$1 input=$2 value
+    value=$(sed -n -E "s/^pub const ${name}: [^=]+ = ([0-9]+);$/\1/p" "$input" | head -n 1)
+    [[ $value =~ ^[1-9][0-9]*$ ]] \
+        || fail "portable CSER coordinate is missing or invalid: $name"
+    printf '%s\n' "$value"
+}
+api_profile=$(extract_coordinate CSER_CORE_API_PROFILE_VERSION "$core_lib")
+catalog_version=$(extract_coordinate STANDARD_CATALOG_VERSION "$core_lib")
+projection_version=$(extract_coordinate PROJECTION_VERSION "$core_lib")
+snapshot_version=$(extract_coordinate RECOVERY_SNAPSHOT_VERSION "$core_lib")
+journal_schema=$(extract_coordinate JOURNAL_SCHEMA_VERSION "$core_journal")
+grep -Fq "pub const JOURNAL_MAGIC: [u8; 8] = *b\"CSERJ${journal_schema}\\0\";" "$core_journal" \
+    || fail 'portable core journal magic is not bound to the current schema coordinate'
+for current_engine_guard in \
+    'catalog: CatalogSet,' \
+    'catalog_set: CatalogSet' \
+    'pub fn catalog_set(&self) -> &CatalogSet'; do
+    grep -Fq "$current_engine_guard" "$core_engine" \
+        || fail "portable Engine lacks the closed CatalogSet boundary: $current_engine_guard"
 done
 for profile_coordinate in \
     'pub const AGENT_OPERATION_COMPOSITE: CompositeKindId = match CompositeKindId::new(1) {' \
@@ -126,7 +127,7 @@ for profile_coordinate in \
     'pub const AGENT_COMPONENT_DMA: ComponentId = match ComponentId::new(2) {' \
     'pub const DMA_ARENA_REUSE_COMPOSITE: CompositeKindId = match CompositeKindId::new(2) {'; do
     grep -Fxq "$profile_coordinate" "$core_profiles" \
-        || fail "portable profile 2 lacks frozen composite coordinate: $profile_coordinate"
+        || fail "portable standard catalog lacks frozen composite coordinate: $profile_coordinate"
 done
 
 declare -a closure_sources=()
@@ -242,6 +243,14 @@ forbidden_tokens=(
     transact_volatile
     new_legacy_compatibility
     recover_legacy_compatibility
+    RootId
+    PrincipalId
+    PrincipalIncarnation
+    binding_generation
+    CreateCompositeEffect
+    RootRecoveryState
+    AuthorityBindingGeneration
+    'VerifierIdentity::new('
 )
 closure_inputs=("${closure_sources[@]}" "$kernel_entry")
 for token in "${forbidden_tokens[@]}"; do
@@ -250,6 +259,10 @@ for token in "${forbidden_tokens[@]}"; do
         fail "production source closure contains forbidden legacy/development token: $token"
     fi
 done
+exact_verifier_binding_count=$(grep -Fh 'VerifierIdentity::new_exact(' "${closure_sources[@]}" \
+    | wc -l || true)
+(( exact_verifier_binding_count > 0 )) \
+    || fail 'production source closure lacks exact VerifierIdentity::new_exact binding'
 
 ingress_identity=$(extract_rust_item \
     'pub(crate) struct ProductionIngressIdentity {' \
@@ -258,12 +271,11 @@ ingress_identity=$(extract_rust_item \
 ingress_identity_field_count=$(grep -Ec \
     '^    [[:alpha:]_][[:alnum:]_]*:' \
     <<<"$ingress_identity" || true)
-(( ingress_identity_field_count == 3 )) \
-    || fail 'production ingress identity must bind exact root/incarnation/binding generation'
+(( ingress_identity_field_count == 2 )) \
+    || fail 'production ingress identity must bind exact operation/executor coordinate'
 for field in \
-    '    root: cser_core::RootId,' \
-    '    incarnation: cser_core::PrincipalIncarnation,' \
-    '    binding_generation: u64,'; do
+    '    operation: OperationId,' \
+    '    executor: ExecutorCoordinate,'; do
     grep -Fxq "$field" <<<"$ingress_identity" \
         || fail "production ingress identity lacks exact field: $field"
 done
@@ -382,8 +394,8 @@ client_transact=$(extract_rust_item \
     "$production_registry") \
     || fail 'cannot isolate client-facing production Registry transact'
 require_ordered_tokens "$client_transact" 'client-facing production Registry transact' \
-    'if !request.is_profile_two_compatible() {' \
-    'return Err(ProductionRegistryError::ProfileOneCommandForbidden);' \
+    'if !matches!(' \
+    'CommandRequest::RecordCompositeCommitIntents { .. }' \
     '.authorize_current_ingress()' \
     'if command_ingress_identity(&request) != Some(identity) {' \
     '.installed' \
@@ -394,7 +406,7 @@ for component_command in \
     'CommandRequest::RecordComponentCommitIntent { .. }' \
     'CommandRequest::RecordCompositeCommitIntents { .. }'; do
     grep -Fq "$component_command" <<<"$client_transact" \
-        || fail "client-facing production Registry rejects profile 2 command: $component_command"
+        || fail "client-facing production Registry rejects current component command: $component_command"
 done
 for trusted_admission in \
     'CommandRequest::CreateCompositeEffect { .. }' \
@@ -411,7 +423,7 @@ component_intent_take=$(extract_rust_item \
 for component_coordinate in \
     '        effect: cser_core::EffectId,' \
     '        component: cser_core::ComponentId,' \
-    '        self.take_matching_commit_intent(effect, Some(component))'; do
+    '        self.take_matching_commit_intent(effect, component)'; do
     grep -Fxq "$component_coordinate" <<<"$component_intent_take" \
         || fail "production Registry component bearer lacks exact coordinate: $component_coordinate"
 done
@@ -444,41 +456,36 @@ trusted_transact=$(extract_rust_item \
     || fail 'cannot isolate trusted production Registry transact'
 require_ordered_tokens "$trusted_transact" 'trusted production Registry transact' \
     'let command = command.into();' \
-    'if !command.is_profile_two_compatible() {' \
-    'return Err(TxError::Core(CoreError::IncompatibleApiProfile));' \
     'self.installed.transact(command)'
 if grep -Fq 'authorize_current_ingress' <<<"$trusted_transact"; then
     fail 'trusted supervisor/domain path is incorrectly coupled to client task ingress'
 fi
 
-profile2_install=$(extract_rust_item \
+production_owner_install=$(extract_rust_item \
     'pub(crate) fn new(installed: S)' \
     "$production_registry") \
-    || fail 'cannot isolate profile-2 production owner installation'
-require_ordered_tokens "$profile2_install" 'profile-2 production owner installation' \
-    'installed.observe(Engine::profile_one_estate_count) != 0' \
-    'return Err((CoreError::IncompatibleApiProfile, installed));' \
+    || fail 'cannot isolate production owner installation'
+require_ordered_tokens "$production_owner_install" 'production owner installation' \
     'linear_custody: Mutex::new(Vec::with_capacity(MAX_LINEAR_PORTAL_BEARERS))'
 
 portal_policy=$(extract_rust_item \
     'fn require_client_command(request: &CommandRequest)' \
     "$portal_vnext") \
-    || fail 'cannot isolate profile-2 portal policy'
-require_ordered_tokens "$portal_policy" 'profile-2 portal policy' \
-    'if !request.is_profile_two_compatible() {' \
-    'return Err(PortalPolicyError::ProfileOneCommandForbidden);' \
+    || fail 'cannot isolate scoped portal policy'
+require_ordered_tokens "$portal_policy" 'scoped portal policy' \
+    'let trusted = match request {' \
     'CommandRequest::AddComponentClaim { .. }' \
     '| CommandRequest::RecordComponentCommitIntent { .. }' \
     '| CommandRequest::RecordCompositeCommitIntents { .. } => return Ok(())' \
-    '| CommandRequest::CreateCompositeEffect { .. }' \
-    'CommandRequest::AdmitScopedCompositeEffect { .. } => TrustedTransition::ScopedAdmission'
+    'CommandRequest::AdmitScopedCompositeEffect { .. } => TrustedTransition::ScopedAdmission' \
+    'Err(PortalPolicyError::TrustedPathRequired(trusted))'
 
 if grep -Fq 'pub(crate) fn take_commit_intent(' "$production_registry"; then
-    fail 'production Registry still exposes a profile-1 commit-intent transfer'
+    fail 'production Registry still exposes a legacy commit-intent transfer'
 fi
 for legacy_query in 'Estate(EffectId)' 'Claims(EffectId)'; do
     if grep -Fq "$legacy_query" "$portal_vnext"; then
-        fail "production portal still exposes a profile-1 query: $legacy_query"
+        fail "production portal still exposes a legacy query: $legacy_query"
     fi
 done
 
@@ -491,41 +498,45 @@ runtime_effect_constructor_count=$(grep -Fc 'EffectId::new(' "$persistent_runtim
 (( runtime_effect_constructor_count == 2 )) \
     || fail "production runtime must construct exactly one operation and one reuse EffectId; found $runtime_effect_constructor_count"
 
-operation_root=$(extract_rust_item \
-    'fn operation_root() -> RootId {' \
+operation_id=$(extract_rust_item \
+    'fn operation_id() -> OperationId {' \
     "$persistent_runtime") \
-    || fail 'cannot isolate production operation root'
-grep -Fxq '    root(0xc501)' <<<"$operation_root" \
-    || fail 'production operation root is not the frozen shared root'
+    || fail 'cannot isolate production operation identity'
+grep -Fq 'OperationId::new(1)' <<<"$operation_id" \
+    || fail 'production operation identity is not the exact standard operation'
 
 operation_effect=$(extract_rust_item \
     'fn operation_effect() -> EffectId {' \
     "$persistent_runtime") \
     || fail 'cannot isolate production operation effect'
 grep -Fxq \
-    '    EffectId::new(operation_root(), 1).expect("agent operation effect is non-zero")' \
+    '    EffectId::new(operation_id(), 1).expect("agent operation effect is non-zero")' \
     <<<"$operation_effect" \
-    || fail 'production operation effect is not derived once from the shared root'
+    || fail 'production operation effect is not derived once from the operation identity'
 
 reuse_effect=$(extract_rust_item \
     'fn reuse_effect() -> EffectId {' \
     "$persistent_runtime") \
     || fail 'cannot isolate production DMA reuse effect'
 for coordinate in \
-    '    EffectId::new(operation_root(), REUSE_EFFECT_SEQUENCE)' \
+    '    EffectId::new(reuse_operation_id(), REUSE_EFFECT_SEQUENCE)' \
     '        .expect("DMA reuse effect identity is non-zero")'; do
     grep -Fxq "$coordinate" <<<"$reuse_effect" \
-        || fail "production DMA reuse effect lacks exact root/sequence coordinate: $coordinate"
+        || fail "production DMA reuse effect lacks exact operation/sequence coordinate: $coordinate"
 done
 grep -Fxq 'const REUSE_EFFECT_SEQUENCE: u64 = 2;' "$persistent_runtime" \
     || fail 'production DMA reuse effect is not the frozen second effect on the agent root'
 
 operation_origin=$(extract_rust_item \
-    'fn operation_origin() -> PrincipalIncarnation {' \
+    'fn operation_origin() -> ExecutorCoordinate {' \
     "$persistent_runtime") \
-    || fail 'cannot isolate production operation origin'
-grep -Fxq '    principal(0xc501, 1)' <<<"$operation_origin" \
-    || fail 'production operation origin is not bound to the shared root'
+    || fail 'cannot isolate production operation executor origin'
+for coordinate in \
+    '        ExecutorId::new(0xc501)' \
+    '        ExecutorGeneration::new(1)'; do
+    grep -Fq "$coordinate" <<<"$operation_origin" \
+        || fail "production operation origin lacks exact executor coordinate: $coordinate"
+done
 
 activation_boot=$(extract_rust_item \
     'fn run_activation_boot(boot: PersistentBoot) -> ! {' \
@@ -536,7 +547,7 @@ activation_service_count=$(grep -Fc 'build_production_service(' <<<"$activation_
     || fail "first-boot operation must run in exactly one production service task; found $activation_service_count"
 require_ordered_tokens "$activation_boot" 'first-boot composite production service' \
     'let service_identity = match prepare_production_service(' \
-    'operation_root(),' \
+    'operation_id(),' \
     'operation_origin(),' \
     'ProductionServiceStage::InitialCompositePublication,' \
     'let service = match build_production_service(' \
@@ -546,12 +557,9 @@ composite_prepare=$(extract_rust_item \
     'fn ensure_composite_prepared<S>(' \
     "$persistent_runtime") \
     || fail 'cannot isolate production composite preparation'
-legacy_create_composite_count=$(grep -Fc 'CommandRequest::CreateCompositeEffect {' \
-    <<<"$composite_prepare" || true)
-prepare_composite_count=$(grep -Fc 'CommandRequest::PrepareCompositeEffect {' \
-    <<<"$composite_prepare" || true)
-(( legacy_create_composite_count == 0 && prepare_composite_count == 1 )) \
-    || fail 'production composite preparation must only prepare an already scoped effect'
+if grep -Fq 'CommandRequest::CreateCompositeEffect {' <<<"$composite_prepare"; then
+    fail 'production composite preparation retains unscoped composite creation'
+fi
 require_ordered_tokens "$composite_prepare" 'production composite preparation' \
     'let effect = operation_effect();' \
     'engine.component(effect, AGENT_COMPONENT_REPLY)' \
@@ -569,7 +577,7 @@ scoped_admission=$(extract_rust_item \
 require_ordered_tokens "$scoped_admission" 'production scoped admission' \
     'if bindings.iter().any(|binding| binding.artifact().is_some()) {' \
     'if let Some(composite) = composite {' \
-    'if composite.operation != Some(operation) || composite.provider_bindings != bindings {' \
+    'if composite.operation != effect.operation() || composite.provider_bindings != bindings {' \
     '.admit_scoped_composite_effect(' \
     'operation_charge_account(),' \
     'bindings.clone(),'
@@ -589,7 +597,7 @@ require_ordered_tokens "$reply_commit" 'reply component commit' \
     'projection.commit == CommitState::Committed' \
     'projection.commit != CommitState::CommitIntentDurable' \
     'let intent = intent.ok_or("reply-atomic-commit-intent-custody")?;' \
-    'intent.component() != Some(AGENT_COMPONENT_REPLY)' \
+    'intent.component() != AGENT_COMPONENT_REPLY' \
     '.commit(&challenge, REPLY_SEQUENCE, plan.payload_digest())' \
     '.acknowledge(outcome)'
 if grep -Fq 'CommandRequest::RecordComponentCommitIntent {' <<<"$reply_commit"; then
@@ -608,8 +616,8 @@ require_ordered_tokens "$initial_commit_arm" 'atomic initial component commit ar
     'ComponentCommitOperation::new(AGENT_COMPONENT_DMA, dma_operation)' \
     '.take_composite_commit_intents(operation_effect())' \
     'intents.len() != 2' \
-    'intent.component() == Some(AGENT_COMPONENT_REPLY)' \
-    'dma.component() != Some(AGENT_COMPONENT_DMA)'
+    'intent.component() == AGENT_COMPONENT_REPLY' \
+    'dma.component() != AGENT_COMPONENT_DMA'
 if grep -Fq 'CommandRequest::RecordComponentCommitIntent {' <<<"$initial_commit_arm"; then
     fail 'initial composite arm falls back to a singleton component intent'
 fi
@@ -625,7 +633,7 @@ require_ordered_tokens "$first_publication" 'first-boot composite publication' \
     'ensure_composite_prepared(' \
     'let arena = persistent_dma_arena_layout().ok_or("dma-arena-layout-absent")?;' \
     'let arena_digest = persistent_dma_arena_digest(arena);' \
-    'arm_initial_component_commits(portal, owner, actor, binding_generation, arena_digest)?;' \
+    'arm_initial_component_commits(portal, owner, actor, arena_digest)?;' \
     'ensure_reply_component_committed(owner, &mut outbox, Some(reply_intent))?;' \
     'component.commit != CommitState::CommitIntentDurable' \
     'bind_queue_commit(engine, dma_intent, cohort)' \
@@ -647,7 +655,7 @@ component_settlement=$(extract_rust_item \
 require_ordered_tokens "$component_settlement" 'component-local settlement claim' \
     'self.authorize_ingress()?;' \
     'CoreSupervisorVNext::new(Arc::clone(&self.owner))' \
-    '.claim_component_settlement(effect, component, self.identity.ingress.incarnation())'
+    '.claim_component_settlement(effect, component, self.identity.ingress.executor())'
 reply_component_settlement_count=$(grep -Fc \
     'ingress.claim_component_settlement(operation_effect(), AGENT_COMPONENT_REPLY)?;' \
     "$persistent_runtime" || true)
@@ -812,22 +820,21 @@ require_ordered_tokens "$service_ready" 'fresh service Ready/Rebind handshake' \
     'self.control.advance(SERVICE_ENTERED, SERVICE_READY)?;' \
     'if !self.control.wait_for(SERVICE_REBOUND) {' \
     'self.authorize_ingress()?;' \
-    'Some(RootRecoveryState::Rebound {'
+    'Some(OperationRecoveryState::Rebound {'
 
 manager_rebind=$(extract_rust_item \
     'fn rebind_production_service<S>(' \
     "$persistent_runtime") \
     || fail 'cannot isolate production manager Rebind handshake'
 for coordinate in \
-    'run.identity.ingress.root(),' \
-    'run.identity.ingress.incarnation(),' \
-    'run.identity.ingress.binding_generation(),'; do
+    'run.identity.ingress.operation(),' \
+    'run.identity.ingress.executor(),'; do
     grep -Fq "$coordinate" <<<"$manager_rebind" \
         || fail "production manager Rebind lacks exact ingress coordinate: $coordinate"
 done
 require_ordered_tokens "$manager_rebind" 'production manager Rebind handshake' \
     'if !run.control.wait_for(SERVICE_READY) {' \
-    'Some(RootRecoveryState::Ready {' \
+    'Some(OperationRecoveryState::Ready {' \
     '.rebind(' \
     '.open_ingress(run.identity.ingress)' \
     'run.control.mark_ingress_open()?;' \
@@ -852,12 +859,12 @@ for boot in 1 2 3 4; do
     case $boot in
         1)
             boot_contract=(
-                'profile=2'
+                'profile=6'
                 'composite_effect=true'
                 'effect_identity=shared'
                 'component_ids=reply+dma'
-                'service_principal_generation={}'
-                'binding_generation={}'
+                'service_executor_generation={}'
+                'executor_generation={}'
                 'production_service_tasks=1'
                 'service_death=task-return'
                 'exact_reap=true'
@@ -869,8 +876,8 @@ for boot in 1 2 3 4; do
             ;;
         2)
             boot_contract=(
-                'service_principal_generation={}'
-                'binding_generation={}'
+                'service_executor_generation={}'
+                'successor_generation={}'
                 'second_crash=service-exact-reap'
                 'fresh_service_task=true'
                 'ready_in_fresh_task=true'
@@ -884,8 +891,8 @@ for boot in 1 2 3 4; do
             ;;
         3)
             boot_contract=(
-                'service_principal_generation={}'
-                'binding_generation={}'
+                'service_executor_generation={}'
+                'executor_generation={}'
                 'fresh_service_task=true'
                 'ready_in_fresh_task=true'
                 'production_rebind=true'
@@ -896,8 +903,8 @@ for boot in 1 2 3 4; do
             ;;
         4)
             boot_contract=(
-                'service_principal_generation={}'
-                'binding_generation={}'
+                'service_executor_generation={}'
+                'executor_generation={}'
                 'fresh_service_task=true'
                 'ready_in_fresh_task=true'
                 'production_rebind=true'
@@ -1160,16 +1167,17 @@ runtime_recovery=$(extract_rust_item \
     "$persistent_runtime") \
     || fail 'cannot isolate production persistent recovery entry'
 require_ordered_tokens "$runtime_recovery" 'production trusted-state recovery order' \
+    'let catalogs = CatalogSet::new(' \
     'let mut prepared = match PreparedQemuPersistentBoot::acquire() {' \
     'let selected_tip = prepared.candidate().committed();' \
     'let selected_bytes = match prepared.journal_bytes() {' \
     'if is_legacy_schema8(&selected_bytes) {' \
-    'let boot = match prepared.recover(catalog, CoreLimits::bounded_default(), binding) {'
+    'let boot = match prepared.recover(catalogs, CoreLimits::bounded_default(), binding) {'
 for schema8_fail_closed_token in \
     'if is_legacy_schema8(&selected_bytes)' \
     'selected_tip.revision() == 0 || selected_tip.head().is_zero()' \
     'trusted_tpm_candidate_selected=true' \
-    'profile5_binding_authorized=false' \
+    'current_binding_authorized=false' \
     'journal_schema=8' \
     'typed_error=migration-required' \
     'semantic_replay=false inferred_pairing=false pre_replay_quarantine=true' \
@@ -1346,4 +1354,4 @@ for forbidden_container_option in --privileged --cap-add --device; do
     fi
 done
 
-echo "CSER_CORE_PRODUCTION_CUTOVER PASS manifest_sources=${#closure_sources[@]} portable_core=nonoptional api_profile=5 catalog_version=8 projection_version=9 snapshot_version=5 journal_schema=9 default=cser-production registry=single operation_effect=shared provider_scope=closed component_custody=reply+dma production_service_tasks=1 legacy_runtime_estates=false task_bound_ingress=true post_exit_fence=true production_rebind=true vnext_portal=true vnext_supervisor=true volatile_transitions=false evidence_schemes=reply+dma boots=4 shared_media=true tpm_fixture_policy=scoped"
+echo "CSER_CORE_PRODUCTION_CUTOVER PASS manifest_sources=${#closure_sources[@]} portable_core=nonoptional api_profile=$api_profile catalog_version=$catalog_version projection_version=$projection_version snapshot_version=$snapshot_version journal_schema=$journal_schema default=cser-production registry=single operation_identity=operation_id+effect_sequence provider_scope=closed component_custody=reply+dma production_service_tasks=1 legacy_runtime_estates=false task_bound_ingress=true post_exit_fence=true production_rebind=true executor_coordinate=true catalog_set=true scoped_admission=true exact_verifier_binding=true vnext_portal=true vnext_supervisor=true volatile_transitions=false evidence_schemes=reply+dma boots=4 shared_media=true tpm_fixture_policy=scoped"

@@ -4,17 +4,24 @@
 //! mutex.  This checks gate winner sets, not a production lock implementation,
 //! device memory ordering, or hardware DMA quiescence.
 
-use cser_model::EffectId;
 use cser_model::composite_effect_oracle::{
     ClaimKind, ClaimState, ComponentId, CompositeAuthority, CompositeEffectOracle, CompositeError,
     CompositeResources, DmaEvent, DmaOutcome, EscapeState, ReplyClaim, ReplyState, ResourceId,
     ReusePermit,
 };
+use cser_model::{EffectId, ExecutorCoordinate, ExecutorGeneration, ExecutorId, OperationId};
 use loom::{
     model,
     sync::{Arc, Mutex},
     thread,
 };
+
+fn executor(id: u64, generation: u64) -> ExecutorCoordinate {
+    ExecutorCoordinate::new(
+        ExecutorId::new(id).unwrap(),
+        ExecutorGeneration::new(generation).unwrap(),
+    )
+}
 
 fn resources() -> CompositeResources {
     CompositeResources {
@@ -26,7 +33,13 @@ fn resources() -> CompositeResources {
 }
 
 fn staged() -> CompositeEffectOracle {
-    CompositeEffectOracle::new(EffectId::new(0xce01), 1, 1, 1, 1, resources())
+    CompositeEffectOracle::new(
+        EffectId::new(OperationId::new(0xce01).unwrap(), 1).unwrap(),
+        executor(1, 1),
+        1,
+        1,
+        resources(),
+    )
 }
 
 fn committed() -> CompositeEffectOracle {
@@ -39,9 +52,32 @@ fn committed() -> CompositeEffectOracle {
 
 fn recovered() -> CompositeEffectOracle {
     let mut oracle = committed();
-    oracle.fence_incarnation(1, 1).unwrap();
-    oracle.rebind(2, 2).unwrap();
+    oracle.fence_executor(executor(1, 1)).unwrap();
+    oracle.rebind(executor(1, 2)).unwrap();
     oracle
+}
+
+#[test]
+fn loom_rebind_requires_origin_id_and_newer_generation() {
+    model(|| {
+        let mut oracle = staged();
+        oracle.fence_executor(executor(1, 1)).unwrap();
+        let before = oracle.projection();
+
+        assert_eq!(
+            oracle.rebind(executor(9, 2)),
+            Err(CompositeError::StaleAuthority)
+        );
+        assert_eq!(oracle.projection(), before);
+        assert_eq!(
+            oracle.rebind(executor(1, 1)),
+            Err(CompositeError::StaleAuthority)
+        );
+        assert_eq!(oracle.projection(), before);
+        oracle.rebind(executor(1, 2)).unwrap();
+        assert_eq!(oracle.projection().live_executor, Some(executor(1, 2)));
+        assert!(oracle.check_invariants());
+    });
 }
 
 fn issue_reuse(
@@ -287,7 +323,8 @@ fn loom_dma_commit_and_fence_preserve_the_only_linearized_commit() {
         let commit_oracle = Arc::clone(&shared);
         let commit = thread::spawn(move || commit_oracle.lock().unwrap().commit_dma(authority));
         let fence_oracle = Arc::clone(&shared);
-        let fence = thread::spawn(move || fence_oracle.lock().unwrap().fence_incarnation(1, 1));
+        let fence =
+            thread::spawn(move || fence_oracle.lock().unwrap().fence_executor(executor(1, 1)));
 
         let commit_result = commit.join().unwrap();
         assert_eq!(fence.join().unwrap(), Ok(()));
@@ -315,7 +352,8 @@ fn loom_reply_commit_and_fence_preserve_the_only_linearized_commit() {
         let commit_oracle = Arc::clone(&shared);
         let commit = thread::spawn(move || commit_oracle.lock().unwrap().commit_reply(authority));
         let fence_oracle = Arc::clone(&shared);
-        let fence = thread::spawn(move || fence_oracle.lock().unwrap().fence_incarnation(1, 1));
+        let fence =
+            thread::spawn(move || fence_oracle.lock().unwrap().fence_executor(executor(1, 1)));
 
         let commit_result = commit.join().unwrap();
         assert_eq!(fence.join().unwrap(), Ok(()));
@@ -337,8 +375,8 @@ fn loom_reply_commit_and_fence_preserve_the_only_linearized_commit() {
 fn loom_adopt_and_revoke_have_one_parent_epoch_winner() {
     model(|| {
         let mut initial = staged();
-        initial.fence_incarnation(1, 1).unwrap();
-        initial.rebind(2, 2).unwrap();
+        initial.fence_executor(executor(1, 1)).unwrap();
+        initial.rebind(executor(1, 2)).unwrap();
         let observed = initial.observe_authority().unwrap();
         let revision = initial.projection().revision;
         let shared = Arc::new(Mutex::new(initial));
@@ -398,14 +436,14 @@ fn loom_second_crash_preserves_every_reply_dma_partial_state() {
 
                 let stale_oracle = Arc::clone(&shared);
                 let stale = thread::spawn(move || {
-                    stale_oracle
-                        .lock()
-                        .unwrap()
-                        .claim_reply(stale_authority.with_effect(EffectId::new(0xdead)))
+                    stale_oracle.lock().unwrap().claim_reply(
+                        stale_authority.with_operation(OperationId::new(0xdead).unwrap()),
+                    )
                 });
                 let crash_oracle = Arc::clone(&shared);
-                let crash =
-                    thread::spawn(move || crash_oracle.lock().unwrap().fence_incarnation(2, 2));
+                let crash = thread::spawn(move || {
+                    crash_oracle.lock().unwrap().fence_executor(executor(1, 2))
+                });
 
                 assert!(matches!(
                     stale.join().unwrap(),
@@ -423,11 +461,7 @@ fn loom_second_crash_preserves_every_reply_dma_partial_state() {
                 );
                 assert_eq!(fenced.authority_epoch, before.authority_epoch + 1);
                 assert_eq!(fenced.crash_generation, before.crash_generation + 1);
-                assert_eq!(fenced.live_incarnation, None, "{coordinates}");
-                assert_eq!(
-                    fenced.binding_generation, before.binding_generation,
-                    "{coordinates}"
-                );
+                assert_eq!(fenced.live_executor, None, "{coordinates}");
                 assert_eq!(fenced.revision, before.revision + 1, "{coordinates}");
                 assert_eq!(
                     fenced.reply,
@@ -469,13 +503,12 @@ fn loom_second_crash_preserves_every_reply_dma_partial_state() {
                 assert_ne!(fenced.escape, EscapeState::Released, "{coordinates}");
                 assert!(oracle.check_invariants(), "{coordinates}");
 
-                oracle.rebind(3, 3).unwrap();
+                oracle.rebind(executor(1, 3)).unwrap();
                 let rebound = oracle.projection();
                 assert_eq!(rebound.authority, CompositeAuthority::Fenced);
                 assert_eq!(rebound.authority_epoch, fenced.authority_epoch);
                 assert_eq!(rebound.crash_generation, fenced.crash_generation);
-                assert_eq!(rebound.live_incarnation, Some(3), "{coordinates}");
-                assert_eq!(rebound.binding_generation, 3, "{coordinates}");
+                assert_eq!(rebound.live_executor, Some(executor(1, 3)), "{coordinates}");
                 assert_eq!(rebound.revision, fenced.revision + 1, "{coordinates}");
                 assert_eq!(rebound.reply, fenced.reply, "{coordinates}");
                 assert_eq!(rebound.dma, fenced.dma, "{coordinates}");
@@ -587,7 +620,8 @@ fn loom_successor_must_reclaim_a_pending_reuse_reservation_after_crash() {
             let observer_oracle = Arc::clone(&shared);
             let observer = thread::spawn(move || observer_oracle.lock().unwrap().claim(kind));
             let crash_oracle = Arc::clone(&shared);
-            let crash = thread::spawn(move || crash_oracle.lock().unwrap().fence_incarnation(2, 2));
+            let crash =
+                thread::spawn(move || crash_oracle.lock().unwrap().fence_executor(executor(1, 2)));
 
             assert_eq!(observer.join().unwrap(), retained_before);
             assert_eq!(crash.join().unwrap(), Ok(()));
@@ -600,7 +634,7 @@ fn loom_successor_must_reclaim_a_pending_reuse_reservation_after_crash() {
             );
             assert_eq!(oracle.projection(), fenced);
 
-            oracle.rebind(3, 3).unwrap();
+            oracle.rebind(executor(1, 3)).unwrap();
             let rebound = oracle.projection();
             assert_eq!(
                 oracle.activate_reuse(old_permit),
@@ -609,7 +643,7 @@ fn loom_successor_must_reclaim_a_pending_reuse_reservation_after_crash() {
             assert_eq!(oracle.projection(), rebound);
 
             let replacement = reclaim_reuse(&mut oracle, kind).unwrap();
-            assert_eq!(replacement.effect(), old_permit.effect());
+            assert_eq!(replacement.operation(), old_permit.operation());
             assert_eq!(replacement.kind(), old_permit.kind());
             assert_eq!(replacement.resource(), old_permit.resource());
             assert_eq!(
@@ -617,8 +651,7 @@ fn loom_successor_must_reclaim_a_pending_reuse_reservation_after_crash() {
                 old_permit.retired_generation()
             );
             assert_eq!(replacement.next_generation(), old_permit.next_generation());
-            assert_eq!(replacement.actor(), 3);
-            assert_eq!(replacement.binding_generation(), 3);
+            assert_eq!(replacement.actor(), executor(1, 3));
             assert_eq!(
                 replacement.authority_epoch(),
                 oracle.projection().authority_epoch
@@ -657,8 +690,8 @@ fn loom_stale_reply_ack_cannot_mutate_a_new_claimant_or_duplicate_settlement() {
         let old_claim = initial.claim_reply(authority).unwrap();
         initial.record_reply_apply_intent(old_claim).unwrap();
         initial.record_reply_applied(old_claim).unwrap();
-        initial.fence_incarnation(2, 2).unwrap();
-        initial.rebind(3, 3).unwrap();
+        initial.fence_executor(executor(1, 2)).unwrap();
+        initial.rebind(executor(1, 3)).unwrap();
         let new_claim = initial
             .claim_reply(initial.observe_authority().unwrap())
             .unwrap();
@@ -782,14 +815,20 @@ fn loom_quarantined_composite_does_not_freeze_an_unrelated_effect() {
             pinned_page: ResourceId::new(103),
             iova_mapping: ResourceId::new(104),
         };
-        let unrelated =
-            CompositeEffectOracle::new(EffectId::new(0xce02), 7, 9, 1, 1, unrelated_resources);
+        let unrelated = CompositeEffectOracle::new(
+            EffectId::new(OperationId::new(0xce02).unwrap(), 1).unwrap(),
+            executor(7, 9),
+            1,
+            1,
+            unrelated_resources,
+        );
         let unrelated_authority = unrelated.observe_authority().unwrap();
         let quarantined = Arc::new(Mutex::new(quarantined));
         let unrelated = Arc::new(Mutex::new(unrelated));
 
         let fence_oracle = Arc::clone(&quarantined);
-        let fence = thread::spawn(move || fence_oracle.lock().unwrap().fence_incarnation(1, 1));
+        let fence =
+            thread::spawn(move || fence_oracle.lock().unwrap().fence_executor(executor(1, 1)));
         let progress_oracle = Arc::clone(&unrelated);
         let progress = thread::spawn(move || {
             let mut oracle = progress_oracle.lock().unwrap();

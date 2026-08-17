@@ -13,11 +13,11 @@ use cser_core::{
     ChargeAccountId, ClaimId, ClaimScope, CommandRequest, ComponentId, Digest, EffectFactChallenge,
     EffectFactKind, EffectId, EffectReceiptVerifier, EvidenceChallenge, ExternalOutcome,
     HandoffChildResolutionVerifier, HandoffResolutionChallenge, HandoffResolutionVerifier,
-    PrincipalIncarnation, ReceiptVerifier, ResourceGeneration, ResourceId, RootId,
-    TOOL_APPLY_RECEIPT_SCHEMA, TOOL_CLAIM_OUTCOME_SLOT, TOOL_COMMIT_RECEIPT_SCHEMA, TOOL_DOMAIN,
-    TOOL_EVIDENCE_OUTCOME_ACK, TOOL_OBLIGATION_INVOCATION, TOOL_RECEIPT_SCHEMA,
-    TOOL_SETTLEMENT_RECEIPT_SCHEMA, TOOL_VERIFIER, VerificationError, VerifiedEffectObservation,
-    VerifiedObservation, VerifierIdentity,
+    OperationId, ReceiptVerifier, ResourceGeneration, ResourceId, TOOL_APPLY_RECEIPT_SCHEMA,
+    TOOL_CLAIM_OUTCOME_SLOT, TOOL_COMMIT_RECEIPT_SCHEMA, TOOL_DOMAIN, TOOL_EVIDENCE_OUTCOME_ACK,
+    TOOL_OBLIGATION_INVOCATION, TOOL_RECEIPT_SCHEMA, TOOL_SETTLEMENT_RECEIPT_SCHEMA, TOOL_VERIFIER,
+    VerificationError, VerifiedEffectObservation, VerifiedObservation, VerifierBinding,
+    VerifierGeneration, VerifierIdentity,
 };
 use sha2::{Digest as _, Sha256};
 
@@ -29,6 +29,14 @@ use super::core_tool_uart::{
 
 /// Must remain no larger than the bounded UART transport's payload limit.
 const MAX_TOOL_PAYLOAD_BYTES: usize = 576;
+
+// These exact implementation digests are registered by the profile-5
+// provider generation. A scoped challenge must compare the verifier's
+// implementation identity in addition to its class, generation, and schema.
+const TOOL_RECEIPT_IMPLEMENTATION_DIGEST: Digest = Digest::new([0x71; 32]);
+const TOOL_COMMIT_IMPLEMENTATION_DIGEST: Digest = Digest::new([0x72; 32]);
+const TOOL_APPLY_IMPLEMENTATION_DIGEST: Digest = Digest::new([0x73; 32]);
+const TOOL_SETTLEMENT_IMPLEMENTATION_DIGEST: Digest = Digest::new([0x74; 32]);
 
 /// SHA-256("nexus-cser-tool-provider-child-route-v1"). This fixed provider
 /// route is part of the descriptor receipt; callers cannot choose it.
@@ -160,7 +168,7 @@ impl ToolOperationPlan {
         let operation_key = hash_parts(
             b"nexus-cser-tool-key-v1",
             &[
-                &effect.root().get().to_le_bytes(),
+                &effect.operation().get().to_le_bytes(),
                 &effect.sequence().to_le_bytes(),
                 &component.get().to_le_bytes(),
                 &claim.get().to_le_bytes(),
@@ -664,8 +672,22 @@ impl ToolOutcomeVerifier {
     }
 
     fn identity_for(self, schema: cser_core::ReceiptSchemaId) -> VerifierIdentity {
-        VerifierIdentity::new(TOOL_VERIFIER, self.epoch, schema)
-            .expect("non-zero tool verifier epoch and static schema are valid")
+        let implementation_digest = match schema {
+            TOOL_RECEIPT_SCHEMA => TOOL_RECEIPT_IMPLEMENTATION_DIGEST,
+            TOOL_COMMIT_RECEIPT_SCHEMA => TOOL_COMMIT_IMPLEMENTATION_DIGEST,
+            TOOL_APPLY_RECEIPT_SCHEMA => TOOL_APPLY_IMPLEMENTATION_DIGEST,
+            TOOL_SETTLEMENT_RECEIPT_SCHEMA => TOOL_SETTLEMENT_IMPLEMENTATION_DIGEST,
+            _ => panic!("tool verifier schema has no registered implementation digest"),
+        };
+        let binding = VerifierBinding::new(
+            TOOL_VERIFIER,
+            VerifierGeneration::new(self.epoch)
+                .expect("non-zero tool verifier generation is valid"),
+            schema,
+            implementation_digest,
+        )
+        .expect("tool verifier binding is valid");
+        VerifierIdentity::new_exact(binding)
     }
 
     fn exact_observation(self, observation: &DurableToolObservation) -> bool {
@@ -689,7 +711,7 @@ impl EffectReceiptVerifier for ToolOutcomeVerifier {
     ) -> Result<VerifiedEffectObservation, VerificationError> {
         if !self.exact_observation(observation)
             || challenge.effect() != self.plan.effect()
-            || challenge.component() != Some(self.plan.component())
+            || challenge.component() != self.plan.component()
             || challenge.domain() != TOOL_DOMAIN
             || challenge.obligation() != TOOL_OBLIGATION_INVOCATION
             || challenge.expected_verifier() != TOOL_VERIFIER
@@ -803,7 +825,7 @@ impl ReceiptVerifier for ToolOutcomeVerifier {
     ) -> Result<VerifiedObservation, VerificationError> {
         if !self.exact_observation(observation)
             || challenge.effect() != self.plan.effect()
-            || challenge.component() != Some(self.plan.component())
+            || challenge.component() != self.plan.component()
             || challenge.claim() != self.plan.claim()
             || challenge.domain() != TOOL_DOMAIN
             || challenge.kind() != TOOL_EVIDENCE_OUTCOME_ACK
@@ -1026,11 +1048,11 @@ mod tests {
         OperationKey, ToolResponse, ToolRunId, ToolTerminalOutput, ToolTerminalRecord,
         ToolV2Identity, terminal_record_for_test,
     };
-    use cser_core::{ClaimId, ComponentId, EffectId, ResourceGeneration, ResourceId, RootId};
+    use cser_core::{ClaimId, ComponentId, EffectId, OperationId, ResourceGeneration, ResourceId};
 
     #[test]
     fn plan_binds_key_and_payload_before_submit() {
-        let effect = EffectId::new(RootId::new(7).unwrap(), 9).unwrap();
+        let effect = EffectId::new(OperationId::new(7).unwrap(), 9).unwrap();
         let plan = ToolOperationPlan::new(
             [0x12; 16],
             effect,
@@ -1060,7 +1082,7 @@ mod tests {
 
     #[test]
     fn cser2_plan_digest_binds_complete_recovery_identity() {
-        let effect = EffectId::new(RootId::new(7).unwrap(), 9).unwrap();
+        let effect = EffectId::new(OperationId::new(7).unwrap(), 9).unwrap();
         let base = ToolOperationPlan::new(
             [0x12; 16],
             effect,
@@ -1099,7 +1121,7 @@ mod tests {
 
     #[test]
     fn observation_requires_the_exact_decoded_terminal_record() {
-        let effect = EffectId::new(RootId::new(7).unwrap(), 9).unwrap();
+        let effect = EffectId::new(OperationId::new(7).unwrap(), 9).unwrap();
         let plan = ToolOperationPlan::new(
             [0x33; 16],
             effect,
@@ -1130,7 +1152,7 @@ mod tests {
 
     #[test]
     fn checksum_bound_nonterminal_absent_and_expired_states_remain_distinct() {
-        let effect = EffectId::new(RootId::new(7).unwrap(), 9).unwrap();
+        let effect = EffectId::new(OperationId::new(7).unwrap(), 9).unwrap();
         let plan = ToolOperationPlan::new(
             [0x33; 16],
             effect,
@@ -1154,7 +1176,7 @@ mod tests {
 
     #[test]
     fn canonical_core_child_descriptor_wire_is_the_only_accepted_shape() {
-        let parent = EffectId::new(RootId::new(9).unwrap(), 2).unwrap();
+        let parent = EffectId::new(OperationId::new(9).unwrap(), 2).unwrap();
         let descriptor = cser_core::ChildDescriptorV1 {
             schema: 1,
             sequence: 1,
@@ -1186,7 +1208,7 @@ mod tests {
 
     #[test]
     fn child_descriptor_verifier_binds_live_terminal_plan_fields() {
-        let parent = EffectId::new(RootId::new(21).unwrap(), 2).unwrap();
+        let parent = EffectId::new(OperationId::new(21).unwrap(), 2).unwrap();
         let payload = b"handoff-input";
         let catalog = cser_core::tool_dma_catalog().digest();
         let identity = ToolV2Identity::new(
@@ -1278,7 +1300,7 @@ mod tests {
 
     #[test]
     fn cser3_child_plan_is_descriptor_bound_and_requires_output_none() {
-        let parent = EffectId::new(RootId::new(31).unwrap(), 2).unwrap();
+        let parent = EffectId::new(OperationId::new(31).unwrap(), 2).unwrap();
         let catalog = cser_core::tool_dma_catalog().digest();
         let identity = ToolV2Identity::new(
             b"handoff",
@@ -1349,7 +1371,7 @@ mod tests {
             Err(ToolObservationError::PlanRecordMismatch)
         );
         let mut wrong_descriptor = descriptor;
-        wrong_descriptor.parent = EffectId::new(RootId::new(32).unwrap(), 2).unwrap();
+        wrong_descriptor.parent = EffectId::new(OperationId::new(32).unwrap(), 2).unwrap();
         assert_eq!(
             ToolOperationPlan::handoff_child_for_descriptor(source, wrong_descriptor),
             Err(ToolPlanError::InvalidCoordinate)

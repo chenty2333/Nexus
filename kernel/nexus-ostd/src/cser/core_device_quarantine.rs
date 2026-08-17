@@ -5,15 +5,20 @@
 //! Hardware ownership remains in `nexus-ostd-virtio`; this module only binds
 //! its linear guard and trusted device generation to the recovery coordinator.
 
-use cser_core::{
-    ClaimProjection, ClaimScope, ComponentClaimProjection, ComponentId, DEVICE_CLAIM_IOVA,
-    DEVICE_CLAIM_PINNED_PAGE, DEVICE_DOMAIN, DEVICE_EVIDENCE_IOTLB, DEVICE_EVIDENCE_IRQ_DRAINED,
-    DEVICE_EVIDENCE_RESET, DEVICE_RECEIPT_SCHEMA, DEVICE_VERIFIER, DeviceGeneration, Digest,
-    EffectId, EvidenceChallenge, Freshness, ReceiptSchemaId, ReceiptVerifier, ResourceGeneration,
-    ResourceId, VerificationError, VerifiedObservation, VerifierIdentity,
-};
 #[cfg(feature = "cser-production")]
-use cser_core::{VerifierBinding, VerifierGeneration};
+use super::core_production_registry::{
+    DEVICE_RECEIPT_IMPLEMENTATION_DIGEST, PRODUCTION_WORLD, STANDARD_DMA_PROVIDER,
+};
+use cser_core::{
+    ClaimScope, ComponentClaimProjection, ComponentId, DEVICE_CLAIM_IOVA, DEVICE_CLAIM_PINNED_PAGE,
+    DEVICE_DOMAIN, DEVICE_EVIDENCE_IOTLB, DEVICE_EVIDENCE_IRQ_DRAINED, DEVICE_EVIDENCE_RESET,
+    DEVICE_RECEIPT_SCHEMA, DEVICE_VERIFIER, DeviceGeneration, Digest, EffectId, EvidenceChallenge,
+    Freshness, ProviderCoordinate, ReceiptSchemaId, ReceiptVerifier, ResourceGeneration,
+    ResourceId, VerificationError, VerifiedObservation, VerifierBinding, VerifierGeneration,
+    VerifierIdentity, WorldId,
+};
+#[cfg(not(feature = "cser-production"))]
+use cser_core::{ProviderGeneration, ProviderId};
 use nexus_ostd_virtio::{
     ActivatedBootDevice, BootClaimCoordinateError, BootClaimCoordinates,
     BootClaimQuarantineReceipts, BootDeviceScope, BootGlobalIotlbInvalidationReceipt,
@@ -23,11 +28,46 @@ use nexus_ostd_virtio::{
 };
 use sha2::{Digest as _, Sha256};
 
-#[cfg(feature = "cser-production")]
-use super::core_production_registry::{
-    DEVICE_RECEIPT_IMPLEMENTATION_DIGEST, PRODUCTION_WORLD, STANDARD_DMA_PROVIDER,
-};
 use super::core_reboot::{BootDeviceQuarantine, BootDeviceQuarantineGuard};
+
+#[cfg(not(feature = "cser-production"))]
+const DEVICE_RECEIPT_IMPLEMENTATION_DIGEST: Digest = Digest::new([0x61; 32]);
+
+#[cfg(not(feature = "cser-production"))]
+const NONPRODUCTION_DMA_PROVIDER: ProviderCoordinate = ProviderCoordinate::new(
+    match WorldId::new(1) {
+        Ok(value) => value,
+        Err(_) => unreachable!(),
+    },
+    match ProviderId::new(2) {
+        Ok(value) => value,
+        Err(_) => unreachable!(),
+    },
+    match ProviderGeneration::new(1) {
+        Ok(value) => value,
+        Err(_) => unreachable!(),
+    },
+);
+
+#[cfg(not(feature = "cser-production"))]
+const fn quarantine_provider_coordinate() -> ProviderCoordinate {
+    NONPRODUCTION_DMA_PROVIDER
+}
+
+#[cfg(feature = "cser-production")]
+const fn quarantine_provider_coordinate() -> ProviderCoordinate {
+    STANDARD_DMA_PROVIDER
+}
+
+#[cfg(feature = "cser-production")]
+const fn quarantine_world() -> WorldId {
+    PRODUCTION_WORLD
+}
+
+#[cfg(not(feature = "cser-production"))]
+const fn quarantine_world() -> WorldId {
+    NONPRODUCTION_DMA_PROVIDER.world()
+}
 
 /// One request to fence the fixed production device at a trusted generation.
 pub(crate) struct OstdVirtioBootQuarantine {
@@ -82,36 +122,6 @@ pub(crate) enum OstdBootClaimBindingError {
     Hardware(BootReceiptBindingError),
 }
 
-/// Projects whole-device quarantine observations onto one exact replayed claim.
-///
-/// The returned IOTLB receipt remains descriptive only. In particular, this
-/// helper does not turn a global invalidation into page/IOVA custody or reuse
-/// authority.
-pub(crate) fn project_replayed_claim(
-    guard: &BootQuarantineGuard,
-    claim: ClaimProjection,
-) -> Result<BootClaimQuarantineReceipts, OstdBootClaimBindingError> {
-    let ClaimScope::Device(scope) = claim.scope else {
-        return Err(OstdBootClaimBindingError::LogicalClaim);
-    };
-    let scope = BootDeviceScope::new(scope.get()).map_err(OstdBootClaimBindingError::Coordinate)?;
-    let coordinates = BootClaimCoordinates::new(
-        scope,
-        claim.effect.root().get(),
-        claim.effect.sequence(),
-        claim.claim.get(),
-        claim.kind.get(),
-        claim.resource.get(),
-        claim.resource_generation.get(),
-        claim.units,
-        claim.enrolled_freshness.device().get(),
-    )
-    .map_err(OstdBootClaimBindingError::Coordinate)?;
-    guard
-        .project_claim_quarantine(coordinates)
-        .map_err(OstdBootClaimBindingError::Hardware)
-}
-
 /// Projects whole-device quarantine observations onto one component-local
 /// replayed claim, preserving the component coordinate in every receipt.
 pub(crate) fn project_replayed_component_claim(
@@ -124,7 +134,7 @@ pub(crate) fn project_replayed_component_claim(
     let scope = BootDeviceScope::new(scope.get()).map_err(OstdBootClaimBindingError::Coordinate)?;
     let coordinates = BootClaimCoordinates::new_component(
         scope,
-        claim.effect.root().get(),
+        claim.effect.operation().get(),
         claim.effect.sequence(),
         claim.component.get(),
         claim.claim.get(),
@@ -143,7 +153,7 @@ pub(crate) fn project_replayed_component_claim(
 #[derive(Clone, Copy)]
 struct ReplayedClaim {
     effect: EffectId,
-    component: Option<ComponentId>,
+    component: ComponentId,
     claim: cser_core::ClaimId,
     kind: cser_core::ClaimKindId,
     scope: ClaimScope,
@@ -153,27 +163,11 @@ struct ReplayedClaim {
     enrolled_freshness: Freshness,
 }
 
-impl From<ClaimProjection> for ReplayedClaim {
-    fn from(claim: ClaimProjection) -> Self {
-        Self {
-            effect: claim.effect,
-            component: None,
-            claim: claim.claim,
-            kind: claim.kind,
-            scope: claim.scope,
-            resource: claim.resource,
-            resource_generation: claim.resource_generation,
-            units: claim.units,
-            enrolled_freshness: claim.enrolled_freshness,
-        }
-    }
-}
-
 impl From<ComponentClaimProjection> for ReplayedClaim {
     fn from(claim: ComponentClaimProjection) -> Self {
         Self {
             effect: claim.effect,
-            component: Some(claim.component),
+            component: claim.component,
             claim: claim.claim,
             kind: claim.kind,
             scope: claim.scope,
@@ -192,27 +186,11 @@ pub(crate) struct OstdBootClaimVerifier {
 }
 
 impl OstdBootClaimVerifier {
-    pub(crate) const fn new(claim: ClaimProjection) -> Self {
-        Self {
-            claim: ReplayedClaim {
-                effect: claim.effect,
-                component: None,
-                claim: claim.claim,
-                kind: claim.kind,
-                scope: claim.scope,
-                resource: claim.resource,
-                resource_generation: claim.resource_generation,
-                units: claim.units,
-                enrolled_freshness: claim.enrolled_freshness,
-            },
-        }
-    }
-
     pub(crate) const fn new_component(claim: ComponentClaimProjection) -> Self {
         Self {
             claim: ReplayedClaim {
                 effect: claim.effect,
-                component: Some(claim.component),
+                component: claim.component,
                 claim: claim.claim,
                 kind: claim.kind,
                 scope: claim.scope,
@@ -245,9 +223,9 @@ impl OstdBootClaimVerifier {
             && challenge.resource_generation() == self.claim.resource_generation
             && challenge.subject() == self.claim.enrolled_freshness
             && coordinates.scope().get() == scope.get()
-            && coordinates.effect_root() == self.claim.effect.root().get()
+            && coordinates.effect_root() == self.claim.effect.operation().get()
             && coordinates.effect_sequence() == self.claim.effect.sequence()
-            && coordinates.component() == self.claim.component.map(ComponentId::get)
+            && coordinates.component() == Some(self.claim.component.get())
             && coordinates.claim() == self.claim.claim.get()
             && coordinates.claim_kind() == self.claim.kind.get()
             && coordinates.resource() == self.claim.resource.get()
@@ -259,7 +237,6 @@ impl OstdBootClaimVerifier {
     }
 }
 
-#[cfg(feature = "cser-production")]
 fn quarantine_verifier_identity() -> VerifierIdentity {
     let binding = VerifierBinding::new(
         DEVICE_VERIFIER,
@@ -271,13 +248,6 @@ fn quarantine_verifier_identity() -> VerifierIdentity {
     VerifierIdentity::new_exact(binding)
 }
 
-#[cfg(not(feature = "cser-production"))]
-fn quarantine_verifier_identity() -> VerifierIdentity {
-    VerifierIdentity::new(DEVICE_VERIFIER, 1, DEVICE_RECEIPT_SCHEMA)
-        .expect("legacy device verifier identity is valid")
-}
-
-#[cfg(feature = "cser-production")]
 fn quarantine_scope_matches(challenge: &EvidenceChallenge, schema: ReceiptSchemaId) -> bool {
     let Ok(binding) = VerifierBinding::new(
         DEVICE_VERIFIER,
@@ -287,24 +257,12 @@ fn quarantine_scope_matches(challenge: &EvidenceChallenge, schema: ReceiptSchema
     ) else {
         return false;
     };
-    match (
-        challenge.verification_scope(),
-        challenge.expected_verifier_binding(),
-    ) {
-        (None, None) => false,
-        (Some(scope), Some(expected)) => {
-            scope.world() == PRODUCTION_WORLD
-                && scope.provider() == STANDARD_DMA_PROVIDER
-                && scope.verifier_binding() == expected
-                && expected == binding
-        }
-        _ => false,
-    }
-}
-
-#[cfg(not(feature = "cser-production"))]
-fn quarantine_scope_matches(challenge: &EvidenceChallenge, _schema: ReceiptSchemaId) -> bool {
-    challenge.verification_scope().is_none() && challenge.expected_verifier_binding().is_none()
+    let scope = challenge.verification_scope();
+    scope.world() == quarantine_world()
+        && scope.provider() == quarantine_provider_coordinate()
+        && scope.operation() == challenge.effect().operation()
+        && scope.verifier_binding() == binding
+        && challenge.expected_verifier_binding() == binding
 }
 
 impl ReceiptVerifier for OstdBootClaimVerifier {
@@ -346,12 +304,6 @@ pub(crate) struct OstdBootIrqVerifier {
 }
 
 impl OstdBootIrqVerifier {
-    pub(crate) const fn new(claim: ClaimProjection) -> Self {
-        Self {
-            claim: OstdBootClaimVerifier::new(claim).claim,
-        }
-    }
-
     pub(crate) const fn new_component(claim: ComponentClaimProjection) -> Self {
         Self {
             claim: OstdBootClaimVerifier::new_component(claim).claim,

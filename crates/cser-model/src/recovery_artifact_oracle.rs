@@ -9,115 +9,9 @@
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
-use crate::EffectId;
-
-/// Stable world identity allocated by the embedding kernel.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct WorldId(u64);
-
-impl WorldId {
-    /// Constructs a non-zero world identity.
-    #[must_use]
-    pub const fn new(raw: u64) -> Option<Self> {
-        if raw == 0 { None } else { Some(Self(raw)) }
-    }
-
-    /// Returns the numeric identity.
-    #[must_use]
-    pub const fn get(self) -> u64 {
-        self.0
-    }
-}
-
-/// Stable provider identity within a world.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct ProviderId(u64);
-
-impl ProviderId {
-    /// Constructs a non-zero provider identity.
-    #[must_use]
-    pub const fn new(raw: u64) -> Option<Self> {
-        if raw == 0 { None } else { Some(Self(raw)) }
-    }
-
-    /// Returns the numeric identity.
-    #[must_use]
-    pub const fn get(self) -> u64 {
-        self.0
-    }
-}
-
-/// Monotonic provider-generation identity.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct ProviderGeneration(u64);
-
-impl ProviderGeneration {
-    /// Constructs a non-zero provider generation.
-    #[must_use]
-    pub const fn new(raw: u64) -> Option<Self> {
-        if raw == 0 { None } else { Some(Self(raw)) }
-    }
-
-    /// Returns the numeric generation.
-    #[must_use]
-    pub const fn get(self) -> u64 {
-        self.0
-    }
-}
-
-/// Stable operation identity for one admitted effect.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct OperationId(u64);
-
-impl OperationId {
-    /// Constructs a non-zero operation identity.
-    #[must_use]
-    pub const fn new(raw: u64) -> Option<Self> {
-        if raw == 0 { None } else { Some(Self(raw)) }
-    }
-
-    /// Returns the numeric identity.
-    #[must_use]
-    pub const fn get(self) -> u64 {
-        self.0
-    }
-}
-
-/// Bounded component identity within one effect.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct ComponentId(u8);
-
-impl ComponentId {
-    /// Constructs a non-zero component identity.
-    #[must_use]
-    pub const fn new(raw: u8) -> Option<Self> {
-        if raw == 0 { None } else { Some(Self(raw)) }
-    }
-
-    /// Returns the numeric identity.
-    #[must_use]
-    pub const fn get(self) -> u8 {
-        self.0
-    }
-}
-
-/// Stable recovery-artifact lease identity.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct RecoveryArtifactId(u64);
-
-impl RecoveryArtifactId {
-    /// Constructs a non-zero recovery-artifact identity.
-    #[must_use]
-    pub const fn new(raw: u64) -> Option<Self> {
-        if raw == 0 { None } else { Some(Self(raw)) }
-    }
-
-    /// Returns the numeric identity.
-    #[must_use]
-    pub const fn get(self) -> u64 {
-        self.0
-    }
-}
+use crate::{
+    ArtifactId, ComponentId, EffectId, OperationId, ProviderGeneration, ProviderId, WorldId,
+};
 
 /// Opaque closure identity supplied by the embedding artifact system.
 pub type ClosureDigest = [u8; 32];
@@ -212,7 +106,7 @@ pub enum ArtifactLeaseState {
 /// Exact release permit minted by the oracle.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ArtifactReleasePermit {
-    lease: RecoveryArtifactId,
+    lease: ArtifactId,
     owner: ArtifactOwner,
     authorization_epoch: u64,
 }
@@ -220,7 +114,7 @@ pub struct ArtifactReleasePermit {
 impl ArtifactReleasePermit {
     /// Returns the lease authorized by this permit.
     #[must_use]
-    pub const fn lease(self) -> RecoveryArtifactId {
+    pub const fn lease(self) -> ArtifactId {
         self.lease
     }
 
@@ -256,7 +150,7 @@ pub struct ComponentProjection {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ArtifactProjection {
     /// Lease identity.
-    pub lease: RecoveryArtifactId,
+    pub lease: ArtifactId,
     /// Exact lease owner tuple.
     pub owner: ArtifactOwner,
     /// Current lease lifecycle.
@@ -361,12 +255,11 @@ struct ComponentRecord {
     phase: ComponentPhase,
     physical_retired: bool,
     claims_retired: bool,
-    artifacts: Vec<RecoveryArtifactId>,
+    artifacts: Vec<ArtifactId>,
 }
 
 #[derive(Clone, Debug)]
 struct EffectRecord {
-    operation: OperationId,
     provider: ProviderId,
     generation: ProviderGeneration,
     components: BTreeMap<ComponentId, ComponentRecord>,
@@ -390,7 +283,7 @@ pub struct RecoveryArtifactOracle {
     providers: BTreeMap<(ProviderId, ProviderGeneration), ProviderRecord>,
     effects: BTreeMap<EffectId, EffectRecord>,
     operations: BTreeMap<OperationId, EffectId>,
-    artifacts: BTreeMap<RecoveryArtifactId, ArtifactRecord>,
+    artifacts: BTreeMap<ArtifactId, ArtifactRecord>,
 }
 
 impl RecoveryArtifactOracle {
@@ -460,7 +353,6 @@ impl RecoveryArtifactOracle {
     pub fn admit_effect(
         &mut self,
         effect: EffectId,
-        operation: OperationId,
         provider: ProviderId,
         generation: ProviderGeneration,
         components: &[ComponentId],
@@ -468,6 +360,7 @@ impl RecoveryArtifactOracle {
         if self.effects.contains_key(&effect) {
             return Err(ArtifactError::EffectAlreadyExists);
         }
+        let operation = effect.operation();
         if self.operations.contains_key(&operation) {
             return Err(ArtifactError::OperationAlreadyExists);
         }
@@ -500,7 +393,6 @@ impl RecoveryArtifactOracle {
         self.effects.insert(
             effect,
             EffectRecord {
-                operation,
                 provider,
                 generation,
                 components: component_records,
@@ -514,7 +406,7 @@ impl RecoveryArtifactOracle {
     /// Declares one required artifact lease for an admitted component.
     pub fn require_artifact(
         &mut self,
-        lease: RecoveryArtifactId,
+        lease: ArtifactId,
         owner: ArtifactOwner,
     ) -> Result<(), ArtifactError> {
         self.check_owner_effect(owner)?;
@@ -542,7 +434,7 @@ impl RecoveryArtifactOracle {
     /// Pins a declared recovery-artifact lease against its exact owner tuple.
     pub fn pin_artifact(
         &mut self,
-        lease: RecoveryArtifactId,
+        lease: ArtifactId,
         owner: ArtifactOwner,
     ) -> Result<(), ArtifactError> {
         let record = self.artifact_record_mut(lease, owner)?;
@@ -703,7 +595,7 @@ impl RecoveryArtifactOracle {
     /// retirement.  Repeating this call returns the exact same permit.
     pub fn authorize_artifact_release(
         &mut self,
-        lease: RecoveryArtifactId,
+        lease: ArtifactId,
         owner: ArtifactOwner,
     ) -> Result<ArtifactReleasePermit, ArtifactError> {
         let component = self.component_record(owner.effect, owner.component)?;
@@ -740,7 +632,7 @@ impl RecoveryArtifactOracle {
     /// Reissues the exact persisted release permit after a recovery cut.
     pub fn reissue_release_permit(
         &self,
-        lease: RecoveryArtifactId,
+        lease: ArtifactId,
         owner: ArtifactOwner,
     ) -> Result<ArtifactReleasePermit, ArtifactError> {
         let record = self.artifact_record(lease, owner)?;
@@ -937,7 +829,7 @@ impl RecoveryArtifactOracle {
         for (key, provider) in &self.providers {
             if provider.provider != key.0
                 || provider.generation != key.1
-                || self.world == WorldId(0)
+                || self.world.get() == 0
                 || provider.phase.is_retired()
                     && self.effects.values().any(|effect| {
                         effect.provider == provider.provider
@@ -958,7 +850,7 @@ impl RecoveryArtifactOracle {
             let Some(effect) = self.effects.get(&artifact.owner.effect) else {
                 return false;
             };
-            if effect.operation != artifact.owner.operation
+            if artifact.owner.effect.operation() != artifact.owner.operation
                 || effect.provider != artifact.owner.provider
                 || effect.generation != artifact.owner.generation
                 || !effect
@@ -1036,7 +928,7 @@ impl RecoveryArtifactOracle {
             .effects
             .get(&owner.effect)
             .ok_or(ArtifactError::UnknownEffect)?;
-        if effect.operation != owner.operation
+        if owner.effect.operation() != owner.operation
             || effect.provider != owner.provider
             || effect.generation != owner.generation
         {
@@ -1076,7 +968,7 @@ impl RecoveryArtifactOracle {
 
     fn artifact_record(
         &self,
-        lease: RecoveryArtifactId,
+        lease: ArtifactId,
         owner: ArtifactOwner,
     ) -> Result<&ArtifactRecord, ArtifactError> {
         let record = self
@@ -1091,7 +983,7 @@ impl RecoveryArtifactOracle {
 
     fn artifact_record_mut(
         &mut self,
-        lease: RecoveryArtifactId,
+        lease: ArtifactId,
         owner: ArtifactOwner,
     ) -> Result<&mut ArtifactRecord, ArtifactError> {
         let record = self
@@ -1124,10 +1016,9 @@ mod tests {
         world: WorldId,
         provider: ProviderId,
         generation: ProviderGeneration,
-        operation: OperationId,
         effect: EffectId,
         component: ComponentId,
-        lease: RecoveryArtifactId,
+        lease: ArtifactId,
         owner: ArtifactOwner,
     }
 
@@ -1136,14 +1027,13 @@ mod tests {
         let provider = ProviderId::new(7).unwrap();
         let generation = ProviderGeneration::new(3).unwrap();
         let operation = OperationId::new(11).unwrap();
-        let effect = EffectId::new(13);
+        let effect = EffectId::new(operation, 13).unwrap();
         let component = ComponentId::new(1).unwrap();
-        let lease = RecoveryArtifactId::new(17).unwrap();
+        let lease = ArtifactId::new(17).unwrap();
         Fixture {
             world,
             provider,
             generation,
-            operation,
             effect,
             component,
             lease,
@@ -1167,7 +1057,6 @@ mod tests {
         oracle
             .admit_effect(
                 fixture.effect,
-                fixture.operation,
                 fixture.provider,
                 fixture.generation,
                 &[fixture.component],
@@ -1307,7 +1196,7 @@ mod tests {
     fn equal_closure_digests_have_independent_leases() {
         let fixture = fixture();
         let mut oracle = admitted(&fixture);
-        let lease_two = RecoveryArtifactId::new(18).unwrap();
+        let lease_two = ArtifactId::new(18).unwrap();
         oracle
             .require_artifact(fixture.lease, fixture.owner)
             .unwrap();

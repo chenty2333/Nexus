@@ -14,8 +14,8 @@
 //! instance until it is dropped and recovered from the trusted anchor.
 
 use crate::{
-    AuthorityBindingGeneration, Digest, Freshness, JournalRecord, RecoveryAnchor,
-    RecoveryAnchorError, RegistryInstance, WorldId,
+    Digest, Freshness, JournalRecord, RecoveryAnchor, RecoveryAnchorError, RegistryInstance,
+    WorldId,
 };
 
 /// Immutable schema coordinates which govern one recovery domain.
@@ -80,24 +80,22 @@ impl RecoveryProfile {
     }
 }
 
-/// Stable schema and principal-binding coordinates expected at boot.
+/// Stable schema and recovery coordinates expected at boot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RecoveryBinding {
     profile: RecoveryProfile,
     world: WorldId,
     catalog_digest: Digest,
     registry: RegistryInstance,
-    authority_binding: AuthorityBindingGeneration,
 }
 
 impl RecoveryBinding {
-    /// Creates an exact recovery binding.
+    /// Creates an exact recovery binding for an immutable catalog set.
     pub const fn new(
         profile: RecoveryProfile,
         world: WorldId,
         catalog_digest: Digest,
         registry: RegistryInstance,
-        authority_binding: AuthorityBindingGeneration,
     ) -> Result<Self, PersistenceProtocolError> {
         if catalog_digest.is_zero() {
             return Err(PersistenceProtocolError::InvalidAnchor);
@@ -107,7 +105,6 @@ impl RecoveryBinding {
             world,
             catalog_digest,
             registry,
-            authority_binding,
         })
     }
 
@@ -121,7 +118,8 @@ impl RecoveryBinding {
         self.world
     }
 
-    /// Returns the expected domain-catalog digest.
+    /// Returns the aggregate digest of the immutable catalog set expected for
+    /// recovery. Per-effect/provider schema digests remain in their records.
     pub const fn catalog_digest(self) -> Digest {
         self.catalog_digest
     }
@@ -129,16 +127,6 @@ impl RecoveryBinding {
     /// Returns the expected durable Registry identity.
     pub const fn registry(self) -> RegistryInstance {
         self.registry
-    }
-
-    /// Returns the expected principal-binding generation.
-    pub const fn binding(self) -> AuthorityBindingGeneration {
-        self.authority_binding
-    }
-
-    /// Returns the global recovery-authority generation.
-    pub const fn authority_binding(self) -> AuthorityBindingGeneration {
-        self.authority_binding
     }
 }
 
@@ -164,9 +152,7 @@ impl TrustedAnchorSnapshot {
         head: Digest,
         projection: Digest,
     ) -> Result<Self, PersistenceProtocolError> {
-        if committed_freshness.registry().get() != binding.registry().get()
-            || committed_freshness.binding() != binding.binding().get()
-        {
+        if committed_freshness.registry().get() != binding.registry().get() {
             return Err(PersistenceProtocolError::BindingMismatch);
         }
         if projection.is_zero() || (revision == 0) != head.is_zero() {
@@ -267,7 +253,7 @@ impl RecoveryLease {
 pub enum PersistenceProtocolError {
     /// A zero digest or inconsistent genesis coordinates were supplied.
     InvalidAnchor,
-    /// Catalog, Registry, schema, world, or authority-binding coordinates do not match.
+    /// Catalog, Registry, schema, or world coordinates do not match.
     BindingMismatch,
     /// A record does not extend the exact trusted journal tip.
     StaleJournalHead,
@@ -538,6 +524,13 @@ where
         )
         .map_err(CoordinatedPersistenceError::Protocol)?;
 
+        // A whole-state checkpoint may own up to the configured checkpoint
+        // limit. Materialize the coordinator's replacement before crossing
+        // either durability boundary: cloning it after the journal append and
+        // anchor advance would leave allocation as a fallible operation in the
+        // publication-only suffix.
+        let committed_checkpoint = record.is_whole_state_checkpoint().then(|| record.clone());
+
         self.recovery_required = true;
         self.journal
             .append_and_sync(record)
@@ -546,7 +539,7 @@ where
             .compare_and_advance(self.committed, replacement)
             .map_err(CoordinatedPersistenceError::Anchor)?;
         self.committed = replacement;
-        self.committed_checkpoint = record.is_whole_state_checkpoint().then(|| record.clone());
+        self.committed_checkpoint = committed_checkpoint;
         if self.reserved_recovery == Some(resulting_freshness) {
             self.reserved_recovery = None;
         }
@@ -560,8 +553,8 @@ mod tests {
     use alloc::vec::Vec;
 
     use crate::{
-        BootGeneration, CoreLimits, DeviceGeneration, Engine, JournalGeneration, RegistryInstance,
-        standard_catalog,
+        BootGeneration, CatalogSet, CoreLimits, DeviceGeneration, Engine, JournalGeneration,
+        RegistryInstance, standard_catalog,
     };
 
     use super::*;
@@ -641,29 +634,27 @@ mod tests {
         Freshness::new(
             BootGeneration::new(boot).unwrap(),
             RegistryInstance::new(1).unwrap(),
-            1,
             DeviceGeneration::new(1).unwrap(),
             JournalGeneration::new(boot).unwrap(),
         )
-        .unwrap()
     }
 
     fn coordinator(
         fail_replacement: bool,
     ) -> (Engine, CoordinatedPersistence<TestJournal, TestAnchor>) {
         let catalog = standard_catalog();
+        let catalog_set = CatalogSet::new(core::slice::from_ref(&catalog)).unwrap();
         let engine = Engine::new(
             crate::WorldId::new(1).unwrap(),
-            catalog.clone(),
+            catalog_set.clone(),
             CoreLimits::bounded_default(),
             freshness(1),
         );
         let binding = RecoveryBinding::new(
             RecoveryProfile::current(),
             crate::WorldId::new(1).unwrap(),
-            catalog.digest(),
+            catalog_set.digest(),
             RegistryInstance::new(1).unwrap(),
-            crate::AuthorityBindingGeneration::new(1).unwrap(),
         )
         .unwrap();
         let committed = TrustedAnchorSnapshot::from_trusted_backend(
@@ -782,7 +773,7 @@ mod tests {
             bytes.extend_from_slice(record.bytes());
         }
         let recovered = Engine::recover(
-            standard_catalog(),
+            CatalogSet::new(&[standard_catalog()]).unwrap(),
             CoreLimits::bounded_default(),
             RecoveryAnchor::from_trusted_provider(
                 anchor.committed.binding(),

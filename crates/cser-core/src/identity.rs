@@ -43,16 +43,6 @@ macro_rules! nonzero_id {
 }
 
 nonzero_id!(
-    RootId,
-    u64,
-    "Stable identity of one causal and charging root."
-);
-nonzero_id!(
-    PrincipalId,
-    u64,
-    "Stable logical identity of one restartable principal."
-);
-nonzero_id!(
     RegistryInstance,
     u64,
     "Durable identity of one authoritative Registry instance."
@@ -66,11 +56,6 @@ nonzero_id!(
     JournalGeneration,
     u64,
     "Monotonic journal generation supplied by the persistence provider."
-);
-nonzero_id!(
-    AuthorityBindingGeneration,
-    u64,
-    "Monotonic generation of the global recovery authority binding."
 );
 nonzero_id!(
     DeviceGeneration,
@@ -152,6 +137,16 @@ nonzero_id!(
     "Monotonic generation of one semantic provider."
 );
 nonzero_id!(
+    ExecutorId,
+    u64,
+    "Stable logical identity of one effect executor."
+);
+nonzero_id!(
+    ExecutorGeneration,
+    u64,
+    "Monotonic generation of one effect executor."
+);
+nonzero_id!(
     OperationId,
     u64,
     "Stable identity of one general causal operation allocated by the embedding."
@@ -201,62 +196,65 @@ impl ProviderCoordinate {
     }
 }
 
-/// Stable identity of one effect below a causal root.
+/// Exact executor generation coordinate bound to an effect or observation.
+///
+/// The executor identity is deliberately separate from the provider
+/// coordinate. A provider may be invoked by more than one executor, and an
+/// executor generation can be retired independently of the provider it uses.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ExecutorCoordinate {
+    executor: ExecutorId,
+    generation: ExecutorGeneration,
+}
+
+impl ExecutorCoordinate {
+    /// Creates an executor coordinate from its non-zero identity components.
+    pub const fn new(executor: ExecutorId, generation: ExecutorGeneration) -> Self {
+        Self {
+            executor,
+            generation,
+        }
+    }
+
+    /// Returns the logical executor identity.
+    pub const fn executor(self) -> ExecutorId {
+        self.executor
+    }
+
+    /// Returns the executor generation.
+    pub const fn generation(self) -> ExecutorGeneration {
+        self.generation
+    }
+}
+
+/// Stable identity of one effect below a causal operation.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct EffectId {
-    root: RootId,
+    operation: OperationId,
     sequence: u64,
 }
 
 impl EffectId {
-    /// Creates an effect identity with a non-zero per-root sequence.
-    pub const fn new(root: RootId, sequence: u64) -> Result<Self, IdentityError> {
+    /// Creates an effect identity with a non-zero per-operation sequence.
+    pub const fn new(operation: OperationId, sequence: u64) -> Result<Self, IdentityError> {
         if sequence == 0 {
             Err(IdentityError::Zero)
         } else {
-            Ok(Self { root, sequence })
-        }
-    }
-
-    /// Returns the causal root.
-    pub const fn root(self) -> RootId {
-        self.root
-    }
-
-    /// Returns the per-root effect sequence.
-    pub const fn sequence(self) -> u64 {
-        self.sequence
-    }
-}
-
-/// Exact executable incarnation of a logical principal.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct PrincipalIncarnation {
-    principal: PrincipalId,
-    generation: u64,
-}
-
-impl PrincipalIncarnation {
-    /// Creates an incarnation with a non-zero generation.
-    pub const fn new(principal: PrincipalId, generation: u64) -> Result<Self, IdentityError> {
-        if generation == 0 {
-            Err(IdentityError::Zero)
-        } else {
             Ok(Self {
-                principal,
-                generation,
+                operation,
+                sequence,
             })
         }
     }
 
-    /// Returns the logical principal.
-    pub const fn principal(self) -> PrincipalId {
-        self.principal
+    /// Returns the causal operation.
+    pub const fn operation(self) -> OperationId {
+        self.operation
     }
 
-    /// Returns the incarnation generation.
-    pub const fn generation(self) -> u64 {
-        self.generation
+    /// Returns the per-operation effect sequence.
+    pub const fn sequence(self) -> u64 {
+        self.sequence
     }
 }
 
@@ -306,7 +304,6 @@ impl fmt::Debug for Digest {
 pub struct Freshness {
     boot: BootGeneration,
     registry: RegistryInstance,
-    binding: u64,
     device: DeviceGeneration,
     journal: JournalGeneration,
 }
@@ -316,20 +313,14 @@ impl Freshness {
     pub const fn new(
         boot: BootGeneration,
         registry: RegistryInstance,
-        binding: u64,
         device: DeviceGeneration,
         journal: JournalGeneration,
-    ) -> Result<Self, IdentityError> {
-        if binding == 0 {
-            Err(IdentityError::Zero)
-        } else {
-            Ok(Self {
-                boot,
-                registry,
-                binding,
-                device,
-                journal,
-            })
+    ) -> Self {
+        Self {
+            boot,
+            registry,
+            device,
+            journal,
         }
     }
 
@@ -341,11 +332,6 @@ impl Freshness {
     /// Returns the Registry instance.
     pub const fn registry(self) -> RegistryInstance {
         self.registry
-    }
-
-    /// Returns the current binding generation.
-    pub const fn binding(self) -> u64 {
-        self.binding
     }
 
     /// Returns the current device generation.
@@ -367,13 +353,6 @@ impl Freshness {
         self.journal = journal;
     }
 
-    /// Returns the same freshness envelope bound to another principal
-    /// generation. This is a value transformation, not authority to install
-    /// the binding in an [`Engine`](crate::Engine).
-    pub const fn with_binding(self, binding: u64) -> Result<Self, IdentityError> {
-        Self::new(self.boot, self.registry, binding, self.device, self.journal)
-    }
-
     /// Returns the same freshness envelope with one observed device
     /// generation. Acceptance still requires a configured verifier and the
     /// core's exact evidence challenge.
@@ -389,8 +368,9 @@ impl Freshness {
 #[cfg(test)]
 mod tests {
     use super::{
-        AuthorityBindingGeneration, IdentityError, OperationId, ProviderCoordinate,
-        ProviderGeneration, ProviderId, RecoveryArtifactId, VerifierGeneration, WorldId,
+        ExecutorCoordinate, ExecutorGeneration, ExecutorId, IdentityError, OperationId,
+        ProviderCoordinate, ProviderGeneration, ProviderId, RecoveryArtifactId, VerifierGeneration,
+        WorldId,
     };
 
     #[test]
@@ -398,10 +378,11 @@ mod tests {
         assert_eq!(WorldId::new(0), Err(IdentityError::Zero));
         assert_eq!(ProviderId::new(0), Err(IdentityError::Zero));
         assert_eq!(ProviderGeneration::new(0), Err(IdentityError::Zero));
+        assert_eq!(ExecutorId::new(0), Err(IdentityError::Zero));
+        assert_eq!(ExecutorGeneration::new(0), Err(IdentityError::Zero));
         assert_eq!(OperationId::new(0), Err(IdentityError::Zero));
         assert_eq!(RecoveryArtifactId::new(0), Err(IdentityError::Zero));
         assert_eq!(VerifierGeneration::new(0), Err(IdentityError::Zero));
-        assert_eq!(AuthorityBindingGeneration::new(0), Err(IdentityError::Zero));
     }
 
     #[test]
@@ -413,6 +394,16 @@ mod tests {
 
         assert_eq!(coordinate.world(), world);
         assert_eq!(coordinate.provider(), provider);
+        assert_eq!(coordinate.generation(), generation);
+    }
+
+    #[test]
+    fn executor_coordinate_exposes_exact_components() {
+        let executor = ExecutorId::new(44).unwrap();
+        let generation = ExecutorGeneration::new(55).unwrap();
+        let coordinate = ExecutorCoordinate::new(executor, generation);
+
+        assert_eq!(coordinate.executor(), executor);
         assert_eq!(coordinate.generation(), generation);
     }
 }

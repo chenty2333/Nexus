@@ -26,21 +26,21 @@ use core::{
 };
 
 use cser_core::{
-    AGENT_COMPONENT_DMA, AGENT_COMPONENT_REPLY, AGENT_OPERATION_COMPOSITE,
-    AuthorityBindingGeneration, AuthorityState, CSER_CORE_API_PROFILE_VERSION, ChargeAccountId,
-    ClaimId, ClaimScope, Command, CommandRequest, CommitIntent, CommitState,
-    ComponentClaimProjection, ComponentCommitOperation, ComponentId, ComponentProjection,
-    ComponentProviderBinding, CompositeEffectProjection, CoordinatedPersistence, CoreError,
-    CoreLimits, CustodyState, DEVICE_CLAIM_IOVA, DEVICE_CLAIM_PINNED_PAGE, DEVICE_CLAIM_QUEUE_SLOT,
-    DEVICE_DOMAIN, DEVICE_EVIDENCE_IOTLB, DEVICE_EVIDENCE_IRQ_DRAINED, DEVICE_EVIDENCE_RESET,
-    DEVICE_OBLIGATION_DMA, DMA_ARENA_REUSE_COMPOSITE, Digest, EffectEscapeState, EffectId, Engine,
-    JOURNAL_SCHEMA_VERSION, OperationId, OutcomeState, PROJECTION_VERSION, PrincipalId,
-    PrincipalIncarnation, ProviderEffectState, RECOVERY_SNAPSHOT_VERSION,
+    AGENT_COMPONENT_DMA, AGENT_COMPONENT_REPLY, AGENT_OPERATION_COMPOSITE, AuthorityState,
+    CSER_CORE_API_PROFILE_VERSION, CatalogSet, ChargeAccountId, ClaimId, ClaimScope, Command,
+    CommandRequest, CommitIntent, CommitState, ComponentClaimProjection, ComponentCommitOperation,
+    ComponentId, ComponentProjection, ComponentProviderBinding, CompositeEffectProjection,
+    CoordinatedPersistence, CoreError, CoreLimits, CustodyState, DEVICE_CLAIM_IOVA,
+    DEVICE_CLAIM_PINNED_PAGE, DEVICE_CLAIM_QUEUE_SLOT, DEVICE_DOMAIN, DEVICE_EVIDENCE_IOTLB,
+    DEVICE_EVIDENCE_IRQ_DRAINED, DEVICE_EVIDENCE_RESET, DEVICE_OBLIGATION_DMA,
+    DMA_ARENA_REUSE_COMPOSITE, Digest, EffectEscapeState, EffectId, Engine, ExecutorCoordinate,
+    ExecutorGeneration, ExecutorId, JOURNAL_SCHEMA_VERSION, OperationId, OperationRecoveryState,
+    OutcomeState, PROJECTION_VERSION, ProviderEffectState, RECOVERY_SNAPSHOT_VERSION,
     REPLY_CLAIM_PUBLICATION_SLOT, REPLY_DOMAIN, REPLY_EVIDENCE_PUBLICATION_ACK,
     REPLY_OBLIGATION_PUBLICATION, RecoveryBinding, RecoveryProfile, RegistryInstance,
-    ResourceGeneration, ResourceId, RetirementState, ReusePermit, RootId, RootRecoveryState,
-    STANDARD_CATALOG_VERSION, SettlementClaim, SettlementState, SnapshotId, TransitionDurability,
-    TransitionOutput, TransitionReceipt, TxError, standard_catalog,
+    ResourceGeneration, ResourceId, RetirementState, ReusePermit, STANDARD_CATALOG_VERSION,
+    SettlementClaim, SettlementState, SnapshotId, TransitionDurability, TransitionOutput,
+    TransitionReceipt, TxError, standard_catalog,
 };
 use nexus_ostd_virtio::{
     BootQuarantineGuard, MaskedIntx, OwnerKind, PersistentDmaArenaLayout, ProductionDevice,
@@ -124,7 +124,7 @@ struct RuntimeMetrics {
     journal_generation: u64,
     device_generation: u64,
     retained: usize,
-    catalog_digest: Digest,
+    catalog_set_digest: Digest,
     projection_digest: Digest,
 }
 
@@ -322,8 +322,7 @@ struct ArmedSecondCrash {
     outbox: AtaPioReplyOutbox,
     checksum: Digest,
     resumed_prefix: bool,
-    successor: PrincipalIncarnation,
-    binding_generation: u64,
+    successor: ExecutorCoordinate,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -477,9 +476,9 @@ impl<S: InstalledCore + 'static> ProductionServiceIngress<S> {
         expect_no_output_checked(
             supervisor
                 .ready(
-                    self.identity.ingress.root(),
+                    self.identity.ingress.operation(),
                     snapshot,
-                    self.identity.ingress.incarnation(),
+                    self.identity.ingress.executor(),
                 )
                 .map_err(|_| "service-ready")?,
         )?;
@@ -489,10 +488,9 @@ impl<S: InstalledCore + 'static> ProductionServiceIngress<S> {
         }
         self.authorize_ingress()?;
         let rebound = self.owner.observe_engine(|engine| {
-            engine.root(self.identity.ingress.root())
-                == Some(RootRecoveryState::Rebound {
-                    successor: self.identity.ingress.incarnation(),
-                    binding_generation: self.identity.ingress.binding_generation(),
+            engine.operation(self.identity.ingress.operation())
+                == Some(OperationRecoveryState::Rebound {
+                    successor: self.identity.ingress.executor(),
                 })
         });
         if !rebound {
@@ -523,7 +521,7 @@ impl<S: InstalledCore + 'static> ProductionServiceIngress<S> {
         let supervisor = CoreSupervisorVNext::new(Arc::clone(&self.owner));
         settlement_claim_checked(
             supervisor
-                .claim_component_settlement(effect, component, self.identity.ingress.incarnation())
+                .claim_component_settlement(effect, component, self.identity.ingress.executor())
                 .map_err(|_| "service-settlement-claim")?,
         )
     }
@@ -658,10 +656,10 @@ where
         return Err("service-ready-timeout");
     }
     let ready = owner.observe_engine(|engine| {
-        engine.root(run.identity.ingress.root())
-            == Some(RootRecoveryState::Ready {
+        engine.operation(run.identity.ingress.operation())
+            == Some(OperationRecoveryState::Ready {
                 snapshot,
-                successor: run.identity.ingress.incarnation(),
+                successor: run.identity.ingress.executor(),
             })
     });
     if !ready {
@@ -670,10 +668,9 @@ where
     expect_no_output_checked(
         supervisor
             .rebind(
-                run.identity.ingress.root(),
+                run.identity.ingress.operation(),
                 snapshot,
-                run.identity.ingress.incarnation(),
-                run.identity.ingress.binding_generation(),
+                run.identity.ingress.executor(),
             )
             .map_err(|_| "service-rebind")?,
     )?;
@@ -702,58 +699,48 @@ where
 fn prepare_production_service<S>(
     owner: &ProductionCoreOwner<S>,
     supervisor: &CoreSupervisorVNext<ProductionCoreOwner<S>>,
-    root: RootId,
-    initial: PrincipalIncarnation,
+    operation: OperationId,
+    initial: ExecutorCoordinate,
     stage: ProductionServiceStage,
 ) -> Result<ProductionServiceIdentity, &'static str>
 where
     S: InstalledCore + 'static,
 {
-    let state = owner.observe_engine(|engine| engine.root(root));
-    let (incarnation, binding_generation, snapshot) = match state {
-        None => (initial, 1, None),
-        Some(RootRecoveryState::Active {
-            incarnation,
-            binding_generation,
-        }) => (incarnation, binding_generation, None),
-        Some(RootRecoveryState::Rebound {
-            successor,
-            binding_generation,
-        }) => (successor, binding_generation, None),
-        Some(RootRecoveryState::Fenced {
-            crashed,
-            binding_generation,
-            ..
-        }) => {
+    let state = owner.observe_engine(|engine| engine.operation(operation));
+    let (executor, snapshot) = match state {
+        None => (initial, None),
+        Some(OperationRecoveryState::Active { executor }) => (executor, None),
+        Some(OperationRecoveryState::Rebound { successor }) => (successor, None),
+        Some(OperationRecoveryState::Fenced { crashed, .. }) => {
             let successor_generation = crashed
                 .generation()
+                .get()
                 .checked_add(1)
                 .ok_or("successor-generation-exhausted")?;
-            let successor = PrincipalIncarnation::new(crashed.principal(), successor_generation)
-                .map_err(|_| "successor-generation")?;
-            let next_binding = binding_generation
-                .checked_add(1)
-                .ok_or("binding-generation-exhausted")?;
+            let successor = ExecutorCoordinate::new(
+                crashed.executor(),
+                ExecutorGeneration::new(successor_generation)
+                    .map_err(|_| "successor-generation")?,
+            );
             let snapshot_generation =
                 owner.observe_engine(|engine| engine.freshness().boot().get());
             let snapshot =
                 SnapshotId::new(snapshot_generation).map_err(|_| "snapshot-generation")?;
             expect_no_output_checked(
                 supervisor
-                    .snapshot_fenced(root, snapshot)
-                    .map_err(|_| "root-snapshot")?,
+                    .snapshot_fenced(operation, snapshot)
+                    .map_err(|_| "operation-snapshot")?,
             )?;
-            (successor, next_binding, Some(snapshot))
+            (successor, Some(snapshot))
         }
-        Some(RootRecoveryState::Snapshotted { .. } | RootRecoveryState::Ready { .. }) => {
-            return Err("partial-root-recovery-stage");
+        Some(OperationRecoveryState::Snapshotted { .. } | OperationRecoveryState::Ready { .. }) => {
+            return Err("partial-operation-recovery-stage");
         }
-        Some(RootRecoveryState::RecoveryExhausted { .. }) => {
-            return Err("root-recovery-exhausted");
+        Some(OperationRecoveryState::RecoveryExhausted { .. }) => {
+            return Err("operation-recovery-exhausted");
         }
     };
-    let ingress = ProductionIngressIdentity::new(root, incarnation, binding_generation)
-        .map_err(|_| "production-service-identity")?;
+    let ingress = ProductionIngressIdentity::new(operation, executor);
     Ok(ProductionServiceIdentity {
         ingress,
         snapshot,
@@ -819,43 +806,28 @@ fn ensure_exact_reap_fenced<S>(
 where
     S: InstalledCore,
 {
-    let root = identity.root();
-    let crashed = identity.incarnation();
-    let binding_generation = identity.binding_generation();
-    match owner.observe_engine(|engine| engine.root(root)) {
+    let operation = identity.operation();
+    let crashed = identity.executor();
+    match owner.observe_engine(|engine| engine.operation(operation)) {
         Some(
-            RootRecoveryState::Active {
-                incarnation,
-                binding_generation: observed_binding,
-            }
-            | RootRecoveryState::Rebound {
-                successor: incarnation,
-                binding_generation: observed_binding,
+            OperationRecoveryState::Active { executor }
+            | OperationRecoveryState::Rebound {
+                successor: executor,
             },
-        ) if incarnation == crashed && observed_binding == binding_generation => {
+        ) if executor == crashed => {
             expect_no_output_checked(owner_tx_checked(
                 owner,
-                CommandRequest::FenceIncarnation {
-                    root,
-                    crashed,
-                    binding_generation,
-                },
+                CommandRequest::FenceExecutor { operation, crashed },
             )?)?;
         }
-        Some(RootRecoveryState::Fenced {
-            crashed: observed,
-            binding_generation: observed_binding,
-            ..
-        }) if observed == crashed && observed_binding == binding_generation => {}
-        _ => return Err("exact-reap-root-state"),
+        Some(OperationRecoveryState::Fenced {
+            crashed: observed, ..
+        }) if observed == crashed => {}
+        _ => return Err("exact-reap-operation-state"),
     }
     if !matches!(
-        owner.observe_engine(|engine| engine.root(root)),
-        Some(RootRecoveryState::Fenced {
-            crashed: observed,
-            binding_generation: observed_binding,
-            ..
-        }) if observed == crashed && observed_binding == binding_generation
+        owner.observe_engine(|engine| engine.operation(operation)),
+        Some(OperationRecoveryState::Fenced { crashed: observed, .. }) if observed == crashed
     ) {
         return Err("exact-reap-fence-postcondition");
     }
@@ -906,13 +878,12 @@ pub(crate) fn launch() -> ! {
 }
 
 fn run_persistent_recovery() {
-    let catalog = standard_catalog();
+    let catalogs = CatalogSet::new(&[standard_catalog()]).expect("standard catalog set is valid");
     let binding = RecoveryBinding::new(
         RecoveryProfile::current(),
         PRODUCTION_WORLD,
-        catalog.digest(),
+        catalogs.digest(),
         RegistryInstance::new(1).expect("persistent Registry identity is non-zero"),
-        AuthorityBindingGeneration::new(1).expect("persistent binding is non-zero"),
     )
     .expect("persistent recovery binding is valid");
     let mut prepared = match PreparedQemuPersistentBoot::acquire() {
@@ -931,7 +902,7 @@ fn run_persistent_recovery() {
         let quarantine = prepared.quarantine_observation();
         println!(
             "CSER_CORE_SCHEMA8_MIGRATION_REQUIRED PASS trusted_tpm_candidate_selected=true \
-             profile5_binding_authorized=false \
+             current_binding_authorized=false \
              selected_revision={} selected_head={} selected_catalog={} expected_catalog={} \
              anchor_binding_match={} journal_schema=8 typed_error=migration-required \
              semantic_replay=false inferred_pairing=false pre_replay_quarantine=true \
@@ -957,7 +928,7 @@ fn run_persistent_recovery() {
         );
         fail_closed("schema8-migration-required", prepared)
     }
-    let boot = match prepared.recover(catalog, CoreLimits::bounded_default(), binding) {
+    let boot = match prepared.recover(catalogs, CoreLimits::bounded_default(), binding) {
         Ok(boot) => boot,
         Err(error) => {
             if let QemuPersistentBootError::RecoveryCore(core) = &error {
@@ -969,10 +940,6 @@ fn run_persistent_recovery() {
             fail_closed(qemu_boot_failure_reason(error), ())
         }
     };
-
-    if boot.observe(|engine| engine.profile_one_estate_count() != 0) {
-        fail_closed("profile1-state-selected-for-profile2-boot", boot);
-    }
 
     let can_activate = boot.observe(|engine| {
         engine
@@ -1024,7 +991,7 @@ fn ensure_standard_provider_generations<S>(
 where
     S: InstalledCore,
 {
-    let catalog_digest = owner.observe_engine(|engine| engine.catalog_digest());
+    let catalog_digest = standard_catalog().digest();
     let expected = standard_verifier_bindings();
     for coordinate in [STANDARD_REPLY_PROVIDER, STANDARD_DMA_PROVIDER] {
         match owner.trusted_provider_generation(coordinate) {
@@ -1064,9 +1031,7 @@ where
 fn ensure_standard_scoped_composite<S>(
     owner: &ProductionCoreOwner<S>,
     effect: EffectId,
-    operation: OperationId,
-    origin: PrincipalIncarnation,
-    binding_generation: u64,
+    origin: ExecutorCoordinate,
     kind: cser_core::CompositeKindId,
     bindings: Vec<ComponentProviderBinding>,
 ) -> Result<(), &'static str>
@@ -1078,7 +1043,7 @@ where
     }
     let composite = owner.observe_engine(|engine| engine.composite_effect(effect));
     if let Some(composite) = composite {
-        if composite.operation != Some(operation) || composite.provider_bindings != bindings {
+        if composite.operation != effect.operation() || composite.provider_bindings != bindings {
             return Err("scoped-admission-projection-mismatch");
         }
         return Ok(());
@@ -1086,9 +1051,7 @@ where
     owner
         .admit_scoped_composite_effect(
             effect,
-            operation,
             origin,
-            binding_generation,
             kind,
             operation_charge_account(),
             bindings.clone(),
@@ -1097,7 +1060,7 @@ where
     let admitted = owner
         .observe_engine(|engine| engine.composite_effect(effect))
         .ok_or("scoped-admission-projection")?;
-    if admitted.operation != Some(operation) || admitted.provider_bindings != bindings {
+    if admitted.operation != effect.operation() || admitted.provider_bindings != bindings {
         return Err("scoped-admission-projection-mismatch");
     }
     Ok(())
@@ -1117,7 +1080,7 @@ fn run_activation_boot(boot: PersistentBoot) -> ! {
     let installed = PersistentRuntime::from_engine(engine, persistence);
     let owner = match ProductionCoreOwner::new(installed) {
         Ok(owner) => Arc::new(owner),
-        Err(error) => fail_closed("profile2-production-install", (error, devices)),
+        Err(error) => fail_closed("profile6-production-install", (error, devices)),
     };
     let supervisor_owner = Arc::clone(&owner);
     let supervisor = CoreSupervisorVNext::new(supervisor_owner);
@@ -1141,7 +1104,7 @@ fn run_activation_boot(boot: PersistentBoot) -> ! {
     let service_identity = match prepare_production_service(
         &owner,
         &supervisor,
-        operation_root(),
+        operation_id(),
         operation_origin(),
         ProductionServiceStage::InitialCompositePublication,
     ) {
@@ -1160,9 +1123,7 @@ fn run_activation_boot(boot: PersistentBoot) -> ! {
         ensure_standard_scoped_composite(
             &ingress.owner,
             operation_effect(),
-            operation_id(),
-            ingress.identity.ingress.incarnation(),
-            ingress.identity.ingress.binding_generation(),
+            ingress.identity.ingress.executor(),
             AGENT_OPERATION_COMPOSITE,
             vec![
                 ComponentProviderBinding::new(AGENT_COMPONENT_REPLY, STANDARD_REPLY_PROVIDER),
@@ -1237,8 +1198,7 @@ fn run_activation_boot(boot: PersistentBoot) -> ! {
         0xc501_00ff,
         CommandRequest::PrepareCompositeEffect {
             effect: operation_effect(),
-            actor: service_identity.ingress.incarnation(),
-            binding_generation: service_identity.ingress.binding_generation(),
+            actor: service_identity.ingress.executor(),
         },
     ) {
         fail_closed(
@@ -1291,7 +1251,7 @@ fn run_activation_boot(boot: PersistentBoot) -> ! {
         journal_generation,
         device_generation,
         retained,
-        catalog_digest,
+        catalog_set_digest,
         projection_digest,
     } = runtime_metrics(&owner);
     let resource_generation = owner
@@ -1328,15 +1288,15 @@ fn run_activation_boot(boot: PersistentBoot) -> ! {
 
     println!(
         "CSER_CORE_PERSISTENT_BOOT1 PASS shared_runtime=true production_registry=single \
-         profile=2 composite_effect=true effect_identity=shared component_ids=reply+dma \
+         profile=6 composite_effect=true effect_identity=shared component_ids=reply+dma \
          api_profile={} catalog_version={} projection_version={} snapshot_version={} \
-         journal_schema={} catalog_digest={} projection_digest={} \
-         operation_effect_root={} operation_effect_sequence={} \
+         journal_schema={} catalog_set_digest={} projection_digest={} \
+         operation_id={} effect_sequence={} \
          reply_component_id={} dma_component_id={} arena_contract_digest={} \
          portal=nxp3 supervisor=core-v1 reply=committed-unsettled \
          dma=queue-published-retained retained={} dma_retained=3 resumed_prefix={} \
          resource_generation={} guest_pfn_base={} emulated_iova_base={} host_backing_offset={} \
-         service_principal_generation={} binding_generation={} \
+         service_executor_generation={} executor_generation={} \
          production_service_tasks=1 service_death=task-return exact_reap=true \
          same_boot_fence=true ingress_latch=closed closed_ingress_rejected=true \
          production_rebind=initial \
@@ -1349,9 +1309,9 @@ fn run_activation_boot(boot: PersistentBoot) -> ! {
         PROJECTION_VERSION,
         RECOVERY_SNAPSHOT_VERSION,
         JOURNAL_SCHEMA_VERSION,
-        HexDigest(catalog_digest),
+        HexDigest(catalog_set_digest),
         HexDigest(projection_digest),
-        operation_effect().root().get(),
+        operation_effect().operation().get(),
         operation_effect().sequence(),
         AGENT_COMPONENT_REPLY.get(),
         AGENT_COMPONENT_DMA.get(),
@@ -1362,8 +1322,8 @@ fn run_activation_boot(boot: PersistentBoot) -> ! {
         arena.paddr_base() / PAGE_SIZE,
         arena.daddr_base(),
         arena.qemu_backing_offset(OwnerKind::QueueDriver),
-        service.identity.ingress.incarnation().generation(),
-        service.identity.ingress.binding_generation(),
+        service.identity.ingress.executor().generation().get(),
+        service.identity.ingress.executor().generation().get(),
         revision,
         boot_generation,
         journal_generation,
@@ -1467,7 +1427,7 @@ fn run_reuse_activation_boot(
     let identity = match prepare_production_service(
         &owner,
         &supervisor,
-        operation_root(),
+        operation_id(),
         operation_origin(),
         ProductionServiceStage::ReconcileSecondCrash,
     ) {
@@ -1481,8 +1441,7 @@ fn run_reuse_activation_boot(
             (owner, supervisor, outbox, root, masked_intx, device),
         ),
     };
-    let successor = identity.ingress.incarnation();
-    let binding_generation = identity.ingress.binding_generation();
+    let successor = identity.ingress.executor();
     let (client, endpoint) = if needs_receiver {
         let (client, custody, result) = match spawn_reply_client(reply_coordinate()) {
             Ok(client) => client,
@@ -1513,9 +1472,7 @@ fn run_reuse_activation_boot(
         ensure_standard_scoped_composite(
             &ingress.owner,
             reuse_effect(),
-            reuse_operation_id(),
-            ingress.identity.ingress.incarnation(),
-            ingress.identity.ingress.binding_generation(),
+            ingress.identity.ingress.executor(),
             DMA_ARENA_REUSE_COMPOSITE,
             vec![ComponentProviderBinding::new(
                 AGENT_COMPONENT_DMA,
@@ -1613,7 +1570,7 @@ fn run_reuse_activation_boot(
         journal_generation,
         device_generation,
         retained,
-        catalog_digest,
+        catalog_set_digest,
         projection_digest,
     } = runtime_metrics(&owner);
     let (old_resource_generation, resource_generation, stale_old_generation_evidence) = owner
@@ -1683,9 +1640,9 @@ fn run_reuse_activation_boot(
     println!(
         "CSER_CORE_PERSISTENT_BOOT3 PASS shared_runtime=true production_registry=single \
          api_profile={} catalog_version={} projection_version={} snapshot_version={} \
-         journal_schema={} catalog_digest={} projection_digest={} \
-         operation_effect_root={} operation_effect_sequence={} \
-         reply_component_id={} dma_component_id={} reuse_effect_root={} \
+         journal_schema={} catalog_set_digest={} projection_digest={} \
+         operation_id={} effect_sequence={} \
+         reply_component_id={} dma_component_id={} reuse_operation_id={} \
          reuse_effect_sequence={} arena_contract_digest={} \
          portal=nxp3 supervisor=core-v1 reply=settled-after-second-crash \
          reconciliation=true second_apply_intent=false dma=reused-published \
@@ -1694,7 +1651,7 @@ fn run_reuse_activation_boot(
          stale_old_generation_evidence=rejected_without_mutation \
          activation=active resource_reuse_authorized=true exact_guest_pfn_reuse=true \
          exact_emulated_iova_reuse=true exact_backing_offset_reuse=true \
-         service_principal_generation={} successor_generation={} binding_generation={} \
+         service_executor_generation={} executor_generation={} \
          fresh_service_task=true ready_in_fresh_task=true production_rebind=true \
          service_state=live ingress_latch=open prior_service_fence=same-boot-exact-reap \
          revision={} boot={} journal={} device={} journal_provider=ata-pio \
@@ -1707,13 +1664,13 @@ fn run_reuse_activation_boot(
         PROJECTION_VERSION,
         RECOVERY_SNAPSHOT_VERSION,
         JOURNAL_SCHEMA_VERSION,
-        HexDigest(catalog_digest),
+        HexDigest(catalog_set_digest),
         HexDigest(projection_digest),
-        operation_effect().root().get(),
+        operation_effect().operation().get(),
         operation_effect().sequence(),
         AGENT_COMPONENT_REPLY.get(),
         AGENT_COMPONENT_DMA.get(),
-        reuse_effect().root().get(),
+        reuse_effect().operation().get(),
         reuse_effect().sequence(),
         HexDigest(persistent_dma_arena_digest(arena)),
         retained,
@@ -1722,9 +1679,8 @@ fn run_reuse_activation_boot(
         arena.paddr_base() / PAGE_SIZE,
         arena.daddr_base(),
         arena.qemu_backing_offset(OwnerKind::QueueDriver),
-        successor.generation(),
-        successor.generation(),
-        binding_generation,
+        successor.generation().get(),
+        successor.generation().get(),
         revision,
         boot_generation,
         journal_generation,
@@ -1750,8 +1706,7 @@ fn publish_reused_dma(
     masked_intx: MaskedIntx,
     mut device: ProductionDevice,
 ) -> Result<ReusePublicationOutput, &'static str> {
-    let actor = ingress.identity.ingress.incarnation();
-    let binding_generation = ingress.identity.ingress.binding_generation();
+    let actor = ingress.identity.ingress.executor();
     let old_claims = ingress
         .observe(|engine| engine.component_claims(operation_effect(), AGENT_COMPONENT_DMA))?
         .map_err(|_| "old-dma-claims-query")?;
@@ -1773,13 +1728,13 @@ fn publish_reused_dma(
         .ok_or("scoped-admission-missing")?;
     if composite.effect != reuse_effect()
         || composite.kind != DMA_ARENA_REUSE_COMPOSITE
-        || composite.operation != Some(reuse_operation_id())
+        || composite.operation != reuse_effect().operation()
         || composite.provider_bindings
             != vec![ComponentProviderBinding::new(
                 AGENT_COMPONENT_DMA,
                 STANDARD_DMA_PROVIDER,
             )]
-        || composite.causal_owner.principal() != actor.principal()
+        || composite.causal_owner != actor
         || composite.charge_owner != operation_charge_account()
         || composite.component_count != 1
         || composite.authority == AuthorityState::Revoked
@@ -1794,7 +1749,6 @@ fn publish_reused_dma(
         reuse_effect(),
         composite,
         actor,
-        binding_generation,
     )?;
     let mut projections = ingress
         .observe(|engine| engine.component_claims(reuse_effect(), AGENT_COMPONENT_DMA))?
@@ -1819,7 +1773,6 @@ fn publish_reused_dma(
                     reuse_effect(),
                     AGENT_COMPONENT_DMA,
                     actor,
-                    binding_generation,
                     new.resource(),
                     new.generation(),
                 )
@@ -1839,7 +1792,6 @@ fn publish_reused_dma(
                     effect: reuse_effect(),
                     component: AGENT_COMPONENT_DMA,
                     actor,
-                    binding_generation,
                     claim: new.claim(),
                     kind,
                     scope,
@@ -1864,7 +1816,6 @@ fn publish_reused_dma(
                 CommandRequest::PrepareCompositeEffect {
                     effect: reuse_effect(),
                     actor,
-                    binding_generation,
                 },
             )?)?;
         }
@@ -1888,7 +1839,6 @@ fn publish_reused_dma(
         reuse_effect(),
         AGENT_COMPONENT_DMA,
         actor,
-        binding_generation,
         operation_charge_account(),
         receipted.identity(),
         reused_dma_claims(),
@@ -1933,8 +1883,7 @@ fn ensure_composite_prepared<S>(
     portal: &CorePortalVNext<ProductionCoreOwner<S>>,
     supervisor: &CoreSupervisorVNext<ProductionCoreOwner<S>>,
     owner: &ProductionCoreOwner<S>,
-    actor: PrincipalIncarnation,
-    binding_generation: u64,
+    actor: ExecutorCoordinate,
     dma: CoreDmaCohort,
 ) -> Result<bool, &'static str>
 where
@@ -1956,14 +1905,7 @@ where
     if !validate_composite_projection(&projection) {
         return Err("composite-effect-identity");
     }
-    ensure_uncommitted_composite_actor(
-        owner,
-        supervisor,
-        effect,
-        projection,
-        actor,
-        binding_generation,
-    )?;
+    ensure_uncommitted_composite_actor(owner, supervisor, effect, projection, actor)?;
 
     let reply = owner
         .observe_engine(|engine| engine.component(effect, AGENT_COMPONENT_REPLY))
@@ -1992,7 +1934,6 @@ where
                     effect,
                     component: AGENT_COMPONENT_REPLY,
                     actor,
-                    binding_generation,
                     claim: reply_claim(),
                     kind: REPLY_CLAIM_PUBLICATION_SLOT,
                     scope: ClaimScope::Logical,
@@ -2053,11 +1994,7 @@ where
         portal_tx_checked(
             portal,
             0xc501_0020,
-            CommandRequest::PrepareCompositeEffect {
-                effect,
-                actor,
-                binding_generation,
-            },
+            CommandRequest::PrepareCompositeEffect { effect, actor },
         )?;
     }
     if !owner.observe_engine(validate_precommit_components) {
@@ -2099,7 +2036,7 @@ where
         return Err("reply-component-prefix-not-resumable");
     }
     let intent = intent.ok_or("reply-atomic-commit-intent-custody")?;
-    if intent.effect() != operation_effect() || intent.component() != Some(AGENT_COMPONENT_REPLY) {
+    if intent.effect() != operation_effect() || intent.component() != AGENT_COMPONENT_REPLY {
         return Err("reply-atomic-commit-intent-coordinate");
     }
     let challenge = owner
@@ -2126,8 +2063,7 @@ where
 fn arm_initial_component_commits<S>(
     portal: &CorePortalVNext<ProductionCoreOwner<S>>,
     owner: &ProductionCoreOwner<S>,
-    actor: PrincipalIncarnation,
-    binding_generation: u64,
+    actor: ExecutorCoordinate,
     dma_operation: Digest,
 ) -> Result<(CommitIntent, CommitIntent), &'static str>
 where
@@ -2139,7 +2075,6 @@ where
         CommandRequest::RecordCompositeCommitIntents {
             effect: operation_effect(),
             actor,
-            binding_generation,
             operations: vec![
                 ComponentCommitOperation::new(AGENT_COMPONENT_REPLY, digest(0xc1)),
                 ComponentCommitOperation::new(AGENT_COMPONENT_DMA, dma_operation),
@@ -2154,13 +2089,13 @@ where
     }
     let reply_index = intents
         .iter()
-        .position(|intent| intent.component() == Some(AGENT_COMPONENT_REPLY))
+        .position(|intent| intent.component() == AGENT_COMPONENT_REPLY)
         .ok_or("reply-atomic-commit-intent-absent")?;
     let reply = intents.swap_remove(reply_index);
     let dma = intents.pop().ok_or("dma-atomic-commit-intent-absent")?;
     if reply.effect() != operation_effect()
         || dma.effect() != operation_effect()
-        || dma.component() != Some(AGENT_COMPONENT_DMA)
+        || dma.component() != AGENT_COMPONENT_DMA
     {
         return Err("composite-commit-intent-coordinate");
     }
@@ -2184,8 +2119,7 @@ fn publish_first_boot_operation(
         masked_intx,
         mut device,
     } = resources;
-    let actor = ingress.incarnation();
-    let binding_generation = ingress.binding_generation();
+    let actor = ingress.executor();
     let prepared = device
         .prepare_read_sector0(&mut root)
         .map_err(|_| "dma-prepare")?;
@@ -2196,19 +2130,17 @@ fn publish_first_boot_operation(
         operation_effect(),
         AGENT_COMPONENT_DMA,
         actor,
-        binding_generation,
         operation_charge_account(),
         receipted.identity(),
         dma_claims(),
     )
     .map_err(|_| "dma-cohort-binding")?;
 
-    let resumed_prefix =
-        ensure_composite_prepared(portal, supervisor, owner, actor, binding_generation, cohort)?;
+    let resumed_prefix = ensure_composite_prepared(portal, supervisor, owner, actor, cohort)?;
     let arena = persistent_dma_arena_layout().ok_or("dma-arena-layout-absent")?;
     let arena_digest = persistent_dma_arena_digest(arena);
     let (reply_intent, dma_intent) =
-        arm_initial_component_commits(portal, owner, actor, binding_generation, arena_digest)?;
+        arm_initial_component_commits(portal, owner, actor, arena_digest)?;
     let reply_checksum = ensure_reply_component_committed(owner, &mut outbox, Some(reply_intent))?;
     if owner
         .observe_engine(|engine| engine.component(operation_effect(), AGENT_COMPONENT_DMA))
@@ -2244,7 +2176,7 @@ fn rebase_prearm_and_activate(boot: PersistentBoot) -> ! {
     let installed = QuarantinedPersistentCore::new(boot);
     let owner = match ProductionCoreOwner::new(installed) {
         Ok(owner) => Arc::new(owner),
-        Err(error) => fail_closed("prearm-profile2-install", error),
+        Err(error) => fail_closed("prearm-profile6-install", error),
     };
     if let Err(reason) = ensure_standard_provider_generations(&owner) {
         fail_closed(reason, owner);
@@ -2253,7 +2185,7 @@ fn rebase_prearm_and_activate(boot: PersistentBoot) -> ! {
     let identity = match prepare_production_service(
         &owner,
         &supervisor,
-        operation_root(),
+        operation_id(),
         operation_origin(),
         ProductionServiceStage::RebasePrecommit,
     ) {
@@ -2261,8 +2193,7 @@ fn rebase_prearm_and_activate(boot: PersistentBoot) -> ! {
         Ok(_) => fail_closed("prearm-service-not-fresh", (owner, supervisor)),
         Err(reason) => fail_closed(reason, (owner, supervisor)),
     };
-    let successor = identity.ingress.incarnation();
-    let binding_generation = identity.ingress.binding_generation();
+    let successor = identity.ingress.executor();
     let run = match build_production_service(&owner, identity, move |ingress| {
         ingress.ready_and_wait_for_rebind()?;
         let quarantine_is_exact = ingress
@@ -2295,13 +2226,11 @@ fn rebase_prearm_and_activate(boot: PersistentBoot) -> ! {
             operation_effect(),
             projection,
             successor,
-            binding_generation,
         )?;
         expect_no_output_checked(ingress.transact(
             CommandRequest::RebaseCompositePrecommitClaims {
                 effect: operation_effect(),
                 actor: successor,
-                binding_generation,
             },
         )?)?;
         let exact_rebase = ingress.observe(|engine| {
@@ -2353,14 +2282,14 @@ fn rebase_prearm_and_activate(boot: PersistentBoot) -> ! {
     };
     let boot = owner.into_installed().into_boot();
     println!(
-        "CSER_CORE_PREARM_REBASE PASS effect_root={} effect_sequence={} \
-         successor_generation={} binding_generation={} task_bound_ingress=true \
+        "CSER_CORE_PREARM_REBASE PASS operation_id={} effect_sequence={} \
+         successor_generation={} executor_generation={} task_bound_ingress=true \
          ready=true rebind=true adopt=true device_quarantine_guard=retained \
          claims_freshness=rebased activation_block=clear manager_portal_bypass=false",
-        operation_effect().root().get(),
+        operation_effect().operation().get(),
         operation_effect().sequence(),
-        successor.generation(),
-        binding_generation,
+        successor.generation().get(),
+        successor.generation().get(),
     );
     run_activation_boot(boot)
 }
@@ -2375,7 +2304,7 @@ fn run_quarantined_boot(boot: PersistentBoot) -> ! {
     let installed = QuarantinedPersistentCore::new(boot);
     let owner = match ProductionCoreOwner::new(installed) {
         Ok(owner) => Arc::new(owner),
-        Err(error) => fail_closed("profile2-quarantined-install", error),
+        Err(error) => fail_closed("profile6-quarantined-install", error),
     };
     if let Err(reason) = ensure_standard_provider_generations(&owner) {
         fail_closed(reason, owner);
@@ -2466,7 +2395,6 @@ fn run_quarantined_boot(boot: PersistentBoot) -> ! {
                 checksum: reply_checksum,
                 resumed_prefix,
                 successor,
-                binding_generation,
             } = match arm_reply_second_crash(&reply_owner, &supervisor, plan, source, outbox) {
                 Ok(armed) => armed,
                 Err(reason) => fail_closed(reason, (owner, supervisor, reply_owner, dma_owner)),
@@ -2477,7 +2405,7 @@ fn run_quarantined_boot(boot: PersistentBoot) -> ! {
                 journal_generation,
                 device_generation,
                 retained,
-                catalog_digest,
+                catalog_set_digest,
                 projection_digest,
             } = runtime_metrics(&owner);
             let exact = owner.observe_engine(|engine| {
@@ -2508,8 +2436,8 @@ fn run_quarantined_boot(boot: PersistentBoot) -> ! {
             println!(
                 "CSER_CORE_PERSISTENT_BOOT2 PASS shared_runtime=true production_registry=single \
                  api_profile={} catalog_version={} projection_version={} snapshot_version={} \
-                 journal_schema={} catalog_digest={} projection_digest={} \
-                 operation_effect_root={} operation_effect_sequence={} \
+                 journal_schema={} catalog_set_digest={} projection_digest={} \
+                 operation_id={} effect_sequence={} \
                  reply_component_id={} dma_component_id={} \
                  portal=nxp3 supervisor=core-v1 reply=reconciliation-required \
                  pre_fence_reply=apply-intent-durable core_apply_intent_durable=true \
@@ -2518,7 +2446,7 @@ fn run_quarantined_boot(boot: PersistentBoot) -> ! {
                  dma_pages_iova=retired dma_component=retired retained={} dma_retained=0 \
                  activation=deferred resource_reuse_authorized=true \
                  reset_submitted={} irq_submitted={} iotlb_submitted={} \
-                 service_principal_generation={} successor_generation={} binding_generation={} \
+                 service_executor_generation={} successor_generation={} \
                  fresh_service_task=true ready_in_fresh_task=true production_rebind=true \
                  service_death=task-return exact_reap=true same_boot_fence=true ingress_latch=closed \
                  closed_ingress_rejected=true resumed_prefix={} \
@@ -2532,9 +2460,9 @@ fn run_quarantined_boot(boot: PersistentBoot) -> ! {
                 PROJECTION_VERSION,
                 RECOVERY_SNAPSHOT_VERSION,
                 JOURNAL_SCHEMA_VERSION,
-                HexDigest(catalog_digest),
+                HexDigest(catalog_set_digest),
                 HexDigest(projection_digest),
-                operation_effect().root().get(),
+                operation_effect().operation().get(),
                 operation_effect().sequence(),
                 AGENT_COMPONENT_REPLY.get(),
                 AGENT_COMPONENT_DMA.get(),
@@ -2542,9 +2470,8 @@ fn run_quarantined_boot(boot: PersistentBoot) -> ! {
                 dma_report.reset_submitted,
                 dma_report.irq_submitted,
                 dma_report.iotlb_submitted,
-                successor.generation(),
-                successor.generation(),
-                binding_generation,
+                successor.generation().get(),
+                successor.generation().get(),
                 resumed_prefix,
                 revision,
                 boot_generation,
@@ -2568,20 +2495,20 @@ fn run_quarantined_boot(boot: PersistentBoot) -> ! {
             ),
         ),
         PersistentPhase::StableRecovery => {
-            let (service, successor, binding_generation) =
-                match bind_stable_recovery_service(&reply_owner, &supervisor) {
-                    Ok(recovered) => recovered,
-                    Err(reason) => {
-                        fail_closed(reason, (owner, supervisor, reply_owner, dma_owner, outbox))
-                    }
-                };
+            let (service, successor) = match bind_stable_recovery_service(&reply_owner, &supervisor)
+            {
+                Ok(recovered) => recovered,
+                Err(reason) => {
+                    fail_closed(reason, (owner, supervisor, reply_owner, dma_owner, outbox))
+                }
+            };
             let RuntimeMetrics {
                 revision,
                 boot_generation,
                 journal_generation,
                 device_generation,
                 retained,
-                catalog_digest,
+                catalog_set_digest,
                 projection_digest,
             } = runtime_metrics(&owner);
             let exact = owner.observe_engine(|engine| {
@@ -2613,16 +2540,16 @@ fn run_quarantined_boot(boot: PersistentBoot) -> ! {
             println!(
                 "CSER_CORE_PERSISTENT_BOOT4 PASS shared_runtime=true production_registry=single \
                  api_profile={} catalog_version={} projection_version={} snapshot_version={} \
-                 journal_schema={} catalog_digest={} projection_digest={} \
-                 operation_effect_root={} operation_effect_sequence={} \
-                 reply_component_id={} dma_component_id={} reuse_effect_root={} \
+                 journal_schema={} catalog_set_digest={} projection_digest={} \
+                 operation_id={} effect_sequence={} \
+                 reply_component_id={} dma_component_id={} reuse_operation_id={} \
                  reuse_effect_sequence={} \
                  portal=nxp3 supervisor=core-v1 reply=settled repeated_recovery=stable \
                  duplicate_apply_intent=false duplicate_dma_evidence=false dma_queue=retired \
                  dma_pages_iova=retired reuse_generation=2 retained={} dma_retained=0 \
                  activation=deferred resource_reuse_authorized=true \
                  reset_submitted={} irq_submitted={} iotlb_submitted={} \
-                 service_principal_generation={} successor_generation={} binding_generation={} \
+                 service_executor_generation={} successor_generation={} \
                  fresh_service_task=true ready_in_fresh_task=true production_rebind=true \
                  service_state=live ingress_latch=open prior_service_fence=boot-checkpoint \
                  revision={} boot={} journal={} device={} journal_provider=ata-pio \
@@ -2635,21 +2562,20 @@ fn run_quarantined_boot(boot: PersistentBoot) -> ! {
                 PROJECTION_VERSION,
                 RECOVERY_SNAPSHOT_VERSION,
                 JOURNAL_SCHEMA_VERSION,
-                HexDigest(catalog_digest),
+                HexDigest(catalog_set_digest),
                 HexDigest(projection_digest),
-                operation_effect().root().get(),
+                operation_effect().operation().get(),
                 operation_effect().sequence(),
                 AGENT_COMPONENT_REPLY.get(),
                 AGENT_COMPONENT_DMA.get(),
-                reuse_effect().root().get(),
+                reuse_effect().operation().get(),
                 reuse_effect().sequence(),
                 retained,
                 dma_report.reset_submitted,
                 dma_report.irq_submitted,
                 dma_report.iotlb_submitted,
-                successor.generation(),
-                successor.generation(),
-                binding_generation,
+                successor.generation().get(),
+                successor.generation().get(),
                 revision,
                 boot_generation,
                 journal_generation,
@@ -2670,15 +2596,14 @@ fn arm_reply_second_crash(
     let identity = prepare_production_service(
         owner,
         supervisor,
-        operation_root(),
+        operation_id(),
         operation_origin(),
         ProductionServiceStage::ArmSecondCrash,
     )?;
     if identity.snapshot.is_none() {
         return Err("second-crash-service-not-fresh");
     }
-    let successor = identity.ingress.incarnation();
-    let binding_generation = identity.ingress.binding_generation();
+    let successor = identity.ingress.executor();
     let output = Arc::new(OneShot::new());
     let task_output = Arc::clone(&output);
     let run = build_production_service(owner, identity, move |ingress| {
@@ -2735,7 +2660,6 @@ fn arm_reply_second_crash(
         CommandRequest::PrepareCompositeEffect {
             effect: operation_effect(),
             actor: successor,
-            binding_generation,
         },
     )?;
     Ok(ArmedSecondCrash {
@@ -2744,7 +2668,6 @@ fn arm_reply_second_crash(
         checksum,
         resumed_prefix,
         successor,
-        binding_generation,
     })
 }
 
@@ -2890,19 +2813,18 @@ where
 fn bind_stable_recovery_service(
     owner: &Arc<QuarantinedProductionOwner>,
     supervisor: &CoreSupervisorVNext<QuarantinedProductionOwner>,
-) -> Result<(ProductionServiceRun, PrincipalIncarnation, u64), &'static str> {
+) -> Result<(ProductionServiceRun, ExecutorCoordinate), &'static str> {
     let identity = prepare_production_service(
         owner,
         supervisor,
-        operation_root(),
+        operation_id(),
         operation_origin(),
         ProductionServiceStage::StableRecovery,
     )?;
     if identity.snapshot.is_none() {
         return Err("stable-service-not-fresh");
     }
-    let successor = identity.ingress.incarnation();
-    let binding_generation = identity.ingress.binding_generation();
+    let successor = identity.ingress.executor();
     let run = build_production_service(owner, identity, move |ingress| {
         ingress.ready_and_wait_for_rebind()?;
         ingress.verify_component_observation(operation_effect(), AGENT_COMPONENT_REPLY)?;
@@ -2940,33 +2862,27 @@ fn bind_stable_recovery_service(
     {
         return Err("stable-service-not-live");
     }
-    Ok((run, successor, binding_generation))
+    Ok((run, successor))
 }
 
-fn bound_root_identity<S>(
+fn bound_operation_identity<S>(
     owner: &ProductionCoreOwner<S>,
-    root: RootId,
-) -> Result<(PrincipalIncarnation, u64), &'static str>
+    operation: OperationId,
+) -> Result<ExecutorCoordinate, &'static str>
 where
     S: InstalledCore,
 {
     let state = owner
-        .observe_engine(|engine| engine.root(root))
-        .ok_or("recovery-root-absent")?;
+        .observe_engine(|engine| engine.operation(operation))
+        .ok_or("recovery-operation-absent")?;
     match state {
-        RootRecoveryState::Active {
-            incarnation,
-            binding_generation,
-        } => Ok((incarnation, binding_generation)),
-        RootRecoveryState::Rebound {
-            successor,
-            binding_generation,
-        } => Ok((successor, binding_generation)),
-        RootRecoveryState::Fenced { .. } => Err("service-root-not-rebound"),
-        RootRecoveryState::Snapshotted { .. } | RootRecoveryState::Ready { .. } => {
-            Err("partial-root-recovery-stage")
+        OperationRecoveryState::Active { executor } => Ok(executor),
+        OperationRecoveryState::Rebound { successor } => Ok(successor),
+        OperationRecoveryState::Fenced { .. } => Err("service-operation-not-rebound"),
+        OperationRecoveryState::Snapshotted { .. } | OperationRecoveryState::Ready { .. } => {
+            Err("partial-operation-recovery-stage")
         }
-        RootRecoveryState::RecoveryExhausted { .. } => Err("root-recovery-exhausted"),
+        OperationRecoveryState::RecoveryExhausted { .. } => Err("operation-recovery-exhausted"),
     }
 }
 
@@ -3243,15 +3159,15 @@ fn validate_reply_commit_lineage(engine: &Engine, receipt: ReplyCommitReceipt) -
     {
         return false;
     }
-    let current = match engine.root(operation_root()) {
-        Some(RootRecoveryState::Active { incarnation, .. }) => incarnation,
-        Some(RootRecoveryState::Fenced { crashed, .. })
-        | Some(RootRecoveryState::RecoveryExhausted { crashed, .. }) => crashed,
-        Some(RootRecoveryState::Ready { successor, .. })
-        | Some(RootRecoveryState::Rebound { successor, .. }) => successor,
-        Some(RootRecoveryState::Snapshotted { .. }) | None => return false,
+    let current = match engine.operation(operation_id()) {
+        Some(OperationRecoveryState::Active { executor }) => executor,
+        Some(OperationRecoveryState::Fenced { crashed, .. })
+        | Some(OperationRecoveryState::RecoveryExhausted { crashed, .. }) => crashed,
+        Some(OperationRecoveryState::Ready { successor, .. })
+        | Some(OperationRecoveryState::Rebound { successor }) => successor,
+        Some(OperationRecoveryState::Snapshotted { .. }) | None => return false,
     };
-    current.principal() == receipt.actor().principal()
+    current.executor() == receipt.actor().executor()
         && current.generation() >= receipt.actor().generation()
 }
 
@@ -3296,7 +3212,7 @@ fn inspect_reply_delivery(
 fn validate_composite_projection(composite: &CompositeEffectProjection) -> bool {
     composite.effect == operation_effect()
         && composite.kind == AGENT_OPERATION_COMPOSITE
-        && composite.operation == Some(operation_id())
+        && composite.operation == operation_effect().operation()
         && composite.provider_bindings
             == vec![
                 ComponentProviderBinding::new(AGENT_COMPONENT_REPLY, STANDARD_REPLY_PROVIDER),
@@ -3412,7 +3328,7 @@ fn validate_reuse_precommit(engine: &Engine) -> bool {
     };
     composite.effect == reuse_effect()
         && composite.kind == DMA_ARENA_REUSE_COMPOSITE
-        && composite.operation == Some(reuse_operation_id())
+        && composite.operation == reuse_effect().operation()
         && composite.provider_bindings
             == vec![ComponentProviderBinding::new(
                 AGENT_COMPONENT_DMA,
@@ -3421,7 +3337,7 @@ fn validate_reuse_precommit(engine: &Engine) -> bool {
         && composite.charge_owner == operation_charge_account()
         && composite.component_count == 1
         && composite.authority == AuthorityState::Active
-        && matches!(composite.custodian, CustodyState::Principal(_))
+        && matches!(composite.custodian, CustodyState::Executor(_))
         && component.commit == CommitState::Prepared
         && component.claim_count == 3
         && component.retained_claims == 3
@@ -3475,8 +3391,8 @@ fn validate_prearm_recovery_candidate(engine: &Engine) -> bool {
         || composite.escape != EffectEscapeState::Unescaped
         || !matches!(
             (composite.authority, composite.custodian),
-            (AuthorityState::Fenced, CustodyState::KernelEstate)
-                | (AuthorityState::Active, CustodyState::Principal(_))
+            (AuthorityState::Fenced, CustodyState::CoreOwned)
+                | (AuthorityState::Active, CustodyState::Executor(_))
         )
         || !matches!(
             reply.commit,
@@ -3588,24 +3504,23 @@ fn ensure_uncommitted_composite_actor<S>(
     supervisor: &CoreSupervisorVNext<ProductionCoreOwner<S>>,
     effect: EffectId,
     projection: CompositeEffectProjection,
-    actor: PrincipalIncarnation,
-    binding_generation: u64,
+    actor: ExecutorCoordinate,
 ) -> Result<(), &'static str>
 where
     S: InstalledCore,
 {
-    if bound_root_identity(owner, effect.root())? != (actor, binding_generation) {
+    if bound_operation_identity(owner, effect.operation())? != actor {
         return Err("composite-actor-binding");
     }
     match projection.authority {
-        AuthorityState::Fenced if projection.custodian == CustodyState::KernelEstate => {
+        AuthorityState::Fenced if projection.custodian == CustodyState::CoreOwned => {
             expect_no_output_checked(
                 supervisor
-                    .adopt_effect(effect, actor, binding_generation)
+                    .adopt_effect(effect, actor)
                     .map_err(|_| "composite-adoption")?,
             )?;
         }
-        AuthorityState::Active if projection.custodian == CustodyState::Principal(actor) => {}
+        AuthorityState::Active if projection.custodian == CustodyState::Executor(actor) => {}
         AuthorityState::Active | AuthorityState::Fenced | AuthorityState::Revoked => {
             return Err("composite-adoption-state");
         }
@@ -3613,7 +3528,7 @@ where
     let live = owner.observe_engine(|engine| engine.composite_effect(effect));
     if !live.is_some_and(|composite| {
         composite.authority == AuthorityState::Active
-            && composite.custodian == CustodyState::Principal(actor)
+            && composite.custodian == CustodyState::Executor(actor)
     }) {
         return Err("composite-adoption-postcondition");
     }
@@ -3786,7 +3701,7 @@ where
             journal_generation: freshness.journal().get(),
             device_generation: freshness.device().get(),
             retained: engine.retained_component_claims().len(),
-            catalog_digest: engine.catalog_digest(),
+            catalog_set_digest: engine.catalog_set_digest(),
             projection_digest: engine.projection_digest(),
         }
     })
@@ -3857,7 +3772,7 @@ fn validate_reuse_permit(
     arena: PersistentDmaArenaLayout,
 ) -> Result<ReusePermit, &'static str> {
     if permit.effect() != reuse_effect()
-        || permit.component() != Some(AGENT_COMPONENT_DMA)
+        || permit.component() != AGENT_COMPONENT_DMA
         || permit.resource() != new.resource()
         || permit.claim() != new.claim()
         || permit.previous_generation() != old.generation()
@@ -3937,12 +3852,8 @@ fn reply_coordinate() -> ReplyCoordinate {
     )
 }
 
-fn operation_root() -> RootId {
-    root(0xc501)
-}
-
 fn operation_effect() -> EffectId {
-    EffectId::new(operation_root(), 1).expect("agent operation effect is non-zero")
+    EffectId::new(operation_id(), 1).expect("agent operation effect is non-zero")
 }
 
 /// Stable semantic operation identity for the standard reply+DMA operation.
@@ -3951,17 +3862,23 @@ fn operation_id() -> OperationId {
 }
 
 fn reuse_effect() -> EffectId {
-    EffectId::new(operation_root(), REUSE_EFFECT_SEQUENCE)
+    EffectId::new(reuse_operation_id(), REUSE_EFFECT_SEQUENCE)
         .expect("DMA reuse effect identity is non-zero")
 }
 
-/// Stable semantic operation identity for the DMA-only reuse operation.
+/// Causal operation coordinate shared by the DMA-only reuse effect.
 fn reuse_operation_id() -> OperationId {
-    OperationId::new(2).expect("DMA reuse operation identity is non-zero")
+    // The reuse witness is a second effect of the same agent action. Keeping
+    // one operation coordinate lets one task-bound ingress cover the bounded
+    // recovery/reuse sequence without an unscoped multi-operation escape.
+    operation_id()
 }
 
-fn operation_origin() -> PrincipalIncarnation {
-    principal(0xc501, 1)
+fn operation_origin() -> ExecutorCoordinate {
+    ExecutorCoordinate::new(
+        ExecutorId::new(0xc501).expect("executor identity is non-zero"),
+        ExecutorGeneration::new(1).expect("executor generation is non-zero"),
+    )
 }
 
 fn operation_charge_account() -> ChargeAccountId {
@@ -3974,10 +3891,6 @@ fn reply_claim() -> ClaimId {
 
 fn reply_resource() -> ResourceId {
     resource(0xc521)
-}
-
-fn root(value: u64) -> RootId {
-    RootId::new(value).expect("root identity is non-zero")
 }
 
 fn claim_id(value: u64) -> ClaimId {
@@ -3994,14 +3907,6 @@ fn resource_generation(value: u64) -> ResourceGeneration {
 
 fn charge_account(value: u64) -> ChargeAccountId {
     ChargeAccountId::new(value).expect("charge account is non-zero")
-}
-
-fn principal(value: u64, generation: u64) -> PrincipalIncarnation {
-    PrincipalIncarnation::new(
-        PrincipalId::new(value).expect("principal identity is non-zero"),
-        generation,
-    )
-    .expect("principal generation is non-zero")
 }
 
 fn digest(tag: u8) -> Digest {

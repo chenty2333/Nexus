@@ -1,10 +1,17 @@
-use cser_model::EffectId;
 use cser_model::composite_effect_oracle::{
     ClaimKind, ClaimState, ComponentId, CompositeAuthority, CompositeEffectOracle, CompositeError,
     CompositeResources, DmaOutcome, EscapeState, ReplyClaim, ReplyState, ResourceId, ReusePermit,
 };
+use cser_model::{EffectId, ExecutorCoordinate, ExecutorGeneration, ExecutorId, OperationId};
 
-const EFFECT: EffectId = EffectId::new(0xce01);
+const EFFECT: EffectId = EffectId::new(OperationId::new(0xce01).unwrap(), 1).unwrap();
+
+fn executor(id: u64, generation: u64) -> ExecutorCoordinate {
+    ExecutorCoordinate::new(
+        ExecutorId::new(id).unwrap(),
+        ExecutorGeneration::new(generation).unwrap(),
+    )
+}
 
 fn resources() -> CompositeResources {
     CompositeResources {
@@ -16,7 +23,7 @@ fn resources() -> CompositeResources {
 }
 
 fn staged() -> CompositeEffectOracle {
-    CompositeEffectOracle::new(EFFECT, 1, 1, 1, 1, resources())
+    CompositeEffectOracle::new(EFFECT, executor(1, 1), 1, 1, resources())
 }
 
 fn committed() -> CompositeEffectOracle {
@@ -29,9 +36,31 @@ fn committed() -> CompositeEffectOracle {
 
 fn recovered() -> CompositeEffectOracle {
     let mut model = committed();
-    model.fence_incarnation(1, 1).unwrap();
-    model.rebind(2, 2).unwrap();
+    model.fence_executor(executor(1, 1)).unwrap();
+    model.rebind(executor(1, 2)).unwrap();
     model
+}
+
+#[test]
+fn rebind_accepts_same_origin_id_only_for_a_strictly_newer_generation() {
+    let mut model = staged();
+    model.fence_executor(executor(1, 1)).unwrap();
+
+    let before = model.projection();
+    assert_eq!(
+        model.rebind(executor(9, 2)),
+        Err(CompositeError::StaleAuthority)
+    );
+    assert_eq!(model.projection(), before);
+    assert_eq!(
+        model.rebind(executor(1, 1)),
+        Err(CompositeError::StaleAuthority)
+    );
+    assert_eq!(model.projection(), before);
+
+    model.rebind(executor(1, 2)).unwrap();
+    assert_eq!(model.projection().live_executor, Some(executor(1, 2)));
+    assert!(model.check_invariants());
 }
 
 fn claim_applied(model: &mut CompositeEffectOracle) -> ReplyClaim {
@@ -251,7 +280,7 @@ fn recovered_effect_partially_discharges_and_reuses_physical_claims_before_reply
     assert_eq!(
         partial.reply,
         ReplyState::AppliedUnacknowledged {
-            claimant: 2,
+            claimant: executor(1, 2),
             generation: 1,
         }
     );
@@ -331,7 +360,7 @@ fn reply_and_dma_fence_commit_orders_preserve_exactly_the_linearized_component()
     let mut reply_commit_first = staged();
     let old = reply_commit_first.observe_authority().unwrap();
     reply_commit_first.commit_reply(old).unwrap();
-    reply_commit_first.fence_incarnation(1, 1).unwrap();
+    reply_commit_first.fence_executor(executor(1, 1)).unwrap();
     assert!(reply_commit_first.component(ComponentId::Reply).committed);
     assert_eq!(
         reply_commit_first.projection().authority,
@@ -340,7 +369,7 @@ fn reply_and_dma_fence_commit_orders_preserve_exactly_the_linearized_component()
 
     let mut reply_fence_first = staged();
     let stale = reply_fence_first.observe_authority().unwrap();
-    reply_fence_first.fence_incarnation(1, 1).unwrap();
+    reply_fence_first.fence_executor(executor(1, 1)).unwrap();
     let fenced = reply_fence_first.projection();
     assert_eq!(
         reply_fence_first.commit_reply(stale),
@@ -352,7 +381,7 @@ fn reply_and_dma_fence_commit_orders_preserve_exactly_the_linearized_component()
     let mut commit_first = staged();
     let old = commit_first.observe_authority().unwrap();
     commit_first.commit_dma(old).unwrap();
-    commit_first.fence_incarnation(1, 1).unwrap();
+    commit_first.fence_executor(executor(1, 1)).unwrap();
     assert!(commit_first.component(ComponentId::Dma).committed);
     assert_eq!(
         commit_first.projection().authority,
@@ -361,7 +390,7 @@ fn reply_and_dma_fence_commit_orders_preserve_exactly_the_linearized_component()
 
     let mut fence_first = staged();
     let stale = fence_first.observe_authority().unwrap();
-    fence_first.fence_incarnation(1, 1).unwrap();
+    fence_first.fence_executor(executor(1, 1)).unwrap();
     let fenced = fence_first.projection();
     assert_eq!(
         fence_first.commit_dma(stale),
@@ -378,8 +407,8 @@ fn reply_and_dma_fence_commit_orders_preserve_exactly_the_linearized_component()
 #[test]
 fn adopt_and_revoke_share_the_parent_authority_epoch_before_escape() {
     let mut adopt_first = staged();
-    adopt_first.fence_incarnation(1, 1).unwrap();
-    adopt_first.rebind(2, 2).unwrap();
+    adopt_first.fence_executor(executor(1, 1)).unwrap();
+    adopt_first.rebind(executor(1, 2)).unwrap();
     let observed = adopt_first.observe_authority().unwrap();
     adopt_first.adopt_effect(observed).unwrap();
     let adopted_projection = adopt_first.projection();
@@ -394,8 +423,8 @@ fn adopt_and_revoke_share_the_parent_authority_epoch_before_escape() {
     );
 
     let mut revoke_first = staged();
-    revoke_first.fence_incarnation(1, 1).unwrap();
-    revoke_first.rebind(2, 2).unwrap();
+    revoke_first.fence_executor(executor(1, 1)).unwrap();
+    revoke_first.rebind(executor(1, 2)).unwrap();
     let observed = revoke_first.observe_authority().unwrap();
     revoke_first.begin_revoke(observed).unwrap();
     let revoked_projection = revoke_first.projection();
@@ -431,8 +460,8 @@ fn any_committed_component_makes_parent_adoption_fail_closed_and_failure_atomic(
         if committed_components.1 {
             model.commit_dma(authority).unwrap();
         }
-        model.fence_incarnation(1, 1).unwrap();
-        model.rebind(2, 2).unwrap();
+        model.fence_executor(executor(1, 1)).unwrap();
+        model.rebind(executor(1, 2)).unwrap();
         let successor = model.observe_authority().unwrap();
         let before = model.projection();
 
@@ -454,7 +483,7 @@ fn stale_reply_ack_irq_and_retirement_coordinates_are_failure_atomic() {
     let mut model = recovered();
     let old_irq = model.dma_completion_event().unwrap();
     let claim = claim_applied(&mut model);
-    model.fence_incarnation(2, 2).unwrap();
+    model.fence_executor(executor(1, 2)).unwrap();
     let after_crash = model.projection();
 
     assert_eq!(
@@ -463,7 +492,7 @@ fn stale_reply_ack_irq_and_retirement_coordinates_are_failure_atomic() {
     );
     assert_eq!(model.projection(), after_crash);
 
-    model.rebind(3, 3).unwrap();
+    model.rebind(executor(1, 3)).unwrap();
     let replacement = model
         .claim_reply(model.observe_authority().unwrap())
         .unwrap();
@@ -496,7 +525,9 @@ fn stale_reply_ack_irq_and_retirement_coordinates_are_failure_atomic() {
         Err(CompositeError::StaleDeviceEvidence)
     );
     assert_eq!(
-        model.accept_reset(evidence.with_effect(EffectId::new(EFFECT.get() + 1))),
+        model.accept_reset(
+            evidence.with_operation(OperationId::new(EFFECT.operation().get() + 1).unwrap())
+        ),
         Err(CompositeError::StaleDeviceEvidence)
     );
     assert_eq!(
@@ -518,7 +549,7 @@ fn stale_reply_ack_irq_and_retirement_coordinates_are_failure_atomic() {
 #[test]
 fn fenced_composite_does_not_block_an_unrelated_composite() {
     let mut quarantined = committed();
-    quarantined.fence_incarnation(1, 1).unwrap();
+    quarantined.fence_executor(executor(1, 1)).unwrap();
     let quarantined_projection = quarantined.projection();
 
     let unrelated_resources = CompositeResources {
@@ -527,8 +558,13 @@ fn fenced_composite_does_not_block_an_unrelated_composite() {
         pinned_page: ResourceId::new(103),
         iova_mapping: ResourceId::new(104),
     };
-    let mut unrelated =
-        CompositeEffectOracle::new(EffectId::new(0xce02), 7, 9, 1, 1, unrelated_resources);
+    let mut unrelated = CompositeEffectOracle::new(
+        EffectId::new(OperationId::new(0xce02).unwrap(), 1).unwrap(),
+        executor(7, 9),
+        1,
+        1,
+        unrelated_resources,
+    );
     let authority = unrelated.observe_authority().unwrap();
     unrelated.commit_reply(authority).unwrap();
     unrelated.commit_dma(authority).unwrap();
@@ -540,7 +576,10 @@ fn fenced_composite_does_not_block_an_unrelated_composite() {
         quarantined.projection().authority,
         CompositeAuthority::Fenced
     );
-    assert_eq!(unrelated.projection().effect, EffectId::new(0xce02));
+    assert_eq!(
+        unrelated.projection().effect,
+        EffectId::new(OperationId::new(0xce02).unwrap(), 1).unwrap()
+    );
     assert_eq!(unrelated.projection().reply, ReplyState::Settled);
     assert_eq!(
         unrelated.claim(ClaimKind::QueueSlot).state,
@@ -594,7 +633,7 @@ fn second_crash_preserves_every_modeled_reply_dma_partial_boundary() {
                 model.claim(ClaimKind::IovaMapping),
             ];
 
-            model.fence_incarnation(2, 2).unwrap();
+            model.fence_executor(executor(1, 2)).unwrap();
             let after = model.projection();
             let physical_after = [
                 model.claim(ClaimKind::QueueSlot),
@@ -621,7 +660,7 @@ fn second_crash_preserves_every_modeled_reply_dma_partial_boundary() {
                 "{coordinates}"
             );
 
-            model.rebind(3, 3).unwrap();
+            model.rebind(executor(1, 3)).unwrap();
 
             if let Some(stale) = old_reply_claim {
                 if matches!(
@@ -651,8 +690,7 @@ fn second_crash_preserves_every_modeled_reply_dma_partial_boundary() {
                 );
                 assert_eq!(model.projection(), retained, "{coordinates}");
                 let replacement = reclaim_reuse(&mut model, permit.kind()).unwrap();
-                assert_eq!(replacement.actor(), 3, "{coordinates}");
-                assert_eq!(replacement.binding_generation(), 3, "{coordinates}");
+                assert_eq!(replacement.actor(), executor(1, 3), "{coordinates}");
                 assert_eq!(
                     replacement.authority_epoch(),
                     model.projection().authority_epoch,
@@ -677,9 +715,9 @@ fn second_crash_preserves_every_modeled_reply_dma_partial_boundary() {
 fn second_crash_preserves_tombstoned_reply_across_every_dma_partial_boundary() {
     for dma_boundary in DmaBoundary::ALL {
         let mut model = committed();
-        model.fence_incarnation(1, 1).unwrap();
+        model.fence_executor(executor(1, 1)).unwrap();
         model.tombstone_reply().unwrap();
-        model.rebind(2, 2).unwrap();
+        model.rebind(executor(1, 2)).unwrap();
         let outstanding_permit = at_dma_boundary(&mut model, dma_boundary);
         let before = model.projection();
         let physical_before = [
@@ -688,7 +726,7 @@ fn second_crash_preserves_tombstoned_reply_across_every_dma_partial_boundary() {
             model.claim(ClaimKind::IovaMapping),
         ];
 
-        model.fence_incarnation(2, 2).unwrap();
+        model.fence_executor(executor(1, 2)).unwrap();
         let after = model.projection();
         let coordinates = format!("tombstone,dma={dma_boundary:?}");
         assert_eq!(after.reply, ReplyState::Tombstoned, "{coordinates}");
@@ -703,7 +741,7 @@ fn second_crash_preserves_tombstoned_reply_across_every_dma_partial_boundary() {
             "{coordinates}"
         );
 
-        model.rebind(3, 3).unwrap();
+        model.rebind(executor(1, 3)).unwrap();
         if let Some(permit) = outstanding_permit {
             let retained = model.projection();
             assert_eq!(
@@ -733,7 +771,7 @@ fn second_crash_preserves_completed_dma_without_releasing_its_physical_claims() 
             model.claim(ClaimKind::IovaMapping),
         ];
 
-        model.fence_incarnation(2, 2).unwrap();
+        model.fence_executor(executor(1, 2)).unwrap();
         let coordinates = format!("completed-dma,reply={reply_boundary:?}");
         assert_eq!(
             model.projection().dma,
@@ -750,7 +788,7 @@ fn second_crash_preserves_completed_dma_without_releasing_its_physical_claims() 
             "{coordinates}"
         );
 
-        model.rebind(3, 3).unwrap();
+        model.rebind(executor(1, 3)).unwrap();
         if let Some(stale) = old_reply_claim {
             assert_eq!(
                 model.accept_reply_ack(stale),

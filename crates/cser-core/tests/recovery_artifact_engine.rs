@@ -1,16 +1,16 @@
 use cser_core::{
     AdoptionPolicy, ArtifactAdmission, ArtifactPinChallenge, ArtifactPinVerifier,
     ArtifactReceiptBindings, ArtifactReleaseChallenge, ArtifactReleaseVerifier, BootGeneration,
-    ClaimCardinality, ClaimKindId, ClaimScope, CommandRequest, CommitState, ComponentId,
-    ComponentProviderBinding, CompositeComponentSpec, CompositeKindId, CoreError, CoreLimits,
-    CreditClassId, DeviceGeneration, DeviceGenerationEffect, Digest, DomainCatalog,
-    DomainCatalogBuilder, DomainId, EffectId, Engine, EvidenceKindId, EvidenceRule, Freshness,
-    FreshnessAxes, JournalGeneration, ObligationKindId, ObligationPolicy, ObligationReceipts,
-    ObligationSpec, OperationId, PrincipalId, PrincipalIncarnation, ProviderCoordinate,
-    ProviderGeneration, ProviderId, ReceiptBinding, ReceiptSchemaId, RecoveryArtifactId,
-    RecoveryArtifactPolicy, RegistryInstance, ResourceGeneration, ResourceId, RootId,
-    TransitionEvent, TransitionOutput, VerificationError, VerifierBinding, VerifierGeneration,
-    VerifierIdentity, WorldId,
+    CatalogSet, ClaimCardinality, ClaimKindId, ClaimScope, CommandRequest, CommitState,
+    ComponentId, ComponentProviderBinding, CompositeComponentSpec, CompositeKindId, CoreError,
+    CoreLimits, CreditClassId, DeviceGeneration, DeviceGenerationEffect, Digest, DomainCatalog,
+    DomainCatalogBuilder, DomainId, EffectId, Engine, EvidenceKindId, EvidenceRule,
+    ExecutorCoordinate, ExecutorGeneration, ExecutorId, Freshness, FreshnessAxes,
+    JournalGeneration, ObligationKindId, ObligationPolicy, ObligationReceipts, ObligationSpec,
+    OperationId, ProviderCoordinate, ProviderGeneration, ProviderId, ReceiptBinding,
+    ReceiptSchemaId, RecoveryArtifactId, RecoveryArtifactPolicy, RegistryInstance,
+    ResourceGeneration, ResourceId, TransitionEvent, TransitionOutput, VerificationError,
+    VerifierBinding, VerifierGeneration, VerifierIdentity, WorldId,
 };
 
 const WORLD: u64 = 7_001;
@@ -35,11 +35,9 @@ fn freshness() -> Freshness {
     Freshness::new(
         BootGeneration::new(1).unwrap(),
         RegistryInstance::new(1).unwrap(),
-        1,
         DeviceGeneration::new(1).unwrap(),
         JournalGeneration::new(1).unwrap(),
     )
-    .unwrap()
 }
 
 fn id<T>(value: u64, make: impl FnOnce(u32) -> Result<T, cser_core::IdentityError>) -> T {
@@ -234,7 +232,7 @@ fn registered_engine_with_catalog(
     let provider = provider(world);
     let mut engine = Engine::new(
         world,
-        catalog.clone(),
+        CatalogSet::new(std::slice::from_ref(&catalog)).unwrap(),
         CoreLimits::bounded_default(),
         freshness(),
     );
@@ -265,12 +263,14 @@ fn fixture(
     DomainCatalog,
     ProviderCoordinate,
     EffectId,
-    PrincipalIncarnation,
+    ExecutorCoordinate,
 ) {
     let (mut engine, catalog, provider) = registered_engine();
-    let effect = EffectId::new(RootId::new(effect_value).unwrap(), 1).unwrap();
-    let actor = PrincipalIncarnation::new(PrincipalId::new(effect_value).unwrap(), 1).unwrap();
-    let operation = OperationId::new(effect_value + 1).unwrap();
+    let effect = EffectId::new(OperationId::new(effect_value).unwrap(), 1).unwrap();
+    let actor = ExecutorCoordinate::new(
+        ExecutorId::new(effect_value).unwrap(),
+        ExecutorGeneration::new(1).unwrap(),
+    );
     let admission = ArtifactAdmission::new(
         RecoveryArtifactId::new(effect_value + 2).unwrap(),
         Digest::new([0x51; 32]),
@@ -279,9 +279,7 @@ fn fixture(
     engine
         .transact_volatile(CommandRequest::AdmitScopedCompositeEffect {
             effect,
-            operation,
             origin: actor,
-            binding_generation: 1,
             kind: id(COMPOSITE, CompositeKindId::new),
             charge_account: cser_core::ChargeAccountId::new(effect_value).unwrap(),
             bindings: vec![
@@ -295,9 +293,11 @@ fn fixture(
 
 fn mixed_fixture(effect_value: u64) -> (Engine, DomainCatalog, ProviderCoordinate, EffectId) {
     let (mut engine, catalog, provider) = registered_engine_with_catalog(mixed_catalog());
-    let effect = EffectId::new(RootId::new(effect_value).unwrap(), 1).unwrap();
-    let actor = PrincipalIncarnation::new(PrincipalId::new(effect_value).unwrap(), 1).unwrap();
-    let operation = OperationId::new(effect_value + 1).unwrap();
+    let effect = EffectId::new(OperationId::new(effect_value).unwrap(), 1).unwrap();
+    let actor = ExecutorCoordinate::new(
+        ExecutorId::new(effect_value).unwrap(),
+        ExecutorGeneration::new(1).unwrap(),
+    );
     let first = ArtifactAdmission::new(
         RecoveryArtifactId::new(effect_value + 2).unwrap(),
         Digest::new([0x51; 32]),
@@ -311,9 +311,7 @@ fn mixed_fixture(effect_value: u64) -> (Engine, DomainCatalog, ProviderCoordinat
     engine
         .transact_volatile(CommandRequest::AdmitScopedCompositeEffect {
             effect,
-            operation,
             origin: actor,
-            binding_generation: 1,
             kind: id(COMPOSITE, CompositeKindId::new),
             charge_account: cser_core::ChargeAccountId::new(effect_value).unwrap(),
             bindings: vec![
@@ -327,13 +325,12 @@ fn mixed_fixture(effect_value: u64) -> (Engine, DomainCatalog, ProviderCoordinat
     (engine, catalog, provider, effect)
 }
 
-fn prepare(engine: &mut Engine, effect: EffectId, actor: PrincipalIncarnation, value: u64) {
+fn prepare(engine: &mut Engine, effect: EffectId, actor: ExecutorCoordinate, value: u64) {
     engine
         .transact_volatile(CommandRequest::AddComponentClaim {
             effect,
             component: id(COMPONENT, ComponentId::new),
             actor,
-            binding_generation: 1,
             claim: cser_core::ClaimId::new(value).unwrap(),
             kind: id(CLAIM, ClaimKindId::new),
             scope: ClaimScope::Logical,
@@ -343,11 +340,7 @@ fn prepare(engine: &mut Engine, effect: EffectId, actor: PrincipalIncarnation, v
         })
         .unwrap();
     engine
-        .transact_volatile(CommandRequest::PrepareCompositeEffect {
-            effect,
-            actor,
-            binding_generation: 1,
-        })
+        .transact_volatile(CommandRequest::PrepareCompositeEffect { effect, actor })
         .unwrap();
 }
 
@@ -409,16 +402,17 @@ fn tx<C: Into<cser_core::Command>>(
 #[test]
 fn required_admission_without_artifact_is_rejected() {
     let (mut engine, catalog, provider) = registered_engine();
-    let effect = EffectId::new(RootId::new(71_001).unwrap(), 1).unwrap();
-    let actor = PrincipalIncarnation::new(PrincipalId::new(71_001).unwrap(), 1).unwrap();
+    let effect = EffectId::new(OperationId::new(71_001).unwrap(), 1).unwrap();
+    let actor = ExecutorCoordinate::new(
+        ExecutorId::new(71_001).unwrap(),
+        ExecutorGeneration::new(1).unwrap(),
+    );
     assert_eq!(
         tx(
             &mut engine,
             CommandRequest::AdmitScopedCompositeEffect {
                 effect,
-                operation: OperationId::new(71_002).unwrap(),
                 origin: actor,
-                binding_generation: 1,
                 kind: id(COMPOSITE, CompositeKindId::new),
                 charge_account: cser_core::ChargeAccountId::new(71_001).unwrap(),
                 bindings: vec![ComponentProviderBinding::new(
@@ -429,8 +423,61 @@ fn required_admission_without_artifact_is_rejected() {
         ),
         Err(CoreError::ArtifactRequired)
     );
-    assert_eq!(engine.catalog_digest(), catalog.digest());
+    assert_eq!(
+        engine.catalog_set_digest(),
+        CatalogSet::new(std::slice::from_ref(&catalog))
+            .unwrap()
+            .digest()
+    );
     assert!(engine.composite_effect(effect).is_none());
+}
+
+#[test]
+fn scoped_admission_rejects_duplicate_artifact_ids_before_state_mutation() {
+    let value = 71_101;
+    let (mut engine, catalog, provider) = registered_engine_with_catalog(mixed_catalog());
+    let effect = EffectId::new(OperationId::new(value).unwrap(), 1).unwrap();
+    let actor = ExecutorCoordinate::new(
+        ExecutorId::new(value).unwrap(),
+        ExecutorGeneration::new(1).unwrap(),
+    );
+    let duplicate = ArtifactAdmission::new(
+        RecoveryArtifactId::new(value + 2).unwrap(),
+        Digest::new([0x61; 32]),
+        Digest::new([0x62; 32]),
+    );
+    assert_eq!(
+        tx(
+            &mut engine,
+            CommandRequest::AdmitScopedCompositeEffect {
+                effect,
+                origin: actor,
+                kind: id(COMPOSITE, CompositeKindId::new),
+                charge_account: cser_core::ChargeAccountId::new(value).unwrap(),
+                bindings: vec![
+                    ComponentProviderBinding::new(id(COMPONENT, ComponentId::new), provider)
+                        .with_artifact(duplicate),
+                    ComponentProviderBinding::new(id(COMPONENT_TWO, ComponentId::new), provider)
+                        .with_artifact(duplicate),
+                ],
+            },
+        ),
+        Err(CoreError::ArtifactBindingMismatch)
+    );
+    assert!(engine.composite_effect(effect).is_none());
+    assert_eq!(
+        engine
+            .provider_generation_projection(provider)
+            .unwrap()
+            .live_component_bindings,
+        0
+    );
+    assert_eq!(
+        engine.catalog_set_digest(),
+        CatalogSet::new(std::slice::from_ref(&catalog))
+            .unwrap()
+            .digest()
+    );
 }
 
 #[test]
@@ -444,7 +491,6 @@ fn unpinned_component_commit_intent_is_rejected() {
                 effect,
                 component: id(COMPONENT, ComponentId::new),
                 actor,
-                binding_generation: 1,
                 operation: Digest::new([0x73; 32]),
             },
         ),
@@ -501,7 +547,6 @@ fn pin_then_component_commit_intent_is_viable() {
             effect,
             component: id(COMPONENT, ComponentId::new),
             actor,
-            binding_generation: 1,
             operation: Digest::new([0x75; 32]),
         },
     )
@@ -509,7 +554,7 @@ fn pin_then_component_commit_intent_is_viable() {
     assert_eq!(receipt.event(), TransitionEvent::CommitIntentDurable);
     assert!(matches!(
         receipt.into_output(),
-        TransitionOutput::CommitIntent(intent) if intent.component() == Some(id(COMPONENT, ComponentId::new))
+        TransitionOutput::CommitIntent(intent) if intent.component() == id(COMPONENT, ComponentId::new)
     ));
     assert_eq!(
         engine

@@ -7,16 +7,9 @@
 //! In particular, a retired physical claim may receive a resource-local reuse
 //! permit while the reply component is still live.
 
-use crate::EffectId;
+use crate::{EffectId, ExecutorCoordinate, ExecutorId, OperationId};
 
-/// Logical component carried by the composite effect.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ComponentId {
-    /// Logical output publication and acknowledgement.
-    Reply,
-    /// Queue, pinned-page, and IOVA custody.
-    Dma,
-}
+pub use crate::ComponentId;
 
 /// Fixed claim classes in the bounded composite profile.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -127,7 +120,7 @@ impl CompositeResources {
 pub enum CompositeError {
     /// Revocation or release permanently closed principal authority.
     GateClosed,
-    /// An authority observation names an old incarnation, binding, or epoch.
+    /// An authority observation names an old executor coordinate or epoch.
     StaleAuthority,
     /// The requested transition is not legal for the current authority state.
     WrongAuthorityState,
@@ -160,7 +153,7 @@ pub enum CompositeError {
 /// Shared authority state of the parent effect.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CompositeAuthority {
-    /// The current incarnation may advance component work.
+    /// The current executor may advance component work.
     Active,
     /// Executor authority is fenced while kernel custody survives.
     Fenced,
@@ -193,24 +186,24 @@ pub enum ReplyState {
         /// Monotonic settlement generation.
         generation: u64,
     },
-    /// One live incarnation owns settlement.
+    /// One live executor coordinate owns settlement.
     Claimed {
-        /// Incarnation that owns the claim.
-        claimant: u64,
+        /// Executor coordinate that owns the claim.
+        claimant: ExecutorCoordinate,
         /// Monotonic settlement generation.
         generation: u64,
     },
     /// External apply intent is durable.
     ApplyIntentDurable {
-        /// Incarnation that owns the claim.
-        claimant: u64,
+        /// Executor coordinate that owns the claim.
+        claimant: ExecutorCoordinate,
         /// Monotonic settlement generation.
         generation: u64,
     },
     /// External apply occurred but acknowledgement is not durable.
     AppliedUnacknowledged {
-        /// Incarnation that owns the claim.
-        claimant: u64,
+        /// Executor coordinate that owns the claim.
+        claimant: ExecutorCoordinate,
         /// Monotonic settlement generation.
         generation: u64,
     },
@@ -305,28 +298,27 @@ impl ClaimState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AuthorityObservation {
     effect: EffectId,
-    incarnation: u64,
-    binding_generation: u64,
+    executor: ExecutorCoordinate,
     authority_epoch: u64,
 }
 
 impl AuthorityObservation {
-    /// Returns the observed parent effect.
+    /// Returns the observed operation.
+    #[must_use]
+    pub const fn operation(self) -> OperationId {
+        self.effect.operation()
+    }
+
+    /// Returns the exact observed effect identity.
     #[must_use]
     pub const fn effect(self) -> EffectId {
         self.effect
     }
 
-    /// Returns the observed executor incarnation.
+    /// Returns the observed executor coordinate.
     #[must_use]
-    pub const fn incarnation(self) -> u64 {
-        self.incarnation
-    }
-
-    /// Returns the observed binding generation.
-    #[must_use]
-    pub const fn binding_generation(self) -> u64 {
-        self.binding_generation
+    pub const fn executor(self) -> ExecutorCoordinate {
+        self.executor
     }
 
     /// Returns the observed authority epoch.
@@ -335,24 +327,24 @@ impl AuthorityObservation {
         self.authority_epoch
     }
 
-    /// Substitutes an effect identity for negative testing.
+    /// Substitutes an operation identity for negative testing.
+    #[must_use]
+    pub const fn with_operation(mut self, operation: OperationId) -> Self {
+        self.effect = EffectId::new(operation, self.effect.sequence()).unwrap();
+        self
+    }
+
+    /// Substitutes an exact effect identity for negative testing.
     #[must_use]
     pub const fn with_effect(mut self, effect: EffectId) -> Self {
         self.effect = effect;
         self
     }
 
-    /// Substitutes an incarnation for negative testing.
+    /// Substitutes an executor coordinate for negative testing.
     #[must_use]
-    pub const fn with_incarnation(mut self, incarnation: u64) -> Self {
-        self.incarnation = incarnation;
-        self
-    }
-
-    /// Substitutes a binding generation for negative testing.
-    #[must_use]
-    pub const fn with_binding_generation(mut self, generation: u64) -> Self {
-        self.binding_generation = generation;
+    pub const fn with_executor(mut self, executor: ExecutorCoordinate) -> Self {
+        self.executor = executor;
         self
     }
 
@@ -368,21 +360,27 @@ impl AuthorityObservation {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReplyClaim {
     effect: EffectId,
-    claimant: u64,
+    claimant: ExecutorCoordinate,
     generation: u64,
     nonce: u64,
 }
 
 impl ReplyClaim {
-    /// Returns the parent effect identity.
+    /// Returns the operation identity.
+    #[must_use]
+    pub const fn operation(self) -> OperationId {
+        self.effect.operation()
+    }
+
+    /// Returns the exact effect identity bound to this claim.
     #[must_use]
     pub const fn effect(self) -> EffectId {
         self.effect
     }
 
-    /// Returns the claimant incarnation.
+    /// Returns the claimant executor coordinate.
     #[must_use]
-    pub const fn claimant(self) -> u64 {
+    pub const fn claimant(self) -> ExecutorCoordinate {
         self.claimant
     }
 
@@ -398,7 +396,14 @@ impl ReplyClaim {
         self.nonce
     }
 
-    /// Substitutes the effect identity for negative testing.
+    /// Substitutes the operation identity for negative testing.
+    #[must_use]
+    pub const fn with_operation(mut self, operation: OperationId) -> Self {
+        self.effect = EffectId::new(operation, self.effect.sequence()).unwrap();
+        self
+    }
+
+    /// Substitutes an exact effect identity for negative testing.
     #[must_use]
     pub const fn with_effect(mut self, effect: EffectId) -> Self {
         self.effect = effect;
@@ -407,7 +412,7 @@ impl ReplyClaim {
 
     /// Substitutes the claimant for negative testing.
     #[must_use]
-    pub const fn with_claimant(mut self, claimant: u64) -> Self {
+    pub const fn with_claimant(mut self, claimant: ExecutorCoordinate) -> Self {
         self.claimant = claimant;
         self
     }
@@ -436,7 +441,13 @@ pub struct DmaEvent {
 }
 
 impl DmaEvent {
-    /// Returns the parent effect.
+    /// Returns the parent operation.
+    #[must_use]
+    pub const fn operation(self) -> OperationId {
+        self.effect.operation()
+    }
+
+    /// Returns the exact effect identity bound to this event.
     #[must_use]
     pub const fn effect(self) -> EffectId {
         self.effect
@@ -454,7 +465,14 @@ impl DmaEvent {
         self.device_generation
     }
 
-    /// Substitutes the effect identity for negative testing.
+    /// Substitutes the operation identity for negative testing.
+    #[must_use]
+    pub const fn with_operation(mut self, operation: OperationId) -> Self {
+        self.effect = EffectId::new(operation, self.effect.sequence()).unwrap();
+        self
+    }
+
+    /// Substitutes an exact effect identity for negative testing.
     #[must_use]
     pub const fn with_effect(mut self, effect: EffectId) -> Self {
         self.effect = effect;
@@ -486,7 +504,13 @@ pub struct DmaEvidence {
 }
 
 impl DmaEvidence {
-    /// Returns the parent effect.
+    /// Returns the parent operation.
+    #[must_use]
+    pub const fn operation(self) -> OperationId {
+        self.effect.operation()
+    }
+
+    /// Returns the exact effect identity bound to this evidence.
     #[must_use]
     pub const fn effect(self) -> EffectId {
         self.effect
@@ -510,7 +534,14 @@ impl DmaEvidence {
         self.observation_device_generation
     }
 
-    /// Substitutes the effect identity for negative testing.
+    /// Substitutes the operation identity for negative testing.
+    #[must_use]
+    pub const fn with_operation(mut self, operation: OperationId) -> Self {
+        self.effect = EffectId::new(operation, self.effect.sequence()).unwrap();
+        self
+    }
+
+    /// Substitutes an exact effect identity for negative testing.
     #[must_use]
     pub const fn with_effect(mut self, effect: EffectId) -> Self {
         self.effect = effect;
@@ -544,8 +575,7 @@ impl DmaEvidence {
 pub struct ReusePermit {
     effect: EffectId,
     kind: ClaimKind,
-    actor: u64,
-    binding_generation: u64,
+    actor: ExecutorCoordinate,
     authority_epoch: u64,
     resource: ResourceId,
     retired_generation: u64,
@@ -555,7 +585,13 @@ pub struct ReusePermit {
 }
 
 impl ReusePermit {
-    /// Returns the parent effect whose old claim was discharged.
+    /// Returns the parent operation whose old claim was discharged.
+    #[must_use]
+    pub const fn operation(self) -> OperationId {
+        self.effect.operation()
+    }
+
+    /// Returns the exact effect identity bound to this permit.
     #[must_use]
     pub const fn effect(self) -> EffectId {
         self.effect
@@ -567,16 +603,10 @@ impl ReusePermit {
         self.kind
     }
 
-    /// Returns the executor incarnation to which this bearer was issued.
+    /// Returns the executor coordinate to which this bearer was issued.
     #[must_use]
-    pub const fn actor(self) -> u64 {
+    pub const fn actor(self) -> ExecutorCoordinate {
         self.actor
-    }
-
-    /// Returns the executor binding generation to which this bearer was issued.
-    #[must_use]
-    pub const fn binding_generation(self) -> u64 {
-        self.binding_generation
     }
 
     /// Returns the parent authority epoch to which this bearer was issued.
@@ -615,24 +645,24 @@ impl ReusePermit {
         self.nonce
     }
 
-    /// Substitutes the effect identity for negative testing.
+    /// Substitutes the operation identity for negative testing.
+    #[must_use]
+    pub const fn with_operation(mut self, operation: OperationId) -> Self {
+        self.effect = EffectId::new(operation, self.effect.sequence()).unwrap();
+        self
+    }
+
+    /// Substitutes an exact effect identity for negative testing.
     #[must_use]
     pub const fn with_effect(mut self, effect: EffectId) -> Self {
         self.effect = effect;
         self
     }
 
-    /// Substitutes the executor incarnation for negative testing.
+    /// Substitutes the executor coordinate for negative testing.
     #[must_use]
-    pub const fn with_actor(mut self, actor: u64) -> Self {
+    pub const fn with_actor(mut self, actor: ExecutorCoordinate) -> Self {
         self.actor = actor;
-        self
-    }
-
-    /// Substitutes the binding generation for negative testing.
-    #[must_use]
-    pub const fn with_binding_generation(mut self, generation: u64) -> Self {
-        self.binding_generation = generation;
         self
     }
 
@@ -668,7 +698,7 @@ impl ReusePermit {
 /// Stable projection of one component-local claim.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ClaimProjection {
-    /// Common parent effect identity.
+    /// Exact parent effect identity.
     pub effect: EffectId,
     /// Component that owns the claim.
     pub component: ComponentId,
@@ -687,10 +717,8 @@ pub struct ClaimProjection {
 /// Stable projection of one authority-bound resource reuse reservation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReuseReservationProjection {
-    /// Executor incarnation that owns the current bearer.
-    pub actor: u64,
-    /// Binding generation that owns the current bearer.
-    pub binding_generation: u64,
+    /// Executor coordinate that owns the current bearer.
+    pub actor: ExecutorCoordinate,
     /// Parent authority epoch that owns the current bearer.
     pub authority_epoch: u64,
     /// Exact successor resource generation reserved.
@@ -704,7 +732,7 @@ pub struct ReuseReservationProjection {
 /// Stable projection of one logical component.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ComponentProjection {
-    /// Common parent effect identity.
+    /// Exact parent effect identity.
     pub effect: EffectId,
     /// Component identity.
     pub component: ComponentId,
@@ -719,16 +747,14 @@ pub struct ComponentProjection {
 /// Stable projection of the complete composite effect.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CompositeProjection {
-    /// One identity shared by reply and DMA.
+    /// Exact effect identity shared by reply and DMA.
     pub effect: EffectId,
     /// Shared executor authority.
     pub authority: CompositeAuthority,
     /// Monotonic shared authority epoch.
     pub authority_epoch: u64,
-    /// Current executor incarnation, absent between fence and rebind.
-    pub live_incarnation: Option<u64>,
-    /// Last installed binding generation.
-    pub binding_generation: u64,
+    /// Current executor coordinate, absent between fence and rebind.
+    pub live_executor: Option<ExecutorCoordinate>,
     /// Number of accepted executor crashes.
     pub crash_generation: u64,
     /// Aggregate escape and discharge state.
@@ -775,8 +801,7 @@ struct ClaimRecord {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ReuseReservation {
-    actor: u64,
-    binding_generation: u64,
+    actor: ExecutorCoordinate,
     authority_epoch: u64,
     next_generation: u64,
     device_generation: u64,
@@ -791,12 +816,12 @@ struct ReuseReservation {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CompositeEffectOracle {
     effect: EffectId,
+    origin_executor: ExecutorId,
     authority: CompositeAuthority,
     authority_epoch: u64,
     root_live: bool,
-    live_incarnation: Option<u64>,
-    last_incarnation: u64,
-    binding_generation: u64,
+    live_executor: Option<ExecutorCoordinate>,
+    last_executor: ExecutorCoordinate,
     crash_generation: u64,
     reply: ReplyState,
     reply_claim_stage: Option<ReplyClaimStage>,
@@ -819,22 +844,16 @@ pub struct CompositeEffectOracle {
 impl CompositeEffectOracle {
     /// Registers one staged composite effect under a live executor.
     ///
-    /// Resource identities must be pairwise distinct.  All generations and
-    /// incarnation coordinates must be non-zero.
+    /// Resource identities must be pairwise distinct.  All operation and
+    /// executor coordinates must be non-zero.
     #[must_use]
     pub fn new(
         effect: EffectId,
-        incarnation: u64,
-        binding_generation: u64,
+        executor: ExecutorCoordinate,
         resource_generation: u64,
         device_generation: u64,
         resources: CompositeResources,
     ) -> Self {
-        assert!(incarnation != 0, "incarnation must be non-zero");
-        assert!(
-            binding_generation != 0,
-            "binding generation must be non-zero"
-        );
         assert!(
             resource_generation != 0 && resource_generation != u64::MAX,
             "resource generation must admit one successor"
@@ -853,12 +872,12 @@ impl CompositeEffectOracle {
         });
         let model = Self {
             effect,
+            origin_executor: executor.executor(),
             authority: CompositeAuthority::Active,
             authority_epoch: 1,
             root_live: true,
-            live_incarnation: Some(incarnation),
-            last_incarnation: incarnation,
-            binding_generation,
+            live_executor: Some(executor),
+            last_executor: executor,
             crash_generation: 0,
             reply: ReplyState::Staged,
             reply_claim_stage: None,
@@ -888,10 +907,9 @@ impl CompositeEffectOracle {
         }
         Ok(AuthorityObservation {
             effect: self.effect,
-            incarnation: self
-                .live_incarnation
+            executor: self
+                .live_executor
                 .ok_or(CompositeError::WrongAuthorityState)?,
-            binding_generation: self.binding_generation,
             authority_epoch: self.authority_epoch,
         })
     }
@@ -903,8 +921,7 @@ impl CompositeEffectOracle {
             effect: self.effect,
             authority: self.authority,
             authority_epoch: self.authority_epoch,
-            live_incarnation: self.live_incarnation,
-            binding_generation: self.binding_generation,
+            live_executor: self.live_executor,
             crash_generation: self.crash_generation,
             escape: self.escape_state(),
             reply: self.reply,
@@ -926,6 +943,7 @@ impl CompositeEffectOracle {
         let (committed, terminal) = match component {
             ComponentId::Reply => (self.reply.committed(), self.reply.terminal()),
             ComponentId::Dma => (self.dma.committed(), self.dma.terminal()),
+            _ => (false, false),
         };
         ComponentProjection {
             effect: self.effect,
@@ -1014,19 +1032,15 @@ impl CompositeEffectOracle {
     }
 
     /// Fences one exact live executor while preserving both components.
-    pub fn fence_incarnation(
+    pub fn fence_executor(
         &mut self,
-        crashed_incarnation: u64,
-        binding_generation: u64,
+        crashed_executor: ExecutorCoordinate,
     ) -> Result<(), CompositeError> {
-        if !self.root_live
-            || self.live_incarnation != Some(crashed_incarnation)
-            || self.binding_generation != binding_generation
-        {
+        if !self.root_live || self.live_executor != Some(crashed_executor) {
             return Err(CompositeError::StaleAuthority);
         }
         self.root_live = false;
-        self.live_incarnation = None;
+        self.live_executor = None;
         self.crash_generation = next_generation_of(self.crash_generation);
         self.authority_epoch = next_generation_of(self.authority_epoch);
         if self.authority != CompositeAuthority::Revoked {
@@ -1038,25 +1052,20 @@ impl CompositeEffectOracle {
         Ok(())
     }
 
-    /// Installs a strictly newer executor after snapshot, Ready, and Rebind.
-    pub fn rebind(
-        &mut self,
-        successor_incarnation: u64,
-        binding_generation: u64,
-    ) -> Result<(), CompositeError> {
+    /// Installs a strictly newer generation of the operation's executor after
+    /// snapshot, Ready, and Rebind.
+    pub fn rebind(&mut self, successor: ExecutorCoordinate) -> Result<(), CompositeError> {
         if self.root_live {
             return Err(CompositeError::WrongAuthorityState);
         }
-        if successor_incarnation == 0
-            || successor_incarnation <= self.last_incarnation
-            || binding_generation <= self.binding_generation
+        if successor.executor() != self.origin_executor
+            || successor.generation() <= self.last_executor.generation()
         {
             return Err(CompositeError::StaleAuthority);
         }
         self.root_live = true;
-        self.live_incarnation = Some(successor_incarnation);
-        self.last_incarnation = successor_incarnation;
-        self.binding_generation = binding_generation;
+        self.live_executor = Some(successor);
+        self.last_executor = successor;
         self.bump_revision();
         debug_assert!(self.check_invariants());
         Ok(())
@@ -1107,7 +1116,7 @@ impl CompositeEffectOracle {
         Ok(())
     }
 
-    /// Claims the committed reply component for an exact current incarnation.
+    /// Claims the committed reply component for an exact executor coordinate.
     ///
     /// A fresh successor rebound to a fenced postcommit parent may settle this
     /// component without adopting the parent effect or physical DMA custody.
@@ -1150,14 +1159,14 @@ impl CompositeEffectOracle {
         self.active_reply_nonce = Some(nonce);
         self.reply_claim_stage = Some(stage);
         self.reply = ReplyState::Claimed {
-            claimant: observation.incarnation,
+            claimant: observation.executor,
             generation,
         };
         self.bump_revision();
         debug_assert!(self.check_invariants());
         Ok(ReplyClaim {
             effect: self.effect,
-            claimant: observation.incarnation,
+            claimant: observation.executor,
             generation,
             nonce,
         })
@@ -1405,8 +1414,7 @@ impl CompositeEffectOracle {
         let nonce = self.next_permit_nonce;
         self.next_permit_nonce = next_generation_of(self.next_permit_nonce);
         let reservation = ReuseReservation {
-            actor: observation.incarnation,
-            binding_generation: observation.binding_generation,
+            actor: observation.executor,
             authority_epoch: observation.authority_epoch,
             next_generation,
             device_generation: self.active_device_generation,
@@ -1420,7 +1428,6 @@ impl CompositeEffectOracle {
             effect: self.effect,
             kind,
             actor: reservation.actor,
-            binding_generation: reservation.binding_generation,
             authority_epoch: reservation.authority_epoch,
             resource: record.resource,
             retired_generation: record.enrolled_generation,
@@ -1457,16 +1464,14 @@ impl CompositeEffectOracle {
             _ => return Err(CompositeError::StaleReusePermit),
         };
         if previous.authority_epoch >= observation.authority_epoch
-            || (previous.actor == observation.incarnation
-                && previous.binding_generation == observation.binding_generation)
+            || previous.actor == observation.executor
         {
             return Err(CompositeError::GateClaimed);
         }
         let nonce = self.next_permit_nonce;
         self.next_permit_nonce = next_generation_of(self.next_permit_nonce);
         let reservation = ReuseReservation {
-            actor: observation.incarnation,
-            binding_generation: observation.binding_generation,
+            actor: observation.executor,
             authority_epoch: observation.authority_epoch,
             next_generation: previous.next_generation,
             device_generation: self.active_device_generation,
@@ -1479,7 +1484,6 @@ impl CompositeEffectOracle {
             effect: self.effect,
             kind,
             actor: reservation.actor,
-            binding_generation: reservation.binding_generation,
             authority_epoch: reservation.authority_epoch,
             resource: record.resource,
             retired_generation: record.enrolled_generation,
@@ -1497,15 +1501,13 @@ impl CompositeEffectOracle {
         let record = self.claims[permit.kind.index()];
         let expected = ReuseReservation {
             actor: permit.actor,
-            binding_generation: permit.binding_generation,
             authority_epoch: permit.authority_epoch,
             next_generation: permit.next_generation,
             device_generation: permit.device_generation,
             nonce: permit.nonce,
         };
         if permit.effect != self.effect
-            || self.live_incarnation != Some(permit.actor)
-            || self.binding_generation != permit.binding_generation
+            || self.live_executor != Some(permit.actor)
             || self.authority_epoch != permit.authority_epoch
             || permit.resource != record.resource
             || permit.retired_generation != record.enrolled_generation
@@ -1545,14 +1547,16 @@ impl CompositeEffectOracle {
     #[must_use]
     pub fn check_invariants(&self) -> bool {
         if self.authority_epoch == 0
-            || self.last_incarnation == 0
-            || self.binding_generation == 0
             || self.next_reply_nonce == 0
             || self.next_permit_nonce == 0
             || self.dma_resource_generation == 0
             || self.enrolled_device_generation == 0
             || self.active_device_generation < self.enrolled_device_generation
-            || self.root_live != self.live_incarnation.is_some()
+            || self.root_live != self.live_executor.is_some()
+            || self.last_executor.executor() != self.origin_executor
+            || self
+                .live_executor
+                .is_some_and(|executor| executor.executor() != self.origin_executor)
         {
             return false;
         }
@@ -1568,16 +1572,16 @@ impl CompositeEffectOracle {
                 || matches!(claim.state, ClaimState::ReusePermitted { .. })
                     != claim.pending_reuse.is_some()
                 || claim.pending_reuse.is_some_and(|pending| {
-                    pending.actor == 0
-                        || pending.binding_generation == 0
+                    pending.actor.executor() != self.origin_executor
+                        || pending.actor.executor().get() == 0
+                        || pending.actor.generation().get() == 0
                         || pending.authority_epoch == 0
                         || pending.authority_epoch > self.authority_epoch
                         || pending.next_generation != next_generation_of(claim.enrolled_generation)
                         || pending.device_generation != self.active_device_generation
                         || pending.nonce == 0
                         || (pending.authority_epoch == self.authority_epoch
-                            && (self.live_incarnation != Some(pending.actor)
-                                || self.binding_generation != pending.binding_generation))
+                            && self.live_executor != Some(pending.actor))
                 })
         }) {
             return false;
@@ -1621,8 +1625,7 @@ impl CompositeEffectOracle {
             return Err(CompositeError::WrongAuthorityState);
         }
         if observation.effect != self.effect
-            || self.live_incarnation != Some(observation.incarnation)
-            || observation.binding_generation != self.binding_generation
+            || self.live_executor != Some(observation.executor)
             || observation.authority_epoch != self.authority_epoch
         {
             return Err(CompositeError::StaleAuthority);
@@ -1770,7 +1773,6 @@ impl CompositeEffectOracle {
                 .pending_reuse
                 .map(|pending| ReuseReservationProjection {
                     actor: pending.actor,
-                    binding_generation: pending.binding_generation,
                     authority_epoch: pending.authority_epoch,
                     next_generation: pending.next_generation,
                     device_generation: pending.device_generation,

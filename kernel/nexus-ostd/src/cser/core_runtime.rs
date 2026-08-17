@@ -15,9 +15,10 @@
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use cser_core::{
-    Command, CompactingJournalBackend, CoordinatedPersistence, CoordinatedPersistenceError,
-    CoreError, CoreLimits, Digest, DomainCatalog, DurableJournalBackend, Engine, JournalRepair,
-    RecoveryAnchor, TransitionDurability, TransitionReceipt, TrustedAnchorBackend, TxError,
+    CatalogSet, Command, CompactingJournalBackend, CoordinatedPersistence,
+    CoordinatedPersistenceError, CoreError, CoreLimits, Digest, DurableJournalBackend, Engine,
+    JournalRepair, RecoveryAnchor, TransitionDurability, TransitionReceipt, TrustedAnchorBackend,
+    TxError,
 };
 use ostd::{prelude::*, sync::Mutex};
 
@@ -222,13 +223,13 @@ impl<P> OstdCserRuntime<P> {
     /// from independent persistent providers.  A returned torn-tail boundary
     /// is not permission to publish the runtime.
     pub(crate) fn recover(
-        catalog: DomainCatalog,
+        catalogs: CatalogSet,
         limits: CoreLimits,
         anchor: RecoveryAnchor,
         bytes: &[u8],
         persistence: P,
     ) -> Result<(Self, OstdRecoveryBoundary), CoreError> {
-        let report = Engine::recover(catalog, limits, anchor, bytes)?;
+        let report = Engine::recover(catalogs, limits, anchor, bytes)?;
         let boundary = OstdRecoveryBoundary {
             acknowledged_revision: report.acknowledged_revision(),
             acknowledged_head: report.acknowledged_head(),
@@ -382,14 +383,17 @@ where
 #[cfg(any(test, ktest))]
 mod tests {
     use alloc::sync::Arc;
+    use alloc::vec;
     use core::sync::atomic::{AtomicU64, Ordering};
 
     use cser_core::{
-        AGENT_OPERATION_COMPOSITE, AuthorityBindingGeneration, BootGeneration, ChargeAccountId,
-        CommandRequest, CompactingJournalBackend, CoordinatedPersistence, DeviceGeneration,
-        EffectId, Freshness, JournalGeneration, JournalRecord, PrincipalId, PrincipalIncarnation,
-        RecoveryBinding, RecoveryLease, RecoveryProfile, RegistryInstance, RootId,
-        TrustedAnchorBackend, TrustedAnchorSnapshot, WorldId, standard_catalog,
+        AGENT_COMPONENT_DMA, AGENT_COMPONENT_REPLY, AGENT_OPERATION_COMPOSITE, BootGeneration,
+        ChargeAccountId, CommandRequest, CompactingJournalBackend, ComponentProviderBinding,
+        CoordinatedPersistence, DeviceGeneration, Digest, EffectId, ExecutorCoordinate,
+        ExecutorGeneration, ExecutorId, Freshness, JournalGeneration, JournalRecord, OperationId,
+        ProviderCoordinate, ProviderGeneration, ProviderId, RecoveryBinding, RecoveryLease,
+        RecoveryProfile, RegistryInstance, TrustedAnchorBackend, TrustedAnchorSnapshot,
+        VerifierBinding, VerifierGeneration, WorldId, standard_catalog,
     };
     #[cfg(ktest)]
     use ostd::prelude::ktest;
@@ -473,33 +477,68 @@ mod tests {
     }
 
     fn runtime() -> OstdCserRuntime<TestDurability> {
+        let world = WorldId::new(1).unwrap();
+        let catalog = standard_catalog();
+        let catalogs = cser_core::CatalogSet::new(core::slice::from_ref(&catalog)).unwrap();
         let freshness = Freshness::new(
             BootGeneration::new(1).unwrap(),
             RegistryInstance::new(1).unwrap(),
-            1,
             DeviceGeneration::new(1).unwrap(),
             JournalGeneration::new(1).unwrap(),
-        )
-        .unwrap();
-        OstdCserRuntime::from_engine(
-            Engine::new(
-                WorldId::new(1).unwrap(),
-                standard_catalog(),
-                CoreLimits::bounded_default(),
-                freshness,
-            ),
-            TestDurability,
-        )
+        );
+        let provider = ProviderCoordinate::new(
+            world,
+            ProviderId::new(1).unwrap(),
+            ProviderGeneration::new(1).unwrap(),
+        );
+        let verifier_generation = VerifierGeneration::new(1).unwrap();
+        let verifier_bindings = catalog
+            .verifier_class_bindings()
+            .into_iter()
+            .enumerate()
+            .map(|(index, class)| {
+                VerifierBinding::new(
+                    class.verifier(),
+                    verifier_generation,
+                    class.receipt_schema(),
+                    Digest::new([0x40u8.wrapping_add(index as u8); 32]),
+                )
+                .unwrap()
+            })
+            .collect();
+        let mut engine = Engine::new(world, catalogs, CoreLimits::bounded_default(), freshness);
+        engine
+            .transact(
+                CommandRequest::RegisterProviderGeneration {
+                    coordinate: provider,
+                    catalog_digest: catalog.digest(),
+                    verifier_bindings,
+                },
+                |_| Ok::<(), &'static str>(()),
+            )
+            .unwrap();
+        OstdCserRuntime::from_engine(engine, TestDurability)
     }
 
     fn create(effect_sequence: u64) -> CommandRequest {
-        let root = RootId::new(1).unwrap();
-        CommandRequest::CreateCompositeEffect {
-            effect: EffectId::new(root, effect_sequence).unwrap(),
-            origin: PrincipalIncarnation::new(PrincipalId::new(1).unwrap(), 1).unwrap(),
-            binding_generation: 1,
+        let operation = OperationId::new(1).unwrap();
+        let provider = ProviderCoordinate::new(
+            WorldId::new(1).unwrap(),
+            ProviderId::new(1).unwrap(),
+            ProviderGeneration::new(1).unwrap(),
+        );
+        CommandRequest::AdmitScopedCompositeEffect {
+            effect: EffectId::new(operation, effect_sequence).unwrap(),
+            origin: ExecutorCoordinate::new(
+                ExecutorId::new(1).unwrap(),
+                ExecutorGeneration::new(1).unwrap(),
+            ),
             kind: AGENT_OPERATION_COMPOSITE,
             charge_account: ChargeAccountId::new(1).unwrap(),
+            bindings: vec![
+                ComponentProviderBinding::new(AGENT_COMPONENT_REPLY, provider),
+                ComponentProviderBinding::new(AGENT_COMPONENT_DMA, provider),
+            ],
         }
     }
 
@@ -541,33 +580,29 @@ mod tests {
     #[cfg_attr(test, test)]
     fn runtime_compacts_only_the_anchored_checkpoint_under_its_mutex() {
         let catalog = standard_catalog();
+        let catalogs = cser_core::CatalogSet::new(core::slice::from_ref(&catalog)).unwrap();
         let freshness = Freshness::new(
             BootGeneration::new(1).unwrap(),
             RegistryInstance::new(1).unwrap(),
-            1,
             DeviceGeneration::new(1).unwrap(),
             JournalGeneration::new(1).unwrap(),
-        )
-        .unwrap();
+        );
         let next = Freshness::new(
             BootGeneration::new(2).unwrap(),
             RegistryInstance::new(1).unwrap(),
-            1,
             DeviceGeneration::new(1).unwrap(),
             JournalGeneration::new(2).unwrap(),
-        )
-        .unwrap();
+        );
         let binding = RecoveryBinding::new(
             RecoveryProfile::current(),
             WorldId::new(1).unwrap(),
             catalog.digest(),
             RegistryInstance::new(1).unwrap(),
-            AuthorityBindingGeneration::new(1).unwrap(),
         )
         .unwrap();
         let engine = Engine::new(
             WorldId::new(1).unwrap(),
-            catalog.clone(),
+            catalogs,
             CoreLimits::bounded_default(),
             freshness,
         );

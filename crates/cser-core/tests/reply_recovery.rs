@@ -6,7 +6,9 @@ use cser_core::{
     SettlementState, TransitionOutput,
 };
 use support::{
-    Harness, claim, committed_reply, current_evidence_command, digest, fence_and_rebind, principal,
+    EFFECT_APPLY_RECEIPT_SCHEMA, EFFECT_COMPONENT, EFFECT_CREDIT, EFFECT_EVIDENCE_KIND,
+    EFFECT_RECEIPT_SCHEMA, EFFECT_SETTLEMENT_RECEIPT_SCHEMA, EFFECT_VERIFIER, Harness, claim,
+    committed_reply, current_evidence_command, digest, executor, fence_and_rebind, prepared_reply,
     resource, snapshot, verified_apply_completion, verified_settlement_ack,
 };
 
@@ -14,11 +16,12 @@ use support::{
 fn postcommit_reply_uses_real_snapshot_ready_rebind_and_one_settlement() {
     let mut harness = Harness::new();
     let (effect, origin) = committed_reply(&mut harness, 1);
-    let successor = principal(1, 2);
-    fence_and_rebind(&mut harness, effect, origin, successor, 1, 2, 1);
+    let successor = executor(1, 2);
+    fence_and_rebind(&mut harness, effect, origin, successor, 1);
 
-    let settlement = match harness.output(Command::ClaimSettlement {
+    let settlement = match harness.output(Command::ClaimComponentSettlement {
         effect,
+        component: EFFECT_COMPONENT,
         claimant: successor,
     }) {
         TransitionOutput::SettlementClaim(claim) => claim,
@@ -33,8 +36,8 @@ fn postcommit_reply_uses_real_snapshot_ready_rebind_and_one_settlement() {
     let applied = verified_apply_completion(
         &harness,
         &settlement,
-        cser_core::REPLY_VERIFIER,
-        cser_core::REPLY_APPLY_RECEIPT_SCHEMA,
+        EFFECT_VERIFIER,
+        EFFECT_APPLY_RECEIPT_SCHEMA,
         digest(31),
     );
     let settlement = match harness.output(settlement.record_applied(applied).unwrap()) {
@@ -44,8 +47,8 @@ fn postcommit_reply_uses_real_snapshot_ready_rebind_and_one_settlement() {
     let acknowledgement = verified_settlement_ack(
         &harness,
         &settlement,
-        cser_core::REPLY_VERIFIER,
-        cser_core::REPLY_SETTLEMENT_RECEIPT_SCHEMA,
+        EFFECT_VERIFIER,
+        EFFECT_SETTLEMENT_RECEIPT_SCHEMA,
         digest(32),
     );
     harness
@@ -56,19 +59,19 @@ fn postcommit_reply_uses_real_snapshot_ready_rebind_and_one_settlement() {
         &harness,
         effect,
         claim(1),
-        cser_core::REPLY_EVIDENCE_PUBLICATION_ACK,
-        cser_core::ReceiptBinding::new(cser_core::REPLY_VERIFIER, cser_core::REPLY_RECEIPT_SCHEMA),
+        EFFECT_EVIDENCE_KIND,
+        cser_core::ReceiptBinding::new(EFFECT_VERIFIER, EFFECT_RECEIPT_SCHEMA),
         digest(33),
     );
     harness.tx(evidence).unwrap();
-    let estate = harness.engine.estate(effect).unwrap();
-    assert_eq!(estate.outcome, OutcomeState::KnownSuccess(digest(11)));
-    assert_eq!(estate.settlement, SettlementState::Settled);
-    assert_eq!(estate.retirement, RetirementState::Retired);
+    let component = harness.engine.component(effect, EFFECT_COMPONENT).unwrap();
+    assert_eq!(component.outcome, OutcomeState::KnownSuccess(digest(11)));
+    assert_eq!(component.settlement, SettlementState::Settled);
+    assert_eq!(component.retirement, RetirementState::Retired);
     assert_eq!(
         harness
             .engine
-            .charge(support::charge(1), cser_core::CREDIT_REPLY_SLOT)
+            .charge(support::charge(1), EFFECT_CREDIT)
             .retained_units,
         0
     );
@@ -78,64 +81,87 @@ fn postcommit_reply_uses_real_snapshot_ready_rebind_and_one_settlement() {
             .check_reusable(resource(1), cser_core::ResourceGeneration::new(1).unwrap()),
         Ok(())
     );
-    harness.tx(Command::ReleaseEstate { effect }).unwrap();
+    harness
+        .tx(Command::ReleaseCompositeEffect { effect })
+        .unwrap();
     assert_eq!(
-        harness.engine.estate(effect).unwrap().retirement,
+        harness
+            .engine
+            .component(effect, EFFECT_COMPONENT)
+            .unwrap()
+            .retirement,
         RetirementState::Released
     );
 }
 
 #[test]
-fn revoke_and_claim_have_two_reachable_linearized_winners() {
+fn precommit_revoke_closes_the_commit_gate_and_claim_wins_after_commit() {
     let mut revoke_wins = Harness::new();
-    let (effect, origin) = committed_reply(&mut revoke_wins, 2);
-    let successor = principal(2, 2);
-    fence_and_rebind(&mut revoke_wins, effect, origin, successor, 1, 2, 2);
-    let authority_epoch = revoke_wins.engine.estate(effect).unwrap().authority_epoch;
+    let (effect, origin) = prepared_reply(&mut revoke_wins, 2);
+    let successor = executor(2, 2);
+    fence_and_rebind(&mut revoke_wins, effect, origin, successor, 2);
+    let authority_epoch = revoke_wins
+        .engine
+        .composite_effect(effect)
+        .unwrap()
+        .authority_epoch;
     revoke_wins
         .tx(Command::BeginRevoke {
             effect,
             expected_actor: successor,
-            binding_generation: 2,
             authority_epoch,
         })
         .unwrap();
     let before = revoke_wins.engine.projection_digest();
     assert_eq!(
-        revoke_wins.tx(Command::ClaimSettlement {
+        revoke_wins.tx(Command::RecordComponentCommitIntent {
             effect,
-            claimant: successor,
+            component: EFFECT_COMPONENT,
+            actor: successor,
+            operation: digest(20),
         }),
-        Err(CoreError::GateClosed)
+        Err(CoreError::StaleExecutor)
     );
     assert_eq!(revoke_wins.engine.projection_digest(), before);
     assert_eq!(
-        revoke_wins.engine.estate(effect).unwrap().settlement,
-        SettlementState::Open { generation: 1 }
+        revoke_wins
+            .engine
+            .component(effect, EFFECT_COMPONENT)
+            .unwrap()
+            .settlement,
+        SettlementState::Revoked
     );
     assert_eq!(
-        revoke_wins.engine.estate(effect).unwrap().authority,
+        revoke_wins
+            .engine
+            .composite_effect(effect)
+            .unwrap()
+            .authority,
         AuthorityState::Revoked
     );
 
     let mut claim_wins = Harness::new();
     let (effect, origin) = committed_reply(&mut claim_wins, 3);
-    let successor = principal(3, 2);
-    fence_and_rebind(&mut claim_wins, effect, origin, successor, 1, 2, 3);
-    let _claim = match claim_wins.output(Command::ClaimSettlement {
+    let successor = executor(3, 2);
+    fence_and_rebind(&mut claim_wins, effect, origin, successor, 3);
+    let _claim = match claim_wins.output(Command::ClaimComponentSettlement {
         effect,
+        component: EFFECT_COMPONENT,
         claimant: successor,
     }) {
         TransitionOutput::SettlementClaim(claim) => claim,
         other => panic!("expected claim, got {other:?}"),
     };
     let before = claim_wins.engine.projection_digest();
-    let authority_epoch = claim_wins.engine.estate(effect).unwrap().authority_epoch;
+    let authority_epoch = claim_wins
+        .engine
+        .composite_effect(effect)
+        .unwrap()
+        .authority_epoch;
     assert_eq!(
         claim_wins.tx(Command::BeginRevoke {
             effect,
             expected_actor: successor,
-            binding_generation: 2,
             authority_epoch,
         }),
         Err(CoreError::GateClaimed)
@@ -147,10 +173,11 @@ fn revoke_and_claim_have_two_reachable_linearized_winners() {
 fn second_crash_reclaims_durable_intent_without_reapplying_blindly() {
     let mut harness = Harness::new();
     let (effect, origin) = committed_reply(&mut harness, 4);
-    let successor = principal(4, 2);
-    fence_and_rebind(&mut harness, effect, origin, successor, 1, 2, 4);
-    let settlement = match harness.output(Command::ClaimSettlement {
+    let successor = executor(4, 2);
+    fence_and_rebind(&mut harness, effect, origin, successor, 4);
+    let settlement = match harness.output(Command::ClaimComponentSettlement {
         effect,
+        component: EFFECT_COMPONENT,
         claimant: successor,
     }) {
         TransitionOutput::SettlementClaim(claim) => claim,
@@ -161,17 +188,22 @@ fn second_crash_reclaims_durable_intent_without_reapplying_blindly() {
         other => panic!("expected intent claim, got {other:?}"),
     };
 
-    let third = principal(4, 3);
-    fence_and_rebind(&mut harness, effect, successor, third, 2, 3, 5);
+    let third = executor(4, 3);
+    fence_and_rebind(&mut harness, effect, successor, third, 5);
     assert!(matches!(
-        harness.engine.estate(effect).unwrap().settlement,
+        harness
+            .engine
+            .component(effect, EFFECT_COMPONENT)
+            .unwrap()
+            .settlement,
         SettlementState::ReconciliationRequired {
             generation: 2,
             applied: false
         }
     ));
-    let reconciliation = match harness.output(Command::ClaimSettlement {
+    let reconciliation = match harness.output(Command::ClaimComponentSettlement {
         effect,
+        component: EFFECT_COMPONENT,
         claimant: third,
     }) {
         TransitionOutput::SettlementClaim(claim) => claim,
@@ -185,8 +217,8 @@ fn second_crash_reclaims_durable_intent_without_reapplying_blindly() {
     let applied = verified_apply_completion(
         &harness,
         &reconciliation,
-        cser_core::REPLY_VERIFIER,
-        cser_core::REPLY_APPLY_RECEIPT_SCHEMA,
+        EFFECT_VERIFIER,
+        EFFECT_APPLY_RECEIPT_SCHEMA,
         digest(42),
     );
     let reconciliation = match harness.output(
@@ -200,15 +232,19 @@ fn second_crash_reclaims_durable_intent_without_reapplying_blindly() {
     let acknowledgement = verified_settlement_ack(
         &harness,
         &reconciliation,
-        cser_core::REPLY_VERIFIER,
-        cser_core::REPLY_SETTLEMENT_RECEIPT_SCHEMA,
+        EFFECT_VERIFIER,
+        EFFECT_SETTLEMENT_RECEIPT_SCHEMA,
         digest(43),
     );
     harness
         .tx(reconciliation.settle(acknowledgement).unwrap())
         .unwrap();
     assert_eq!(
-        harness.engine.estate(effect).unwrap().settlement,
+        harness
+            .engine
+            .component(effect, EFFECT_COMPONENT)
+            .unwrap()
+            .settlement,
         SettlementState::Settled
     );
 }
@@ -217,10 +253,11 @@ fn second_crash_reclaims_durable_intent_without_reapplying_blindly() {
 fn indeterminate_outcome_and_physical_retirement_are_orthogonal() {
     let mut harness = Harness::new();
     let (effect, origin) = committed_reply(&mut harness, 5);
-    let successor = principal(5, 2);
-    fence_and_rebind(&mut harness, effect, origin, successor, 1, 2, 6);
-    let settlement = match harness.output(Command::ClaimSettlement {
+    let successor = executor(5, 2);
+    fence_and_rebind(&mut harness, effect, origin, successor, 6);
+    let settlement = match harness.output(Command::ClaimComponentSettlement {
         effect,
+        component: EFFECT_COMPONENT,
         claimant: successor,
     }) {
         TransitionOutput::SettlementClaim(claim) => claim,
@@ -229,21 +266,25 @@ fn indeterminate_outcome_and_physical_retirement_are_orthogonal() {
     harness
         .tx(settlement.mark_indeterminate(digest(50)))
         .unwrap();
-    let estate = harness.engine.estate(effect).unwrap();
-    assert_eq!(estate.outcome, OutcomeState::Indeterminate(digest(50)));
-    assert_eq!(estate.retirement, RetirementState::RetirementPending);
+    let component = harness.engine.component(effect, EFFECT_COMPONENT).unwrap();
+    assert_eq!(component.outcome, OutcomeState::Indeterminate(digest(50)));
+    assert_eq!(component.retirement, RetirementState::RetirementPending);
 
     let evidence = current_evidence_command(
         &harness,
         effect,
         claim(5),
-        cser_core::REPLY_EVIDENCE_PUBLICATION_ACK,
-        cser_core::ReceiptBinding::new(cser_core::REPLY_VERIFIER, cser_core::REPLY_RECEIPT_SCHEMA),
+        EFFECT_EVIDENCE_KIND,
+        cser_core::ReceiptBinding::new(EFFECT_VERIFIER, EFFECT_RECEIPT_SCHEMA),
         digest(51),
     );
     harness.tx(evidence).unwrap();
     assert_eq!(
-        harness.engine.estate(effect).unwrap().retirement,
+        harness
+            .engine
+            .component(effect, EFFECT_COMPONENT)
+            .unwrap()
+            .retirement,
         RetirementState::Retired
     );
 }
@@ -253,24 +294,23 @@ fn wrong_snapshot_and_stale_successor_reject_without_mutation() {
     let mut harness = Harness::new();
     let (effect, origin) = committed_reply(&mut harness, 6);
     harness
-        .tx(Command::FenceIncarnation {
-            root: effect.root(),
+        .tx(Command::FenceExecutor {
+            operation: effect.operation(),
             crashed: origin,
-            binding_generation: 1,
         })
         .unwrap();
     let snapshot_record = harness
         .engine
-        .snapshot_root(effect.root(), snapshot(7))
+        .snapshot_operation(effect.operation(), snapshot(7))
         .unwrap()
         .record();
     harness.tx(snapshot_record).unwrap();
     let before = harness.engine.projection_digest();
     assert_eq!(
         harness.tx(Command::Ready {
-            root: effect.root(),
+            operation: effect.operation(),
             snapshot: snapshot(8),
-            successor: principal(6, 2),
+            successor: executor(6, 2),
         }),
         Err(CoreError::StaleSnapshot)
     );

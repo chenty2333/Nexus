@@ -9,10 +9,10 @@
 use core::fmt;
 
 use cser_core::{
-    AuthorityBindingGeneration, ChargeAccountId, ClaimId, CoreLimits, EffectId, PrincipalId,
-    PrincipalIncarnation, RecoveryBinding, RecoveryProfile, RegistryInstance, ResourceGeneration,
-    ResourceId, RootId, SingleHopHandoffProjection, TOOL_HANDOFF_COMPONENT,
-    TOOL_HANDOFF_SOURCE_COMPONENT, WorldId, tool_dma_catalog,
+    CatalogSet, ChargeAccountId, ClaimId, CoreLimits, EffectId, ExecutorCoordinate,
+    ExecutorGeneration, ExecutorId, OperationId, RecoveryBinding, RecoveryProfile,
+    RegistryInstance, ResourceGeneration, ResourceId, SingleHopHandoffProjection,
+    TOOL_HANDOFF_COMPONENT, TOOL_HANDOFF_SOURCE_COMPONENT, WorldId, tool_dma_catalog,
 };
 use ostd::{
     power::{ExitCode, poweroff},
@@ -57,19 +57,21 @@ type HandoffRuntime = OstdCserRuntime<
 /// for the numeric crash barriers below.
 pub(crate) fn run() {
     let catalog = tool_dma_catalog();
+    let catalogs = CatalogSet::new(core::slice::from_ref(&catalog))
+        .expect("handoff catalog set is non-empty and canonical");
+    let catalog_set_digest = catalogs.digest();
     let identity = acquire_identity(catalog.digest());
     let run_id = identity.run_id().bytes();
     let binding = RecoveryBinding::new(
         RecoveryProfile::current(),
         WorldId::new(1).expect("handoff world is non-zero"),
-        catalog.digest(),
+        catalog_set_digest,
         RegistryInstance::new(1).expect("handoff registry"),
-        AuthorityBindingGeneration::new(1).expect("handoff binding is non-zero"),
     )
     .expect("handoff binding");
     let boot = PreparedQemuPersistentBoot::acquire()
         .unwrap_or_else(|_| panic!("CSER_HANDOFF_FAIL stage=boot-acquire"))
-        .recover(catalog, CoreLimits::bounded_default(), binding)
+        .recover(catalogs, CoreLimits::bounded_default(), binding)
         .unwrap_or_else(|_| panic!("CSER_HANDOFF_FAIL stage=boot-recover"));
     let source = source_plan(fixed_effect(), run_id, identity);
     let source_runtime = ToolDmaRuntime::new(source, 1).expect("handoff source verifier");
@@ -112,7 +114,6 @@ fn run_initial(
         source_runtime,
         &observation,
         fixed_actor(1),
-        1,
         nz(SOURCE_CHARGE + 1),
     )
     .unwrap_or_else(|e| panic!("CSER_HANDOFF_FAIL stage=child-install error={e:?}"));
@@ -138,7 +139,6 @@ fn run_initial(
         &observation,
         child,
         fixed_actor(1),
-        1,
     )
     .unwrap_or_else(|e| panic!("CSER_HANDOFF_FAIL stage=handoff-commit error={e:?}"));
     assert_eq!(child_intent.effect(), child.effect());
@@ -222,7 +222,7 @@ fn run_recovery(
             .observe(|engine| engine.outstanding_component_commit_intents(source.effect()))
             .expect("CSER_HANDOFF_FAIL stage=recovery-source-intents")
             .into_iter()
-            .find(|intent| intent.component() == Some(TOOL_HANDOFF_SOURCE_COMPONENT))
+            .find(|intent| intent.component() == TOOL_HANDOFF_SOURCE_COMPONENT)
             .expect("CSER_HANDOFF_FAIL stage=recovery-source-intent");
         let (command, recovered) = boot
             .observe(|engine| {
@@ -250,7 +250,7 @@ fn run_recovery(
         // CheckpointRecovery deliberately destroyed the crashed executor's
         // nonce and fenced the parent.  This dedicated resolution proves the
         // same terminal success and descriptor without recreating that nonce,
-        // activating the root, creating the child, or releasing any claim.
+        // activating the operation, creating the child, or releasing any claim.
         let (command, recovered) = boot
             .observe(|engine| {
                 source_runtime
@@ -316,7 +316,7 @@ fn run_recovery(
         expect_none("recovery-child-resolution", boot.recovery_transact(command));
         resolved_child_observation = Some(child_observation);
     }
-    let (successor, recovery_binding) = rebind_handoff_root(&mut boot, source.effect().root());
+    let successor = rebind_handoff_root(&mut boot, source.effect().operation());
     let activated = boot
         .try_activate()
         .unwrap_or_else(|_| panic!("CSER_HANDOFF_FAIL stage=recovery-activate"));
@@ -337,7 +337,6 @@ fn run_recovery(
             source_runtime,
             &source_observation,
             successor,
-            recovery_binding,
             nz(SOURCE_CHARGE + 1),
         )
         .unwrap_or_else(|e| panic!("CSER_HANDOFF_FAIL stage=recovery-child-install error={e:?}"));
@@ -388,11 +387,11 @@ fn run_recovery(
             "CSER_HANDOFF_FAIL stage=recovery-child-target-phase"
         );
         match (target.authority, target.custodian) {
-            // A child installed on the prior boot was fenced with its root
+            // A child installed on the prior boot was fenced with its operation
             // and its live logical claim is therefore RetirementPending until
             // AdoptEffect restores active custody, at which point rebase
             // refreshes the precommit claim to Held.
-            (cser_core::AuthorityState::Fenced, cser_core::CustodyState::KernelEstate) => {
+            (cser_core::AuthorityState::Fenced, cser_core::CustodyState::CoreOwned) => {
                 assert_eq!(
                     component.retirement,
                     cser_core::RetirementState::RetirementPending,
@@ -403,7 +402,6 @@ fn run_recovery(
                     runtime.transact(cser_core::CommandRequest::AdoptEffect {
                         effect: child.effect(),
                         successor,
-                        binding_generation: recovery_binding,
                     }),
                 );
                 expect_none(
@@ -411,13 +409,12 @@ fn run_recovery(
                     runtime.transact(cser_core::CommandRequest::RebaseCompositePrecommitClaims {
                         effect: child.effect(),
                         actor: successor,
-                        binding_generation: recovery_binding,
                     }),
                 );
             }
             // This recovery just installed the missing child under the
             // rebound successor. Re-adopting it would be a stale transition.
-            (cser_core::AuthorityState::Active, cser_core::CustodyState::Principal(actor))
+            (cser_core::AuthorityState::Active, cser_core::CustodyState::Executor(actor))
                 if actor == successor =>
             {
                 assert_eq!(
@@ -434,7 +431,6 @@ fn run_recovery(
             &source_observation,
             child,
             successor,
-            recovery_binding,
         )
         .unwrap_or_else(|e| panic!("CSER_HANDOFF_FAIL stage=recovery-handoff-commit error={e:?}"));
         assert_eq!(intent.effect(), child.effect());
@@ -507,7 +503,7 @@ fn run_recovery(
             .observe(|engine| engine.outstanding_component_commit_intents(child.effect()))
             .expect("CSER_HANDOFF_FAIL stage=recovery-child-intents")
             .into_iter()
-            .find(|intent| intent.component() == Some(TOOL_HANDOFF_COMPONENT))
+            .find(|intent| intent.component() == TOOL_HANDOFF_COMPONENT)
             .expect("CSER_HANDOFF_FAIL stage=recovery-child-intent");
         let command = runtime
             .observe(|engine| child_runtime.acknowledge_commit(engine, intent, &child_observation))
@@ -573,7 +569,7 @@ fn handoff_source_payload(effect: EffectId) -> [u8; 60] {
     let mut payload = [0_u8; 60];
     payload[..PREFIX.len()].copy_from_slice(PREFIX);
     let mut at = PREFIX.len();
-    for value in [effect.root().get(), effect.sequence()] {
+    for value in [effect.operation().get(), effect.sequence()] {
         for shift in (0..16).rev() {
             payload[at] = HEX[((value >> (shift * 4)) & 0x0f) as usize];
             at += 1;
@@ -596,7 +592,6 @@ fn source_coordinates(effect: EffectId) -> HandoffSourceCoordinates {
     HandoffSourceCoordinates {
         effect,
         actor: fixed_actor(1),
-        binding_generation: 1,
         charge_account: nz(SOURCE_CHARGE),
         claim: nz(SOURCE_CLAIM),
         resource: nz(SOURCE_RESOURCE),
@@ -604,41 +599,40 @@ fn source_coordinates(effect: EffectId) -> HandoffSourceCoordinates {
     }
 }
 
-/// Recovery fencing is core authority, not a COM3 protocol.  The same root
+/// Recovery fencing is core authority, not a COM3 protocol.  The same operation
 /// owns both fixed parent and descriptor-derived child, so one snapshot/ready
 /// /rebind establishes the successor before it settles either component.
-fn rebind_handoff_root(boot: &mut QemuPersistentBoot, root: RootId) -> (PrincipalIncarnation, u64) {
-    let cser_core::RootRecoveryState::Fenced {
+fn rebind_handoff_root(
+    boot: &mut QemuPersistentBoot,
+    operation: OperationId,
+) -> ExecutorCoordinate {
+    let cser_core::OperationRecoveryState::Fenced {
         crashed,
-        binding_generation,
         crash_generation,
     } = boot
-        .observe(|engine| engine.root(root))
+        .observe(|engine| engine.operation(operation))
         .expect("CSER_HANDOFF_FAIL stage=recovery-root")
     else {
         panic!("CSER_HANDOFF_FAIL stage=recovery-root-not-fenced")
     };
     let successor_generation = crashed
         .generation()
+        .get()
         .checked_add(1)
+        .and_then(|value| ExecutorGeneration::new(value).ok())
         .unwrap_or_else(|| panic!("CSER_HANDOFF_FAIL stage=recovery-successor-overflow"));
-    let successor = PrincipalIncarnation::new(crashed.principal(), successor_generation)
-        .unwrap_or_else(|_| panic!("CSER_HANDOFF_FAIL stage=recovery-successor-invalid"));
-    let next_binding = binding_generation
-        .checked_add(1)
-        .filter(|value| *value != 0)
-        .unwrap_or_else(|| panic!("CSER_HANDOFF_FAIL stage=recovery-binding-overflow"));
+    let successor = ExecutorCoordinate::new(crashed.executor(), successor_generation);
     let snapshot = cser_core::SnapshotId::new(crash_generation)
         .unwrap_or_else(|_| panic!("CSER_HANDOFF_FAIL stage=recovery-snapshot-invalid"));
     let command = boot
-        .observe(|engine| engine.snapshot_root(root, snapshot))
+        .observe(|engine| engine.snapshot_operation(operation, snapshot))
         .expect("CSER_HANDOFF_FAIL stage=recovery-snapshot-build")
         .record();
     expect_none("recovery-root-snapshot", boot.recovery_transact(command));
     expect_none(
         "recovery-root-ready",
         boot.recovery_transact(cser_core::CommandRequest::Ready {
-            root,
+            operation,
             snapshot,
             successor,
         }),
@@ -646,13 +640,12 @@ fn rebind_handoff_root(boot: &mut QemuPersistentBoot, root: RootId) -> (Principa
     expect_none(
         "recovery-root-rebind",
         boot.recovery_transact(cser_core::CommandRequest::Rebind {
-            root,
+            operation,
             snapshot,
             successor,
-            binding_generation: next_binding,
         }),
     );
-    (successor, next_binding)
+    successor
 }
 
 fn get_terminal(tool: ToolDmaRuntime) -> Result<DurableToolObservation, ToolTransportError> {
@@ -896,10 +889,13 @@ impl HandoffBarriers {
     }
 }
 fn fixed_effect() -> EffectId {
-    EffectId::new(nz::<RootId>(EFFECT_ROOT), EFFECT_SEQUENCE).expect("handoff effect")
+    EffectId::new(nz::<OperationId>(EFFECT_ROOT), EFFECT_SEQUENCE).expect("handoff effect")
 }
-fn fixed_actor(generation: u64) -> PrincipalIncarnation {
-    PrincipalIncarnation::new(nz::<PrincipalId>(EFFECT_ROOT), generation).expect("handoff actor")
+fn fixed_actor(generation: u64) -> ExecutorCoordinate {
+    ExecutorCoordinate::new(
+        nz::<ExecutorId>(EFFECT_ROOT),
+        nz::<ExecutorGeneration>(generation),
+    )
 }
 trait NonZeroId: Sized {
     fn from_nonzero(value: u64) -> Self;
@@ -908,10 +904,11 @@ macro_rules! nonzero { ($($t:ty),+ $(,)?) => { $(impl NonZeroId for $t { fn from
 nonzero!(
     ChargeAccountId,
     ClaimId,
-    PrincipalId,
+    ExecutorGeneration,
+    ExecutorId,
+    OperationId,
     ResourceGeneration,
     ResourceId,
-    RootId
 );
 fn nz<T: NonZeroId>(value: u64) -> T {
     T::from_nonzero(value)

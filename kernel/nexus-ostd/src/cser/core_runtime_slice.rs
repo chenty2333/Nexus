@@ -13,7 +13,7 @@
 //! core state rather than a production ingress switch. This feature has no
 //! service ingress. A production adapter must therefore add an immediate death
 //! latch that rejects ingress between exact reap and the durable
-//! `FenceIncarnation` commit.
+//! `FenceExecutor` commit.
 
 use alloc::{
     sync::{Arc, Weak},
@@ -32,14 +32,14 @@ use cser_core::{
     DEVICE_CLAIM_QUEUE_SLOT, DEVICE_COMMIT_RECEIPT_SCHEMA, DEVICE_EVIDENCE_IRQ_DRAINED,
     DEVICE_EVIDENCE_RESET, DEVICE_RECEIPT_SCHEMA, DEVICE_VERIFIER, DeviceGeneration, DeviceScopeId,
     Digest, EffectFactChallenge, EffectFactKind, EffectId, EffectReceiptVerifier,
-    EvidenceChallenge, ExternalOutcome, Freshness, JournalGeneration, JournalRecord, OperationId,
-    OutcomeState, PrincipalId, PrincipalIncarnation, ProviderCoordinate, ProviderGeneration,
-    ProviderId, REPLY_CLAIM_PUBLICATION_SLOT, REPLY_COMMIT_RECEIPT_SCHEMA, REPLY_VERIFIER,
-    ReceiptSchemaId, ReceiptVerifier, RegistryInstance, ResourceGeneration, ResourceId,
-    RetirementState, RootId, SettlementClaim, SettlementState, SnapshotId, TransitionDurability,
-    TransitionOutput, TransitionReceipt, TxError, VerificationError, VerifiedEffectObservation,
-    VerifiedObservation, VerifierBinding, VerifierGeneration, VerifierIdentity, WorldId,
-    standard_catalog,
+    EvidenceChallenge, ExecutorCoordinate, ExecutorGeneration, ExecutorId, ExternalOutcome,
+    Freshness, JournalGeneration, JournalRecord, OperationId, OutcomeState, ProviderCoordinate,
+    ProviderGeneration, ProviderId, REPLY_CLAIM_PUBLICATION_SLOT, REPLY_COMMIT_RECEIPT_SCHEMA,
+    REPLY_VERIFIER, ReceiptSchemaId, ReceiptVerifier, RegistryInstance, ResourceGeneration,
+    ResourceId, RetirementState, SettlementClaim, SettlementState, SnapshotId,
+    TransitionDurability, TransitionOutput, TransitionReceipt, TxError, VerificationError,
+    VerifiedEffectObservation, VerifiedObservation, VerifierBinding, VerifierGeneration,
+    VerifierIdentity, WorldId, standard_catalog,
 };
 use ostd::{
     power::{ExitCode, poweroff},
@@ -102,9 +102,8 @@ enum ReapStage {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ReapObservation {
-    root: RootId,
-    crashed: PrincipalIncarnation,
-    binding_generation: u64,
+    operation: OperationId,
+    crashed: ExecutorCoordinate,
     stage: ReapStage,
 }
 
@@ -275,10 +274,8 @@ impl ReceiptVerifier for ProbeEvidenceVerifier {
         receipt: &Self::Receipt,
     ) -> Result<VerifiedObservation, VerificationError> {
         if *challenge != receipt.challenge
-            || challenge.expected_verifier_binding() != Some(self.binding)
-            || challenge
-                .verification_scope()
-                .is_none_or(|scope| scope.verifier_binding() != self.binding)
+            || challenge.expected_verifier_binding() != self.binding
+            || challenge.verification_scope().verifier_binding() != self.binding
             || receipt.digest.is_zero()
         {
             return Err(VerificationError::Rejected);
@@ -306,10 +303,8 @@ impl EffectReceiptVerifier for ProbeEffectVerifier {
         if *challenge != receipt.challenge
             || challenge.expected_verifier() != self.binding.verifier()
             || challenge.expected_receipt_schema() != self.binding.receipt_schema()
-            || challenge.expected_verifier_binding() != Some(self.binding)
-            || challenge
-                .verification_scope()
-                .is_none_or(|scope| scope.verifier_binding() != self.binding)
+            || challenge.expected_verifier_binding() != self.binding
+            || challenge.verification_scope().verifier_binding() != self.binding
             || receipt.digest.is_zero()
         {
             return Err(VerificationError::Rejected);
@@ -370,14 +365,14 @@ fn run_task_recovery_slice() {
         VolatileReplyDurability::new(),
     ));
     let inbox = Arc::new(ReapInbox::new());
-    let root = root(1);
-    let effect = effect(root, 1);
-    let origin = principal(1, 1);
+    let operation = operation(1);
+    let effect = effect(operation, 1);
+    let origin = executor(1, 1);
     let coordinate = ReplyCoordinate::new_component(
         effect,
         AGENT_COMPONENT_REPLY,
-        claim_id(root.get()),
-        resource(root.get()),
+        claim_id(operation.get()),
+        resource(operation.get()),
         ResourceGeneration::new(1).expect("reply resource generation is valid"),
     );
     let custody_inbox = Arc::new(OneShotInbox::<ReplyCustody>::new());
@@ -410,15 +405,14 @@ fn run_task_recovery_slice() {
     let origin_task = Arc::new(
         TaskOptions::new(move || {
             println!("CSER_CORE_REPLY_TRACE origin=entered");
-            create_committed_reply(&origin_runtime, effect, origin, 1);
+            create_committed_reply(&origin_runtime, effect, origin);
             println!("CSER_CORE_REPLY_TRACE origin=returning");
         })
         .data(CoreTaskData::reaped(
             &inbox,
             ReapObservation {
-                root,
+                operation,
                 crashed: origin,
-                binding_generation: 1,
                 stage: ReapStage::Origin,
             },
         ))
@@ -434,17 +428,16 @@ fn run_task_recovery_slice() {
     assert_eq!(
         first_reap,
         ReapObservation {
-            root,
+            operation,
             crashed: origin,
-            binding_generation: 1,
             stage: ReapStage::Origin,
         }
     );
     assert!(origin_task.is_reaped());
-    fence_and_snapshot(&runtime, root, origin, 1, snapshot(1));
+    fence_and_snapshot(&runtime, operation, origin, snapshot(1));
     println!("CSER_CORE_REPLY_TRACE manager=origin-fenced-snapshotted");
 
-    let first_successor = principal(1, 2);
+    let first_successor = executor(1, 2);
     let first_control = Arc::new(RecoveryControl::new());
     let successor_runtime = Arc::clone(&runtime);
     let successor_control = Arc::clone(&first_control);
@@ -455,7 +448,7 @@ fn run_task_recovery_slice() {
             ready_and_wait_for_rebind(
                 &successor_runtime,
                 &successor_control,
-                root,
+                operation,
                 snapshot(1),
                 first_successor,
             );
@@ -468,9 +461,8 @@ fn run_task_recovery_slice() {
         .data(CoreTaskData::reaped(
             &inbox,
             ReapObservation {
-                root,
+                operation,
                 crashed: first_successor,
-                binding_generation: 2,
                 stage: ReapStage::FirstSuccessor,
             },
         ))
@@ -484,10 +476,9 @@ fn run_task_recovery_slice() {
     tx(
         &runtime,
         CommandRequest::Rebind {
-            root,
+            operation,
             snapshot: snapshot(1),
             successor: first_successor,
-            binding_generation: 2,
         },
     );
     first_control.publish(PHASE_REBOUND);
@@ -496,9 +487,8 @@ fn run_task_recovery_slice() {
     assert_eq!(
         second_reap,
         ReapObservation {
-            root,
+            operation,
             crashed: first_successor,
-            binding_generation: 2,
             stage: ReapStage::FirstSuccessor,
         }
     );
@@ -508,7 +498,7 @@ fn run_task_recovery_slice() {
     );
     assert!(successor_task.is_reaped());
 
-    fence_and_snapshot(&runtime, root, first_successor, 2, snapshot(2));
+    fence_and_snapshot(&runtime, operation, first_successor, snapshot(2));
     println!("CSER_CORE_REPLY_TRACE manager=successor-v2-fenced-snapshotted");
     assert!(matches!(
         runtime.observe(|engine| {
@@ -523,7 +513,7 @@ fn run_task_recovery_slice() {
         }
     ));
 
-    let terminal_successor = principal(1, 3);
+    let terminal_successor = executor(1, 3);
     let terminal_control = Arc::new(RecoveryControl::new());
     let settlement_inbox = Arc::new(OneShotInbox::<SettlementClaim>::new());
     let terminal_runtime = Arc::clone(&runtime);
@@ -535,7 +525,7 @@ fn run_task_recovery_slice() {
             ready_and_wait_for_rebind(
                 &terminal_runtime,
                 &task_control,
-                root,
+                operation,
                 snapshot(2),
                 terminal_successor,
             );
@@ -561,10 +551,9 @@ fn run_task_recovery_slice() {
     tx(
         &runtime,
         CommandRequest::Rebind {
-            root,
+            operation,
             snapshot: snapshot(2),
             successor: terminal_successor,
-            binding_generation: 3,
         },
     );
     terminal_control.publish(PHASE_REBOUND);
@@ -627,18 +616,14 @@ fn cser_engine() -> cser_core::Engine {
     let freshness = Freshness::new(
         BootGeneration::new(1).expect("probe boot generation is valid"),
         RegistryInstance::new(1).expect("probe Registry instance is valid"),
-        1,
         cser_core::DeviceGeneration::new(1).expect("probe device generation is valid"),
         JournalGeneration::new(1).expect("probe journal generation is valid"),
-    )
-    .expect("probe freshness is complete");
-    let catalog = standard_catalog();
-    let mut engine = cser_core::Engine::new(
-        world,
-        catalog.clone(),
-        CoreLimits::bounded_default(),
-        freshness,
     );
+    let catalog = standard_catalog();
+    let catalog_set = cser_core::CatalogSet::new(core::slice::from_ref(&catalog))
+        .expect("probe catalog set is valid");
+    let mut engine =
+        cser_core::Engine::new(world, catalog_set, CoreLimits::bounded_default(), freshness);
     let verifier_bindings = probe_verifier_bindings();
     for provider in [provider_coordinate(world, 1), provider_coordinate(world, 2)] {
         engine
@@ -746,14 +731,14 @@ fn wait_for_reap(inbox: &ReapInbox) -> ReapObservation {
 fn ready_and_wait_for_rebind(
     runtime: &SpikeRuntime,
     control: &RecoveryControl,
-    root: RootId,
+    operation: OperationId,
     snapshot: SnapshotId,
-    successor: PrincipalIncarnation,
+    successor: ExecutorCoordinate,
 ) {
     tx(
         runtime,
         CommandRequest::Ready {
-            root,
+            operation,
             snapshot,
             successor,
         },
@@ -764,44 +749,31 @@ fn ready_and_wait_for_rebind(
 
 fn fence_and_snapshot(
     runtime: &SpikeRuntime,
-    root: RootId,
-    crashed: PrincipalIncarnation,
-    binding_generation: u64,
+    operation: OperationId,
+    crashed: ExecutorCoordinate,
     snapshot: SnapshotId,
 ) {
     tx(
         runtime,
-        CommandRequest::FenceIncarnation {
-            root,
-            crashed,
-            binding_generation,
-        },
+        CommandRequest::FenceExecutor { operation, crashed },
     );
     let command = runtime.observe(|engine| {
         engine
-            .snapshot_root(root, snapshot)
-            .expect("fenced root produces a snapshot")
+            .snapshot_operation(operation, snapshot)
+            .expect("fenced operation produces a snapshot")
             .record()
     });
     tx(runtime, command);
 }
 
-fn create_committed_reply(
-    runtime: &SpikeRuntime,
-    effect: EffectId,
-    origin: PrincipalIncarnation,
-    binding_generation: u64,
-) {
+fn create_committed_reply(runtime: &SpikeRuntime, effect: EffectId, origin: ExecutorCoordinate) {
     tx(
         runtime,
         CommandRequest::AdmitScopedCompositeEffect {
             effect,
-            operation: OperationId::new(effect.root().get())
-                .expect("reply operation identity is valid"),
             origin,
-            binding_generation,
             kind: AGENT_OPERATION_COMPOSITE,
-            charge_account: ChargeAccountId::new(effect.root().get())
+            charge_account: ChargeAccountId::new(effect.operation().get())
                 .expect("reply charge account is valid"),
             bindings: vec![
                 ComponentProviderBinding::new(
@@ -821,11 +793,10 @@ fn create_committed_reply(
             effect,
             component: AGENT_COMPONENT_REPLY,
             actor: origin,
-            binding_generation,
-            claim: claim_id(effect.root().get()),
+            claim: claim_id(effect.operation().get()),
             kind: REPLY_CLAIM_PUBLICATION_SLOT,
             scope: ClaimScope::Logical,
-            resource: resource(effect.root().get()),
+            resource: resource(effect.operation().get()),
             resource_generation: ResourceGeneration::new(1)
                 .expect("reply resource generation is valid"),
             units: 1,
@@ -833,7 +804,7 @@ fn create_committed_reply(
     );
     let dma_claim = claim_id(
         effect
-            .root()
+            .operation()
             .get()
             .checked_add(1_000)
             .expect("probe DMA claim identity is bounded"),
@@ -844,7 +815,6 @@ fn create_committed_reply(
             effect,
             component: AGENT_COMPONENT_DMA,
             actor: origin,
-            binding_generation,
             claim: dma_claim,
             kind: DEVICE_CLAIM_QUEUE_SLOT,
             scope: ClaimScope::Device(
@@ -852,7 +822,7 @@ fn create_committed_reply(
             ),
             resource: resource(
                 effect
-                    .root()
+                    .operation()
                     .get()
                     .checked_add(2_000)
                     .expect("probe DMA resource identity is bounded"),
@@ -867,7 +837,6 @@ fn create_committed_reply(
         CommandRequest::PrepareCompositeEffect {
             effect,
             actor: origin,
-            binding_generation,
         },
     );
     let output = output(
@@ -875,7 +844,6 @@ fn create_committed_reply(
         CommandRequest::RecordCompositeCommitIntents {
             effect,
             actor: origin,
-            binding_generation,
             operations: vec![
                 ComponentCommitOperation::new(AGENT_COMPONENT_REPLY, digest(10)),
                 ComponentCommitOperation::new(AGENT_COMPONENT_DMA, digest(12)),
@@ -888,11 +856,11 @@ fn create_committed_reply(
     assert_eq!(intents.len(), 2);
     for intent in intents {
         let (binding, receipt_digest) = match intent.component() {
-            Some(component) if component == AGENT_COMPONENT_REPLY => (
+            component if component == AGENT_COMPONENT_REPLY => (
                 probe_verifier_binding(REPLY_VERIFIER, REPLY_COMMIT_RECEIPT_SCHEMA),
                 digest(11),
             ),
-            Some(component) if component == AGENT_COMPONENT_DMA => (
+            component if component == AGENT_COMPONENT_DMA => (
                 probe_verifier_binding(DEVICE_VERIFIER, DEVICE_COMMIT_RECEIPT_SCHEMA),
                 digest(13),
             ),
@@ -933,10 +901,7 @@ fn retire_probe_dma_claim(runtime: &SpikeRuntime, effect: EffectId, claim: Claim
             .expect("probe DMA reset challenge is available")
     });
     let current = reset_challenge.current_observation();
-    let reset_observation = Freshness::new(
-        current.boot(),
-        current.registry(),
-        current.binding(),
+    let reset_observation = current.with_device(
         DeviceGeneration::new(
             current
                 .device()
@@ -945,9 +910,7 @@ fn retire_probe_dma_claim(runtime: &SpikeRuntime, effect: EffectId, claim: Claim
                 .expect("probe device generation is bounded"),
         )
         .expect("probe device generation advances"),
-        current.journal(),
-    )
-    .expect("probe reset observation is complete");
+    );
     let reset_receipt = ProbeEvidenceReceipt {
         challenge: reset_challenge,
         observation: reset_observation,
@@ -1000,7 +963,7 @@ fn retire_probe_dma_claim(runtime: &SpikeRuntime, effect: EffectId, claim: Claim
 fn record_settlement_intent(
     runtime: &SpikeRuntime,
     effect: EffectId,
-    successor: PrincipalIncarnation,
+    successor: ExecutorCoordinate,
     apply_intent: Digest,
 ) {
     let settlement = settlement_claim(
@@ -1028,7 +991,7 @@ fn record_settlement_intent(
 fn claim_reconciliation(
     runtime: &SpikeRuntime,
     effect: EffectId,
-    successor: PrincipalIncarnation,
+    successor: ExecutorCoordinate,
 ) -> SettlementClaim {
     let settlement = settlement_claim(
         output(
@@ -1107,13 +1070,13 @@ fn settle_real_reply(
 }
 
 fn exercise_revoke_adopt_orders(runtime: &SpikeRuntime) {
-    let revoke_effect = effect(root(11), 1);
-    let revoke_origin = principal(11, 1);
-    let revoke_successor = principal(11, 2);
+    let revoke_effect = effect(operation(11), 1);
+    let revoke_origin = executor(11, 1);
+    let revoke_successor = executor(11, 2);
     create_registered_reply(runtime, revoke_effect, revoke_origin);
     fence_snapshot_ready_rebind(
         runtime,
-        revoke_effect.root(),
+        revoke_effect.operation(),
         revoke_origin,
         revoke_successor,
         snapshot(11),
@@ -1129,7 +1092,6 @@ fn exercise_revoke_adopt_orders(runtime: &SpikeRuntime) {
         CommandRequest::BeginRevoke {
             effect: revoke_effect,
             expected_actor: revoke_successor,
-            binding_generation: 2,
             authority_epoch: revoke_epoch,
         },
     );
@@ -1137,18 +1099,17 @@ fn exercise_revoke_adopt_orders(runtime: &SpikeRuntime) {
         runtime.transact(CommandRequest::AdoptEffect {
             effect: revoke_effect,
             successor: revoke_successor,
-            binding_generation: 2,
         }),
         Err(TxError::Core(CoreError::GateClosed))
     );
 
-    let adopt_effect = effect(root(12), 1);
-    let adopt_origin = principal(12, 1);
-    let adopt_successor = principal(12, 2);
+    let adopt_effect = effect(operation(12), 1);
+    let adopt_origin = executor(12, 1);
+    let adopt_successor = executor(12, 2);
     create_registered_reply(runtime, adopt_effect, adopt_origin);
     fence_snapshot_ready_rebind(
         runtime,
-        adopt_effect.root(),
+        adopt_effect.operation(),
         adopt_origin,
         adopt_successor,
         snapshot(12),
@@ -1164,31 +1125,26 @@ fn exercise_revoke_adopt_orders(runtime: &SpikeRuntime) {
         CommandRequest::AdoptEffect {
             effect: adopt_effect,
             successor: adopt_successor,
-            binding_generation: 2,
         },
     );
     assert_eq!(
         runtime.transact(CommandRequest::BeginRevoke {
             effect: adopt_effect,
             expected_actor: adopt_successor,
-            binding_generation: 2,
             authority_epoch: stale_epoch,
         }),
         Err(TxError::Core(CoreError::StaleAuthorityEpoch))
     );
 }
 
-fn create_registered_reply(runtime: &SpikeRuntime, effect: EffectId, origin: PrincipalIncarnation) {
+fn create_registered_reply(runtime: &SpikeRuntime, effect: EffectId, origin: ExecutorCoordinate) {
     tx(
         runtime,
         CommandRequest::AdmitScopedCompositeEffect {
             effect,
-            operation: OperationId::new(effect.root().get())
-                .expect("race operation identity is valid"),
             origin,
-            binding_generation: 1,
             kind: AGENT_OPERATION_COMPOSITE,
-            charge_account: ChargeAccountId::new(effect.root().get())
+            charge_account: ChargeAccountId::new(effect.operation().get())
                 .expect("race charge account is valid"),
             bindings: vec![
                 ComponentProviderBinding::new(
@@ -1206,16 +1162,16 @@ fn create_registered_reply(runtime: &SpikeRuntime, effect: EffectId, origin: Pri
 
 fn fence_snapshot_ready_rebind(
     runtime: &SpikeRuntime,
-    root: RootId,
-    origin: PrincipalIncarnation,
-    successor: PrincipalIncarnation,
+    operation: OperationId,
+    origin: ExecutorCoordinate,
+    successor: ExecutorCoordinate,
     snapshot: SnapshotId,
 ) {
-    fence_and_snapshot(runtime, root, origin, 1, snapshot);
+    fence_and_snapshot(runtime, operation, origin, snapshot);
     tx(
         runtime,
         CommandRequest::Ready {
-            root,
+            operation,
             snapshot,
             successor,
         },
@@ -1223,10 +1179,9 @@ fn fence_snapshot_ready_rebind(
     tx(
         runtime,
         CommandRequest::Rebind {
-            root,
+            operation,
             snapshot,
             successor,
-            binding_generation: 2,
         },
     );
 }
@@ -1254,29 +1209,32 @@ where
     tx(runtime, command).into_output()
 }
 
-const fn root(value: u64) -> RootId {
-    match RootId::new(value) {
+const fn operation(value: u64) -> OperationId {
+    match OperationId::new(value) {
         Ok(value) => value,
-        Err(_) => panic!("probe root must be non-zero"),
+        Err(_) => panic!("probe operation must be non-zero"),
     }
 }
 
-const fn effect(root: RootId, sequence: u64) -> EffectId {
-    match EffectId::new(root, sequence) {
+const fn effect(operation: OperationId, sequence: u64) -> EffectId {
+    match EffectId::new(operation, sequence) {
         Ok(value) => value,
         Err(_) => panic!("probe effect sequence must be non-zero"),
     }
 }
 
-const fn principal(id: u64, generation: u64) -> PrincipalIncarnation {
-    let id = match PrincipalId::new(id) {
+const fn executor(id: u64, generation: u64) -> ExecutorCoordinate {
+    let id = match ExecutorId::new(id) {
         Ok(value) => value,
-        Err(_) => panic!("probe principal must be non-zero"),
+        Err(_) => panic!("probe executor must be non-zero"),
     };
-    match PrincipalIncarnation::new(id, generation) {
-        Ok(value) => value,
-        Err(_) => panic!("probe incarnation generation must be non-zero"),
-    }
+    ExecutorCoordinate::new(
+        id,
+        match ExecutorGeneration::new(generation) {
+            Ok(value) => value,
+            Err(_) => panic!("probe executor generation must be non-zero"),
+        },
+    )
 }
 
 const fn snapshot(value: u64) -> SnapshotId {

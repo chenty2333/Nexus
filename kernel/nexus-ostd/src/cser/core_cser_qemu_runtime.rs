@@ -13,12 +13,12 @@
 use alloc::sync::Arc;
 use core::fmt;
 use cser_core::{
-    AuthorityBindingGeneration, ChargeAccountId, ClaimId, CommandRequest, CoordinatedPersistence,
-    CoreLimits, DEVICE_DOMAIN, DEVICE_EVIDENCE_IOTLB, DEVICE_EVIDENCE_IRQ_DRAINED,
-    DEVICE_EVIDENCE_RESET, DeviceScopeId, Digest, EffectId, PrincipalId, PrincipalIncarnation,
-    RecoveryBinding, RecoveryProfile, RegistryInstance, ResourceGeneration, ResourceId, RootId,
-    TOOL_DMA_COMPONENT_DMA, TOOL_DMA_COMPONENT_TOOL, TransitionDurability, TransitionOutput,
-    WorldId, tool_dma_catalog,
+    CatalogSet, ChargeAccountId, ClaimId, CommandRequest, CoordinatedPersistence, CoreLimits,
+    DEVICE_DOMAIN, DEVICE_EVIDENCE_IOTLB, DEVICE_EVIDENCE_IRQ_DRAINED, DEVICE_EVIDENCE_RESET,
+    DeviceScopeId, Digest, EffectId, ExecutorCoordinate, ExecutorGeneration, ExecutorId,
+    OperationId, RecoveryBinding, RecoveryProfile, RegistryInstance, ResourceGeneration,
+    ResourceId, TOOL_DMA_COMPONENT_DMA, TOOL_DMA_COMPONENT_TOOL, TransitionDurability,
+    TransitionOutput, WorldId, tool_dma_catalog,
 };
 use nexus_ostd_virtio::{
     CompletedRequest, InterruptCompletionProgress, InterruptReceipt, MaskedIntx,
@@ -39,8 +39,8 @@ use super::{
     },
     core_cser_tool_experiment::{
         ToolDmaBarrier, ToolDmaBarrierHook, ToolDmaCoordinates, ToolDmaCoreOwner,
-        ToolDmaResumeState, arm_tool_dma, dma_reuse_gate_observation, resume_tool_dma,
-        tool_dma_metrics, tool_dma_terminal,
+        ToolDmaResumeState, arm_tool_dma, dma_reuse_gate_observation, ensure_tool_dma_provider,
+        resume_tool_dma, tool_dma_metrics, tool_dma_terminal,
     },
     core_device_quarantine::{
         OstdBootClaimVerifier, OstdBootIrqVerifier, QemuArenaIotlbVerifier,
@@ -266,13 +266,15 @@ impl fmt::Display for HexDigest {
 pub(crate) fn run() {
     let catalog = tool_dma_catalog();
     let experiment_identity = acquire_experiment_identity(catalog.digest());
+    let catalogs = CatalogSet::new(core::slice::from_ref(&catalog))
+        .expect("tool DMA catalog set is non-empty and canonical");
+    let catalog_set_digest = catalogs.digest();
     let run_id = experiment_identity.run_id().bytes();
     let binding = RecoveryBinding::new(
         RecoveryProfile::current(),
         WorldId::new(1).expect("experiment world is non-zero"),
-        catalog.digest(),
+        catalog_set_digest,
         RegistryInstance::new(1).expect("non-zero experiment registry"),
-        AuthorityBindingGeneration::new(1).expect("experiment binding is non-zero"),
     )
     .expect("valid experiment binding");
     let mut prepared = ExperimentPreparedBoot::acquire()
@@ -280,7 +282,7 @@ pub(crate) fn run() {
     prepared.set_diagnostic_telemetry(true);
     let arena = prepared.arena();
     let boot = prepared
-        .recover(catalog, CoreLimits::bounded_default(), binding)
+        .recover(catalogs, CoreLimits::bounded_default(), binding)
         .unwrap_or_else(|_| panic!("TOOL_DMA_FAIL stage=anchored-tool-catalog-recovery"));
     let effect = fixed_effect();
 
@@ -579,7 +581,7 @@ fn finish_deferred(
 fn reconcile_tool<O: ToolDmaCoreOwner>(
     runtime: &mut O,
     effect: EffectId,
-    claimant: PrincipalIncarnation,
+    claimant: ExecutorCoordinate,
     tool: ToolDmaRuntime,
     observation: super::core_tool_adapter::DurableToolObservation,
     after_apply_intent: impl FnOnce(),
@@ -734,12 +736,14 @@ fn expect_none<E>(
 }
 
 fn run_initial(
-    boot: ExperimentBoot,
+    mut boot: ExperimentBoot,
     effect: EffectId,
     arena: nexus_ostd_virtio::PersistentDmaArenaLayout,
     run_id: [u8; 16],
     experiment_identity: ExperimentIdentity,
 ) {
+    ensure_tool_dma_provider(&mut boot)
+        .unwrap_or_else(|_| panic!("TOOL_DMA_FAIL stage=provider-generation-registration"));
     let activated = boot
         .try_activate()
         .unwrap_or_else(|_| panic!("TOOL_DMA_FAIL stage=empty-boot-activation"));
@@ -771,7 +775,6 @@ fn run_initial(
         effect,
         TOOL_DMA_COMPONENT_DMA,
         fixed_actor(),
-        1,
         nz::<ChargeAccountId>(0x7101),
         identity,
         super::core_dma_adapter::CoreDmaClaims::new(
@@ -1124,35 +1127,44 @@ impl ToolDmaBarrierHook for QemuBarriers {
 }
 
 fn fixed_effect() -> EffectId {
-    EffectId::new(nz::<RootId>(EFFECT_ROOT), EFFECT_SEQUENCE).expect("fixed effect")
+    EffectId::new(
+        OperationId::new(EFFECT_ROOT).expect("fixed operation"),
+        EFFECT_SEQUENCE,
+    )
+    .expect("fixed effect")
 }
 
-fn fixed_actor() -> PrincipalIncarnation {
-    PrincipalIncarnation::new(nz::<PrincipalId>(EFFECT_ROOT), 1).expect("fixed actor")
+fn fixed_actor() -> ExecutorCoordinate {
+    ExecutorCoordinate::new(
+        ExecutorId::new(EFFECT_ROOT).expect("fixed executor"),
+        ExecutorGeneration::new(1).expect("fixed executor generation"),
+    )
 }
 
 /// Re-establishes successor custody before a replayed settlement is claimed.
 /// `CheckpointRecovery` already fenced every root before the boot owner was
 /// returned, including conversion of interrupted commit/apply authority into
 /// conservative indeterminate/reconciliation state. Repeating that fence here
-/// would be a stale-principal transition.
+/// would be a stale-executor transition.
 fn snapshot_ready_rebind(
     boot: &mut ExperimentBoot,
     effect: EffectId,
     state: ToolDmaResumeState,
-) -> PrincipalIncarnation {
-    let root = effect.root();
-    let successor = PrincipalIncarnation::new(nz::<PrincipalId>(EFFECT_ROOT), 2)
-        .expect("fixed recovery successor");
+) -> ExecutorCoordinate {
+    let operation = effect.operation();
+    let successor = ExecutorCoordinate::new(
+        ExecutorId::new(EFFECT_ROOT).expect("fixed recovery executor"),
+        ExecutorGeneration::new(2).expect("fixed recovery successor"),
+    );
     let snapshot = cser_core::SnapshotId::new(1).expect("fixed recovery snapshot");
     let command = boot
-        .observe(|engine| engine.snapshot_root(root, snapshot))
+        .observe(|engine| engine.snapshot_operation(operation, snapshot))
         .unwrap_or_else(|_| panic!("TOOL_DMA_FAIL stage=recovery-snapshot-build"))
         .record();
     expect_none(boot.recovery_transact(command), "recovery-snapshot");
     expect_none(
         boot.recovery_transact(CommandRequest::Ready {
-            root,
+            operation,
             snapshot,
             successor,
         }),
@@ -1160,27 +1172,21 @@ fn snapshot_ready_rebind(
     );
     expect_none(
         boot.recovery_transact(CommandRequest::Rebind {
-            root,
+            operation,
             snapshot,
             successor,
-            binding_generation: 2,
         }),
         "recovery-rebind",
     );
     if state == ToolDmaResumeState::Prepared {
         expect_none(
-            boot.recovery_transact(CommandRequest::AdoptEffect {
-                effect,
-                successor,
-                binding_generation: 2,
-            }),
+            boot.recovery_transact(CommandRequest::AdoptEffect { effect, successor }),
             "recovery-adopt-precommit",
         );
         expect_none(
             boot.recovery_transact(CommandRequest::RebaseCompositePrecommitClaims {
                 effect,
                 actor: successor,
-                binding_generation: 2,
             }),
             "recovery-rebase-precommit",
         );
@@ -1194,7 +1200,6 @@ fn coordinates(effect: EffectId, bdf: nexus_ostd_virtio::DeviceBdf) -> ToolDmaCo
     ToolDmaCoordinates::new(
         effect,
         fixed_actor(),
-        1,
         nz::<ChargeAccountId>(0x7101),
         nz(CLAIM_TOOL),
         nz(RESOURCE_TOOL),
@@ -1230,14 +1235,7 @@ macro_rules! impl_nonzero_id {
     )+};
 }
 
-impl_nonzero_id!(
-    ChargeAccountId,
-    ClaimId,
-    PrincipalId,
-    ResourceGeneration,
-    ResourceId,
-    RootId,
-);
+impl_nonzero_id!(ChargeAccountId, ClaimId, ResourceGeneration, ResourceId,);
 
 fn nz<T: NonZeroId>(value: u64) -> T {
     T::from_nonzero(value)

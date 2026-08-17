@@ -9,7 +9,7 @@
 use core::fmt;
 
 use cser_core::{
-    ChildDescriptorV1, ClaimId, Digest, EffectId, ResourceGeneration, ResourceId, RootId,
+    ChildDescriptorV1, ClaimId, Digest, EffectId, OperationId, ResourceGeneration, ResourceId,
     TOOL_HANDOFF_SOURCE_COMPONENT, tool_dma_catalog,
 };
 use ostd::{
@@ -400,7 +400,7 @@ fn handoff_source_payload(effect: EffectId) -> [u8; 60] {
     let mut payload = [0_u8; 60];
     payload[..PREFIX.len()].copy_from_slice(PREFIX);
     let mut at = PREFIX.len();
-    for value in [effect.root().get(), effect.sequence()] {
+    for value in [effect.operation().get(), effect.sequence()] {
         for shift in (0..16).rev() {
             payload[at] = HEX[((value >> (shift * 4)) & 0x0f) as usize];
             at += 1;
@@ -451,13 +451,13 @@ impl Barriers {
 }
 
 fn fixed_effect() -> EffectId {
-    EffectId::new(nz::<RootId>(EFFECT_ROOT), EFFECT_SEQUENCE).expect("baseline handoff effect")
+    EffectId::new(nz::<OperationId>(EFFECT_ROOT), EFFECT_SEQUENCE).expect("baseline handoff effect")
 }
 trait NonZeroId: Sized {
     fn from_nonzero(value: u64) -> Self;
 }
 macro_rules! nonzero { ($($t:ty),+ $(,)?) => { $(impl NonZeroId for $t { fn from_nonzero(value: u64) -> Self { <$t>::new(value).expect("fixed nonzero baseline handoff id") } })+ }; }
-nonzero!(ClaimId, ResourceGeneration, ResourceId, RootId);
+nonzero!(ClaimId, OperationId, ResourceGeneration, ResourceId);
 fn nz<T: NonZeroId>(value: u64) -> T {
     T::from_nonzero(value)
 }

@@ -17,17 +17,17 @@ use cser_core::{
 };
 
 #[test]
-fn semantic_api_profile_five_freezes_journal_and_domain_catalog() {
-    assert_eq!(CSER_CORE_API_PROFILE_VERSION, 5);
-    assert_eq!(JOURNAL_MAGIC, *b"CSERJR9\0");
-    assert_eq!(JOURNAL_SCHEMA_VERSION, 9);
-    assert_eq!(JOURNAL_CORE_API_PROFILE, 5);
+fn semantic_api_current_profile_freezes_journal_and_domain_catalog() {
+    assert_eq!(CSER_CORE_API_PROFILE_VERSION, 6);
+    assert_eq!(JOURNAL_MAGIC, *b"CSERJ10\0");
+    assert_eq!(JOURNAL_SCHEMA_VERSION, 10);
+    assert_eq!(JOURNAL_CORE_API_PROFILE, 6);
     assert_eq!(STANDARD_CATALOG_VERSION, 8);
-    assert_eq!(PROJECTION_VERSION, 9);
-    assert_eq!(RECOVERY_SNAPSHOT_VERSION, 5);
+    assert_eq!(PROJECTION_VERSION, 10);
+    assert_eq!(RECOVERY_SNAPSHOT_VERSION, 6);
     assert_eq!(NORMALIZED_TRACE_VERSION, 3);
-    assert_eq!(JOURNAL_CHECKPOINT_MAGIC, *b"CSERCP2\0");
-    assert_eq!(JOURNAL_CHECKPOINT_VERSION, 2);
+    assert_eq!(JOURNAL_CHECKPOINT_MAGIC, *b"CSERCP3\0");
+    assert_eq!(JOURNAL_CHECKPOINT_VERSION, 3);
     let catalog = standard_catalog();
     let agent_operation = catalog
         .composite_rule(AGENT_OPERATION_COMPOSITE)
@@ -62,7 +62,7 @@ fn semantic_api_profile_five_freezes_journal_and_domain_catalog() {
 /// admission algebra for domains that need it, but silence in the standard
 /// profile must continue to mean exclusion.
 #[test]
-fn semantic_api_profile_two_freezes_exclusive_conflict_for_every_standard_class() {
+fn semantic_api_current_profile_freezes_exclusive_conflict_for_every_standard_class() {
     let catalog = standard_catalog();
     for (domain, kind) in [
         (REPLY_DOMAIN, REPLY_CLAIM_PUBLICATION_SLOT),
@@ -81,11 +81,12 @@ fn semantic_api_profile_two_freezes_exclusive_conflict_for_every_standard_class(
 }
 
 /// The evidence capability classification is part of the frozen catalog contract,
-/// not an internal detail. Profile 2 must keep its logical outcome and every
-/// device claim's quiescence path separate, because an escaped effect can reach
-/// physical quiescence while its externally visible outcome is unresolved.
+/// not an internal detail. The current API profile must keep its logical
+/// outcome and every device claim's quiescence path separate, because an
+/// escaped effect can reach physical quiescence while its externally visible
+/// outcome is unresolved.
 #[test]
-fn semantic_api_profile_two_freezes_evidence_capability_classification() {
+fn semantic_api_current_profile_freezes_evidence_capability_classification() {
     let catalog = standard_catalog();
 
     let reply = catalog
@@ -126,7 +127,7 @@ fn semantic_api_profile_two_freezes_evidence_capability_classification() {
             assert_eq!(
                 rule.recovery(),
                 EvidenceRecovery::Recoverable,
-                "a successor incarnation must be able to re-observe device quiescence"
+                "a successor executor must be able to re-observe device quiescence"
             );
         }
     }

@@ -1,11 +1,11 @@
 use cser_core::{
-    AGENT_COMPONENT_REPLY, AGENT_OPERATION_COMPOSITE, AuthorityBindingGeneration, BootGeneration,
-    ClaimScope, CommandRequest, ComponentProviderBinding, CoreError, CoreLimits, DeviceGeneration,
-    Digest, DomainCatalog, EffectId, Engine, Freshness, JournalGeneration, PrincipalId,
-    PrincipalIncarnation, ProviderCoordinate, ProviderGeneration, ProviderId,
+    AGENT_COMPONENT_REPLY, AGENT_OPERATION_COMPOSITE, BootGeneration, CatalogSet, ClaimScope,
+    CommandRequest, ComponentProviderBinding, CoreError, CoreLimits, DeviceGeneration, Digest,
+    DomainCatalog, EffectId, Engine, ExecutorCoordinate, ExecutorGeneration, ExecutorId, Freshness,
+    JournalGeneration, ProviderCoordinate, ProviderGeneration, ProviderId,
     REPLY_CLAIM_PUBLICATION_SLOT, REPLY_EVIDENCE_PUBLICATION_ACK, REPLY_VERIFIER, ReceiptSchemaId,
     RecoveryAnchor, RecoveryBinding, RecoveryProfile, RegistryInstance, ResourceGeneration,
-    ResourceId, RootId, TransitionDurability, VerifierBinding, VerifierGeneration, VerifierId,
+    ResourceId, TransitionDurability, VerifierBinding, VerifierGeneration, VerifierId,
     VerifierIdentity, WorldId, standard_catalog,
 };
 
@@ -13,11 +13,9 @@ fn freshness() -> Freshness {
     Freshness::new(
         BootGeneration::new(1).unwrap(),
         RegistryInstance::new(1).unwrap(),
-        1,
         DeviceGeneration::new(1).unwrap(),
         JournalGeneration::new(1).unwrap(),
     )
-    .unwrap()
 }
 
 fn recovery_binding(
@@ -28,9 +26,10 @@ fn recovery_binding(
     RecoveryBinding::new(
         RecoveryProfile::current(),
         world,
-        catalog.digest(),
+        CatalogSet::new(std::slice::from_ref(catalog))
+            .unwrap()
+            .digest(),
         freshness.registry(),
-        AuthorityBindingGeneration::new(freshness.binding()).unwrap(),
     )
     .unwrap()
 }
@@ -65,15 +64,16 @@ fn admit_one_component_effect(
     provider: ProviderCoordinate,
     effect_value: u64,
 ) -> (EffectId, cser_core::ComponentProviderBinding) {
-    let effect = EffectId::new(RootId::new(effect_value).unwrap(), 1).unwrap();
-    let actor = PrincipalIncarnation::new(PrincipalId::new(effect_value).unwrap(), 1).unwrap();
+    let effect = EffectId::new(cser_core::OperationId::new(effect_value).unwrap(), 1).unwrap();
+    let actor = ExecutorCoordinate::new(
+        ExecutorId::new(effect_value).unwrap(),
+        ExecutorGeneration::new(1).unwrap(),
+    );
     let binding = ComponentProviderBinding::new(AGENT_COMPONENT_REPLY, provider);
     engine
         .transact_volatile(CommandRequest::AdmitScopedCompositeEffect {
             effect,
-            operation: cser_core::OperationId::new(effect_value).unwrap(),
             origin: actor,
-            binding_generation: 1,
             kind: AGENT_OPERATION_COMPOSITE,
             charge_account: cser_core::ChargeAccountId::new(effect_value).unwrap(),
             bindings: vec![
@@ -87,7 +87,6 @@ fn admit_one_component_effect(
             effect,
             component: AGENT_COMPONENT_REPLY,
             actor,
-            binding_generation: 1,
             claim: cser_core::ClaimId::new(effect_value).unwrap(),
             kind: REPLY_CLAIM_PUBLICATION_SLOT,
             scope: ClaimScope::Logical,
@@ -150,11 +149,16 @@ fn scoped_verifier_generation_and_implementation_mismatch_fail_without_mutation(
         })
         .copied()
         .unwrap();
-    let mut engine = Engine::new(world, catalog, CoreLimits::bounded_default(), freshness());
+    let mut engine = Engine::new(
+        world,
+        CatalogSet::new(std::slice::from_ref(&catalog)).unwrap(),
+        CoreLimits::bounded_default(),
+        freshness(),
+    );
     engine
         .transact_volatile(CommandRequest::RegisterProviderGeneration {
             coordinate: provider,
-            catalog_digest: engine.catalog_digest(),
+            catalog_digest: catalog.digest(),
             verifier_bindings: exact,
         })
         .unwrap();
@@ -167,7 +171,7 @@ fn scoped_verifier_generation_and_implementation_mismatch_fail_without_mutation(
             REPLY_EVIDENCE_PUBLICATION_ACK,
         )
         .unwrap();
-    assert_eq!(challenge.expected_verifier_binding(), Some(expected));
+    assert_eq!(challenge.expected_verifier_binding(), expected);
     let revision = engine.revision();
     let projection = engine.projection_digest();
     let wrong_generation = VerifierBinding::new(
@@ -217,7 +221,7 @@ fn verifier_rotation_does_not_rebind_an_existing_effect_challenge() {
     let provider = coordinate(903, 904, 1);
     let mut engine = Engine::new(
         world,
-        catalog.clone(),
+        CatalogSet::new(std::slice::from_ref(&catalog)).unwrap(),
         CoreLimits::bounded_default(),
         freshness(),
     );
@@ -271,7 +275,7 @@ fn provider_checkpoint_roundtrip_retains_exact_verifier_set() {
     let exact = bindings(&catalog, 1, 0x70);
     let mut engine = Engine::new(
         world,
-        catalog.clone(),
+        CatalogSet::new(std::slice::from_ref(&catalog)).unwrap(),
         CoreLimits::bounded_default(),
         freshness(),
     );
@@ -292,13 +296,11 @@ fn provider_checkpoint_roundtrip_retains_exact_verifier_set() {
     let next = Freshness::new(
         BootGeneration::new(2).unwrap(),
         RegistryInstance::new(1).unwrap(),
-        1,
         DeviceGeneration::new(1).unwrap(),
         JournalGeneration::new(2).unwrap(),
-    )
-    .unwrap();
+    );
     let recovered = Engine::recover(
-        catalog.clone(),
+        CatalogSet::new(std::slice::from_ref(&catalog)).unwrap(),
         CoreLimits::bounded_default(),
         RecoveryAnchor::from_trusted_provider(
             recovery_binding(world, &catalog, freshness()),
@@ -328,7 +330,7 @@ fn provider_registration_rejects_raw_or_wrong_verifier_classes() {
     let catalog = standard_catalog();
     let mut engine = Engine::new(
         world,
-        catalog.clone(),
+        CatalogSet::new(std::slice::from_ref(&catalog)).unwrap(),
         CoreLimits::bounded_default(),
         freshness(),
     );

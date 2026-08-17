@@ -12,7 +12,7 @@
 extern crate alloc;
 
 use cser_core::{
-    ClaimId, Digest, EffectId, ExternalOutcome, ResourceGeneration, ResourceId, RootId,
+    ClaimId, Digest, EffectId, ExternalOutcome, OperationId, ResourceGeneration, ResourceId,
 };
 use sha2::{Digest as _, Sha256};
 
@@ -79,7 +79,10 @@ pub(crate) struct HandoffClaimCoordinate {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct DurableOperationBinding {
     pub(crate) run_id: [u8; 16],
-    pub(crate) root: u64,
+    /// Stable causal operation identity. The on-disk slot remains at the
+    /// historical offset so the independent baseline keeps its fixed image,
+    /// but it is no longer interpreted as a legacy root identity.
+    pub(crate) operation: u64,
     pub(crate) sequence: u64,
     pub(crate) component: u32,
     pub(crate) claim: u64,
@@ -122,7 +125,7 @@ impl DurableOperationBinding {
         });
         Self {
             run_id: plan.run_id(),
-            root: plan.effect().root().get(),
+            operation: plan.effect().operation().get(),
             sequence: plan.effect().sequence(),
             component: plan.component().get(),
             claim: plan.claim().get(),
@@ -145,7 +148,7 @@ impl DurableOperationBinding {
 
     fn reconstruct(self) -> Result<ToolOperationPlan, HandoffError> {
         let effect = EffectId::new(
-            RootId::new(self.root).map_err(|_| HandoffError::Persist)?,
+            OperationId::new(self.operation).map_err(|_| HandoffError::Persist)?,
             self.sequence,
         )
         .map_err(|_| HandoffError::Persist)?;
@@ -528,7 +531,7 @@ impl DurableHandoffRecord {
         }
         if let Some(wire) = self.descriptor {
             let descriptor = Descriptor::parse(&wire)?;
-            if source.effect().root().get() != descriptor.parent.root
+            if source.effect().operation().get() != descriptor.parent.operation
                 || source.effect().sequence() != descriptor.parent.sequence
                 || source.component().get() != descriptor.parent_component
                 || source.catalog_digest().bytes() != descriptor.catalog
@@ -583,7 +586,7 @@ fn read_u64(bytes: &[u8], at: usize) -> Result<u64, HandoffError> {
 fn encode_binding(bytes: &mut [u8], binding: DurableOperationBinding) {
     bytes.fill(0);
     bytes[..16].copy_from_slice(&binding.run_id);
-    put_u64(bytes, 16, binding.root);
+    put_u64(bytes, 16, binding.operation);
     put_u64(bytes, 24, binding.sequence);
     put_u32(bytes, 32, binding.component);
     put_u64(bytes, 36, binding.claim);
@@ -650,7 +653,7 @@ fn decode_binding(bytes: &[u8]) -> Result<DurableOperationBinding, HandoffError>
     }
     let binding = DurableOperationBinding {
         run_id: bytes[..16].try_into().map_err(|_| HandoffError::Persist)?,
-        root: read_u64(bytes, 16)?,
+        operation: read_u64(bytes, 16)?,
         sequence: read_u64(bytes, 24)?,
         component: u32_at(bytes, 32)?,
         claim: read_u64(bytes, 36)?,
@@ -679,7 +682,7 @@ fn decode_binding(bytes: &[u8]) -> Result<DurableOperationBinding, HandoffError>
         cser3_output: bytes[767] & 2 != 0,
         child_route,
     };
-    if binding.root == 0
+    if binding.operation == 0
         || binding.sequence == 0
         || binding.component == 0
         || binding.claim == 0
@@ -698,7 +701,7 @@ fn decode_binding(bytes: &[u8]) -> Result<DurableOperationBinding, HandoffError>
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ChildKey {
-    root: u64,
+    operation: u64,
     sequence: u64,
 }
 
@@ -734,10 +737,10 @@ impl Descriptor {
             return Err(HandoffError::InvalidDescriptor);
         }
         let parent = ChildKey {
-            root: u64_at(wire, 18)?,
+            operation: u64_at(wire, 18)?,
             sequence: u64_at(wire, 26)?,
         };
-        if parent.root == 0 || parent.sequence == 0 {
+        if parent.operation == 0 || parent.sequence == 0 {
             return Err(HandoffError::InvalidDescriptor);
         }
         let parent_component = u32_at(wire, 34)?;
@@ -845,7 +848,7 @@ fn derive_child(wire: &[u8; DESCRIPTOR_LEN], parent: ChildKey) -> Result<ChildKe
         return Err(HandoffError::InvalidDescriptor);
     }
     Ok(ChildKey {
-        root: parent.root,
+        operation: parent.operation,
         sequence,
     })
 }
@@ -1232,7 +1235,7 @@ fn validate_source(
     let plan = source.plan();
     if source.outcome() != ExternalOutcome::Success
         || !plan.is_cser3_source()
-        || plan.effect().root().get() != descriptor.parent.root
+        || plan.effect().operation().get() != descriptor.parent.operation
         || plan.effect().sequence() != descriptor.parent.sequence
         || plan.component().get() != descriptor.parent_component
         || plan.catalog_digest().bytes() != descriptor.catalog
@@ -1270,12 +1273,12 @@ fn permit_token(record: &DurableHandoff) -> [u8; 32] {
     hash.update(b"nexus-baseline-handoff-permit-v1");
     hash.update(record.descriptor.wire);
     hash.update(record.source_receipt.terminal_record_digest().bytes());
-    hash.update(record.descriptor.parent.root.to_le_bytes());
+    hash.update(record.descriptor.parent.operation.to_le_bytes());
     hash.update(record.descriptor.parent.sequence.to_le_bytes());
     hash.update(record.descriptor.route);
     hash.update(record.descriptor.input);
     hash.update(record.descriptor.catalog);
-    hash.update(record.descriptor.child.root.to_le_bytes());
+    hash.update(record.descriptor.child.operation.to_le_bytes());
     hash.update(record.descriptor.child.sequence.to_le_bytes());
     hash.update(
         record
@@ -1339,8 +1342,8 @@ mod tests {
         ToolV2Identity, decode_response,
     };
     use cser_core::{
-        ClaimId, Digest, EffectId, ResourceGeneration, ResourceId, RootId, TOOL_CLAIM_OUTCOME_SLOT,
-        TOOL_HANDOFF_COMPONENT, TOOL_HANDOFF_SOURCE_COMPONENT,
+        ClaimId, Digest, EffectId, OperationId, ResourceGeneration, ResourceId,
+        TOOL_CLAIM_OUTCOME_SLOT, TOOL_HANDOFF_COMPONENT, TOOL_HANDOFF_SOURCE_COMPONENT,
     };
     use ostd::prelude::ktest;
 
@@ -1361,7 +1364,7 @@ mod tests {
         ToolOperationPlan,
         HandoffClaimCoordinate,
     ) {
-        let parent = EffectId::new(RootId::new(41).unwrap(), 2).unwrap();
+        let parent = EffectId::new(OperationId::new(41).unwrap(), 2).unwrap();
         let catalog = Digest::new([0x33; 32]);
         let payload = b"baseline-handoff-input";
         let identity = ToolV2Identity::new(

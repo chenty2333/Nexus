@@ -25,16 +25,16 @@ use core::{
 };
 
 use cser_core::{
-    AGENT_COMPONENT_DMA, BootGeneration, CSER_CORE_API_PROFILE_VERSION, ChargeAccountId, ClaimId,
-    ClaimScope, Command, CommandRequest, ComponentProviderBinding, CoreError, CoreLimits,
-    DEVICE_CLAIM_IOVA, DEVICE_CLAIM_PINNED_PAGE, DEVICE_CLAIM_QUEUE_SLOT,
+    AGENT_COMPONENT_DMA, BootGeneration, CSER_CORE_API_PROFILE_VERSION, CatalogSet,
+    ChargeAccountId, ClaimId, ClaimScope, Command, CommandRequest, ComponentProviderBinding,
+    CoreError, CoreLimits, DEVICE_CLAIM_IOVA, DEVICE_CLAIM_PINNED_PAGE, DEVICE_CLAIM_QUEUE_SLOT,
     DEVICE_COMMIT_RECEIPT_SCHEMA, DEVICE_RECEIPT_SCHEMA, DEVICE_VERIFIER,
     DMA_ARENA_REUSE_COMPOSITE, DeviceGeneration, DeviceScopeId, Digest, EffectId, Engine,
-    Freshness, JournalGeneration, JournalRecord, OperationId, PrincipalId, PrincipalIncarnation,
-    REPLY_APPLY_RECEIPT_SCHEMA, REPLY_COMMIT_RECEIPT_SCHEMA, REPLY_RECEIPT_SCHEMA,
-    REPLY_SETTLEMENT_RECEIPT_SCHEMA, REPLY_VERIFIER, RegistryInstance, ResourceGeneration,
-    ResourceId, RootId, SnapshotId, TransitionDurability, TransitionOutput, TransitionReceipt,
-    TxError, VerifierBinding, VerifierGeneration, standard_catalog,
+    ExecutorCoordinate, ExecutorGeneration, ExecutorId, Freshness, JournalGeneration,
+    JournalRecord, OperationId, REPLY_APPLY_RECEIPT_SCHEMA, REPLY_COMMIT_RECEIPT_SCHEMA,
+    REPLY_RECEIPT_SCHEMA, REPLY_SETTLEMENT_RECEIPT_SCHEMA, REPLY_VERIFIER, RegistryInstance,
+    ResourceGeneration, ResourceId, SnapshotId, TransitionDurability, TransitionOutput,
+    TransitionReceipt, TxError, VerifierBinding, VerifierGeneration, standard_catalog,
 };
 use nexus_ostd_virtio::{
     CompletedRequest, CompletionMode, InterruptCompletionProgress, InterruptNotReadyReason,
@@ -103,18 +103,18 @@ type DmaRuntime = OstdCserRuntime<VolatileDmaDurability>;
 fn new_dma_runtime() -> DmaRuntime {
     let world = DMA_RECOVERY_PROVIDER.world();
     let catalog = standard_catalog();
+    let catalogs = CatalogSet::new(core::slice::from_ref(&catalog))
+        .expect("DMA runtime catalog set is non-empty");
     let mut engine = Engine::new(
         world,
-        catalog.clone(),
+        catalogs,
         CoreLimits::bounded_default(),
         Freshness::new(
             nz::<BootGeneration>(1),
             nz::<RegistryInstance>(1),
-            1,
             nz::<DeviceGeneration>(1),
             nz::<JournalGeneration>(1),
-        )
-        .expect("DMA runtime freshness is complete"),
+        ),
     );
     // The DMA slice runs against the current profile-5 command grammar.  Both
     // DMA provider is registered before any effect can bind a component, so
@@ -190,7 +190,7 @@ impl ServiceControl {
 }
 
 struct DmaServiceTask {
-    incarnation: PrincipalIncarnation,
+    executor: ExecutorCoordinate,
 }
 
 /// Single-request handoff between the real OSTD top half and manager task.
@@ -283,11 +283,11 @@ pub(crate) fn launch() -> ! {
 #[allow(clippy::result_large_err)]
 fn run_dma_recovery_slice() {
     let core = new_dma_runtime();
-    let root_id = nz::<RootId>(0xd001);
-    let effect1 = EffectId::new(root_id, 1).expect("first DMA effect is valid");
-    let origin = principal(0xd001, 1);
-    let successor1 = principal(0xd001, 2);
-    let successor2 = principal(0xd001, 3);
+    let operation1 = OperationId::new(0xd001).expect("first DMA operation is valid");
+    let effect1 = EffectId::new(operation1, 1).expect("first DMA effect is valid");
+    let origin = executor(0xd001, 1);
+    let successor1 = executor(0xd001, 2);
+    let successor2 = executor(0xd001, 3);
 
     let (origin_task, origin_control) = spawn_service(origin, "origin");
     let mut root =
@@ -325,21 +325,13 @@ fn run_dma_recovery_slice() {
         effect1,
         AGENT_COMPONENT_DMA,
         origin,
-        1,
         nz::<ChargeAccountId>(0xd001),
         first_identity,
         claims1,
     )
     .expect("first real request binds to the portable core");
 
-    enroll_new_effect(
-        &core,
-        cohort1,
-        OperationId::new(1).expect("first DMA operation is valid"),
-        origin,
-        1,
-        nz::<ChargeAccountId>(0xd001),
-    );
+    enroll_new_effect(&core, cohort1, origin, nz::<ChargeAccountId>(0xd001));
     let intent1 = commit_intent(&core, cohort1, digest(0x11));
     let authority1 = core
         .observe(move |engine| bind_queue_commit(engine, intent1, cohort1))
@@ -366,18 +358,17 @@ fn run_dma_recovery_slice() {
     stop_and_reap(&origin_task, &origin_control);
     tx(
         &core,
-        CommandRequest::FenceIncarnation {
-            root: root_id,
+        CommandRequest::FenceExecutor {
+            operation: operation1,
             crashed: origin,
-            binding_generation: 1,
         },
     );
     assert_retained(&core, cohort1);
 
     let snapshot1 = core
-        .observe(|engine| engine.snapshot_root(root_id, nz::<SnapshotId>(1)))
+        .observe(|engine| engine.snapshot_operation(operation1, nz::<SnapshotId>(1)))
         .expect("first DMA post-mortem snapshot is available");
-    assert_eq!(snapshot1.items().len(), 0);
+    assert_eq!(snapshot1.artifacts().len(), 0);
     assert_eq!(snapshot1.composites().len(), 1);
     assert_eq!(snapshot1.composites()[0].components.len(), 1);
     assert_eq!(
@@ -388,7 +379,7 @@ fn run_dma_recovery_slice() {
     tx(
         &core,
         CommandRequest::Ready {
-            root: root_id,
+            operation: operation1,
             snapshot: nz::<SnapshotId>(1),
             successor: successor1,
         },
@@ -396,31 +387,29 @@ fn run_dma_recovery_slice() {
     tx(
         &core,
         CommandRequest::Rebind {
-            root: root_id,
+            operation: operation1,
             snapshot: nz::<SnapshotId>(1),
             successor: successor1,
-            binding_generation: 2,
         },
     );
 
     // A fresh successor dies before it can settle the physical tombstone.
     // The manager retains the real queue/DMA owners and fences the exact
-    // rebound incarnation a second time.
+    // rebound executor a second time.
     let (successor1_task, successor1_control) = spawn_service(successor1, "successor-v2");
     stop_and_reap(&successor1_task, &successor1_control);
     tx(
         &core,
-        CommandRequest::FenceIncarnation {
-            root: root_id,
+        CommandRequest::FenceExecutor {
+            operation: operation1,
             crashed: successor1,
-            binding_generation: 2,
         },
     );
     assert_retained(&core, cohort1);
     let snapshot2 = core
-        .observe(|engine| engine.snapshot_root(root_id, nz::<SnapshotId>(2)))
+        .observe(|engine| engine.snapshot_operation(operation1, nz::<SnapshotId>(2)))
         .expect("second-crash DMA snapshot is available");
-    assert_eq!(snapshot2.items().len(), 0);
+    assert_eq!(snapshot2.artifacts().len(), 0);
     assert_eq!(snapshot2.composites().len(), 1);
     assert_eq!(snapshot2.composites()[0].components.len(), 1);
     assert_eq!(
@@ -431,7 +420,7 @@ fn run_dma_recovery_slice() {
     tx(
         &core,
         CommandRequest::Ready {
-            root: root_id,
+            operation: operation1,
             snapshot: nz::<SnapshotId>(2),
             successor: successor2,
         },
@@ -439,10 +428,9 @@ fn run_dma_recovery_slice() {
     tx(
         &core,
         CommandRequest::Rebind {
-            root: root_id,
+            operation: operation1,
             snapshot: nz::<SnapshotId>(2),
             successor: successor2,
-            binding_generation: 3,
         },
     );
 
@@ -461,14 +449,13 @@ fn run_dma_recovery_slice() {
     assert!(first_close.iotlb_pending_observed);
     assert_reusable(&core, cohort1);
 
-    let effect2 = EffectId::new(root_id, 2).expect("second DMA effect is valid");
+    let operation2 = OperationId::new(2).expect("second DMA operation is valid");
+    let effect2 = EffectId::new(operation2, 1).expect("second DMA effect is valid");
     let claims2 = dma_claims(0x200, 2);
     admit_dma_effect(
         &core,
         effect2,
-        OperationId::new(2).expect("second DMA operation is valid"),
         successor2,
-        3,
         nz::<ChargeAccountId>(0xd001),
         cohort1.scope(),
         claims2,
@@ -488,7 +475,6 @@ fn run_dma_recovery_slice() {
                 role,
                 effect2,
                 successor2,
-                3,
                 claim.claim(),
                 claim.units(),
                 digest(0xda),
@@ -515,7 +501,6 @@ fn run_dma_recovery_slice() {
         effect2,
         AGENT_COMPONENT_DMA,
         successor2,
-        3,
         nz::<ChargeAccountId>(0xd001),
         second_identity,
         claims2,
@@ -563,10 +548,9 @@ fn run_dma_recovery_slice() {
     stop_and_reap(&successor2_task, &successor2_control);
     tx(
         &core,
-        CommandRequest::FenceIncarnation {
-            root: root_id,
+        CommandRequest::FenceExecutor {
+            operation: operation2,
             crashed: successor2,
-            binding_generation: 3,
         },
     );
     assert_retained(&core, cohort2);
@@ -635,17 +619,13 @@ fn output<C: Into<Command>>(core: &DmaRuntime, command: C) -> TransitionOutput {
 fn enroll_new_effect(
     core: &DmaRuntime,
     cohort: CoreDmaCohort,
-    operation: OperationId,
-    origin: PrincipalIncarnation,
-    binding_generation: u64,
+    origin: ExecutorCoordinate,
     charge_account: ChargeAccountId,
 ) {
     admit_dma_effect(
         core,
         cohort.effect(),
-        operation,
         origin,
-        binding_generation,
         charge_account,
         cohort.scope(),
         CoreDmaClaims::new(
@@ -664,9 +644,7 @@ fn enroll_new_effect(
 fn admit_dma_effect(
     core: &DmaRuntime,
     effect: EffectId,
-    operation: OperationId,
-    origin: PrincipalIncarnation,
-    binding_generation: u64,
+    origin: ExecutorCoordinate,
     charge_account: ChargeAccountId,
     scope: DeviceScopeId,
     claims: CoreDmaClaims,
@@ -676,9 +654,7 @@ fn admit_dma_effect(
         core,
         CommandRequest::AdmitScopedCompositeEffect {
             effect,
-            operation,
             origin,
-            binding_generation,
             kind: DMA_ARENA_REUSE_COMPOSITE,
             charge_account,
             bindings: alloc::vec![ComponentProviderBinding::new(
@@ -700,7 +676,6 @@ fn admit_dma_effect(
                     effect,
                     component: AGENT_COMPONENT_DMA,
                     actor: origin,
-                    binding_generation,
                     claim: claim.claim(),
                     kind,
                     scope: ClaimScope::Device(scope),
@@ -715,7 +690,6 @@ fn admit_dma_effect(
             CommandRequest::PrepareCompositeEffect {
                 effect,
                 actor: origin,
-                binding_generation,
             },
         );
     }
@@ -733,7 +707,7 @@ fn commit_intent(
 }
 
 fn spawn_service(
-    incarnation: PrincipalIncarnation,
+    executor: ExecutorCoordinate,
     label: &'static str,
 ) -> (Arc<Task>, Arc<ServiceControl>) {
     let control = Arc::new(ServiceControl::new());
@@ -745,13 +719,13 @@ fn spawn_service(
                 Task::yield_now();
             }
             println!(
-                "CSER_CORE_DMA ServiceExit label={} principal={} incarnation={} reason=task-return",
+                "CSER_CORE_DMA ServiceExit label={} executor={} generation={} reason=task-return",
                 label,
-                incarnation.principal().get(),
-                incarnation.generation(),
+                executor.executor().get(),
+                executor.generation().get(),
             );
         })
-        .data(DmaServiceTask { incarnation })
+        .data(DmaServiceTask { executor })
         .build()
         .expect("DMA service task builds"),
     );
@@ -766,15 +740,15 @@ fn stop_and_reap(task: &Arc<Task>, control: &Arc<ServiceControl>) {
     let expected = task
         .data()
         .downcast_ref::<DmaServiceTask>()
-        .expect("DMA service carries exact incarnation")
-        .incarnation;
+        .expect("DMA service carries exact executor")
+        .executor;
     control.stop.store(true, Ordering::Release);
     for _ in 0..MAX_DEVICE_TURNS {
         if task.is_reaped() {
             println!(
-                "CSER_CORE_DMA ExactReap principal={} incarnation={} reaped=true",
-                expected.principal().get(),
-                expected.generation(),
+                "CSER_CORE_DMA ExactReap executor={} generation={} reaped=true",
+                expected.executor().get(),
+                expected.generation().get(),
             );
             return;
         }
@@ -918,12 +892,7 @@ fn close_real_generation(
 fn assert_retained(core: &DmaRuntime, cohort: CoreDmaCohort) {
     core.observe(|engine| {
         let component = engine
-            .component(
-                cohort.effect(),
-                cohort
-                    .component()
-                    .expect("scoped DMA cohort has a component identity"),
-            )
+            .component(cohort.effect(), cohort.component())
             .expect("DMA component remains present");
         assert_eq!(component.retained_claims, 3);
         for role in [ClaimRole::Queue, ClaimRole::PinnedPages, ClaimRole::Iova] {
@@ -939,12 +908,7 @@ fn assert_retained(core: &DmaRuntime, cohort: CoreDmaCohort) {
 fn assert_reusable(core: &DmaRuntime, cohort: CoreDmaCohort) {
     core.observe(|engine| {
         let component = engine
-            .component(
-                cohort.effect(),
-                cohort
-                    .component()
-                    .expect("scoped DMA cohort has a component identity"),
-            )
+            .component(cohort.effect(), cohort.component())
             .expect("retired DMA component remains inspectable");
         assert_eq!(component.retained_claims, 0);
         for role in [ClaimRole::Queue, ClaimRole::PinnedPages, ClaimRole::Iova] {
@@ -992,9 +956,11 @@ fn dma_addresses(generation: u64) -> [(usize, usize); 3] {
     ]
 }
 
-fn principal(id: u64, incarnation: u64) -> PrincipalIncarnation {
-    PrincipalIncarnation::new(nz::<PrincipalId>(id), incarnation)
-        .expect("principal incarnation is valid")
+fn executor(id: u64, generation: u64) -> ExecutorCoordinate {
+    ExecutorCoordinate::new(
+        ExecutorId::new(id).expect("executor id must be non-zero"),
+        ExecutorGeneration::new(generation).expect("executor generation must be non-zero"),
+    )
 }
 
 fn digest(tag: u8) -> Digest {
@@ -1025,11 +991,9 @@ impl_nonzero_id!(
     ClaimId,
     DeviceGeneration,
     JournalGeneration,
-    PrincipalId,
     RegistryInstance,
     ResourceGeneration,
     ResourceId,
-    RootId,
     SnapshotId,
 );
 

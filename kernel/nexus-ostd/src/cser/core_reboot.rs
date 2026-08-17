@@ -31,8 +31,8 @@ use alloc::{boxed::Box, vec::Vec};
 use core::convert::Infallible;
 
 use cser_core::{
-    Command, CommandRequest, CoordinatedPersistence, CoordinatedPersistenceError, CoreError,
-    CoreLimits, DeviceGeneration, DomainCatalog, DurableJournalBackend, Engine, JournalRepair,
+    CatalogSet, Command, CommandRequest, CoordinatedPersistence, CoordinatedPersistenceError,
+    CoreError, CoreLimits, DeviceGeneration, DurableJournalBackend, Engine, JournalRepair,
     RecoveryBinding, TransitionReceipt, TrustedAnchorBackend, TxError,
 };
 
@@ -354,7 +354,7 @@ where
 /// intentionally single-use, a repaired retry reserves a newer logical
 /// recovery epoch even within the same physical boot.
 pub(crate) fn recover_quarantined_boot<J, A, Q>(
-    catalog: DomainCatalog,
+    catalogs: CatalogSet,
     limits: CoreLimits,
     binding: RecoveryBinding,
     mut journal: J,
@@ -391,7 +391,7 @@ where
         let next_freshness = lease.next_freshness();
         let mut persistence = CoordinatedPersistence::from_recovery_lease(journal, anchor, &lease);
         let report = Engine::recover(
-            catalog.clone(),
+            catalogs.clone(),
             limits,
             lease
                 .into_recovery_anchor()
@@ -438,11 +438,12 @@ mod tests {
     use super::*;
     use alloc::vec;
     use cser_core::{
-        AuthorityBindingGeneration, BootGeneration, ChargeAccountId, ClaimId, ClaimScope,
+        BootGeneration, ChargeAccountId, ClaimId, ClaimScope, ComponentProviderBinding,
         DEVICE_CLAIM_QUEUE_SLOT, DMA_ARENA_REUSE_COMPOSITE, DeviceScopeId, Digest, EffectId,
-        Freshness, JournalGeneration, PrincipalId, PrincipalIncarnation, RecoveryProfile,
-        RegistryInstance, ResourceGeneration, ResourceId, RootId, TrustedAnchorSnapshot, WorldId,
-        standard_catalog,
+        ExecutorCoordinate, ExecutorGeneration, ExecutorId, Freshness, JournalGeneration,
+        OperationId, ProviderCoordinate, ProviderGeneration, ProviderId, RecoveryProfile,
+        RegistryInstance, ResourceGeneration, ResourceId, TrustedAnchorSnapshot, VerifierBinding,
+        VerifierGeneration, WorldId, standard_catalog,
     };
     use ostd::prelude::ktest;
 
@@ -530,14 +531,7 @@ mod tests {
                     .ok_or(MockError::Stale)?,
             )
             .map_err(|_| MockError::Stale)?;
-            let next = Freshness::new(
-                boot,
-                binding.registry(),
-                binding.binding(),
-                observed_device,
-                journal,
-            )
-            .map_err(|_| MockError::Stale)?;
+            let next = Freshness::new(boot, binding.registry(), observed_device, journal);
             self.issued = next;
             self.reservations = self.reservations.checked_add(1).ok_or(MockError::Stale)?;
             cser_core::RecoveryLease::from_trusted_backend(self.committed, next)
@@ -608,20 +602,22 @@ mod tests {
         Freshness::new(
             BootGeneration::new(1).unwrap(),
             RegistryInstance::new(17).unwrap(),
-            23,
             DeviceGeneration::new(device).unwrap(),
             JournalGeneration::new(1).unwrap(),
         )
-        .unwrap()
+    }
+
+    fn catalog_set() -> CatalogSet {
+        let catalog = standard_catalog();
+        CatalogSet::new(core::slice::from_ref(&catalog)).unwrap()
     }
 
     fn binding() -> RecoveryBinding {
         RecoveryBinding::new(
             RecoveryProfile::current(),
             WorldId::new(1).unwrap(),
-            standard_catalog().digest(),
+            catalog_set().digest(),
             RegistryInstance::new(17).unwrap(),
-            AuthorityBindingGeneration::new(23).unwrap(),
         )
         .unwrap()
     }
@@ -630,7 +626,7 @@ mod tests {
         let freshness = initial_freshness(1);
         let projection = Engine::new(
             WorldId::new(1).unwrap(),
-            standard_catalog(),
+            catalog_set(),
             CoreLimits::bounded_default(),
             freshness,
         )
@@ -650,29 +646,70 @@ mod tests {
     }
 
     fn quarantined_device_fixture() -> (MemoryJournal, MemoryAnchor) {
+        let catalog = standard_catalog();
+        let catalogs = CatalogSet::new(core::slice::from_ref(&catalog)).unwrap();
+        let world = WorldId::new(1).unwrap();
+        let provider = ProviderCoordinate::new(
+            world,
+            ProviderId::new(1).unwrap(),
+            ProviderGeneration::new(1).unwrap(),
+        );
+        let verifier_generation = VerifierGeneration::new(1).unwrap();
+        let verifier_bindings = catalog
+            .verifier_class_bindings()
+            .into_iter()
+            .enumerate()
+            .map(|(index, class)| {
+                VerifierBinding::new(
+                    class.verifier(),
+                    verifier_generation,
+                    class.receipt_schema(),
+                    Digest::new([0x40u8.wrapping_add(index as u8); 32]),
+                )
+                .unwrap()
+            })
+            .collect();
         let mut engine = Engine::new(
-            WorldId::new(1).unwrap(),
-            standard_catalog(),
+            world,
+            catalogs,
             CoreLimits::bounded_default(),
             initial_freshness(1),
         );
         let mut bytes = Vec::new();
-        let root = RootId::new(9).unwrap();
-        let effect = EffectId::new(root, 1).unwrap();
-        let actor = PrincipalIncarnation::new(PrincipalId::new(5).unwrap(), 1).unwrap();
+        engine
+            .transact(
+                CommandRequest::RegisterProviderGeneration {
+                    coordinate: provider,
+                    catalog_digest: catalog.digest(),
+                    verifier_bindings,
+                },
+                |record| {
+                    bytes.extend_from_slice(record.bytes());
+                    Ok::<(), MockError>(())
+                },
+            )
+            .unwrap();
+        let operation = OperationId::new(9).unwrap();
+        let effect = EffectId::new(operation, 1).unwrap();
+        let actor = ExecutorCoordinate::new(
+            ExecutorId::new(5).unwrap(),
+            ExecutorGeneration::new(1).unwrap(),
+        );
         for command in [
-            CommandRequest::CreateCompositeEffect {
+            CommandRequest::AdmitScopedCompositeEffect {
                 effect,
                 origin: actor,
-                binding_generation: 23,
                 kind: DMA_ARENA_REUSE_COMPOSITE,
                 charge_account: ChargeAccountId::new(7).unwrap(),
+                bindings: vec![ComponentProviderBinding::new(
+                    cser_core::AGENT_COMPONENT_DMA,
+                    provider,
+                )],
             },
             CommandRequest::AddComponentClaim {
                 effect,
                 component: cser_core::AGENT_COMPONENT_DMA,
                 actor,
-                binding_generation: 23,
                 claim: ClaimId::new(1).unwrap(),
                 kind: DEVICE_CLAIM_QUEUE_SLOT,
                 scope: ClaimScope::Device(DeviceScopeId::new(11).unwrap()),
@@ -723,7 +760,7 @@ mod tests {
     #[ktest]
     fn clean_boot_checkpoints_before_returning_activation_owner() {
         let boot = recover_quarantined_boot(
-            standard_catalog(),
+            catalog_set(),
             CoreLimits::bounded_default(),
             binding(),
             MemoryJournal {
@@ -752,7 +789,7 @@ mod tests {
     fn retained_device_claim_prevents_activation_after_reboot() {
         let (journal, anchor) = quarantined_device_fixture();
         let boot = recover_quarantined_boot(
-            standard_catalog(),
+            catalog_set(),
             CoreLimits::bounded_default(),
             binding(),
             journal,
@@ -780,7 +817,7 @@ mod tests {
     #[ktest]
     fn ignored_suffix_is_repaired_before_a_newer_recovery_epoch() {
         let boot = recover_quarantined_boot(
-            standard_catalog(),
+            catalog_set(),
             CoreLimits::bounded_default(),
             binding(),
             MemoryJournal {
@@ -807,7 +844,7 @@ mod tests {
     #[ktest]
     fn provider_release_failure_returns_the_quarantine_guard() {
         let boot = recover_quarantined_boot(
-            standard_catalog(),
+            catalog_set(),
             CoreLimits::bounded_default(),
             binding(),
             MemoryJournal {

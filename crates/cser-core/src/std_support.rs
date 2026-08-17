@@ -432,17 +432,14 @@ mod tests {
         let freshness = crate::Freshness::new(
             BootGeneration::new(1).unwrap(),
             RegistryInstance::new(1).unwrap(),
-            1,
             DeviceGeneration::new(1).unwrap(),
             JournalGeneration::new(1).unwrap(),
-        )
-        .unwrap();
+        );
         let binding = crate::RecoveryBinding::new(
             crate::RecoveryProfile::current(),
             crate::WorldId::new(1).unwrap(),
             digest(9),
             RegistryInstance::new(1).unwrap(),
-            crate::AuthorityBindingGeneration::new(1).unwrap(),
         )
         .unwrap();
         JournalRecord::build(

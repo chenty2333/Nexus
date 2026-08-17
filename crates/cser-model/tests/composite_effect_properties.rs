@@ -1,9 +1,16 @@
-use cser_model::EffectId;
 use cser_model::composite_effect_oracle::{
     ClaimKind, ClaimState, ComponentId, CompositeAuthority, CompositeEffectOracle, CompositeError,
     CompositeResources, EscapeState, ReplyState, ResourceId, ReusePermit,
 };
+use cser_model::{EffectId, ExecutorCoordinate, ExecutorGeneration, ExecutorId, OperationId};
 use proptest::prelude::*;
+
+fn executor(id: u64, generation: u64) -> ExecutorCoordinate {
+    ExecutorCoordinate::new(
+        ExecutorId::new(id).unwrap(),
+        ExecutorGeneration::new(generation).unwrap(),
+    )
+}
 
 fn resources(seed: u64) -> CompositeResources {
     CompositeResources {
@@ -15,13 +22,18 @@ fn resources(seed: u64) -> CompositeResources {
 }
 
 fn recovered(effect: EffectId, resource_generation: u64) -> CompositeEffectOracle {
-    let mut model =
-        CompositeEffectOracle::new(effect, 1, 1, resource_generation, 1, resources(100));
+    let mut model = CompositeEffectOracle::new(
+        effect,
+        executor(1, 1),
+        resource_generation,
+        1,
+        resources(100),
+    );
     let authority = model.observe_authority().unwrap();
     model.commit_dma(authority).unwrap();
     model.commit_reply(authority).unwrap();
-    model.fence_incarnation(1, 1).unwrap();
-    model.rebind(2, 2).unwrap();
+    model.fence_executor(executor(1, 1)).unwrap();
+    model.rebind(executor(1, 2)).unwrap();
     model
 }
 
@@ -68,10 +80,51 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(96))]
 
     #[test]
+    fn rebind_requires_the_origin_executor_and_a_strictly_newer_generation(
+        origin_id in 1_u64..10_000,
+        initial_generation in 1_u64..10_000,
+        generation_delta in 1_u64..10_000,
+    ) {
+        let successor_generation = initial_generation + generation_delta;
+        let origin = executor(origin_id, initial_generation);
+        let wrong_id = if origin_id == 1 { 2 } else { 1 };
+        let mut model = CompositeEffectOracle::new(
+            EffectId::new(OperationId::new(0xce03).unwrap(), 1).unwrap(),
+            origin,
+            1,
+            1,
+            resources(300),
+        );
+        model.fence_executor(origin).unwrap();
+
+        let before = model.projection();
+        prop_assert_eq!(
+            model.rebind(executor(wrong_id, successor_generation)),
+            Err(CompositeError::StaleAuthority)
+        );
+        prop_assert_eq!(model.projection(), before);
+        prop_assert_eq!(
+            model.rebind(executor(origin_id, initial_generation)),
+            Err(CompositeError::StaleAuthority)
+        );
+        prop_assert_eq!(model.projection(), before);
+
+        prop_assert_eq!(
+            model.rebind(executor(origin_id, successor_generation)),
+            Ok(())
+        );
+        prop_assert_eq!(
+            model.projection().live_executor,
+            Some(executor(origin_id, successor_generation))
+        );
+        prop_assert!(model.check_invariants());
+    }
+
+    #[test]
     fn arbitrary_retirement_and_reuse_orders_are_failure_atomic_and_resource_local(
         actions in prop::collection::vec(0_u8..=7, 1..40),
     ) {
-        let mut model = recovered(EffectId::new(0xce01), 1);
+        let mut model = recovered(EffectId::new(OperationId::new(0xce01).unwrap(), 1).unwrap(), 1);
         model.advance_device_generation(2).unwrap();
         let evidence = model.dma_retirement_evidence();
 
@@ -138,11 +191,11 @@ proptest! {
         field in 0_u8..4,
         wrong in 3_u64..10_000,
     ) {
-        let mut model = recovered(EffectId::new(0xce01), 1);
+        let mut model = recovered(EffectId::new(OperationId::new(0xce01).unwrap(), 1).unwrap(), 1);
         model.advance_device_generation(2).unwrap();
         let exact = model.dma_retirement_evidence();
         let stale = match field {
-            0 => exact.with_effect(EffectId::new(wrong)),
+            0 => exact.with_operation(OperationId::new(wrong).unwrap()),
             1 => exact.with_resource_generation(wrong),
             2 => exact.with_subject_device_generation(wrong),
             3 => exact.with_observation_device_generation(wrong),
@@ -162,7 +215,7 @@ proptest! {
     fn exact_successor_generation_is_the_only_reuse_generation(
         resource_generation in 1_u64..(u64::MAX - 1),
     ) {
-        let mut model = recovered(EffectId::new(0xce01), resource_generation);
+        let mut model = recovered(EffectId::new(OperationId::new(0xce01).unwrap(), 1).unwrap(), resource_generation);
         model.advance_device_generation(2).unwrap();
         let evidence = model.dma_retirement_evidence();
         model.accept_reset(evidence).unwrap();
@@ -185,7 +238,7 @@ proptest! {
             prop_assert_eq!(model.projection(), before);
             prop_assert!(model.reuse_is_admissible(kind, successor));
             let permit = issue_reuse(&mut model, kind, successor).unwrap();
-            prop_assert_eq!(permit.effect(), EffectId::new(0xce01));
+            prop_assert_eq!(permit.operation(), OperationId::new(0xce01).unwrap());
             prop_assert_eq!(permit.kind(), kind);
             prop_assert_eq!(permit.retired_generation(), resource_generation);
             prop_assert_eq!(permit.next_generation(), successor);
@@ -201,16 +254,16 @@ proptest! {
         field in 0_u8..4,
         wrong in 10_u64..10_000,
     ) {
-        let mut model = recovered(EffectId::new(0xce01), 1);
+        let mut model = recovered(EffectId::new(OperationId::new(0xce01).unwrap(), 1).unwrap(), 1);
         model.advance_device_generation(2).unwrap();
         let evidence = model.dma_retirement_evidence();
         model.accept_reset(evidence).unwrap();
         model.accept_irq_drain(evidence).unwrap();
         let permit = issue_reuse(&mut model, ClaimKind::QueueSlot, 2).unwrap();
         let forged = match field {
-            0 => permit.with_actor(wrong),
-            1 => permit.with_binding_generation(wrong),
-            2 => permit.with_authority_epoch(wrong),
+            0 => permit.with_actor(executor(wrong, wrong)),
+            1 => permit.with_authority_epoch(wrong),
+            2 => permit.with_next_generation(wrong),
             3 => permit.with_nonce(wrong),
             _ => unreachable!(),
         };
@@ -233,7 +286,7 @@ proptest! {
         reply_settled in any::<bool>(),
         dma_boundary in 0_u8..5,
     ) {
-        let mut model = recovered(EffectId::new(0xce01), 1);
+        let mut model = recovered(EffectId::new(OperationId::new(0xce01).unwrap(), 1).unwrap(), 1);
         let physical_before = [
             model.claim(ClaimKind::QueueSlot),
             model.claim(ClaimKind::PinnedPage),
@@ -288,14 +341,13 @@ proptest! {
         reply_first in any::<bool>(),
         settle_unrelated_reply in any::<bool>(),
     ) {
-        let mut quarantined = recovered(EffectId::new(0xce01), 1);
-        quarantined.fence_incarnation(2, 2).unwrap();
+        let mut quarantined = recovered(EffectId::new(OperationId::new(0xce01).unwrap(), 1).unwrap(), 1);
+        quarantined.fence_executor(executor(1, 2)).unwrap();
         let quarantined_projection = quarantined.projection();
 
         let mut unrelated = CompositeEffectOracle::new(
-            EffectId::new(0xce02),
-            11,
-            13,
+            EffectId::new(OperationId::new(0xce02).unwrap(), 1).unwrap(),
+            executor(11, 13),
             1,
             1,
             resources(1_000),
@@ -317,7 +369,7 @@ proptest! {
             quarantined.projection().authority,
             CompositeAuthority::Fenced
         );
-        prop_assert_eq!(unrelated.projection().effect, EffectId::new(0xce02));
+        prop_assert_eq!(unrelated.projection().effect, EffectId::new(OperationId::new(0xce02).unwrap(), 1).unwrap());
         prop_assert!(unrelated.component(ComponentId::Reply).committed);
         prop_assert!(unrelated.component(ComponentId::Dma).committed);
         prop_assert_eq!(

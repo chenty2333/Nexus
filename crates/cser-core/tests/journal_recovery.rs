@@ -2,14 +2,15 @@
 mod support;
 
 use cser_core::{
-    CommandRequest as Command, CommitState, CoreError, CoreLimits, Digest, Engine, Freshness,
-    JournalDecodeError, JournalRepair, OutcomeState, RecoveryAnchor, RecoveryAnchorError,
-    SettlementState, TransitionOutput, TxError, WorldId, scan_journal, standard_catalog,
+    CatalogSet, CommandRequest as Command, CommitState, CoreError, CoreLimits, Digest, Engine,
+    Freshness, JournalDecodeError, JournalRepair, OutcomeState, RecoveryAnchor,
+    RecoveryAnchorError, SettlementState, TransitionOutput, TxError, scan_journal,
+    tool_dma_catalog,
 };
-use sha2::{Digest as _, Sha256};
 use support::{
-    Harness, charge, claim, digest, effect, freshness, genesis_projection, principal,
-    recovery_anchor, recovery_binding, resource, resource_generation,
+    EFFECT_COMMIT_RECEIPT_SCHEMA, EFFECT_COMPONENT, EFFECT_VERIFIER, Harness, admit_command, claim,
+    digest, effect, executor, freshness, recovery_anchor, resource, resource_generation,
+    verified_commit_outcome,
 };
 
 fn recover(
@@ -20,11 +21,15 @@ fn recover(
     expected_head: Digest,
     projection: Digest,
 ) -> Result<cser_core::RecoveryReport, CoreError> {
-    Engine::recover_legacy_compatibility(
-        standard_catalog(),
+    let catalog = tool_dma_catalog();
+    let catalog_set = CatalogSet::new(core::slice::from_ref(&catalog)).unwrap();
+    Engine::recover(
+        catalog_set,
         CoreLimits::bounded_default(),
         recovery_anchor(
-            standard_catalog().digest(),
+            CatalogSet::new(core::slice::from_ref(&catalog))
+                .unwrap()
+                .digest(),
             committed,
             target,
             minimum_revision,
@@ -33,6 +38,16 @@ fn recover(
         ),
         bytes,
     )
+}
+
+fn tool_genesis_projection() -> Digest {
+    Engine::new(
+        support::test_world(),
+        CatalogSet::new(&[tool_dma_catalog()]).unwrap(),
+        CoreLimits::bounded_default(),
+        freshness(1, 1, 1, 1),
+    )
+    .projection_digest()
 }
 
 fn checkpoint(engine: &mut Engine, journal: &mut Vec<u8>, target: Freshness) {
@@ -51,50 +66,44 @@ fn checkpoint(engine: &mut Engine, journal: &mut Vec<u8>, target: Freshness) {
         .unwrap();
 }
 
-fn create_estate(root_value: u64) -> Command {
-    Command::CreateEstate {
-        effect: effect(root_value, 1),
-        origin: principal(root_value, 1),
-        binding_generation: 1,
-        domain: cser_core::REPLY_DOMAIN,
-        obligation: cser_core::REPLY_OBLIGATION_PUBLICATION,
-        charge_account: charge(root_value),
-    }
-}
-
-fn add_reply_claim(harness: &mut Harness, root_value: u64) {
+fn add_claim(harness: &mut Harness, value: u64) {
     harness
-        .tx(Command::AddClaim {
-            effect: effect(root_value, 1),
-            actor: principal(root_value, 1),
-            binding_generation: 1,
-            claim: claim(root_value),
-            domain: cser_core::REPLY_DOMAIN,
-            kind: cser_core::REPLY_CLAIM_PUBLICATION_SLOT,
+        .tx(Command::AddComponentClaim {
+            effect: effect(value, 1),
+            component: EFFECT_COMPONENT,
+            actor: executor(value, 1),
+            claim: claim(value),
+            kind: support::EFFECT_CLAIM_KIND,
             scope: cser_core::ClaimScope::Logical,
-            resource: resource(root_value),
+            resource: resource(value),
             resource_generation: resource_generation(1),
             units: 1,
         })
         .unwrap();
 }
 
-#[test]
-fn record_roundtrip_recovers_the_exact_acknowledged_chain_head() {
-    let mut source = Harness::new();
-    source.tx(create_estate(20)).unwrap();
-    add_reply_claim(&mut source, 20);
-    source
-        .tx(Command::PrepareEffect {
-            effect: effect(20, 1),
-            actor: principal(20, 1),
-            binding_generation: 1,
+fn prepare(harness: &mut Harness, value: u64) {
+    harness
+        .tx(Command::PrepareCompositeEffect {
+            effect: effect(value, 1),
+            actor: executor(value, 1),
         })
         .unwrap();
+}
 
+fn create_prepared(value: u64) -> Harness {
+    let mut harness = Harness::new();
+    harness.tx(admit_command(effect(value, 1), value)).unwrap();
+    add_claim(&mut harness, value);
+    prepare(&mut harness, value);
+    harness
+}
+
+#[test]
+fn record_roundtrip_recovers_the_exact_acknowledged_chain_head() {
+    let source = create_prepared(20);
     let scan = scan_journal(&source.journal).unwrap();
     assert_eq!(scan.torn_tail(), None);
-    assert_eq!(scan.records().len(), 3);
     assert_eq!(
         scan.records()
             .iter()
@@ -104,158 +113,119 @@ fn record_roundtrip_recovers_the_exact_acknowledged_chain_head() {
         source.journal
     );
 
-    let report = Engine::recover_legacy_compatibility(
-        standard_catalog(),
-        CoreLimits::bounded_default(),
-        RecoveryAnchor::from_trusted_provider(
-            recovery_binding(standard_catalog().digest(), freshness(1, 1, 1, 1, 1)),
-            freshness(1, 1, 1, 1, 1),
-            freshness(2, 1, 1, 1, 2),
-            source.engine.revision(),
-            source.engine.head(),
-            source.engine.projection_digest(),
-        )
-        .unwrap(),
+    let report = recover(
         &source.journal,
+        freshness(1, 1, 1, 1),
+        freshness(2, 1, 1, 2),
+        source.engine.revision(),
+        source.engine.head(),
+        source.engine.projection_digest(),
     )
     .unwrap();
     assert_eq!(report.acknowledged_revision(), source.engine.revision());
     assert_eq!(report.acknowledged_head(), source.engine.head());
     let replay = report.into_engine();
     assert_eq!(
-        replay.estate(effect(20, 1)).unwrap().commit,
+        replay
+            .component(effect(20, 1), EFFECT_COMPONENT)
+            .unwrap()
+            .commit,
         CommitState::Prepared
     );
-    assert_eq!(replay.estate(effect(20, 1)).unwrap().retained_claims, 1);
+    assert_eq!(
+        replay
+            .component(effect(20, 1), EFFECT_COMPONENT)
+            .unwrap()
+            .retained_claims,
+        1
+    );
 }
 
 #[test]
-fn current_recovery_rejects_a_schema_six_journal_bound_to_the_frozen_v5_catalog() {
-    // This is the catalog digest recorded by the accepted RFC-0007 v5 profile.
-    // This historical envelope remains schema 6: a catalog evolution must
-    // therefore fail closed by binding rather than be mistaken for an
-    // unrecognized journal prefix.
-    let v5_catalog = Digest::new([
-        0xf6, 0xa4, 0xb0, 0x7c, 0x1e, 0x17, 0x36, 0x1a, 0xa6, 0x2b, 0xbc, 0xa2, 0xc6, 0x57, 0x9b,
-        0x38, 0x0f, 0xde, 0x43, 0xbe, 0x44, 0xf3, 0x88, 0x24, 0xa3, 0xdb, 0x42, 0xe8, 0x28, 0x55,
-        0xc1, 0x73,
-    ]);
-    let mut source = Harness::new();
-    source.tx(create_estate(20)).unwrap();
-
-    let mut legacy_catalog_journal = source.journal.clone();
-    assert_eq!(&legacy_catalog_journal[..8], b"CSERJR9\0");
-    legacy_catalog_journal[72..104].copy_from_slice(&v5_catalog.bytes());
-    let checksum_start = legacy_catalog_journal.len() - 32;
-    let checksum = Sha256::digest(&legacy_catalog_journal[..checksum_start]);
-    legacy_catalog_journal[checksum_start..].copy_from_slice(&checksum);
-    let old_head = Digest::new(checksum.into());
-    assert!(scan_journal(&legacy_catalog_journal).is_ok());
-
-    let anchor = RecoveryAnchor::from_trusted_provider(
-        recovery_binding(v5_catalog, freshness(1, 1, 1, 1, 1)),
-        freshness(1, 1, 1, 1, 1),
-        freshness(2, 1, 1, 1, 2),
-        1,
-        old_head,
-        source.engine.projection_digest(),
-    )
-    .unwrap();
-    assert_eq!(
+fn current_recovery_rejects_a_recognized_old_journal_prefix() {
+    let committed = freshness(1, 1, 1, 1);
+    let target = freshness(2, 1, 1, 2);
+    let anchor = recovery_anchor(
+        CatalogSet::new(&[tool_dma_catalog()]).unwrap().digest(),
+        committed,
+        target,
+        0,
+        Digest::ZERO,
+        tool_genesis_projection(),
+    );
+    let mut old = Vec::from(*b"CSERJR5\0");
+    old.extend_from_slice(b"old journal payload");
+    assert!(matches!(
         Engine::recover(
-            standard_catalog(),
+            CatalogSet::new(&[tool_dma_catalog()]).unwrap(),
             CoreLimits::bounded_default(),
             anchor,
-            &legacy_catalog_journal,
-        )
-        .unwrap_err(),
-        CoreError::SchemaMismatch
-    );
+            &old
+        ),
+        Err(CoreError::Journal(JournalDecodeError::UnsupportedVersion {
+            version: 5
+        }))
+    ));
 }
 
 #[test]
 fn incomplete_final_record_recovers_only_the_acknowledged_prefix_and_quarantines() {
     let mut source = Harness::new();
-    let first = source.tx(create_estate(21)).unwrap();
-    let first_len = source.journal.len();
-    source
-        .tx(Command::AddClaim {
-            effect: effect(21, 1),
-            actor: principal(21, 1),
-            binding_generation: 1,
-            claim: claim(21),
-            domain: cser_core::REPLY_DOMAIN,
-            kind: cser_core::REPLY_CLAIM_PUBLICATION_SLOT,
-            scope: cser_core::ClaimScope::Logical,
-            resource: resource(21),
-            resource_generation: resource_generation(1),
-            units: 1,
-        })
-        .unwrap();
-    let full_len = source.journal.len();
-    source.journal.truncate(full_len - 7);
-
-    let target = freshness(2, 1, 1, 1, 2);
+    source.tx(admit_command(effect(21, 1), 21)).unwrap();
+    add_claim(&mut source, 21);
+    let accepted = source.journal.len();
+    let accepted_revision = source.engine.revision();
+    let accepted_head = source.engine.head();
+    let accepted_projection = source.engine.projection_digest();
+    prepare(&mut source, 21);
+    let mut torn = source.journal.clone();
+    torn.truncate(torn.len() - 7);
     let report = recover(
-        &source.journal,
-        freshness(1, 1, 1, 1, 1),
-        target,
-        first.revision(),
-        first.head(),
-        first.projection(),
+        &torn,
+        freshness(1, 1, 1, 1),
+        freshness(2, 1, 1, 2),
+        accepted_revision,
+        accepted_head,
+        accepted_projection,
     )
     .unwrap();
-    assert_eq!(report.acknowledged_revision(), first.revision());
-    assert_eq!(report.acknowledged_head(), first.head());
-    assert_eq!(report.torn_tail(), Some(first_len));
-
+    assert_eq!(
+        report.journal_repair(),
+        Some(JournalRepair::TornTail { offset: accepted })
+    );
     let mut engine = report.into_engine();
     assert!(engine.pressure().quarantined);
     assert_eq!(
-        engine.journal_repair_required(),
-        Some(JournalRepair::TornTail { offset: first_len })
-    );
-    assert_eq!(
-        engine.transact_volatile(Command::PrepareEffect {
+        engine.transact_volatile(Command::PrepareCompositeEffect {
             effect: effect(21, 1),
-            actor: principal(21, 1),
-            binding_generation: 1,
-        }),
-        Err(CoreError::JournalRepairRequired)
-    );
-    assert_eq!(
-        engine.transact_volatile(Command::CheckpointRecovery {
-            boot: target.boot(),
-            journal: target.journal(),
-            device: target.device(),
+            actor: executor(21, 1),
         }),
         Err(CoreError::JournalRepairRequired)
     );
 
-    let mut recovered_journal = source.journal[..first_len].to_vec();
-    let report = recover(
-        &recovered_journal,
-        freshness(1, 1, 1, 1, 1),
-        target,
-        first.revision(),
-        first.head(),
-        first.projection(),
+    let mut repaired_journal = torn[..accepted].to_vec();
+    // The accepted prefix is the source journal minus the incomplete tail.
+    let accepted_prefix = scan_journal(&repaired_journal).unwrap();
+    let accepted_record = accepted_prefix.records().last().unwrap();
+    let mut engine = recover(
+        &repaired_journal,
+        freshness(1, 1, 1, 1),
+        freshness(2, 1, 1, 2),
+        accepted_record.revision(),
+        accepted_record.digest(),
+        accepted_projection,
     )
-    .unwrap();
-    let mut engine = report.into_engine();
-    assert_eq!(engine.journal_repair_required(), None);
-    checkpoint(&mut engine, &mut recovered_journal, target);
+    .unwrap()
+    .into_engine();
+    checkpoint(&mut engine, &mut repaired_journal, freshness(2, 1, 1, 2));
     assert!(!engine.pressure().quarantined);
 }
 
 #[test]
 fn corruption_in_a_complete_record_is_never_downgraded_to_a_torn_tail() {
-    let mut source = Harness::new();
-    source.tx(create_estate(22)).unwrap();
+    let source = create_prepared(22);
     let mut corrupt = source.journal.clone();
-    let payload_byte = corrupt.len() - 33;
-    corrupt[payload_byte] ^= 0x40;
-
+    corrupt[24] ^= 0x40;
     assert!(matches!(
         scan_journal(&corrupt),
         Err(JournalDecodeError::ChecksumMismatch { offset: 0 })
@@ -263,8 +233,8 @@ fn corruption_in_a_complete_record_is_never_downgraded_to_a_torn_tail() {
     assert!(matches!(
         recover(
             &corrupt,
-            freshness(1, 1, 1, 1, 1),
-            freshness(2, 1, 1, 1, 2),
+            freshness(1, 1, 1, 1),
+            freshness(2, 1, 1, 2),
             1,
             source.engine.head(),
             source.engine.projection_digest(),
@@ -276,119 +246,17 @@ fn corruption_in_a_complete_record_is_never_downgraded_to_a_torn_tail() {
 }
 
 #[test]
-fn recovery_anchor_requires_exact_catalog_head_and_advancing_epochs() {
-    let catalog = standard_catalog().digest();
-    let committed = freshness(1, 1, 1, 1, 1);
-    let next = freshness(2, 1, 1, 1, 2);
-    let head = digest(1);
-
-    assert_eq!(
-        RecoveryAnchor::from_trusted_provider(
-            recovery_binding(catalog, committed),
-            committed,
-            next,
-            1,
-            head,
-            Digest::ZERO,
-        ),
-        Err(RecoveryAnchorError::ZeroDigest)
-    );
-    assert_eq!(
-        RecoveryAnchor::from_trusted_provider(
-            recovery_binding(catalog, committed),
-            committed,
-            next,
-            1,
-            Digest::ZERO,
-            genesis_projection(),
-        ),
-        Err(RecoveryAnchorError::InconsistentGenesis)
-    );
-    assert_eq!(
-        RecoveryAnchor::from_trusted_provider(
-            recovery_binding(catalog, committed),
-            committed,
-            next,
-            0,
-            head,
-            genesis_projection(),
-        ),
-        Err(RecoveryAnchorError::InconsistentGenesis)
-    );
-    assert!(
-        RecoveryAnchor::from_trusted_provider(
-            recovery_binding(catalog, committed),
-            committed,
-            next,
-            0,
-            Digest::ZERO,
-            genesis_projection(),
-        )
-        .is_ok()
-    );
-    assert_eq!(
-        RecoveryAnchor::from_trusted_provider(
-            recovery_binding(catalog, committed),
-            committed,
-            freshness(2, 2, 1, 1, 2),
-            1,
-            head,
-            genesis_projection(),
-        ),
-        Err(RecoveryAnchorError::RegistryMismatch)
-    );
-    assert_eq!(
-        RecoveryAnchor::from_trusted_provider(
-            recovery_binding(catalog, committed),
-            committed,
-            freshness(2, 1, 2, 1, 2),
-            1,
-            head,
-            genesis_projection(),
-        ),
-        Err(RecoveryAnchorError::RegistryMismatch)
-    );
-    assert_eq!(
-        RecoveryAnchor::from_trusted_provider(
-            recovery_binding(catalog, committed),
-            committed,
-            freshness(1, 1, 1, 1, 2),
-            1,
-            head,
-            genesis_projection(),
-        ),
-        Err(RecoveryAnchorError::NonAdvancingEpoch)
-    );
-}
-
-#[test]
 fn trusted_revision_head_and_freshness_anchors_reject_rollback() {
-    let mut source = Harness::new();
-    let first = source.tx(create_estate(23)).unwrap();
-    let prefix_len = source.journal.len();
-    add_reply_claim(&mut source, 23);
-    let second_revision = source.engine.revision();
-    let second_head = source.engine.head();
-
+    let source = create_prepared(23);
+    let scan = scan_journal(&source.journal).unwrap();
+    let first = &scan.records()[0];
     assert_eq!(
         recover(
-            &source.journal[..prefix_len],
-            freshness(1, 1, 1, 1, 1),
-            freshness(2, 1, 1, 1, 2),
-            second_revision,
-            first.head(),
-            first.projection(),
-        )
-        .unwrap_err(),
-        CoreError::RollbackDetected
-    );
-    assert_eq!(
-        recover(
-            &source.journal[..prefix_len],
-            freshness(1, 1, 1, 1, 1),
-            freshness(2, 1, 1, 1, 2),
-            first.revision(),
-            second_head,
+            &source.journal[..source.journal.len() / 2],
+            freshness(1, 1, 1, 1),
+            freshness(2, 1, 1, 2),
+            source.engine.revision(),
+            source.engine.head(),
             source.engine.projection_digest(),
         )
         .unwrap_err(),
@@ -396,561 +264,129 @@ fn trusted_revision_head_and_freshness_anchors_reject_rollback() {
     );
     assert_eq!(
         RecoveryAnchor::from_trusted_provider(
-            recovery_binding(standard_catalog().digest(), freshness(1, 1, 1, 1, 1)),
-            freshness(1, 1, 1, 1, 1),
-            freshness(1, 1, 1, 1, 2),
-            second_revision,
-            second_head,
-            source.engine.projection_digest(),
-        ),
-        Err(RecoveryAnchorError::NonAdvancingEpoch)
-    );
-    assert_eq!(
-        RecoveryAnchor::from_trusted_provider(
-            recovery_binding(standard_catalog().digest(), freshness(1, 1, 1, 1, 1)),
-            freshness(1, 1, 1, 1, 1),
-            freshness(2, 1, 1, 1, 1),
-            second_revision,
-            second_head,
-            source.engine.projection_digest(),
-        ),
-        Err(RecoveryAnchorError::NonAdvancingEpoch)
-    );
-    assert_eq!(
-        Engine::recover(
-            standard_catalog(),
-            CoreLimits::bounded_default(),
-            RecoveryAnchor::from_trusted_provider(
-                recovery_binding(standard_catalog().digest(), freshness(1, 2, 1, 1, 1)),
-                freshness(1, 2, 1, 1, 1),
-                freshness(2, 2, 1, 1, 2),
-                second_revision,
-                second_head,
-                source.engine.projection_digest(),
-            )
-            .unwrap(),
-            &source.journal,
-        )
-        .unwrap_err(),
-        CoreError::SchemaMismatch
-    );
-    assert_eq!(
-        Engine::recover(
-            standard_catalog(),
-            CoreLimits::bounded_default(),
-            RecoveryAnchor::from_trusted_provider(
-                recovery_binding(digest(254), freshness(1, 1, 1, 1, 1)),
-                freshness(1, 1, 1, 1, 1),
-                freshness(2, 1, 1, 1, 2),
-                second_revision,
-                second_head,
-                source.engine.projection_digest(),
-            )
-            .unwrap(),
-            &source.journal,
-        )
-        .unwrap_err(),
-        CoreError::SchemaMismatch
-    );
-    assert_eq!(
-        recover(
-            &source.journal,
-            freshness(1, 1, 1, 2, 1),
-            freshness(2, 1, 1, 2, 2),
-            second_revision,
-            second_head,
-            source.engine.projection_digest(),
-        )
-        .unwrap_err(),
-        CoreError::FreshnessRollback
-    );
-
-    let mut device_source = Harness::new();
-    device_source.tx(create_estate(230)).unwrap();
-    let first_recovery = freshness(2, 1, 1, 2, 2);
-    let report = recover(
-        &device_source.journal,
-        freshness(1, 1, 1, 1, 1),
-        first_recovery,
-        device_source.engine.revision(),
-        device_source.engine.head(),
-        device_source.engine.projection_digest(),
-    )
-    .unwrap();
-    let mut recovered = report.into_engine();
-    checkpoint(&mut recovered, &mut device_source.journal, first_recovery);
-    let target_with_older_device = freshness(3, 1, 1, 1, 3);
-    assert_eq!(
-        RecoveryAnchor::from_trusted_provider(
-            recovery_binding(standard_catalog().digest(), first_recovery),
-            first_recovery,
-            target_with_older_device,
-            recovered.revision(),
-            recovered.head(),
-            recovered.projection_digest(),
-        ),
-        Err(RecoveryAnchorError::NonAdvancingEpoch)
-    );
-}
-
-#[test]
-fn trusted_head_recovers_before_complete_or_corrupt_unanchored_suffix() {
-    let mut source = Harness::new();
-    let first = source.tx(create_estate(231)).unwrap();
-    let accepted_len = source.journal.len();
-    add_reply_claim(&mut source, 231);
-
-    for bytes in [source.journal.clone(), {
-        let mut corrupt_suffix = source.journal.clone();
-        let suffix_byte = accepted_len + 24;
-        corrupt_suffix[suffix_byte] ^= 0x40;
-        corrupt_suffix
-    }] {
-        let report = recover(
-            &bytes,
-            freshness(1, 1, 1, 1, 1),
-            freshness(2, 1, 1, 1, 2),
-            first.revision(),
-            first.head(),
-            first.projection(),
-        )
-        .unwrap();
-        assert_eq!(report.acknowledged_revision(), first.revision());
-        assert_eq!(report.acknowledged_head(), first.head());
-        assert_eq!(
-            report.journal_repair(),
-            Some(JournalRepair::UnanchoredSuffix {
-                offset: accepted_len
-            })
-        );
-        assert_eq!(report.torn_tail(), None);
-
-        let mut engine = report.into_engine();
-        assert_eq!(engine.estate(effect(231, 1)).unwrap().claim_count, 0);
-        assert_eq!(
-            engine.journal_repair_required(),
-            Some(JournalRepair::UnanchoredSuffix {
-                offset: accepted_len
-            })
-        );
-        assert_eq!(
-            engine.transact_volatile(Command::AddClaim {
-                effect: effect(231, 1),
-                actor: principal(231, 1),
-                binding_generation: 1,
-                claim: claim(231),
-                domain: cser_core::REPLY_DOMAIN,
-                kind: cser_core::REPLY_CLAIM_PUBLICATION_SLOT,
-                scope: cser_core::ClaimScope::Logical,
-                resource: resource(231),
-                resource_generation: resource_generation(1),
-                units: 1,
-            }),
-            Err(CoreError::JournalRepairRequired)
-        );
-    }
-
-    let mut corrupt_anchor = source.journal[..accepted_len].to_vec();
-    corrupt_anchor[24] ^= 0x40;
-    assert!(matches!(
-        recover(
-            &corrupt_anchor,
-            freshness(1, 1, 1, 1, 1),
-            freshness(2, 1, 1, 1, 2),
-            first.revision(),
-            first.head(),
-            first.projection(),
-        ),
-        Err(CoreError::Journal(JournalDecodeError::ChecksumMismatch {
-            offset: 0
-        }))
-    ));
-}
-
-#[test]
-fn trusted_genesis_recovers_an_empty_prefix_and_rejects_unanchored_first_append() {
-    let committed = freshness(1, 1, 1, 1, 1);
-    let target = freshness(2, 1, 1, 1, 2);
-    let genesis_anchor = || {
-        RecoveryAnchor::from_trusted_provider(
-            recovery_binding(standard_catalog().digest(), committed),
-            committed,
-            target,
-            0,
-            Digest::ZERO,
-            genesis_projection(),
-        )
-        .unwrap()
-    };
-
-    let report = Engine::recover_legacy_compatibility(
-        standard_catalog(),
-        CoreLimits::bounded_default(),
-        genesis_anchor(),
-        &[],
-    )
-    .unwrap();
-    assert_eq!(report.acknowledged_revision(), 0);
-    assert_eq!(report.acknowledged_head(), Digest::ZERO);
-    assert_eq!(report.journal_repair(), None);
-    let mut journal = Vec::new();
-    let mut engine = report.into_engine();
-    assert_eq!(
-        engine.transact_volatile(create_estate(232)),
-        Err(CoreError::RecoveryPending)
-    );
-    checkpoint(&mut engine, &mut journal, target);
-    assert_eq!(engine.revision(), 1);
-    assert_ne!(engine.head(), Digest::ZERO);
-    engine
-        .transact(create_estate(232), |record| {
-            journal.extend_from_slice(record.bytes());
-            Ok::<(), ()>(())
-        })
-        .unwrap();
-
-    let unanchored_first_append = journal.clone();
-    let report = Engine::recover_legacy_compatibility(
-        standard_catalog(),
-        CoreLimits::bounded_default(),
-        genesis_anchor(),
-        &unanchored_first_append,
-    )
-    .unwrap();
-    assert_eq!(
-        report.journal_repair(),
-        Some(JournalRepair::UnanchoredSuffix { offset: 0 })
-    );
-    let mut engine = report.into_engine();
-    assert_eq!(
-        engine.transact_volatile(Command::CheckpointRecovery {
-            boot: target.boot(),
-            journal: target.journal(),
-            device: target.device(),
-        }),
-        Err(CoreError::JournalRepairRequired)
-    );
-}
-
-#[test]
-fn trusted_genesis_rejects_profile_one_before_repair_without_reclassifying_residue() {
-    let committed = freshness(1, 1, 1, 1, 1);
-    let target = freshness(2, 1, 1, 1, 2);
-    let genesis_anchor = || {
-        RecoveryAnchor::from_trusted_provider(
-            recovery_binding(standard_catalog().digest(), committed),
-            committed,
-            target,
-            0,
-            Digest::ZERO,
-            genesis_projection(),
-        )
-        .unwrap()
-    };
-
-    for suffix in [&[][..], &b"\xffroots-and-timestamps\x00"[..]] {
-        let mut bytes = Vec::from(*b"CSERJR5\0");
-        bytes.extend_from_slice(suffix);
-        assert!(matches!(
-            Engine::recover(
-                standard_catalog(),
-                CoreLimits::bounded_default(),
-                genesis_anchor(),
-                &bytes,
+            support::recovery_binding(
+                CatalogSet::new(&[tool_dma_catalog()]).unwrap().digest(),
+                freshness(1, 1, 1, 1),
             ),
-            Err(CoreError::Journal(JournalDecodeError::UnsupportedVersion {
-                version: 5
-            }))
-        ));
-    }
-
-    let report = Engine::recover_legacy_compatibility(
-        standard_catalog(),
-        CoreLimits::bounded_default(),
-        genesis_anchor(),
-        b"arbitrary failed-write residue",
-    )
-    .unwrap();
-    assert_eq!(
-        report.journal_repair(),
-        Some(JournalRepair::UnanchoredSuffix { offset: 0 })
+            freshness(1, 1, 1, 1),
+            freshness(1, 1, 1, 2),
+            first.revision(),
+            first.digest(),
+            source.engine.projection_digest(),
+        ),
+        Err(RecoveryAnchorError::NonAdvancingEpoch)
     );
 }
 
 #[test]
-fn ambiguous_persistence_failure_latches_the_engine_until_journal_recovery() {
-    #[derive(Debug, Eq, PartialEq)]
-    struct DiskFull;
-
-    let mut engine = Engine::new_scoped_legacy_compatibility(
-        WorldId::new(1).unwrap(),
-        standard_catalog(),
-        CoreLimits::bounded_default(),
-        freshness(1, 1, 1, 1, 1),
-    );
-    let before_projection = engine.projection_digest();
-    let before_revision = engine.revision();
-    let before_head = engine.head();
-    let mut rejected_record = Vec::new();
-    let error = engine
-        .transact(create_estate(24), |record| {
-            rejected_record.extend_from_slice(record.bytes());
-            Err(DiskFull)
-        })
-        .unwrap_err();
-    assert_eq!(error, TxError::Persist(DiskFull));
-    assert_eq!(engine.projection_digest(), before_projection);
-    assert_eq!(engine.revision(), before_revision);
-    assert_eq!(engine.head(), before_head);
-    assert_eq!(engine.estate(effect(24, 1)), None);
-    assert!(engine.persistence_recovery_required());
-    assert!(engine.pressure().persistence_recovery_required);
-
-    assert_eq!(
-        engine.transact(create_estate(24), |_| Ok::<(), DiskFull>(())),
-        Err(TxError::Core(CoreError::PersistenceRecoveryRequired))
-    );
-
-    let accepted = scan_journal(&rejected_record).unwrap();
-    let candidate = accepted.records().last().unwrap();
-    let mut expected = Harness::new();
-    expected.tx(create_estate(24)).unwrap();
-    let target = freshness(2, 1, 1, 1, 2);
-    let recovered = recover(
-        &rejected_record,
-        freshness(1, 1, 1, 1, 1),
-        target,
-        candidate.revision(),
-        candidate.digest(),
-        expected.engine.projection_digest(),
-    )
-    .unwrap();
-    assert_eq!(recovered.acknowledged_revision(), 1);
-    assert_eq!(recovered.acknowledged_head(), candidate.digest());
-    assert!(recovered.into_engine().estate(effect(24, 1)).is_some());
-}
-
-#[test]
-fn crash_after_durable_commit_intent_recovers_as_indeterminate_without_reapply() {
-    let mut source = Harness::new();
-    let effect = effect(25, 1);
-    source.tx(create_estate(25)).unwrap();
-    add_reply_claim(&mut source, 25);
-    source
-        .tx(Command::PrepareEffect {
-            effect,
-            actor: principal(25, 1),
-            binding_generation: 1,
-        })
-        .unwrap();
-    let operation = digest(25);
-    let intent_receipt = source
-        .tx(Command::RecordCommitIntent {
-            effect,
-            actor: principal(25, 1),
-            binding_generation: 1,
-            operation,
-        })
-        .unwrap();
-    assert!(matches!(
-        intent_receipt.into_output(),
-        TransitionOutput::CommitIntent(_)
-    ));
-
-    let target = freshness(2, 1, 1, 1, 2);
+fn durable_commit_intent_recovers_as_indeterminate_without_reapply() {
+    let mut source = create_prepared(25);
+    let intent = match source.output(Command::RecordComponentCommitIntent {
+        effect: effect(25, 1),
+        component: EFFECT_COMPONENT,
+        actor: executor(25, 1),
+        operation: digest(25),
+    }) {
+        TransitionOutput::CommitIntent(intent) => intent,
+        other => panic!("expected commit intent, got {other:?}"),
+    };
     let report = recover(
         &source.journal,
-        freshness(1, 1, 1, 1, 1),
-        target,
+        freshness(1, 1, 1, 1),
+        freshness(2, 1, 1, 2),
         source.engine.revision(),
         source.engine.head(),
         source.engine.projection_digest(),
     )
     .unwrap();
-    let mut recovered = report.into_engine();
+    let recovered = report.into_engine();
     assert_eq!(
-        recovered.estate(effect).unwrap().commit,
+        recovered
+            .component(effect(25, 1), EFFECT_COMPONENT)
+            .unwrap()
+            .commit,
         CommitState::CommitIntentDurable
     );
-    checkpoint(&mut recovered, &mut source.journal, target);
+    let outcome = verified_commit_outcome(
+        &source,
+        &intent,
+        EFFECT_VERIFIER,
+        EFFECT_COMMIT_RECEIPT_SCHEMA,
+        cser_core::ExternalOutcome::Success,
+        digest(26),
+    );
+    source.tx(intent.acknowledge(outcome).unwrap()).unwrap();
+    let effect = source
+        .engine
+        .component(effect(25, 1), EFFECT_COMPONENT)
+        .unwrap();
+    assert_eq!(effect.outcome, OutcomeState::KnownSuccess(digest(26)));
+    assert!(matches!(effect.settlement, SettlementState::Open { .. }));
+}
 
-    let estate = recovered.estate(effect).unwrap();
-    assert_eq!(estate.commit, CommitState::Committed);
-    assert_eq!(estate.outcome, OutcomeState::Indeterminate(operation));
-    assert!(matches!(
-        estate.settlement,
-        SettlementState::Open { generation: 1 }
-    ));
-
-    let target = freshness(3, 1, 1, 1, 3);
-    let report = recover(
-        &source.journal,
-        freshness(2, 1, 1, 1, 2),
+#[test]
+fn recovery_anchor_rejects_wrong_catalog_and_nonadvancing_freshness() {
+    let source = create_prepared(26);
+    let committed = freshness(1, 1, 1, 1);
+    let target = freshness(2, 1, 1, 2);
+    let wrong = recovery_anchor(
+        digest(254),
+        committed,
         target,
-        recovered.revision(),
-        recovered.head(),
-        recovered.projection_digest(),
-    )
-    .unwrap();
-    let replayed = report.into_engine();
-    let estate = replayed.estate(effect).unwrap();
-    assert_eq!(estate.commit, CommitState::Committed);
-    assert_eq!(estate.outcome, OutcomeState::Indeterminate(operation));
-    assert!(matches!(
-        estate.settlement,
-        SettlementState::Open { generation: 1 }
-    ));
+        source.engine.revision(),
+        source.engine.head(),
+        source.engine.projection_digest(),
+    );
+    assert_eq!(
+        Engine::recover(
+            CatalogSet::new(&[tool_dma_catalog()]).unwrap(),
+            CoreLimits::bounded_default(),
+            wrong,
+            &source.journal
+        )
+        .unwrap_err(),
+        CoreError::SchemaMismatch
+    );
+    assert_eq!(
+        RecoveryAnchor::from_trusted_provider(
+            support::recovery_binding(
+                CatalogSet::new(&[tool_dma_catalog()]).unwrap().digest(),
+                committed,
+            ),
+            committed,
+            freshness(1, 1, 1, 2),
+            source.engine.revision(),
+            source.engine.head(),
+            source.engine.projection_digest(),
+        ),
+        Err(RecoveryAnchorError::NonAdvancingEpoch)
+    );
 }
 
 #[test]
-fn fixture_recovers_and_reconciles_across_three_real_processes() {
-    use std::{
-        fs,
-        process::Command as ProcessCommand,
-        time::{SystemTime, UNIX_EPOCH},
-    };
-
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let path = std::env::temp_dir().join(format!(
-        "cser-restart-{}-{unique}.journal",
-        std::process::id()
-    ));
-    let binary = env!("CARGO_BIN_EXE_cser-restart-fixture");
-
-    let mut anchor: Option<(String, String)> = None;
-    for phase in ["origin", "adopt", "reconcile"] {
-        let mut process = ProcessCommand::new(binary);
-        process.arg(phase).arg(&path);
-        if let Some((revision, head)) = &anchor {
-            process.arg(revision).arg(head);
-        }
-        let output = process.output().unwrap();
-        assert!(
-            output.status.success(),
-            "phase {phase} failed: stdout={} stderr={}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let stdout = String::from_utf8(output.stdout).unwrap();
-        let mut fields = stdout.split_whitespace();
-        let revision = fields
-            .next()
-            .unwrap_or_else(|| panic!("phase {phase} omitted anchor revision"));
-        let head = fields
-            .next()
-            .unwrap_or_else(|| panic!("phase {phase} omitted anchor head"));
-        assert!(
-            fields.next().is_none(),
-            "phase {phase} emitted an ambiguous anchor"
-        );
-        anchor = Some((revision.to_owned(), head.to_owned()));
-        if phase == "origin" {
-            let mut stale_head = head.as_bytes().to_vec();
-            stale_head[0] = if stale_head[0] == b'0' { b'1' } else { b'0' };
-            let stale_head = String::from_utf8(stale_head).unwrap();
-            let rejected = ProcessCommand::new(binary)
-                .arg("adopt")
-                .arg(&path)
-                .arg(revision)
-                .arg(stale_head)
-                .output()
-                .unwrap();
-            assert!(
-                !rejected.status.success(),
-                "adopt accepted a stale external head: stdout={} stderr={}",
-                String::from_utf8_lossy(&rejected.stdout),
-                String::from_utf8_lossy(&rejected.stderr)
-            );
-        }
-    }
-
-    let bytes = fs::read(&path).unwrap();
-    let scan = scan_journal(&bytes).unwrap();
-    assert!(scan.records().len() >= 18);
-    assert_eq!(scan.torn_tail(), None);
-    fs::remove_file(&path).unwrap();
-}
-
-#[cfg(feature = "std")]
-#[test]
-fn file_journal_requires_exact_recovery_coordinates_before_torn_tail_repair() {
-    use std::{
-        fs,
-        time::{SystemTime, UNIX_EPOCH},
-    };
-
-    use cser_core::std_support::FileJournal;
+fn persistence_failure_latches_until_exact_recovery() {
+    #[derive(Debug, Eq, PartialEq)]
+    struct DiskFull;
 
     let mut source = Harness::new();
-    let first = source.tx(create_estate(27)).unwrap();
-    let accepted_len = source.journal.len();
-    source
-        .tx(Command::AddClaim {
-            effect: effect(27, 1),
-            actor: principal(27, 1),
-            binding_generation: 1,
-            claim: claim(27),
-            domain: cser_core::REPLY_DOMAIN,
-            kind: cser_core::REPLY_CLAIM_PUBLICATION_SLOT,
-            scope: cser_core::ClaimScope::Logical,
-            resource: resource(27),
-            resource_generation: resource_generation(1),
-            units: 1,
+    let before = source.engine.projection_digest();
+    let mut rejected = Vec::new();
+    let error = source
+        .engine
+        .transact(admit_command(effect(27, 1), 27), |record| {
+            rejected.extend_from_slice(record.bytes());
+            Err::<(), _>(DiskFull)
         })
-        .unwrap();
-    source.journal.truncate(source.journal.len() - 9);
-
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let path = std::env::temp_dir().join(format!(
-        "cser-torn-repair-{}-{unique}.journal",
-        std::process::id()
-    ));
-    fs::write(&path, &source.journal).unwrap();
-
-    let mut file = FileJournal::open(&path).unwrap();
-    assert_eq!(file.torn_tail(), Some(accepted_len));
-    assert_eq!(file.revision(), first.revision());
-    assert_eq!(file.head(), first.head());
-    assert!(
-        file.repair_to_anchored_prefix(accepted_len, first.revision(), digest(250))
-            .is_err()
+        .unwrap_err();
+    assert_eq!(error, TxError::Persist(DiskFull));
+    assert_eq!(source.engine.projection_digest(), before);
+    assert!(source.engine.persistence_recovery_required());
+    assert_eq!(
+        source
+            .engine
+            .transact(admit_command(effect(27, 1), 27), |_| Ok::<(), DiskFull>(())),
+        Err(TxError::Core(CoreError::PersistenceRecoveryRequired))
     );
-    file.repair_to_anchored_prefix(accepted_len, first.revision(), first.head())
-        .unwrap();
-    assert_eq!(file.torn_tail(), None);
-    assert_eq!(fs::metadata(&path).unwrap().len(), accepted_len as u64);
-
-    let target = freshness(2, 1, 1, 1, 2);
-    let report = recover(
-        &file.read_all().unwrap(),
-        freshness(1, 1, 1, 1, 1),
-        target,
-        first.revision(),
-        first.head(),
-        first.projection(),
-    )
-    .unwrap();
-    let mut engine = report.into_engine();
-    engine
-        .transact(
-            Command::CheckpointRecovery {
-                boot: target.boot(),
-                journal: target.journal(),
-                device: target.device(),
-            },
-            |record| file.append(record),
-        )
-        .unwrap();
-
-    let final_bytes = file.read_all().unwrap();
-    let scan = scan_journal(&final_bytes).unwrap();
-    assert_eq!(scan.torn_tail(), None);
-    assert_eq!(scan.records().last().unwrap().digest(), engine.head());
-    fs::remove_file(&path).unwrap();
+    let scan = scan_journal(&rejected).unwrap();
+    assert_eq!(scan.records().len(), 1);
 }

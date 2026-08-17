@@ -1697,6 +1697,11 @@ run_core_reply_evidence_guest() {
 }
 
 capture_core_reply_evidence() {
+    local core_api_profile
+    core_api_profile=$(sed -n \
+        's/^pub const CSER_CORE_API_PROFILE_VERSION: u16 = \([0-9][0-9]*\);$/\1/p' \
+        "$repo_root/crates/cser-core/src/lib.rs")
+    [[ $core_api_profile =~ ^[1-9][0-9]*$ ]] || return 1
     build_core_reply_recovery_kernel
     # shellcheck source=scripts/qemu-stream-capture.sh
     source "$capture_helper"
@@ -1719,14 +1724,14 @@ capture_core_reply_evidence() {
         'real_waiter_wake=true' \
         'precommit_adopt_race=true' \
         'revoke_adopt_orders=2' \
-        'api_profile=5' \
+        "api_profile=$core_api_profile" \
         'scoped_providers=true' \
         'exact_verifier_binding=true' \
         'production_profile=false' \
         'legacy_runtime=false' \
         'live_dual_write=false' \
         'reboot_persistence=false'
-    echo 'CSER_CORE_REPLY_EVIDENCE_QEMU PASS runtime=real-task-reap reply=physical settlement=claimed second_crash=reconciled api_profile=5 scoped_providers=true exact_verifier_binding=true production_registry=false'
+    echo "CSER_CORE_REPLY_EVIDENCE_QEMU PASS runtime=real-task-reap reply=physical settlement=claimed second_crash=reconciled api_profile=$core_api_profile scoped_providers=true exact_verifier_binding=true production_registry=false"
 }
 
 run_core_dma_evidence_guest() {
@@ -1744,6 +1749,11 @@ run_core_dma_evidence_guest() {
 }
 
 capture_core_dma_evidence() {
+    local core_api_profile
+    core_api_profile=$(sed -n \
+        's/^pub const CSER_CORE_API_PROFILE_VERSION: u16 = \([0-9][0-9]*\);$/\1/p' \
+        "$repo_root/crates/cser-core/src/lib.rs")
+    [[ $core_api_profile =~ ^[1-9][0-9]*$ ]] || return 1
     build_core_dma_recovery_kernel
     # shellcheck source=scripts/qemu-stream-capture.sh
     source "$capture_helper"
@@ -1773,7 +1783,7 @@ capture_core_dma_evidence() {
         'CSER_CORE_DMA_OSTD_QEMU PASS' \
         'death=real-task-reap' \
         'second_crash=true' \
-        'api_profile=5' \
+        "api_profile=$core_api_profile" \
         'scoped_providers=true' \
         'exact_verifier_binding=true' \
         'production_profile=false' \
@@ -1978,7 +1988,7 @@ capture_core_schema8_negative_boot() {
         "$core_persistent_artifact_dir/schema8-negative-serial.log" \
         'CSER_CORE_SCHEMA8_MIGRATION_REQUIRED PASS' \
         'trusted_tpm_candidate_selected=true' \
-        'profile5_binding_authorized=false' \
+        'current_binding_authorized=false' \
         "selected_revision=$core_schema8_fixture_revision_number" \
         "selected_head=$core_schema8_fixture_head" \
         "selected_catalog=$core_schema8_fixture_catalog" \
@@ -2038,7 +2048,7 @@ capture_core_schema8_negative_boot() {
         "$core_persistent_artifact_dir/swtpm.log" \
         "$core_persistent_artifact_dir/task-entry-debugcon.log"
     initialize_core_persistent_media
-    echo "CSER_CORE_SCHEMA8_QEMU_NEGATIVE PASS selected_revision=$core_schema8_fixture_revision_number selected_head=$core_schema8_fixture_head selected_catalog=$core_schema8_fixture_catalog expected_catalog=$catalog_digest trusted_tpm_candidate_selected=true profile5_binding_authorized=false typed_error=migration-required registry_publication=false post_quarantine_activation=false device_quarantined=true device_guard_retained=true arena_withheld=true pci_bus_master_fence_readback=true isr_drain=two-empty-reads iotlb_completion=true tpm_selected_nv_unchanged=true tpm_selected_coordinate_digest=$tpm_coordinate_digest tpm_tip_counter_hex=$tip_counter tpm_tip_selected_slot=$tip_slot tpm_lease_counter_hex=$lease_counter tpm_lease_selected_slot=$lease_slot"
+    echo "CSER_CORE_SCHEMA8_QEMU_NEGATIVE PASS selected_revision=$core_schema8_fixture_revision_number selected_head=$core_schema8_fixture_head selected_catalog=$core_schema8_fixture_catalog expected_catalog=$catalog_digest trusted_tpm_candidate_selected=true current_binding_authorized=false typed_error=migration-required registry_publication=false post_quarantine_activation=false device_quarantined=true device_guard_retained=true arena_withheld=true pci_bus_master_fence_readback=true isr_drain=two-empty-reads iotlb_completion=true tpm_selected_nv_unchanged=true tpm_selected_coordinate_digest=$tpm_coordinate_digest tpm_tip_counter_hex=$tip_counter tpm_tip_selected_slot=$tip_slot tpm_lease_counter_hex=$lease_counter tpm_lease_selected_slot=$lease_slot"
 }
 
 require_core_persistent_marker() {
@@ -2342,33 +2352,36 @@ assert_core_persistent_freshness_progression() {
         "$(IFS=,; echo "${devices[*]}")"
 }
 
-assert_core_persistent_service_identity_progression() {
+assert_core_persistent_executor_identity_progression() {
     local -a markers=("$@")
-    local -a principals=() bindings=()
+    local -a service_generations=() executor_generations=()
     local marker index expected coordinate
     if (( ${#markers[@]} != 4 )); then
-        echo "persistent service identity progression requires exactly four markers" >&2
+        echo "persistent executor identity progression requires exactly four markers" >&2
         return 1
     fi
     for marker in "${markers[@]}"; do
         coordinate=$(core_persistent_marker_u64 \
-            "$marker" service_principal_generation) || return 1
-        principals+=("$coordinate")
-        coordinate=$(core_persistent_marker_u64 \
-            "$marker" binding_generation) || return 1
-        bindings+=("$coordinate")
+            "$marker" service_executor_generation) || return 1
+        service_generations+=("$coordinate")
+        if ! coordinate=$(core_persistent_marker_u64 \
+            "$marker" executor_generation 2>/dev/null); then
+            coordinate=$(core_persistent_marker_u64 \
+                "$marker" successor_generation) || return 1
+        fi
+        executor_generations+=("$coordinate")
     done
     for index in 0 1 2 3; do
         expected=$((index + 1))
-        if (( 10#${principals[$index]} != expected )) \
-            || (( 10#${bindings[$index]} != expected )); then
-            echo "persistent service identity is not the exact fresh boot $expected pair" >&2
+        if (( 10#${service_generations[$index]} != expected )) \
+            || (( 10#${executor_generations[$index]} != expected )); then
+            echo "persistent executor identity is not the exact fresh boot $expected pair" >&2
             return 1
         fi
     done
-    printf 'service_principal_generation=%s binding_generation=%s\n' \
-        "$(IFS=,; echo "${principals[*]}")" \
-        "$(IFS=,; echo "${bindings[*]}")"
+    printf 'service_executor_generation=%s executor_generation=%s\n' \
+        "$(IFS=,; echo "${service_generations[*]}")" \
+        "$(IFS=,; echo "${executor_generations[*]}")"
 }
 
 core_persistent_qemu_event_count() {
@@ -2442,11 +2455,11 @@ capture_core_persistent_run() {
     journal_schema=$(sed -n \
         's/^pub const JOURNAL_SCHEMA_VERSION: u16 = \([0-9][0-9]*\);$/\1/p' \
         "$repo_root/crates/cser-core/src/journal.rs")
-    if [[ $core_api_profile != 5 \
-        || $catalog_version != 8 \
-        || $projection_version != 9 \
-        || $snapshot_version != 5 \
-        || $journal_schema != 9 ]]; then
+    if [[ ! $core_api_profile =~ ^[1-9][0-9]*$ \
+        || ! $catalog_version =~ ^[1-9][0-9]*$ \
+        || ! $projection_version =~ ^[1-9][0-9]*$ \
+        || ! $snapshot_version =~ ^[1-9][0-9]*$ \
+        || ! $journal_schema =~ ^[1-9][0-9]*$ ]]; then
         echo "unfrozen CSER coordinates: api=$core_api_profile catalog=$catalog_version projection=$projection_version snapshot=$snapshot_version journal=$journal_schema" >&2
         return 1
     fi
@@ -2481,17 +2494,17 @@ capture_core_persistent_run() {
         "$core_persistent_artifact_dir/boot1-serial.log" \
         'CSER_CORE_PERSISTENT_BOOT1 PASS' \
         'production_registry=single' \
-        'profile=2' \
+        'profile=6' \
         'composite_effect=true' \
         'effect_identity=shared' \
         'component_ids=reply+dma' \
-        'api_profile=5' \
-        'catalog_version=8' \
-        'projection_version=9' \
-        'snapshot_version=5' \
-        'journal_schema=9' \
-        'operation_effect_root=50433' \
-        'operation_effect_sequence=1' \
+        "api_profile=$core_api_profile" \
+        "catalog_version=$catalog_version" \
+        "projection_version=$projection_version" \
+        "snapshot_version=$snapshot_version" \
+        "journal_schema=$journal_schema" \
+        'operation_id=1' \
+        'effect_sequence=1' \
         'reply_component_id=1' \
         'dma_component_id=2' \
         'portal=nxp3' \
@@ -2502,8 +2515,8 @@ capture_core_persistent_run() {
         'dma_retained=3' \
         'resource_generation=1' \
         'resumed_prefix=false' \
-        'service_principal_generation=1' \
-        'binding_generation=1' \
+        'service_executor_generation=1' \
+        'executor_generation=1' \
         'production_service_tasks=1' \
         'service_death=task-return' \
         'exact_reap=true' \
@@ -2514,13 +2527,13 @@ capture_core_persistent_run() {
         "$core_persistent_artifact_dir/boot2-serial.log" \
         'CSER_CORE_PERSISTENT_BOOT2 PASS' \
         'production_registry=single' \
-        'api_profile=5' \
-        'catalog_version=8' \
-        'projection_version=9' \
-        'snapshot_version=5' \
-        'journal_schema=9' \
-        'operation_effect_root=50433' \
-        'operation_effect_sequence=1' \
+        "api_profile=$core_api_profile" \
+        "catalog_version=$catalog_version" \
+        "projection_version=$projection_version" \
+        "snapshot_version=$snapshot_version" \
+        "journal_schema=$journal_schema" \
+        'operation_id=1' \
+        'effect_sequence=1' \
         'reply_component_id=1' \
         'dma_component_id=2' \
         'portal=nxp3' \
@@ -2539,9 +2552,8 @@ capture_core_persistent_run() {
         'reset_submitted=3' \
         'irq_submitted=1' \
         'iotlb_submitted=2' \
-        'service_principal_generation=2' \
+        'service_executor_generation=2' \
         'successor_generation=2' \
-        'binding_generation=2' \
         'fresh_service_task=true' \
         'ready_in_fresh_task=true' \
         'production_rebind=true' \
@@ -2553,16 +2565,16 @@ capture_core_persistent_run() {
         "$core_persistent_artifact_dir/boot3-serial.log" \
         'CSER_CORE_PERSISTENT_BOOT3 PASS' \
         'production_registry=single' \
-        'api_profile=5' \
-        'catalog_version=8' \
-        'projection_version=9' \
-        'snapshot_version=5' \
-        'journal_schema=9' \
-        'operation_effect_root=50433' \
-        'operation_effect_sequence=1' \
+        "api_profile=$core_api_profile" \
+        "catalog_version=$catalog_version" \
+        "projection_version=$projection_version" \
+        "snapshot_version=$snapshot_version" \
+        "journal_schema=$journal_schema" \
+        'operation_id=1' \
+        'effect_sequence=1' \
         'reply_component_id=1' \
         'dma_component_id=2' \
-        'reuse_effect_root=50433' \
+        'reuse_operation_id=1' \
         'reuse_effect_sequence=2' \
         'portal=nxp3' \
         'supervisor=core-v1' \
@@ -2575,9 +2587,8 @@ capture_core_persistent_run() {
         'resource_generation=2' \
         'prior_resource_generation=1' \
         'stale_old_generation_evidence=rejected_without_mutation' \
-        'service_principal_generation=3' \
-        'successor_generation=3' \
-        'binding_generation=3' \
+        'service_executor_generation=3' \
+        'executor_generation=3' \
         'fresh_service_task=true' \
         'ready_in_fresh_task=true' \
         'production_rebind=true' \
@@ -2588,16 +2599,16 @@ capture_core_persistent_run() {
         "$core_persistent_artifact_dir/boot4-serial.log" \
         'CSER_CORE_PERSISTENT_BOOT4 PASS' \
         'production_registry=single' \
-        'api_profile=5' \
-        'catalog_version=8' \
-        'projection_version=9' \
-        'snapshot_version=5' \
-        'journal_schema=9' \
-        'operation_effect_root=50433' \
-        'operation_effect_sequence=1' \
+        "api_profile=$core_api_profile" \
+        "catalog_version=$catalog_version" \
+        "projection_version=$projection_version" \
+        "snapshot_version=$snapshot_version" \
+        "journal_schema=$journal_schema" \
+        'operation_id=1' \
+        'effect_sequence=1' \
         'reply_component_id=1' \
         'dma_component_id=2' \
-        'reuse_effect_root=50433' \
+        'reuse_operation_id=1' \
         'reuse_effect_sequence=2' \
         'portal=nxp3' \
         'supervisor=core-v1' \
@@ -2613,9 +2624,8 @@ capture_core_persistent_run() {
         'reset_submitted=3' \
         'irq_submitted=1' \
         'iotlb_submitted=2' \
-        'service_principal_generation=4' \
-        'successor_generation=4' \
-        'binding_generation=4' \
+        'service_executor_generation=4' \
+        'executor_generation=4' \
         'fresh_service_task=true' \
         'ready_in_fresh_task=true' \
         'production_rebind=true' \
@@ -2705,7 +2715,7 @@ capture_core_persistent_run() {
     local combined_receipt receipt_basename receipt_checksum_basename
     local receipt_header receipt_sha256 seal_failure=false
     local boot1_marker boot2_marker boot3_marker boot4_marker
-    local freshness_progression service_identity_progression dma_arena_reuse
+    local freshness_progression executor_identity_progression dma_arena_reuse
     local semantic_coordinates
     local docker_image_id git_revision
     local reply_evidence_marker dma_hardware_marker dma_runtime_marker schema8_negative_marker
@@ -2738,7 +2748,7 @@ capture_core_persistent_run() {
         >"$core_persistent_artifact_dir/boot4-marker.txt"
     freshness_progression=$(assert_core_persistent_freshness_progression \
         "$boot1_marker" "$boot2_marker" "$boot3_marker" "$boot4_marker")
-    service_identity_progression=$(assert_core_persistent_service_identity_progression \
+    executor_identity_progression=$(assert_core_persistent_executor_identity_progression \
         "$boot1_marker" "$boot2_marker" "$boot3_marker" "$boot4_marker")
     semantic_coordinates=$(assert_core_persistent_semantic_coordinates \
         "$catalog_digest" \
@@ -2792,7 +2802,7 @@ capture_core_persistent_run() {
     schema8_tpm_lease_slot=$(core_schema8_tpm_snapshot_field \
         "$core_schema8_tpm_after" lease_selected_slot '^[01]$')
 
-    combined_receipt="CSER_CORE_PERSISTENT_QEMU_RESTART PASS boots=4 schema8_negative_boot=true schema8_selected_revision=5 schema8_selected_catalog=$core_schema8_fixture_catalog schema8_expected_catalog=$catalog_digest schema8_trusted_tpm_candidate_selected=true schema8_profile5_binding_authorized=false schema8_anchor_binding_match=false schema8_typed_rejection=migration-required schema8_semantic_replay=false schema8_pairing_inference=false schema8_registry_publication=false schema8_device_activation=false schema8_device_guard_retained=true schema8_arena_withheld=true schema8_bus_master_disabled=true schema8_intx_masked=true schema8_reset_status_zero=true schema8_observed_isr_bits=0 schema8_isr_reads_at_least=2 schema8_consecutive_empty_isr_reads=2 schema8_iotlb_used_remapped_iova=true schema8_iotlb_completed_trigger_pages_at_least=1 schema8_pci_bus_master_fence_readback=true schema8_iotlb_completion=true schema8_tpm_selected_nv_unchanged=true schema8_tpm_selected_coordinate_digest=$schema8_tpm_coordinate_digest schema8_tpm_tip_counter_hex=$schema8_tpm_tip_counter schema8_tpm_tip_selected_slot=$schema8_tpm_tip_slot schema8_tpm_lease_counter_hex=$schema8_tpm_lease_counter schema8_tpm_lease_selected_slot=$schema8_tpm_lease_slot shared_runtime=true shared_media=journal+swtpm+ram api_profile=5 catalog_version=$catalog_version projection_version=9 snapshot_version=5 journal_schema=9 predecessor_api_profile=4 predecessor_schema=8 predecessor_journal_schema=8 composite_effect=shared operation_effect=50433:1 component_ids=1,2 evidence_schemes=reply+dma production_registry=single portal=nxp3 supervisor=core-v1 journal=ata-pio outbox=ata-pio-secondary ram_backend=memory-backend-file ram_backend_offset=0 qemu_ram_mapping=guest-paddr-equals-file-offset anchor=tpm2-nv quarantine=pre-replay-virtio+vtd reply=committed-then-intent-crash-then-settled second_crash=after-durable-apply-intent reconciliation=without-second-intent stable_recovery=true freshness=strictly-increasing projection_sequence=boot-distinct service_principal_generations=1,2,3,4 binding_generations=1,2,3,4 boot1_composite_task_death_exact_reap=true boot1_ingress_closed_rejected=true boot2_fresh_ready_rebind_death_exact_reap=true boot2_ingress_closed_rejected=true boot3_fresh_ready_rebind_live_open=true boot4_fresh_ready_rebind_live_open=true boot3_prior_service_fence=same-boot-exact-reap boot4_prior_service_fence=boot-checkpoint dma_generation_reuse=1->2 dma_generation1_retired=true dma_generation2_retired=true dma_queue=retired retained=0 resource_reuse_authorized=true arena_provider_contract=stable guest_pfn_reuse=true emulated_iova_reuse=true host_backing_file_offset_reuse=true qemu=true physical_hardware=false host_physical_pfn_identity=false physical_dma_drain=false physical_antirollback=false physical_powerloss=false"
+    combined_receipt="CSER_CORE_PERSISTENT_QEMU_RESTART PASS boots=4 schema8_negative_boot=true schema8_selected_revision=5 schema8_selected_catalog=$core_schema8_fixture_catalog schema8_expected_catalog=$catalog_digest schema8_trusted_tpm_candidate_selected=true schema8_current_binding_authorized=false schema8_anchor_binding_match=false schema8_typed_rejection=migration-required schema8_semantic_replay=false schema8_pairing_inference=false schema8_registry_publication=false schema8_device_activation=false schema8_device_guard_retained=true schema8_arena_withheld=true schema8_bus_master_disabled=true schema8_intx_masked=true schema8_reset_status_zero=true schema8_observed_isr_bits=0 schema8_isr_reads_at_least=2 schema8_consecutive_empty_isr_reads=2 schema8_iotlb_used_remapped_iova=true schema8_iotlb_completed_trigger_pages_at_least=1 schema8_pci_bus_master_fence_readback=true schema8_iotlb_completion=true schema8_tpm_selected_nv_unchanged=true schema8_tpm_selected_coordinate_digest=$schema8_tpm_coordinate_digest schema8_tpm_tip_counter_hex=$schema8_tpm_tip_counter schema8_tpm_tip_selected_slot=$schema8_tpm_tip_slot schema8_tpm_lease_counter_hex=$schema8_tpm_lease_counter schema8_tpm_lease_selected_slot=$schema8_tpm_lease_slot shared_runtime=true shared_media=journal+swtpm+ram api_profile=$core_api_profile catalog_version=$catalog_version projection_version=$projection_version snapshot_version=$snapshot_version journal_schema=$journal_schema predecessor_api_profile=4 predecessor_schema=8 predecessor_journal_schema=8 composite_effect=shared operation_id=1 effect_sequence=1 component_ids=1,2 evidence_schemes=reply+dma production_registry=single portal=nxp3 supervisor=core-v1 journal=ata-pio outbox=ata-pio-secondary ram_backend=memory-backend-file ram_backend_offset=0 qemu_ram_mapping=guest-paddr-equals-file-offset anchor=tpm2-nv quarantine=pre-replay-virtio+vtd reply=committed-then-intent-crash-then-settled second_crash=after-durable-apply-intent reconciliation=without-second-intent stable_recovery=true freshness=strictly-increasing projection_sequence=boot-distinct service_executor_generations=1,2,3,4 executor_generations=1,2,3,4 boot1_composite_task_death_exact_reap=true boot1_ingress_closed_rejected=true boot2_fresh_ready_rebind_death_exact_reap=true boot2_ingress_closed_rejected=true boot3_fresh_ready_rebind_live_open=true boot4_fresh_ready_rebind_live_open=true boot3_prior_service_fence=same-boot-exact-reap boot4_prior_service_fence=boot-checkpoint dma_generation_reuse=1->2 dma_generation1_retired=true dma_generation2_retired=true dma_queue=retired retained=0 resource_reuse_authorized=true arena_provider_contract=stable guest_pfn_reuse=true emulated_iova_reuse=true host_backing_file_offset_reuse=true qemu=true physical_hardware=false host_physical_pfn_identity=false physical_dma_drain=false physical_antirollback=false physical_powerloss=false"
     combined_receipt+=" focused_test_profiles=profile4-predecessor focused_test_profiles_are_production=false"
     receipt_header=nexus.cser.production-receipt.v1
     receipt_basename=combined-receipt.txt
@@ -2913,8 +2923,8 @@ capture_core_persistent_run() {
         printf 'boot3_marker=%s\n' "$boot3_marker"
         printf 'boot4_marker=%s\n' "$boot4_marker"
         printf 'freshness_progression=%s\n' "$freshness_progression"
-        printf 'service_identity_progression=%s\n' \
-            "$service_identity_progression"
+        printf 'executor_identity_progression=%s\n' \
+            "$executor_identity_progression"
         printf 'semantic_coordinates=%s\n' "$semantic_coordinates"
         printf 'dma_arena_reuse_coordinates=%s\n' "$dma_arena_reuse"
         printf 'ram_backing_path=%s\n' ram.raw

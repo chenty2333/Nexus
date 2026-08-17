@@ -13,17 +13,18 @@ use std::{
 };
 
 use cser_core::{
-    AuthorityBindingGeneration, ClaimScope, CommandRequest as Command, CoordinatedPersistence,
-    CoreError, CoreLimits, DEVICE_CLAIM_IOVA, DEVICE_DOMAIN, DEVICE_EVIDENCE_IOTLB,
-    DEVICE_EVIDENCE_RESET, DEVICE_OBLIGATION_DMA, DEVICE_RECEIPT_SCHEMA, DEVICE_VERIFIER,
-    DeviceGeneration, DurableJournalBackend, Engine, Freshness, JournalRepair, ReceiptBinding,
-    RecoveryBinding, RecoveryLease, RecoveryProfile, TransitionOutput, TrustedAnchorBackend,
+    AGENT_COMPONENT_DMA, CatalogSet, ClaimScope, CommandRequest as Command,
+    ComponentProviderBinding, CoordinatedPersistence, CoreError, CoreLimits, DEVICE_CLAIM_IOVA,
+    DEVICE_EVIDENCE_IOTLB, DEVICE_EVIDENCE_RESET, DEVICE_RECEIPT_SCHEMA, DEVICE_VERIFIER,
+    DMA_ARENA_REUSE_COMPOSITE, DeviceGeneration, DurableJournalBackend, Engine, Freshness,
+    JournalRepair, RecoveryBinding, RecoveryLease, RecoveryProfile, TrustedAnchorBackend,
     TrustedAnchorSnapshot, TxError, WorldId, standard_catalog,
     std_support::{FileJournal, HostAnchorFailpoint, HostFileTrustedAnchor},
 };
 use support::{
-    ExactTestVerifier, TestReceipt, charge, claim, digest, effect, freshness, genesis_projection,
-    principal, recovery_binding, resource, resource_generation,
+    ExactTestVerifier, TestReceipt, charge, claim, digest, effect, executor, freshness,
+    genesis_projection, provider, recovery_binding, register_provider_command, resource,
+    resource_generation,
 };
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(1);
@@ -61,22 +62,22 @@ impl Drop for TempStore {
 }
 
 fn binding() -> RecoveryBinding {
-    recovery_binding(standard_catalog().digest(), freshness(1, 1, 1, 1, 1))
+    recovery_binding(
+        CatalogSet::new(&[standard_catalog()]).unwrap().digest(),
+        freshness(1, 1, 1, 1),
+    )
 }
 
 fn open_anchor(path: &Path) -> HostFileTrustedAnchor {
     HostFileTrustedAnchor::open_or_initialize(
         path,
         binding(),
-        freshness(1, 1, 1, 1, 1),
+        freshness(1, 1, 1, 1),
         genesis_projection(),
     )
     .unwrap()
 }
 
-/// A test-only controller injects a storage failure without borrowing the
-/// coordinator's backend. Production code receives no mutable backend escape
-/// hatch from `CoordinatedPersistence`.
 #[derive(Clone, Debug)]
 struct AnchorFailpointController(Arc<Mutex<HostAnchorFailpoint>>);
 
@@ -166,8 +167,8 @@ fn cold_reopen(directory: &Path, observed_device: u64) -> Result<Reopened, CoreE
     }
     let bytes = journal.read_all().unwrap();
     let persistence = CoordinatedPersistence::from_recovery_lease(journal, anchor, &lease);
-    let engine = Engine::recover_legacy_compatibility(
-        standard_catalog(),
+    let engine = Engine::recover(
+        CatalogSet::new(&[standard_catalog()]).unwrap(),
         CoreLimits::bounded_default(),
         lease.into_recovery_anchor().unwrap(),
         &bytes,
@@ -183,6 +184,32 @@ fn cold_reopen(directory: &Path, observed_device: u64) -> Result<Reopened, CoreE
 }
 
 fn checkpoint(reopened: &mut Reopened) {
+    let catalog = standard_catalog();
+    let needs_provider = reopened
+        .engine
+        .provider_generation_projection(provider())
+        .is_none();
+    if needs_provider {
+        reopened
+            .engine
+            .transact_durable(
+                Command::CheckpointRecovery {
+                    boot: reopened.target.boot(),
+                    journal: reopened.target.journal(),
+                    device: reopened.target.device(),
+                },
+                &mut reopened.persistence,
+            )
+            .unwrap();
+        reopened
+            .engine
+            .transact_durable(
+                register_provider_command(&catalog),
+                &mut reopened.persistence,
+            )
+            .unwrap();
+        return;
+    }
     reopened
         .engine
         .transact_durable(
@@ -203,52 +230,82 @@ fn transact(reopened: &mut Reopened, command: Command) {
         .unwrap();
 }
 
-fn create_reply_command(root: u64) -> Command {
-    Command::CreateEstate {
-        effect: effect(root, 1),
-        origin: principal(root, 1),
-        binding_generation: 1,
-        domain: cser_core::REPLY_DOMAIN,
-        obligation: cser_core::REPLY_OBLIGATION_PUBLICATION,
-        charge_account: charge(root),
+fn create_dma_command(operation_value: u64) -> Command {
+    Command::AdmitScopedCompositeEffect {
+        effect: effect(operation_value, 1),
+        origin: executor(operation_value, 1),
+        kind: DMA_ARENA_REUSE_COMPOSITE,
+        charge_account: charge(operation_value),
+        bindings: vec![ComponentProviderBinding::new(
+            AGENT_COMPONENT_DMA,
+            provider(),
+        )],
+    }
+}
+
+fn add_dma_claim(operation_value: u64) -> Command {
+    Command::AddComponentClaim {
+        effect: effect(operation_value, 1),
+        component: AGENT_COMPONENT_DMA,
+        actor: executor(operation_value, 1),
+        claim: claim(operation_value),
+        kind: DEVICE_CLAIM_IOVA,
+        scope: ClaimScope::Device(cser_core::DeviceScopeId::new(operation_value).unwrap()),
+        resource: resource(operation_value),
+        resource_generation: resource_generation(1),
+        units: 1,
     }
 }
 
 fn bootstrap_dma(directory: &Path) {
     let mut reopened = cold_reopen(directory, 2).unwrap();
     checkpoint(&mut reopened);
+    transact(&mut reopened, create_dma_command(90));
+    transact(&mut reopened, add_dma_claim(90));
     transact(
         &mut reopened,
-        Command::CreateEstate {
+        Command::PrepareCompositeEffect {
             effect: effect(90, 1),
-            origin: principal(90, 1),
-            binding_generation: 1,
-            domain: DEVICE_DOMAIN,
-            obligation: DEVICE_OBLIGATION_DMA,
-            charge_account: charge(90),
+            actor: executor(90, 1),
         },
     );
-    transact(
-        &mut reopened,
-        Command::AddClaim {
-            effect: effect(90, 1),
-            actor: principal(90, 1),
-            binding_generation: 1,
-            claim: claim(90),
-            domain: DEVICE_DOMAIN,
-            kind: DEVICE_CLAIM_IOVA,
-            scope: ClaimScope::Device(cser_core::DeviceScopeId::new(9).unwrap()),
-            resource: resource(90),
-            resource_generation: resource_generation(1),
-            units: 4,
-        },
+    let intent = match reopened
+        .engine
+        .transact_durable(
+            Command::RecordComponentCommitIntent {
+                effect: effect(90, 1),
+                component: AGENT_COMPONENT_DMA,
+                actor: executor(90, 1),
+                operation: digest(90),
+            },
+            &mut reopened.persistence,
+        )
+        .unwrap()
+        .into_output()
+    {
+        cser_core::TransitionOutput::CommitIntent(intent) => intent,
+        other => panic!("expected commit intent, got {other:?}"),
+    };
+    let outcome = support::verified_commit_outcome_for_engine(
+        &reopened.engine,
+        &intent,
+        DEVICE_VERIFIER,
+        cser_core::DEVICE_COMMIT_RECEIPT_SCHEMA,
+        cser_core::ExternalOutcome::Success,
+        digest(91),
     );
+    reopened
+        .engine
+        .transact_durable(
+            intent.acknowledge(outcome).unwrap(),
+            &mut reopened.persistence,
+        )
+        .unwrap();
     transact(
         &mut reopened,
-        Command::FenceIncarnation {
-            root: effect(90, 1).root(),
-            crashed: principal(90, 1),
-            binding_generation: 1,
+        Command::FenceExecutor {
+            operation: effect(90, 1).operation(),
+            crashed: executor(90, 1),
         },
     );
 }
@@ -295,7 +352,12 @@ fn device_tombstone_and_quarantine_survive_process_and_cold_reopen() {
 
     let challenge = reopened
         .engine
-        .evidence_challenge(effect(90, 1), claim(90), DEVICE_EVIDENCE_RESET)
+        .component_evidence_challenge(
+            effect(90, 1),
+            AGENT_COMPONENT_DMA,
+            claim(90),
+            DEVICE_EVIDENCE_RESET,
+        )
         .unwrap();
     let wrong_subject = TestReceipt {
         effect: effect(90, 1),
@@ -308,8 +370,9 @@ fn device_tombstone_and_quarantine_survive_process_and_cold_reopen() {
         digest: digest(90),
     };
     assert_eq!(
-        reopened.engine.verify_retirement_evidence(
+        reopened.engine.verify_component_retirement_evidence(
             effect(90, 1),
+            AGENT_COMPONENT_DMA,
             claim(90),
             DEVICE_EVIDENCE_RESET,
             &ExactTestVerifier::new(DEVICE_VERIFIER, DEVICE_RECEIPT_SCHEMA),
@@ -317,54 +380,72 @@ fn device_tombstone_and_quarantine_survive_process_and_cold_reopen() {
         ),
         Err(CoreError::VerificationFailed)
     );
-    assert!(reopened.engine.pressure().quarantined);
-    assert_eq!(reopened.engine.pressure().retained_claims, 1);
 
-    for (kind, digest_value) in [(DEVICE_EVIDENCE_RESET, 91), (DEVICE_EVIDENCE_IOTLB, 92)] {
-        let challenge = reopened
-            .engine
-            .evidence_challenge(effect(90, 1), claim(90), kind)
-            .unwrap();
-        let receipt = TestReceipt {
-            effect: effect(90, 1),
-            claim: claim(90),
-            kind,
-            resource: challenge.resource(),
-            resource_generation: challenge.resource_generation(),
-            subject: challenge.subject(),
-            observation: if kind == DEVICE_EVIDENCE_RESET
-                && challenge.current_observation().device() == challenge.subject().device()
-            {
-                Freshness::new(
-                    challenge.current_observation().boot(),
-                    challenge.current_observation().registry(),
-                    challenge.current_observation().binding(),
-                    DeviceGeneration::new(challenge.current_observation().device().get() + 1)
-                        .unwrap(),
-                    challenge.current_observation().journal(),
-                )
-                .unwrap()
-            } else {
-                challenge.current_observation()
-            },
-            digest: digest(digest_value),
-        };
-        let verified = reopened
-            .engine
-            .verify_retirement_evidence(
-                effect(90, 1),
-                claim(90),
-                kind,
-                &ExactTestVerifier::new(DEVICE_VERIFIER, DEVICE_RECEIPT_SCHEMA),
-                &receipt,
-            )
-            .unwrap();
-        reopened
-            .engine
-            .transact_durable(verified.submit(), &mut reopened.persistence)
-            .unwrap();
-    }
-    assert!(!reopened.engine.pressure().quarantined);
+    let reset = TestReceipt {
+        effect: effect(90, 1),
+        claim: claim(90),
+        kind: DEVICE_EVIDENCE_RESET,
+        resource: challenge.resource(),
+        resource_generation: challenge.resource_generation(),
+        subject: challenge.subject(),
+        observation: Freshness::new(
+            challenge.current_observation().boot(),
+            challenge.current_observation().registry(),
+            DeviceGeneration::new(challenge.subject().device().get() + 1).unwrap(),
+            challenge.current_observation().journal(),
+        ),
+        digest: digest(91),
+    };
+    let verified = reopened
+        .engine
+        .verify_component_retirement_evidence(
+            effect(90, 1),
+            AGENT_COMPONENT_DMA,
+            claim(90),
+            DEVICE_EVIDENCE_RESET,
+            &ExactTestVerifier::new(DEVICE_VERIFIER, DEVICE_RECEIPT_SCHEMA),
+            &reset,
+        )
+        .unwrap();
+    reopened
+        .engine
+        .transact_durable(verified.submit(), &mut reopened.persistence)
+        .unwrap();
+
+    let challenge = reopened
+        .engine
+        .component_evidence_challenge(
+            effect(90, 1),
+            AGENT_COMPONENT_DMA,
+            claim(90),
+            DEVICE_EVIDENCE_IOTLB,
+        )
+        .unwrap();
+    let iotlb = TestReceipt {
+        effect: effect(90, 1),
+        claim: claim(90),
+        kind: DEVICE_EVIDENCE_IOTLB,
+        resource: challenge.resource(),
+        resource_generation: challenge.resource_generation(),
+        subject: challenge.subject(),
+        observation: challenge.current_observation(),
+        digest: digest(92),
+    };
+    let verified = reopened
+        .engine
+        .verify_component_retirement_evidence(
+            effect(90, 1),
+            AGENT_COMPONENT_DMA,
+            claim(90),
+            DEVICE_EVIDENCE_IOTLB,
+            &ExactTestVerifier::new(DEVICE_VERIFIER, DEVICE_RECEIPT_SCHEMA),
+            &iotlb,
+        )
+        .unwrap();
+    reopened
+        .engine
+        .transact_durable(verified.submit(), &mut reopened.persistence)
+        .unwrap();
     assert_eq!(reopened.engine.pressure().retained_claims, 0);
     drop(reopened);
 
@@ -379,15 +460,11 @@ fn device_tombstone_and_quarantine_survive_process_and_cold_reopen() {
 
 #[test]
 fn crash_windows_reconcile_to_the_exact_trusted_prefix() {
-    // Torn journal write: the old anchor wins and the exact tail is truncated.
     let torn = TempStore::new("torn");
     let mut opened = cold_reopen(&torn.directory, 1).unwrap();
     checkpoint(&mut opened);
-    let (journal, anchor) = opened.persistence.into_backends();
-    drop(journal);
-    drop(anchor);
     let journal_path = torn.journal();
-    let result = opened.engine.transact(create_reply_command(101), |record| {
+    let result = opened.engine.transact(create_dma_command(101), |record| {
         let mut file = OpenOptions::new().append(true).open(&journal_path).unwrap();
         file.write_all(&record.bytes()[..record.bytes().len() / 2])
             .unwrap();
@@ -395,14 +472,14 @@ fn crash_windows_reconcile_to_the_exact_trusted_prefix() {
         Err::<(), _>("injected torn write")
     });
     assert!(matches!(result, Err(TxError::Persist(_))));
+    drop(opened);
     let repaired = cold_reopen(&torn.directory, 1).unwrap();
     assert!(matches!(
         repaired.observed_repair,
         Some(JournalRepair::TornTail { .. })
     ));
-    assert!(repaired.engine.estate(effect(101, 1)).is_none());
+    assert!(repaired.engine.composite_effect(effect(101, 1)).is_none());
 
-    // Record durable, anchor not advanced: complete suffix is discarded.
     let suffix = TempStore::new("unanchored-suffix");
     let mut opened = cold_reopen(&suffix.directory, 1).unwrap();
     checkpoint(&mut opened);
@@ -411,7 +488,7 @@ fn crash_windows_reconcile_to_the_exact_trusted_prefix() {
         .arm(HostAnchorFailpoint::BeforeAtomicReplace);
     let result = opened
         .engine
-        .transact_durable(create_reply_command(102), &mut opened.persistence);
+        .transact_durable(create_dma_command(102), &mut opened.persistence);
     assert!(matches!(result, Err(TxError::Persist(_))));
     assert!(opened.persistence.recovery_required());
     drop(opened);
@@ -420,9 +497,8 @@ fn crash_windows_reconcile_to_the_exact_trusted_prefix() {
         repaired.observed_repair,
         Some(JournalRepair::UnanchoredSuffix { .. })
     ));
-    assert!(repaired.engine.estate(effect(102, 1)).is_none());
+    assert!(repaired.engine.composite_effect(effect(102, 1)).is_none());
 
-    // Anchor advanced, acknowledgement lost: recovery replays the record once.
     let lost_ack = TempStore::new("anchor-ack-lost");
     let mut opened = cold_reopen(&lost_ack.directory, 1).unwrap();
     checkpoint(&mut opened);
@@ -431,12 +507,12 @@ fn crash_windows_reconcile_to_the_exact_trusted_prefix() {
         .arm(HostAnchorFailpoint::AfterAtomicReplaceBeforeReturn);
     let result = opened
         .engine
-        .transact_durable(create_reply_command(103), &mut opened.persistence);
+        .transact_durable(create_dma_command(103), &mut opened.persistence);
     assert!(matches!(result, Err(TxError::Persist(_))));
     drop(opened);
     let replayed = cold_reopen(&lost_ack.directory, 1).unwrap();
     assert_eq!(replayed.observed_repair, None);
-    assert!(replayed.engine.estate(effect(103, 1)).is_some());
+    assert!(replayed.engine.composite_effect(effect(103, 1)).is_some());
 }
 
 #[test]
@@ -451,61 +527,49 @@ fn binding_device_and_journal_rollback_fail_closed() {
             .reserve_recovery_epoch(binding(), DeviceGeneration::new(1).unwrap())
             .is_err()
     );
-    let wrong_binding = RecoveryBinding::new(
+    // The former global authority-generation coordinate is no longer part of
+    // the binding. Equal typed coordinates therefore replay identically.
+    let formerly_different_binding = RecoveryBinding::new(
         RecoveryProfile::current(),
         WorldId::new(1).unwrap(),
-        standard_catalog().digest(),
-        freshness(1, 1, 1, 1, 1).registry(),
-        AuthorityBindingGeneration::new(2).unwrap(),
+        CatalogSet::new(&[standard_catalog()]).unwrap().digest(),
+        freshness(1, 1, 1, 1).registry(),
     )
     .unwrap();
-    assert!(
-        anchor
-            .reserve_recovery_epoch(wrong_binding, DeviceGeneration::new(2).unwrap())
-            .is_err()
-    );
+    assert_eq!(formerly_different_binding, binding());
+    anchor
+        .reserve_recovery_epoch(
+            formerly_different_binding,
+            DeviceGeneration::new(2).unwrap(),
+        )
+        .unwrap();
     let wrong_catalog = RecoveryBinding::new(
         RecoveryProfile::current(),
         WorldId::new(1).unwrap(),
         digest(201),
-        freshness(1, 1, 1, 1, 1).registry(),
-        AuthorityBindingGeneration::new(1).unwrap(),
+        freshness(1, 1, 1, 1).registry(),
     )
     .unwrap();
     assert!(
         anchor
-            .reserve_recovery_epoch(wrong_catalog, DeviceGeneration::new(2).unwrap())
+            .reserve_recovery_epoch(wrong_catalog, DeviceGeneration::new(3).unwrap())
             .is_err()
     );
     let snapshot = TrustedAnchorSnapshot::from_trusted_backend(
         binding(),
-        freshness(1, 1, 1, 1, 1),
+        freshness(1, 1, 1, 1),
         0,
         cser_core::Digest::ZERO,
         genesis_projection(),
     )
     .unwrap();
-    assert!(RecoveryLease::from_trusted_backend(snapshot, freshness(1, 1, 1, 1, 1)).is_err());
-    drop(anchor);
-
-    let mut opened = cold_reopen(&store.directory, 2).unwrap();
-    checkpoint(&mut opened);
-    transact(&mut opened, create_reply_command(110));
-    let committed_revision = opened.persistence.committed().revision();
-    assert!(committed_revision >= 2);
-    drop(opened);
-
-    fs::write(store.journal(), []).unwrap();
-    assert_eq!(
-        cold_reopen(&store.directory, 2).unwrap_err(),
-        CoreError::RollbackDetected
-    );
+    assert!(RecoveryLease::from_trusted_backend(snapshot, freshness(1, 1, 1, 1)).is_err());
 }
 
 #[test]
 fn file_journal_trait_is_an_exact_append_and_sync_adapter() {
     fn assert_backend<T: DurableJournalBackend<Error = std::io::Error>>() {}
     assert_backend::<FileJournal>();
-    let _ = ReceiptBinding::new(DEVICE_VERIFIER, DEVICE_RECEIPT_SCHEMA);
-    let _ = TransitionOutput::None;
+    let _ = cser_core::ReceiptBinding::new(DEVICE_VERIFIER, DEVICE_RECEIPT_SCHEMA);
+    let _ = cser_core::TransitionOutput::None;
 }

@@ -15,15 +15,15 @@ use crate::persistent_map::{StateMap, StateSet};
 use crate::{
     ArtifactBinding, ArtifactLeaseState, ArtifactPinChallenge, ArtifactPinVerifier,
     ArtifactReceiptBindings, ArtifactReleaseChallenge, ArtifactReleasePermit,
-    ArtifactReleaseVerifier, BootGeneration, ChargeAccountId, ClaimId, ClaimKindId,
+    ArtifactReleaseVerifier, BootGeneration, CatalogSet, ChargeAccountId, ClaimId, ClaimKindId,
     ClaimScopePolicy, ComponentId, CompositeKindId, ConflictMode, CreditClassId, DeviceGeneration,
     DeviceGenerationEffect, DeviceScopeId, Digest, DomainCatalog, DomainId, EffectId,
-    EvidenceKindId, Freshness, FreshnessAxes, JournalCheckpoint, JournalCheckpointDecodeError,
-    JournalDecodeError, JournalGeneration, JournalRecord, JournalRepair,
-    MAX_JOURNAL_CHECKPOINT_IMAGE_BYTES, ObligationKindId, ObligationPolicy, OperationId,
-    PrincipalIncarnation, ProviderCoordinate, ProviderGeneration, ProviderId, ReceiptSchemaId,
-    RecoveryBinding, RegistryInstance, ResourceGeneration, ResourceId, RootId, SnapshotId,
-    VerifierBinding, VerifierGeneration, VerifierId, WorldId, scan_journal, scan_journal_to_head,
+    EvidenceKindId, ExecutorCoordinate, Freshness, FreshnessAxes, JournalCheckpoint,
+    JournalCheckpointDecodeError, JournalDecodeError, JournalGeneration, JournalRecord,
+    JournalRepair, MAX_JOURNAL_CHECKPOINT_IMAGE_BYTES, ObligationKindId, ObligationPolicy,
+    OperationId, ProviderCoordinate, ProviderGeneration, ProviderId, ReceiptSchemaId,
+    RecoveryBinding, RegistryInstance, ResourceGeneration, ResourceId, SnapshotId, VerifierBinding,
+    VerifierGeneration, VerifierId, WorldId, scan_journal, scan_journal_to_head,
     validate_verifier_set,
 };
 
@@ -33,7 +33,8 @@ use crate::{
 pub(crate) fn reject_recognized_legacy_journal_prefix(
     bytes: &[u8],
 ) -> Result<(), JournalDecodeError> {
-    if bytes.starts_with(b"CSERJR8\0")
+    if bytes.starts_with(b"CSERJR9\0")
+        || bytes.starts_with(b"CSERJR8\0")
         || bytes.starts_with(b"CSERJR6\0")
         || bytes.starts_with(b"CSERJR7\0")
         || bytes.starts_with(b"CSERJR5\0")
@@ -54,13 +55,13 @@ pub enum ClaimScope {
 }
 
 /// Canonical, version-one description of the only child admitted by the
-/// profile-two handoff guard.  It is data, not authority: live installation
+/// bounded handoff guard.  It is data, not authority: live installation
 /// requires a [`VerifiedChildDescriptor`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ChildDescriptorV1 {
     /// Fixed descriptor grammar version.
     pub schema: u16,
-    /// Fixed child sequence below the parent's root.
+    /// Fixed child sequence below the parent's operation.
     pub sequence: u64,
     /// The retired source composite.
     pub parent: EffectId,
@@ -116,7 +117,7 @@ impl ChildDescriptorV1 {
         let mut at = 8;
         child_wire_put_u16(&mut bytes, &mut at, self.schema);
         child_wire_put_u64(&mut bytes, &mut at, self.sequence);
-        child_wire_put_u64(&mut bytes, &mut at, self.parent.root().get());
+        child_wire_put_u64(&mut bytes, &mut at, self.parent.operation().get());
         child_wire_put_u64(&mut bytes, &mut at, self.parent.sequence());
         child_wire_put_u32(&mut bytes, &mut at, self.parent_component.get());
         child_wire_put_digest(&mut bytes, &mut at, self.route_digest);
@@ -155,7 +156,7 @@ impl ChildDescriptorV1 {
         }
         let sequence = child_wire_u64(bytes, &mut at)?;
         let parent = EffectId::new(
-            RootId::new(child_wire_u64(bytes, &mut at)?)
+            OperationId::new(child_wire_u64(bytes, &mut at)?)
                 .map_err(|_| ChildDescriptorDecodeError::InvalidEncoding)?,
             child_wire_u64(bytes, &mut at)?,
         )
@@ -223,7 +224,7 @@ impl ChildDescriptorV1 {
         if sequence == 0 {
             sequence = 1;
         }
-        EffectId::new(self.parent.root(), sequence).map_err(|_| CoreError::InvalidPayload)
+        EffectId::new(self.parent.operation(), sequence).map_err(|_| CoreError::InvalidPayload)
     }
 }
 
@@ -260,7 +261,7 @@ pub struct HandoffResolutionChallenge {
     current_observation: Freshness,
     expected_verifier: VerifierId,
     expected_receipt_schema: ReceiptSchemaId,
-    expected_verifier_binding: Option<VerifierBinding>,
+    verification_scope: ProviderVerificationScope,
 }
 
 impl HandoffResolutionChallenge {
@@ -301,10 +302,103 @@ impl HandoffResolutionChallenge {
         self.expected_receipt_schema
     }
 
-    /// Returns the exact provider-generation verifier binding for a scoped
-    /// handoff challenge, when one is retained.
-    pub const fn expected_verifier_binding(self) -> Option<VerifierBinding> {
-        self.expected_verifier_binding
+    /// Returns the exact world/provider/catalog/verifier scope for this
+    /// challenge.
+    pub const fn verification_scope(self) -> ProviderVerificationScope {
+        self.verification_scope
+    }
+
+    /// Returns the verifier binding derived from the mandatory exact scope.
+    pub const fn expected_verifier_binding(self) -> VerifierBinding {
+        self.verification_scope.verifier_binding()
+    }
+}
+
+/// Role of a durable handoff recovery fact.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HandoffRecoveryRole {
+    /// Fact resolves the fenced source/parent operation.
+    Parent,
+    /// Fact resolves the fenced installed target/child operation.
+    Child,
+}
+
+/// Exact verifier-bound recovery fact for one handoff role.
+///
+/// The fact is durable evidence, not a fresh execution capability. Its
+/// coordinates bind the role, effect, component, external operation,
+/// descriptor, freshness, verifier provenance, and provider scope together so
+/// replay cannot move evidence across handoff roles or provider generations.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VerifiedHandoffRecoveryFact {
+    role: HandoffRecoveryRole,
+    effect: EffectId,
+    component: ComponentId,
+    operation: Digest,
+    descriptor_digest: Digest,
+    freshness: Freshness,
+    stamp: VerifierStamp,
+    verification_scope: ProviderVerificationScope,
+}
+
+impl VerifiedHandoffRecoveryFact {
+    fn from_challenge(
+        role: HandoffRecoveryRole,
+        challenge: HandoffResolutionChallenge,
+        stamp: VerifierStamp,
+    ) -> Self {
+        Self {
+            role,
+            effect: challenge.effect(),
+            component: challenge.component(),
+            operation: challenge.operation(),
+            descriptor_digest: handoff_descriptor_digest(challenge.descriptor()),
+            freshness: challenge.current_observation(),
+            stamp,
+            verification_scope: challenge.verification_scope(),
+        }
+    }
+
+    /// Returns the handoff role authenticated by this fact.
+    pub const fn role(self) -> HandoffRecoveryRole {
+        self.role
+    }
+
+    /// Returns the exact effect authenticated by this fact.
+    pub const fn effect(self) -> EffectId {
+        self.effect
+    }
+
+    /// Returns the exact component authenticated by this fact.
+    pub const fn component(self) -> ComponentId {
+        self.component
+    }
+
+    /// Returns the exact external operation digest authenticated by this fact.
+    pub const fn operation(self) -> Digest {
+        self.operation
+    }
+
+    /// Returns the canonical handoff descriptor digest authenticated by this
+    /// fact.
+    pub const fn descriptor_digest(self) -> Digest {
+        self.descriptor_digest
+    }
+
+    /// Returns the exact freshness at which the fact was verified.
+    pub const fn freshness(self) -> Freshness {
+        self.freshness
+    }
+
+    /// Returns complete verifier identity and receipt provenance.
+    pub const fn stamp(self) -> VerifierStamp {
+        self.stamp
+    }
+
+    /// Returns the exact provider/world/catalog scope authenticated by this
+    /// fact.
+    pub const fn verification_scope(self) -> ProviderVerificationScope {
+        self.verification_scope
     }
 }
 
@@ -350,7 +444,7 @@ pub trait HandoffChildResolutionVerifier {
 #[derive(Debug, Eq, PartialEq)]
 pub struct VerifiedHandoffResolution {
     descriptor: VerifiedChildDescriptor,
-    terminal_receipt_digest: Digest,
+    fact: VerifiedHandoffRecoveryFact,
 }
 
 impl VerifiedHandoffResolution {
@@ -358,8 +452,8 @@ impl VerifiedHandoffResolution {
     pub fn resolve(self) -> Command {
         Command(CommandKind::ResolveIndeterminateHandoffParent {
             descriptor: self.descriptor.descriptor,
-            terminal_receipt_digest: self.terminal_receipt_digest,
             descriptor_receipt_digest: self.descriptor.receipt_digest,
+            fact: self.fact,
         })
     }
 }
@@ -368,7 +462,7 @@ impl VerifiedHandoffResolution {
 #[derive(Debug, Eq, PartialEq)]
 pub struct VerifiedHandoffChildResolution {
     descriptor: VerifiedChildDescriptor,
-    terminal_receipt_digest: Digest,
+    fact: VerifiedHandoffRecoveryFact,
 }
 
 impl VerifiedHandoffChildResolution {
@@ -376,8 +470,8 @@ impl VerifiedHandoffChildResolution {
     pub fn resolve(self) -> Command {
         Command(CommandKind::ResolveIndeterminateHandoffParent {
             descriptor: self.descriptor.descriptor,
-            terminal_receipt_digest: self.terminal_receipt_digest,
             descriptor_receipt_digest: self.descriptor.receipt_digest,
+            fact: self.fact,
         })
     }
 }
@@ -385,22 +479,22 @@ impl VerifiedHandoffChildResolution {
 /// Authority state of one effect.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AuthorityState {
-    /// The exact current incarnation may still act.
+    /// The exact current executor may still act.
     Active,
-    /// The originating or successor incarnation has been fenced.
+    /// The originating or successor executor has been fenced.
     Fenced,
     /// Revocation won the action gate.
     Revoked,
 }
 
-/// Principal or kernel object currently responsible for an estate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Durable custody of an effect obligation.
 pub enum CustodyState {
-    /// A live, exact principal incarnation is the operational custodian.
-    Principal(PrincipalIncarnation),
-    /// The non-authorizing kernel estate retains the obligation post mortem.
-    KernelEstate,
-    /// The estate has settled and released every physical claim.
+    /// The exact executor coordinate currently holds the obligation.
+    Executor(ExecutorCoordinate),
+    /// The non-authorizing core retains the obligation post mortem.
+    CoreOwned,
+    /// The effect has settled and released every physical claim.
     Released,
 }
 
@@ -422,8 +516,8 @@ pub enum EffectEscapeState {
 /// Core-owned projection of the current custodian for one component claim.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ClaimCustodian {
-    /// A logical claim is retained by the non-authorizing kernel estate.
-    KernelEstate,
+    /// A logical claim is retained by the non-authorizing core.
+    CoreOwned,
     /// A physical claim is retained by the provider for one exact device scope.
     DeviceProvider(DeviceScopeId),
     /// Typed retirement evidence released the old resource generation.
@@ -456,16 +550,16 @@ pub enum OutcomeState {
     Indeterminate(Digest),
 }
 
-/// Physical retirement state of an estate's claims.
+/// Physical retirement state of an effect's claims.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RetirementState {
     /// Claims exist but the effect has not crossed its commit boundary.
     Held,
     /// One or more claims await typed retirement evidence.
     RetirementPending,
-    /// Every claim has been retired but the estate record remains.
+    /// Every claim has been retired but the effect record remains.
     Retired,
-    /// The terminal estate was explicitly released.
+    /// The terminal effect was explicitly released.
     Released,
 }
 
@@ -483,22 +577,22 @@ pub enum SettlementState {
     },
     /// A successor holds the settlement authority.
     Claimed {
-        /// Exact claimant incarnation.
-        claimant: PrincipalIncarnation,
+        /// Exact claimant executor.
+        claimant: ExecutorCoordinate,
         /// Monotonic claim generation.
         generation: u64,
     },
     /// Publication or reconciliation intent is durable before external apply.
     ApplyIntentDurable {
-        /// Exact claimant incarnation.
-        claimant: PrincipalIncarnation,
+        /// Exact claimant executor.
+        claimant: ExecutorCoordinate,
         /// Monotonic claim generation.
         generation: u64,
     },
     /// External apply happened but acknowledgement is not durably settled.
     AppliedUnacknowledged {
-        /// Exact claimant incarnation.
-        claimant: PrincipalIncarnation,
+        /// Exact claimant executor.
+        claimant: ExecutorCoordinate,
         /// Monotonic claim generation.
         generation: u64,
     },
@@ -519,23 +613,19 @@ pub enum SettlementState {
     Revoked,
 }
 
-/// Recovery lane state for one causal root.
+/// Recovery lane state for one causal operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RootRecoveryState {
-    /// A live binding owns future authority.
+pub enum OperationRecoveryState {
+    /// The operation is authorized for the exact live executor coordinate.
     Active {
-        /// Exact live incarnation.
-        incarnation: PrincipalIncarnation,
-        /// Exact binding generation.
-        binding_generation: u64,
+        /// Exact live executor.
+        executor: ExecutorCoordinate,
     },
-    /// The previous binding is fenced and no snapshot is active.
+    /// The prior executor coordinate has been durably fenced.
     Fenced {
-        /// Last fenced incarnation.
-        crashed: PrincipalIncarnation,
-        /// Last fenced binding generation.
-        binding_generation: u64,
-        /// Number of observed crashes for this root.
+        /// Last fenced executor.
+        crashed: ExecutorCoordinate,
+        /// Number of observed crashes for this operation.
         crash_generation: u64,
     },
     /// A stable non-authorizing recovery snapshot exists.
@@ -545,31 +635,27 @@ pub enum RootRecoveryState {
         /// Snapshot contents digest.
         digest: Digest,
     },
-    /// A fresh incarnation declared itself ready for the exact snapshot.
+    /// A fresh executor declared itself ready for the exact snapshot.
     Ready {
         /// Snapshot identity.
         snapshot: SnapshotId,
-        /// Ready successor incarnation.
-        successor: PrincipalIncarnation,
+        /// Ready successor executor.
+        successor: ExecutorCoordinate,
     },
-    /// The fresh incarnation is rebound but owns no old obligation implicitly.
+    /// The fresh executor is rebound but owns no old obligation implicitly.
     Rebound {
-        /// Rebound successor incarnation.
-        successor: PrincipalIncarnation,
-        /// New binding generation.
-        binding_generation: u64,
+        /// Rebound successor executor.
+        successor: ExecutorCoordinate,
     },
     /// Crash fencing succeeded, but automatic recovery may not mint authority.
     ///
-    /// Reaching this state is fail-closed: the dead incarnation and every
-    /// estate are fenced, while snapshot/ready/rebind/adoption require an
+    /// Reaching this state is fail-closed: the dead executor and every
+    /// composite effect are fenced, while snapshot/ready/rebind/adoption require an
     /// explicit operator recovery mechanism outside the automatic lane.
     RecoveryExhausted {
-        /// Last incarnation whose authority was fenced.
-        crashed: PrincipalIncarnation,
-        /// Last binding generation whose authority was fenced.
-        binding_generation: u64,
-        /// Saturating number of observed crashes for this root.
+        /// Last executor whose authority was fenced.
+        crashed: ExecutorCoordinate,
+        /// Saturating number of observed crashes for this operation.
         crash_generation: u64,
     },
 }
@@ -577,57 +663,57 @@ pub enum RootRecoveryState {
 /// Bounded capacity and pressure policy for one core instance.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CoreLimits {
-    max_roots: usize,
-    max_estates: usize,
+    max_operations: usize,
+    max_effects: usize,
     max_total_claims: usize,
     max_resource_records: usize,
-    max_claims_per_estate: usize,
+    max_claims_per_effect: usize,
     max_units_per_account: u64,
-    max_crashes_per_root: u64,
+    max_crashes_per_operation: u64,
 }
 
 impl CoreLimits {
     /// Creates a non-zero bounded policy.
     pub const fn new(
-        max_roots: usize,
-        max_estates: usize,
+        max_operations: usize,
+        max_effects: usize,
         max_total_claims: usize,
         max_resource_records: usize,
-        max_claims_per_estate: usize,
+        max_claims_per_effect: usize,
         max_units_per_account: u64,
-        max_crashes_per_root: u64,
+        max_crashes_per_operation: u64,
     ) -> Result<Self, CoreError> {
-        if max_roots == 0
-            || max_estates == 0
+        if max_operations == 0
+            || max_effects == 0
             || max_total_claims == 0
             || max_resource_records == 0
-            || max_claims_per_estate == 0
+            || max_claims_per_effect == 0
             || max_units_per_account == 0
-            || max_crashes_per_root == 0
+            || max_crashes_per_operation == 0
         {
             return Err(CoreError::InvalidLimits);
         }
         Ok(Self {
-            max_roots,
-            max_estates,
+            max_operations,
+            max_effects,
             max_total_claims,
             max_resource_records,
-            max_claims_per_estate,
+            max_claims_per_effect,
             max_units_per_account,
-            max_crashes_per_root,
+            max_crashes_per_operation,
         })
     }
 
     /// Returns a conservative test and single-service profile.
     pub const fn bounded_default() -> Self {
         Self {
-            max_roots: 64,
-            max_estates: 1024,
+            max_operations: 64,
+            max_effects: 1024,
             max_total_claims: 4096,
             max_resource_records: 4096,
-            max_claims_per_estate: 32,
+            max_claims_per_effect: 32,
             max_units_per_account: 1 << 20,
-            max_crashes_per_root: 1024,
+            max_crashes_per_operation: 1024,
         }
     }
 }
@@ -638,30 +724,11 @@ pub struct VerifierIdentity {
     verifier: VerifierId,
     epoch: u64,
     receipt_schema: ReceiptSchemaId,
-    implementation_digest: Option<Digest>,
+    implementation_digest: Digest,
 }
 
 impl VerifierIdentity {
-    /// Creates one non-zero verifier incarnation and receipt schema.
-    pub const fn new(
-        verifier: VerifierId,
-        epoch: u64,
-        receipt_schema: ReceiptSchemaId,
-    ) -> Result<Self, CoreError> {
-        if epoch == 0 {
-            Err(CoreError::InvalidPayload)
-        } else {
-            Ok(Self {
-                verifier,
-                epoch,
-                receipt_schema,
-                implementation_digest: None,
-            })
-        }
-    }
-
     /// Creates an exact verifier identity bound to a provider-generation
-    /// verifier binding.  Scoped challenges require this constructor so a
     /// verifier cannot satisfy a challenge with only its class, epoch, and
     /// schema while silently changing implementation.
     pub const fn new_exact(binding: VerifierBinding) -> Self {
@@ -669,7 +736,7 @@ impl VerifierIdentity {
             verifier: binding.verifier(),
             epoch: binding.generation().get(),
             receipt_schema: binding.receipt_schema(),
-            implementation_digest: Some(binding.implementation_digest()),
+            implementation_digest: binding.implementation_digest(),
         }
     }
 
@@ -678,7 +745,7 @@ impl VerifierIdentity {
         self.verifier
     }
 
-    /// Returns the exact verifier incarnation epoch.
+    /// Returns the exact verifier executor epoch.
     pub const fn epoch(self) -> u64 {
         self.epoch
     }
@@ -688,10 +755,8 @@ impl VerifierIdentity {
         self.receipt_schema
     }
 
-    /// Returns the exact implementation identity when this is a scoped
-    /// verifier identity. Legacy identities created by [`Self::new`] return
-    /// `None` and are intentionally rejected for scoped challenges.
-    pub const fn implementation_digest(self) -> Option<Digest> {
+    /// Returns the exact implementation identity.
+    pub const fn implementation_digest(self) -> Digest {
         self.implementation_digest
     }
 }
@@ -744,7 +809,7 @@ impl ProviderVerificationScope {
         self.catalog_digest
     }
 
-    /// Returns the exact verifier-generation binding retained by the provider.
+    /// Returns the verifier binding selected by the catalog.
     pub const fn verifier_binding(self) -> VerifierBinding {
         self.verifier_binding
     }
@@ -754,7 +819,7 @@ impl ProviderVerificationScope {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EvidenceChallenge {
     effect: EffectId,
-    component: Option<ComponentId>,
+    component: ComponentId,
     claim: ClaimId,
     domain: DomainId,
     kind: EvidenceKindId,
@@ -765,8 +830,8 @@ pub struct EvidenceChallenge {
     current_observation: Freshness,
     expected_verifier: VerifierId,
     expected_receipt_schema: ReceiptSchemaId,
-    expected_verifier_binding: Option<VerifierBinding>,
-    verification_scope: Option<ProviderVerificationScope>,
+    expected_verifier_binding: VerifierBinding,
+    verification_scope: ProviderVerificationScope,
 }
 
 impl EvidenceChallenge {
@@ -776,7 +841,7 @@ impl EvidenceChallenge {
     }
 
     /// Returns the component slot for a composite-effect claim.
-    pub const fn component(self) -> Option<ComponentId> {
+    pub const fn component(self) -> ComponentId {
         self.component
     }
 
@@ -830,15 +895,14 @@ impl EvidenceChallenge {
         self.expected_receipt_schema
     }
 
-    /// Returns the exact provider-generation verifier binding for a scoped
-    /// challenge. Unscoped legacy effects expose no provider binding.
-    pub const fn expected_verifier_binding(self) -> Option<VerifierBinding> {
+    /// Returns the expected verifier binding, when the challenge is typed.
+    pub const fn expected_verifier_binding(self) -> VerifierBinding {
         self.expected_verifier_binding
     }
 
-    /// Returns the exact world/provider/operation/catalog scope for a scoped
-    /// component challenge. Legacy unscoped challenges return `None`.
-    pub const fn verification_scope(self) -> Option<ProviderVerificationScope> {
+    /// Returns the exact world/provider/operation/catalog scope for this
+    /// component challenge.
+    pub const fn verification_scope(self) -> ProviderVerificationScope {
         self.verification_scope
     }
 }
@@ -935,10 +999,10 @@ pub enum ExternalOutcome {
 pub struct EffectFactChallenge {
     kind: EffectFactKind,
     effect: EffectId,
-    component: Option<ComponentId>,
+    component: ComponentId,
     domain: DomainId,
     obligation: ObligationKindId,
-    actor: PrincipalIncarnation,
+    actor: ExecutorCoordinate,
     generation: u64,
     nonce: u64,
     operation: Digest,
@@ -946,8 +1010,8 @@ pub struct EffectFactChallenge {
     current_observation: Freshness,
     expected_verifier: VerifierId,
     expected_receipt_schema: ReceiptSchemaId,
-    expected_verifier_binding: Option<VerifierBinding>,
-    verification_scope: Option<ProviderVerificationScope>,
+    expected_verifier_binding: VerifierBinding,
+    verification_scope: ProviderVerificationScope,
 }
 
 impl EffectFactChallenge {
@@ -962,7 +1026,7 @@ impl EffectFactChallenge {
     }
 
     /// Returns the component slot for a composite-effect fact.
-    pub const fn component(self) -> Option<ComponentId> {
+    pub const fn component(self) -> ComponentId {
         self.component
     }
 
@@ -976,8 +1040,8 @@ impl EffectFactChallenge {
         self.obligation
     }
 
-    /// Returns the exact committing principal or settlement claimant.
-    pub const fn actor(self) -> PrincipalIncarnation {
+    /// Returns the exact executor coordinate which authored the fact.
+    pub const fn actor(self) -> ExecutorCoordinate {
         self.actor
     }
 
@@ -1016,15 +1080,14 @@ impl EffectFactChallenge {
         self.expected_receipt_schema
     }
 
-    /// Returns the exact provider-generation verifier binding for a scoped
-    /// challenge. Unscoped legacy effects expose no provider binding.
-    pub const fn expected_verifier_binding(self) -> Option<VerifierBinding> {
+    /// Returns the expected verifier binding, when the challenge is typed.
+    pub const fn expected_verifier_binding(self) -> VerifierBinding {
         self.expected_verifier_binding
     }
 
-    /// Returns the exact world/provider/operation/catalog scope for a scoped
-    /// component challenge. Legacy unscoped challenges return `None`.
-    pub const fn verification_scope(self) -> Option<ProviderVerificationScope> {
+    /// Returns the exact world/provider/operation/catalog scope for this
+    /// component challenge.
+    pub const fn verification_scope(self) -> ProviderVerificationScope {
         self.verification_scope
     }
 }
@@ -1111,20 +1174,20 @@ impl VerifierStamp {
 pub(crate) struct VerifiedEffectFact {
     kind: EffectFactKind,
     effect: EffectId,
-    component: Option<ComponentId>,
-    actor: PrincipalIncarnation,
+    component: ComponentId,
+    actor: ExecutorCoordinate,
     generation: u64,
     nonce: u64,
     operation: Digest,
     predecessor: Option<Digest>,
     freshness: Freshness,
     stamp: VerifierStamp,
-    verification_scope: Option<ProviderVerificationScope>,
+    verification_scope: ProviderVerificationScope,
     outcome: Option<ExternalOutcome>,
 }
 
 impl VerifiedEffectFact {
-    pub(crate) const fn verification_scope(self) -> Option<ProviderVerificationScope> {
+    pub(crate) const fn verification_scope(self) -> ProviderVerificationScope {
         self.verification_scope
     }
 }
@@ -1146,7 +1209,7 @@ pub struct VerifiedCommitOutcome(VerifiedEffectFact);
 
 impl VerifiedCommitOutcome {
     /// Returns the exact scope retained by the verified commit token.
-    pub const fn verification_scope(&self) -> Option<ProviderVerificationScope> {
+    pub const fn verification_scope(&self) -> ProviderVerificationScope {
         self.0.verification_scope()
     }
 }
@@ -1157,7 +1220,7 @@ pub struct VerifiedApplyReceipt(VerifiedEffectFact);
 
 impl VerifiedApplyReceipt {
     /// Returns the exact scope retained by the verified apply token.
-    pub const fn verification_scope(&self) -> Option<ProviderVerificationScope> {
+    pub const fn verification_scope(&self) -> ProviderVerificationScope {
         self.0.verification_scope()
     }
 }
@@ -1168,7 +1231,7 @@ pub struct VerifiedSettlementAck(VerifiedEffectFact);
 
 impl VerifiedSettlementAck {
     /// Returns the exact scope retained by the verified settlement token.
-    pub const fn verification_scope(&self) -> Option<ProviderVerificationScope> {
+    pub const fn verification_scope(&self) -> ProviderVerificationScope {
         self.0.verification_scope()
     }
 }
@@ -1227,21 +1290,21 @@ pub(crate) struct RetirementEvidence {
     subject: Freshness,
     freshness: Freshness,
     stamp: VerifierStamp,
-    verification_scope: Option<ProviderVerificationScope>,
+    verification_scope: ProviderVerificationScope,
 }
 
 /// Non-forgeable verified fact for one exact effect/claim pair.
 #[derive(Debug, Eq, PartialEq)]
 pub struct VerifiedRetirementEvidence {
     effect: EffectId,
-    component: Option<ComponentId>,
+    component: ComponentId,
     claim: ClaimId,
     evidence: RetirementEvidence,
 }
 
 impl VerifiedRetirementEvidence {
     /// Returns the exact scope retained by the verified evidence token.
-    pub const fn verification_scope(&self) -> Option<ProviderVerificationScope> {
+    pub const fn verification_scope(&self) -> ProviderVerificationScope {
         self.evidence.verification_scope
     }
 }
@@ -1249,18 +1312,11 @@ impl VerifiedRetirementEvidence {
 impl VerifiedRetirementEvidence {
     /// Consumes this verified fact into the only live evidence-ingress command.
     pub fn submit(self) -> Command {
-        Command(match self.component {
-            Some(component) => CommandKind::SubmitComponentEvidence {
-                effect: self.effect,
-                component,
-                claim: self.claim,
-                evidence: self.evidence,
-            },
-            None => CommandKind::SubmitEvidence {
-                effect: self.effect,
-                claim: self.claim,
-                evidence: self.evidence,
-            },
+        Command(CommandKind::SubmitComponentEvidence {
+            effect: self.effect,
+            component: self.component,
+            claim: self.claim,
+            evidence: self.evidence,
         })
     }
 }
@@ -1272,32 +1328,31 @@ impl VerifiedChildDescriptor {
         self.descriptor
     }
 
-    /// Consumes the verifier-minted descriptor into the atomic child install.
+    /// Consumes the verifier-minted descriptor into an atomic child install
+    /// carrying the exact target provider generation.
     pub fn install(
         self,
-        origin: PrincipalIncarnation,
-        binding_generation: u64,
+        origin: ExecutorCoordinate,
         charge_account: ChargeAccountId,
+        provider: ComponentProviderBinding,
     ) -> Command {
         Command(CommandKind::InstallHandoffChild {
             descriptor: self.descriptor,
             origin,
-            binding_generation,
             charge_account,
+            provider,
         })
     }
 
     /// Creates the sole atomic source-release/target-intent command.
     pub fn release_source_and_record_target_intent(
         self,
-        actor: PrincipalIncarnation,
-        binding_generation: u64,
+        actor: ExecutorCoordinate,
         operation: Digest,
     ) -> Command {
         Command(CommandKind::ReleaseHandoffSourceAndRecordTargetIntent {
             descriptor: self.descriptor,
             actor,
-            binding_generation,
             operation,
         })
     }
@@ -1450,16 +1505,6 @@ pub struct ProviderGenerationProjection {
 }
 
 impl Command {
-    /// Returns whether this command belongs to the profile-2 composite state
-    /// machine or to a lifecycle transition shared by both profiles.
-    ///
-    /// A production profile-2 Registry uses this classification at every
-    /// trusted ingress. Offline profile-1 conformance binaries may continue to
-    /// execute the rejected singleton variants directly against an `Engine`.
-    pub const fn is_profile_two_compatible(&self) -> bool {
-        self.0.is_profile_two_compatible()
-    }
-
     /// Returns stable normalized trace coordinates without granting authority.
     pub const fn coordinates(&self) -> TransitionCoordinates {
         self.0.coordinates()
@@ -1526,63 +1571,10 @@ pub(crate) enum CommandKind {
     /// Atomically admits a composite effect with exact provider bindings.
     AdmitScopedCompositeEffect {
         effect: EffectId,
-        operation: OperationId,
-        origin: PrincipalIncarnation,
-        binding_generation: u64,
+        origin: ExecutorCoordinate,
         kind: CompositeKindId,
         charge_account: ChargeAccountId,
         bindings: Vec<ComponentProviderBinding>,
-    },
-    /// Creates one registered causal estate and its root if absent.
-    CreateEstate {
-        /// Stable effect identity.
-        effect: EffectId,
-        /// Exact originating principal incarnation.
-        origin: PrincipalIncarnation,
-        /// Initial binding generation.
-        binding_generation: u64,
-        /// Domain defining the obligation.
-        domain: DomainId,
-        /// Domain-defined obligation class.
-        obligation: ObligationKindId,
-        /// Account charged for retained claims.
-        charge_account: ChargeAccountId,
-    },
-    /// Creates one catalog-bound heterogeneous effect under one authority gate.
-    CreateCompositeEffect {
-        /// Stable escaped-effect identity.
-        effect: EffectId,
-        /// Exact originating principal incarnation.
-        origin: PrincipalIncarnation,
-        /// Initial binding generation.
-        binding_generation: u64,
-        /// Catalog-defined component product.
-        kind: CompositeKindId,
-        /// Account charged for every retained component claim.
-        charge_account: ChargeAccountId,
-    },
-    /// Adds one typed claim before effect preparation.
-    AddClaim {
-        /// Stable effect identity.
-        effect: EffectId,
-        /// Exact live principal requesting the enrollment.
-        actor: PrincipalIncarnation,
-        /// Exact live binding generation.
-        binding_generation: u64,
-        /// Stable claim identity.
-        claim: ClaimId,
-        /// Domain defining the claim.
-        domain: DomainId,
-        /// Domain-defined claim class.
-        kind: ClaimKindId,
-        /// Exact logical or device scope of this claim.
-        scope: ClaimScope,
-        /// Exact resource protected by the claim.
-        resource: ResourceId,
-        /// Exact allocation generation of the protected resource.
-        resource_generation: ResourceGeneration,
-        /// Conserved resource units.
-        units: u64,
     },
     /// Adds one claim to an exact catalog-defined component.
     AddComponentClaim {
@@ -1591,9 +1583,7 @@ pub(crate) enum CommandKind {
         /// Exact component slot.
         component: ComponentId,
         /// Exact live actor.
-        actor: PrincipalIncarnation,
-        /// Exact live binding generation.
-        binding_generation: u64,
+        actor: ExecutorCoordinate,
         /// Stable claim identity, unique within the parent effect.
         claim: ClaimId,
         /// Domain-defined claim class.
@@ -1607,34 +1597,12 @@ pub(crate) enum CommandKind {
         /// Conserved resource units.
         units: u64,
     },
-    /// Freezes claim enrollment and prepares the effect.
-    PrepareEffect {
-        /// Stable effect identity.
-        effect: EffectId,
-        /// Exact live principal preparing the effect.
-        actor: PrincipalIncarnation,
-        /// Exact live binding generation.
-        binding_generation: u64,
-    },
     /// Freezes claim enrollment for every component atomically.
     PrepareCompositeEffect {
         /// Shared parent effect.
         effect: EffectId,
         /// Exact live actor.
-        actor: PrincipalIncarnation,
-        /// Exact live binding generation.
-        binding_generation: u64,
-    },
-    /// Durably records intent before an external commit point.
-    RecordCommitIntent {
-        /// Stable effect identity.
-        effect: EffectId,
-        /// Exact live principal crossing the commit gate.
-        actor: PrincipalIncarnation,
-        /// Exact live binding generation.
-        binding_generation: u64,
-        /// Digest of the external operation coordinates.
-        operation: Digest,
+        actor: ExecutorCoordinate,
     },
     /// Records a component-local write-ahead external commit intent.
     RecordComponentCommitIntent {
@@ -1643,9 +1611,7 @@ pub(crate) enum CommandKind {
         /// Exact component crossing its commit gate.
         component: ComponentId,
         /// Exact live actor.
-        actor: PrincipalIncarnation,
-        /// Exact live binding generation.
-        binding_generation: u64,
+        actor: ExecutorCoordinate,
         /// Digest of the external operation coordinates.
         operation: Digest,
     },
@@ -1654,9 +1620,7 @@ pub(crate) enum CommandKind {
         /// Shared parent effect.
         effect: EffectId,
         /// Exact live actor.
-        actor: PrincipalIncarnation,
-        /// Exact live binding generation.
-        binding_generation: u64,
+        actor: ExecutorCoordinate,
         /// Complete catalog-ordered component operation set.
         operations: Vec<ComponentCommitOperation>,
     },
@@ -1665,68 +1629,53 @@ pub(crate) enum CommandKind {
         /// Verifier-bound exact commit fact.
         fact: VerifiedEffectFact,
     },
-    /// Fences one exact live incarnation and preserves committed estates.
-    FenceIncarnation {
-        /// Causal root being fenced.
-        root: RootId,
-        /// Exact crashed incarnation.
-        crashed: PrincipalIncarnation,
-        /// Exact old binding generation.
-        binding_generation: u64,
+    /// Fences one exact live executor and preserves committed composites.
+    FenceExecutor {
+        /// Causal operation being fenced.
+        operation: OperationId,
+        /// Exact crashed executor.
+        crashed: ExecutorCoordinate,
     },
     /// Captures a stable, non-authorizing recovery snapshot.
     Snapshot {
-        /// Causal root being recovered.
-        root: RootId,
+        /// Causal operation being recovered.
+        operation: OperationId,
         /// Snapshot identity.
         snapshot: SnapshotId,
         /// Digest of the complete snapshot projection.
         digest: Digest,
     },
-    /// Marks a fresh incarnation ready for an exact snapshot.
+    /// Marks a fresh executor ready for an exact snapshot.
     Ready {
-        /// Causal root being recovered.
-        root: RootId,
+        /// Causal operation being recovered.
+        operation: OperationId,
         /// Exact snapshot identity.
         snapshot: SnapshotId,
-        /// Fresh successor incarnation.
-        successor: PrincipalIncarnation,
+        /// Fresh successor executor.
+        successor: ExecutorCoordinate,
     },
-    /// Installs a fresh binding without implicitly adopting any effect.
+    /// Binds a fresh executor coordinate to an exact recovery snapshot.
     Rebind {
-        /// Causal root being recovered.
-        root: RootId,
+        /// Causal operation being recovered.
+        operation: OperationId,
         /// Exact snapshot identity.
         snapshot: SnapshotId,
-        /// Fresh successor incarnation.
-        successor: PrincipalIncarnation,
-        /// New binding generation.
-        binding_generation: u64,
+        /// Fresh successor executor.
+        successor: ExecutorCoordinate,
     },
     /// Explicitly transfers one uncommitted orphan into successor custody.
     AdoptEffect {
         /// Stable orphan effect identity.
         effect: EffectId,
-        /// Exact rebound successor incarnation.
-        successor: PrincipalIncarnation,
-        /// Exact rebound binding generation.
-        binding_generation: u64,
+        /// Exact rebound successor executor.
+        successor: ExecutorCoordinate,
     },
     /// Refreshes wholly-precommit component claims after explicit adoption.
     RebaseCompositePrecommitClaims {
         /// Stable adopted composite effect identity.
         effect: EffectId,
-        /// Exact active successor incarnation.
-        actor: PrincipalIncarnation,
-        /// Exact active successor binding generation.
-        binding_generation: u64,
-    },
-    /// Claims one exact committed obligation for settlement.
-    ClaimSettlement {
-        /// Stable effect identity.
-        effect: EffectId,
-        /// Exact rebound claimant.
-        claimant: PrincipalIncarnation,
+        /// Exact active successor executor.
+        actor: ExecutorCoordinate,
     },
     /// Claims one exact committed component obligation for settlement.
     ClaimComponentSettlement {
@@ -1735,20 +1684,7 @@ pub(crate) enum CommandKind {
         /// Exact successor-settled component.
         component: ComponentId,
         /// Exact rebound claimant.
-        claimant: PrincipalIncarnation,
-    },
-    /// Durably records settlement intent before publication or reconciliation.
-    RecordApplyIntent {
-        /// Stable effect identity.
-        effect: EffectId,
-        /// Exact claimant incarnation.
-        claimant: PrincipalIncarnation,
-        /// Claim generation.
-        generation: u64,
-        /// Secret one-shot nonce.
-        nonce: u64,
-        /// Digest of the intended external action.
-        intent: Digest,
+        claimant: ExecutorCoordinate,
     },
     /// Records component-local settlement intent before external apply.
     RecordComponentApplyIntent {
@@ -1756,8 +1692,8 @@ pub(crate) enum CommandKind {
         effect: EffectId,
         /// Exact component.
         component: ComponentId,
-        /// Exact claimant incarnation.
-        claimant: PrincipalIncarnation,
+        /// Exact claimant executor.
+        claimant: ExecutorCoordinate,
         /// Claim generation.
         generation: u64,
         /// Secret one-shot nonce.
@@ -1775,27 +1711,14 @@ pub(crate) enum CommandKind {
         /// Verifier-bound exact settlement acknowledgement.
         fact: VerifiedEffectFact,
     },
-    /// Closes settlement honestly with an indeterminate result.
-    MarkIndeterminate {
-        /// Stable effect identity.
-        effect: EffectId,
-        /// Exact claimant incarnation.
-        claimant: PrincipalIncarnation,
-        /// Claim generation.
-        generation: u64,
-        /// Secret one-shot nonce.
-        nonce: u64,
-        /// Digest describing the unresolved outcome.
-        reason: Digest,
-    },
     /// Closes one component settlement authority with an indeterminate result.
     MarkComponentIndeterminate {
         /// Shared parent effect.
         effect: EffectId,
         /// Exact component.
         component: ComponentId,
-        /// Exact claimant incarnation.
-        claimant: PrincipalIncarnation,
+        /// Exact claimant executor.
+        claimant: ExecutorCoordinate,
         /// Claim generation.
         generation: u64,
         /// Secret one-shot nonce.
@@ -1810,21 +1733,10 @@ pub(crate) enum CommandKind {
     BeginRevoke {
         /// Stable effect identity.
         effect: EffectId,
-        /// Exact live root actor authorizing this revoke attempt.
-        expected_actor: PrincipalIncarnation,
-        /// Exact live root binding authorizing this revoke attempt.
-        binding_generation: u64,
-        /// Exact estate authority epoch observed before the race.
+        /// Exact live operation actor authorizing this revoke attempt.
+        expected_actor: ExecutorCoordinate,
+        /// Exact composite authority epoch observed before the race.
         authority_epoch: u64,
-    },
-    /// Submits typed, freshness-bound evidence for one exact resource claim.
-    SubmitEvidence {
-        /// Stable effect identity.
-        effect: EffectId,
-        /// Stable claim identity.
-        claim: ClaimId,
-        /// Typed retirement evidence.
-        evidence: RetirementEvidence,
     },
     /// Submits typed evidence for one exact component-local resource claim.
     SubmitComponentEvidence {
@@ -1846,40 +1758,10 @@ pub(crate) enum CommandKind {
         /// Device generation observed behind boot quarantine.
         device: DeviceGeneration,
     },
-    /// Releases a settled, fully retired estate record.
-    ReleaseEstate {
-        /// Stable effect identity.
-        effect: EffectId,
-    },
     /// Releases a fully terminal composite effect record.
     ReleaseCompositeEffect {
         /// Shared parent effect.
         effect: EffectId,
-    },
-    /// Durably reserves the next allocation generation after exact retirement.
-    ReserveReuse {
-        /// Estate which will retain the new generation before hardware use.
-        effect: EffectId,
-        /// Exact live principal requesting the reuse reservation.
-        actor: PrincipalIncarnation,
-        /// Exact live binding generation.
-        binding_generation: u64,
-        /// Stable claim identity for the new allocation generation.
-        claim: ClaimId,
-        /// Domain defining the claim.
-        domain: DomainId,
-        /// Domain-defined claim class.
-        kind: ClaimKindId,
-        /// Exact logical or device scope of the new claim.
-        scope: ClaimScope,
-        /// Stable resource identity.
-        resource: ResourceId,
-        /// Exact retired generation which is being advanced.
-        expected_generation: ResourceGeneration,
-        /// Conserved resource units retained before hardware reuse.
-        units: u64,
-        /// Provider-defined physical layout and drain contract digest.
-        reuse_contract: Digest,
     },
     /// Reserves a retired resource generation for one exact component.
     ReserveComponentReuse {
@@ -1888,9 +1770,7 @@ pub(crate) enum CommandKind {
         /// Component retaining the next generation.
         component: ComponentId,
         /// Exact live actor.
-        actor: PrincipalIncarnation,
-        /// Exact live binding generation.
-        binding_generation: u64,
+        actor: ExecutorCoordinate,
         /// Stable new claim identity.
         claim: ClaimId,
         /// Domain-defined claim class.
@@ -1909,15 +1789,12 @@ pub(crate) enum CommandKind {
     /// Consumes one exact durable reservation before external resource reuse.
     #[non_exhaustive]
     ActivateResourceReuse {
-        /// Estate retaining the resource before external reuse.
+        /// Composite effect retaining the resource before external reuse.
         effect: EffectId,
-        /// Composite component retaining the reservation, when applicable.
-        component: Option<ComponentId>,
-        /// Exact principal incarnation which received the bearer.
-        actor: PrincipalIncarnation,
-        /// Exact binding generation which received the bearer.
-        binding_generation: u64,
-        /// Exact estate authority epoch which received the bearer.
+        /// Composite component retaining the reservation.
+        component: ComponentId,
+        actor: ExecutorCoordinate,
+        /// Exact composite authority epoch which received the bearer.
         authority_epoch: u64,
         /// Exact next-generation claim retained before reuse.
         claim: ClaimId,
@@ -1940,15 +1817,13 @@ pub(crate) enum CommandKind {
     },
     /// Reissues a pending reuse bearer only after explicit effect adoption.
     ReclaimResourceReuse {
-        /// Adopted estate retaining the resource.
+        /// Adopted composite effect retaining the resource.
         effect: EffectId,
-        /// Composite component retaining the reservation, when applicable.
-        component: Option<ComponentId>,
-        /// Exact live successor incarnation.
-        actor: PrincipalIncarnation,
-        /// Exact live successor binding generation.
-        binding_generation: u64,
-        /// Exact adopted estate authority epoch.
+        /// Composite component retaining the reservation.
+        component: ComponentId,
+        /// Exact live successor executor.
+        actor: ExecutorCoordinate,
+        /// Exact adopted composite authority epoch.
         authority_epoch: u64,
         /// Exact pending next-generation claim.
         claim: ClaimId,
@@ -1968,23 +1843,22 @@ pub(crate) enum CommandKind {
     /// Atomically creates, claims, and prepares the canonical child.
     InstallHandoffChild {
         descriptor: ChildDescriptorV1,
-        origin: PrincipalIncarnation,
-        binding_generation: u64,
+        origin: ExecutorCoordinate,
         charge_account: ChargeAccountId,
+        provider: ComponentProviderBinding,
     },
     /// Atomically releases the terminal source and arms the sole target intent.
     ReleaseHandoffSourceAndRecordTargetIntent {
         descriptor: ChildDescriptorV1,
-        actor: PrincipalIncarnation,
-        binding_generation: u64,
+        actor: ExecutorCoordinate,
         operation: Digest,
     },
     /// Resolves a crash-fenced indeterminate source into a success-bound
     /// handoff source without recreating the consumed commit nonce.
     ResolveIndeterminateHandoffParent {
         descriptor: ChildDescriptorV1,
-        terminal_receipt_digest: Digest,
         descriptor_receipt_digest: Digest,
+        fact: VerifiedHandoffRecoveryFact,
     },
 }
 
@@ -1993,17 +1867,23 @@ impl CommandKind {
     /// durable state. Tag 41 is shared by fenced-source and installed-target
     /// recovery, so a target resolution must be attributed to the child it
     /// changes rather than to the source descriptor's parent.
-    fn coordinates_for_state(&self, state: &State) -> TransitionCoordinates {
+    fn coordinates_for_state(&self, state: &impl StateAccess) -> TransitionCoordinates {
         if let Self::ResolveIndeterminateHandoffParent {
             descriptor,
             descriptor_receipt_digest,
+            fact,
             ..
         } = self
             && let Ok(child) = descriptor.child_effect()
-            && handoff_child_resolution_eligible(state, *descriptor, *descriptor_receipt_digest)
+            && handoff_child_resolution_eligible(
+                state,
+                *descriptor,
+                *descriptor_receipt_digest,
+                *fact,
+            )
         {
             return TransitionCoordinates::new(
-                Some(child.root()),
+                Some(child.operation()),
                 Some(child),
                 Some(descriptor.child_component),
                 None,
@@ -2012,101 +1892,39 @@ impl CommandKind {
         self.coordinates()
     }
 
-    const fn is_profile_two_compatible(&self) -> bool {
-        match self {
-            Self::CreateEstate { .. }
-            | Self::CreateCompositeEffect { .. }
-            | Self::AddClaim { .. }
-            | Self::PrepareEffect { .. }
-            | Self::RecordCommitIntent { .. }
-            | Self::ClaimSettlement { .. }
-            | Self::RecordApplyIntent { .. }
-            | Self::MarkIndeterminate { .. }
-            | Self::SubmitEvidence { .. }
-            | Self::ReleaseEstate { .. }
-            | Self::ReserveReuse { .. } => false,
-            Self::AcknowledgeCommit { fact }
-            | Self::RecordApplied { fact }
-            | Self::Settle { fact } => fact.component.is_some(),
-            Self::ActivateResourceReuse { component, .. }
-            | Self::ReclaimResourceReuse { component, .. } => component.is_some(),
-            Self::RegisterProviderGeneration { .. }
-            | Self::BindArtifactReceiptVerifiers { .. }
-            | Self::FenceProviderEffects { .. }
-            | Self::EnterProviderSettlementOnly { .. }
-            | Self::RetireProviderEffects { .. }
-            | Self::AbortUnescapedEffect { .. }
-            | Self::RecordArtifactPin { .. }
-            | Self::AuthorizeArtifactRelease { .. }
-            | Self::RecordArtifactRelease { .. }
-            | Self::AdmitScopedCompositeEffect { .. }
-            | Self::AddComponentClaim { .. }
-            | Self::PrepareCompositeEffect { .. }
-            | Self::RecordComponentCommitIntent { .. }
-            | Self::RecordCompositeCommitIntents { .. }
-            | Self::FenceIncarnation { .. }
-            | Self::Snapshot { .. }
-            | Self::Ready { .. }
-            | Self::Rebind { .. }
-            | Self::AdoptEffect { .. }
-            | Self::RebaseCompositePrecommitClaims { .. }
-            | Self::ClaimComponentSettlement { .. }
-            | Self::RecordComponentApplyIntent { .. }
-            | Self::MarkComponentIndeterminate { .. }
-            | Self::BeginRevoke { .. }
-            | Self::SubmitComponentEvidence { .. }
-            | Self::CheckpointRecovery { .. }
-            | Self::ReleaseCompositeEffect { .. }
-            | Self::ReserveComponentReuse { .. } => true,
-            Self::WholeStateCheckpointV1 { .. }
-            | Self::AcknowledgeHandoffParent { .. }
-            | Self::InstallHandoffChild { .. }
-            | Self::ReleaseHandoffSourceAndRecordTargetIntent { .. }
-            | Self::ResolveIndeterminateHandoffParent { .. } => true,
-        }
-    }
-
     const fn coordinates(&self) -> TransitionCoordinates {
-        let (root, effect, component, claim) = match self {
+        let (operation, effect, component, claim) = match self {
             Self::RegisterProviderGeneration { .. }
             | Self::BindArtifactReceiptVerifiers { .. }
             | Self::FenceProviderEffects { .. }
             | Self::EnterProviderSettlementOnly { .. }
             | Self::RetireProviderEffects { .. } => (None, None, None, None),
-            Self::AbortUnescapedEffect { effect }
-            | Self::AuthorizeArtifactRelease { effect, .. } => {
-                (Some(effect.root()), Some(*effect), None, None)
+            Self::AbortUnescapedEffect { effect } => {
+                (Some(effect.operation()), Some(*effect), None, None)
             }
+            Self::AuthorizeArtifactRelease { effect, component } => (
+                Some(effect.operation()),
+                Some(*effect),
+                Some(*component),
+                None,
+            ),
             Self::RecordArtifactPin { binding, .. }
             | Self::RecordArtifactRelease { binding, .. } => (
-                Some(binding.effect().root()),
+                Some(binding.effect().operation()),
                 Some(binding.effect()),
                 Some(binding.component()),
                 None,
             ),
             Self::AdmitScopedCompositeEffect { effect, .. } => {
-                (Some(effect.root()), Some(*effect), None, None)
+                (Some(effect.operation()), Some(*effect), None, None)
             }
-            Self::CreateEstate { effect, .. }
-            | Self::CreateCompositeEffect { effect, .. }
-            | Self::PrepareEffect { effect, .. }
-            | Self::PrepareCompositeEffect { effect, .. }
-            | Self::RecordCommitIntent { effect, .. }
+            Self::PrepareCompositeEffect { effect, .. }
             | Self::RecordCompositeCommitIntents { effect, .. }
             | Self::AdoptEffect { effect, .. }
             | Self::RebaseCompositePrecommitClaims { effect, .. }
-            | Self::ClaimSettlement { effect, .. }
-            | Self::RecordApplyIntent { effect, .. }
-            | Self::MarkIndeterminate { effect, .. }
             | Self::BeginRevoke { effect, .. }
-            | Self::ReleaseEstate { effect }
             | Self::ReleaseCompositeEffect { effect } => {
-                (Some(effect.root()), Some(*effect), None, None)
-            }
-            Self::AddClaim { effect, claim, .. }
-            | Self::SubmitEvidence { effect, claim, .. }
-            | Self::ReserveReuse { effect, claim, .. } => {
-                (Some(effect.root()), Some(*effect), None, Some(*claim))
+                (Some(effect.operation()), Some(*effect), None, None)
             }
             Self::AddComponentClaim {
                 effect,
@@ -2126,7 +1944,7 @@ impl CommandKind {
                 claim,
                 ..
             } => (
-                Some(effect.root()),
+                Some(effect.operation()),
                 Some(*effect),
                 Some(*component),
                 Some(*claim),
@@ -2142,13 +1960,18 @@ impl CommandKind {
             }
             | Self::MarkComponentIndeterminate {
                 effect, component, ..
-            } => (Some(effect.root()), Some(*effect), Some(*component), None),
+            } => (
+                Some(effect.operation()),
+                Some(*effect),
+                Some(*component),
+                None,
+            ),
             Self::AcknowledgeCommit { fact }
             | Self::RecordApplied { fact }
             | Self::Settle { fact } => (
-                Some(fact.effect.root()),
+                Some(fact.effect.operation()),
                 Some(fact.effect),
-                fact.component,
+                Some(fact.component),
                 None,
             ),
             Self::ActivateResourceReuse {
@@ -2162,40 +1985,45 @@ impl CommandKind {
                 component,
                 claim,
                 ..
-            } => (Some(effect.root()), Some(*effect), *component, Some(*claim)),
-            Self::FenceIncarnation { root, .. }
-            | Self::Snapshot { root, .. }
-            | Self::Ready { root, .. }
-            | Self::Rebind { root, .. } => (Some(*root), None, None, None),
+            } => (
+                Some(effect.operation()),
+                Some(*effect),
+                Some(*component),
+                Some(*claim),
+            ),
+            Self::FenceExecutor { operation, .. }
+            | Self::Snapshot { operation, .. }
+            | Self::Ready { operation, .. }
+            | Self::Rebind { operation, .. } => (Some(*operation), None, None, None),
             Self::CheckpointRecovery { .. } | Self::WholeStateCheckpointV1 { .. } => {
                 (None, None, None, None)
             }
             Self::AcknowledgeHandoffParent { fact, .. } => (
-                Some(fact.effect.root()),
+                Some(fact.effect.operation()),
                 Some(fact.effect),
-                fact.component,
+                Some(fact.component),
                 None,
             ),
             Self::InstallHandoffChild { descriptor, .. } => (
-                Some(descriptor.parent.root()),
+                Some(descriptor.parent.operation()),
                 Some(descriptor.parent),
                 None,
                 Some(descriptor.claim),
             ),
             Self::ReleaseHandoffSourceAndRecordTargetIntent { descriptor, .. } => (
-                Some(descriptor.parent.root()),
+                Some(descriptor.parent.operation()),
                 Some(descriptor.parent),
                 Some(descriptor.parent_component),
                 None,
             ),
-            Self::ResolveIndeterminateHandoffParent { descriptor, .. } => (
-                Some(descriptor.parent.root()),
-                Some(descriptor.parent),
-                Some(descriptor.parent_component),
+            Self::ResolveIndeterminateHandoffParent { fact, .. } => (
+                Some(fact.effect.operation()),
+                Some(fact.effect),
+                Some(fact.component),
                 None,
             ),
         };
-        TransitionCoordinates::new(root, effect, component, claim)
+        TransitionCoordinates::new(operation, effect, component, claim)
     }
 }
 
@@ -2283,69 +2111,14 @@ pub enum CommandRequest {
     AdmitScopedCompositeEffect {
         /// Stable escaped-effect identity.
         effect: EffectId,
-        /// Stable operation identity.
-        operation: OperationId,
-        /// Exact originating incarnation.
-        origin: PrincipalIncarnation,
-        /// Initial binding generation.
-        binding_generation: u64,
+        /// Exact originating executor.
+        origin: ExecutorCoordinate,
         /// Catalog-defined component product.
         kind: CompositeKindId,
         /// Retained-resource charge account.
         charge_account: ChargeAccountId,
         /// Exact catalog component/provider bindings.
         bindings: Vec<ComponentProviderBinding>,
-    },
-    /// Registers one causal estate.
-    CreateEstate {
-        /// Stable effect identity.
-        effect: EffectId,
-        /// Exact originating principal incarnation.
-        origin: PrincipalIncarnation,
-        /// Exact live binding generation.
-        binding_generation: u64,
-        /// Domain schema.
-        domain: DomainId,
-        /// Obligation class.
-        obligation: ObligationKindId,
-        /// Retained-resource charge account.
-        charge_account: ChargeAccountId,
-    },
-    /// Registers one catalog-bound heterogeneous effect.
-    CreateCompositeEffect {
-        /// Stable escaped-effect identity.
-        effect: EffectId,
-        /// Exact originating principal incarnation.
-        origin: PrincipalIncarnation,
-        /// Exact live binding generation.
-        binding_generation: u64,
-        /// Catalog-defined component product.
-        kind: CompositeKindId,
-        /// Retained-resource charge account.
-        charge_account: ChargeAccountId,
-    },
-    /// Enrolls one resource claim before preparation.
-    AddClaim {
-        /// Stable effect identity.
-        effect: EffectId,
-        /// Exact live actor.
-        actor: PrincipalIncarnation,
-        /// Exact live binding.
-        binding_generation: u64,
-        /// Stable claim identity.
-        claim: ClaimId,
-        /// Domain schema.
-        domain: DomainId,
-        /// Claim class.
-        kind: ClaimKindId,
-        /// Logical or device scope.
-        scope: ClaimScope,
-        /// Stable protected resource.
-        resource: ResourceId,
-        /// Exact allocation generation.
-        resource_generation: ResourceGeneration,
-        /// Conserved units.
-        units: u64,
     },
     /// Enrolls one component-local resource claim before preparation.
     AddComponentClaim {
@@ -2354,9 +2127,7 @@ pub enum CommandRequest {
         /// Exact catalog component slot.
         component: ComponentId,
         /// Exact live actor.
-        actor: PrincipalIncarnation,
-        /// Exact live binding.
-        binding_generation: u64,
+        actor: ExecutorCoordinate,
         /// Stable claim identity, unique within the effect.
         claim: ClaimId,
         /// Domain-defined claim class.
@@ -2370,34 +2141,12 @@ pub enum CommandRequest {
         /// Conserved units.
         units: u64,
     },
-    /// Freezes claim enrollment and prepares an effect.
-    PrepareEffect {
-        /// Stable effect identity.
-        effect: EffectId,
-        /// Exact live actor.
-        actor: PrincipalIncarnation,
-        /// Exact live binding.
-        binding_generation: u64,
-    },
     /// Atomically freezes enrollment and prepares every component.
     PrepareCompositeEffect {
         /// Shared parent effect.
         effect: EffectId,
         /// Exact live actor.
-        actor: PrincipalIncarnation,
-        /// Exact live binding.
-        binding_generation: u64,
-    },
-    /// Records write-ahead intent before an external commit.
-    RecordCommitIntent {
-        /// Stable effect identity.
-        effect: EffectId,
-        /// Exact live actor.
-        actor: PrincipalIncarnation,
-        /// Exact live binding.
-        binding_generation: u64,
-        /// Exact external operation coordinates.
-        operation: Digest,
+        actor: ExecutorCoordinate,
     },
     /// Records a component-local write-ahead external commit intent.
     RecordComponentCommitIntent {
@@ -2406,9 +2155,7 @@ pub enum CommandRequest {
         /// Exact component crossing its commit gate.
         component: ComponentId,
         /// Exact live actor.
-        actor: PrincipalIncarnation,
-        /// Exact live binding.
-        binding_generation: u64,
+        actor: ExecutorCoordinate,
         /// Exact external operation coordinates.
         operation: Digest,
     },
@@ -2417,65 +2164,48 @@ pub enum CommandRequest {
         /// Shared parent effect.
         effect: EffectId,
         /// Exact live actor.
-        actor: PrincipalIncarnation,
-        /// Exact live binding.
-        binding_generation: u64,
+        actor: ExecutorCoordinate,
         /// Complete catalog-ordered component operation set.
         operations: Vec<ComponentCommitOperation>,
     },
-    /// Requests an immediate fence of one exact incarnation.
-    FenceIncarnation {
-        /// Causal root.
-        root: RootId,
-        /// Exact crashed incarnation.
-        crashed: PrincipalIncarnation,
-        /// Exact old binding.
-        binding_generation: u64,
+    /// Requests an immediate fence of one exact executor.
+    FenceExecutor {
+        /// Causal operation.
+        operation: OperationId,
+        /// Exact crashed executor.
+        crashed: ExecutorCoordinate,
     },
     /// Marks a successor ready for one exact snapshot.
     Ready {
-        /// Causal root.
-        root: RootId,
+        /// Causal operation.
+        operation: OperationId,
         /// Exact snapshot.
         snapshot: SnapshotId,
         /// Fresh successor.
-        successor: PrincipalIncarnation,
+        successor: ExecutorCoordinate,
     },
-    /// Installs one fresh binding without implicit adoption.
+    /// Binds a fresh executor coordinate to an exact recovery snapshot.
     Rebind {
-        /// Causal root.
-        root: RootId,
+        /// Causal operation.
+        operation: OperationId,
         /// Exact snapshot.
         snapshot: SnapshotId,
         /// Fresh successor.
-        successor: PrincipalIncarnation,
-        /// Fresh binding generation.
-        binding_generation: u64,
+        successor: ExecutorCoordinate,
     },
     /// Requests explicit adoption of one uncommitted orphan.
     AdoptEffect {
         /// Stable effect identity.
         effect: EffectId,
         /// Exact rebound successor.
-        successor: PrincipalIncarnation,
-        /// Exact rebound binding.
-        binding_generation: u64,
+        successor: ExecutorCoordinate,
     },
     /// Requests a freshness rebase for an adopted wholly-precommit composite.
     RebaseCompositePrecommitClaims {
         /// Stable adopted composite effect identity.
         effect: EffectId,
         /// Exact active successor.
-        actor: PrincipalIncarnation,
-        /// Exact active successor binding.
-        binding_generation: u64,
-    },
-    /// Requests a one-shot settlement claim.
-    ClaimSettlement {
-        /// Stable committed effect.
-        effect: EffectId,
-        /// Exact live claimant.
-        claimant: PrincipalIncarnation,
+        actor: ExecutorCoordinate,
     },
     /// Requests a one-shot claim for an exact committed component.
     ClaimComponentSettlement {
@@ -2484,16 +2214,14 @@ pub enum CommandRequest {
         /// Exact successor-settled component.
         component: ComponentId,
         /// Exact live claimant.
-        claimant: PrincipalIncarnation,
+        claimant: ExecutorCoordinate,
     },
     /// Races revocation against adoption or settlement.
     BeginRevoke {
         /// Stable effect identity.
         effect: EffectId,
         /// Exact observed live actor.
-        expected_actor: PrincipalIncarnation,
-        /// Exact observed binding.
-        binding_generation: u64,
+        expected_actor: ExecutorCoordinate,
         /// Exact observed authority epoch.
         authority_epoch: u64,
     },
@@ -2506,40 +2234,10 @@ pub enum CommandRequest {
         /// Observed base device generation.
         device: DeviceGeneration,
     },
-    /// Releases a terminal, fully retired estate.
-    ReleaseEstate {
-        /// Stable effect identity.
-        effect: EffectId,
-    },
     /// Releases a terminal composite effect.
     ReleaseCompositeEffect {
         /// Shared parent effect.
         effect: EffectId,
-    },
-    /// Reserves and retains the next resource allocation generation.
-    ReserveReuse {
-        /// Estate retaining the new claim.
-        effect: EffectId,
-        /// Exact live actor.
-        actor: PrincipalIncarnation,
-        /// Exact live binding.
-        binding_generation: u64,
-        /// Stable new claim identity.
-        claim: ClaimId,
-        /// Domain schema.
-        domain: DomainId,
-        /// Claim class.
-        kind: ClaimKindId,
-        /// Logical or device scope.
-        scope: ClaimScope,
-        /// Stable protected resource.
-        resource: ResourceId,
-        /// Exact retired allocation generation.
-        expected_generation: ResourceGeneration,
-        /// Conserved units retained before external reuse.
-        units: u64,
-        /// Provider-defined physical layout and drain contract digest.
-        reuse_contract: Digest,
     },
     /// Reserves and retains a resource generation in one exact component.
     ReserveComponentReuse {
@@ -2548,9 +2246,7 @@ pub enum CommandRequest {
         /// Component retaining the new claim.
         component: ComponentId,
         /// Exact live actor.
-        actor: PrincipalIncarnation,
-        /// Exact live binding.
-        binding_generation: u64,
+        actor: ExecutorCoordinate,
         /// Stable new claim identity.
         claim: ClaimId,
         /// Domain-defined claim class.
@@ -2568,37 +2264,7 @@ pub enum CommandRequest {
     },
 }
 
-impl CommandRequest {
-    /// Returns whether this untrusted request belongs to the profile-2
-    /// composite command grammar.
-    pub const fn is_profile_two_compatible(&self) -> bool {
-        matches!(
-            self,
-            Self::RegisterProviderGeneration { .. }
-                | Self::BindArtifactReceiptVerifiers { .. }
-                | Self::FenceProviderEffects { .. }
-                | Self::EnterProviderSettlementOnly { .. }
-                | Self::RetireProviderEffects { .. }
-                | Self::AbortUnescapedEffect { .. }
-                | Self::AuthorizeArtifactRelease { .. }
-                | Self::AdmitScopedCompositeEffect { .. }
-                | Self::AddComponentClaim { .. }
-                | Self::PrepareCompositeEffect { .. }
-                | Self::RecordComponentCommitIntent { .. }
-                | Self::RecordCompositeCommitIntents { .. }
-                | Self::FenceIncarnation { .. }
-                | Self::Ready { .. }
-                | Self::Rebind { .. }
-                | Self::AdoptEffect { .. }
-                | Self::RebaseCompositePrecommitClaims { .. }
-                | Self::ClaimComponentSettlement { .. }
-                | Self::BeginRevoke { .. }
-                | Self::CheckpointRecovery { .. }
-                | Self::ReleaseCompositeEffect { .. }
-                | Self::ReserveComponentReuse { .. }
-        )
-    }
-}
+impl CommandRequest {}
 
 impl From<CommandRequest> for Command {
     fn from(request: CommandRequest) -> Self {
@@ -2648,77 +2314,21 @@ impl From<CommandRequest> for Command {
             }
             CommandRequest::AdmitScopedCompositeEffect {
                 effect,
-                operation,
                 origin,
-                binding_generation,
                 kind,
                 charge_account,
                 bindings,
             } => CommandKind::AdmitScopedCompositeEffect {
                 effect,
-                operation,
                 origin,
-                binding_generation,
                 kind,
                 charge_account,
                 bindings,
-            },
-            CommandRequest::CreateEstate {
-                effect,
-                origin,
-                binding_generation,
-                domain,
-                obligation,
-                charge_account,
-            } => CommandKind::CreateEstate {
-                effect,
-                origin,
-                binding_generation,
-                domain,
-                obligation,
-                charge_account,
-            },
-            CommandRequest::CreateCompositeEffect {
-                effect,
-                origin,
-                binding_generation,
-                kind,
-                charge_account,
-            } => CommandKind::CreateCompositeEffect {
-                effect,
-                origin,
-                binding_generation,
-                kind,
-                charge_account,
-            },
-            CommandRequest::AddClaim {
-                effect,
-                actor,
-                binding_generation,
-                claim,
-                domain,
-                kind,
-                scope,
-                resource,
-                resource_generation,
-                units,
-            } => CommandKind::AddClaim {
-                effect,
-                actor,
-                binding_generation,
-                claim,
-                domain,
-                kind,
-                scope,
-                resource,
-                resource_generation,
-                units,
             },
             CommandRequest::AddComponentClaim {
                 effect,
                 component,
                 actor,
-                binding_generation,
                 claim,
                 kind,
                 scope,
@@ -2729,7 +2339,6 @@ impl From<CommandRequest> for Command {
                 effect,
                 component,
                 actor,
-                binding_generation,
                 claim,
                 kind,
                 scope,
@@ -2737,108 +2346,55 @@ impl From<CommandRequest> for Command {
                 resource_generation,
                 units,
             },
-            CommandRequest::PrepareEffect {
-                effect,
-                actor,
-                binding_generation,
-            } => CommandKind::PrepareEffect {
-                effect,
-                actor,
-                binding_generation,
-            },
-            CommandRequest::PrepareCompositeEffect {
-                effect,
-                actor,
-                binding_generation,
-            } => CommandKind::PrepareCompositeEffect {
-                effect,
-                actor,
-                binding_generation,
-            },
-            CommandRequest::RecordCommitIntent {
-                effect,
-                actor,
-                binding_generation,
-                operation,
-            } => CommandKind::RecordCommitIntent {
-                effect,
-                actor,
-                binding_generation,
-                operation,
-            },
+            CommandRequest::PrepareCompositeEffect { effect, actor } => {
+                CommandKind::PrepareCompositeEffect { effect, actor }
+            }
             CommandRequest::RecordComponentCommitIntent {
                 effect,
                 component,
                 actor,
-                binding_generation,
                 operation,
             } => CommandKind::RecordComponentCommitIntent {
                 effect,
                 component,
                 actor,
-                binding_generation,
                 operation,
             },
             CommandRequest::RecordCompositeCommitIntents {
                 effect,
                 actor,
-                binding_generation,
                 operations,
             } => CommandKind::RecordCompositeCommitIntents {
                 effect,
                 actor,
-                binding_generation,
                 operations,
             },
-            CommandRequest::FenceIncarnation {
-                root,
-                crashed,
-                binding_generation,
-            } => CommandKind::FenceIncarnation {
-                root,
-                crashed,
-                binding_generation,
-            },
+            CommandRequest::FenceExecutor { operation, crashed } => {
+                CommandKind::FenceExecutor { operation, crashed }
+            }
             CommandRequest::Ready {
-                root,
+                operation,
                 snapshot,
                 successor,
             } => CommandKind::Ready {
-                root,
+                operation,
                 snapshot,
                 successor,
             },
             CommandRequest::Rebind {
-                root,
+                operation,
                 snapshot,
                 successor,
-                binding_generation,
             } => CommandKind::Rebind {
-                root,
+                operation,
                 snapshot,
                 successor,
-                binding_generation,
             },
-            CommandRequest::AdoptEffect {
-                effect,
-                successor,
-                binding_generation,
-            } => CommandKind::AdoptEffect {
-                effect,
-                successor,
-                binding_generation,
-            },
-            CommandRequest::RebaseCompositePrecommitClaims {
-                effect,
-                actor,
-                binding_generation,
-            } => CommandKind::RebaseCompositePrecommitClaims {
-                effect,
-                actor,
-                binding_generation,
-            },
-            CommandRequest::ClaimSettlement { effect, claimant } => {
-                CommandKind::ClaimSettlement { effect, claimant }
+            CommandRequest::AdoptEffect { effect, successor } => {
+                CommandKind::AdoptEffect { effect, successor }
+            }
+            CommandRequest::RebaseCompositePrecommitClaims { effect, actor } => {
+                CommandKind::RebaseCompositePrecommitClaims { effect, actor }
             }
             CommandRequest::ClaimComponentSettlement {
                 effect,
@@ -2852,12 +2408,10 @@ impl From<CommandRequest> for Command {
             CommandRequest::BeginRevoke {
                 effect,
                 expected_actor,
-                binding_generation,
                 authority_epoch,
             } => CommandKind::BeginRevoke {
                 effect,
                 expected_actor,
-                binding_generation,
                 authority_epoch,
             },
             CommandRequest::CheckpointRecovery {
@@ -2869,40 +2423,13 @@ impl From<CommandRequest> for Command {
                 journal,
                 device,
             },
-            CommandRequest::ReleaseEstate { effect } => CommandKind::ReleaseEstate { effect },
             CommandRequest::ReleaseCompositeEffect { effect } => {
                 CommandKind::ReleaseCompositeEffect { effect }
             }
-            CommandRequest::ReserveReuse {
-                effect,
-                actor,
-                binding_generation,
-                claim,
-                domain,
-                kind,
-                scope,
-                resource,
-                expected_generation,
-                units,
-                reuse_contract,
-            } => CommandKind::ReserveReuse {
-                effect,
-                actor,
-                binding_generation,
-                claim,
-                domain,
-                kind,
-                scope,
-                resource,
-                expected_generation,
-                units,
-                reuse_contract,
-            },
             CommandRequest::ReserveComponentReuse {
                 effect,
                 component,
                 actor,
-                binding_generation,
                 claim,
                 kind,
                 scope,
@@ -2914,7 +2441,6 @@ impl From<CommandRequest> for Command {
                 effect,
                 component,
                 actor,
-                binding_generation,
                 claim,
                 kind,
                 scope,
@@ -2931,7 +2457,7 @@ impl From<CommandRequest> for Command {
 #[derive(Debug, Eq, PartialEq)]
 pub struct CommitIntent {
     effect: EffectId,
-    component: Option<ComponentId>,
+    component: ComponentId,
     nonce: u64,
 }
 
@@ -2942,7 +2468,7 @@ impl CommitIntent {
     }
 
     /// Returns the component slot for a composite-effect commit.
-    pub const fn component(&self) -> Option<ComponentId> {
+    pub const fn component(&self) -> ComponentId {
         self.component
     }
 
@@ -3022,8 +2548,8 @@ enum ClaimStage {
 #[derive(Debug, Eq, PartialEq)]
 pub struct SettlementClaim {
     effect: EffectId,
-    component: Option<ComponentId>,
-    claimant: PrincipalIncarnation,
+    component: ComponentId,
+    claimant: ExecutorCoordinate,
     generation: u64,
     nonce: u64,
     stage: ClaimStage,
@@ -3055,12 +2581,12 @@ impl SettlementClaim {
     }
 
     /// Returns the component slot for a composite-effect settlement claim.
-    pub const fn component(&self) -> Option<ComponentId> {
+    pub const fn component(&self) -> ComponentId {
         self.component
     }
 
     /// Returns the exact claimant.
-    pub const fn claimant(&self) -> PrincipalIncarnation {
+    pub const fn claimant(&self) -> ExecutorCoordinate {
         self.claimant
     }
 
@@ -3077,22 +2603,13 @@ impl SettlementClaim {
                 claim: self,
             });
         }
-        Ok(Command(match self.component {
-            Some(component) => CommandKind::RecordComponentApplyIntent {
-                effect: self.effect,
-                component,
-                claimant: self.claimant,
-                generation: self.generation,
-                nonce: self.nonce,
-                intent,
-            },
-            None => CommandKind::RecordApplyIntent {
-                effect: self.effect,
-                claimant: self.claimant,
-                generation: self.generation,
-                nonce: self.nonce,
-                intent,
-            },
+        Ok(Command(CommandKind::RecordComponentApplyIntent {
+            effect: self.effect,
+            component: self.component,
+            claimant: self.claimant,
+            generation: self.generation,
+            nonce: self.nonce,
+            intent,
         }))
     }
 
@@ -3149,22 +2666,13 @@ impl SettlementClaim {
 
     /// Consumes any live claim and records an honest indeterminate outcome.
     pub fn mark_indeterminate(self, reason: Digest) -> Command {
-        Command(match self.component {
-            Some(component) => CommandKind::MarkComponentIndeterminate {
-                effect: self.effect,
-                component,
-                claimant: self.claimant,
-                generation: self.generation,
-                nonce: self.nonce,
-                reason,
-            },
-            None => CommandKind::MarkIndeterminate {
-                effect: self.effect,
-                claimant: self.claimant,
-                generation: self.generation,
-                nonce: self.nonce,
-                reason,
-            },
+        Command(CommandKind::MarkComponentIndeterminate {
+            effect: self.effect,
+            component: self.component,
+            claimant: self.claimant,
+            generation: self.generation,
+            nonce: self.nonce,
+            reason,
         })
     }
 }
@@ -3178,9 +2686,8 @@ impl SettlementClaim {
 #[derive(Debug, Eq, PartialEq)]
 pub struct ReusePermit {
     effect: EffectId,
-    component: Option<ComponentId>,
-    actor: PrincipalIncarnation,
-    binding_generation: u64,
+    component: ComponentId,
+    actor: ExecutorCoordinate,
     authority_epoch: u64,
     claim: ClaimId,
     resource: ResourceId,
@@ -3199,13 +2706,13 @@ impl ReusePermit {
         self.resource
     }
 
-    /// Returns the estate retaining the resource.
+    /// Returns the composite effect retaining the resource.
     pub const fn effect(&self) -> EffectId {
         self.effect
     }
 
     /// Returns the component which retains a composite-effect reuse reservation.
-    pub const fn component(&self) -> Option<ComponentId> {
+    pub const fn component(&self) -> ComponentId {
         self.component
     }
 
@@ -3251,7 +2758,6 @@ impl ReusePermit {
             effect: self.effect,
             component: self.component,
             actor: self.actor,
-            binding_generation: self.binding_generation,
             authority_epoch: self.authority_epoch,
             claim: self.claim,
             resource: self.resource,
@@ -3269,7 +2775,7 @@ impl ReusePermit {
 /// Stable parent/component/claim coordinates carried by normalized trace v2.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TransitionCoordinates {
-    root: Option<RootId>,
+    operation: Option<OperationId>,
     effect: Option<EffectId>,
     component: Option<ComponentId>,
     claim: Option<ClaimId>,
@@ -3278,22 +2784,22 @@ pub struct TransitionCoordinates {
 impl TransitionCoordinates {
     /// Constructs one non-authorizing normalized coordinate tuple.
     pub const fn new(
-        root: Option<RootId>,
+        operation: Option<OperationId>,
         effect: Option<EffectId>,
         component: Option<ComponentId>,
         claim: Option<ClaimId>,
     ) -> Self {
         Self {
-            root,
+            operation,
             effect,
             component,
             claim,
         }
     }
 
-    /// Returns the causal root, when the command is root scoped.
-    pub const fn root(self) -> Option<RootId> {
-        self.root
+    /// Returns the causal operation, when the command is operation scoped.
+    pub const fn operation(self) -> Option<OperationId> {
+        self.operation
     }
 
     /// Returns the parent effect, when the command is effect scoped.
@@ -3334,8 +2840,6 @@ pub enum TransitionEvent {
     ArtifactReceiptVerifiersBound,
     /// A scoped composite effect was admitted.
     ScopedCompositeAdmitted,
-    /// A causal estate was created.
-    EstateCreated,
     /// A typed resource claim was enrolled.
     ClaimAdded,
     /// An effect was prepared.
@@ -3344,13 +2848,13 @@ pub enum TransitionEvent {
     CommitIntentDurable,
     /// An external commit was acknowledged.
     EffectCommitted,
-    /// A live incarnation was fenced.
-    IncarnationFenced,
+    /// A live executor was fenced.
+    ExecutorFenced,
     /// A recovery snapshot was captured.
     Snapshot,
     /// A successor became ready.
     Ready,
-    /// A successor binding was installed.
+    /// A successor was rebound to the recovery lane.
     Rebound,
     /// One exact uncommitted orphan was explicitly adopted.
     EffectAdopted,
@@ -3378,8 +2882,8 @@ pub enum TransitionEvent {
     ResourceReuseReclaimed,
     /// The exact durable reuse bearer was consumed before external use.
     ResourceReuseActivated,
-    /// A fully retired estate was released.
-    EstateReleased,
+    /// A fully retired composite effect was released.
+    CompositeEffectReleased,
     /// A recovery artifact was durably pinned.
     ArtifactPinned,
     /// Artifact release was durably authorized.
@@ -3433,7 +2937,7 @@ impl TransitionReceipt {
         self.journal_schema
     }
 
-    /// Returns the exact catalog digest which interpreted the transition.
+    /// Returns the aggregate catalog-set digest protecting the transition.
     pub const fn catalog_digest(&self) -> Digest {
         self.catalog_digest
     }
@@ -3463,7 +2967,7 @@ impl TransitionReceipt {
         self.projection
     }
 
-    /// Returns exact root/effect/component/claim trace coordinates.
+    /// Returns exact operation/effect/component/claim trace coordinates.
     pub const fn coordinates(&self) -> TransitionCoordinates {
         self.coordinates
     }
@@ -3484,42 +2988,6 @@ impl TransitionReceipt {
     }
 }
 
-/// Public projection of one causal estate.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct EstateProjection {
-    /// Stable effect identity.
-    pub effect: EffectId,
-    /// Immutable originating incarnation.
-    pub causal_owner: PrincipalIncarnation,
-    /// Current live principal or non-authorizing kernel custodian.
-    pub custodian: CustodyState,
-    /// Account still charged for retained resources.
-    pub charge_owner: ChargeAccountId,
-    /// Domain-defined obligation class.
-    pub obligation: (DomainId, ObligationKindId),
-    /// Domain-selected lifecycle enforced for this obligation.
-    pub obligation_policy: ObligationPolicy,
-    /// Current authority state.
-    pub authority: AuthorityState,
-    /// Monotonic epoch of the estate authority gate.
-    ///
-    /// Revocation commands bind this value so a command prepared before an
-    /// adoption or fence cannot revoke the newly installed authority.
-    pub authority_epoch: u64,
-    /// Current commit state.
-    pub commit: CommitState,
-    /// Current outcome knowledge.
-    pub outcome: OutcomeState,
-    /// Current settlement state.
-    pub settlement: SettlementState,
-    /// Current physical retirement state.
-    pub retirement: RetirementState,
-    /// Total claim count.
-    pub claim_count: usize,
-    /// Claims still retaining resources.
-    pub retained_claims: usize,
-}
-
 /// Public, non-authorizing projection of one domain-defined resource claim.
 ///
 /// This is the boot-recovery enumeration surface.  It contains enough exact
@@ -3527,9 +2995,9 @@ pub struct EstateProjection {
 /// reuse, adoption, or settlement authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ClaimProjection {
-    /// Estate which owns the claim.
+    /// Effect which owns the claim.
     pub effect: EffectId,
-    /// Stable claim identity within the estate.
+    /// Stable claim identity within the effect.
     pub claim: ClaimId,
     /// Domain which defined the claim lifecycle.
     pub domain: DomainId,
@@ -3543,7 +3011,7 @@ pub struct ClaimProjection {
     pub resource: ResourceId,
     /// Generation of the protected resource.
     pub resource_generation: ResourceGeneration,
-    /// Conserved units charged to the estate.
+    /// Conserved units charged to the effect.
     pub units: u64,
     /// Freshness under which the claim was enrolled.
     pub enrolled_freshness: Freshness,
@@ -3558,14 +3026,16 @@ pub struct CompositeEffectProjection {
     pub effect: EffectId,
     /// Catalog-defined heterogeneous component product.
     pub kind: CompositeKindId,
-    /// Immutable originating incarnation.
-    pub causal_owner: PrincipalIncarnation,
-    /// Current live principal or non-authorizing kernel custodian.
+    /// Exact immutable catalog digest used to interpret this effect.
+    pub catalog_digest: Digest,
+    /// Immutable originating executor.
+    pub causal_owner: ExecutorCoordinate,
+    /// Current custody of the composite obligation.
     pub custodian: CustodyState,
     /// Account charged for every retained component claim.
     pub charge_owner: ChargeAccountId,
-    /// Stable operation identity for a scoped effect, when present.
-    pub operation: Option<OperationId>,
+    /// Stable operation identity shared by every component.
+    pub operation: OperationId,
     /// Exact component/provider bindings fixed at scoped admission.
     pub provider_bindings: Vec<ComponentProviderBinding>,
     /// Shared authority gate for all components.
@@ -3601,8 +3071,10 @@ pub enum SingleHopHandoffProjection {
         descriptor: Box<ChildDescriptorV1>,
         /// Receipt proving the parent component's successful terminal outcome.
         terminal_receipt_digest: Digest,
-        /// Receipt proving the descriptor's binding at handoff ingress.
+        /// Receipt authenticating the descriptor presented to the child.
         descriptor_receipt_digest: Digest,
+        /// Optional exact recovery fact accepted for the parent role.
+        recovery_fact: Option<VerifiedHandoffRecoveryFact>,
         /// Whether the exact target was durably created, claimed, and prepared.
         child_installed: bool,
     },
@@ -3612,6 +3084,8 @@ pub enum SingleHopHandoffProjection {
         parent: EffectId,
         /// Canonical digest of the source-bound descriptor.
         descriptor_digest: Digest,
+        /// Optional exact recovery fact accepted for the child role.
+        recovery_fact: Option<VerifiedHandoffRecoveryFact>,
     },
 }
 
@@ -3673,7 +3147,7 @@ pub struct ComponentClaimProjection {
     pub retired: bool,
 }
 
-/// One estate in a core-generated recovery cohort.
+/// One effect in a core-generated recovery cohort.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProviderObligation {
     /// Exact provider generation carrying this obligation.
@@ -3703,7 +3177,7 @@ pub struct ProviderObligation {
 /// Public non-authorizing projection of one recovery-artifact lease.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ArtifactRecoveryItem {
-    /// Exact artifact and provider/operation binding.
+    /// Exact artifact binding retained by the recovery projection.
     pub binding: ArtifactBinding,
     /// Current durable lease state.
     pub lease: ArtifactLeaseState,
@@ -3716,37 +3190,6 @@ impl ArtifactRecoveryItem {
     pub const fn is_releasable(self) -> bool {
         self.releasable
     }
-}
-
-/// One estate in a core-generated recovery cohort.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RecoveryItem {
-    /// Stable effect identity.
-    pub effect: EffectId,
-    /// Current non-authorizing custodian.
-    pub custodian: CustodyState,
-    /// Domain-defined obligation class.
-    pub obligation: (DomainId, ObligationKindId),
-    /// Current authority state.
-    pub authority: AuthorityState,
-    /// Exact authority epoch observed by the snapshot.
-    pub authority_epoch: u64,
-    /// Current external commit state.
-    pub commit: CommitState,
-    /// Current outcome knowledge.
-    pub outcome: OutcomeState,
-    /// Current successor-settlement state.
-    pub settlement: SettlementState,
-    /// Current physical-retirement state.
-    pub retirement: RetirementState,
-    /// Total claim count.
-    pub claim_count: usize,
-    /// Claims which still retain resources.
-    pub retained_claims: usize,
-    /// Whether this exact estate may be explicitly execution-adopted.
-    pub adoptable: bool,
-    /// Whether this exact estate carries a live successor-settlement duty.
-    pub settlement_required: bool,
 }
 
 /// One component-local obligation in a core-generated recovery cohort.
@@ -3791,8 +3234,8 @@ pub struct RecoveryEvidenceItem {
     pub observation: Freshness,
     /// Verifier identity, epoch, schema, and receipt digest.
     pub stamp: VerifierStamp,
-    /// Exact provider scope retained by the accepted fact, if scoped.
-    pub verification_scope: Option<ProviderVerificationScope>,
+    /// Exact provider scope retained by the accepted fact.
+    pub verification_scope: ProviderVerificationScope,
 }
 
 /// One exact retained component claim in snapshot schema v2.
@@ -3813,8 +3256,10 @@ pub struct CompositeRecoveryItem {
     pub effect: EffectId,
     /// Catalog-defined complete component product.
     pub kind: CompositeKindId,
-    /// Immutable originating principal.
-    pub causal_owner: PrincipalIncarnation,
+    /// Exact immutable catalog digest used to interpret this effect.
+    pub catalog_digest: Digest,
+    /// Exact originating executor coordinate.
+    pub causal_owner: ExecutorCoordinate,
     /// Current parent-level custodian.
     pub custodian: CustodyState,
     /// Account charged for retained component claims.
@@ -3842,14 +3287,12 @@ pub struct RecoverySnapshot {
     snapshot_version: u16,
     journal_schema: u16,
     catalog_digest: Digest,
-    root: RootId,
+    operation: OperationId,
     snapshot: SnapshotId,
     digest: Digest,
     covered_revision: u64,
     covered_head: Digest,
-    items: Vec<RecoveryItem>,
     composites: Vec<CompositeRecoveryItem>,
-    component_items: Vec<ComponentRecoveryItem>,
     artifacts: Vec<ArtifactRecoveryItem>,
 }
 
@@ -3869,14 +3312,14 @@ impl RecoverySnapshot {
         self.journal_schema
     }
 
-    /// Returns the exact catalog used to interpret every component.
+    /// Returns the aggregate catalog-set digest protecting this snapshot.
     pub const fn catalog_digest(&self) -> Digest {
         self.catalog_digest
     }
 
-    /// Returns the causal root covered by this snapshot.
-    pub const fn root(&self) -> RootId {
-        self.root
+    /// Returns the causal operation covered by this snapshot.
+    pub const fn operation(&self) -> OperationId {
+        self.operation
     }
 
     /// Returns the stable snapshot identity.
@@ -3899,20 +3342,9 @@ impl RecoverySnapshot {
         self.covered_head
     }
 
-    /// Returns the ordered estate cohort.
-    pub fn items(&self) -> &[RecoveryItem] {
-        &self.items
-    }
-
     /// Returns parent-grouped composite graphs in stable effect order.
     pub fn composites(&self) -> &[CompositeRecoveryItem] {
         &self.composites
-    }
-
-    /// Returns a compatibility flattening in stable effect/component order.
-    /// Profile-2 consumers should prefer [`Self::composites`].
-    pub fn component_items(&self) -> &[ComponentRecoveryItem] {
-        &self.component_items
     }
 
     /// Returns exact provider/artifact recovery obligations covered by this
@@ -3925,7 +3357,7 @@ impl RecoverySnapshot {
     /// exact snapshot. The transition still rejects if state changed.
     pub fn record(self) -> Command {
         Command(CommandKind::Snapshot {
-            root: self.root,
+            operation: self.operation,
             snapshot: self.snapshot,
             digest: self.digest,
         })
@@ -3946,10 +3378,10 @@ pub struct ChargeProjection {
 /// Bounded pressure projection for observability and admission.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PressureProjection {
-    /// Number of causal roots.
-    pub roots: usize,
-    /// Number of estate records.
-    pub estates: usize,
+    /// Number of causal operations.
+    pub operations: usize,
+    /// Number of composite effect records.
+    pub composites: usize,
     /// Number of retained claims.
     pub retained_claims: usize,
     /// Whether boot or corruption quarantine blocks resource reuse.
@@ -3961,13 +3393,13 @@ pub struct PressureProjection {
 /// Failure while constructing a structurally valid trusted recovery anchor.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RecoveryAnchorError {
-    /// The catalog used the reserved zero digest.
+    /// The catalog-set used the reserved zero digest.
     ZeroDigest,
     /// Revision zero and the zero head must be presented together.
     InconsistentGenesis,
     /// The committed and next epochs name different Registry instances.
     RegistryMismatch,
-    /// Recovery cannot silently change the active principal-binding epoch.
+    /// The trusted binding tuple does not match the freshness coordinates.
     BindingMismatch,
     /// The next boot, journal, or device epoch is stale or rolled back.
     NonAdvancingEpoch,
@@ -4019,13 +3451,8 @@ impl RecoveryAnchor {
         }
         if committed_freshness.registry().get() != next_freshness.registry().get()
             || committed_freshness.registry().get() != binding.registry().get()
-            || committed_freshness.binding() != binding.authority_binding().get()
-            || next_freshness.binding() != binding.authority_binding().get()
         {
             return Err(RecoveryAnchorError::RegistryMismatch);
-        }
-        if committed_freshness.binding() != next_freshness.binding() {
-            return Err(RecoveryAnchorError::BindingMismatch);
         }
         if next_freshness.boot().get() <= committed_freshness.boot().get()
             || next_freshness.journal().get() <= committed_freshness.journal().get()
@@ -4043,12 +3470,12 @@ impl RecoveryAnchor {
         })
     }
 
-    /// Returns the catalog schema digest protected by the anchor.
+    /// Returns the aggregate catalog-set digest protected by the anchor.
     pub const fn catalog_digest(&self) -> Digest {
         self.binding.catalog_digest()
     }
 
-    /// Returns the complete immutable recovery binding.
+    /// Returns the complete trusted recovery binding.
     pub const fn binding(&self) -> RecoveryBinding {
         self.binding
     }
@@ -4136,6 +3563,8 @@ pub enum CoreError {
     ProviderLifecycleViolation,
     /// Provider bindings do not exactly match the catalog component product.
     ProviderBindingMismatch,
+    /// Components of one composite resolve to different immutable catalogs.
+    CatalogMismatch,
     /// A provider generation's exact verifier bindings do not match the
     /// catalog-required class/schema set.
     VerifierSetMismatch,
@@ -4153,9 +3582,9 @@ pub enum CoreError {
     ArtifactNotReleasable,
     /// Artifact release confirmation did not match its durable permit.
     ArtifactReleaseMismatch,
-    /// A profile-1 singleton command or recovered estate reached profile 2.
+    /// A command or recovered record does not belong to this API profile.
     IncompatibleApiProfile,
-    /// A guarded profile-two handoff must use its dedicated transition.
+    /// A guarded bounded handoff must use its dedicated transition.
     HandoffGuardRequired,
     /// At least one limit is zero.
     InvalidLimits,
@@ -4166,9 +3595,9 @@ pub enum CoreError {
     /// A declared claim class is unknown.
     UnknownClaimClass,
     /// The effect already exists.
-    DuplicateEstate,
+    DuplicateEffect,
     /// The effect does not exist.
-    UnknownEstate,
+    UnknownEffect,
     /// The claim already exists.
     DuplicateClaim,
     /// The claim does not exist.
@@ -4181,9 +3610,9 @@ pub enum CoreError {
     AdoptionForbidden,
     /// A claim or resource was presented in the wrong logical/device scope.
     WrongClaimScope,
-    /// The root does not exist.
-    UnknownRoot,
-    /// A root or estate capacity would be exceeded.
+    /// The operation does not exist.
+    UnknownOperation,
+    /// A operation or composite-effect capacity would be exceeded.
     CapacityExceeded,
     /// A per-account retained-unit limit would be exceeded.
     Backpressure,
@@ -4193,9 +3622,9 @@ pub enum CoreError {
     WrongSettlementStage,
     /// The recovery lane is in the wrong phase.
     WrongRecoveryState,
-    /// The presented incarnation or binding is stale.
-    StaleIncarnation,
-    /// The presented estate authority epoch is stale.
+    /// The presented executor coordinate is not the exact live coordinate.
+    StaleExecutor,
+    /// The presented composite authority epoch is stale.
     StaleAuthorityEpoch,
     /// The presented snapshot is not exact.
     StaleSnapshot,
@@ -4221,7 +3650,7 @@ pub enum CoreError {
     StaleEvidence,
     /// The configured verifier class is absent or does not match the rule.
     UnknownVerifier,
-    /// The verifier incarnation is stale.
+    /// The verifier executor is stale.
     StaleVerifierEpoch,
     /// The verifier uses a different canonical receipt schema.
     ReceiptSchemaMismatch,
@@ -4253,8 +3682,8 @@ pub enum CoreError {
     ReuseAlreadyReserved,
     /// A resource reuse permit does not match the durable reservation.
     StaleReusePermit,
-    /// The estate is not settled and fully retired.
-    EstateNotReleasable,
+    /// The composite effect is not settled and fully retired.
+    EffectNotReleasable,
     /// Journal replay detected a revision conflict.
     RevisionConflict,
     /// Journal replay detected a broken predecessor chain.
@@ -4294,11 +3723,10 @@ pub trait JournalFailure: core::fmt::Debug + Eq {}
 impl<T> JournalFailure for T where T: core::fmt::Debug + Eq {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct RootRecord {
-    origin: PrincipalIncarnation,
-    state: RootRecoveryState,
-    last_binding_generation: u64,
-    last_incarnation_generation: u64,
+struct CompositeRecoveryRecord {
+    origin: ExecutorCoordinate,
+    state: OperationRecoveryState,
+    last_executor: ExecutorCoordinate,
     crash_generation: u64,
 }
 
@@ -4320,7 +3748,7 @@ struct AcceptedEvidence {
     subject: Freshness,
     observation: Freshness,
     stamp: VerifierStamp,
-    verification_scope: Option<ProviderVerificationScope>,
+    verification_scope: ProviderVerificationScope,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4346,9 +3774,8 @@ struct ClaimRecord {
 /// the next resource generation.
 struct PendingReuse {
     effect: EffectId,
-    component: Option<ComponentId>,
-    actor: PrincipalIncarnation,
-    binding_generation: u64,
+    component: ComponentId,
+    actor: ExecutorCoordinate,
     authority_epoch: u64,
     claim: ClaimId,
     previous_generation: ResourceGeneration,
@@ -4376,32 +3803,6 @@ struct ResourceRecord {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct EstateRecord {
-    effect: EffectId,
-    causal_owner: PrincipalIncarnation,
-    custodian: CustodyState,
-    charge_owner: ChargeAccountId,
-    domain: DomainId,
-    obligation: ObligationKindId,
-    obligation_policy: ObligationPolicy,
-    authority: AuthorityState,
-    authority_epoch: u64,
-    commit: CommitState,
-    commit_nonce: Option<u64>,
-    commit_operation: Option<Digest>,
-    commit_fact: Option<VerifiedEffectFact>,
-    outcome: OutcomeState,
-    settlement: SettlementState,
-    settlement_nonce: Option<u64>,
-    claim_stage: Option<ClaimStage>,
-    settlement_intent: Option<Digest>,
-    applied_fact: Option<VerifiedEffectFact>,
-    settlement_fact: Option<VerifiedEffectFact>,
-    retirement: RetirementState,
-    claims: BTreeMap<ClaimId, ClaimRecord>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 struct ComponentRecord {
     id: ComponentId,
     domain: DomainId,
@@ -4426,12 +3827,17 @@ struct ComponentRecord {
 struct CompositeEffectRecord {
     effect: EffectId,
     kind: CompositeKindId,
-    causal_owner: PrincipalIncarnation,
+    /// Exact immutable catalog used to create and interpret this effect.
+    catalog_digest: Digest,
+    causal_owner: ExecutorCoordinate,
     custodian: CustodyState,
     charge_owner: ChargeAccountId,
     authority: AuthorityState,
     authority_epoch: u64,
     handoff: SingleHopRole,
+    /// This is provenance only: it must never contribute to provider live
+    /// accounting or admission gates.
+    released_provenance: Option<ReleasedCompositeProvenance>,
     components: BTreeMap<ComponentId, ComponentRecord>,
 }
 
@@ -4448,9 +3854,28 @@ struct ProviderGenerationRecord {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ScopedCompositeRecord {
-    operation: OperationId,
+    /// Exact immutable catalog shared by every provider binding.
+    catalog_digest: Digest,
     bindings: BTreeMap<ComponentId, ProviderCoordinate>,
     artifacts: BTreeMap<ComponentId, ArtifactBinding>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ReleasedCompositeProvenance {
+    /// Exact immutable catalog retained after live provider accounting ends.
+    catalog_digest: Digest,
+    bindings: BTreeMap<ComponentId, ProviderCoordinate>,
+    artifacts: BTreeMap<ComponentId, ArtifactBinding>,
+}
+
+impl From<ScopedCompositeRecord> for ReleasedCompositeProvenance {
+    fn from(scoped: ScopedCompositeRecord) -> Self {
+        Self {
+            catalog_digest: scoped.catalog_digest,
+            bindings: scoped.bindings,
+            artifacts: scoped.artifacts,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4460,42 +3885,161 @@ enum SingleHopRole {
         descriptor: Box<ChildDescriptorV1>,
         terminal_receipt_digest: Digest,
         descriptor_receipt_digest: Digest,
+        recovery_fact: Option<VerifiedHandoffRecoveryFact>,
     },
     Target {
         parent: EffectId,
         descriptor_digest: Digest,
+        recovery_fact: Option<VerifiedHandoffRecoveryFact>,
     },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct State {
-    world: Option<WorldId>,
+    world: WorldId,
     provider_generations: StateMap<ProviderCoordinate, ProviderGenerationRecord>,
     provider_high_water: StateMap<ProviderId, ProviderGeneration>,
     scoped_composites: StateMap<EffectId, ScopedCompositeRecord>,
     artifact_leases: StateMap<crate::RecoveryArtifactId, ArtifactLeaseState>,
-    roots: StateMap<RootId, RootRecord>,
-    /// Derived effect membership by root.  Fence transitions and projection
-    /// touch collection must not scan unrelated roots.
-    root_effects: StateMap<RootId, StateSet<EffectId>>,
-    estates: StateMap<EffectId, EstateRecord>,
+    recovery_operations: StateMap<OperationId, CompositeRecoveryRecord>,
     composite_effects: StateMap<EffectId, CompositeEffectRecord>,
-    resource_index: StateMap<ResourceId, Vec<(EffectId, ClaimId)>>,
     composite_resource_index: StateMap<ResourceId, Vec<(EffectId, ComponentId, ClaimId)>>,
     resources: StateMap<ResourceId, ResourceRecord>,
     charges: StateMap<(ChargeAccountId, CreditClassId), u64>,
     device_generations: StateMap<DeviceScopeId, DeviceGeneration>,
     device_quarantine: StateSet<DeviceScopeId>,
-    verifier_epochs: StateMap<VerifierId, u64>,
     revision: u64,
     head: Digest,
     next_nonce: u64,
-    /// Derived count of all estate and component claims.  Claims are retired
+    /// Derived count of all composite-component claims. Claims are retired
     /// in place, so only enrollment changes this value.
     total_claims: usize,
     freshness: Freshness,
     recovery_target: Option<Freshness>,
     projection_cache: ProjectionCache,
+}
+
+type ResourceIndexMap = StateMap<ResourceId, Vec<(EffectId, ComponentId, ClaimId)>>;
+
+impl StateAccess for State {
+    fn world(&self) -> WorldId {
+        self.world
+    }
+    fn provider_generations(&self) -> &StateMap<ProviderCoordinate, ProviderGenerationRecord> {
+        &self.provider_generations
+    }
+    fn provider_high_water(&self) -> &StateMap<ProviderId, ProviderGeneration> {
+        &self.provider_high_water
+    }
+    fn scoped_composites(&self) -> &StateMap<EffectId, ScopedCompositeRecord> {
+        &self.scoped_composites
+    }
+    fn artifact_leases(&self) -> &StateMap<crate::RecoveryArtifactId, ArtifactLeaseState> {
+        &self.artifact_leases
+    }
+    fn recovery_operations(&self) -> &StateMap<OperationId, CompositeRecoveryRecord> {
+        &self.recovery_operations
+    }
+    fn composite_effects(&self) -> &StateMap<EffectId, CompositeEffectRecord> {
+        &self.composite_effects
+    }
+    fn composite_resource_index(&self) -> &ResourceIndexMap {
+        &self.composite_resource_index
+    }
+    fn resources(&self) -> &StateMap<ResourceId, ResourceRecord> {
+        &self.resources
+    }
+    fn charges(&self) -> &StateMap<(ChargeAccountId, CreditClassId), u64> {
+        &self.charges
+    }
+    fn device_generations(&self) -> &StateMap<DeviceScopeId, DeviceGeneration> {
+        &self.device_generations
+    }
+    fn device_quarantine(&self) -> &StateSet<DeviceScopeId> {
+        &self.device_quarantine
+    }
+    fn revision(&self) -> u64 {
+        self.revision
+    }
+    fn head(&self) -> Digest {
+        self.head
+    }
+    fn next_nonce(&self) -> u64 {
+        self.next_nonce
+    }
+    fn total_claims(&self) -> usize {
+        self.total_claims
+    }
+    fn freshness(&self) -> Freshness {
+        self.freshness
+    }
+    fn recovery_target(&self) -> Option<Freshness> {
+        self.recovery_target
+    }
+    fn projection_cache(&self) -> &ProjectionCache {
+        &self.projection_cache
+    }
+}
+
+impl StateAccessMut for State {
+    fn provider_generations_mut(
+        &mut self,
+    ) -> &mut StateMap<ProviderCoordinate, ProviderGenerationRecord> {
+        &mut self.provider_generations
+    }
+    fn provider_high_water_mut(&mut self) -> &mut StateMap<ProviderId, ProviderGeneration> {
+        &mut self.provider_high_water
+    }
+    fn scoped_composites_mut(&mut self) -> &mut StateMap<EffectId, ScopedCompositeRecord> {
+        &mut self.scoped_composites
+    }
+    fn artifact_leases_mut(
+        &mut self,
+    ) -> &mut StateMap<crate::RecoveryArtifactId, ArtifactLeaseState> {
+        &mut self.artifact_leases
+    }
+    fn recovery_operations_mut(&mut self) -> &mut StateMap<OperationId, CompositeRecoveryRecord> {
+        &mut self.recovery_operations
+    }
+    fn composite_effects_mut(&mut self) -> &mut StateMap<EffectId, CompositeEffectRecord> {
+        &mut self.composite_effects
+    }
+    fn composite_resource_index_mut(&mut self) -> &mut ResourceIndexMap {
+        &mut self.composite_resource_index
+    }
+    fn resources_mut(&mut self) -> &mut StateMap<ResourceId, ResourceRecord> {
+        &mut self.resources
+    }
+    fn charges_mut(&mut self) -> &mut StateMap<(ChargeAccountId, CreditClassId), u64> {
+        &mut self.charges
+    }
+    fn device_generations_mut(&mut self) -> &mut StateMap<DeviceScopeId, DeviceGeneration> {
+        &mut self.device_generations
+    }
+    fn device_quarantine_mut(&mut self) -> &mut StateSet<DeviceScopeId> {
+        &mut self.device_quarantine
+    }
+    fn set_revision(&mut self, value: u64) {
+        self.revision = value;
+    }
+    fn set_head(&mut self, value: Digest) {
+        self.head = value;
+    }
+    fn set_next_nonce(&mut self, value: u64) {
+        self.next_nonce = value;
+    }
+    fn set_total_claims(&mut self, value: usize) {
+        self.total_claims = value;
+    }
+    fn freshness_mut(&mut self) -> &mut Freshness {
+        &mut self.freshness
+    }
+    fn set_recovery_target(&mut self, value: Option<Freshness>) {
+        self.recovery_target = value;
+    }
+    fn set_projection_cache(&mut self, value: ProjectionCache) {
+        self.projection_cache = value;
+    }
 }
 
 /// Derived authenticated projection of [`State`].
@@ -4512,7 +4056,7 @@ struct ProjectionCache {
 }
 
 impl ProjectionCache {
-    fn from_leaves(state: &State, catalog: Digest, leaves: AuthenticatedMap) -> Self {
+    fn from_leaves(state: &impl StateAccess, catalog: Digest, leaves: AuthenticatedMap) -> Self {
         Self {
             digest: projection_envelope(state, catalog, leaves.root_digest()),
             leaves,
@@ -4523,24 +4067,576 @@ impl ProjectionCache {
 /// The sole authoritative portable CSER state machine.
 #[derive(Debug)]
 pub struct Engine {
-    catalog: DomainCatalog,
+    catalog: CatalogSet,
     limits: CoreLimits,
-    api_mode: EngineApiMode,
     state: State,
     persistence_recovery_required: bool,
     journal_repair_required: Option<JournalRepair>,
 }
 
-/// The complete result of the semantic half of one transition.
+/// Keep a committed top-level value or publish its prepared replacement.
 ///
-/// A prepared transition owns every value needed by the commit half of the
-/// operation. In particular, the candidate already has its durable revision
-/// and journal head installed before its projection and public receipt are
-/// computed. Once persistence accepts the record,
-/// [`Engine::apply_prepared`] can therefore be a move-only state publication
-/// with no fallible semantic work left to perform.
+/// A delta owns replacements rather than a second `State`.  That distinction
+/// is important at the durability boundary: after the journal append has
+/// succeeded, publication only moves already-validated roots and scalars into
+/// the committed state.
+enum Change<T> {
+    Keep,
+    Set(T),
+}
+
+trait StateAccess {
+    fn world(&self) -> WorldId;
+    fn provider_generations(&self) -> &StateMap<ProviderCoordinate, ProviderGenerationRecord>;
+    fn provider_high_water(&self) -> &StateMap<ProviderId, ProviderGeneration>;
+    fn scoped_composites(&self) -> &StateMap<EffectId, ScopedCompositeRecord>;
+    fn artifact_leases(&self) -> &StateMap<crate::RecoveryArtifactId, ArtifactLeaseState>;
+    fn recovery_operations(&self) -> &StateMap<OperationId, CompositeRecoveryRecord>;
+    fn composite_effects(&self) -> &StateMap<EffectId, CompositeEffectRecord>;
+    fn composite_resource_index(&self) -> &ResourceIndexMap;
+    fn resources(&self) -> &StateMap<ResourceId, ResourceRecord>;
+    fn charges(&self) -> &StateMap<(ChargeAccountId, CreditClassId), u64>;
+    fn device_generations(&self) -> &StateMap<DeviceScopeId, DeviceGeneration>;
+    fn device_quarantine(&self) -> &StateSet<DeviceScopeId>;
+    fn revision(&self) -> u64;
+    fn head(&self) -> Digest;
+    fn next_nonce(&self) -> u64;
+    fn total_claims(&self) -> usize;
+    fn freshness(&self) -> Freshness;
+    fn recovery_target(&self) -> Option<Freshness>;
+    fn projection_cache(&self) -> &ProjectionCache;
+}
+
+trait StateAccessMut: StateAccess {
+    fn provider_generations_mut(
+        &mut self,
+    ) -> &mut StateMap<ProviderCoordinate, ProviderGenerationRecord>;
+    fn provider_high_water_mut(&mut self) -> &mut StateMap<ProviderId, ProviderGeneration>;
+    fn scoped_composites_mut(&mut self) -> &mut StateMap<EffectId, ScopedCompositeRecord>;
+    fn artifact_leases_mut(
+        &mut self,
+    ) -> &mut StateMap<crate::RecoveryArtifactId, ArtifactLeaseState>;
+    fn recovery_operations_mut(&mut self) -> &mut StateMap<OperationId, CompositeRecoveryRecord>;
+    fn composite_effects_mut(&mut self) -> &mut StateMap<EffectId, CompositeEffectRecord>;
+    fn composite_resource_index_mut(&mut self) -> &mut ResourceIndexMap;
+    fn resources_mut(&mut self) -> &mut StateMap<ResourceId, ResourceRecord>;
+    fn charges_mut(&mut self) -> &mut StateMap<(ChargeAccountId, CreditClassId), u64>;
+    fn device_generations_mut(&mut self) -> &mut StateMap<DeviceScopeId, DeviceGeneration>;
+    fn device_quarantine_mut(&mut self) -> &mut StateSet<DeviceScopeId>;
+    fn set_revision(&mut self, value: u64);
+    fn set_head(&mut self, value: Digest);
+    fn set_next_nonce(&mut self, value: u64);
+    fn set_total_claims(&mut self, value: usize);
+    fn freshness_mut(&mut self) -> &mut Freshness;
+    fn set_recovery_target(&mut self, value: Option<Freshness>);
+    fn set_projection_cache(&mut self, value: ProjectionCache);
+
+    // Production preparation records projection addresses at the point where
+    // the corresponding primary record is mutated. Replay/checkpoint helpers
+    // use the default no-op implementations because they rebuild the complete
+    // projection independently.
+    fn touch_provider_high_water(&mut self, _provider: ProviderId) {}
+    fn touch_provider_generation(&mut self, _coordinate: ProviderCoordinate) {}
+    fn touch_scoped_composite(&mut self, _effect: EffectId) {}
+    fn touch_artifact_lease(&mut self, _artifact: crate::RecoveryArtifactId) {}
+    fn touch_operation(&mut self, _operation: OperationId) {}
+    fn touch_composite(&mut self, _effect: EffectId) {}
+    fn touch_resource(&mut self, _resource: ResourceId) {}
+    fn touch_device(&mut self, _scope: DeviceScopeId) {}
+}
+
+/// Exact prepared replacement for every top-level state collection/scalar.
+struct PreparedStateDelta {
+    world: Change<WorldId>,
+    provider_generations: Change<StateMap<ProviderCoordinate, ProviderGenerationRecord>>,
+    provider_high_water: Change<StateMap<ProviderId, ProviderGeneration>>,
+    scoped_composites: Change<StateMap<EffectId, ScopedCompositeRecord>>,
+    artifact_leases: Change<StateMap<crate::RecoveryArtifactId, ArtifactLeaseState>>,
+    recovery_operations: Change<StateMap<OperationId, CompositeRecoveryRecord>>,
+    composite_effects: Change<StateMap<EffectId, CompositeEffectRecord>>,
+    composite_resource_index: Change<ResourceIndexMap>,
+    resources: Change<StateMap<ResourceId, ResourceRecord>>,
+    charges: Change<StateMap<(ChargeAccountId, CreditClassId), u64>>,
+    device_generations: Change<StateMap<DeviceScopeId, DeviceGeneration>>,
+    device_quarantine: Change<StateSet<DeviceScopeId>>,
+    revision: Change<u64>,
+    head: Change<Digest>,
+    next_nonce: Change<u64>,
+    total_claims: Change<usize>,
+    freshness: Change<Freshness>,
+    recovery_target: Change<Option<Freshness>>,
+    projection_cache: Change<ProjectionCache>,
+}
+
+/// Borrowed builder for one transition. A collection is cloned from the
+/// committed root only on its first mutation; all subsequent updates reuse
+/// that slot's path-copied root. This is the production preparation surface,
+/// not a second state image.
+struct DeltaBuilder<'a> {
+    base: &'a State,
+    world: Change<WorldId>,
+    provider_generations: Change<StateMap<ProviderCoordinate, ProviderGenerationRecord>>,
+    provider_high_water: Change<StateMap<ProviderId, ProviderGeneration>>,
+    scoped_composites: Change<StateMap<EffectId, ScopedCompositeRecord>>,
+    artifact_leases: Change<StateMap<crate::RecoveryArtifactId, ArtifactLeaseState>>,
+    recovery_operations: Change<StateMap<OperationId, CompositeRecoveryRecord>>,
+    composite_effects: Change<StateMap<EffectId, CompositeEffectRecord>>,
+    composite_resource_index: Change<ResourceIndexMap>,
+    resources: Change<StateMap<ResourceId, ResourceRecord>>,
+    charges: Change<StateMap<(ChargeAccountId, CreditClassId), u64>>,
+    device_generations: Change<StateMap<DeviceScopeId, DeviceGeneration>>,
+    device_quarantine: Change<StateSet<DeviceScopeId>>,
+    revision: Change<u64>,
+    head: Change<Digest>,
+    next_nonce: Change<u64>,
+    total_claims: Change<usize>,
+    freshness: Change<Freshness>,
+    recovery_target: Change<Option<Freshness>>,
+    projection_cache: Change<ProjectionCache>,
+    projection_touches: ProjectionTouches,
+}
+
+fn change_ref<'a, T>(change: &'a Change<T>, base: &'a T) -> &'a T {
+    match change {
+        Change::Keep => base,
+        Change::Set(value) => value,
+    }
+}
+
+impl<'a> DeltaBuilder<'a> {
+    fn new(base: &'a State) -> Self {
+        Self {
+            base,
+            world: Change::Keep,
+            provider_generations: Change::Keep,
+            provider_high_water: Change::Keep,
+            scoped_composites: Change::Keep,
+            artifact_leases: Change::Keep,
+            recovery_operations: Change::Keep,
+            composite_effects: Change::Keep,
+            composite_resource_index: Change::Keep,
+            resources: Change::Keep,
+            charges: Change::Keep,
+            device_generations: Change::Keep,
+            device_quarantine: Change::Keep,
+            revision: Change::Keep,
+            head: Change::Keep,
+            next_nonce: Change::Keep,
+            total_claims: Change::Keep,
+            freshness: Change::Keep,
+            recovery_target: Change::Keep,
+            projection_cache: Change::Keep,
+            projection_touches: ProjectionTouches::default(),
+        }
+    }
+
+    fn finish(self) -> PreparedStateDelta {
+        PreparedStateDelta {
+            world: self.world,
+            provider_generations: self.provider_generations,
+            provider_high_water: self.provider_high_water,
+            scoped_composites: self.scoped_composites,
+            artifact_leases: self.artifact_leases,
+            recovery_operations: self.recovery_operations,
+            composite_effects: self.composite_effects,
+            composite_resource_index: self.composite_resource_index,
+            resources: self.resources,
+            charges: self.charges,
+            device_generations: self.device_generations,
+            device_quarantine: self.device_quarantine,
+            revision: self.revision,
+            head: self.head,
+            next_nonce: self.next_nonce,
+            total_claims: self.total_claims,
+            freshness: self.freshness,
+            recovery_target: self.recovery_target,
+            projection_cache: self.projection_cache,
+        }
+    }
+
+    fn take_projection_touches(&mut self) -> ProjectionTouches {
+        core::mem::take(&mut self.projection_touches)
+    }
+
+    fn ensure_provider_generations(
+        &mut self,
+    ) -> &mut StateMap<ProviderCoordinate, ProviderGenerationRecord> {
+        if matches!(self.provider_generations, Change::Keep) {
+            self.provider_generations = Change::Set(self.base.provider_generations.clone());
+        }
+        match &mut self.provider_generations {
+            Change::Set(value) => value,
+            Change::Keep => unreachable!(),
+        }
+    }
+    fn ensure_provider_high_water(&mut self) -> &mut StateMap<ProviderId, ProviderGeneration> {
+        if matches!(self.provider_high_water, Change::Keep) {
+            self.provider_high_water = Change::Set(self.base.provider_high_water.clone());
+        }
+        match &mut self.provider_high_water {
+            Change::Set(value) => value,
+            Change::Keep => unreachable!(),
+        }
+    }
+    fn ensure_scoped_composites(&mut self) -> &mut StateMap<EffectId, ScopedCompositeRecord> {
+        if matches!(self.scoped_composites, Change::Keep) {
+            self.scoped_composites = Change::Set(self.base.scoped_composites.clone());
+        }
+        match &mut self.scoped_composites {
+            Change::Set(value) => value,
+            Change::Keep => unreachable!(),
+        }
+    }
+    fn ensure_artifact_leases(
+        &mut self,
+    ) -> &mut StateMap<crate::RecoveryArtifactId, ArtifactLeaseState> {
+        if matches!(self.artifact_leases, Change::Keep) {
+            self.artifact_leases = Change::Set(self.base.artifact_leases.clone());
+        }
+        match &mut self.artifact_leases {
+            Change::Set(value) => value,
+            Change::Keep => unreachable!(),
+        }
+    }
+    fn ensure_recovery_operations(
+        &mut self,
+    ) -> &mut StateMap<OperationId, CompositeRecoveryRecord> {
+        if matches!(self.recovery_operations, Change::Keep) {
+            self.recovery_operations = Change::Set(self.base.recovery_operations.clone());
+        }
+        match &mut self.recovery_operations {
+            Change::Set(value) => value,
+            Change::Keep => unreachable!(),
+        }
+    }
+    fn ensure_composite_effects(&mut self) -> &mut StateMap<EffectId, CompositeEffectRecord> {
+        if matches!(self.composite_effects, Change::Keep) {
+            self.composite_effects = Change::Set(self.base.composite_effects.clone());
+        }
+        match &mut self.composite_effects {
+            Change::Set(value) => value,
+            Change::Keep => unreachable!(),
+        }
+    }
+    fn ensure_composite_resource_index(&mut self) -> &mut ResourceIndexMap {
+        if matches!(self.composite_resource_index, Change::Keep) {
+            self.composite_resource_index = Change::Set(self.base.composite_resource_index.clone());
+        }
+        match &mut self.composite_resource_index {
+            Change::Set(value) => value,
+            Change::Keep => unreachable!(),
+        }
+    }
+    fn ensure_resources(&mut self) -> &mut StateMap<ResourceId, ResourceRecord> {
+        if matches!(self.resources, Change::Keep) {
+            self.resources = Change::Set(self.base.resources.clone());
+        }
+        match &mut self.resources {
+            Change::Set(value) => value,
+            Change::Keep => unreachable!(),
+        }
+    }
+    fn ensure_charges(&mut self) -> &mut StateMap<(ChargeAccountId, CreditClassId), u64> {
+        if matches!(self.charges, Change::Keep) {
+            self.charges = Change::Set(self.base.charges.clone());
+        }
+        match &mut self.charges {
+            Change::Set(value) => value,
+            Change::Keep => unreachable!(),
+        }
+    }
+    fn ensure_device_generations(&mut self) -> &mut StateMap<DeviceScopeId, DeviceGeneration> {
+        if matches!(self.device_generations, Change::Keep) {
+            self.device_generations = Change::Set(self.base.device_generations.clone());
+        }
+        match &mut self.device_generations {
+            Change::Set(value) => value,
+            Change::Keep => unreachable!(),
+        }
+    }
+    fn ensure_device_quarantine(&mut self) -> &mut StateSet<DeviceScopeId> {
+        if matches!(self.device_quarantine, Change::Keep) {
+            self.device_quarantine = Change::Set(self.base.device_quarantine.clone());
+        }
+        match &mut self.device_quarantine {
+            Change::Set(value) => value,
+            Change::Keep => unreachable!(),
+        }
+    }
+}
+
+impl<'a> StateAccess for DeltaBuilder<'a> {
+    fn world(&self) -> WorldId {
+        self.base.world()
+    }
+    fn provider_generations(&self) -> &StateMap<ProviderCoordinate, ProviderGenerationRecord> {
+        change_ref(&self.provider_generations, self.base.provider_generations())
+    }
+    fn provider_high_water(&self) -> &StateMap<ProviderId, ProviderGeneration> {
+        change_ref(&self.provider_high_water, self.base.provider_high_water())
+    }
+    fn scoped_composites(&self) -> &StateMap<EffectId, ScopedCompositeRecord> {
+        change_ref(&self.scoped_composites, self.base.scoped_composites())
+    }
+    fn artifact_leases(&self) -> &StateMap<crate::RecoveryArtifactId, ArtifactLeaseState> {
+        change_ref(&self.artifact_leases, self.base.artifact_leases())
+    }
+    fn recovery_operations(&self) -> &StateMap<OperationId, CompositeRecoveryRecord> {
+        change_ref(&self.recovery_operations, self.base.recovery_operations())
+    }
+    fn composite_effects(&self) -> &StateMap<EffectId, CompositeEffectRecord> {
+        change_ref(&self.composite_effects, self.base.composite_effects())
+    }
+    fn composite_resource_index(&self) -> &ResourceIndexMap {
+        change_ref(
+            &self.composite_resource_index,
+            self.base.composite_resource_index(),
+        )
+    }
+    fn resources(&self) -> &StateMap<ResourceId, ResourceRecord> {
+        change_ref(&self.resources, self.base.resources())
+    }
+    fn charges(&self) -> &StateMap<(ChargeAccountId, CreditClassId), u64> {
+        change_ref(&self.charges, self.base.charges())
+    }
+    fn device_generations(&self) -> &StateMap<DeviceScopeId, DeviceGeneration> {
+        change_ref(&self.device_generations, self.base.device_generations())
+    }
+    fn device_quarantine(&self) -> &StateSet<DeviceScopeId> {
+        change_ref(&self.device_quarantine, self.base.device_quarantine())
+    }
+    fn revision(&self) -> u64 {
+        match self.revision {
+            Change::Keep => self.base.revision(),
+            Change::Set(value) => value,
+        }
+    }
+    fn head(&self) -> Digest {
+        match self.head {
+            Change::Keep => self.base.head(),
+            Change::Set(value) => value,
+        }
+    }
+    fn next_nonce(&self) -> u64 {
+        match self.next_nonce {
+            Change::Keep => self.base.next_nonce(),
+            Change::Set(value) => value,
+        }
+    }
+    fn total_claims(&self) -> usize {
+        match self.total_claims {
+            Change::Keep => self.base.total_claims(),
+            Change::Set(value) => value,
+        }
+    }
+    fn freshness(&self) -> Freshness {
+        match self.freshness {
+            Change::Keep => self.base.freshness(),
+            Change::Set(value) => value,
+        }
+    }
+    fn recovery_target(&self) -> Option<Freshness> {
+        match self.recovery_target {
+            Change::Keep => self.base.recovery_target(),
+            Change::Set(value) => value,
+        }
+    }
+    fn projection_cache(&self) -> &ProjectionCache {
+        change_ref(&self.projection_cache, self.base.projection_cache())
+    }
+}
+
+impl<'a> StateAccessMut for DeltaBuilder<'a> {
+    fn provider_generations_mut(
+        &mut self,
+    ) -> &mut StateMap<ProviderCoordinate, ProviderGenerationRecord> {
+        self.ensure_provider_generations()
+    }
+    fn provider_high_water_mut(&mut self) -> &mut StateMap<ProviderId, ProviderGeneration> {
+        self.ensure_provider_high_water()
+    }
+    fn scoped_composites_mut(&mut self) -> &mut StateMap<EffectId, ScopedCompositeRecord> {
+        self.ensure_scoped_composites()
+    }
+    fn artifact_leases_mut(
+        &mut self,
+    ) -> &mut StateMap<crate::RecoveryArtifactId, ArtifactLeaseState> {
+        self.ensure_artifact_leases()
+    }
+    fn recovery_operations_mut(&mut self) -> &mut StateMap<OperationId, CompositeRecoveryRecord> {
+        self.ensure_recovery_operations()
+    }
+    fn composite_effects_mut(&mut self) -> &mut StateMap<EffectId, CompositeEffectRecord> {
+        self.ensure_composite_effects()
+    }
+    fn composite_resource_index_mut(&mut self) -> &mut ResourceIndexMap {
+        self.ensure_composite_resource_index()
+    }
+    fn resources_mut(&mut self) -> &mut StateMap<ResourceId, ResourceRecord> {
+        self.ensure_resources()
+    }
+    fn charges_mut(&mut self) -> &mut StateMap<(ChargeAccountId, CreditClassId), u64> {
+        self.ensure_charges()
+    }
+    fn device_generations_mut(&mut self) -> &mut StateMap<DeviceScopeId, DeviceGeneration> {
+        self.ensure_device_generations()
+    }
+    fn device_quarantine_mut(&mut self) -> &mut StateSet<DeviceScopeId> {
+        self.ensure_device_quarantine()
+    }
+    fn set_revision(&mut self, value: u64) {
+        self.revision = Change::Set(value);
+    }
+    fn set_head(&mut self, value: Digest) {
+        self.head = Change::Set(value);
+    }
+    fn set_next_nonce(&mut self, value: u64) {
+        self.next_nonce = Change::Set(value);
+    }
+    fn set_total_claims(&mut self, value: usize) {
+        self.total_claims = Change::Set(value);
+    }
+    fn freshness_mut(&mut self) -> &mut Freshness {
+        if matches!(self.freshness, Change::Keep) {
+            self.freshness = Change::Set(self.base.freshness);
+        }
+        match &mut self.freshness {
+            Change::Set(value) => value,
+            Change::Keep => unreachable!(),
+        }
+    }
+    fn set_recovery_target(&mut self, value: Option<Freshness>) {
+        self.recovery_target = Change::Set(value);
+    }
+    fn set_projection_cache(&mut self, value: ProjectionCache) {
+        self.projection_cache = Change::Set(value);
+    }
+
+    fn touch_provider_high_water(&mut self, provider: ProviderId) {
+        self.projection_touches.provider_high_water.insert(provider);
+    }
+    fn touch_provider_generation(&mut self, coordinate: ProviderCoordinate) {
+        self.projection_touches
+            .provider_generations
+            .insert(coordinate);
+    }
+    fn touch_scoped_composite(&mut self, effect: EffectId) {
+        self.projection_touches.scoped_composites.insert(effect);
+    }
+    fn touch_artifact_lease(&mut self, artifact: crate::RecoveryArtifactId) {
+        self.projection_touches.artifact_leases.insert(artifact);
+    }
+    fn touch_operation(&mut self, operation: OperationId) {
+        self.projection_touches.operations.insert(operation);
+    }
+    fn touch_composite(&mut self, effect: EffectId) {
+        self.projection_touches.composites.insert(effect);
+    }
+    fn touch_resource(&mut self, resource: ResourceId) {
+        self.projection_touches.resources.insert(resource);
+    }
+    fn touch_device(&mut self, scope: DeviceScopeId) {
+        self.projection_touches.devices.insert(scope);
+    }
+}
+
+impl PreparedStateDelta {
+    fn freshness(&self, current: Freshness) -> Freshness {
+        match &self.freshness {
+            Change::Keep => current,
+            Change::Set(freshness) => *freshness,
+        }
+    }
+
+    /// Publishes this delta.  This function intentionally contains only
+    /// conditional moves; it does not call a fallible helper, allocate, walk
+    /// a map, hash, or invoke verifier logic.
+    fn apply(self, state: &mut State) {
+        let Self {
+            world,
+            provider_generations,
+            provider_high_water,
+            scoped_composites,
+            artifact_leases,
+            recovery_operations,
+            composite_effects,
+            composite_resource_index,
+            resources,
+            charges,
+            device_generations,
+            device_quarantine,
+            revision,
+            head,
+            next_nonce,
+            total_claims,
+            freshness,
+            recovery_target,
+            projection_cache,
+        } = self;
+        apply_change(&mut state.world, world);
+        apply_change(&mut state.provider_generations, provider_generations);
+        apply_change(&mut state.provider_high_water, provider_high_water);
+        apply_change(&mut state.scoped_composites, scoped_composites);
+        apply_change(&mut state.artifact_leases, artifact_leases);
+        apply_change(&mut state.recovery_operations, recovery_operations);
+        apply_change(&mut state.composite_effects, composite_effects);
+        apply_change(
+            &mut state.composite_resource_index,
+            composite_resource_index,
+        );
+        apply_change(&mut state.resources, resources);
+        apply_change(&mut state.charges, charges);
+        apply_change(&mut state.device_generations, device_generations);
+        apply_change(&mut state.device_quarantine, device_quarantine);
+        apply_change(&mut state.revision, revision);
+        apply_change(&mut state.head, head);
+        apply_change(&mut state.next_nonce, next_nonce);
+        apply_change(&mut state.total_claims, total_claims);
+        apply_change(&mut state.freshness, freshness);
+        apply_change(&mut state.recovery_target, recovery_target);
+        apply_change(&mut state.projection_cache, projection_cache);
+    }
+}
+
+fn apply_change<T>(slot: &mut T, change: Change<T>) {
+    if let Change::Set(value) = change {
+        *slot = value;
+    }
+}
+
+fn checkpoint_state_matches<S: StateAccess>(state: &S, rebuilt: &State) -> bool {
+    state.world() == rebuilt.world
+        && state.provider_generations() == &rebuilt.provider_generations
+        && state.provider_high_water() == &rebuilt.provider_high_water
+        && state.scoped_composites() == &rebuilt.scoped_composites
+        && state.artifact_leases() == &rebuilt.artifact_leases
+        && state.recovery_operations() == &rebuilt.recovery_operations
+        && state.composite_effects() == &rebuilt.composite_effects
+        && state.composite_resource_index() == &rebuilt.composite_resource_index
+        && state.resources() == &rebuilt.resources
+        && charges_equal_ignoring_zero(state.charges(), &rebuilt.charges)
+        && state.device_generations() == &rebuilt.device_generations
+        && state.device_quarantine() == &rebuilt.device_quarantine
+        && state.revision() == rebuilt.revision
+        && state.head() == rebuilt.head
+        && state.next_nonce() == rebuilt.next_nonce
+        && state.total_claims() == rebuilt.total_claims
+        && state.freshness() == rebuilt.freshness
+        && state.recovery_target() == rebuilt.recovery_target
+}
+
+fn charges_equal_ignoring_zero(
+    left: &StateMap<(ChargeAccountId, CreditClassId), u64>,
+    right: &StateMap<(ChargeAccountId, CreditClassId), u64>,
+) -> bool {
+    left.iter()
+        .filter(|(_, units)| **units != 0)
+        .eq(right.iter().filter(|(_, units)| **units != 0))
+}
+
+/// The complete result of the semantic half of one transition.
 struct PreparedTransition {
-    candidate: State,
+    delta: PreparedStateDelta,
     record: JournalRecord,
     receipt: TransitionReceipt,
 }
@@ -4551,107 +4647,131 @@ enum PrepareError {
     Journal(JournalDecodeError),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum EngineApiMode {
-    ProfileTwo,
-    #[cfg(feature = "test-support")]
-    LegacyCompatibility,
+/// Initializes the common composite record after an exact provider-scoped
+/// admission has validated every component binding. Keeping this helper
+/// private means replay and public requests cannot create an unbound effect.
+fn initialize_composite_effect(
+    catalog: &DomainCatalog,
+    limits: CoreLimits,
+    state: &mut impl StateAccessMut,
+    effect: EffectId,
+    origin: ExecutorCoordinate,
+    kind: CompositeKindId,
+    charge_account: ChargeAccountId,
+) -> Result<(), CoreError> {
+    let component_specs = catalog
+        .composite_rule(kind)
+        .ok_or(CoreError::UnknownObligationClass)?
+        .components()
+        .to_vec();
+    if state.composite_effects().contains_key(&effect) {
+        return Err(CoreError::DuplicateEffect);
+    }
+    if state.composite_effects().len() >= limits.max_effects {
+        return Err(CoreError::CapacityExceeded);
+    }
+    match state.recovery_operations().get(&effect.operation()) {
+        Some(operation) => {
+            if operation.origin.executor() != origin.executor()
+                || !matches!(
+                    operation.state,
+                    OperationRecoveryState::Active { executor }
+                        | OperationRecoveryState::Rebound {
+                            successor: executor,
+                        } if executor == origin
+                )
+            {
+                return Err(CoreError::StaleExecutor);
+            }
+        }
+        None => {
+            if state.recovery_operations().len() >= limits.max_operations {
+                return Err(CoreError::CapacityExceeded);
+            }
+            state.touch_operation(effect.operation());
+            state.recovery_operations_mut().insert_mut(
+                effect.operation(),
+                CompositeRecoveryRecord {
+                    origin,
+                    state: OperationRecoveryState::Active { executor: origin },
+                    last_executor: origin,
+                    crash_generation: 0,
+                },
+            );
+        }
+    }
+    let mut components = BTreeMap::new();
+    for spec in component_specs {
+        let obligation = catalog
+            .obligation_rule(spec.domain(), spec.obligation())
+            .ok_or(CoreError::UnknownObligationClass)?;
+        components.insert(
+            spec.component(),
+            ComponentRecord {
+                id: spec.component(),
+                domain: spec.domain(),
+                obligation: spec.obligation(),
+                obligation_policy: obligation.policy(),
+                commit: CommitState::Registered,
+                commit_nonce: None,
+                commit_operation: None,
+                commit_fact: None,
+                outcome: OutcomeState::Pending,
+                settlement: SettlementState::Unavailable,
+                settlement_nonce: None,
+                claim_stage: None,
+                settlement_intent: None,
+                applied_fact: None,
+                settlement_fact: None,
+                retirement: RetirementState::Held,
+                claims: BTreeMap::new(),
+            },
+        );
+    }
+    state.touch_composite(effect);
+    state.composite_effects_mut().insert_mut(
+        effect,
+        CompositeEffectRecord {
+            effect,
+            kind,
+            catalog_digest: catalog.digest(),
+            causal_owner: origin,
+            custodian: CustodyState::Executor(origin),
+            charge_owner: charge_account,
+            authority: AuthorityState::Active,
+            authority_epoch: 1,
+            handoff: SingleHopRole::None,
+            released_provenance: None,
+            components,
+        },
+    );
+    Ok(())
 }
 
 impl Engine {
-    /// Creates a profile-2 engine scoped to one exact semantic world.
-    ///
-    /// Production state is never admitted without a world coordinate. The
-    /// predecessor unscoped constructor is intentionally retained only by the
-    /// hidden `test-support` compatibility entry point below.
+    /// Creates the sole engine grammar, scoped to one exact semantic world.
     pub fn new(
         world: WorldId,
-        catalog: DomainCatalog,
+        catalog_set: CatalogSet,
         limits: CoreLimits,
         freshness: Freshness,
     ) -> Self {
-        Self::new_with_mode(
-            catalog,
-            limits,
-            freshness,
-            EngineApiMode::ProfileTwo,
-            Some(world),
-        )
-    }
-
-    /// Creates an offline compatibility engine for predecessor profile tests.
-    ///
-    /// Records produced by this mode are intentionally rejected by
-    /// [`Self::recover`]. It must not be installed as a production Registry.
-    #[cfg(feature = "test-support")]
-    #[doc(hidden)]
-    pub fn new_legacy_compatibility(
-        catalog: DomainCatalog,
-        limits: CoreLimits,
-        freshness: Freshness,
-    ) -> Self {
-        Self::new_with_mode(
-            catalog,
-            limits,
-            freshness,
-            EngineApiMode::LegacyCompatibility,
-            None,
-        )
-    }
-
-    /// Creates an offline predecessor-profile engine bound to one semantic
-    /// world. This is used only by scoped unit fixtures while the production
-    /// constructor remains profile-two-only.
-    #[cfg(feature = "test-support")]
-    #[doc(hidden)]
-    pub fn new_scoped_legacy_compatibility(
-        world: WorldId,
-        catalog: DomainCatalog,
-        limits: CoreLimits,
-        freshness: Freshness,
-    ) -> Self {
-        Self::new_with_mode(
-            catalog,
-            limits,
-            freshness,
-            EngineApiMode::LegacyCompatibility,
-            Some(world),
-        )
-    }
-
-    fn new_with_mode(
-        catalog: DomainCatalog,
-        limits: CoreLimits,
-        freshness: Freshness,
-        api_mode: EngineApiMode,
-        world: Option<WorldId>,
-    ) -> Self {
-        let verifier_epochs: StateMap<VerifierId, u64> = catalog
-            .verifier_ids()
-            .into_iter()
-            .map(|verifier| (verifier, 1))
-            .collect();
         let mut engine = Self {
-            catalog,
+            catalog: catalog_set,
             limits,
-            api_mode,
             state: State {
                 world,
                 provider_generations: StateMap::new(),
                 provider_high_water: StateMap::new(),
                 scoped_composites: StateMap::new(),
                 artifact_leases: StateMap::new(),
-                roots: StateMap::new(),
-                root_effects: StateMap::new(),
-                estates: StateMap::new(),
+                recovery_operations: StateMap::new(),
                 composite_effects: StateMap::new(),
-                resource_index: StateMap::new(),
                 composite_resource_index: StateMap::new(),
                 resources: StateMap::new(),
                 charges: StateMap::new(),
                 device_generations: StateMap::new(),
                 device_quarantine: StateSet::new(),
-                verifier_epochs,
                 revision: 0,
                 head: Digest::ZERO,
                 next_nonce: 1,
@@ -4671,88 +4791,176 @@ impl Engine {
         engine
     }
 
+    /// Resolves one exact immutable catalog by schema digest.
+    fn catalog_for(&self, digest: Digest) -> Result<&DomainCatalog, CoreError> {
+        self.catalog.get(digest).ok_or(CoreError::SchemaMismatch)
+    }
+
+    /// Resolves the catalog recorded by an admitted or released effect.
+    fn effect_catalog(&self, effect: EffectId) -> Result<&DomainCatalog, CoreError> {
+        let digest = self
+            .state
+            .composite_effects()
+            .get(&effect)
+            .map(|composite| composite.catalog_digest)
+            .ok_or(CoreError::UnknownEffect)?;
+        self.catalog_for(digest)
+    }
+
+    /// Resolves the exact catalog material required by one command.  Commands
+    /// which operate on an admitted effect use that effect's immutable
+    /// provenance; provider lifecycle commands use their provider record;
+    /// registration and verifier-bound receipts carry the digest explicitly.
+    fn command_catalog_digest(&self, command: &CommandKind) -> Result<Digest, CoreError> {
+        let digest = match command {
+            CommandKind::RegisterProviderGeneration { catalog_digest, .. } => *catalog_digest,
+            CommandKind::AdmitScopedCompositeEffect { bindings, .. } => {
+                // Admission is a product over exact provider generations.  Do
+                // not let the wire order choose the semantic catalog: every
+                // bound generation must agree on one immutable catalog, and a
+                // mixed set is rejected before the command dispatcher sees a
+                // domain materialization.
+                let mut consensus = None;
+                for binding in bindings {
+                    let provider_catalog = self
+                        .state
+                        .provider_generations()
+                        .get(&binding.provider())
+                        .ok_or(CoreError::UnknownProviderGeneration)?
+                        .catalog_digest;
+                    match consensus {
+                        Some(expected) if expected != provider_catalog => {
+                            return Err(CoreError::CatalogMismatch);
+                        }
+                        None => consensus = Some(provider_catalog),
+                        _ => {}
+                    }
+                }
+                consensus.ok_or(CoreError::CatalogMismatch)?
+            }
+            CommandKind::RecordArtifactPin { binding, .. }
+            | CommandKind::RecordArtifactRelease { binding, .. } => binding.catalog_digest(),
+            CommandKind::ResolveIndeterminateHandoffParent { descriptor, .. } => {
+                descriptor.catalog_digest
+            }
+            CommandKind::ActivateResourceReuse { catalog_digest, .. } => *catalog_digest,
+            CommandKind::BindArtifactReceiptVerifiers { coordinate, .. }
+            | CommandKind::FenceProviderEffects { coordinate, .. }
+            | CommandKind::EnterProviderSettlementOnly { coordinate, .. }
+            | CommandKind::RetireProviderEffects { coordinate, .. } => self
+                .state
+                .provider_generations()
+                .get(coordinate)
+                .map(|record| record.catalog_digest)
+                .ok_or(CoreError::UnknownProviderGeneration)?,
+            CommandKind::AbortUnescapedEffect { effect }
+            | CommandKind::AuthorizeArtifactRelease { effect, .. }
+            | CommandKind::BeginRevoke { effect, .. }
+            | CommandKind::ReleaseCompositeEffect { effect }
+            | CommandKind::RecordCompositeCommitIntents { effect, .. }
+            | CommandKind::PrepareCompositeEffect { effect, .. }
+            | CommandKind::AdoptEffect { effect, .. }
+            | CommandKind::RebaseCompositePrecommitClaims { effect, .. }
+            | CommandKind::ClaimComponentSettlement { effect, .. }
+            | CommandKind::RecordComponentCommitIntent { effect, .. }
+            | CommandKind::RecordComponentApplyIntent { effect, .. }
+            | CommandKind::MarkComponentIndeterminate { effect, .. }
+            | CommandKind::SubmitComponentEvidence { effect, .. }
+            | CommandKind::AddComponentClaim { effect, .. }
+            | CommandKind::ReserveComponentReuse { effect, .. }
+            | CommandKind::ReclaimResourceReuse { effect, .. } => self
+                .state
+                .composite_effects()
+                .get(effect)
+                .map(|composite| composite.catalog_digest)
+                .ok_or(CoreError::UnknownEffect)?,
+            CommandKind::AcknowledgeCommit { fact }
+            | CommandKind::RecordApplied { fact }
+            | CommandKind::Settle { fact }
+            | CommandKind::AcknowledgeHandoffParent { fact, .. } => self
+                .state
+                .composite_effects()
+                .get(&fact.effect)
+                .map(|composite| composite.catalog_digest)
+                .ok_or(CoreError::UnknownEffect)?,
+            CommandKind::InstallHandoffChild { descriptor, .. }
+            | CommandKind::ReleaseHandoffSourceAndRecordTargetIntent { descriptor, .. } => {
+                descriptor.catalog_digest
+            }
+            // These commands carry no effect/provider coordinate. They are
+            // validated against the aggregate set and do not interpret a
+            // domain product directly.
+            CommandKind::CheckpointRecovery { .. }
+            | CommandKind::WholeStateCheckpointV1 { .. }
+            | CommandKind::Snapshot { .. }
+            | CommandKind::FenceExecutor { .. }
+            | CommandKind::Ready { .. }
+            | CommandKind::Rebind { .. } => self.catalog.digest(),
+        };
+        if matches!(
+            command,
+            CommandKind::CheckpointRecovery { .. }
+                | CommandKind::WholeStateCheckpointV1 { .. }
+                | CommandKind::Snapshot { .. }
+                | CommandKind::FenceExecutor { .. }
+                | CommandKind::Ready { .. }
+                | CommandKind::Rebind { .. }
+        ) {
+            // Structural commands carry the aggregate catalog-set digest but
+            // do not select one catalog member for domain interpretation.
+            Ok(digest)
+        } else if self.catalog.contains(digest) {
+            Ok(digest)
+        } else {
+            Err(CoreError::SchemaMismatch)
+        }
+    }
+
+    /// Supplies a domain materialization to the command dispatcher. Commands
+    /// such as checkpoint recovery and recovery-lane bookkeeping carry no
+    /// domain coordinate; their dispatcher branches are structural only, so
+    /// the materialization is never consulted (whole-state checkpoints use
+    /// the complete set explicitly).
+    fn command_catalog(&self, command: &CommandKind) -> Result<Option<&DomainCatalog>, CoreError> {
+        match command {
+            CommandKind::CheckpointRecovery { .. }
+            | CommandKind::WholeStateCheckpointV1 { .. }
+            | CommandKind::Snapshot { .. }
+            | CommandKind::FenceExecutor { .. }
+            | CommandKind::Ready { .. }
+            | CommandKind::Rebind { .. } => Ok(None),
+            _ => self
+                .catalog_for(self.command_catalog_digest(command)?)
+                .map(Some),
+        }
+    }
+
     /// Returns the current journal revision.
-    pub const fn revision(&self) -> u64 {
-        self.state.revision
+    pub fn revision(&self) -> u64 {
+        self.state.revision()
     }
 
     /// Returns the current journal head digest.
-    pub const fn head(&self) -> Digest {
-        self.state.head
+    pub fn head(&self) -> Digest {
+        self.state.head()
     }
 
     /// Returns the active freshness coordinates.
-    pub const fn freshness(&self) -> Freshness {
-        self.state.freshness
+    pub fn freshness(&self) -> Freshness {
+        self.state.freshness()
     }
 
-    /// Returns freshness bound to one root's latest principal binding.
-    pub fn freshness_for_root(&self, root: RootId) -> Option<Freshness> {
-        self.state.roots.get(&root).and_then(|record| {
-            self.state
-                .freshness
-                .with_binding(record.last_binding_generation)
-                .ok()
-        })
+    /// Returns active freshness when the operation is present in recovery.
+    pub fn freshness_for_operation(&self, operation: OperationId) -> Option<Freshness> {
+        self.state
+            .recovery_operations()
+            .contains_key(&operation)
+            .then_some(self.state.freshness())
     }
 
     /// Returns the current generation of one independently reset device scope.
     pub fn device_generation(&self, scope: DeviceScopeId) -> Option<DeviceGeneration> {
-        self.state.device_generations.get(&scope).copied()
-    }
-
-    /// Builds the exact current challenge for a domain receipt verifier.
-    pub fn evidence_challenge(
-        &self,
-        effect: EffectId,
-        claim_id: ClaimId,
-        kind: EvidenceKindId,
-    ) -> Result<EvidenceChallenge, CoreError> {
-        let root = self
-            .state
-            .roots
-            .get(&effect.root())
-            .ok_or(CoreError::UnknownRoot)?;
-        let estate = self
-            .state
-            .estates
-            .get(&effect)
-            .ok_or(CoreError::UnknownEstate)?;
-        let claim = estate
-            .claims
-            .get(&claim_id)
-            .ok_or(CoreError::UnknownClaim)?;
-        if claim.retired {
-            return Err(CoreError::DuplicateEvidence);
-        }
-        let rule = self
-            .catalog
-            .claim_rule(claim.domain, claim.kind)
-            .ok_or(CoreError::UnknownClaimClass)?
-            .evidence()
-            .iter()
-            .find(|rule| rule.kind() == kind)
-            .ok_or(CoreError::UnexpectedEvidence)?;
-        let current_observation =
-            scoped_freshness(&self.state, claim.scope, root.last_binding_generation)?;
-        let expected_verifier_binding =
-            self.scoped_verifier_binding(effect, None, rule.verifier(), rule.receipt_schema())?;
-        Ok(EvidenceChallenge {
-            effect,
-            component: None,
-            claim: claim_id,
-            domain: claim.domain,
-            kind,
-            scope: claim.scope,
-            resource: claim.resource,
-            resource_generation: claim.resource_generation,
-            subject: claim.enrolled_freshness,
-            current_observation,
-            expected_verifier: rule.verifier(),
-            expected_receipt_schema: rule.receipt_schema(),
-            expected_verifier_binding,
-            verification_scope: None,
-        })
+        self.state.device_generations().get(&scope).copied()
     }
 
     /// Builds the exact current challenge for one component-local claim.
@@ -4763,14 +4971,13 @@ impl Engine {
         claim_id: ClaimId,
         kind: EvidenceKindId,
     ) -> Result<EvidenceChallenge, CoreError> {
-        let root = self
-            .state
-            .roots
-            .get(&effect.root())
-            .ok_or(CoreError::UnknownRoot)?;
+        self.state
+            .recovery_operations()
+            .get(&effect.operation())
+            .ok_or(CoreError::UnknownOperation)?;
         let claim = self
             .state
-            .composite_effects
+            .composite_effects()
             .get(&effect)
             .and_then(|composite| composite.components.get(&component))
             .and_then(|component| component.claims.get(&claim_id))
@@ -4778,26 +4985,25 @@ impl Engine {
         if claim.retired {
             return Err(CoreError::DuplicateEvidence);
         }
-        let rule = self
-            .catalog
+        let catalog = self.effect_catalog(effect)?;
+        let rule = catalog
             .claim_rule(claim.domain, claim.kind)
             .ok_or(CoreError::UnknownClaimClass)?
             .evidence()
             .iter()
             .find(|rule| rule.kind() == kind)
             .ok_or(CoreError::UnexpectedEvidence)?;
-        let current_observation =
-            scoped_freshness(&self.state, claim.scope, root.last_binding_generation)?;
+        let current_observation = scoped_freshness(&self.state, claim.scope)?;
         let verification_scope = self.scoped_verification_scope(
             effect,
-            Some(component),
+            component,
             rule.verifier(),
             rule.receipt_schema(),
         )?;
-        let expected_verifier_binding = verification_scope.map(|scope| scope.verifier_binding());
+        let expected_verifier_binding = verification_scope.verifier_binding();
         Ok(EvidenceChallenge {
             effect,
-            component: Some(component),
+            component,
             claim: claim_id,
             domain: claim.domain,
             kind,
@@ -4813,32 +5019,6 @@ impl Engine {
         })
     }
 
-    /// Reports whether one exact retirement requirement has already won its
-    /// durable transition.
-    ///
-    /// This read-only projection grants no evidence authority. Hardware
-    /// adapters use it to prove prerequisites are committed before consuming a
-    /// non-replayable reset owner into the next physical closure phase.
-    pub fn retirement_evidence_accepted(
-        &self,
-        effect: EffectId,
-        claim_id: ClaimId,
-        kind: EvidenceKindId,
-    ) -> Result<bool, CoreError> {
-        let claim = self
-            .state
-            .estates
-            .get(&effect)
-            .and_then(|estate| estate.claims.get(&claim_id))
-            .ok_or(CoreError::UnknownClaim)?;
-        claim
-            .requirements
-            .iter()
-            .find(|requirement| requirement.kind == kind)
-            .map(|requirement| requirement.accepted.is_some())
-            .ok_or(CoreError::UnexpectedEvidence)
-    }
-
     /// Reports whether one component-local retirement requirement is durable.
     pub fn component_retirement_evidence_accepted(
         &self,
@@ -4849,7 +5029,7 @@ impl Engine {
     ) -> Result<bool, CoreError> {
         let claim = self
             .state
-            .composite_effects
+            .composite_effects()
             .get(&effect)
             .and_then(|composite| composite.components.get(&component))
             .and_then(|component| component.claims.get(&claim_id))
@@ -4860,47 +5040,6 @@ impl Engine {
             .find(|requirement| requirement.kind == kind)
             .map(|requirement| requirement.accepted.is_some())
             .ok_or(CoreError::UnexpectedEvidence)
-    }
-
-    /// Verifies one raw domain receipt against an exact, current claim challenge.
-    ///
-    /// The returned fact is linear and must still win the authoritative
-    /// transition race when submitted.
-    pub fn verify_retirement_evidence<V: ReceiptVerifier>(
-        &self,
-        effect: EffectId,
-        claim_id: ClaimId,
-        kind: EvidenceKindId,
-        verifier: &V,
-        receipt: &V::Receipt,
-    ) -> Result<VerifiedRetirementEvidence, CoreError> {
-        let challenge = self.evidence_challenge(effect, claim_id, kind)?;
-        let identity = verifier.identity();
-        self.validate_verifier_identity(
-            identity,
-            challenge.expected_verifier(),
-            challenge.expected_receipt_schema(),
-            challenge.expected_verifier_binding(),
-        )?;
-        let observation = verifier
-            .verify(&challenge, receipt)
-            .map_err(|_| CoreError::VerificationFailed)?;
-        require_digest(observation.digest())?;
-        Ok(VerifiedRetirementEvidence {
-            effect,
-            component: None,
-            claim: claim_id,
-            evidence: RetirementEvidence {
-                kind,
-                subject: observation.subject(),
-                freshness: observation.observation(),
-                stamp: VerifierStamp {
-                    identity,
-                    receipt_digest: observation.digest(),
-                },
-                verification_scope: challenge.verification_scope(),
-            },
-        })
     }
 
     /// Verifies one raw receipt for an exact component-local claim.
@@ -4927,7 +5066,7 @@ impl Engine {
         require_digest(observation.digest())?;
         Ok(VerifiedRetirementEvidence {
             effect,
-            component: Some(component),
+            component,
             claim: claim_id,
             evidence: RetirementEvidence {
                 kind,
@@ -4947,91 +5086,53 @@ impl Engine {
         &self,
         intent: &CommitIntent,
     ) -> Result<EffectFactChallenge, CoreError> {
-        if let Some(component) = intent.component {
-            let composite = self
-                .state
-                .composite_effects
-                .get(&intent.effect)
-                .ok_or(CoreError::UnknownEstate)?;
-            let component_record = composite
-                .components
-                .get(&component)
-                .ok_or(CoreError::UnknownObligationClass)?;
-            if component_record.commit != CommitState::CommitIntentDurable
-                || component_record.commit_nonce != Some(intent.nonce)
-            {
-                return Err(CoreError::StaleCommitIntent);
-            }
-            let operation = component_record
-                .commit_operation
-                .ok_or(CoreError::InvariantViolation)?;
-            let binding = self
-                .catalog
-                .obligation_rule(component_record.domain, component_record.obligation)
-                .ok_or(CoreError::UnknownObligationClass)?
-                .receipts()
-                .commit_outcome();
-            let verification_scope = self.scoped_verification_scope(
-                intent.effect,
-                Some(component),
-                binding.verifier(),
-                binding.receipt_schema(),
-            )?;
-            let expected_verifier_binding =
-                verification_scope.map(|scope| scope.verifier_binding());
-            return Ok(EffectFactChallenge {
-                kind: EffectFactKind::CommitOutcome,
-                effect: intent.effect,
-                component: Some(component),
-                domain: component_record.domain,
-                obligation: component_record.obligation,
-                actor: composite.causal_owner,
-                generation: composite.authority_epoch,
-                nonce: intent.nonce,
-                operation,
-                predecessor: None,
-                current_observation: component_freshness(&self.state, composite, component_record)?,
-                expected_verifier: binding.verifier(),
-                expected_receipt_schema: binding.receipt_schema(),
-                expected_verifier_binding,
-                verification_scope,
-            });
-        }
-        let estate = self
+        let component = intent.component;
+        let composite = self
             .state
-            .estates
+            .composite_effects()
             .get(&intent.effect)
-            .ok_or(CoreError::UnknownEstate)?;
-        if estate.commit != CommitState::CommitIntentDurable
-            || estate.commit_nonce != Some(intent.nonce)
+            .ok_or(CoreError::UnknownEffect)?;
+        let component_record = composite
+            .components
+            .get(&component)
+            .ok_or(CoreError::UnknownObligationClass)?;
+        if component_record.commit != CommitState::CommitIntentDurable
+            || component_record.commit_nonce != Some(intent.nonce)
         {
             return Err(CoreError::StaleCommitIntent);
         }
-        let operation = estate
+        let operation = component_record
             .commit_operation
             .ok_or(CoreError::InvariantViolation)?;
-        let binding = self
-            .catalog
-            .obligation_rule(estate.domain, estate.obligation)
+        let catalog = self.effect_catalog(intent.effect)?;
+        let binding = catalog
+            .obligation_rule(component_record.domain, component_record.obligation)
             .ok_or(CoreError::UnknownObligationClass)?
             .receipts()
             .commit_outcome();
+        let verification_scope = self.scoped_verification_scope(
+            intent.effect,
+            component,
+            binding.verifier(),
+            binding.receipt_schema(),
+        )?;
+        let expected_verifier_binding = verification_scope.verifier_binding();
         Ok(EffectFactChallenge {
             kind: EffectFactKind::CommitOutcome,
             effect: intent.effect,
-            component: None,
-            domain: estate.domain,
-            obligation: estate.obligation,
-            actor: estate.causal_owner,
-            generation: estate.authority_epoch,
+            component,
+            domain: component_record.domain,
+            obligation: component_record.obligation,
+            actor: composite.causal_owner,
+            generation: composite.authority_epoch,
             nonce: intent.nonce,
             operation,
             predecessor: None,
-            current_observation: estate_freshness(&self.state, estate)?,
+            current_observation: component_freshness(&self.state, composite, component_record)?,
             expected_verifier: binding.verifier(),
             expected_receipt_schema: binding.receipt_schema(),
-            expected_verifier_binding: None,
-            verification_scope: None,
+            expected_verifier_binding,
+            verification_scope,
         })
     }
 
@@ -5047,7 +5148,7 @@ impl Engine {
             .map(VerifiedCommitOutcome)
     }
 
-    /// Verifies a canonical profile-two child descriptor at the embedding's
+    /// Verifies a canonical bounded child descriptor at the embedding's
     /// trust boundary.  The resulting value is opaque and cannot be recreated
     /// from a raw command request or external output bytes.
     pub fn verify_child_descriptor<V: ChildDescriptorVerifier>(
@@ -5056,7 +5157,7 @@ impl Engine {
         verifier: &V,
         receipt: &V::Receipt,
     ) -> Result<VerifiedChildDescriptor, CoreError> {
-        if descriptor.catalog_digest != self.catalog.digest()
+        if !self.catalog.contains(descriptor.catalog_digest)
             || descriptor.route_digest.is_zero()
             || descriptor.input_digest.is_zero()
             || descriptor.units == 0
@@ -5083,47 +5184,50 @@ impl Engine {
         descriptor: &VerifiedChildDescriptor,
     ) -> Result<HandoffResolutionChallenge, CoreError> {
         let descriptor = descriptor.descriptor;
-        let root = self
+        let operation_record = self
             .state
-            .roots
-            .get(&descriptor.parent.root())
-            .ok_or(CoreError::UnknownEstate)?;
+            .recovery_operations()
+            .get(&descriptor.parent.operation())
+            .ok_or(CoreError::UnknownEffect)?;
         let composite = self
             .state
-            .composite_effects
+            .composite_effects()
             .get(&descriptor.parent)
-            .ok_or(CoreError::UnknownEstate)?;
+            .ok_or(CoreError::UnknownEffect)?;
         let component = composite
             .components
             .get(&descriptor.parent_component)
             .ok_or(CoreError::UnknownObligationClass)?;
-        let operation = component
+        let operation_digest = component
             .commit_operation
             .ok_or(CoreError::WrongCommitState)?;
-        if !matches!(root.state, RootRecoveryState::Fenced { .. })
-            || composite.authority != AuthorityState::Fenced
-            || composite.custodian != CustodyState::KernelEstate
+        let catalog = self.effect_catalog(descriptor.parent)?;
+        if !matches!(
+            operation_record.state,
+            OperationRecoveryState::Fenced { .. }
+        ) || composite.authority != AuthorityState::Fenced
+            || composite.custodian != CustodyState::CoreOwned
             || !matches!(composite.handoff, SingleHopRole::None)
             || component.commit != CommitState::Committed
             || component.commit_nonce.is_some()
             || component.commit_fact.is_some()
-            || component.outcome != OutcomeState::Indeterminate(operation)
-            || descriptor.catalog_digest != self.catalog.digest()
+            || component.outcome != OutcomeState::Indeterminate(operation_digest)
+            || descriptor.catalog_digest != catalog.digest()
+            || composite.catalog_digest != descriptor.catalog_digest
             || descriptor.parent != composite.effect
             || descriptor.child_effect().is_err()
-            || !matches!(self.catalog.single_hop_handoff_rule(composite.kind), Some(rule) if rule.target() == descriptor.child_kind)
+            || !matches!(catalog.single_hop_handoff_rule(composite.kind), Some(rule) if rule.target() == descriptor.child_kind)
         {
             return Err(CoreError::HandoffGuardRequired);
         }
-        let binding = self
-            .catalog
+        let binding = catalog
             .obligation_rule(component.domain, component.obligation)
             .ok_or(CoreError::UnknownObligationClass)?
             .receipts()
             .commit_outcome();
-        let expected_verifier_binding = self.scoped_verifier_binding(
+        let verification_scope = self.scoped_verification_scope(
             descriptor.parent,
-            Some(descriptor.parent_component),
+            descriptor.parent_component,
             binding.verifier(),
             binding.receipt_schema(),
         )?;
@@ -5132,12 +5236,12 @@ impl Engine {
             component: descriptor.parent_component,
             domain: component.domain,
             obligation: component.obligation,
-            operation,
+            operation: operation_digest,
             descriptor,
             current_observation: component_freshness(&self.state, composite, component)?,
             expected_verifier: binding.verifier(),
             expected_receipt_schema: binding.receipt_schema(),
-            expected_verifier_binding,
+            verification_scope,
         })
     }
 
@@ -5161,10 +5265,15 @@ impl Engine {
             .verify_handoff_parent_success(&challenge, receipt)
             .map_err(|_| CoreError::VerificationFailed)?;
         require_digest(terminal_receipt_digest)?;
-        Ok(VerifiedHandoffResolution {
-            descriptor,
-            terminal_receipt_digest,
-        })
+        let fact = VerifiedHandoffRecoveryFact::from_challenge(
+            HandoffRecoveryRole::Parent,
+            challenge,
+            VerifierStamp {
+                identity,
+                receipt_digest: terminal_receipt_digest,
+            },
+        );
+        Ok(VerifiedHandoffResolution { descriptor, fact })
     }
 
     /// Builds the exact challenge for an already installed handoff child whose
@@ -5175,49 +5284,53 @@ impl Engine {
     ) -> Result<HandoffResolutionChallenge, CoreError> {
         let descriptor = descriptor.descriptor;
         let child = descriptor.child_effect()?;
-        let root = self
+        let operation_record = self
             .state
-            .roots
-            .get(&child.root())
-            .ok_or(CoreError::UnknownEstate)?;
+            .recovery_operations()
+            .get(&child.operation())
+            .ok_or(CoreError::UnknownEffect)?;
         let composite = self
             .state
-            .composite_effects
+            .composite_effects()
             .get(&child)
-            .ok_or(CoreError::UnknownEstate)?;
+            .ok_or(CoreError::UnknownEffect)?;
         let component = composite
             .components
             .get(&descriptor.child_component)
             .ok_or(CoreError::UnknownObligationClass)?;
         let source = self
             .state
-            .composite_effects
+            .composite_effects()
             .get(&descriptor.parent)
-            .ok_or(CoreError::UnknownEstate)?;
-        let operation = component
+            .ok_or(CoreError::UnknownEffect)?;
+        let operation_digest = component
             .commit_operation
             .ok_or(CoreError::WrongCommitState)?;
-        if !matches!(root.state, RootRecoveryState::Fenced { .. })
-            || composite.authority != AuthorityState::Fenced
-            || composite.custodian != CustodyState::KernelEstate
-            || !matches!(composite.handoff, SingleHopRole::Target { parent, descriptor_digest } if parent == descriptor.parent && descriptor_digest == handoff_descriptor_digest(descriptor))
+        let catalog = self.effect_catalog(child)?;
+        if !matches!(
+            operation_record.state,
+            OperationRecoveryState::Fenced { .. }
+        ) || composite.authority != AuthorityState::Fenced
+            || composite.custodian != CustodyState::CoreOwned
+            || composite.catalog_digest != descriptor.catalog_digest
+            || source.catalog_digest != descriptor.catalog_digest
+            || !matches!(composite.handoff, SingleHopRole::Target { parent, descriptor_digest, recovery_fact: None } if parent == descriptor.parent && descriptor_digest == handoff_descriptor_digest(descriptor))
             || !matches!(&source.handoff, SingleHopRole::Source { descriptor: saved, .. } if **saved == descriptor)
             || component.commit != CommitState::Committed
             || component.commit_nonce.is_some()
             || component.commit_fact.is_some()
-            || component.outcome != OutcomeState::Indeterminate(operation)
+            || component.outcome != OutcomeState::Indeterminate(operation_digest)
         {
             return Err(CoreError::HandoffGuardRequired);
         }
-        let binding = self
-            .catalog
+        let binding = catalog
             .obligation_rule(component.domain, component.obligation)
             .ok_or(CoreError::UnknownObligationClass)?
             .receipts()
             .commit_outcome();
-        let expected_verifier_binding = self.scoped_verifier_binding(
+        let verification_scope = self.scoped_verification_scope(
             child,
-            Some(descriptor.child_component),
+            descriptor.child_component,
             binding.verifier(),
             binding.receipt_schema(),
         )?;
@@ -5226,12 +5339,12 @@ impl Engine {
             component: descriptor.child_component,
             domain: component.domain,
             obligation: component.obligation,
-            operation,
+            operation: operation_digest,
             descriptor,
             current_observation: component_freshness(&self.state, composite, component)?,
             expected_verifier: binding.verifier(),
             expected_receipt_schema: binding.receipt_schema(),
-            expected_verifier_binding,
+            verification_scope,
         })
     }
 
@@ -5254,10 +5367,15 @@ impl Engine {
             .verify_handoff_child_success(&challenge, receipt)
             .map_err(|_| CoreError::VerificationFailed)?;
         require_digest(terminal_receipt_digest)?;
-        Ok(VerifiedHandoffChildResolution {
-            descriptor,
-            terminal_receipt_digest,
-        })
+        let fact = VerifiedHandoffRecoveryFact::from_challenge(
+            HandoffRecoveryRole::Child,
+            challenge,
+            VerifierStamp {
+                identity,
+                receipt_digest: terminal_receipt_digest,
+            },
+        );
+        Ok(VerifiedHandoffChildResolution { descriptor, fact })
     }
 
     /// Builds the exact challenge for externally completing a durable
@@ -5272,99 +5390,57 @@ impl Engine {
         ) {
             return Err(CoreError::WrongSettlementStage);
         }
-        if let Some(component) = claim.component {
-            let composite = self
-                .state
-                .composite_effects
-                .get(&claim.effect)
-                .ok_or(CoreError::UnknownEstate)?;
-            let component_record = composite
-                .components
-                .get(&component)
-                .ok_or(CoreError::UnknownObligationClass)?;
-            if !component_claim_matches(component_record, claim)
-                || !matches!(
-                    component_record.settlement,
-                    SettlementState::ApplyIntentDurable { .. } | SettlementState::Claimed { .. }
-                )
-            {
-                return Err(CoreError::StaleSettlementClaim);
-            }
-            let operation = component_record
-                .settlement_intent
-                .ok_or(CoreError::InvariantViolation)?;
-            let binding = self
-                .catalog
-                .obligation_rule(component_record.domain, component_record.obligation)
-                .ok_or(CoreError::UnknownObligationClass)?
-                .receipts()
-                .apply_completed()
-                .ok_or(CoreError::WrongSettlementStage)?;
-            let verification_scope = self.scoped_verification_scope(
-                claim.effect,
-                Some(component),
-                binding.verifier(),
-                binding.receipt_schema(),
-            )?;
-            let expected_verifier_binding =
-                verification_scope.map(|scope| scope.verifier_binding());
-            return Ok(EffectFactChallenge {
-                kind: EffectFactKind::ApplyCompleted,
-                effect: claim.effect,
-                component: Some(component),
-                domain: component_record.domain,
-                obligation: component_record.obligation,
-                actor: claim.claimant,
-                generation: claim.generation,
-                nonce: claim.nonce,
-                operation,
-                predecessor: None,
-                current_observation: component_freshness(&self.state, composite, component_record)?,
-                expected_verifier: binding.verifier(),
-                expected_receipt_schema: binding.receipt_schema(),
-                expected_verifier_binding,
-                verification_scope,
-            });
-        }
-        let estate = self
+        let component = claim.component;
+        let composite = self
             .state
-            .estates
+            .composite_effects()
             .get(&claim.effect)
-            .ok_or(CoreError::UnknownEstate)?;
-        if !settlement_claim_matches(estate, claim)
+            .ok_or(CoreError::UnknownEffect)?;
+        let component_record = composite
+            .components
+            .get(&component)
+            .ok_or(CoreError::UnknownObligationClass)?;
+        if !component_claim_matches(component_record, claim)
             || !matches!(
-                estate.settlement,
+                component_record.settlement,
                 SettlementState::ApplyIntentDurable { .. } | SettlementState::Claimed { .. }
             )
         {
             return Err(CoreError::StaleSettlementClaim);
         }
-        let operation = estate
+        let operation = component_record
             .settlement_intent
             .ok_or(CoreError::InvariantViolation)?;
-        let binding = self
-            .catalog
-            .obligation_rule(estate.domain, estate.obligation)
+        let catalog = self.effect_catalog(claim.effect)?;
+        let binding = catalog
+            .obligation_rule(component_record.domain, component_record.obligation)
             .ok_or(CoreError::UnknownObligationClass)?
             .receipts()
             .apply_completed()
             .ok_or(CoreError::WrongSettlementStage)?;
+        let verification_scope = self.scoped_verification_scope(
+            claim.effect,
+            component,
+            binding.verifier(),
+            binding.receipt_schema(),
+        )?;
+        let expected_verifier_binding = verification_scope.verifier_binding();
         Ok(EffectFactChallenge {
             kind: EffectFactKind::ApplyCompleted,
             effect: claim.effect,
-            component: None,
-            domain: estate.domain,
-            obligation: estate.obligation,
+            component,
+            domain: component_record.domain,
+            obligation: component_record.obligation,
             actor: claim.claimant,
             generation: claim.generation,
             nonce: claim.nonce,
             operation,
             predecessor: None,
-            current_observation: estate_freshness(&self.state, estate)?,
+            current_observation: component_freshness(&self.state, composite, component_record)?,
             expected_verifier: binding.verifier(),
             expected_receipt_schema: binding.receipt_schema(),
-            expected_verifier_binding: None,
-            verification_scope: None,
+            expected_verifier_binding,
+            verification_scope,
         })
     }
 
@@ -5392,107 +5468,61 @@ impl Engine {
         ) {
             return Err(CoreError::WrongSettlementStage);
         }
-        if let Some(component) = claim.component {
-            let composite = self
-                .state
-                .composite_effects
-                .get(&claim.effect)
-                .ok_or(CoreError::UnknownEstate)?;
-            let component_record = composite
-                .components
-                .get(&component)
-                .ok_or(CoreError::UnknownObligationClass)?;
-            if !component_claim_matches(component_record, claim)
-                || !matches!(
-                    component_record.settlement,
-                    SettlementState::AppliedUnacknowledged { .. } | SettlementState::Claimed { .. }
-                )
-            {
-                return Err(CoreError::StaleSettlementClaim);
-            }
-            let operation = component_record
-                .settlement_intent
-                .ok_or(CoreError::InvariantViolation)?;
-            let predecessor = component_record
-                .applied_fact
-                .map(|fact| fact.stamp.receipt_digest)
-                .ok_or(CoreError::InvariantViolation)?;
-            let binding = self
-                .catalog
-                .obligation_rule(component_record.domain, component_record.obligation)
-                .ok_or(CoreError::UnknownObligationClass)?
-                .receipts()
-                .settlement_acknowledged()
-                .ok_or(CoreError::WrongSettlementStage)?;
-            let verification_scope = self.scoped_verification_scope(
-                claim.effect,
-                Some(component),
-                binding.verifier(),
-                binding.receipt_schema(),
-            )?;
-            let expected_verifier_binding =
-                verification_scope.map(|scope| scope.verifier_binding());
-            return Ok(EffectFactChallenge {
-                kind: EffectFactKind::SettlementAcknowledged,
-                effect: claim.effect,
-                component: Some(component),
-                domain: component_record.domain,
-                obligation: component_record.obligation,
-                actor: claim.claimant,
-                generation: claim.generation,
-                nonce: claim.nonce,
-                operation,
-                predecessor: Some(predecessor),
-                current_observation: component_freshness(&self.state, composite, component_record)?,
-                expected_verifier: binding.verifier(),
-                expected_receipt_schema: binding.receipt_schema(),
-                expected_verifier_binding,
-                verification_scope,
-            });
-        }
-        let estate = self
+        let component = claim.component;
+        let composite = self
             .state
-            .estates
+            .composite_effects()
             .get(&claim.effect)
-            .ok_or(CoreError::UnknownEstate)?;
-        if !settlement_claim_matches(estate, claim)
+            .ok_or(CoreError::UnknownEffect)?;
+        let component_record = composite
+            .components
+            .get(&component)
+            .ok_or(CoreError::UnknownObligationClass)?;
+        if !component_claim_matches(component_record, claim)
             || !matches!(
-                estate.settlement,
+                component_record.settlement,
                 SettlementState::AppliedUnacknowledged { .. } | SettlementState::Claimed { .. }
             )
         {
             return Err(CoreError::StaleSettlementClaim);
         }
-        let operation = estate
+        let operation = component_record
             .settlement_intent
             .ok_or(CoreError::InvariantViolation)?;
-        let predecessor = estate
+        let predecessor = component_record
             .applied_fact
             .map(|fact| fact.stamp.receipt_digest)
             .ok_or(CoreError::InvariantViolation)?;
-        let binding = self
-            .catalog
-            .obligation_rule(estate.domain, estate.obligation)
+        let catalog = self.effect_catalog(claim.effect)?;
+        let binding = catalog
+            .obligation_rule(component_record.domain, component_record.obligation)
             .ok_or(CoreError::UnknownObligationClass)?
             .receipts()
             .settlement_acknowledged()
             .ok_or(CoreError::WrongSettlementStage)?;
+        let verification_scope = self.scoped_verification_scope(
+            claim.effect,
+            component,
+            binding.verifier(),
+            binding.receipt_schema(),
+        )?;
+        let expected_verifier_binding = verification_scope.verifier_binding();
         Ok(EffectFactChallenge {
             kind: EffectFactKind::SettlementAcknowledged,
             effect: claim.effect,
-            component: None,
-            domain: estate.domain,
-            obligation: estate.obligation,
+            component,
+            domain: component_record.domain,
+            obligation: component_record.obligation,
             actor: claim.claimant,
             generation: claim.generation,
             nonce: claim.nonce,
             operation,
             predecessor: Some(predecessor),
-            current_observation: estate_freshness(&self.state, estate)?,
+            current_observation: component_freshness(&self.state, composite, component_record)?,
             expected_verifier: binding.verifier(),
             expected_receipt_schema: binding.receipt_schema(),
-            expected_verifier_binding: None,
-            verification_scope: None,
+            expected_verifier_binding,
+            verification_scope,
         })
     }
 
@@ -5556,13 +5586,18 @@ impl Engine {
         })
     }
 
-    /// Returns the catalog schema digest.
-    pub const fn catalog_digest(&self) -> Digest {
+    /// Returns the aggregate digest of the immutable catalog set.
+    pub const fn catalog_set_digest(&self) -> Digest {
         self.catalog.digest()
     }
 
-    /// Returns the semantic world bound to this engine, when scoped.
-    pub const fn world(&self) -> Option<WorldId> {
+    /// Returns the immutable catalog set protecting this engine.
+    pub fn catalog_set(&self) -> &CatalogSet {
+        &self.catalog
+    }
+
+    /// Returns the semantic world bound to this engine.
+    pub const fn world(&self) -> WorldId {
         self.state.world
     }
 
@@ -5572,7 +5607,7 @@ impl Engine {
         coordinate: ProviderCoordinate,
     ) -> Option<ProviderGenerationProjection> {
         self.state
-            .provider_generations
+            .provider_generations()
             .get(&coordinate)
             .map(|record| ProviderGenerationProjection {
                 coordinate: record.coordinate,
@@ -5590,7 +5625,7 @@ impl Engine {
         &self,
         artifact: crate::RecoveryArtifactId,
     ) -> Option<ArtifactLeaseState> {
-        self.state.artifact_leases.get(&artifact).copied()
+        self.state.artifact_leases().get(&artifact).copied()
     }
 
     /// Returns all component obligations retained by one exact provider
@@ -5598,12 +5633,12 @@ impl Engine {
     /// not grant settlement, release, or execution authority.
     pub fn provider_obligations(&self, coordinate: ProviderCoordinate) -> Vec<ProviderObligation> {
         let mut obligations = Vec::new();
-        for (effect, scoped) in &self.state.scoped_composites {
+        for (effect, scoped) in self.state.scoped_composites() {
             for (component, provider) in &scoped.bindings {
                 if *provider != coordinate {
                     continue;
                 }
-                let Some(composite) = self.state.composite_effects.get(effect) else {
+                let Some(composite) = self.state.composite_effects().get(effect) else {
                     continue;
                 };
                 let Some(record) = composite.components.get(component) else {
@@ -5611,8 +5646,8 @@ impl Engine {
                 };
                 obligations.push(ProviderObligation {
                     provider: coordinate,
-                    operation: scoped.operation,
-                    catalog_digest: self.catalog.digest(),
+                    operation: effect.operation(),
+                    catalog_digest: scoped.catalog_digest,
                     effect: *effect,
                     component: *component,
                     artifact: scoped.artifacts.get(component).copied(),
@@ -5627,11 +5662,11 @@ impl Engine {
         obligations
     }
 
-    /// Returns all durable artifact recovery roots, including already
+    /// Returns all durable artifact recovery operations, including already
     /// released leases retained for audit and snapshot identity.
     pub fn artifact_recovery_items(&self) -> Vec<ArtifactRecoveryItem> {
         self.state
-            .artifact_leases
+            .artifact_leases()
             .values()
             .map(|lease| ArtifactRecoveryItem {
                 binding: lease.binding(),
@@ -5641,7 +5676,7 @@ impl Engine {
             .collect()
     }
 
-    /// Returns only artifact roots whose release authorization is durable.
+    /// Returns only artifact operations whose release authorization is durable.
     pub fn releasable_artifacts(&self) -> Vec<ArtifactRecoveryItem> {
         self.artifact_recovery_items()
             .into_iter()
@@ -5657,9 +5692,9 @@ impl Engine {
     ) -> Result<ArtifactPinChallenge, CoreError> {
         let scoped = self
             .state
-            .scoped_composites
+            .scoped_composites()
             .get(&effect)
-            .ok_or(CoreError::UnknownEstate)?;
+            .ok_or(CoreError::UnknownEffect)?;
         let binding = scoped
             .artifacts
             .get(&component)
@@ -5667,7 +5702,7 @@ impl Engine {
             .ok_or(CoreError::ArtifactRequired)?;
         if self
             .state
-            .artifact_leases
+            .artifact_leases()
             .contains_key(&binding.artifact_id())
         {
             return Err(CoreError::ArtifactBindingMismatch);
@@ -5676,9 +5711,20 @@ impl Engine {
             .bindings
             .get(&component)
             .ok_or(CoreError::ProviderBindingMismatch)?;
+        if scoped.catalog_digest
+            != self
+                .state
+                .provider_generations()
+                .get(provider)
+                .ok_or(CoreError::UnknownProviderGeneration)?
+                .catalog_digest
+            || !self.catalog.contains(scoped.catalog_digest)
+        {
+            return Err(CoreError::CatalogMismatch);
+        }
         let receipts = self
             .state
-            .provider_generations
+            .provider_generations()
             .get(provider)
             .and_then(|record| record.artifact_receipts)
             .ok_or(CoreError::ArtifactVerifierMismatch)?;
@@ -5699,7 +5745,7 @@ impl Engine {
             verifier.identity(),
             challenge.expected_verifier_binding().verifier(),
             challenge.expected_verifier_binding().receipt_schema(),
-            Some(challenge.expected_verifier_binding()),
+            challenge.expected_verifier_binding(),
         )?;
         let pin_stamp = verifier
             .verify(&challenge, receipt)
@@ -5719,9 +5765,9 @@ impl Engine {
     ) -> Result<ArtifactReleaseChallenge, CoreError> {
         let scoped = self
             .state
-            .scoped_composites
+            .scoped_composites()
             .get(&effect)
-            .ok_or(CoreError::UnknownEstate)?;
+            .ok_or(CoreError::UnknownEffect)?;
         let binding = scoped
             .artifacts
             .get(&component)
@@ -5729,7 +5775,7 @@ impl Engine {
             .ok_or(CoreError::ArtifactRequired)?;
         let lease = self
             .state
-            .artifact_leases
+            .artifact_leases()
             .get(&binding.artifact_id())
             .ok_or(CoreError::ArtifactNotPinned)?;
         let (pin_stamp, release_operation, nonce) = match lease {
@@ -5746,9 +5792,20 @@ impl Engine {
             .bindings
             .get(&component)
             .ok_or(CoreError::ProviderBindingMismatch)?;
+        if scoped.catalog_digest
+            != self
+                .state
+                .provider_generations()
+                .get(provider)
+                .ok_or(CoreError::UnknownProviderGeneration)?
+                .catalog_digest
+            || !self.catalog.contains(scoped.catalog_digest)
+        {
+            return Err(CoreError::CatalogMismatch);
+        }
         let receipts = self
             .state
-            .provider_generations
+            .provider_generations()
             .get(provider)
             .and_then(|record| record.artifact_receipts)
             .ok_or(CoreError::ArtifactVerifierMismatch)?;
@@ -5769,7 +5826,7 @@ impl Engine {
     ) -> Result<ArtifactReleasePermit, CoreError> {
         let challenge = self.artifact_release_challenge(effect, component)?;
         self.state
-            .artifact_leases
+            .artifact_leases()
             .get(&challenge.binding().artifact_id())
             .and_then(|lease| lease.release_permit().ok())
             .ok_or(CoreError::ArtifactReleaseMismatch)
@@ -5788,7 +5845,7 @@ impl Engine {
             verifier.identity(),
             challenge.expected_verifier_binding().verifier(),
             challenge.expected_verifier_binding().receipt_schema(),
-            Some(challenge.expected_verifier_binding()),
+            challenge.expected_verifier_binding(),
         )?;
         let release_stamp = verifier
             .verify(&challenge, receipt)
@@ -5801,44 +5858,38 @@ impl Engine {
         })
     }
 
-    /// Resolves the immutable verifier binding retained by one scoped
-    /// component. Legacy/unscoped effects deliberately return `None`; scoped
-    /// effects fail closed if their provider record cannot provide the exact
-    /// class/schema required by the catalog rule.
-    fn scoped_verifier_binding(
-        &self,
-        effect: EffectId,
-        component: Option<ComponentId>,
-        verifier: VerifierId,
-        receipt_schema: ReceiptSchemaId,
-    ) -> Result<Option<VerifierBinding>, CoreError> {
-        Ok(self
-            .scoped_verification_scope(effect, component, verifier, receipt_schema)?
-            .map(|scope| scope.verifier_binding()))
-    }
-
     /// Resolves the complete exact scope retained by one scoped component.
-    /// The operation, provider, world, catalog digest, and verifier binding
     /// all come from authoritative state; callers cannot supply replacements.
     fn scoped_verification_scope(
         &self,
         effect: EffectId,
-        component: Option<ComponentId>,
+        component: ComponentId,
         verifier: VerifierId,
         receipt_schema: ReceiptSchemaId,
-    ) -> Result<Option<ProviderVerificationScope>, CoreError> {
-        let Some(scoped) = self.state.scoped_composites.get(&effect) else {
-            return Ok(None);
+    ) -> Result<ProviderVerificationScope, CoreError> {
+        let Some(scope_source) = self
+            .state
+            .scoped_composites()
+            .get(&effect)
+            .map(|scoped| (scoped.catalog_digest, &scoped.bindings))
+            .or_else(|| {
+                self.state
+                    .composite_effects()
+                    .get(&effect)
+                    .and_then(|composite| composite.released_provenance.as_ref())
+                    .map(|provenance| (provenance.catalog_digest, &provenance.bindings))
+            })
+        else {
+            return Err(CoreError::UnknownEffect);
         };
-        let component = component.ok_or(CoreError::ProviderBindingMismatch)?;
-        let provider = scoped
-            .bindings
+        let provider = *scope_source
+            .1
             .get(&component)
             .ok_or(CoreError::ProviderBindingMismatch)?;
         let record = self
             .state
-            .provider_generations
-            .get(provider)
+            .provider_generations()
+            .get(&provider)
             .ok_or(CoreError::UnknownProviderGeneration)?;
         let binding = record
             .verifier_bindings
@@ -5848,17 +5899,20 @@ impl Engine {
             })
             .copied()
             .ok_or(CoreError::VerifierSetMismatch)?;
-        let world = self.state.world.ok_or(CoreError::InvariantViolation)?;
-        if world != provider.world() || record.catalog_digest != self.catalog.digest() {
+        let world = self.state.world();
+        if world != provider.world()
+            || scope_source.0 != record.catalog_digest
+            || !self.catalog.contains(record.catalog_digest)
+        {
             return Err(CoreError::ProviderBindingMismatch);
         }
-        Ok(Some(ProviderVerificationScope::new(
+        Ok(ProviderVerificationScope::new(
             world,
-            *provider,
-            scoped.operation,
+            provider,
+            effect.operation(),
             record.catalog_digest,
             binding,
-        )))
+        ))
     }
 
     fn validate_verifier_identity(
@@ -5866,7 +5920,7 @@ impl Engine {
         identity: VerifierIdentity,
         expected_verifier: VerifierId,
         expected_receipt_schema: ReceiptSchemaId,
-        expected_binding: Option<VerifierBinding>,
+        expected_binding: VerifierBinding,
     ) -> Result<(), CoreError> {
         if identity.verifier() != expected_verifier {
             return Err(CoreError::UnknownVerifier);
@@ -5874,22 +5928,10 @@ impl Engine {
         if identity.receipt_schema() != expected_receipt_schema {
             return Err(CoreError::ReceiptSchemaMismatch);
         }
-        if let Some(binding) = expected_binding {
-            if identity.implementation_digest() != Some(binding.implementation_digest()) {
-                return Err(CoreError::UnknownVerifier);
-            }
-            if identity.epoch() != binding.generation().get() {
-                return Err(CoreError::StaleVerifierEpoch);
-            }
-            return Ok(());
+        if identity.implementation_digest() != expected_binding.implementation_digest() {
+            return Err(CoreError::UnknownVerifier);
         }
-        if self
-            .state
-            .verifier_epochs
-            .get(&identity.verifier())
-            .copied()
-            != Some(identity.epoch())
-        {
+        if identity.epoch() != expected_binding.generation().get() {
             return Err(CoreError::StaleVerifierEpoch);
         }
         Ok(())
@@ -5901,7 +5943,7 @@ impl Engine {
     /// profile's durability barrier before returning success. It is invoked
     /// while no core state has changed. A persistence failure leaves the full
     /// semantic projection unchanged, but latches this engine into
-    /// recovery-required state because the candidate record may already be
+    /// recovery-required state because the prepared record may already be
     /// durable.
     pub fn transact<E, P, C>(
         &mut self,
@@ -5917,7 +5959,7 @@ impl Engine {
 
     /// Prepares and commits one transition through a typed durability provider.
     ///
-    /// Unlike [`Self::transact`], this path also passes the candidate
+    /// Unlike [`Self::transact`], this path also passes the prepared
     /// post-transition freshness to the provider. That is required for a
     /// recovery checkpoint, whose record is encoded under the previously
     /// committed epoch but atomically advances the trusted anchor to the
@@ -5944,7 +5986,7 @@ impl Engine {
     where
         P: crate::TransitionDurability,
     {
-        if self.state.recovery_target.is_some() {
+        if self.state.recovery_target().is_some() {
             return Err(TxError::Core(CoreError::RecoveryPending));
         }
         let state = encode_whole_state_checkpoint(&self.state);
@@ -5977,7 +6019,7 @@ impl Engine {
             })?;
         if let Err(error) = persist(
             &prepared.record,
-            prepared.candidate.freshness,
+            prepared.delta.freshness(self.state.freshness()),
             prepared.receipt.projection,
         ) {
             self.persistence_recovery_required = true;
@@ -5988,9 +6030,9 @@ impl Engine {
 
     /// Executes all fallible semantic work for one transition.
     ///
-    /// This includes applying and validating the candidate, constructing the
-    /// journal record, and computing the projection and public output before
-    /// persistence is entered. The candidate's revision and head must be
+    /// This includes applying and validating the prepared delta, constructing
+    /// the journal record, and computing the projection and public output before
+    /// persistence is entered. The prepared revision and head must be
     /// visible to the projection hash, because those coordinates are part of
     /// the authoritative projection.
     fn prepare_transition<C>(&self, command: C) -> Result<PreparedTransition, PrepareError>
@@ -5999,69 +6041,70 @@ impl Engine {
     {
         let Command(command) = command.into();
         let coordinates = command.coordinates_for_state(&self.state);
-        if self.api_mode == EngineApiMode::ProfileTwo && !command.is_profile_two_compatible() {
-            return Err(PrepareError::Core(CoreError::IncompatibleApiProfile));
-        }
         if self.journal_repair_required.is_some() {
             return Err(PrepareError::Core(CoreError::JournalRepairRequired));
         }
         if self.persistence_recovery_required {
             return Err(PrepareError::Core(CoreError::PersistenceRecoveryRequired));
         }
-        if self.state.recovery_target.is_some()
+        if self.state.recovery_target().is_some()
             && !matches!(&command, CommandKind::CheckpointRecovery { .. })
         {
             return Err(PrepareError::Core(CoreError::RecoveryPending));
         }
-        let mut candidate = self.state.clone();
-        let output = apply_command_for_mode(
-            self.api_mode,
+        let command_catalog = self.command_catalog(&command).map_err(PrepareError::Core)?;
+        let mut delta = DeltaBuilder::new(&self.state);
+        let output = apply_command(
             &self.catalog,
+            command_catalog,
             self.limits,
-            &mut candidate,
+            &mut delta,
             &command,
         )
         .map_err(PrepareError::Core)?;
-        let touches = collect_projection_touches(&self.state, &candidate, &command);
-        candidate.total_claims = transition_total_claims(&self.state, &candidate, &touches)
+        // The mutation hooks on `DeltaBuilder` are the sole production source
+        // of projection addresses.  In particular, an idempotent write is
+        // still a touch: recovery overlays may intentionally write a value
+        // equal to the primary value while changing the authenticated
+        // projection envelope.
+        let touches = delta.take_projection_touches();
+        delta.set_total_claims(
+            transition_total_claims(&self.state, &delta, &touches).map_err(PrepareError::Core)?,
+        );
+        #[cfg(feature = "full-invariant-oracle")]
+        check_invariants_for_catalog_set(&self.catalog, self.limits, &delta)
             .map_err(PrepareError::Core)?;
-        #[cfg(any(test, feature = "full-invariant-oracle"))]
-        check_invariants(&self.catalog, self.limits, &candidate).map_err(PrepareError::Core)?;
-        #[cfg(not(any(test, feature = "full-invariant-oracle")))]
+        #[cfg(not(feature = "full-invariant-oracle"))]
         check_transition_local_invariants(
-            &self.catalog,
+            command_catalog,
             self.limits,
             &self.state,
-            &candidate,
+            &delta,
             &touches,
         )
         .map_err(PrepareError::Core)?;
 
-        let world = self
-            .state
-            .world
-            .ok_or(PrepareError::Core(CoreError::WorldMismatch))?;
+        let world = self.state.world;
         let record = JournalRecord::build(
-            self.state.revision,
-            self.state.freshness,
+            self.state.revision(),
+            self.state.freshness(),
             RecoveryBinding::new(
                 crate::RecoveryProfile::current(),
                 world,
                 self.catalog.digest(),
-                self.state.freshness.registry(),
-                crate::AuthorityBindingGeneration::new(self.state.freshness.binding())
-                    .expect("freshness binding is non-zero"),
+                self.state.freshness().registry(),
             )
             .map_err(|_| PrepareError::Core(CoreError::SchemaMismatch))?,
-            self.state.projection_cache.digest,
-            self.state.head,
-            command.clone(),
+            self.state.projection_cache().digest,
+            self.state.head(),
+            command,
         )
         .map_err(PrepareError::Journal)?;
-        candidate.revision = record.revision();
-        candidate.head = record.digest();
-        refresh_projection_cache(&self.state, &mut candidate, &command, self.catalog.digest());
-        let projection = candidate.projection_cache.digest;
+
+        delta.set_revision(record.revision());
+        delta.set_head(record.digest());
+        refresh_projection_cache(&self.state, &mut delta, &touches, self.catalog.digest());
+        let projection = delta.projection_cache().digest;
         let event = output.event;
         let output = output.into_public();
         let receipt = TransitionReceipt {
@@ -6079,7 +6122,7 @@ impl Engine {
             output,
         };
         Ok(PreparedTransition {
-            candidate,
+            delta: delta.finish(),
             record,
             receipt,
         })
@@ -6087,16 +6130,16 @@ impl Engine {
 
     /// Publishes a transition after its journal record has become durable.
     ///
-    /// The prepared candidate and receipt contain all semantic work. Keep
+    /// The prepared delta and receipt contain all semantic work. Keep
     /// this path deliberately infallible and allocation-free: persistence has
     /// already crossed the only externally observable commit boundary.
     fn apply_prepared(&mut self, prepared: PreparedTransition) -> TransitionReceipt {
         let PreparedTransition {
-            candidate,
+            delta,
             record: _,
             receipt,
         } = prepared;
-        self.state = candidate;
+        delta.apply(&mut self.state);
         receipt
     }
 
@@ -6124,51 +6167,20 @@ impl Engine {
     /// catalog digest, committed epoch, minimum revision, and exact head must
     /// all agree before the next freshness epoch can be installed.
     pub fn recover(
-        catalog: DomainCatalog,
+        catalog: CatalogSet,
         limits: CoreLimits,
         anchor: RecoveryAnchor,
         bytes: &[u8],
     ) -> Result<RecoveryReport, CoreError> {
         let world = anchor.world();
-        Self::recover_with_mode(
-            catalog,
-            limits,
-            anchor,
-            bytes,
-            EngineApiMode::ProfileTwo,
-            world,
-        )
+        Self::recover_with_world(catalog, limits, anchor, bytes, world)
     }
 
-    /// Recovers predecessor-profile records for offline conformance tests.
-    ///
-    /// Production boot paths must use [`Self::recover`], which rejects the
-    /// predecessor singleton grammar before applying any record.
-    #[cfg(feature = "test-support")]
-    #[doc(hidden)]
-    pub fn recover_legacy_compatibility(
-        catalog: DomainCatalog,
+    fn recover_with_world(
+        catalog: CatalogSet,
         limits: CoreLimits,
         anchor: RecoveryAnchor,
         bytes: &[u8],
-    ) -> Result<RecoveryReport, CoreError> {
-        let world = anchor.world();
-        Self::recover_with_mode(
-            catalog,
-            limits,
-            anchor,
-            bytes,
-            EngineApiMode::LegacyCompatibility,
-            world,
-        )
-    }
-
-    fn recover_with_mode(
-        catalog: DomainCatalog,
-        limits: CoreLimits,
-        anchor: RecoveryAnchor,
-        bytes: &[u8],
-        api_mode: EngineApiMode,
         expected_world: WorldId,
     ) -> Result<RecoveryReport, CoreError> {
         if anchor.catalog_digest() != catalog.digest()
@@ -6180,12 +6192,11 @@ impl Engine {
             reject_recognized_legacy_journal_prefix(bytes).map_err(CoreError::Journal)?;
             let journal_repair =
                 (!bytes.is_empty()).then_some(JournalRepair::UnanchoredSuffix { offset: 0 });
-            let mut engine = Self::new_with_mode(
+            let mut engine = Self::new(
+                expected_world,
                 catalog,
                 limits,
                 anchor.committed_freshness(),
-                api_mode,
-                Some(expected_world),
             );
             if engine.projection_digest() != anchor.projection() {
                 return Err(CoreError::RollbackDetected);
@@ -6249,15 +6260,31 @@ impl Engine {
         let initial = Freshness::new(
             first.boot(),
             first.registry(),
-            first.binding(),
             first.device(),
             first.journal(),
-        )
-        .map_err(|_| CoreError::InvariantViolation)?;
-        let mut engine =
-            Self::new_with_mode(catalog, limits, initial, api_mode, Some(expected_world));
+        );
+        let mut engine = Self::new(expected_world, catalog, limits, initial);
 
         for (index, record) in records.iter().enumerate() {
+            let replay_catalog = if matches!(
+                record.command(),
+                CommandKind::CheckpointRecovery { .. }
+                    | CommandKind::WholeStateCheckpointV1 { .. }
+                    | CommandKind::Snapshot { .. }
+                    | CommandKind::FenceExecutor { .. }
+                    | CommandKind::Ready { .. }
+                    | CommandKind::Rebind { .. }
+            ) {
+                None
+            } else {
+                let digest = engine.command_catalog_digest(record.command())?;
+                Some(
+                    engine
+                        .catalog
+                        .get(digest)
+                        .ok_or(CoreError::SchemaMismatch)?,
+                )
+            };
             if record.recovery_binding() != anchor.binding() {
                 return Err(CoreError::RollbackDetected);
             }
@@ -6270,24 +6297,18 @@ impl Engine {
                     || rebuilt.head != record.predecessor()
                     || rebuilt.freshness.boot() != record.boot()
                     || rebuilt.freshness.registry() != record.registry()
-                    || rebuilt.freshness.binding() != record.binding()
                     || rebuilt.freshness.journal() != record.journal()
                     || rebuilt.freshness.device() != record.device()
                     || rebuilt.projection_cache.digest != *projection
                 {
                     return Err(CoreError::RollbackDetected);
                 }
-                if rebuilt.world != Some(expected_world) {
+                if rebuilt.world != expected_world {
                     return Err(CoreError::WorldMismatch);
                 }
                 engine.state = rebuilt;
             }
-            if api_mode == EngineApiMode::ProfileTwo
-                && !record.command().is_profile_two_compatible()
-            {
-                return Err(CoreError::IncompatibleApiProfile);
-            }
-            if record.base_revision() != engine.state.revision
+            if record.base_revision() != engine.state.revision()
                 || record.revision()
                     != engine
                         .state
@@ -6297,15 +6318,14 @@ impl Engine {
             {
                 return Err(CoreError::RevisionConflict);
             }
-            if record.predecessor() != engine.state.head {
+            if record.predecessor() != engine.state.head() {
                 return Err(CoreError::PredecessorMismatch);
             }
             if record.catalog_digest() != engine.catalog.digest()
-                || record.registry() != engine.state.freshness.registry()
-                || record.binding() != engine.state.freshness.binding()
-                || record.boot() != engine.state.freshness.boot()
-                || record.journal() != engine.state.freshness.journal()
-                || record.device() != engine.state.freshness.device()
+                || record.registry() != engine.state.freshness().registry()
+                || record.boot() != engine.state.freshness().boot()
+                || record.journal() != engine.state.freshness().journal()
+                || record.device() != engine.state.freshness().device()
             {
                 return Err(CoreError::SchemaMismatch);
             }
@@ -6318,18 +6338,19 @@ impl Engine {
                 engine.catalog.digest(),
             )?;
             let previous = engine.state.clone();
-            apply_command_for_mode(
-                api_mode,
+            apply_command(
                 &engine.catalog,
+                replay_catalog,
                 engine.limits,
                 &mut engine.state,
                 record.command(),
             )?;
-            let touches = collect_projection_touches(&previous, &engine.state, record.command());
-            engine.state.total_claims =
-                transition_total_claims(&previous, &engine.state, &touches)?;
+            let mut touches = ProjectionTouches::default();
+            touch_all_projection_records(&previous, &mut touches);
+            touch_all_projection_records(&engine.state, &mut touches);
+            engine.state.total_claims = count_state_claims(&engine.state)?;
             check_transition_local_invariants(
-                &engine.catalog,
+                replay_catalog,
                 engine.limits,
                 &previous,
                 &engine.state,
@@ -6340,41 +6361,35 @@ impl Engine {
             refresh_projection_cache(
                 &previous,
                 &mut engine.state,
-                record.command(),
+                &touches,
                 engine.catalog.digest(),
             );
-            #[cfg(feature = "test-support")]
-            if api_mode == EngineApiMode::LegacyCompatibility {
-                engine.state.projection_cache =
-                    build_projection_cache(&engine.state, engine.catalog.digest());
-            }
         }
 
-        check_invariants(&engine.catalog, engine.limits, &engine.state)?;
+        check_invariants_for_catalog_set(&engine.catalog, engine.limits, &engine.state)?;
         let rebuilt_projection = build_projection_cache(&engine.state, engine.catalog.digest());
         if rebuilt_projection.digest != engine.projection_digest() {
             return Err(CoreError::InvariantViolation);
         }
         engine.state.projection_cache = rebuilt_projection;
 
-        if engine.state.revision < anchor.minimum_revision {
+        if engine.state.revision() < anchor.minimum_revision {
             return Err(CoreError::RollbackDetected);
         }
-        if anchor.expected_head() != engine.state.head {
+        if anchor.expected_head() != engine.state.head() {
             return Err(CoreError::RollbackDetected);
         }
-        if engine.state.freshness != anchor.committed_freshness() {
+        if engine.state.freshness() != anchor.committed_freshness() {
             return Err(CoreError::FreshnessRollback);
         }
         if engine.projection_digest() != anchor.projection() {
             return Err(CoreError::RollbackDetected);
         }
         let target = anchor.next_freshness;
-        if target.registry() != engine.state.freshness.registry()
-            || target.binding() != engine.state.freshness.binding()
-            || target.boot().get() <= engine.state.freshness.boot().get()
-            || target.journal().get() <= engine.state.freshness.journal().get()
-            || target.device().get() < engine.state.freshness.device().get()
+        if target.registry() != engine.state.freshness().registry()
+            || target.boot().get() <= engine.state.freshness().boot().get()
+            || target.journal().get() <= engine.state.freshness().journal().get()
+            || target.device().get() < engine.state.freshness().device().get()
         {
             return Err(CoreError::FreshnessRollback);
         }
@@ -6383,31 +6398,17 @@ impl Engine {
         engine.journal_repair_required = journal_repair;
 
         Ok(RecoveryReport {
-            acknowledged_revision: engine.state.revision,
-            acknowledged_head: engine.state.head,
+            acknowledged_revision: engine.state.revision(),
+            acknowledged_head: engine.state.head(),
             journal_repair,
             engine,
         })
     }
 
-    /// Returns a public estate projection.
-    pub fn estate(&self, effect: EffectId) -> Option<EstateProjection> {
-        self.state.estates.get(&effect).map(project_estate)
-    }
-
-    /// Returns the number of singleton profile-1 estates in recovered state.
-    ///
-    /// Profile-2 production installation requires this value to be zero. The
-    /// count remains public so boot code can fail closed before releasing a
-    /// device quarantine guard; it grants no transition authority.
-    pub fn profile_one_estate_count(&self) -> usize {
-        self.state.estates.len()
-    }
-
     /// Returns the shared parent projection of one composite effect.
     pub fn composite_effect(&self, effect: EffectId) -> Option<CompositeEffectProjection> {
         self.state
-            .composite_effects
+            .composite_effects()
             .get(&effect)
             .map(|composite| project_composite_effect(composite, &self.state))
     }
@@ -6419,28 +6420,10 @@ impl Engine {
         component: ComponentId,
     ) -> Option<ComponentProjection> {
         self.state
-            .composite_effects
+            .composite_effects()
             .get(&effect)
             .and_then(|composite| composite.components.get(&component))
             .map(|record| project_component(effect, record))
-    }
-
-    /// Returns every claim for one exact estate in stable claim-id order.
-    ///
-    /// The returned values are observations only.  A recovery adapter must
-    /// still request an exact evidence challenge and submit the resulting
-    /// one-shot command before any resource becomes reusable.
-    pub fn claims(&self, effect: EffectId) -> Result<Vec<ClaimProjection>, CoreError> {
-        let estate = self
-            .state
-            .estates
-            .get(&effect)
-            .ok_or(CoreError::UnknownEstate)?;
-        Ok(estate
-            .claims
-            .values()
-            .map(|claim| project_claim(effect, claim))
-            .collect())
     }
 
     /// Returns every claim for one exact component in stable claim-id order.
@@ -6451,10 +6434,10 @@ impl Engine {
     ) -> Result<Vec<ComponentClaimProjection>, CoreError> {
         let component_record = self
             .state
-            .composite_effects
+            .composite_effects()
             .get(&effect)
             .and_then(|composite| composite.components.get(&component))
-            .ok_or(CoreError::UnknownEstate)?;
+            .ok_or(CoreError::UnknownEffect)?;
         Ok(component_record
             .claims
             .values()
@@ -6462,29 +6445,10 @@ impl Engine {
             .collect())
     }
 
-    /// Enumerates all non-retired claims in stable effect/claim order.
-    ///
-    /// Boot recovery uses this bounded projection to reconstruct physical
-    /// custodians and quarantine work from the authoritative replayed state;
-    /// adapters must not persist a parallel semantic tombstone index.
-    pub fn retained_claims(&self) -> Vec<ClaimProjection> {
-        self.state
-            .estates
-            .iter()
-            .flat_map(|(effect, estate)| {
-                estate
-                    .claims
-                    .values()
-                    .filter(|claim| !claim.retired)
-                    .map(|claim| project_claim(*effect, claim))
-            })
-            .collect()
-    }
-
     /// Enumerates every retained component-local claim in stable order.
     pub fn retained_component_claims(&self) -> Vec<ComponentClaimProjection> {
         self.state
-            .composite_effects
+            .composite_effects()
             .iter()
             .flat_map(|(effect, composite)| {
                 composite
@@ -6501,9 +6465,12 @@ impl Engine {
             .collect()
     }
 
-    /// Returns a root recovery projection.
-    pub fn root(&self, root: RootId) -> Option<RootRecoveryState> {
-        self.state.roots.get(&root).map(|record| record.state)
+    /// Returns a operation recovery projection.
+    pub fn operation(&self, operation: OperationId) -> Option<OperationRecoveryState> {
+        self.state
+            .recovery_operations()
+            .get(&operation)
+            .map(|record| record.state)
     }
 
     /// Returns the exact component commit intents which remain durable but
@@ -6520,9 +6487,9 @@ impl Engine {
     ) -> Result<Vec<CommitIntent>, CoreError> {
         let composite = self
             .state
-            .composite_effects
+            .composite_effects()
             .get(&effect)
-            .ok_or(CoreError::UnknownEstate)?;
+            .ok_or(CoreError::UnknownEffect)?;
         Ok(composite
             .components
             .iter()
@@ -6532,7 +6499,7 @@ impl Engine {
                     .flatten()
                     .map(|nonce| CommitIntent {
                         effect,
-                        component: Some(*component),
+                        component: *component,
                         nonce,
                     })
             })
@@ -6540,14 +6507,22 @@ impl Engine {
     }
 
     /// Generates an exact, ordered and non-authorizing recovery cohort for one
-    /// fenced root. The caller may inspect the cohort before consuming it into
+    /// fenced operation. The caller may inspect the cohort before consuming it into
     /// [`RecoverySnapshot::record`].
-    pub fn snapshot_root(
+    pub fn snapshot_operation(
         &self,
-        root: RootId,
+        operation: OperationId,
         snapshot: SnapshotId,
     ) -> Result<RecoverySnapshot, CoreError> {
-        build_recovery_snapshot(&self.catalog, &self.state, root, snapshot)
+        if !self
+            .state
+            .composite_effects()
+            .keys()
+            .any(|effect| effect.operation() == operation)
+        {
+            return Err(CoreError::UnknownOperation);
+        }
+        build_recovery_snapshot(&self.catalog, &self.state, operation, snapshot)
     }
 
     /// Returns retained charging for one exact account and credit class.
@@ -6557,7 +6532,7 @@ impl Engine {
             class,
             retained_units: self
                 .state
-                .charges
+                .charges()
                 .get(&(account, class))
                 .copied()
                 .unwrap_or(0),
@@ -6567,35 +6542,23 @@ impl Engine {
     /// Returns the bounded global pressure projection.
     pub fn pressure(&self) -> PressureProjection {
         PressureProjection {
-            roots: self.state.roots.len(),
-            estates: self.state.estates.len() + self.state.composite_effects.len(),
+            operations: self.state.recovery_operations().len(),
+            composites: self.state.composite_effects().len(),
             retained_claims: self
                 .state
-                .estates
+                .composite_effects()
                 .values()
-                .map(|estate| {
-                    estate
+                .flat_map(|composite| composite.components.values())
+                .map(|component| {
+                    component
                         .claims
                         .values()
                         .filter(|claim| !claim.retired)
                         .count()
                 })
-                .sum::<usize>()
-                + self
-                    .state
-                    .composite_effects
-                    .values()
-                    .flat_map(|composite| composite.components.values())
-                    .map(|component| {
-                        component
-                            .claims
-                            .values()
-                            .filter(|claim| !claim.retired)
-                            .count()
-                    })
-                    .sum::<usize>(),
+                .sum::<usize>(),
             quarantined: self.journal_repair_required.is_some()
-                || !self.state.device_quarantine.is_empty(),
+                || !self.state.device_quarantine().is_empty(),
             persistence_recovery_required: self.persistence_recovery_required,
         }
     }
@@ -6615,17 +6578,17 @@ impl Engine {
     /// Checks whether one exact retired generation can be reserved for reuse.
     ///
     /// This read-only result is not reuse authority. A caller must durably
-    /// transact [`CommandKind::ReserveReuse`] and consume its returned
+    /// transact [`CommandKind::ReserveComponentReuse`] and consume its returned
     /// [`ReusePermit`] when enrolling the next claim.
     pub fn check_reusable(
         &self,
         resource: ResourceId,
         expected_generation: ResourceGeneration,
     ) -> Result<(), CoreError> {
-        if self.state.recovery_target.is_some() {
+        if self.state.recovery_target().is_some() {
             return Err(CoreError::RecoveryPending);
         }
-        match self.state.resources.get(&resource) {
+        match self.state.resources().get(&resource) {
             Some(ResourceRecord {
                 scope,
                 generation,
@@ -6657,17 +6620,18 @@ impl Engine {
     /// custodian may join a live coordinate rather than whether reuse is safe.
     pub fn check_co_claimable(
         &self,
+        effect: EffectId,
         domain: DomainId,
         kind: ClaimKindId,
         scope: ClaimScope,
         resource: ResourceId,
         expected_generation: ResourceGeneration,
     ) -> Result<(), CoreError> {
-        if self.state.recovery_target.is_some() {
+        if self.state.recovery_target().is_some() {
             return Err(CoreError::RecoveryPending);
         }
-        let rule = self
-            .catalog
+        let catalog = self.effect_catalog(effect)?;
+        let rule = catalog
             .claim_rule(domain, kind)
             .ok_or(CoreError::UnknownClaimClass)?;
         if !matches!(
@@ -6680,7 +6644,7 @@ impl Engine {
         if scope_is_quarantined(&self.state, scope) {
             return Err(CoreError::Quarantined);
         }
-        match self.state.resources.get(&resource) {
+        match self.state.resources().get(&resource) {
             None if expected_generation.get() == 1 => Ok(()),
             None => Err(CoreError::StaleResourceGeneration),
             Some(ResourceRecord { generation, .. }) if *generation != expected_generation => {
@@ -6711,7 +6675,7 @@ impl Engine {
                 ..
             }) => {
                 if !resource_allows_additional_custodian(
-                    &self.catalog,
+                    self.effect_catalog(effect)?,
                     &self.state,
                     resource,
                     expected_generation,
@@ -6725,95 +6689,32 @@ impl Engine {
         }
     }
 
-    /// Builds a linear reissue request for a reuse reservation whose previous
-    /// bearer died with an earlier estate authority epoch.
-    ///
-    /// The returned command is bound to the exact current actor, binding,
-    /// authority epoch, resource and allocation generation. It can still lose
-    /// a concurrent fence or adoption race when durably transacted.
-    pub fn reclaim_resource_reuse(
-        &self,
-        effect: EffectId,
-        actor: PrincipalIncarnation,
-        binding_generation: u64,
-        resource: ResourceId,
-        resource_generation: ResourceGeneration,
-    ) -> Result<Command, CoreError> {
-        if self.state.recovery_target.is_some() {
-            return Err(CoreError::RecoveryPending);
-        }
-        require_active_actor(&self.state, effect, actor, binding_generation)?;
-        let estate = self
-            .state
-            .estates
-            .get(&effect)
-            .ok_or(CoreError::UnknownEstate)?;
-        let record = self
-            .state
-            .resources
-            .get(&resource)
-            .ok_or(CoreError::UnknownResource)?;
-        if record.generation != resource_generation {
-            return Err(CoreError::StaleResourceGeneration);
-        }
-        if scope_is_quarantined(&self.state, record.scope) {
-            return Err(CoreError::Quarantined);
-        }
-        let pending = match record.phase {
-            ResourcePhase::Claimed {
-                pending_reuse: Some(pending),
-            } if pending.effect == effect && pending.component.is_none() => pending,
-            _ => return Err(CoreError::StaleReusePermit),
-        };
-        let claim_record = estate
-            .claims
-            .get(&pending.claim)
-            .ok_or(CoreError::UnknownClaim)?;
-        if claim_record.retired
-            || claim_record.resource != resource
-            || claim_record.resource_generation != resource_generation
-        {
-            return Err(CoreError::UnknownClaim);
-        }
-        Ok(Command(CommandKind::ReclaimResourceReuse {
-            effect,
-            component: None,
-            actor,
-            binding_generation,
-            authority_epoch: estate.authority_epoch,
-            claim: pending.claim,
-            resource,
-            resource_generation,
-        }))
-    }
-
     /// Builds a linear reissue request for one component-local reuse
     /// reservation after explicit composite-effect adoption.
     pub fn reclaim_component_resource_reuse(
         &self,
         effect: EffectId,
         component: ComponentId,
-        actor: PrincipalIncarnation,
-        binding_generation: u64,
+        actor: ExecutorCoordinate,
         resource: ResourceId,
         resource_generation: ResourceGeneration,
     ) -> Result<Command, CoreError> {
-        if self.state.recovery_target.is_some() {
+        if self.state.recovery_target().is_some() {
             return Err(CoreError::RecoveryPending);
         }
-        require_active_composite_actor(&self.state, effect, actor, binding_generation)?;
+        require_active_composite_actor(&self.state, effect, actor)?;
         let composite = self
             .state
-            .composite_effects
+            .composite_effects()
             .get(&effect)
-            .ok_or(CoreError::UnknownEstate)?;
+            .ok_or(CoreError::UnknownEffect)?;
         let component_record = composite
             .components
             .get(&component)
             .ok_or(CoreError::UnknownObligationClass)?;
         let record = self
             .state
-            .resources
+            .resources()
             .get(&resource)
             .ok_or(CoreError::UnknownResource)?;
         if record.generation != resource_generation {
@@ -6825,7 +6726,7 @@ impl Engine {
         let pending = match record.phase {
             ResourcePhase::Claimed {
                 pending_reuse: Some(pending),
-            } if pending.effect == effect && pending.component == Some(component) => pending,
+            } if pending.effect == effect && pending.component == component => pending,
             _ => return Err(CoreError::StaleReusePermit),
         };
         let claim_record = component_record
@@ -6840,9 +6741,8 @@ impl Engine {
         }
         Ok(Command(CommandKind::ReclaimResourceReuse {
             effect,
-            component: Some(component),
+            component,
             actor,
-            binding_generation,
             authority_epoch: composite.authority_epoch,
             claim: pending.claim,
             resource,
@@ -6852,7 +6752,7 @@ impl Engine {
 
     /// Computes a deterministic digest over the authoritative projection.
     pub fn projection_digest(&self) -> Digest {
-        self.state.projection_cache.digest
+        self.state.projection_cache().digest
     }
 
     /// Creates a canonical exact-replay checkpoint for the current journal prefix.
@@ -6863,7 +6763,7 @@ impl Engine {
     /// `CheckpointRecovery` transition. The result is an envelope containing
     /// the original records verbatim, not a compact private-state codec.
     pub fn journal_checkpoint(&self, journal_image: &[u8]) -> Result<JournalCheckpoint, CoreError> {
-        if self.state.recovery_target.is_some() {
+        if self.state.recovery_target().is_some() {
             return Err(CoreError::RecoveryPending);
         }
         if self.persistence_recovery_required {
@@ -6875,15 +6775,14 @@ impl Engine {
         let checkpoint = JournalCheckpoint::build(
             RecoveryBinding::new(
                 crate::RecoveryProfile::current(),
-                self.state.world.ok_or(CoreError::WorldMismatch)?,
+                self.state.world(),
                 self.catalog.digest(),
-                self.state.freshness.registry(),
-                crate::AuthorityBindingGeneration::new(self.state.freshness.binding()).unwrap(),
+                self.state.freshness().registry(),
             )
             .map_err(|_| CoreError::SchemaMismatch)?,
-            self.state.freshness,
-            self.state.revision,
-            self.state.head,
+            self.state.freshness(),
+            self.state.revision(),
+            self.state.head(),
             self.projection_digest(),
             journal_image,
         )
@@ -6892,8 +6791,7 @@ impl Engine {
             self.catalog.clone(),
             self.limits,
             &checkpoint,
-            self.state.world.ok_or(CoreError::WorldMismatch)?,
-            self.api_mode,
+            self.state.world(),
         )?;
         if rebuilt.projection_digest() != self.projection_digest() {
             return Err(CoreError::InvariantViolation);
@@ -6902,7 +6800,7 @@ impl Engine {
     }
 
     pub(crate) fn validate_journal_checkpoint(
-        catalog: DomainCatalog,
+        catalog: CatalogSet,
         limits: CoreLimits,
         checkpoint: &JournalCheckpoint,
     ) -> Result<Self, CoreError> {
@@ -6911,16 +6809,14 @@ impl Engine {
             limits,
             checkpoint,
             checkpoint.binding().world(),
-            EngineApiMode::ProfileTwo,
         )
     }
 
     fn validate_journal_checkpoint_for_world(
-        catalog: DomainCatalog,
+        catalog: CatalogSet,
         limits: CoreLimits,
         checkpoint: &JournalCheckpoint,
         expected_world: WorldId,
-        api_mode: EngineApiMode,
     ) -> Result<Self, CoreError> {
         let anchor = checkpoint.anchor();
         if anchor.catalog_digest() != catalog.digest()
@@ -6936,13 +6832,7 @@ impl Engine {
             if !scan.records().is_empty() {
                 return Err(CoreError::RevisionConflict);
             }
-            let engine = Self::new_with_mode(
-                catalog,
-                limits,
-                anchor.freshness(),
-                EngineApiMode::ProfileTwo,
-                Some(expected_world),
-            );
+            let engine = Self::new(expected_world, catalog, limits, anchor.freshness());
             if !anchor.head().is_zero() || engine.projection_digest() != anchor.projection() {
                 return Err(CoreError::RollbackDetected);
             }
@@ -6957,19 +6847,30 @@ impl Engine {
         let initial = Freshness::new(
             first.boot(),
             first.registry(),
-            first.binding(),
             first.device(),
             first.journal(),
-        )
-        .map_err(|_| CoreError::InvariantViolation)?;
-        let mut engine = Self::new_with_mode(
-            catalog,
-            limits,
-            initial,
-            EngineApiMode::ProfileTwo,
-            Some(expected_world),
         );
+        let mut engine = Self::new(expected_world, catalog, limits, initial);
         for (index, record) in scan.records().iter().enumerate() {
+            let replay_catalog = if matches!(
+                record.command(),
+                CommandKind::CheckpointRecovery { .. }
+                    | CommandKind::WholeStateCheckpointV1 { .. }
+                    | CommandKind::Snapshot { .. }
+                    | CommandKind::FenceExecutor { .. }
+                    | CommandKind::Ready { .. }
+                    | CommandKind::Rebind { .. }
+            ) {
+                None
+            } else {
+                let digest = engine.command_catalog_digest(record.command())?;
+                Some(
+                    engine
+                        .catalog
+                        .get(digest)
+                        .ok_or(CoreError::SchemaMismatch)?,
+                )
+            };
             if record.recovery_binding() != anchor.binding() {
                 return Err(CoreError::RollbackDetected);
             }
@@ -6982,24 +6883,18 @@ impl Engine {
                     || rebuilt.head != record.predecessor()
                     || rebuilt.freshness.boot() != record.boot()
                     || rebuilt.freshness.registry() != record.registry()
-                    || rebuilt.freshness.binding() != record.binding()
                     || rebuilt.freshness.journal() != record.journal()
                     || rebuilt.freshness.device() != record.device()
                     || rebuilt.projection_cache.digest != *projection
                 {
                     return Err(CoreError::RollbackDetected);
                 }
-                if rebuilt.world != Some(expected_world) {
+                if rebuilt.world != expected_world {
                     return Err(CoreError::WorldMismatch);
                 }
                 engine.state = rebuilt;
             }
-            if api_mode == EngineApiMode::ProfileTwo
-                && !record.command().is_profile_two_compatible()
-            {
-                return Err(CoreError::IncompatibleApiProfile);
-            }
-            if record.base_revision() != engine.state.revision
+            if record.base_revision() != engine.state.revision()
                 || record.revision()
                     != engine
                         .state
@@ -7009,15 +6904,14 @@ impl Engine {
             {
                 return Err(CoreError::RevisionConflict);
             }
-            if record.predecessor() != engine.state.head {
+            if record.predecessor() != engine.state.head() {
                 return Err(CoreError::PredecessorMismatch);
             }
             if record.catalog_digest() != engine.catalog.digest()
-                || record.registry() != engine.state.freshness.registry()
-                || record.binding() != engine.state.freshness.binding()
-                || record.boot() != engine.state.freshness.boot()
-                || record.journal() != engine.state.freshness.journal()
-                || record.device() != engine.state.freshness.device()
+                || record.registry() != engine.state.freshness().registry()
+                || record.boot() != engine.state.freshness().boot()
+                || record.journal() != engine.state.freshness().journal()
+                || record.device() != engine.state.freshness().device()
             {
                 return Err(CoreError::SchemaMismatch);
             }
@@ -7030,18 +6924,19 @@ impl Engine {
                 engine.catalog.digest(),
             )?;
             let previous = engine.state.clone();
-            apply_command_for_mode(
-                api_mode,
+            apply_command(
                 &engine.catalog,
+                replay_catalog,
                 engine.limits,
                 &mut engine.state,
                 record.command(),
             )?;
-            let touches = collect_projection_touches(&previous, &engine.state, record.command());
-            engine.state.total_claims =
-                transition_total_claims(&previous, &engine.state, &touches)?;
+            let mut touches = ProjectionTouches::default();
+            touch_all_projection_records(&previous, &mut touches);
+            touch_all_projection_records(&engine.state, &mut touches);
+            engine.state.total_claims = count_state_claims(&engine.state)?;
             check_transition_local_invariants(
-                &engine.catalog,
+                replay_catalog,
                 engine.limits,
                 &previous,
                 &engine.state,
@@ -7052,25 +6947,20 @@ impl Engine {
             refresh_projection_cache(
                 &previous,
                 &mut engine.state,
-                record.command(),
+                &touches,
                 engine.catalog.digest(),
             );
-            #[cfg(feature = "test-support")]
-            if api_mode == EngineApiMode::LegacyCompatibility {
-                engine.state.projection_cache =
-                    build_projection_cache(&engine.state, engine.catalog.digest());
-            }
         }
-        check_invariants(&engine.catalog, engine.limits, &engine.state)?;
+        check_invariants_for_catalog_set(&engine.catalog, engine.limits, &engine.state)?;
         let rebuilt_projection = build_projection_cache(&engine.state, engine.catalog.digest());
         if rebuilt_projection.digest != engine.projection_digest() {
             return Err(CoreError::InvariantViolation);
         }
         engine.state.projection_cache = rebuilt_projection;
-        if engine.state.revision != anchor.revision()
-            || engine.state.head != anchor.head()
-            || engine.state.freshness != anchor.freshness()
-            || engine.state.recovery_target.is_some()
+        if engine.state.revision() != anchor.revision()
+            || engine.state.head() != anchor.head()
+            || engine.state.freshness() != anchor.freshness()
+            || engine.state.recovery_target().is_some()
             || engine.projection_digest() != anchor.projection()
         {
             return Err(CoreError::RollbackDetected);
@@ -7084,7 +6974,7 @@ enum OutputData {
     None,
     CommitIntent {
         effect: EffectId,
-        component: Option<ComponentId>,
+        component: ComponentId,
         nonce: u64,
     },
     CompositeCommitIntents {
@@ -7093,17 +6983,16 @@ enum OutputData {
     },
     Settlement {
         effect: EffectId,
-        component: Option<ComponentId>,
-        claimant: PrincipalIncarnation,
+        component: ComponentId,
+        claimant: ExecutorCoordinate,
         generation: u64,
         nonce: u64,
         stage: ClaimStage,
     },
     ReusePermit {
         effect: EffectId,
-        component: Option<ComponentId>,
-        actor: PrincipalIncarnation,
-        binding_generation: u64,
+        component: ComponentId,
+        actor: ExecutorCoordinate,
         authority_epoch: u64,
         claim: ClaimId,
         resource: ResourceId,
@@ -7155,7 +7044,7 @@ impl AppliedOutput {
                         .into_iter()
                         .map(|(component, nonce)| CommitIntent {
                             effect,
-                            component: Some(component),
+                            component,
                             nonce,
                         })
                         .collect(),
@@ -7180,7 +7069,6 @@ impl AppliedOutput {
                 effect,
                 component,
                 actor,
-                binding_generation,
                 authority_epoch,
                 claim,
                 resource,
@@ -7195,7 +7083,6 @@ impl AppliedOutput {
                 effect,
                 component,
                 actor,
-                binding_generation,
                 authority_epoch,
                 claim,
                 resource,
@@ -7222,72 +7109,206 @@ impl AppliedOutput {
     }
 }
 
-fn apply_command(
-    catalog: &DomainCatalog,
+fn apply_structural_command<S: StateAccessMut>(
+    catalogs: &CatalogSet,
     limits: CoreLimits,
-    state: &mut State,
+    state: &mut S,
     command: &CommandKind,
 ) -> Result<AppliedOutput, CoreError> {
-    let output = apply_command_internal(catalog, limits, state, command, false)?;
-    sync_root_effect_index(state, command);
-    Ok(output)
+    match command {
+        CommandKind::FenceExecutor { operation, crashed } => {
+            apply_fence_incarnation(
+                state,
+                *operation,
+                *crashed,
+                limits.max_crashes_per_operation,
+            )?;
+            Ok(AppliedOutput::none(TransitionEvent::ExecutorFenced))
+        }
+        CommandKind::Snapshot {
+            operation,
+            snapshot,
+            digest,
+        } => {
+            require_digest(*digest)?;
+            let expected = build_recovery_snapshot(catalogs, state, *operation, *snapshot)?;
+            if expected.digest != *digest {
+                return Err(CoreError::StaleSnapshot);
+            }
+            state.touch_operation(*operation);
+            let operation_record = state
+                .recovery_operations_mut()
+                .get_mut(operation)
+                .ok_or(CoreError::UnknownOperation)?;
+            if matches!(
+                operation_record.state,
+                OperationRecoveryState::RecoveryExhausted { .. }
+            ) {
+                return Err(CoreError::RecoveryExhausted);
+            }
+            if !matches!(
+                operation_record.state,
+                OperationRecoveryState::Fenced { .. }
+            ) {
+                return Err(CoreError::WrongRecoveryState);
+            }
+            operation_record.state = OperationRecoveryState::Snapshotted {
+                snapshot: *snapshot,
+                digest: *digest,
+            };
+            Ok(AppliedOutput::none(TransitionEvent::Snapshot))
+        }
+        CommandKind::WholeStateCheckpointV1 {
+            state: image,
+            projection,
+        } => {
+            let rebuilt = decode_whole_state_checkpoint(image, catalogs, limits)?;
+            if rebuilt.recovery_target.is_some()
+                || rebuilt.projection_cache.digest != *projection
+                || !checkpoint_state_matches(state, &rebuilt)
+            {
+                return Err(CoreError::InvariantViolation);
+            }
+            Ok(AppliedOutput::none(TransitionEvent::RecoveryCheckpointed))
+        }
+        CommandKind::CheckpointRecovery {
+            boot,
+            journal,
+            device,
+        } => {
+            let target = state
+                .recovery_target()
+                .ok_or(CoreError::WrongRecoveryState)?;
+            if target.boot() != *boot
+                || target.journal() != *journal
+                || target.device() != *device
+                || target.registry() != state.freshness().registry()
+                || state
+                    .device_generations()
+                    .values()
+                    .any(|generation| *generation > *device)
+            {
+                return Err(CoreError::FreshnessRollback);
+            }
+            let operations: Vec<OperationId> =
+                state.recovery_operations().keys().copied().collect();
+            for operation in operations {
+                state.touch_operation(operation);
+                fence_operation_for_boot(state, operation, limits.max_crashes_per_operation)?;
+            }
+            state.freshness_mut().set_boot_and_journal(*boot, *journal);
+            state.freshness_mut().set_device(*device);
+            let device_scopes: Vec<DeviceScopeId> =
+                state.device_generations().keys().copied().collect();
+            for scope in device_scopes {
+                state.touch_device(scope);
+                *state
+                    .device_generations_mut()
+                    .get_mut(&scope)
+                    .expect("scope was collected from device generations") = *device;
+            }
+            quarantine_live_device_claims(state);
+            state.set_recovery_target(None);
+            Ok(AppliedOutput::none(TransitionEvent::RecoveryCheckpointed))
+        }
+        CommandKind::Ready {
+            operation,
+            snapshot,
+            successor,
+        } => {
+            state.touch_operation(*operation);
+            let operation_record = state
+                .recovery_operations_mut()
+                .get_mut(operation)
+                .ok_or(CoreError::UnknownOperation)?;
+            let expected = match operation_record.state {
+                OperationRecoveryState::Snapshotted {
+                    snapshot: expected, ..
+                } => expected,
+                OperationRecoveryState::RecoveryExhausted { .. } => {
+                    return Err(CoreError::RecoveryExhausted);
+                }
+                _ => return Err(CoreError::WrongRecoveryState),
+            };
+            if expected != *snapshot {
+                return Err(CoreError::StaleSnapshot);
+            }
+            if successor.executor() != operation_record.origin.executor()
+                || successor.generation() <= operation_record.last_executor.generation()
+            {
+                return Err(CoreError::StaleExecutor);
+            }
+            operation_record.state = OperationRecoveryState::Ready {
+                snapshot: *snapshot,
+                successor: *successor,
+            };
+            Ok(AppliedOutput::none(TransitionEvent::Ready))
+        }
+        CommandKind::Rebind {
+            operation,
+            snapshot,
+            successor,
+        } => {
+            state.touch_operation(*operation);
+            let operation_record = state
+                .recovery_operations_mut()
+                .get_mut(operation)
+                .ok_or(CoreError::UnknownOperation)?;
+            match operation_record.state {
+                OperationRecoveryState::Ready {
+                    snapshot: expected,
+                    successor: expected_successor,
+                } if expected == *snapshot && expected_successor == *successor => {}
+                OperationRecoveryState::Ready { .. } => return Err(CoreError::StaleSnapshot),
+                OperationRecoveryState::RecoveryExhausted { .. } => {
+                    return Err(CoreError::RecoveryExhausted);
+                }
+                _ => return Err(CoreError::WrongRecoveryState),
+            }
+            if successor.generation() <= operation_record.last_executor.generation() {
+                return Err(CoreError::StaleExecutor);
+            }
+            operation_record.last_executor = *successor;
+            operation_record.state = OperationRecoveryState::Rebound {
+                successor: *successor,
+            };
+            Ok(AppliedOutput::none(TransitionEvent::Rebound))
+        }
+        _ => Err(CoreError::InvariantViolation),
+    }
 }
 
-/// Applies a command using the exact API profile that admitted its journal.
-///
-/// The predecessor profile exists only under `test-support`; keeping this
-/// dispatch in one place prevents prepare and replay from assigning different
-/// trust to the same bounded legacy constructor.
-fn apply_command_for_mode(
-    mode: EngineApiMode,
-    catalog: &DomainCatalog,
+fn apply_command<S: StateAccessMut>(
+    catalogs: &CatalogSet,
+    catalog: Option<&DomainCatalog>,
     limits: CoreLimits,
-    state: &mut State,
+    state: &mut S,
     command: &CommandKind,
 ) -> Result<AppliedOutput, CoreError> {
-    #[cfg(feature = "test-support")]
-    if mode == EngineApiMode::LegacyCompatibility {
-        let output = apply_command_internal(catalog, limits, state, command, true)?;
-        sync_root_effect_index(state, command);
-        return Ok(output);
+    if matches!(
+        command,
+        CommandKind::CheckpointRecovery { .. }
+            | CommandKind::WholeStateCheckpointV1 { .. }
+            | CommandKind::Snapshot { .. }
+            | CommandKind::FenceExecutor { .. }
+            | CommandKind::Ready { .. }
+            | CommandKind::Rebind { .. }
+    ) {
+        return apply_structural_command(catalogs, limits, state, command);
     }
-
-    let _ = mode;
-    apply_command(catalog, limits, state, command)
+    let catalog = catalog.ok_or(CoreError::SchemaMismatch)?;
+    apply_command_internal(catalogs, catalog, limits, state, command)
 }
 
-/// Updates the small derived root membership index after a command has
-/// inserted an effect. Effects are retained in the primary maps after
-/// retirement, so no production command currently removes an indexed effect.
-/// Checkpoint recovery installs an already rebuilt index and therefore needs
-/// no special handling here.
-fn sync_root_effect_index(state: &mut State, command: &CommandKind) {
-    let effect = match command {
-        CommandKind::CreateEstate { effect, .. }
-        | CommandKind::CreateCompositeEffect { effect, .. }
-        | CommandKind::AdmitScopedCompositeEffect { effect, .. } => Some(*effect),
-        CommandKind::InstallHandoffChild { descriptor, .. } => descriptor.child_effect().ok(),
-        _ => None,
-    };
-    if let Some(effect) = effect {
-        state
-            .root_effects
-            .get_or_insert_with_mut(effect.root(), StateSet::new)
-            .insert_mut(effect);
-    }
-}
-
-/// Applies one command with an explicit trust bit for the two bounded
-/// internal composite constructors (scoped admission and handoff child
-/// installation). The public/replay path never sets this bit, so a scoped
-/// engine cannot ingest the legacy unbound constructor from a journal or
-/// untrusted request.
-fn apply_command_internal(
+/// Applies one command. Composite records are created only by the scoped
+/// admission and verified handoff paths below; no unbound constructor is
+/// replayable or available through the request surface.
+fn apply_command_internal<S: StateAccessMut>(
+    catalogs: &CatalogSet,
     catalog: &DomainCatalog,
     limits: CoreLimits,
-    state: &mut State,
+    state: &mut S,
     command: &CommandKind,
-    trusted_scoped_constructor: bool,
 ) -> Result<AppliedOutput, CoreError> {
     enforce_scoped_provider_gate(state, command)?;
     match command.clone() {
@@ -7296,16 +7317,16 @@ fn apply_command_internal(
             catalog_digest,
             mut verifier_bindings,
         } => {
-            if state.world != Some(coordinate.world()) {
+            if state.world() != coordinate.world() {
                 return Err(CoreError::WorldMismatch);
             }
             if catalog_digest != catalog.digest()
-                || state.provider_generations.contains_key(&coordinate)
+                || state.provider_generations().contains_key(&coordinate)
             {
                 return Err(CoreError::ProviderGenerationStale);
             }
             if state
-                .provider_high_water
+                .provider_high_water()
                 .get(&coordinate.provider())
                 .is_some_and(|generation| coordinate.generation() <= *generation)
             {
@@ -7320,10 +7341,12 @@ fn apply_command_internal(
                     .cmp(&right.class_binding())
                     .then_with(|| left.cmp(right))
             });
+            state.touch_provider_high_water(coordinate.provider());
             state
-                .provider_high_water
+                .provider_high_water_mut()
                 .insert_mut(coordinate.provider(), coordinate.generation());
-            state.provider_generations.insert_mut(
+            state.touch_provider_generation(coordinate);
+            state.provider_generations_mut().insert_mut(
                 coordinate,
                 ProviderGenerationRecord {
                     coordinate,
@@ -7343,11 +7366,12 @@ fn apply_command_internal(
             coordinate,
             receipts,
         } => {
-            if state.world != Some(coordinate.world()) {
+            if state.world() != coordinate.world() {
                 return Err(CoreError::WorldMismatch);
             }
+            state.touch_provider_generation(coordinate);
             let record = state
-                .provider_generations
+                .provider_generations_mut()
                 .get_mut(&coordinate)
                 .ok_or(CoreError::UnknownProviderGeneration)?;
             if !matches!(record.state, ProviderEffectState::Active)
@@ -7364,27 +7388,28 @@ fn apply_command_internal(
         CommandKind::RecordArtifactPin { binding, pin_stamp } => {
             require_digest(pin_stamp)?;
             validate_artifact_binding(catalog, state, binding)?;
-            if state.artifact_leases.contains_key(&binding.artifact_id()) {
+            if state.artifact_leases().contains_key(&binding.artifact_id()) {
                 return Err(CoreError::ArtifactBindingMismatch);
             }
             let lease = ArtifactLeaseState::pin(binding, pin_stamp)
                 .map_err(|_| CoreError::ArtifactBindingMismatch)?;
+            state.touch_artifact_lease(binding.artifact_id());
             state
-                .artifact_leases
+                .artifact_leases_mut()
                 .insert_mut(binding.artifact_id(), lease);
             Ok(AppliedOutput::none(TransitionEvent::ArtifactPinned))
         }
         CommandKind::AuthorizeArtifactRelease { effect, component } => {
             let binding = state
-                .scoped_composites
+                .scoped_composites()
                 .get(&effect)
                 .and_then(|scoped| scoped.artifacts.get(&component))
                 .copied()
                 .ok_or(CoreError::ArtifactRequired)?;
             let composite = state
-                .composite_effects
+                .composite_effects()
                 .get(&effect)
-                .ok_or(CoreError::UnknownEstate)?;
+                .ok_or(CoreError::UnknownEffect)?;
             let record = composite
                 .components
                 .get(&component)
@@ -7403,15 +7428,16 @@ fn apply_command_internal(
             let release_operation =
                 OperationId::new(nonce).map_err(|_| CoreError::GenerationExhausted)?;
             let lease = state
-                .artifact_leases
+                .artifact_leases()
                 .get(&binding.artifact_id())
                 .copied()
                 .ok_or(CoreError::ArtifactNotPinned)?;
             let (next, permit) = lease
                 .authorize_release(release_operation, nonce)
                 .map_err(|_| CoreError::ArtifactNotReleasable)?;
+            state.touch_artifact_lease(binding.artifact_id());
             state
-                .artifact_leases
+                .artifact_leases_mut()
                 .insert_mut(binding.artifact_id(), next);
             Ok(AppliedOutput {
                 event: TransitionEvent::ArtifactReleaseAuthorized,
@@ -7433,7 +7459,7 @@ fn apply_command_internal(
             require_digest(release_stamp)?;
             validate_artifact_binding(catalog, state, binding)?;
             let lease = state
-                .artifact_leases
+                .artifact_leases()
                 .get(&binding.artifact_id())
                 .copied()
                 .ok_or(CoreError::ArtifactNotPinned)?;
@@ -7442,8 +7468,9 @@ fn apply_command_internal(
             let next = lease
                 .confirm_release(permit, release_stamp)
                 .map_err(|_| CoreError::ArtifactReleaseMismatch)?;
+            state.touch_artifact_lease(binding.artifact_id());
             state
-                .artifact_leases
+                .artifact_leases_mut()
                 .insert_mut(binding.artifact_id(), next);
             Ok(AppliedOutput::none(TransitionEvent::ArtifactReleased))
         }
@@ -7451,8 +7478,9 @@ fn apply_command_internal(
             coordinate,
             expected_epoch,
         } => {
+            state.touch_provider_generation(coordinate);
             let record = state
-                .provider_generations
+                .provider_generations_mut()
                 .get_mut(&coordinate)
                 .ok_or(CoreError::UnknownProviderGeneration)?;
             if !matches!(record.state, ProviderEffectState::Active)
@@ -7472,7 +7500,7 @@ fn apply_command_internal(
             expected_epoch,
         } => {
             let current = state
-                .provider_generations
+                .provider_generations()
                 .get(&coordinate)
                 .ok_or(CoreError::UnknownProviderGeneration)?
                 .state;
@@ -7481,10 +7509,10 @@ fn apply_command_internal(
             {
                 return Err(CoreError::ProviderLifecycleViolation);
             }
-            if state.scoped_composites.iter().any(|(effect, scoped)| {
+            if state.scoped_composites().iter().any(|(effect, scoped)| {
                 scoped.bindings.values().any(|bound| bound == &coordinate)
                     && state
-                        .composite_effects
+                        .composite_effects()
                         .get(effect)
                         .is_some_and(|composite| {
                             composite.custodian != CustodyState::Released
@@ -7500,8 +7528,9 @@ fn apply_command_internal(
             }) {
                 return Err(CoreError::ProviderEffectsLive);
             }
+            state.touch_provider_generation(coordinate);
             state
-                .provider_generations
+                .provider_generations_mut()
                 .get_mut(&coordinate)
                 .expect("validated provider")
                 .state = ProviderEffectState::SettlementOnly {
@@ -7515,24 +7544,34 @@ fn apply_command_internal(
             coordinate,
             expected_epoch,
         } => {
-            let record = state
-                .provider_generations
-                .get_mut(&coordinate)
-                .ok_or(CoreError::UnknownProviderGeneration)?;
-            if !matches!(record.state, ProviderEffectState::SettlementOnly { .. })
-                || expected_epoch != provider_epoch(record.state)
+            let current_state = state
+                .provider_generations()
+                .get(&coordinate)
+                .ok_or(CoreError::UnknownProviderGeneration)?
+                .state;
+            if !matches!(current_state, ProviderEffectState::SettlementOnly { .. })
+                || expected_epoch != provider_epoch(current_state)
             {
                 return Err(CoreError::ProviderLifecycleViolation);
             }
-            if record.live_component_bindings != 0 {
+            if state
+                .provider_generations()
+                .get(&coordinate)
+                .is_some_and(|record| record.live_component_bindings != 0)
+            {
                 return Err(CoreError::ProviderEffectsLive);
             }
-            if state.artifact_leases.iter().any(|(_, lease)| {
+            if state.artifact_leases().iter().any(|(_, lease)| {
                 lease.binding().provider() == coordinate
                     && !matches!(lease, ArtifactLeaseState::Released { .. })
             }) {
                 return Err(CoreError::ProviderEffectsLive);
             }
+            state.touch_provider_generation(coordinate);
+            let record = state
+                .provider_generations_mut()
+                .get_mut(&coordinate)
+                .expect("validated provider generation");
             record.state = ProviderEffectState::Retired {
                 epoch: expected_epoch
                     .checked_add(1)
@@ -7542,12 +7581,12 @@ fn apply_command_internal(
         }
         CommandKind::AbortUnescapedEffect { effect } => {
             let scoped = state
-                .scoped_composites
+                .scoped_composites()
                 .get(&effect)
-                .ok_or(CoreError::UnknownEstate)?;
+                .ok_or(CoreError::UnknownEffect)?;
             if scoped.bindings.values().any(|provider| {
                 state
-                    .provider_generations
+                    .provider_generations()
                     .get(provider)
                     .is_none_or(|record| matches!(record.state, ProviderEffectState::Active))
             }) {
@@ -7555,14 +7594,14 @@ fn apply_command_internal(
             }
             let (causal_owner, authority_epoch) = {
                 let composite = state
-                    .composite_effects
+                    .composite_effects()
                     .get(&effect)
-                    .ok_or(CoreError::UnknownEstate)?;
+                    .ok_or(CoreError::UnknownEffect)?;
                 (composite.causal_owner, composite.authority_epoch)
             };
             revoke_composite_effect(state, effect, causal_owner, authority_epoch)?;
             let retired = state
-                .composite_effects
+                .composite_effects()
                 .get(&effect)
                 .is_some_and(|composite| {
                     composite_escape_state(composite) == EffectEscapeState::Retired
@@ -7572,10 +7611,11 @@ fn apply_command_internal(
             }
             revoke_unpinned_artifact_placeholders(state, effect)?;
             if artifacts_released_for_effect(state, effect) {
+                state.touch_composite(effect);
                 let composite = state
-                    .composite_effects
+                    .composite_effects_mut()
                     .get_mut(&effect)
-                    .ok_or(CoreError::UnknownEstate)?;
+                    .ok_or(CoreError::UnknownEffect)?;
                 composite.custodian = CustodyState::Released;
                 composite.authority = AuthorityState::Revoked;
                 for component in composite.components.values_mut() {
@@ -7583,20 +7623,18 @@ fn apply_command_internal(
                 }
                 release_scoped_provider_bindings(state, effect)?;
             }
-            Ok(AppliedOutput::none(TransitionEvent::EstateReleased))
+            Ok(AppliedOutput::none(
+                TransitionEvent::CompositeEffectReleased,
+            ))
         }
         CommandKind::AdmitScopedCompositeEffect {
             effect,
-            operation,
             origin,
-            binding_generation,
             kind,
             charge_account,
             bindings,
         } => {
-            if state.world.is_none() || operation.get() == 0 {
-                return Err(CoreError::WorldMismatch);
-            }
+            let operation = effect.operation();
             let schema = catalog
                 .composite_rule(kind)
                 .ok_or(CoreError::UnknownObligationClass)?;
@@ -7605,8 +7643,9 @@ fn apply_command_internal(
             }
             let mut bound = BTreeMap::new();
             let mut artifacts = BTreeMap::new();
+            let mut effect_catalog_digest = None;
             for item in bindings {
-                if item.provider().world() != state.world.expect("checked")
+                if item.provider().world() != state.world()
                     || bound.insert(item.component(), item.provider()).is_some()
                 {
                     return Err(CoreError::ProviderBindingMismatch);
@@ -7615,9 +7654,16 @@ fn apply_command_internal(
                     .component(item.component())
                     .ok_or(CoreError::ProviderBindingMismatch)?;
                 let record = state
-                    .provider_generations
+                    .provider_generations()
                     .get(&item.provider())
                     .ok_or(CoreError::UnknownProviderGeneration)?;
+                match effect_catalog_digest {
+                    Some(expected) if expected != record.catalog_digest => {
+                        return Err(CoreError::CatalogMismatch);
+                    }
+                    None => effect_catalog_digest = Some(record.catalog_digest),
+                    _ => {}
+                }
                 if record.state != ProviderEffectState::Active || declared.component().get() == 0 {
                     return Err(CoreError::ProviderLifecycleViolation);
                 }
@@ -7638,12 +7684,15 @@ fn apply_command_internal(
                             admission.closure_digest(),
                         )
                         .map_err(|_| CoreError::ArtifactBindingMismatch)?;
-                        if state.artifact_leases.contains_key(&binding.artifact_id())
-                            || state.scoped_composites.values().any(|scoped| {
+                        if state.artifact_leases().contains_key(&binding.artifact_id())
+                            || state.scoped_composites().values().any(|scoped| {
                                 scoped
                                     .artifacts
                                     .values()
                                     .any(|existing| existing.artifact_id() == binding.artifact_id())
+                            })
+                            || artifacts.values().any(|existing: &ArtifactBinding| {
+                                existing.artifact_id() == binding.artifact_id()
                             })
                             || artifacts.insert(item.component(), binding).is_some()
                             || receipts.pin().verifier().get() == 0
@@ -7668,30 +7717,29 @@ fn apply_command_internal(
             {
                 return Err(CoreError::ProviderBindingMismatch);
             }
-            apply_command_internal(
+            initialize_composite_effect(
                 catalog,
                 limits,
                 state,
-                &CommandKind::CreateCompositeEffect {
-                    effect,
-                    origin,
-                    binding_generation,
-                    kind,
-                    charge_account,
-                },
-                true,
+                effect,
+                origin,
+                kind,
+                charge_account,
             )?;
+            let effect_catalog_digest = effect_catalog_digest.ok_or(CoreError::CatalogMismatch)?;
             for provider in bound.values() {
+                state.touch_provider_generation(*provider);
                 state
-                    .provider_generations
+                    .provider_generations_mut()
                     .get_mut(provider)
                     .expect("validated provider")
                     .live_component_bindings += 1;
             }
-            state.scoped_composites.insert_mut(
+            state.touch_scoped_composite(effect);
+            state.scoped_composites_mut().insert_mut(
                 effect,
                 ScopedCompositeRecord {
-                    operation,
+                    catalog_digest: effect_catalog_digest,
                     bindings: bound,
                     artifacts,
                 },
@@ -7702,66 +7750,120 @@ fn apply_command_internal(
         }
         CommandKind::ResolveIndeterminateHandoffParent {
             descriptor,
-            terminal_receipt_digest,
             descriptor_receipt_digest,
+            fact,
         } => {
-            require_digest(terminal_receipt_digest)?;
             require_digest(descriptor_receipt_digest)?;
+            require_digest(fact.operation)?;
+            require_digest(fact.descriptor_digest)?;
+            require_digest(fact.stamp.receipt_digest)?;
             let child = descriptor.child_effect()?;
-            if handoff_child_resolution_eligible(state, descriptor, descriptor_receipt_digest) {
-                state
-                    .composite_effects
+            if handoff_child_resolution_eligible(state, descriptor, descriptor_receipt_digest, fact)
+            {
+                let child_composite = state
+                    .composite_effects()
+                    .get(&child)
+                    .ok_or(CoreError::UnknownEffect)?;
+                let child_component = child_composite
+                    .components
+                    .get(&descriptor.child_component)
+                    .ok_or(CoreError::UnknownObligationClass)?;
+                if !handoff_recovery_fact_matches(
+                    state,
+                    catalog,
+                    fact,
+                    HandoffRecoveryCoordinates::new(
+                        HandoffRecoveryRole::Child,
+                        child,
+                        descriptor.child_component,
+                        child_component
+                            .commit_operation
+                            .ok_or(CoreError::WrongCommitState)?,
+                        handoff_descriptor_digest(descriptor),
+                        component_freshness(state, child_composite, child_component)?,
+                    ),
+                ) {
+                    return Err(CoreError::HandoffGuardRequired);
+                }
+                state.touch_composite(child);
+                let child_composite = state
+                    .composite_effects_mut()
                     .get_mut(&child)
-                    .expect("validated child")
+                    .expect("validated child");
+                child_composite
                     .components
                     .get_mut(&descriptor.child_component)
                     .expect("validated component")
-                    .outcome = OutcomeState::KnownSuccess(terminal_receipt_digest);
+                    .outcome = OutcomeState::KnownSuccess(fact.stamp.receipt_digest);
+                if let SingleHopRole::Target { recovery_fact, .. } = &mut child_composite.handoff {
+                    *recovery_fact = Some(fact);
+                }
                 return Ok(AppliedOutput::none(TransitionEvent::EffectCommitted));
             }
-            let root = state
-                .roots
-                .get(&descriptor.parent.root())
-                .ok_or(CoreError::UnknownEstate)?;
+            if !state.scoped_composites().contains_key(&descriptor.parent) {
+                return Err(CoreError::IncompatibleApiProfile);
+            }
+            let operation_record = state
+                .recovery_operations()
+                .get(&descriptor.parent.operation())
+                .ok_or(CoreError::UnknownEffect)?;
             let composite = state
-                .composite_effects
+                .composite_effects()
                 .get(&descriptor.parent)
-                .ok_or(CoreError::UnknownEstate)?;
+                .ok_or(CoreError::UnknownEffect)?;
             let component = composite
                 .components
                 .get(&descriptor.parent_component)
                 .ok_or(CoreError::UnknownObligationClass)?;
-            let operation = component
+            let operation_digest = component
                 .commit_operation
                 .ok_or(CoreError::WrongCommitState)?;
-            if !matches!(root.state, RootRecoveryState::Fenced { .. })
-                || composite.authority != AuthorityState::Fenced
-                || composite.custodian != CustodyState::KernelEstate
+            if !matches!(
+                operation_record.state,
+                OperationRecoveryState::Fenced { .. }
+            ) || composite.authority != AuthorityState::Fenced
+                || composite.custodian != CustodyState::CoreOwned
                 || !matches!(composite.handoff, SingleHopRole::None)
                 || component.commit != CommitState::Committed
                 || component.commit_nonce.is_some()
                 || component.commit_fact.is_some()
-                || component.outcome != OutcomeState::Indeterminate(operation)
+                || component.outcome != OutcomeState::Indeterminate(operation_digest)
                 || descriptor.catalog_digest != catalog.digest()
+                || composite.catalog_digest != descriptor.catalog_digest
                 || descriptor.parent != composite.effect
                 || descriptor.child_effect().is_err()
                 || !matches!(catalog.single_hop_handoff_rule(composite.kind), Some(rule) if rule.target() == descriptor.child_kind)
+                || !handoff_recovery_fact_matches(
+                    state,
+                    catalog,
+                    fact,
+                    HandoffRecoveryCoordinates::new(
+                        HandoffRecoveryRole::Parent,
+                        descriptor.parent,
+                        descriptor.parent_component,
+                        operation_digest,
+                        handoff_descriptor_digest(descriptor),
+                        component_freshness(state, composite, component)?,
+                    ),
+                )
             {
                 return Err(CoreError::HandoffGuardRequired);
             }
+            state.touch_composite(descriptor.parent);
             let composite = state
-                .composite_effects
+                .composite_effects_mut()
                 .get_mut(&descriptor.parent)
                 .expect("validated source");
             let component = composite
                 .components
                 .get_mut(&descriptor.parent_component)
                 .expect("validated component");
-            component.outcome = OutcomeState::KnownSuccess(terminal_receipt_digest);
+            component.outcome = OutcomeState::KnownSuccess(fact.stamp.receipt_digest);
             composite.handoff = SingleHopRole::Source {
                 descriptor: Box::new(descriptor),
-                terminal_receipt_digest,
+                terminal_receipt_digest: fact.stamp.receipt_digest,
                 descriptor_receipt_digest,
+                recovery_fact: Some(fact),
             };
             Ok(AppliedOutput::none(TransitionEvent::EffectCommitted))
         }
@@ -7771,13 +7873,20 @@ fn apply_command_internal(
             descriptor_receipt_digest,
         } => {
             let source_kind = state
-                .composite_effects
+                .composite_effects()
                 .get(&fact.effect)
-                .ok_or(CoreError::UnknownEstate)?
+                .ok_or(CoreError::UnknownEffect)?
                 .kind;
+            if !state.scoped_composites().contains_key(&fact.effect) {
+                return Err(CoreError::IncompatibleApiProfile);
+            }
             if descriptor.parent != fact.effect
-                || Some(descriptor.parent_component) != fact.component
+                || descriptor.parent_component != fact.component
                 || descriptor.catalog_digest != catalog.digest()
+                || state
+                    .composite_effects()
+                    .get(&descriptor.parent)
+                    .is_none_or(|composite| composite.catalog_digest != descriptor.catalog_digest)
                 || descriptor.child_effect().is_err()
                 || !matches!(catalog.single_hop_handoff_rule(source_kind), Some(rule) if rule.target() == descriptor.child_kind)
             {
@@ -7790,10 +7899,11 @@ fn apply_command_internal(
                 descriptor.parent_component,
                 fact,
             )?;
+            state.touch_composite(descriptor.parent);
             let composite = state
-                .composite_effects
+                .composite_effects_mut()
                 .get_mut(&descriptor.parent)
-                .ok_or(CoreError::UnknownEstate)?;
+                .ok_or(CoreError::UnknownEffect)?;
             let component = composite
                 .components
                 .get(&descriptor.parent_component)
@@ -7808,26 +7918,33 @@ fn apply_command_internal(
                 descriptor: Box::new(descriptor),
                 terminal_receipt_digest: receipt,
                 descriptor_receipt_digest,
+                recovery_fact: None,
             };
             Ok(AppliedOutput::none(TransitionEvent::EffectCommitted))
         }
         CommandKind::InstallHandoffChild {
             descriptor,
             origin,
-            binding_generation,
             charge_account,
+            provider,
         } => {
             let child = descriptor.child_effect()?;
             if descriptor.catalog_digest != catalog.digest() || child == descriptor.parent {
                 return Err(CoreError::InvalidPayload);
             }
             let source = state
-                .composite_effects
+                .composite_effects()
                 .get(&descriptor.parent)
-                .ok_or(CoreError::UnknownEstate)?;
+                .ok_or(CoreError::UnknownEffect)?;
+            if !state.scoped_composites().contains_key(&descriptor.parent) {
+                return Err(CoreError::IncompatibleApiProfile);
+            }
             if !matches!(catalog.single_hop_handoff_rule(source.kind), Some(rule) if rule.target() == descriptor.child_kind)
             {
                 return Err(CoreError::HandoffGuardRequired);
+            }
+            if source.catalog_digest != descriptor.catalog_digest {
+                return Err(CoreError::CatalogMismatch);
             }
             if !matches!(&source.handoff, SingleHopRole::Source { descriptor: saved, .. } if **saved == descriptor)
             {
@@ -7844,19 +7961,89 @@ fn apply_command_internal(
             {
                 return Err(CoreError::InvalidPayload);
             }
-            apply_command_internal(
+            if provider.component() != descriptor.child_component
+                || provider.provider().world() != state.world()
+            {
+                return Err(CoreError::ProviderBindingMismatch);
+            }
+            let provider_record = state
+                .provider_generations()
+                .get(&provider.provider())
+                .ok_or(CoreError::UnknownProviderGeneration)?;
+            if provider_record.catalog_digest != catalog.digest()
+                || !matches!(provider_record.state, ProviderEffectState::Active)
+            {
+                return Err(CoreError::ProviderLifecycleViolation);
+            }
+            let mut artifacts = BTreeMap::new();
+            match (
+                schema.components()[0].artifact_policy(),
+                provider.artifact(),
+            ) {
+                (crate::RecoveryArtifactPolicy::Required, Some(admission)) => {
+                    let receipts = provider_record
+                        .artifact_receipts
+                        .ok_or(CoreError::ArtifactVerifierMismatch)?;
+                    let binding = ArtifactBinding::new(
+                        admission.artifact(),
+                        provider.provider(),
+                        child.operation(),
+                        child,
+                        descriptor.child_component,
+                        catalog.digest(),
+                        admission.schema_digest(),
+                        provider_record.verifier_set_digest,
+                        admission.closure_digest(),
+                    )
+                    .map_err(|_| CoreError::ArtifactBindingMismatch)?;
+                    if state.artifact_leases().contains_key(&binding.artifact_id())
+                        || state.scoped_composites().values().any(|scoped| {
+                            scoped
+                                .artifacts
+                                .values()
+                                .any(|existing| existing.artifact_id() == binding.artifact_id())
+                        })
+                        || receipts.pin().verifier().get() == 0
+                        || receipts.release().verifier().get() == 0
+                    {
+                        return Err(CoreError::ArtifactBindingMismatch);
+                    }
+                    artifacts.insert(descriptor.child_component, binding);
+                }
+                (crate::RecoveryArtifactPolicy::Required, None) => {
+                    return Err(CoreError::ArtifactRequired);
+                }
+                (crate::RecoveryArtifactPolicy::NotRequired, Some(_)) => {
+                    return Err(CoreError::ArtifactBindingMismatch);
+                }
+                (crate::RecoveryArtifactPolicy::NotRequired, None) => {}
+            }
+            initialize_composite_effect(
                 catalog,
                 limits,
                 state,
-                &CommandKind::CreateCompositeEffect {
-                    effect: child,
-                    origin,
-                    binding_generation,
-                    kind: descriptor.child_kind,
-                    charge_account,
-                },
-                true,
+                child,
+                origin,
+                descriptor.child_kind,
+                charge_account,
             )?;
+            state.touch_provider_generation(provider.provider());
+            state
+                .provider_generations_mut()
+                .get_mut(&provider.provider())
+                .expect("validated provider")
+                .live_component_bindings += 1;
+            let mut bindings = BTreeMap::new();
+            bindings.insert(descriptor.child_component, provider.provider());
+            state.touch_scoped_composite(child);
+            state.scoped_composites_mut().insert_mut(
+                child,
+                ScopedCompositeRecord {
+                    catalog_digest: catalog.digest(),
+                    bindings,
+                    artifacts,
+                },
+            );
             enroll_component_claim(
                 catalog,
                 limits,
@@ -7864,7 +8051,6 @@ fn apply_command_internal(
                 child,
                 descriptor.child_component,
                 origin,
-                binding_generation,
                 descriptor.claim,
                 descriptor.claim_kind,
                 descriptor.scope,
@@ -7880,88 +8066,118 @@ fn apply_command_internal(
             // two executable custodians.
             deactivate_prepared_handoff_target(state, child, descriptor)?;
             apply_command(
-                catalog,
+                catalogs,
+                Some(catalog),
                 limits,
                 state,
                 &CommandKind::PrepareCompositeEffect {
                     effect: child,
                     actor: origin,
-                    binding_generation,
                 },
             )?;
+            state.touch_composite(child);
             state
-                .composite_effects
+                .composite_effects_mut()
                 .get_mut(&child)
                 .expect("created child")
                 .handoff = SingleHopRole::Target {
                 parent: descriptor.parent,
                 descriptor_digest: handoff_descriptor_digest(descriptor),
+                recovery_fact: None,
             };
             Ok(AppliedOutput::none(TransitionEvent::EffectPrepared))
         }
         CommandKind::ReleaseHandoffSourceAndRecordTargetIntent {
             descriptor,
             actor,
-            binding_generation,
             operation,
         } => {
             let child = descriptor.child_effect()?;
             let descriptor_digest = handoff_descriptor_digest(descriptor);
+            if !state.scoped_composites().contains_key(&descriptor.parent)
+                || !state.scoped_composites().contains_key(&child)
+            {
+                return Err(CoreError::IncompatibleApiProfile);
+            }
+            // This is a preflight-only check.  In particular, do not release
+            // the source claim, alter the target role, or call the generic
+            // commit-intent transition until every required source artifact
+            // lease is already durably Released.
+            ensure_required_artifact_leases_released(catalog, state, descriptor.parent)?;
             {
                 let source = state
-                    .composite_effects
+                    .composite_effects()
                     .get(&descriptor.parent)
-                    .ok_or(CoreError::UnknownEstate)?;
-                if !matches!(&source.handoff, SingleHopRole::Source { descriptor: saved, .. } if **saved == descriptor)
+                    .ok_or(CoreError::UnknownEffect)?;
+                if source.catalog_digest != descriptor.catalog_digest
+                    || state
+                        .scoped_composites()
+                        .get(&descriptor.parent)
+                        .is_some_and(|scoped| scoped.catalog_digest != descriptor.catalog_digest)
+                    || !matches!(&source.handoff, SingleHopRole::Source { descriptor: saved, .. } if **saved == descriptor)
                 {
                     return Err(CoreError::HandoffGuardRequired);
                 }
                 let target = state
-                    .composite_effects
+                    .composite_effects()
                     .get(&child)
-                    .ok_or(CoreError::UnknownEstate)?;
-                if !matches!(target.handoff, SingleHopRole::Target { parent, descriptor_digest: saved } if parent == descriptor.parent && saved == descriptor_digest)
+                    .ok_or(CoreError::UnknownEffect)?;
+                if target.catalog_digest != descriptor.catalog_digest
+                    || state
+                        .scoped_composites()
+                        .get(&child)
+                        .is_some_and(|scoped| scoped.catalog_digest != descriptor.catalog_digest)
+                    || !matches!(target.handoff, SingleHopRole::Target { parent, descriptor_digest: saved, recovery_fact: None } if parent == descriptor.parent && saved == descriptor_digest)
                 {
                     return Err(CoreError::HandoffGuardRequired);
                 }
+                ensure_handoff_target_artifact_admission(
+                    catalog,
+                    state,
+                    child,
+                    descriptor.child_component,
+                )?;
             }
             // The generic component command deliberately rejects a Target;
             // temporarily remove only the in-memory guard while executing the
             // same state-machine transition, then restore it before the
-            // candidate can be committed.
+            // prepared delta can be committed.
             let target_role = state
-                .composite_effects
+                .composite_effects()
                 .get(&child)
                 .expect("validated target")
                 .handoff
                 .clone();
+            state.touch_composite(child);
             state
-                .composite_effects
+                .composite_effects_mut()
                 .get_mut(&child)
                 .expect("validated target")
                 .handoff = SingleHopRole::None;
             let intent = apply_command(
-                catalog,
+                catalogs,
+                Some(catalog),
                 limits,
                 state,
                 &CommandKind::RecordComponentCommitIntent {
                     effect: child,
                     component: descriptor.child_component,
                     actor,
-                    binding_generation,
                     operation,
                 },
             )?;
+            state.touch_composite(child);
             state
-                .composite_effects
+                .composite_effects_mut()
                 .get_mut(&child)
                 .expect("validated target")
                 .handoff = target_role;
             release_handoff_source_claim(state, descriptor)?;
             activate_prepared_handoff_target(catalog, limits, state, child, descriptor)?;
-            let source_was_scoped = state.scoped_composites.contains_key(&descriptor.parent);
+            let source_was_scoped = state.scoped_composites().contains_key(&descriptor.parent);
+            state.touch_composite(descriptor.parent);
             let source = state
-                .composite_effects
+                .composite_effects_mut()
                 .get_mut(&descriptor.parent)
                 .expect("validated source");
             source.custodian = CustodyState::Released;
@@ -7983,236 +8199,10 @@ fn apply_command_internal(
             release_scoped_provider_bindings(state, descriptor.parent)?;
             Ok(intent)
         }
-        CommandKind::CreateEstate {
-            effect,
-            origin,
-            binding_generation,
-            domain,
-            obligation,
-            charge_account,
-        } => {
-            if binding_generation == 0 {
-                return Err(CoreError::InvalidPayload);
-            }
-            let obligation_rule = catalog
-                .obligation_rule(domain, obligation)
-                .ok_or(CoreError::UnknownObligationClass)?;
-            if state.estates.contains_key(&effect) {
-                return Err(CoreError::DuplicateEstate);
-            }
-            if state.estates.len() >= limits.max_estates {
-                return Err(CoreError::CapacityExceeded);
-            }
-
-            match state.roots.get(&effect.root()) {
-                Some(root) => {
-                    if root.origin.principal() != origin.principal()
-                        || !matches!(
-                            root.state,
-                            RootRecoveryState::Active {
-                                incarnation,
-                                binding_generation: live_binding,
-                            } | RootRecoveryState::Rebound {
-                                successor: incarnation,
-                                binding_generation: live_binding,
-                            } if incarnation == origin && live_binding == binding_generation
-                        )
-                    {
-                        return Err(CoreError::StaleIncarnation);
-                    }
-                }
-                None => {
-                    if state.roots.len() >= limits.max_roots {
-                        return Err(CoreError::CapacityExceeded);
-                    }
-                    state.roots.insert_mut(
-                        effect.root(),
-                        RootRecord {
-                            origin,
-                            state: RootRecoveryState::Active {
-                                incarnation: origin,
-                                binding_generation,
-                            },
-                            last_binding_generation: binding_generation,
-                            last_incarnation_generation: origin.generation(),
-                            crash_generation: 0,
-                        },
-                    );
-                }
-            }
-
-            state.estates.insert_mut(
-                effect,
-                EstateRecord {
-                    effect,
-                    causal_owner: origin,
-                    custodian: CustodyState::Principal(origin),
-                    charge_owner: charge_account,
-                    domain,
-                    obligation,
-                    obligation_policy: obligation_rule.policy(),
-                    authority: AuthorityState::Active,
-                    authority_epoch: 1,
-                    commit: CommitState::Registered,
-                    commit_nonce: None,
-                    commit_operation: None,
-                    commit_fact: None,
-                    outcome: OutcomeState::Pending,
-                    settlement: SettlementState::Unavailable,
-                    settlement_nonce: None,
-                    settlement_intent: None,
-                    applied_fact: None,
-                    settlement_fact: None,
-                    retirement: RetirementState::Held,
-                    claims: BTreeMap::new(),
-                    claim_stage: None,
-                },
-            );
-            Ok(AppliedOutput::none(TransitionEvent::EstateCreated))
-        }
-        CommandKind::CreateCompositeEffect {
-            effect,
-            origin,
-            binding_generation,
-            kind,
-            charge_account,
-        } => {
-            if state.world.is_some() && !trusted_scoped_constructor {
-                return Err(CoreError::IncompatibleApiProfile);
-            }
-            if binding_generation == 0 {
-                return Err(CoreError::InvalidPayload);
-            }
-            let component_specs = catalog
-                .composite_rule(kind)
-                .ok_or(CoreError::UnknownObligationClass)?
-                .components()
-                .to_vec();
-            if state.estates.contains_key(&effect) || state.composite_effects.contains_key(&effect)
-            {
-                return Err(CoreError::DuplicateEstate);
-            }
-            if state
-                .estates
-                .len()
-                .checked_add(state.composite_effects.len())
-                .ok_or(CoreError::CapacityExceeded)?
-                >= limits.max_estates
-            {
-                return Err(CoreError::CapacityExceeded);
-            }
-            match state.roots.get(&effect.root()) {
-                Some(root) => {
-                    if root.origin.principal() != origin.principal()
-                        || !matches!(
-                            root.state,
-                            RootRecoveryState::Active {
-                                incarnation,
-                                binding_generation: live_binding,
-                            } | RootRecoveryState::Rebound {
-                                successor: incarnation,
-                                binding_generation: live_binding,
-                            } if incarnation == origin && live_binding == binding_generation
-                        )
-                    {
-                        return Err(CoreError::StaleIncarnation);
-                    }
-                }
-                None => {
-                    if state.roots.len() >= limits.max_roots {
-                        return Err(CoreError::CapacityExceeded);
-                    }
-                    state.roots.insert_mut(
-                        effect.root(),
-                        RootRecord {
-                            origin,
-                            state: RootRecoveryState::Active {
-                                incarnation: origin,
-                                binding_generation,
-                            },
-                            last_binding_generation: binding_generation,
-                            last_incarnation_generation: origin.generation(),
-                            crash_generation: 0,
-                        },
-                    );
-                }
-            }
-            let mut components = BTreeMap::new();
-            for spec in component_specs {
-                let obligation = catalog
-                    .obligation_rule(spec.domain(), spec.obligation())
-                    .ok_or(CoreError::UnknownObligationClass)?;
-                components.insert(
-                    spec.component(),
-                    ComponentRecord {
-                        id: spec.component(),
-                        domain: spec.domain(),
-                        obligation: spec.obligation(),
-                        obligation_policy: obligation.policy(),
-                        commit: CommitState::Registered,
-                        commit_nonce: None,
-                        commit_operation: None,
-                        commit_fact: None,
-                        outcome: OutcomeState::Pending,
-                        settlement: SettlementState::Unavailable,
-                        settlement_nonce: None,
-                        claim_stage: None,
-                        settlement_intent: None,
-                        applied_fact: None,
-                        settlement_fact: None,
-                        retirement: RetirementState::Held,
-                        claims: BTreeMap::new(),
-                    },
-                );
-            }
-            state.composite_effects.insert_mut(
-                effect,
-                CompositeEffectRecord {
-                    effect,
-                    kind,
-                    causal_owner: origin,
-                    custodian: CustodyState::Principal(origin),
-                    charge_owner: charge_account,
-                    authority: AuthorityState::Active,
-                    authority_epoch: 1,
-                    handoff: SingleHopRole::None,
-                    components,
-                },
-            );
-            Ok(AppliedOutput::none(TransitionEvent::EstateCreated))
-        }
-        CommandKind::AddClaim {
-            effect,
-            actor,
-            binding_generation,
-            claim,
-            domain,
-            kind,
-            scope,
-            resource,
-            resource_generation,
-            units,
-        } => enroll_claim(
-            catalog,
-            limits,
-            state,
-            effect,
-            actor,
-            binding_generation,
-            claim,
-            domain,
-            kind,
-            scope,
-            resource,
-            resource_generation,
-            units,
-            None,
-        ),
         CommandKind::AddComponentClaim {
             effect,
             component,
             actor,
-            binding_generation,
             claim,
             kind,
             scope,
@@ -8226,7 +8216,6 @@ fn apply_command_internal(
             effect,
             component,
             actor,
-            binding_generation,
             claim,
             kind,
             scope,
@@ -8236,39 +8225,13 @@ fn apply_command_internal(
             None,
             None,
         ),
-        CommandKind::PrepareEffect {
-            effect,
-            actor,
-            binding_generation,
-        } => {
-            require_active_actor(state, effect, actor, binding_generation)?;
-            {
-                let estate = state.estates.get(&effect).ok_or(CoreError::UnknownEstate)?;
-                validate_obligation_claims(catalog, estate)?;
-            }
-            let estate = state
-                .estates
-                .get_mut(&effect)
-                .ok_or(CoreError::UnknownEstate)?;
-            if estate.authority != AuthorityState::Active
-                || estate.commit != CommitState::Registered
-            {
-                return Err(CoreError::WrongCommitState);
-            }
-            estate.commit = CommitState::Prepared;
-            Ok(AppliedOutput::none(TransitionEvent::EffectPrepared))
-        }
-        CommandKind::PrepareCompositeEffect {
-            effect,
-            actor,
-            binding_generation,
-        } => {
-            require_active_composite_actor(state, effect, actor, binding_generation)?;
+        CommandKind::PrepareCompositeEffect { effect, actor } => {
+            require_active_composite_actor(state, effect, actor)?;
             {
                 let composite = state
-                    .composite_effects
+                    .composite_effects()
                     .get(&effect)
-                    .ok_or(CoreError::UnknownEstate)?;
+                    .ok_or(CoreError::UnknownEffect)?;
                 if composite.authority != AuthorityState::Active
                     || composite
                         .components
@@ -8281,61 +8244,33 @@ fn apply_command_internal(
                     validate_component_claims(catalog, component)?;
                 }
             }
+            state.touch_composite(effect);
             let composite = state
-                .composite_effects
+                .composite_effects_mut()
                 .get_mut(&effect)
-                .ok_or(CoreError::UnknownEstate)?;
+                .ok_or(CoreError::UnknownEffect)?;
             for component in composite.components.values_mut() {
                 component.commit = CommitState::Prepared;
             }
             Ok(AppliedOutput::none(TransitionEvent::EffectPrepared))
         }
-        CommandKind::RecordCommitIntent {
-            effect,
-            actor,
-            binding_generation,
-            operation,
-        } => {
-            require_digest(operation)?;
-            require_active_actor(state, effect, actor, binding_generation)?;
-            let nonce = allocate_nonce(state)?;
-            let estate = state
-                .estates
-                .get_mut(&effect)
-                .ok_or(CoreError::UnknownEstate)?;
-            if estate.authority != AuthorityState::Active || estate.commit != CommitState::Prepared
-            {
-                return Err(CoreError::WrongCommitState);
-            }
-            estate.commit = CommitState::CommitIntentDurable;
-            estate.commit_nonce = Some(nonce);
-            estate.commit_operation = Some(operation);
-            Ok(AppliedOutput {
-                event: TransitionEvent::CommitIntentDurable,
-                output: OutputData::CommitIntent {
-                    effect,
-                    component: None,
-                    nonce,
-                },
-            })
-        }
         CommandKind::RecordComponentCommitIntent {
             effect,
             component,
             actor,
-            binding_generation,
             operation,
         } => {
             require_digest(operation)?;
-            require_active_composite_actor(state, effect, actor, binding_generation)?;
+            require_active_composite_actor(state, effect, actor)?;
             if !artifact_ready_for_component(state, effect, component) {
                 return Err(CoreError::ArtifactNotPinned);
             }
             let nonce = allocate_nonce(state)?;
+            state.touch_composite(effect);
             let composite = state
-                .composite_effects
+                .composite_effects_mut()
                 .get_mut(&effect)
-                .ok_or(CoreError::UnknownEstate)?;
+                .ok_or(CoreError::UnknownEffect)?;
             if matches!(composite.handoff, SingleHopRole::Target { .. }) {
                 return Err(CoreError::HandoffGuardRequired);
             }
@@ -8358,7 +8293,7 @@ fn apply_command_internal(
                 event: TransitionEvent::CommitIntentDurable,
                 output: OutputData::CommitIntent {
                     effect,
-                    component: Some(component),
+                    component,
                     nonce,
                 },
             })
@@ -8366,14 +8301,13 @@ fn apply_command_internal(
         CommandKind::RecordCompositeCommitIntents {
             effect,
             actor,
-            binding_generation,
             operations,
         } => {
-            require_active_composite_actor(state, effect, actor, binding_generation)?;
+            require_active_composite_actor(state, effect, actor)?;
             let composite = state
-                .composite_effects
+                .composite_effects()
                 .get(&effect)
-                .ok_or(CoreError::UnknownEstate)?;
+                .ok_or(CoreError::UnknownEffect)?;
             let component_specs = catalog
                 .composite_rule(composite.kind)
                 .ok_or(CoreError::UnknownObligationClass)?
@@ -8402,8 +8336,9 @@ fn apply_command_internal(
             for operation in &operations {
                 intents.push((operation.component(), allocate_nonce(state)?));
             }
+            state.touch_composite(effect);
             let composite = state
-                .composite_effects
+                .composite_effects_mut()
                 .get_mut(&effect)
                 .expect("composite was validated before nonce allocation");
             for (operation, (component, nonce)) in operations.into_iter().zip(&intents) {
@@ -8421,91 +8356,59 @@ fn apply_command_internal(
             })
         }
         CommandKind::AcknowledgeCommit { fact } => {
-            if let Some(component) = fact.component {
-                return acknowledge_component_commit(catalog, state, fact.effect, component, fact);
-            }
-            let effect = fact.effect;
-            {
-                let estate = state.estates.get(&effect).ok_or(CoreError::UnknownEstate)?;
-                validate_effect_fact(catalog, state, estate, fact)?;
-                if fact.kind != EffectFactKind::CommitOutcome
-                    || fact.actor != estate.causal_owner
-                    || fact.generation != estate.authority_epoch
-                    || fact.operation != estate.commit_operation.unwrap_or(Digest::ZERO)
-                    || fact.predecessor.is_some()
-                {
-                    return Err(CoreError::StaleCommitIntent);
-                }
-            }
-            let estate = state
-                .estates
-                .get_mut(&effect)
-                .ok_or(CoreError::UnknownEstate)?;
-            if estate.commit != CommitState::CommitIntentDurable
-                || estate.commit_nonce != Some(fact.nonce)
-            {
-                return Err(CoreError::StaleCommitIntent);
-            }
-            let outcome = match fact.outcome.ok_or(CoreError::VerificationFailed)? {
-                ExternalOutcome::Success => OutcomeState::KnownSuccess(fact.stamp.receipt_digest),
-                ExternalOutcome::Failure => OutcomeState::KnownFailure(fact.stamp.receipt_digest),
-            };
-            estate.commit = CommitState::Committed;
-            estate.commit_nonce = None;
-            estate.commit_fact = Some(fact);
-            estate.outcome = outcome;
-            initialize_committed_disposition(estate)?;
-            refresh_retirement(estate);
-            Ok(AppliedOutput::none(TransitionEvent::EffectCommitted))
+            let component = fact.component;
+            acknowledge_component_commit(catalog, state, fact.effect, component, fact)
         }
-        CommandKind::FenceIncarnation {
-            root,
-            crashed,
-            binding_generation,
-        } => {
-            apply_fence_incarnation(
-                state,
-                root,
-                crashed,
-                binding_generation,
-                limits.max_crashes_per_root,
-            )?;
-            Ok(AppliedOutput::none(TransitionEvent::IncarnationFenced))
+        CommandKind::FenceExecutor { operation, crashed } => {
+            state.touch_operation(operation);
+            apply_fence_incarnation(state, operation, crashed, limits.max_crashes_per_operation)?;
+            Ok(AppliedOutput::none(TransitionEvent::ExecutorFenced))
         }
         CommandKind::Snapshot {
-            root,
+            operation,
             snapshot,
             digest,
         } => {
             require_digest(digest)?;
-            let expected = build_recovery_snapshot(catalog, state, root, snapshot)?;
+            let expected = build_recovery_snapshot(catalogs, state, operation, snapshot)?;
             if expected.digest != digest {
                 return Err(CoreError::StaleSnapshot);
             }
-            let root_record = state.roots.get_mut(&root).ok_or(CoreError::UnknownRoot)?;
+            state.touch_operation(operation);
+            let operation_record = state
+                .recovery_operations_mut()
+                .get_mut(&operation)
+                .ok_or(CoreError::UnknownOperation)?;
             if matches!(
-                root_record.state,
-                RootRecoveryState::RecoveryExhausted { .. }
+                operation_record.state,
+                OperationRecoveryState::RecoveryExhausted { .. }
             ) {
                 return Err(CoreError::RecoveryExhausted);
             }
-            if !matches!(root_record.state, RootRecoveryState::Fenced { .. }) {
+            if !matches!(
+                operation_record.state,
+                OperationRecoveryState::Fenced { .. }
+            ) {
                 return Err(CoreError::WrongRecoveryState);
             }
-            root_record.state = RootRecoveryState::Snapshotted { snapshot, digest };
+            operation_record.state = OperationRecoveryState::Snapshotted { snapshot, digest };
             Ok(AppliedOutput::none(TransitionEvent::Snapshot))
         }
         CommandKind::Ready {
-            root,
+            operation,
             snapshot,
             successor,
         } => {
-            let root_record = state.roots.get_mut(&root).ok_or(CoreError::UnknownRoot)?;
-            let expected = match root_record.state {
-                RootRecoveryState::Snapshotted {
+            state.touch_operation(operation);
+            let operation_record = state
+                .recovery_operations_mut()
+                .get_mut(&operation)
+                .ok_or(CoreError::UnknownOperation)?;
+            let expected = match operation_record.state {
+                OperationRecoveryState::Snapshotted {
                     snapshot: expected, ..
                 } => expected,
-                RootRecoveryState::RecoveryExhausted { .. } => {
+                OperationRecoveryState::RecoveryExhausted { .. } => {
                     return Err(CoreError::RecoveryExhausted);
                 }
                 _ => return Err(CoreError::WrongRecoveryState),
@@ -8513,253 +8416,102 @@ fn apply_command_internal(
             if expected != snapshot {
                 return Err(CoreError::StaleSnapshot);
             }
-            if successor.principal() != root_record.origin.principal()
-                || successor.generation() <= root_record.last_incarnation_generation
+            if successor.executor() != operation_record.origin.executor()
+                || successor.generation() <= operation_record.last_executor.generation()
             {
-                return Err(CoreError::StaleIncarnation);
+                return Err(CoreError::StaleExecutor);
             }
-            root_record.state = RootRecoveryState::Ready {
+            operation_record.state = OperationRecoveryState::Ready {
                 snapshot,
                 successor,
             };
             Ok(AppliedOutput::none(TransitionEvent::Ready))
         }
         CommandKind::Rebind {
-            root,
+            operation,
             snapshot,
             successor,
-            binding_generation,
         } => {
-            if binding_generation == 0 {
-                return Err(CoreError::InvalidPayload);
-            }
-            let root_record = state.roots.get_mut(&root).ok_or(CoreError::UnknownRoot)?;
-            match root_record.state {
-                RootRecoveryState::Ready {
+            state.touch_operation(operation);
+            let operation_record = state
+                .recovery_operations_mut()
+                .get_mut(&operation)
+                .ok_or(CoreError::UnknownOperation)?;
+            match operation_record.state {
+                OperationRecoveryState::Ready {
                     snapshot: expected,
                     successor: expected_successor,
                 } if expected == snapshot && expected_successor == successor => {}
-                RootRecoveryState::Ready { .. } => return Err(CoreError::StaleSnapshot),
-                RootRecoveryState::RecoveryExhausted { .. } => {
+                OperationRecoveryState::Ready { .. } => return Err(CoreError::StaleSnapshot),
+                OperationRecoveryState::RecoveryExhausted { .. } => {
                     return Err(CoreError::RecoveryExhausted);
                 }
                 _ => return Err(CoreError::WrongRecoveryState),
             }
-            if binding_generation <= root_record.last_binding_generation {
-                return Err(CoreError::StaleIncarnation);
+            if successor.generation() <= operation_record.last_executor.generation() {
+                return Err(CoreError::StaleExecutor);
             }
-            root_record.last_binding_generation = binding_generation;
-            root_record.last_incarnation_generation = successor.generation();
-            root_record.state = RootRecoveryState::Rebound {
-                successor,
-                binding_generation,
-            };
+            operation_record.last_executor = successor;
+            operation_record.state = OperationRecoveryState::Rebound { successor };
             Ok(AppliedOutput::none(TransitionEvent::Rebound))
         }
-        CommandKind::AdoptEffect {
-            effect,
-            successor,
-            binding_generation,
-        } => {
-            let root = state
-                .roots
-                .get(&effect.root())
-                .ok_or(CoreError::UnknownRoot)?;
-            if matches!(root.state, RootRecoveryState::RecoveryExhausted { .. }) {
+        CommandKind::AdoptEffect { effect, successor } => {
+            let operation = state
+                .recovery_operations()
+                .get(&effect.operation())
+                .ok_or(CoreError::UnknownOperation)?;
+            if matches!(
+                operation.state,
+                OperationRecoveryState::RecoveryExhausted { .. }
+            ) {
                 return Err(CoreError::RecoveryExhausted);
             }
             if !matches!(
-                root.state,
-                RootRecoveryState::Rebound {
+                operation.state,
+                OperationRecoveryState::Rebound {
                     successor: current,
-                    binding_generation: current_binding,
-                } if current == successor && current_binding == binding_generation
+                } if current == successor
             ) {
-                return Err(CoreError::StaleIncarnation);
+                return Err(CoreError::StaleExecutor);
             }
-            if let Some(composite) = state.composite_effects.get_mut(&effect) {
-                if composite.authority == AuthorityState::Revoked {
-                    return Err(CoreError::GateClosed);
-                }
-                if composite.authority != AuthorityState::Fenced
-                    || composite.custodian != CustodyState::KernelEstate
-                {
-                    return Err(CoreError::WrongCommitState);
-                }
-                for component in composite.components.values() {
-                    validate_component_execution_adoption(catalog, component)?;
-                }
-                composite.authority_epoch = composite
-                    .authority_epoch
-                    .checked_add(1)
-                    .ok_or(CoreError::GenerationExhausted)?;
-                composite.authority = AuthorityState::Active;
-                composite.custodian = CustodyState::Principal(successor);
-                for component in composite.components.values_mut() {
-                    refresh_component_retirement(component, composite.authority);
-                }
-                return Ok(AppliedOutput::none(TransitionEvent::EffectAdopted));
-            }
-            let estate = state
-                .estates
+            state.touch_composite(effect);
+            let composite = state
+                .composite_effects_mut()
                 .get_mut(&effect)
-                .ok_or(CoreError::UnknownEstate)?;
-            if estate.authority == AuthorityState::Revoked
-                || estate.settlement == SettlementState::Revoked
-            {
+                .ok_or(CoreError::UnknownEffect)?;
+            if composite.authority == AuthorityState::Revoked {
                 return Err(CoreError::GateClosed);
             }
-            if estate.authority != AuthorityState::Fenced
-                || !matches!(
-                    estate.commit,
-                    CommitState::Registered | CommitState::Prepared
-                )
-                || estate.settlement != SettlementState::Unavailable
-                || estate.custodian != CustodyState::KernelEstate
+            if composite.authority != AuthorityState::Fenced
+                || composite.custodian != CustodyState::CoreOwned
             {
                 return Err(CoreError::WrongCommitState);
             }
-            estate.authority_epoch = estate
+            for component in composite.components.values() {
+                validate_component_execution_adoption(catalog, component)?;
+            }
+            composite.authority_epoch = composite
                 .authority_epoch
                 .checked_add(1)
                 .ok_or(CoreError::GenerationExhausted)?;
-            estate.authority = AuthorityState::Active;
-            estate.custodian = CustodyState::Principal(successor);
-            refresh_retirement(estate);
+            composite.authority = AuthorityState::Active;
+            composite.custodian = CustodyState::Executor(successor);
+            for component in composite.components.values_mut() {
+                refresh_component_retirement(component, composite.authority);
+            }
             Ok(AppliedOutput::none(TransitionEvent::EffectAdopted))
         }
-        CommandKind::RebaseCompositePrecommitClaims {
-            effect,
-            actor,
-            binding_generation,
-        } => {
-            rebase_composite_precommit_claims(catalog, state, effect, actor, binding_generation)?;
+        CommandKind::RebaseCompositePrecommitClaims { effect, actor } => {
+            rebase_composite_precommit_claims(catalog, state, effect, actor)?;
             Ok(AppliedOutput::none(
                 TransitionEvent::CompositePrecommitClaimsRebased,
             ))
-        }
-        CommandKind::ClaimSettlement { effect, claimant } => {
-            let root = state
-                .roots
-                .get(&effect.root())
-                .ok_or(CoreError::UnknownRoot)?;
-            let live_claimant = match root.state {
-                RootRecoveryState::Active { incarnation, .. } => incarnation,
-                RootRecoveryState::Rebound { successor, .. } => successor,
-                RootRecoveryState::RecoveryExhausted { .. } => {
-                    return Err(CoreError::RecoveryExhausted);
-                }
-                _ => return Err(CoreError::WrongRecoveryState),
-            };
-            if live_claimant != claimant {
-                return Err(CoreError::StaleIncarnation);
-            }
-            let (generation, stage) = {
-                let estate = state.estates.get(&effect).ok_or(CoreError::UnknownEstate)?;
-                if estate.obligation_policy != ObligationPolicy::SuccessorSettlement {
-                    return Err(CoreError::WrongSettlementStage);
-                }
-                if estate.authority == AuthorityState::Revoked {
-                    return Err(CoreError::GateClosed);
-                }
-                let claimable = match estate.settlement {
-                    SettlementState::Open { generation } => (generation, ClaimStage::Fresh),
-                    SettlementState::ReconciliationRequired {
-                        generation,
-                        applied,
-                    } => (
-                        generation,
-                        if applied {
-                            ClaimStage::ReconcileApplied
-                        } else {
-                            ClaimStage::ReconcileIntent
-                        },
-                    ),
-                    SettlementState::Claimed { .. }
-                    | SettlementState::ApplyIntentDurable { .. }
-                    | SettlementState::AppliedUnacknowledged { .. } => {
-                        return Err(CoreError::GateClaimed);
-                    }
-                    SettlementState::Settled | SettlementState::Revoked => {
-                        return Err(CoreError::GateClosed);
-                    }
-                    SettlementState::Unavailable | SettlementState::NotRequired => {
-                        return Err(CoreError::WrongSettlementStage);
-                    }
-                };
-                let custody_matches = matches!(
-                    (estate.authority, estate.custodian),
-                    (
-                        AuthorityState::Active,
-                        CustodyState::Principal(current),
-                    ) if current == claimant
-                ) || matches!(
-                    (estate.authority, estate.custodian),
-                    (AuthorityState::Fenced, CustodyState::KernelEstate)
-                );
-                if estate.commit != CommitState::Committed || !custody_matches {
-                    return Err(CoreError::WrongCommitState);
-                }
-                claimable
-            };
-            let nonce = allocate_nonce(state)?;
-            let estate = state
-                .estates
-                .get_mut(&effect)
-                .expect("estate validated before nonce allocation");
-            estate.settlement = SettlementState::Claimed {
-                claimant,
-                generation,
-            };
-            estate.settlement_nonce = Some(nonce);
-            estate.claim_stage = Some(stage);
-            Ok(AppliedOutput {
-                event: TransitionEvent::SettlementClaimed,
-                output: OutputData::Settlement {
-                    effect,
-                    component: None,
-                    claimant,
-                    generation,
-                    nonce,
-                    stage,
-                },
-            })
         }
         CommandKind::ClaimComponentSettlement {
             effect,
             component,
             claimant,
         } => claim_component_settlement(state, effect, component, claimant),
-        CommandKind::RecordApplyIntent {
-            effect,
-            claimant,
-            generation,
-            nonce,
-            intent,
-        } => {
-            require_digest(intent)?;
-            let estate = exact_claim_mut(state, effect, claimant, generation, nonce)?;
-            if estate.claim_stage != Some(ClaimStage::Fresh) {
-                return Err(CoreError::WrongSettlementStage);
-            }
-            estate.settlement = SettlementState::ApplyIntentDurable {
-                claimant,
-                generation,
-            };
-            estate.claim_stage = Some(ClaimStage::Intent);
-            estate.settlement_intent = Some(intent);
-            Ok(AppliedOutput {
-                event: TransitionEvent::ApplyIntentDurable,
-                output: OutputData::Settlement {
-                    effect,
-                    component: None,
-                    claimant,
-                    generation,
-                    nonce,
-                    stage: ClaimStage::Intent,
-                },
-            })
-        }
         CommandKind::RecordComponentApplyIntent {
             effect,
             component,
@@ -8769,6 +8521,7 @@ fn apply_command_internal(
             intent,
         } => {
             require_digest(intent)?;
+            state.touch_composite(effect);
             let component_record =
                 exact_component_claim_mut(state, effect, component, claimant, generation, nonce)?;
             if component_record.claim_stage != Some(ClaimStage::Fresh) {
@@ -8784,7 +8537,7 @@ fn apply_command_internal(
                 event: TransitionEvent::ApplyIntentDurable,
                 output: OutputData::Settlement {
                     effect,
-                    component: Some(component),
+                    component,
                     claimant,
                     generation,
                     nonce,
@@ -8793,101 +8546,12 @@ fn apply_command_internal(
             })
         }
         CommandKind::RecordApplied { fact } => {
-            if let Some(component) = fact.component {
-                return record_component_applied(catalog, state, fact.effect, component, fact);
-            }
-            let effect = fact.effect;
-            {
-                let estate = state.estates.get(&effect).ok_or(CoreError::UnknownEstate)?;
-                validate_effect_fact(catalog, state, estate, fact)?;
-                if fact.kind != EffectFactKind::ApplyCompleted
-                    || fact.operation != estate.settlement_intent.unwrap_or(Digest::ZERO)
-                    || fact.predecessor.is_some()
-                {
-                    return Err(CoreError::StaleSettlementClaim);
-                }
-            }
-            let estate = exact_claim_mut(state, effect, fact.actor, fact.generation, fact.nonce)?;
-            let next_stage = match estate.claim_stage {
-                Some(ClaimStage::Intent) => ClaimStage::Applied,
-                Some(ClaimStage::ReconcileIntent) => ClaimStage::ReconcileApplied,
-                _ => return Err(CoreError::WrongSettlementStage),
-            };
-            estate.settlement = SettlementState::AppliedUnacknowledged {
-                claimant: fact.actor,
-                generation: fact.generation,
-            };
-            estate.claim_stage = Some(next_stage);
-            estate.applied_fact = Some(fact);
-            Ok(AppliedOutput {
-                event: TransitionEvent::AppliedUnacknowledged,
-                output: OutputData::Settlement {
-                    effect,
-                    component: None,
-                    claimant: fact.actor,
-                    generation: fact.generation,
-                    nonce: fact.nonce,
-                    stage: next_stage,
-                },
-            })
+            let component = fact.component;
+            record_component_applied(catalog, state, fact.effect, component, fact)
         }
         CommandKind::Settle { fact } => {
-            if let Some(component) = fact.component {
-                return settle_component(catalog, state, fact.effect, component, fact);
-            }
-            let effect = fact.effect;
-            {
-                let estate = state.estates.get(&effect).ok_or(CoreError::UnknownEstate)?;
-                validate_effect_fact(catalog, state, estate, fact)?;
-                if fact.kind != EffectFactKind::SettlementAcknowledged
-                    || fact.operation != estate.settlement_intent.unwrap_or(Digest::ZERO)
-                    || fact.predecessor
-                        != estate
-                            .applied_fact
-                            .map(|applied| applied.stamp.receipt_digest)
-                {
-                    return Err(CoreError::StaleSettlementClaim);
-                }
-            }
-            let estate = exact_claim_mut(state, effect, fact.actor, fact.generation, fact.nonce)?;
-            if !matches!(
-                estate.claim_stage,
-                Some(ClaimStage::Applied | ClaimStage::ReconcileApplied)
-            ) {
-                return Err(CoreError::WrongSettlementStage);
-            }
-            estate.settlement = SettlementState::Settled;
-            estate.settlement_nonce = None;
-            estate.claim_stage = None;
-            estate.settlement_fact = Some(fact);
-            refresh_retirement(estate);
-            Ok(AppliedOutput::none(TransitionEvent::Settled))
-        }
-        CommandKind::MarkIndeterminate {
-            effect,
-            claimant,
-            generation,
-            nonce,
-            reason,
-        } => {
-            require_digest(reason)?;
-            let estate = exact_claim_mut(state, effect, claimant, generation, nonce)?;
-            let applied = matches!(
-                estate.claim_stage,
-                Some(ClaimStage::Applied | ClaimStage::ReconcileApplied)
-            );
-            let next_generation = generation
-                .checked_add(1)
-                .ok_or(CoreError::GenerationExhausted)?;
-            estate.outcome = OutcomeState::Indeterminate(reason);
-            estate.settlement = SettlementState::ReconciliationRequired {
-                generation: next_generation,
-                applied,
-            };
-            estate.settlement_nonce = None;
-            estate.claim_stage = None;
-            refresh_retirement(estate);
-            Ok(AppliedOutput::none(TransitionEvent::Indeterminate))
+            let component = fact.component;
+            settle_component(catalog, state, fact.effect, component, fact)
         }
         CommandKind::MarkComponentIndeterminate {
             effect,
@@ -8899,9 +8563,9 @@ fn apply_command_internal(
         } => {
             require_digest(reason)?;
             let authority = state
-                .composite_effects
+                .composite_effects()
                 .get(&effect)
-                .ok_or(CoreError::UnknownEstate)?
+                .ok_or(CoreError::UnknownEffect)?
                 .authority;
             let component_record =
                 exact_component_claim_mut(state, effect, component, claimant, generation, nonce)?;
@@ -8925,91 +8589,27 @@ fn apply_command_internal(
         CommandKind::BeginRevoke {
             effect,
             expected_actor,
-            binding_generation,
             authority_epoch,
         } => {
-            let root = state
-                .roots
-                .get(&effect.root())
-                .ok_or(CoreError::UnknownRoot)?;
-            let live = match root.state {
-                RootRecoveryState::Active {
-                    incarnation,
-                    binding_generation: live_binding,
-                }
-                | RootRecoveryState::Rebound {
-                    successor: incarnation,
-                    binding_generation: live_binding,
-                } => (incarnation, live_binding),
-                RootRecoveryState::RecoveryExhausted { .. } => {
+            let operation = state
+                .recovery_operations()
+                .get(&effect.operation())
+                .ok_or(CoreError::UnknownOperation)?;
+            let live = match operation.state {
+                OperationRecoveryState::Active { executor }
+                | OperationRecoveryState::Rebound {
+                    successor: executor,
+                } => executor,
+                OperationRecoveryState::RecoveryExhausted { .. } => {
                     return Err(CoreError::RecoveryExhausted);
                 }
                 _ => return Err(CoreError::WrongRecoveryState),
             };
-            if live != (expected_actor, binding_generation) {
-                return Err(CoreError::StaleIncarnation);
+            if live != expected_actor {
+                return Err(CoreError::StaleExecutor);
             }
-            if state.composite_effects.contains_key(&effect) {
-                return revoke_composite_effect(state, effect, expected_actor, authority_epoch);
-            }
-            let estate = state
-                .estates
-                .get_mut(&effect)
-                .ok_or(CoreError::UnknownEstate)?;
-            if estate.authority_epoch != authority_epoch {
-                return Err(CoreError::StaleAuthorityEpoch);
-            }
-            match (estate.authority, estate.custodian) {
-                (AuthorityState::Active, CustodyState::Principal(actor))
-                    if actor == expected_actor => {}
-                (AuthorityState::Fenced, CustodyState::KernelEstate) => {}
-                (AuthorityState::Revoked, _) => return Err(CoreError::GateClosed),
-                _ => return Err(CoreError::StaleAuthorityEpoch),
-            }
-            match estate.settlement {
-                SettlementState::Open { .. } | SettlementState::ReconciliationRequired { .. } => {
-                    estate.authority_epoch = estate
-                        .authority_epoch
-                        .checked_add(1)
-                        .ok_or(CoreError::GenerationExhausted)?;
-                    estate.authority = AuthorityState::Revoked;
-                    estate.custodian = CustodyState::KernelEstate;
-                    estate.settlement_nonce = None;
-                    estate.claim_stage = None;
-                    // A committed revoke closes only successor authority. The
-                    // obligation remains Open/ReconciliationRequired in kernel
-                    // custody until a trusted kernel recovery path resolves it.
-                    refresh_retirement(estate);
-                    Ok(AppliedOutput::none(TransitionEvent::Revoked))
-                }
-                SettlementState::Claimed { .. }
-                | SettlementState::ApplyIntentDurable { .. }
-                | SettlementState::AppliedUnacknowledged { .. } => Err(CoreError::GateClaimed),
-                SettlementState::Settled
-                | SettlementState::Revoked
-                | SettlementState::NotRequired => Err(CoreError::GateClosed),
-                SettlementState::Unavailable
-                    if estate.commit != CommitState::Committed
-                        && estate.authority != AuthorityState::Revoked =>
-                {
-                    estate.authority_epoch = estate
-                        .authority_epoch
-                        .checked_add(1)
-                        .ok_or(CoreError::GenerationExhausted)?;
-                    estate.settlement = SettlementState::Revoked;
-                    estate.authority = AuthorityState::Revoked;
-                    estate.custodian = CustodyState::KernelEstate;
-                    refresh_retirement(estate);
-                    Ok(AppliedOutput::none(TransitionEvent::Revoked))
-                }
-                SettlementState::Unavailable => Err(CoreError::WrongSettlementStage),
-            }
+            revoke_composite_effect(state, effect, expected_actor, authority_epoch)
         }
-        CommandKind::SubmitEvidence {
-            effect,
-            claim,
-            evidence,
-        } => apply_evidence(catalog, state, effect, claim, evidence),
         CommandKind::SubmitComponentEvidence {
             effect,
             component,
@@ -9020,17 +8620,14 @@ fn apply_command_internal(
             state: image,
             projection,
         } => {
-            let rebuilt = decode_whole_state_checkpoint(&image, catalog, limits)?;
-            let mut canonical = state.clone();
-            canonical.charges.retain_mut(|_, units| *units != 0);
+            let rebuilt = decode_whole_state_checkpoint(&image, catalogs, limits)?;
             // Replay applies primary commands without maintaining the
             // derived cache; compare the checkpoint against primary state
             // and the independently rebuilt cache, not the stale replay
-            // cache carried by the candidate.
-            canonical.projection_cache = rebuilt.projection_cache.clone();
+            // cache carried by the replay image.
             if rebuilt.recovery_target.is_some()
                 || rebuilt.projection_cache.digest != projection
-                || rebuilt != canonical
+                || !checkpoint_state_matches(state, &rebuilt)
             {
                 return Err(CoreError::InvariantViolation);
             }
@@ -9050,29 +8647,34 @@ fn apply_command_internal(
             journal,
             device,
         } => {
-            let target = state.recovery_target.ok_or(CoreError::WrongRecoveryState)?;
+            let target = state
+                .recovery_target()
+                .ok_or(CoreError::WrongRecoveryState)?;
             if target.boot() != boot
                 || target.journal() != journal
                 || target.device() != device
-                || target.registry() != state.freshness.registry()
+                || target.registry() != state.freshness().registry()
                 || state
-                    .device_generations
+                    .device_generations()
                     .values()
                     .any(|generation| *generation > device)
             {
                 return Err(CoreError::FreshnessRollback);
             }
-            let roots: Vec<RootId> = state.roots.keys().copied().collect();
-            for root in roots {
-                fence_root_for_boot(state, root, limits.max_crashes_per_root)?;
+            let operations: Vec<OperationId> =
+                state.recovery_operations().keys().copied().collect();
+            for operation in operations {
+                state.touch_operation(operation);
+                fence_operation_for_boot(state, operation, limits.max_crashes_per_operation)?;
             }
-            state.freshness.set_boot_and_journal(boot, journal);
-            state.freshness.set_device(device);
+            state.freshness().set_boot_and_journal(boot, journal);
+            state.freshness().set_device(device);
             let device_scopes: Vec<DeviceScopeId> =
-                state.device_generations.keys().copied().collect();
+                state.device_generations().keys().copied().collect();
             for scope in device_scopes {
+                state.touch_device(scope);
                 *state
-                    .device_generations
+                    .device_generations_mut()
                     .get_mut(&scope)
                     .expect("scope was collected from device generations") = device;
             }
@@ -9082,125 +8684,13 @@ fn apply_command_internal(
             // replay reaches the checkpoint so its resulting projection is
             // identical to the live recovery transition.
             quarantine_live_device_claims(state);
-            state.recovery_target = None;
+            state.set_recovery_target(None);
             Ok(AppliedOutput::none(TransitionEvent::RecoveryCheckpointed))
-        }
-        CommandKind::ReserveReuse {
-            effect,
-            actor,
-            binding_generation,
-            claim,
-            domain,
-            kind,
-            scope,
-            resource,
-            expected_generation,
-            units,
-            reuse_contract,
-        } => {
-            require_digest(reuse_contract)?;
-            if state.recovery_target.is_some() {
-                return Err(CoreError::RecoveryPending);
-            }
-            if scope_is_quarantined(state, scope) {
-                return Err(CoreError::Quarantined);
-            }
-            require_active_actor(state, effect, actor, binding_generation)?;
-            let authority_epoch = state
-                .estates
-                .get(&effect)
-                .ok_or(CoreError::UnknownEstate)?
-                .authority_epoch;
-            let record = state
-                .resources
-                .get(&resource)
-                .ok_or(CoreError::UnknownResource)?;
-            if record.scope != scope {
-                return Err(CoreError::WrongClaimScope);
-            }
-            if record.generation != expected_generation {
-                return Err(CoreError::StaleResourceGeneration);
-            }
-            match record.phase {
-                ResourcePhase::Claimed { .. } => return Err(CoreError::ResourceRetained),
-                ResourcePhase::Retired => {}
-            }
-            let catalog_digest = catalog.digest();
-            let retirement_digest =
-                retirement_contract_digest(catalog_digest, state, resource, expected_generation)?;
-            let generation = ResourceGeneration::new(
-                expected_generation
-                    .get()
-                    .checked_add(1)
-                    .ok_or(CoreError::GenerationExhausted)?,
-            )
-            .map_err(|_| CoreError::GenerationExhausted)?;
-            let nonce = allocate_nonce(state)?;
-            let reservation_freshness = scoped_freshness(state, scope, binding_generation)?;
-            state.resources.insert_mut(
-                resource,
-                ResourceRecord {
-                    scope,
-                    generation,
-                    phase: ResourcePhase::Claimed {
-                        pending_reuse: Some(PendingReuse {
-                            effect,
-                            component: None,
-                            actor,
-                            binding_generation,
-                            authority_epoch,
-                            claim,
-                            previous_generation: expected_generation,
-                            catalog_digest,
-                            retirement_digest,
-                            reuse_contract,
-                            nonce,
-                            freshness: reservation_freshness,
-                        }),
-                    },
-                },
-            );
-            enroll_claim(
-                catalog,
-                limits,
-                state,
-                effect,
-                actor,
-                binding_generation,
-                claim,
-                domain,
-                kind,
-                scope,
-                resource,
-                generation,
-                units,
-                Some(nonce),
-            )?;
-            Ok(AppliedOutput {
-                event: TransitionEvent::ResourceReuseReserved,
-                output: OutputData::ReusePermit {
-                    effect,
-                    component: None,
-                    actor,
-                    binding_generation,
-                    authority_epoch,
-                    claim,
-                    resource,
-                    previous_generation: expected_generation,
-                    generation,
-                    catalog_digest,
-                    retirement_digest,
-                    reuse_contract,
-                    freshness: reservation_freshness,
-                    nonce,
-                },
-            })
         }
         CommandKind::ReserveComponentReuse {
             effect,
             component,
             actor,
-            binding_generation,
             claim,
             kind,
             scope,
@@ -9210,20 +8700,20 @@ fn apply_command_internal(
             reuse_contract,
         } => {
             require_digest(reuse_contract)?;
-            if state.recovery_target.is_some() {
+            if state.recovery_target().is_some() {
                 return Err(CoreError::RecoveryPending);
             }
             if scope_is_quarantined(state, scope) {
                 return Err(CoreError::Quarantined);
             }
-            require_active_composite_actor(state, effect, actor, binding_generation)?;
+            require_active_composite_actor(state, effect, actor)?;
             let authority_epoch = state
-                .composite_effects
+                .composite_effects()
                 .get(&effect)
-                .ok_or(CoreError::UnknownEstate)?
+                .ok_or(CoreError::UnknownEffect)?
                 .authority_epoch;
             let record = state
-                .resources
+                .resources()
                 .get(&resource)
                 .ok_or(CoreError::UnknownResource)?;
             if record.scope != scope {
@@ -9247,8 +8737,9 @@ fn apply_command_internal(
             )
             .map_err(|_| CoreError::GenerationExhausted)?;
             let nonce = allocate_nonce(state)?;
-            let reservation_freshness = scoped_freshness(state, scope, binding_generation)?;
-            state.resources.insert_mut(
+            let reservation_freshness = scoped_freshness(state, scope)?;
+            state.touch_resource(resource);
+            state.resources_mut().insert_mut(
                 resource,
                 ResourceRecord {
                     scope,
@@ -9256,9 +8747,8 @@ fn apply_command_internal(
                     phase: ResourcePhase::Claimed {
                         pending_reuse: Some(PendingReuse {
                             effect,
-                            component: Some(component),
+                            component,
                             actor,
-                            binding_generation,
                             authority_epoch,
                             claim,
                             previous_generation: expected_generation,
@@ -9278,7 +8768,6 @@ fn apply_command_internal(
                 effect,
                 component,
                 actor,
-                binding_generation,
                 claim,
                 kind,
                 scope,
@@ -9292,9 +8781,8 @@ fn apply_command_internal(
                 event: TransitionEvent::ResourceReuseReserved,
                 output: OutputData::ReusePermit {
                     effect,
-                    component: Some(component),
+                    component,
                     actor,
-                    binding_generation,
                     authority_epoch,
                     claim,
                     resource,
@@ -9312,7 +8800,6 @@ fn apply_command_internal(
             effect,
             component,
             actor,
-            binding_generation,
             authority_epoch,
             claim,
             resource,
@@ -9335,54 +8822,37 @@ fn apply_command_internal(
             {
                 return Err(CoreError::StaleReusePermit);
             }
-            match component {
-                Some(component) => {
-                    require_active_composite_actor(state, effect, actor, binding_generation)?;
-                    let composite = state
-                        .composite_effects
-                        .get(&effect)
-                        .ok_or(CoreError::UnknownEstate)?;
-                    if composite.authority_epoch != authority_epoch {
-                        return Err(CoreError::StaleAuthorityEpoch);
-                    }
-                    let claim_record = composite
-                        .components
-                        .get(&component)
-                        .and_then(|record| record.claims.get(&claim))
-                        .ok_or(CoreError::UnknownClaim)?;
-                    if claim_record.retired
-                        || claim_record.resource != resource
-                        || claim_record.resource_generation != resource_generation
-                    {
-                        return Err(CoreError::StaleReusePermit);
-                    }
-                }
-                None => {
-                    require_active_actor(state, effect, actor, binding_generation)?;
-                    let estate = state.estates.get(&effect).ok_or(CoreError::UnknownEstate)?;
-                    if estate.authority_epoch != authority_epoch {
-                        return Err(CoreError::StaleAuthorityEpoch);
-                    }
-                    let claim_record = estate.claims.get(&claim).ok_or(CoreError::UnknownClaim)?;
-                    if claim_record.retired
-                        || claim_record.resource != resource
-                        || claim_record.resource_generation != resource_generation
-                    {
-                        return Err(CoreError::StaleReusePermit);
-                    }
-                }
+            require_active_composite_actor(state, effect, actor)?;
+            let composite = state
+                .composite_effects()
+                .get(&effect)
+                .ok_or(CoreError::UnknownEffect)?;
+            if composite.authority_epoch != authority_epoch {
+                return Err(CoreError::StaleAuthorityEpoch);
+            }
+            let claim_record = composite
+                .components
+                .get(&component)
+                .and_then(|record| record.claims.get(&claim))
+                .ok_or(CoreError::UnknownClaim)?;
+            if claim_record.retired
+                || claim_record.resource != resource
+                || claim_record.resource_generation != resource_generation
+            {
+                return Err(CoreError::StaleReusePermit);
             }
             let scope = state
-                .resources
+                .resources()
                 .get(&resource)
                 .ok_or(CoreError::UnknownResource)?
                 .scope;
             if scope_is_quarantined(state, scope) {
                 return Err(CoreError::Quarantined);
             }
-            let current_freshness = scoped_freshness(state, scope, binding_generation)?;
+            let current_freshness = scoped_freshness(state, scope)?;
+            state.touch_resource(resource);
             let record = state
-                .resources
+                .resources_mut()
                 .get_mut(&resource)
                 .expect("resource was validated");
             if record.generation != resource_generation {
@@ -9395,7 +8865,6 @@ fn apply_command_internal(
                             effect: expected_effect,
                             component: expected_component,
                             actor: expected_actor,
-                            binding_generation: expected_binding,
                             authority_epoch: expected_epoch,
                             claim: expected_claim,
                             previous_generation: expected_previous_generation,
@@ -9408,7 +8877,6 @@ fn apply_command_internal(
                 } if expected_effect == effect
                     && expected_component == component
                     && expected_actor == actor
-                    && expected_binding == binding_generation
                     && expected_epoch == authority_epoch
                     && expected_claim == claim
                     && expected_previous_generation == previous_generation
@@ -9431,53 +8899,34 @@ fn apply_command_internal(
             effect,
             component,
             actor,
-            binding_generation,
             authority_epoch,
             claim,
             resource,
             resource_generation,
         } => {
-            match component {
-                Some(component) => {
-                    require_active_composite_actor(state, effect, actor, binding_generation)?;
-                    let composite = state
-                        .composite_effects
-                        .get(&effect)
-                        .ok_or(CoreError::UnknownEstate)?;
-                    if composite.authority_epoch != authority_epoch {
-                        return Err(CoreError::StaleAuthorityEpoch);
-                    }
-                    let component_record = composite
-                        .components
-                        .get(&component)
-                        .ok_or(CoreError::UnknownObligationClass)?;
-                    let claim_record = component_record
-                        .claims
-                        .get(&claim)
-                        .ok_or(CoreError::UnknownClaim)?;
-                    if claim_record.retired
-                        || claim_record.resource != resource
-                        || claim_record.resource_generation != resource_generation
-                    {
-                        return Err(CoreError::UnknownClaim);
-                    }
-                }
-                None => {
-                    require_active_actor(state, effect, actor, binding_generation)?;
-                    let estate = state.estates.get(&effect).ok_or(CoreError::UnknownEstate)?;
-                    if estate.authority_epoch != authority_epoch {
-                        return Err(CoreError::StaleAuthorityEpoch);
-                    }
-                    let claim_record = estate.claims.get(&claim).ok_or(CoreError::UnknownClaim)?;
-                    if claim_record.retired
-                        || claim_record.resource != resource
-                        || claim_record.resource_generation != resource_generation
-                    {
-                        return Err(CoreError::UnknownClaim);
-                    }
-                }
+            require_active_composite_actor(state, effect, actor)?;
+            let composite = state
+                .composite_effects()
+                .get(&effect)
+                .ok_or(CoreError::UnknownEffect)?;
+            if composite.authority_epoch != authority_epoch {
+                return Err(CoreError::StaleAuthorityEpoch);
             }
-            let (previous, scope) = match state.resources.get(&resource) {
+            let component_record = composite
+                .components
+                .get(&component)
+                .ok_or(CoreError::UnknownObligationClass)?;
+            let claim_record = component_record
+                .claims
+                .get(&claim)
+                .ok_or(CoreError::UnknownClaim)?;
+            if claim_record.retired
+                || claim_record.resource != resource
+                || claim_record.resource_generation != resource_generation
+            {
+                return Err(CoreError::UnknownClaim);
+            }
+            let (previous, scope) = match state.resources().get(&resource) {
                 Some(ResourceRecord {
                     scope,
                     generation,
@@ -9498,17 +8947,16 @@ fn apply_command_internal(
                 || previous.component != component
                 || previous.claim != claim
                 || previous.authority_epoch >= authority_epoch
-                || (previous.actor == actor && previous.binding_generation == binding_generation)
+                || previous.actor == actor
             {
                 return Err(CoreError::GateClaimed);
             }
             let nonce = allocate_nonce(state)?;
-            let reservation_freshness = scoped_freshness(state, scope, binding_generation)?;
+            let reservation_freshness = scoped_freshness(state, scope)?;
             let pending = PendingReuse {
                 effect,
                 component,
                 actor,
-                binding_generation,
                 authority_epoch,
                 claim,
                 previous_generation: previous.previous_generation,
@@ -9518,8 +8966,9 @@ fn apply_command_internal(
                 nonce,
                 freshness: reservation_freshness,
             };
+            state.touch_resource(resource);
             state
-                .resources
+                .resources_mut()
                 .get_mut(&resource)
                 .expect("resource was validated")
                 .phase = ResourcePhase::Claimed {
@@ -9531,7 +8980,6 @@ fn apply_command_internal(
                     effect,
                     component,
                     actor,
-                    binding_generation,
                     authority_epoch,
                     claim,
                     resource,
@@ -9545,38 +8993,20 @@ fn apply_command_internal(
                 },
             })
         }
-        CommandKind::ReleaseEstate { effect } => {
-            let estate = state
-                .estates
-                .get_mut(&effect)
-                .ok_or(CoreError::UnknownEstate)?;
-            if estate.retirement != RetirementState::Retired
-                || !matches!(
-                    estate.settlement,
-                    SettlementState::Settled
-                        | SettlementState::Revoked
-                        | SettlementState::NotRequired
-                )
-            {
-                return Err(CoreError::EstateNotReleasable);
-            }
-            estate.retirement = RetirementState::Released;
-            estate.custodian = CustodyState::Released;
-            Ok(AppliedOutput::none(TransitionEvent::EstateReleased))
-        }
         CommandKind::ReleaseCompositeEffect { effect } => {
             if !artifacts_released_for_effect(state, effect) {
-                return Err(CoreError::EstateNotReleasable);
+                return Err(CoreError::EffectNotReleasable);
             }
+            state.touch_composite(effect);
             let composite = state
-                .composite_effects
+                .composite_effects_mut()
                 .get_mut(&effect)
-                .ok_or(CoreError::UnknownEstate)?;
+                .ok_or(CoreError::UnknownEffect)?;
             if matches!(composite.handoff, SingleHopRole::Source { .. }) {
                 return Err(CoreError::HandoffGuardRequired);
             }
             if composite_escape_state(composite) != EffectEscapeState::Retired {
-                return Err(CoreError::EstateNotReleasable);
+                return Err(CoreError::EffectNotReleasable);
             }
             composite.custodian = CustodyState::Released;
             composite.authority = AuthorityState::Revoked;
@@ -9586,22 +9016,36 @@ fn apply_command_internal(
             if artifacts_released_for_effect(state, effect) {
                 release_scoped_provider_bindings(state, effect)?;
             }
-            Ok(AppliedOutput::none(TransitionEvent::EstateReleased))
+            Ok(AppliedOutput::none(
+                TransitionEvent::CompositeEffectReleased,
+            ))
         }
     }
 }
 
-/// Removes one effect's provider binding at the same durable pivot that
-/// releases the effect. The binding map and every provider's live counter are
 /// updated together so checkpoint/replay can never observe a released effect
 /// still keeping a generation artificially live.
-fn release_scoped_provider_bindings(state: &mut State, effect: EffectId) -> Result<(), CoreError> {
-    let Some(scoped) = state.scoped_composites.remove_mut(&effect) else {
+fn release_scoped_provider_bindings(
+    state: &mut impl StateAccessMut,
+    effect: EffectId,
+) -> Result<(), CoreError> {
+    state.touch_scoped_composite(effect);
+    let Some(scoped) = state.scoped_composites_mut().remove_mut(&effect) else {
         return Ok(());
     };
+    let provenance = ReleasedCompositeProvenance::from(scoped.clone());
+    state.touch_composite(effect);
+    let composite = state
+        .composite_effects_mut()
+        .get_mut(&effect)
+        .ok_or(CoreError::UnknownEffect)?;
+    if composite.released_provenance.replace(provenance).is_some() {
+        return Err(CoreError::InvariantViolation);
+    }
     for provider in scoped.bindings.values() {
+        state.touch_provider_generation(*provider);
         let record = state
-            .provider_generations
+            .provider_generations_mut()
             .get_mut(provider)
             .ok_or(CoreError::UnknownProviderGeneration)?;
         record.live_component_bindings = record
@@ -9614,26 +9058,31 @@ fn release_scoped_provider_bindings(state: &mut State, effect: EffectId) -> Resu
 
 fn validate_artifact_binding(
     catalog: &DomainCatalog,
-    state: &State,
+    state: &impl StateAccess,
     binding: ArtifactBinding,
 ) -> Result<(), CoreError> {
-    if binding.catalog_digest() != catalog.digest()
-        || state.world != Some(binding.provider().world())
-    {
+    if binding.catalog_digest() != catalog.digest() || state.world() != binding.provider().world() {
         return Err(CoreError::ArtifactBindingMismatch);
     }
+    if state
+        .provider_generations()
+        .get(&binding.provider())
+        .is_none_or(|record| record.catalog_digest != binding.catalog_digest())
+    {
+        return Err(CoreError::CatalogMismatch);
+    }
     let scoped = state
-        .scoped_composites
+        .scoped_composites()
         .get(&binding.effect())
-        .ok_or(CoreError::UnknownEstate)?;
-    if scoped.operation != binding.operation()
+        .ok_or(CoreError::UnknownEffect)?;
+    if binding.operation() != binding.effect().operation()
         || scoped.bindings.get(&binding.component()) != Some(&binding.provider())
         || scoped.artifacts.get(&binding.component()) != Some(&binding)
     {
         return Err(CoreError::ArtifactBindingMismatch);
     }
     let provider = state
-        .provider_generations
+        .provider_generations()
         .get(&binding.provider())
         .ok_or(CoreError::UnknownProviderGeneration)?;
     if provider.verifier_set_digest != binding.verifier_set_digest() {
@@ -9642,15 +9091,19 @@ fn validate_artifact_binding(
     Ok(())
 }
 
-fn artifact_ready_for_component(state: &State, effect: EffectId, component: ComponentId) -> bool {
-    let Some(scoped) = state.scoped_composites.get(&effect) else {
+fn artifact_ready_for_component(
+    state: &impl StateAccess,
+    effect: EffectId,
+    component: ComponentId,
+) -> bool {
+    let Some(scoped) = state.scoped_composites().get(&effect) else {
         return true;
     };
     let Some(binding) = scoped.artifacts.get(&component) else {
         return true;
     };
     matches!(
-        state.artifact_leases.get(&binding.artifact_id()),
+        state.artifact_leases().get(&binding.artifact_id()),
         Some(ArtifactLeaseState::Pinned {
             binding: pinned,
             ..
@@ -9658,41 +9111,121 @@ fn artifact_ready_for_component(state: &State, effect: EffectId, component: Comp
     )
 }
 
-fn artifacts_released_for_effect(state: &State, effect: EffectId) -> bool {
-    state.scoped_composites.get(&effect).is_none_or(|scoped| {
+fn artifacts_released_for_effect(state: &impl StateAccess, effect: EffectId) -> bool {
+    state.scoped_composites().get(&effect).is_none_or(|scoped| {
         scoped.artifacts.values().all(|binding| {
             matches!(
-                state.artifact_leases.get(&binding.artifact_id()),
+                state.artifact_leases().get(&binding.artifact_id()),
                 Some(ArtifactLeaseState::Released { .. })
             )
         })
     })
 }
 
+/// Checks the source side of the handoff pivot without changing state.
+/// Required artifact leases are independent of the resource-claim pivot: a
+/// source may only release its claim after every one of its admitted required
+/// artifact closures has reached the terminal `Released` state.
+fn ensure_required_artifact_leases_released(
+    catalog: &DomainCatalog,
+    state: &impl StateAccess,
+    effect: EffectId,
+) -> Result<(), CoreError> {
+    let composite = state
+        .composite_effects()
+        .get(&effect)
+        .ok_or(CoreError::UnknownEffect)?;
+    let schema = catalog
+        .composite_rule(composite.kind)
+        .ok_or(CoreError::UnknownObligationClass)?;
+    let Some(scoped) = state.scoped_composites().get(&effect) else {
+        if schema
+            .components()
+            .iter()
+            .any(|component| component.artifact_policy() == crate::RecoveryArtifactPolicy::Required)
+        {
+            return Err(CoreError::ArtifactRequired);
+        }
+        return Ok(());
+    };
+    for component in schema.components() {
+        if component.artifact_policy() != crate::RecoveryArtifactPolicy::Required {
+            continue;
+        }
+        let binding = scoped
+            .artifacts
+            .get(&component.component())
+            .ok_or(CoreError::ArtifactRequired)?;
+        match state.artifact_leases().get(&binding.artifact_id()) {
+            Some(ArtifactLeaseState::Released { .. }) => {}
+            Some(_) => return Err(CoreError::ArtifactNotReleasable),
+            None => return Err(CoreError::ArtifactRequired),
+        }
+    }
+    Ok(())
+}
+
+/// Verifies that a handoff target with a Required artifact policy is backed by
+/// the same exact scoped admission used by ordinary composite effects. The
+/// current handoff install command has no admission payload and rejects such
+/// targets, but this check also protects the pivot if a future recovery path
+/// materializes a target from durable state.
+fn ensure_handoff_target_artifact_admission(
+    catalog: &DomainCatalog,
+    state: &impl StateAccess,
+    effect: EffectId,
+    component: ComponentId,
+) -> Result<(), CoreError> {
+    let composite = state
+        .composite_effects()
+        .get(&effect)
+        .ok_or(CoreError::UnknownEffect)?;
+    let schema = catalog
+        .composite_rule(composite.kind)
+        .ok_or(CoreError::UnknownObligationClass)?;
+    let Some(declared) = schema.component(component) else {
+        return Err(CoreError::ProviderBindingMismatch);
+    };
+    if declared.artifact_policy() != crate::RecoveryArtifactPolicy::Required {
+        return Ok(());
+    }
+    let scoped = state
+        .scoped_composites()
+        .get(&effect)
+        .ok_or(CoreError::ArtifactRequired)?;
+    let binding = scoped
+        .artifacts
+        .get(&component)
+        .copied()
+        .ok_or(CoreError::ArtifactRequired)?;
+    validate_artifact_binding(catalog, state, binding)
+}
+
 /// Withdraws only artifact admission placeholders which never acquired a
 /// durable global lease. Pinned, release-authorized, and released bindings
 /// remain attached to the scoped effect until the normal release transition.
 fn revoke_unpinned_artifact_placeholders(
-    state: &mut State,
+    state: &mut impl StateAccessMut,
     effect: EffectId,
 ) -> Result<(), CoreError> {
-    let Some(scoped) = state.scoped_composites.get(&effect) else {
+    let Some(scoped) = state.scoped_composites().get(&effect) else {
         return Ok(());
     };
     let unpinned: Vec<_> = scoped
         .artifacts
         .iter()
         .filter_map(|(component, binding)| {
-            (!state.artifact_leases.contains_key(&binding.artifact_id())).then_some(*component)
+            (!state.artifact_leases().contains_key(&binding.artifact_id())).then_some(*component)
         })
         .collect();
     if unpinned.is_empty() {
         return Ok(());
     }
+    state.touch_scoped_composite(effect);
     let scoped = state
-        .scoped_composites
+        .scoped_composites_mut()
         .get_mut(&effect)
-        .ok_or(CoreError::UnknownEstate)?;
+        .ok_or(CoreError::UnknownEffect)?;
     for component in unpinned {
         scoped.artifacts.remove(&component);
     }
@@ -9708,7 +9241,10 @@ fn provider_epoch(state: ProviderEffectState) -> u64 {
     }
 }
 
-fn enforce_scoped_provider_gate(state: &State, command: &CommandKind) -> Result<(), CoreError> {
+fn enforce_scoped_provider_gate(
+    state: &impl StateAccess,
+    command: &CommandKind,
+) -> Result<(), CoreError> {
     let effect = match command {
         CommandKind::AddComponentClaim { effect, .. }
         | CommandKind::PrepareCompositeEffect { effect, .. }
@@ -9717,23 +9253,24 @@ fn enforce_scoped_provider_gate(state: &State, command: &CommandKind) -> Result<
         | CommandKind::AdoptEffect { effect, .. }
         | CommandKind::RebaseCompositePrecommitClaims { effect, .. }
         | CommandKind::ReserveComponentReuse { effect, .. }
-        | CommandKind::ReclaimResourceReuse {
-            effect,
-            component: Some(_),
-            ..
-        }
-        | CommandKind::ActivateResourceReuse {
-            effect,
-            component: Some(_),
-            ..
-        } => Some(*effect),
+        | CommandKind::ReclaimResourceReuse { effect, .. }
+        | CommandKind::ActivateResourceReuse { effect, .. } => Some(*effect),
         CommandKind::RecordArtifactPin { binding, .. } => Some(binding.effect()),
         _ => None,
     };
     let Some(effect) = effect else {
         return Ok(());
     };
-    let Some(scoped) = state.scoped_composites.get(&effect) else {
+    if state.composite_effects().contains_key(&effect)
+        && !state.scoped_composites().contains_key(&effect)
+        && state
+            .composite_effects()
+            .get(&effect)
+            .is_some_and(|composite| composite.released_provenance.is_none())
+    {
+        return Err(CoreError::IncompatibleApiProfile);
+    }
+    let Some(scoped) = state.scoped_composites().get(&effect) else {
         return Ok(());
     };
     let admission = matches!(
@@ -9757,14 +9294,8 @@ fn enforce_scoped_provider_gate(state: &State, command: &CommandKind) -> Result<
         | CommandKind::RecordComponentCommitIntent { component, .. }
         | CommandKind::ReserveComponentReuse { component, .. } => Some(*component),
         CommandKind::RecordArtifactPin { binding, .. } => Some(binding.component()),
-        CommandKind::ReclaimResourceReuse {
-            component: Some(component),
-            ..
-        }
-        | CommandKind::ActivateResourceReuse {
-            component: Some(component),
-            ..
-        } => Some(*component),
+        CommandKind::ReclaimResourceReuse { component, .. }
+        | CommandKind::ActivateResourceReuse { component, .. } => Some(*component),
         _ => None,
     };
     if let Some(component) = component
@@ -9784,7 +9315,7 @@ fn enforce_scoped_provider_gate(state: &State, command: &CommandKind) -> Result<
         );
     for provider in providers {
         let record = state
-            .provider_generations
+            .provider_generations()
             .get(&provider)
             .ok_or(CoreError::UnknownProviderGeneration)?;
         if !matches!(record.state, ProviderEffectState::Active) {
@@ -9799,9 +9330,10 @@ fn enforce_scoped_provider_gate(state: &State, command: &CommandKind) -> Result<
 /// exact committed operation indeterminate. A merely installed/prepared child
 /// must not preempt a still-valid parent resolution.
 fn handoff_child_resolution_eligible(
-    state: &State,
+    state: &impl StateAccess,
     descriptor: ChildDescriptorV1,
     descriptor_receipt_digest: Digest,
+    fact: VerifiedHandoffRecoveryFact,
 ) -> bool {
     let Ok(child) = descriptor.child_effect() else {
         return false;
@@ -9809,40 +9341,133 @@ fn handoff_child_resolution_eligible(
     if child == descriptor.parent {
         return false;
     }
-    let Some(root) = state.roots.get(&child.root()) else {
+    let Some(recovery_operation) = state.recovery_operations().get(&child.operation()) else {
         return false;
     };
-    let Some(composite) = state.composite_effects.get(&child) else {
+    let Some(composite) = state.composite_effects().get(&child) else {
         return false;
     };
+    if !state.scoped_composites().contains_key(&child)
+        || !state.scoped_composites().contains_key(&descriptor.parent)
+    {
+        return false;
+    }
     let Some(component) = composite.components.get(&descriptor.child_component) else {
         return false;
     };
-    let Some(source) = state.composite_effects.get(&descriptor.parent) else {
+    let Some(source) = state.composite_effects().get(&descriptor.parent) else {
         return false;
     };
-    let Some(operation) = component.commit_operation else {
+    let Some(commit_operation) = component.commit_operation else {
         return false;
     };
-    matches!(root.state, RootRecoveryState::Fenced { .. })
-        && composite.authority == AuthorityState::Fenced
-        && composite.custodian == CustodyState::KernelEstate
-        && matches!(composite.handoff, SingleHopRole::Target { parent, descriptor_digest } if parent == descriptor.parent && descriptor_digest == handoff_descriptor_digest(descriptor))
-        && matches!(&source.handoff, SingleHopRole::Source { descriptor: saved, .. } if **saved == descriptor)
-        && matches!(&source.handoff, SingleHopRole::Source { descriptor_receipt_digest: saved, .. } if *saved == descriptor_receipt_digest)
+    matches!(
+        recovery_operation.state,
+        OperationRecoveryState::Fenced { .. }
+    ) && composite.authority == AuthorityState::Fenced
+        && composite.custodian == CustodyState::CoreOwned
+        && matches!(composite.handoff, SingleHopRole::Target { parent, descriptor_digest, recovery_fact: None } if parent == descriptor.parent && descriptor_digest == handoff_descriptor_digest(descriptor))
+        && matches!(&source.handoff, SingleHopRole::Source { descriptor: saved, descriptor_receipt_digest: saved_receipt, .. } if **saved == descriptor && *saved_receipt == descriptor_receipt_digest)
         && component.commit == CommitState::Committed
         && component.commit_nonce.is_none()
         && component.commit_fact.is_none()
-        && component.outcome == OutcomeState::Indeterminate(operation)
+        && component.outcome == OutcomeState::Indeterminate(commit_operation)
+        && fact.role == HandoffRecoveryRole::Child
+        && fact.effect == child
+        && fact.component == descriptor.child_component
+        && fact.operation == commit_operation
+        && fact.descriptor_digest == handoff_descriptor_digest(descriptor)
+}
+
+/// Validates every coordinate carried by a handoff recovery fact before it is
+/// allowed to alter an indeterminate outcome. This is deliberately separate
+/// from the structural branch selector above: tag-41 replay must validate the
+/// exact catalog-selected verifier and scope before any mutation.
+#[derive(Clone, Copy)]
+struct HandoffRecoveryCoordinates {
+    role: HandoffRecoveryRole,
+    effect: EffectId,
+    component: ComponentId,
+    operation: Digest,
+    descriptor_digest: Digest,
+    freshness: Freshness,
+}
+
+impl HandoffRecoveryCoordinates {
+    const fn new(
+        role: HandoffRecoveryRole,
+        effect: EffectId,
+        component: ComponentId,
+        operation: Digest,
+        descriptor_digest: Digest,
+        freshness: Freshness,
+    ) -> Self {
+        Self {
+            role,
+            effect,
+            component,
+            operation,
+            descriptor_digest,
+            freshness,
+        }
+    }
+}
+
+fn handoff_recovery_fact_matches(
+    state: &impl StateAccess,
+    catalog: &DomainCatalog,
+    fact: VerifiedHandoffRecoveryFact,
+    expected: HandoffRecoveryCoordinates,
+) -> bool {
+    if fact.role != expected.role
+        || fact.effect != expected.effect
+        || fact.component != expected.component
+        || fact.operation != expected.operation
+        || fact.descriptor_digest != expected.descriptor_digest
+        || fact.freshness != expected.freshness
+        || fact.verification_scope.operation() != expected.effect.operation()
+        || fact.stamp.receipt_digest.is_zero()
+    {
+        return false;
+    }
+    let Some(composite) = state.composite_effects().get(&expected.effect) else {
+        return false;
+    };
+    let Some(record) = composite.components.get(&expected.component) else {
+        return false;
+    };
+    let Some(binding) = catalog
+        .obligation_rule(record.domain, record.obligation)
+        .map(|rule| rule.receipts().commit_outcome())
+    else {
+        return false;
+    };
+    validate_state_verifier_identity(
+        state,
+        expected.effect,
+        expected.component,
+        fact.stamp.identity,
+        binding.verifier(),
+        binding.receipt_schema(),
+    )
+    .is_ok()
+        && validate_state_verification_scope(
+            state,
+            expected.effect,
+            expected.component,
+            fact.verification_scope,
+            binding.verifier(),
+            binding.receipt_schema(),
+        )
+        .is_ok()
 }
 
 /// Summarizes the modes of every live custodian at one exact resource
-/// generation. The resource record stores the coordinate state, while the two
-/// reverse indexes identify its estate and composite custodians; admission must
-/// consult both rather than treating the incoming class as the whole algebra.
+/// generation. The resource record stores the coordinate state, while the
+/// reverse index identifies its composite custodians.
 fn live_resource_conflict_summary(
     catalog: &DomainCatalog,
-    state: &State,
+    state: &impl StateAccess,
     resource: ResourceId,
     generation: ResourceGeneration,
     candidate: ConflictMode,
@@ -9863,20 +9488,10 @@ fn live_resource_conflict_summary(
         Ok(())
     };
 
-    if let Some(entries) = state.resource_index.get(&resource) {
-        for (effect, claim_id) in entries {
-            let claim = state
-                .estates
-                .get(effect)
-                .and_then(|estate| estate.claims.get(claim_id))
-                .ok_or(CoreError::InvariantViolation)?;
-            inspect(claim)?;
-        }
-    }
-    if let Some(entries) = state.composite_resource_index.get(&resource) {
+    if let Some(entries) = state.composite_resource_index().get(&resource) {
         for (effect, component, claim_id) in entries {
             let claim = state
-                .composite_effects
+                .composite_effects()
                 .get(effect)
                 .and_then(|composite| composite.components.get(component))
                 .and_then(|component| component.claims.get(claim_id))
@@ -9887,12 +9502,55 @@ fn live_resource_conflict_summary(
     Ok((custodians, compatible))
 }
 
+/// Mixed-catalog invariant counterpart of [`live_resource_conflict_summary`].
+/// Each indexed claim is interpreted by the immutable catalog recorded on its
+/// owning composite; no catalog-set iteration order participates in the
+/// result.
+fn live_resource_conflict_summary_for_set(
+    catalogs: &CatalogSet,
+    state: &impl StateAccess,
+    resource: ResourceId,
+    generation: ResourceGeneration,
+    candidate: ConflictMode,
+) -> Result<(usize, bool), CoreError> {
+    let mut custodians = 0usize;
+    let mut compatible = true;
+    let Some(entries) = state.composite_resource_index().get(&resource) else {
+        return Ok((0, true));
+    };
+    for (effect, component, claim_id) in entries {
+        let composite = state
+            .composite_effects()
+            .get(effect)
+            .ok_or(CoreError::InvariantViolation)?;
+        let catalog = catalogs
+            .get(composite.catalog_digest)
+            .ok_or(CoreError::SchemaMismatch)?;
+        let claim = composite
+            .components
+            .get(component)
+            .and_then(|component| component.claims.get(claim_id))
+            .ok_or(CoreError::InvariantViolation)?;
+        if claim.retired || claim.resource != resource || claim.resource_generation != generation {
+            return Err(CoreError::InvariantViolation);
+        }
+        let rule = catalog
+            .claim_rule(claim.domain, claim.kind)
+            .ok_or(CoreError::InvariantViolation)?;
+        custodians = custodians
+            .checked_add(1)
+            .ok_or(CoreError::InvariantViolation)?;
+        compatible &= candidate.compatible_with(rule.conflict());
+    }
+    Ok((custodians, compatible))
+}
+
 /// Returns whether an incoming class may join a live coordinate. Compatibility
 /// is symmetric: every incumbent and the incoming claim must explicitly opt
 /// into shared custody.
 fn resource_allows_additional_custodian(
     catalog: &DomainCatalog,
-    state: &State,
+    state: &impl StateAccess,
     resource: ResourceId,
     generation: ResourceGeneration,
     incoming: ConflictMode,
@@ -9928,7 +9586,7 @@ fn handoff_source_claim_matches(
 
 #[allow(clippy::too_many_arguments)]
 fn handoff_target_reservation_matches(
-    state: &State,
+    state: &impl StateAccess,
     effect: EffectId,
     component: ComponentId,
     claim: ClaimId,
@@ -9951,22 +9609,22 @@ fn handoff_target_reservation_matches(
         && descriptor.resource_generation == resource_generation
         && descriptor.units == units
         && matches!(
-            state.composite_effects.get(&descriptor.parent),
+            state.composite_effects().get(&descriptor.parent),
             Some(source) if matches!(&source.handoff, SingleHopRole::Source { descriptor: saved, .. } if **saved == descriptor)
                 && handoff_source_claim_matches(source, descriptor)
         )
 }
 
 fn deactivate_prepared_handoff_target(
-    state: &mut State,
+    state: &mut impl StateAccessMut,
     child: EffectId,
     descriptor: ChildDescriptorV1,
 ) -> Result<(), CoreError> {
     let (charge_owner, credit_class) = {
         let composite = state
-            .composite_effects
+            .composite_effects()
             .get(&child)
-            .ok_or(CoreError::UnknownEstate)?;
+            .ok_or(CoreError::UnknownEffect)?;
         let claim = composite
             .components
             .get(&descriptor.child_component)
@@ -9984,14 +9642,14 @@ fn deactivate_prepared_handoff_target(
         (composite.charge_owner, claim.credit_class)
     };
     let charged = state
-        .charges
+        .charges_mut()
         .get_mut(&(charge_owner, credit_class))
         .ok_or(CoreError::InvariantViolation)?;
     *charged = charged
         .checked_sub(descriptor.units)
         .ok_or(CoreError::InvariantViolation)?;
     let entries = state
-        .composite_resource_index
+        .composite_resource_index_mut()
         .get_mut(&descriptor.resource)
         .ok_or(CoreError::InvariantViolation)?;
     let before = entries.len();
@@ -10001,21 +9659,21 @@ fn deactivate_prepared_handoff_target(
     }
     if entries.is_empty() {
         state
-            .composite_resource_index
+            .composite_resource_index_mut()
             .remove_mut(&descriptor.resource);
     }
     Ok(())
 }
 
 fn release_handoff_source_claim(
-    state: &mut State,
+    state: &mut impl StateAccessMut,
     descriptor: ChildDescriptorV1,
 ) -> Result<(), CoreError> {
     let (charge_owner, credit_class, source_claim) = {
         let source = state
-            .composite_effects
+            .composite_effects()
             .get(&descriptor.parent)
-            .ok_or(CoreError::UnknownEstate)?;
+            .ok_or(CoreError::UnknownEffect)?;
         if !handoff_source_claim_matches(source, descriptor) {
             return Err(CoreError::HandoffGuardRequired);
         }
@@ -10026,14 +9684,14 @@ fn release_handoff_source_claim(
         (source.charge_owner, claim.credit_class, claim.id)
     };
     let charged = state
-        .charges
+        .charges_mut()
         .get_mut(&(charge_owner, credit_class))
         .ok_or(CoreError::InvariantViolation)?;
     *charged = charged
         .checked_sub(descriptor.units)
         .ok_or(CoreError::InvariantViolation)?;
     let entries = state
-        .composite_resource_index
+        .composite_resource_index_mut()
         .get_mut(&descriptor.resource)
         .ok_or(CoreError::InvariantViolation)?;
     let before = entries.len();
@@ -10044,22 +9702,24 @@ fn release_handoff_source_claim(
     }
     if entries.is_empty() {
         state
-            .composite_resource_index
+            .composite_resource_index_mut()
             .remove_mut(&descriptor.resource);
     }
-    if !state.resource_index.contains_key(&descriptor.resource)
-        && !state
-            .composite_resource_index
-            .contains_key(&descriptor.resource)
+    state.touch_resource(descriptor.resource);
+    if !state
+        .composite_resource_index()
+        .contains_key(&descriptor.resource)
     {
+        state.touch_resource(descriptor.resource);
         state
-            .resources
+            .resources_mut()
             .get_mut(&descriptor.resource)
             .ok_or(CoreError::InvariantViolation)?
             .phase = ResourcePhase::Retired;
     }
+    state.touch_composite(descriptor.parent);
     state
-        .composite_effects
+        .composite_effects_mut()
         .get_mut(&descriptor.parent)
         .expect("validated source")
         .components
@@ -10073,15 +9733,15 @@ fn release_handoff_source_claim(
 fn activate_prepared_handoff_target(
     catalog: &DomainCatalog,
     limits: CoreLimits,
-    state: &mut State,
+    state: &mut impl StateAccessMut,
     child: EffectId,
     descriptor: ChildDescriptorV1,
 ) -> Result<(), CoreError> {
-    let (charge_owner, credit_class) = {
+    let (charge_owner, credit_class, target_catalog_digest) = {
         let target = state
-            .composite_effects
+            .composite_effects()
             .get(&child)
-            .ok_or(CoreError::UnknownEstate)?;
+            .ok_or(CoreError::UnknownEffect)?;
         let claim = target
             .components
             .get(&descriptor.child_component)
@@ -10096,29 +9756,35 @@ fn activate_prepared_handoff_target(
         {
             return Err(CoreError::HandoffGuardRequired);
         }
-        (target.charge_owner, claim.credit_class)
+        (
+            target.charge_owner,
+            claim.credit_class,
+            target.catalog_digest,
+        )
     };
+    if target_catalog_digest != catalog.digest() || descriptor.catalog_digest != catalog.digest() {
+        return Err(CoreError::CatalogMismatch);
+    }
     let limit = catalog
         .credit_rule(credit_class)
         .ok_or(CoreError::InvariantViolation)?
         .max_units_per_account()
         .min(limits.max_units_per_account);
-    let charged = state
-        .charges
-        .get(&(charge_owner, credit_class))
-        .copied()
-        .unwrap_or(0);
-    let next = charged
-        .checked_add(descriptor.units)
-        .ok_or(CoreError::Backpressure)?;
-    if next > limit {
+    let charged = charged_for_catalog(state, catalog.digest(), charge_owner, credit_class)?;
+    // The source claim has already been released and the target reservation
+    // is now live, so the catalog-local scan already includes exactly the
+    // target units. Re-adding `descriptor.units` would double-charge the
+    // handoff pivot and leave the aggregate cache inconsistent with the
+    // authoritative claim set.
+    if charged > limit {
         return Err(CoreError::Backpressure);
     }
     *state
-        .charges
-        .get_or_insert_with_mut((charge_owner, credit_class), || 0) = next;
+        .charges_mut()
+        .get_or_insert_with_mut((charge_owner, credit_class), || 0) = charged;
+    state.touch_resource(descriptor.resource);
     let resource_record = state
-        .resources
+        .resources_mut()
         .get_mut(&descriptor.resource)
         .ok_or(CoreError::InvariantViolation)?;
     if resource_record.scope != descriptor.scope
@@ -10134,7 +9800,7 @@ fn activate_prepared_handoff_target(
         pending_reuse: None,
     };
     let entries = state
-        .composite_resource_index
+        .composite_resource_index_mut()
         .get_or_insert_with_mut(descriptor.resource, Vec::new);
     match entries.binary_search(&(child, descriptor.child_component, descriptor.claim)) {
         Ok(_) => return Err(CoreError::InvariantViolation),
@@ -10144,7 +9810,7 @@ fn activate_prepared_handoff_target(
 }
 
 fn prepared_handoff_target_claim(
-    state: &State,
+    state: &impl StateAccess,
     composite: &CompositeEffectRecord,
     component: &ComponentRecord,
     claim: &ClaimRecord,
@@ -10152,11 +9818,12 @@ fn prepared_handoff_target_claim(
     let SingleHopRole::Target {
         parent,
         descriptor_digest,
+        recovery_fact: _,
     } = composite.handoff
     else {
         return false;
     };
-    let Some(source) = state.composite_effects.get(&parent) else {
+    let Some(source) = state.composite_effects().get(&parent) else {
         return false;
     };
     let SingleHopRole::Source { descriptor, .. } = &source.handoff else {
@@ -10176,249 +9843,51 @@ fn prepared_handoff_target_claim(
         && !claim.retired
 }
 
-#[allow(clippy::too_many_arguments)]
-fn enroll_claim(
-    catalog: &DomainCatalog,
-    limits: CoreLimits,
-    state: &mut State,
-    effect: EffectId,
-    actor: PrincipalIncarnation,
-    binding_generation: u64,
-    claim: ClaimId,
-    domain: DomainId,
-    kind: ClaimKindId,
-    scope: ClaimScope,
-    resource: ResourceId,
-    resource_generation: ResourceGeneration,
-    units: u64,
-    reservation_nonce: Option<u64>,
-) -> Result<AppliedOutput, CoreError> {
-    if units == 0 {
-        return Err(CoreError::InvalidPayload);
-    }
-    let rule = catalog
-        .claim_rule(domain, kind)
-        .ok_or(CoreError::UnknownClaimClass)?;
-    if !matches!(
-        (rule.scope(), scope),
-        (ClaimScopePolicy::Logical, ClaimScope::Logical)
-            | (ClaimScopePolicy::Device, ClaimScope::Device(_))
-    ) {
-        return Err(CoreError::WrongClaimScope);
-    }
-    if let ClaimScope::Device(device_scope) = scope {
-        if !state.device_generations.contains_key(&device_scope) {
-            state
-                .device_generations
-                .insert_mut(device_scope, state.freshness.device());
-        }
-        if state.device_quarantine.contains(&device_scope) {
-            return Err(CoreError::Quarantined);
-        }
-    }
-    let credit_class = rule.credit_class();
-    let credit_limit = catalog
-        .credit_rule(credit_class)
-        .ok_or(CoreError::InvariantViolation)?
-        .max_units_per_account()
-        .min(limits.max_units_per_account);
-    require_active_actor(state, effect, actor, binding_generation)?;
-
-    match (state.resources.get(&resource), reservation_nonce) {
-        (None, None) if resource_generation.get() == 1 => {
-            if state.resources.len() >= limits.max_resource_records {
-                return Err(CoreError::CapacityExceeded);
-            }
-        }
-        (
-            Some(ResourceRecord {
-                scope: existing_scope,
-                generation,
-                phase:
-                    ResourcePhase::Claimed {
-                        pending_reuse: Some(PendingReuse { nonce, .. }),
-                    },
-            }),
-            Some(presented_nonce),
-        ) if *existing_scope == scope
-            && *generation == resource_generation
-            && *nonce == presented_nonce => {}
-        (
-            Some(ResourceRecord {
-                scope: existing, ..
-            }),
-            _,
-        ) if *existing != scope => {
-            return Err(CoreError::WrongClaimScope);
-        }
-        (Some(ResourceRecord { generation, .. }), _) if *generation != resource_generation => {
-            return Err(CoreError::StaleResourceGeneration);
-        }
-        (
-            Some(ResourceRecord {
-                phase: ResourcePhase::Retired,
-                ..
-            }),
-            None,
-        )
-        | (
-            Some(ResourceRecord {
-                phase:
-                    ResourcePhase::Claimed {
-                        pending_reuse: Some(_),
-                    },
-                ..
-            }),
-            None,
-        ) => {
-            return Err(CoreError::ResourceReuseRequired);
-        }
-        // The coordinate is live with no reuse pending. Scope agreement and
-        // exact generation equality were already checked by the guards above,
-        // so the only remaining question is the catalog's admission algebra.
-        // An exclusive class refuses the second custodian; a shared class
-        // admits it, and the retirement path already withholds the coordinate
-        // until the last custodian discharges.
-        (
-            Some(ResourceRecord {
-                phase:
-                    ResourcePhase::Claimed {
-                        pending_reuse: None,
-                    },
-                ..
-            }),
-            None,
-        ) => {
-            if !resource_allows_additional_custodian(
-                catalog,
-                state,
-                resource,
-                resource_generation,
-                rule.conflict(),
-            )? {
-                return Err(CoreError::ResourceRetained);
-            }
-        }
-        (Some(ResourceRecord { .. }), Some(_)) | (None, Some(_)) => {
-            return Err(CoreError::StaleReusePermit);
-        }
-        (None, None) => return Err(CoreError::StaleResourceGeneration),
-    }
-
-    let enrolled_freshness = scoped_freshness(state, scope, binding_generation)?;
-    if state.total_claims >= limits.max_total_claims {
-        return Err(CoreError::CapacityExceeded);
-    }
-    let estate = state
-        .estates
-        .get_mut(&effect)
-        .ok_or(CoreError::UnknownEstate)?;
-    if estate.authority != AuthorityState::Active || estate.commit != CommitState::Registered {
-        return Err(CoreError::WrongCommitState);
-    }
-    if estate.domain != domain {
-        return Err(CoreError::UnknownClaimClass);
-    }
-    let cardinality = catalog
-        .obligation_rule(estate.domain, estate.obligation)
-        .ok_or(CoreError::InvariantViolation)?
-        .claims()
-        .iter()
-        .find(|allowed| allowed.kind() == kind)
-        .ok_or(CoreError::ClaimNotAllowed)?;
-    let existing_of_kind = estate
-        .claims
+/// Returns the live charge total owned by one immutable catalog.  The
+/// persisted `State::charges` map is intentionally an aggregate cache keyed
+/// only by account/class, so cross-catalog validation must not infer a
+/// catalog-local limit from that aggregate (or from another catalog's rule).
+fn charged_for_catalog(
+    state: &impl StateAccess,
+    catalog_digest: Digest,
+    charge_owner: ChargeAccountId,
+    credit_class: CreditClassId,
+) -> Result<u64, CoreError> {
+    state
+        .composite_effects()
         .values()
-        .filter(|candidate| candidate.kind == kind)
-        .count();
-    if existing_of_kind >= usize::from(cardinality.maximum()) {
-        return Err(CoreError::ClaimCardinalityViolation);
-    }
-    if estate.claims.len() >= limits.max_claims_per_estate {
-        return Err(CoreError::CapacityExceeded);
-    }
-    if estate.claims.contains_key(&claim) {
-        return Err(CoreError::DuplicateClaim);
-    }
-    let charged = state
-        .charges
-        .get(&(estate.charge_owner, credit_class))
-        .copied()
-        .unwrap_or(0);
-    let next = charged.checked_add(units).ok_or(CoreError::Backpressure)?;
-    if next > credit_limit {
-        return Err(CoreError::Backpressure);
-    }
-
-    let requirements = rule
-        .evidence()
-        .iter()
-        .map(|evidence| RequirementState {
-            kind: evidence.kind(),
-            verifier: evidence.verifier(),
-            receipt_schema: evidence.receipt_schema(),
-            subject_freshness: evidence.subject_freshness(),
-            observation_freshness: evidence.observation_freshness(),
-            strictly_advanced: evidence.strictly_advanced(),
-            device_generation: evidence.device_generation(),
-            prerequisite: evidence.prerequisite(),
-            accepted: None,
+        .filter(|composite| {
+            composite.catalog_digest == catalog_digest && composite.charge_owner == charge_owner
         })
-        .collect();
-    estate.claims.insert(
-        claim,
-        ClaimRecord {
-            id: claim,
-            domain,
-            kind,
-            credit_class,
-            scope,
-            resource,
-            resource_generation,
-            units,
-            enrolled_freshness,
-            requirements,
-            retired: false,
-        },
-    );
-    *state
-        .charges
-        .get_or_insert_with_mut((estate.charge_owner, credit_class), || 0) = next;
-    let entries = state
-        .resource_index
-        .get_or_insert_with_mut(resource, Vec::new);
-    match entries.binary_search(&(effect, claim)) {
-        Ok(_) => return Err(CoreError::InvariantViolation),
-        Err(index) => entries.insert(index, (effect, claim)),
-    }
-    if reservation_nonce.is_none() {
-        state.resources.insert_mut(
-            resource,
-            ResourceRecord {
-                scope,
-                generation: resource_generation,
-                phase: ResourcePhase::Claimed {
-                    pending_reuse: None,
-                },
-            },
-        );
-    }
-    state.total_claims = state
-        .total_claims
-        .checked_add(1)
-        .ok_or(CoreError::CapacityExceeded)?;
-    Ok(AppliedOutput::none(TransitionEvent::ClaimAdded))
+        .flat_map(|composite| {
+            composite
+                .components
+                .values()
+                .map(move |component| (composite, component))
+        })
+        .flat_map(|(composite, component)| {
+            component.claims.values().filter_map(move |claim| {
+                (claim.credit_class == credit_class
+                    && !claim.retired
+                    && !prepared_handoff_target_claim(state, composite, component, claim))
+                .then_some(claim.units)
+            })
+        })
+        .try_fold(0u64, |total, units| {
+            total
+                .checked_add(units)
+                .ok_or(CoreError::InvariantViolation)
+        })
 }
 
 #[allow(clippy::too_many_arguments)]
 fn enroll_component_claim(
     catalog: &DomainCatalog,
     limits: CoreLimits,
-    state: &mut State,
+    state: &mut impl StateAccessMut,
     effect: EffectId,
     component: ComponentId,
-    actor: PrincipalIncarnation,
-    binding_generation: u64,
+    actor: ExecutorCoordinate,
     claim: ClaimId,
     kind: ClaimKindId,
     scope: ClaimScope,
@@ -10431,12 +9900,12 @@ fn enroll_component_claim(
     if units == 0 {
         return Err(CoreError::InvalidPayload);
     }
-    require_active_composite_actor(state, effect, actor, binding_generation)?;
+    require_active_composite_actor(state, effect, actor)?;
     let (domain, obligation, charge_owner, authority, commit) = {
         let composite = state
-            .composite_effects
+            .composite_effects()
             .get(&effect)
-            .ok_or(CoreError::UnknownEstate)?;
+            .ok_or(CoreError::UnknownEffect)?;
         let component_record = composite
             .components
             .get(&component)
@@ -10463,12 +9932,14 @@ fn enroll_component_claim(
         return Err(CoreError::WrongClaimScope);
     }
     if let ClaimScope::Device(device_scope) = scope {
-        if !state.device_generations.contains_key(&device_scope) {
+        if !state.device_generations().contains_key(&device_scope) {
+            let device_generation = state.freshness().device();
+            state.touch_device(device_scope);
             state
-                .device_generations
-                .insert_mut(device_scope, state.freshness.device());
+                .device_generations_mut()
+                .insert_mut(device_scope, device_generation);
         }
-        if state.device_quarantine.contains(&device_scope) {
+        if state.device_quarantine().contains(&device_scope) {
             return Err(CoreError::Quarantined);
         }
     }
@@ -10486,9 +9957,9 @@ fn enroll_component_claim(
         .max_units_per_account()
         .min(limits.max_units_per_account);
 
-    match (state.resources.get(&resource), reservation_nonce) {
+    match (state.resources().get(&resource), reservation_nonce) {
         (None, None) if resource_generation.get() == 1 => {
-            if state.resources.len() >= limits.max_resource_records {
+            if state.resources().len() >= limits.max_resource_records {
                 return Err(CoreError::CapacityExceeded);
             }
         }
@@ -10505,7 +9976,7 @@ fn enroll_component_claim(
         ) if *existing_scope == scope
             && *generation == resource_generation
             && pending.effect == effect
-            && pending.component == Some(component)
+            && pending.component == component
             && pending.nonce == presented_nonce => {}
         (
             Some(ResourceRecord {
@@ -10576,14 +10047,20 @@ fn enroll_component_claim(
         (None, None) => return Err(CoreError::StaleResourceGeneration),
     }
 
-    let enrolled_freshness = scoped_freshness(state, scope, binding_generation)?;
-    if state.total_claims >= limits.max_total_claims {
+    let enrolled_freshness = scoped_freshness(state, scope)?;
+    if state.total_claims() >= limits.max_total_claims {
         return Err(CoreError::CapacityExceeded);
     }
+    let charged = charged_for_catalog(state, catalog.digest(), charge_owner, credit_class)?;
+    let next = charged.checked_add(units).ok_or(CoreError::Backpressure)?;
+    if next > credit_limit {
+        return Err(CoreError::Backpressure);
+    }
+    state.touch_composite(effect);
     let composite = state
-        .composite_effects
+        .composite_effects_mut()
         .get_mut(&effect)
-        .ok_or(CoreError::UnknownEstate)?;
+        .ok_or(CoreError::UnknownEffect)?;
     if composite
         .components
         .values()
@@ -10603,17 +10080,8 @@ fn enroll_component_claim(
     if existing_of_kind >= usize::from(cardinality.maximum()) {
         return Err(CoreError::ClaimCardinalityViolation);
     }
-    if component_record.claims.len() >= limits.max_claims_per_estate {
+    if component_record.claims.len() >= limits.max_claims_per_effect {
         return Err(CoreError::CapacityExceeded);
-    }
-    let charged = state
-        .charges
-        .get(&(charge_owner, credit_class))
-        .copied()
-        .unwrap_or(0);
-    let next = charged.checked_add(units).ok_or(CoreError::Backpressure)?;
-    if next > credit_limit {
-        return Err(CoreError::Backpressure);
     }
     let requirements = rule
         .evidence()
@@ -10647,17 +10115,18 @@ fn enroll_component_claim(
         },
     );
     *state
-        .charges
+        .charges_mut()
         .get_or_insert_with_mut((charge_owner, credit_class), || 0) = next;
     let entries = state
-        .composite_resource_index
+        .composite_resource_index_mut()
         .get_or_insert_with_mut(resource, Vec::new);
     match entries.binary_search(&(effect, component, claim)) {
         Ok(_) => return Err(CoreError::InvariantViolation),
         Err(index) => entries.insert(index, (effect, component, claim)),
     }
     if reservation_nonce.is_none() {
-        state.resources.insert_mut(
+        state.touch_resource(resource);
+        state.resources_mut().insert_mut(
             resource,
             ResourceRecord {
                 scope,
@@ -10668,55 +10137,25 @@ fn enroll_component_claim(
             },
         );
     }
-    state.total_claims = state
-        .total_claims
+    let total_claims = state
+        .total_claims()
         .checked_add(1)
         .ok_or(CoreError::CapacityExceeded)?;
+    state.set_total_claims(total_claims);
     Ok(AppliedOutput::none(TransitionEvent::ClaimAdded))
 }
 
-fn allocate_nonce(state: &mut State) -> Result<u64, CoreError> {
-    let nonce = state.next_nonce;
-    state.next_nonce = state
-        .next_nonce
+fn allocate_nonce(state: &mut impl StateAccessMut) -> Result<u64, CoreError> {
+    let nonce = state.next_nonce();
+    let next_nonce = state
+        .next_nonce()
         .checked_add(1)
         .ok_or(CoreError::GenerationExhausted)?;
+    state.set_next_nonce(next_nonce);
     if nonce == 0 {
         return Err(CoreError::GenerationExhausted);
     }
     Ok(nonce)
-}
-
-fn validate_obligation_claims(
-    catalog: &DomainCatalog,
-    estate: &EstateRecord,
-) -> Result<(), CoreError> {
-    let rule = catalog
-        .obligation_rule(estate.domain, estate.obligation)
-        .ok_or(CoreError::InvariantViolation)?;
-    if estate.claims.len() < usize::from(rule.minimum_total_claims()) {
-        return Err(CoreError::ClaimCardinalityViolation);
-    }
-    for cardinality in rule.claims() {
-        let count = estate
-            .claims
-            .values()
-            .filter(|claim| claim.kind == cardinality.kind())
-            .count();
-        if count < usize::from(cardinality.minimum()) || count > usize::from(cardinality.maximum())
-        {
-            return Err(CoreError::ClaimCardinalityViolation);
-        }
-    }
-    if estate.claims.values().any(|claim| {
-        !rule
-            .claims()
-            .iter()
-            .any(|allowed| allowed.kind() == claim.kind)
-    }) {
-        return Err(CoreError::ClaimNotAllowed);
-    }
-    Ok(())
 }
 
 fn validate_component_claims(
@@ -10751,19 +10190,12 @@ fn validate_component_claims(
     Ok(())
 }
 
-fn scoped_freshness(
-    state: &State,
-    scope: ClaimScope,
-    binding_generation: u64,
-) -> Result<Freshness, CoreError> {
-    let freshness = state
-        .freshness
-        .with_binding(binding_generation)
-        .map_err(|_| CoreError::InvariantViolation)?;
+fn scoped_freshness(state: &impl StateAccess, scope: ClaimScope) -> Result<Freshness, CoreError> {
+    let freshness = state.freshness();
     match scope {
         ClaimScope::Logical => Ok(freshness),
         ClaimScope::Device(device_scope) => state
-            .device_generations
+            .device_generations()
             .get(&device_scope)
             .copied()
             .map(|device| freshness.with_device(device))
@@ -10771,57 +10203,11 @@ fn scoped_freshness(
     }
 }
 
-fn estate_freshness(state: &State, estate: &EstateRecord) -> Result<Freshness, CoreError> {
-    let binding_generation = state
-        .roots
-        .get(&estate.effect.root())
-        .ok_or(CoreError::UnknownRoot)?
-        .last_binding_generation;
-    let mut device_scope = None;
-    for claim in estate.claims.values() {
-        if let ClaimScope::Device(scope) = claim.scope {
-            if device_scope.is_some_and(|existing| existing != scope) {
-                return Err(CoreError::WrongClaimScope);
-            }
-            device_scope = Some(scope);
-        }
-    }
-    scoped_freshness(
-        state,
-        device_scope.map_or(ClaimScope::Logical, ClaimScope::Device),
-        binding_generation,
-    )
-}
-
-fn settlement_claim_matches(estate: &EstateRecord, claim: &SettlementClaim) -> bool {
-    let identity_matches = match estate.settlement {
-        SettlementState::Claimed {
-            claimant,
-            generation,
-        }
-        | SettlementState::ApplyIntentDurable {
-            claimant,
-            generation,
-        }
-        | SettlementState::AppliedUnacknowledged {
-            claimant,
-            generation,
-        } => claimant == claim.claimant && generation == claim.generation,
-        _ => false,
-    };
-    identity_matches && estate.settlement_nonce == Some(claim.nonce)
-}
-
 fn component_freshness(
-    state: &State,
-    composite: &CompositeEffectRecord,
+    state: &impl StateAccess,
+    _composite: &CompositeEffectRecord,
     component: &ComponentRecord,
 ) -> Result<Freshness, CoreError> {
-    let binding_generation = state
-        .roots
-        .get(&composite.effect.root())
-        .ok_or(CoreError::UnknownRoot)?
-        .last_binding_generation;
     let mut device_scope = None;
     for claim in component.claims.values() {
         if let ClaimScope::Device(scope) = claim.scope {
@@ -10834,7 +10220,6 @@ fn component_freshness(
     scoped_freshness(
         state,
         device_scope.map_or(ClaimScope::Logical, ClaimScope::Device),
-        binding_generation,
     )
 }
 
@@ -10927,24 +10312,24 @@ fn validate_component_execution_adoption(
 
 fn rebase_composite_precommit_claims(
     catalog: &DomainCatalog,
-    state: &mut State,
+    state: &mut impl StateAccessMut,
     effect: EffectId,
-    actor: PrincipalIncarnation,
-    binding_generation: u64,
+    actor: ExecutorCoordinate,
 ) -> Result<(), CoreError> {
-    if state.recovery_target.is_some() {
+    if state.recovery_target().is_some() {
         return Err(CoreError::RecoveryPending);
     }
-    require_active_composite_actor(state, effect, actor, binding_generation)?;
+    require_active_composite_actor(state, effect, actor)?;
 
     let mut rebases = Vec::new();
     let mut touched_device_scopes = BTreeSet::new();
     let mut has_stale_claim = false;
     {
+        state.touch_composite(effect);
         let composite = state
-            .composite_effects
+            .composite_effects()
             .get(&effect)
-            .ok_or(CoreError::UnknownEstate)?;
+            .ok_or(CoreError::UnknownEffect)?;
         if composite.causal_owner == actor
             || composite.authority_epoch <= 1
             || composite_escape_state(composite) != EffectEscapeState::Unescaped
@@ -10979,7 +10364,7 @@ fn rebase_composite_precommit_claims(
                 {
                     return Err(CoreError::WrongCommitState);
                 }
-                let current = scoped_freshness(state, claim.scope, binding_generation)?;
+                let current = scoped_freshness(state, claim.scope)?;
                 has_stale_claim |= claim.enrolled_freshness != current;
                 if let ClaimScope::Device(scope) = claim.scope {
                     touched_device_scopes.insert(scope);
@@ -10999,8 +10384,9 @@ fn rebase_composite_precommit_claims(
     }
 
     {
+        state.touch_composite(effect);
         let composite = state
-            .composite_effects
+            .composite_effects_mut()
             .get_mut(&effect)
             .expect("composite was validated before claim rebasing");
         for (component, claim, freshness) in rebases {
@@ -11014,7 +10400,8 @@ fn rebase_composite_precommit_claims(
     }
     for scope in touched_device_scopes {
         if !device_scope_has_stale_retained_claim(state, scope)? {
-            state.device_quarantine.remove_mut(&scope);
+            state.touch_device(scope);
+            state.device_quarantine_mut().remove_mut(&scope);
         }
     }
     Ok(())
@@ -11056,38 +10443,33 @@ fn composite_escape_state(composite: &CompositeEffectRecord) -> EffectEscapeStat
     }
 }
 
-fn quarantine_live_device_claims(state: &mut State) {
-    for claim in state
-        .estates
-        .values()
-        .flat_map(|estate| estate.claims.values())
-        .filter(|claim| !claim.retired)
-    {
-        if let ClaimScope::Device(scope) = claim.scope {
-            state.device_quarantine.insert_mut(scope);
-        }
-    }
-    for claim in state
-        .composite_effects
+fn quarantine_live_device_claims(state: &mut impl StateAccessMut) {
+    let scopes: Vec<_> = state
+        .composite_effects()
         .values()
         .flat_map(|composite| composite.components.values())
         .flat_map(|component| component.claims.values())
         .filter(|claim| !claim.retired)
-    {
-        if let ClaimScope::Device(scope) = claim.scope {
-            state.device_quarantine.insert_mut(scope);
-        }
+        .filter_map(|claim| match claim.scope {
+            ClaimScope::Device(scope) => Some(scope),
+            ClaimScope::Logical => None,
+        })
+        .collect();
+    for scope in scopes {
+        state.touch_device(scope);
+        state.device_quarantine_mut().insert_mut(scope);
     }
 }
 
-fn install_recovery_target(state: &mut State, target: Freshness, catalog: Digest) {
-    state.recovery_target = Some(target);
+fn install_recovery_target(state: &mut impl StateAccessMut, target: Freshness, catalog: Digest) {
+    state.set_recovery_target(Some(target));
     quarantine_live_device_claims(state);
-    state.projection_cache = build_projection_cache(state, catalog);
+    let projection = build_projection_cache(&*state, catalog);
+    state.set_projection_cache(projection);
 }
 
 fn restore_checkpoint_recovery_prelude(
-    state: &mut State,
+    state: &mut impl StateAccessMut,
     command: &CommandKind,
     catalog: Digest,
 ) -> Result<(), CoreError> {
@@ -11099,26 +10481,19 @@ fn restore_checkpoint_recovery_prelude(
     else {
         return Ok(());
     };
-    if boot.get() <= state.freshness.boot().get()
-        || journal.get() <= state.freshness.journal().get()
-        || device.get() < state.freshness.device().get()
+    if boot.get() <= state.freshness().boot().get()
+        || journal.get() <= state.freshness().journal().get()
+        || device.get() < state.freshness().device().get()
     {
         return Err(CoreError::FreshnessRollback);
     }
-    let target = Freshness::new(
-        *boot,
-        state.freshness.registry(),
-        state.freshness.binding(),
-        *device,
-        *journal,
-    )
-    .map_err(|_| CoreError::InvariantViolation)?;
+    let target = Freshness::new(*boot, state.freshness().registry(), *device, *journal);
     install_recovery_target(state, target, catalog);
     Ok(())
 }
 
-fn scope_is_quarantined(state: &State, scope: ClaimScope) -> bool {
-    matches!(scope, ClaimScope::Device(device) if state.device_quarantine.contains(&device))
+fn scope_is_quarantined(state: &impl StateAccess, scope: ClaimScope) -> bool {
+    matches!(scope, ClaimScope::Device(device) if state.device_quarantine().contains(&device))
 }
 
 fn require_digest(digest: Digest) -> Result<(), CoreError> {
@@ -11129,120 +10504,51 @@ fn require_digest(digest: Digest) -> Result<(), CoreError> {
     }
 }
 
-fn require_active_actor(
-    state: &State,
-    effect: EffectId,
-    actor: PrincipalIncarnation,
-    binding_generation: u64,
-) -> Result<(), CoreError> {
-    let root = state
-        .roots
-        .get(&effect.root())
-        .ok_or(CoreError::UnknownRoot)?;
-    let live = match root.state {
-        RootRecoveryState::Active {
-            incarnation,
-            binding_generation,
-        }
-        | RootRecoveryState::Rebound {
-            successor: incarnation,
-            binding_generation,
-        } => (incarnation, binding_generation),
-        _ => return Err(CoreError::WrongRecoveryState),
-    };
-    if live != (actor, binding_generation) {
-        return Err(CoreError::StaleIncarnation);
-    }
-    let estate = state.estates.get(&effect).ok_or(CoreError::UnknownEstate)?;
-    if estate.authority != AuthorityState::Active
-        || estate.custodian != CustodyState::Principal(actor)
-    {
-        return Err(CoreError::StaleIncarnation);
-    }
-    Ok(())
-}
-
 fn require_active_composite_actor(
-    state: &State,
+    state: &impl StateAccess,
     effect: EffectId,
-    actor: PrincipalIncarnation,
-    binding_generation: u64,
+    actor: ExecutorCoordinate,
 ) -> Result<(), CoreError> {
-    let root = state
-        .roots
-        .get(&effect.root())
-        .ok_or(CoreError::UnknownRoot)?;
-    let live = match root.state {
-        RootRecoveryState::Active {
-            incarnation,
-            binding_generation,
-        }
-        | RootRecoveryState::Rebound {
-            successor: incarnation,
-            binding_generation,
-        } => (incarnation, binding_generation),
+    let operation = state
+        .recovery_operations()
+        .get(&effect.operation())
+        .ok_or(CoreError::UnknownOperation)?;
+    let live = match operation.state {
+        OperationRecoveryState::Active { executor }
+        | OperationRecoveryState::Rebound {
+            successor: executor,
+        } => executor,
         _ => return Err(CoreError::WrongRecoveryState),
     };
-    if live != (actor, binding_generation) {
-        return Err(CoreError::StaleIncarnation);
+    if live != actor {
+        return Err(CoreError::StaleExecutor);
     }
     let composite = state
-        .composite_effects
+        .composite_effects()
         .get(&effect)
-        .ok_or(CoreError::UnknownEstate)?;
+        .ok_or(CoreError::UnknownEffect)?;
     if composite.authority != AuthorityState::Active
-        || composite.custodian != CustodyState::Principal(actor)
+        || composite.custodian != CustodyState::Executor(actor)
     {
-        return Err(CoreError::StaleIncarnation);
+        return Err(CoreError::StaleExecutor);
     }
     Ok(())
-}
-
-fn exact_claim_mut(
-    state: &mut State,
-    effect: EffectId,
-    claimant: PrincipalIncarnation,
-    generation: u64,
-    nonce: u64,
-) -> Result<&mut EstateRecord, CoreError> {
-    let estate = state
-        .estates
-        .get_mut(&effect)
-        .ok_or(CoreError::UnknownEstate)?;
-    let matches = match estate.settlement {
-        SettlementState::Claimed {
-            claimant: expected,
-            generation: expected_generation,
-        }
-        | SettlementState::ApplyIntentDurable {
-            claimant: expected,
-            generation: expected_generation,
-        }
-        | SettlementState::AppliedUnacknowledged {
-            claimant: expected,
-            generation: expected_generation,
-        } => expected == claimant && expected_generation == generation,
-        _ => false,
-    };
-    if !matches || estate.settlement_nonce != Some(nonce) {
-        return Err(CoreError::StaleSettlementClaim);
-    }
-    Ok(estate)
 }
 
 fn exact_component_claim_mut(
-    state: &mut State,
+    state: &mut impl StateAccessMut,
     effect: EffectId,
     component: ComponentId,
-    claimant: PrincipalIncarnation,
+    claimant: ExecutorCoordinate,
     generation: u64,
     nonce: u64,
 ) -> Result<&mut ComponentRecord, CoreError> {
+    state.touch_composite(effect);
     let component_record = state
-        .composite_effects
+        .composite_effects_mut()
         .get_mut(&effect)
         .and_then(|composite| composite.components.get_mut(&component))
-        .ok_or(CoreError::UnknownEstate)?;
+        .ok_or(CoreError::UnknownEffect)?;
     let matches = match component_record.settlement {
         SettlementState::Claimed {
             claimant: expected,
@@ -11265,117 +10571,78 @@ fn exact_component_claim_mut(
 }
 
 fn apply_fence_incarnation(
-    state: &mut State,
-    root: RootId,
-    crashed: PrincipalIncarnation,
-    binding_generation: u64,
+    state: &mut impl StateAccessMut,
+    operation: OperationId,
+    crashed: ExecutorCoordinate,
     max_crashes: u64,
 ) -> Result<(), CoreError> {
+    state.touch_operation(operation);
     let quota_exhausted = {
-        let root_record = state.roots.get_mut(&root).ok_or(CoreError::UnknownRoot)?;
-        let live = match root_record.state {
-            RootRecoveryState::Active {
-                incarnation,
-                binding_generation: live_binding,
-            }
-            | RootRecoveryState::Rebound {
-                successor: incarnation,
-                binding_generation: live_binding,
-            } => (incarnation, live_binding),
-            RootRecoveryState::RecoveryExhausted { .. } => {
+        let operation_record = state
+            .recovery_operations_mut()
+            .get_mut(&operation)
+            .ok_or(CoreError::UnknownOperation)?;
+        let live = match operation_record.state {
+            OperationRecoveryState::Active { executor }
+            | OperationRecoveryState::Rebound {
+                successor: executor,
+            } => executor,
+            OperationRecoveryState::RecoveryExhausted { .. } => {
                 return Err(CoreError::RecoveryExhausted);
             }
             _ => return Err(CoreError::WrongRecoveryState),
         };
-        if live != (crashed, binding_generation) {
-            return Err(CoreError::StaleIncarnation);
+        if live != crashed {
+            return Err(CoreError::StaleExecutor);
         }
         let (crash_generation, exhausted) =
-            next_crash_generation(root_record.crash_generation, max_crashes);
-        root_record.crash_generation = crash_generation;
-        root_record.last_binding_generation = binding_generation;
-        root_record.state = if exhausted {
-            RootRecoveryState::RecoveryExhausted {
+            next_crash_generation(operation_record.crash_generation, max_crashes);
+        operation_record.crash_generation = crash_generation;
+        operation_record.last_executor = crashed;
+        operation_record.state = if exhausted {
+            OperationRecoveryState::RecoveryExhausted {
                 crashed,
-                binding_generation,
                 crash_generation,
             }
         } else {
-            RootRecoveryState::Fenced {
+            OperationRecoveryState::Fenced {
                 crashed,
-                binding_generation,
                 crash_generation,
             }
         };
         exhausted
     };
-    let authority_epoch_exhausted = fence_estates(state, root)?;
+    let authority_epoch_exhausted = fence_composite_effects(state, operation)?;
     if authority_epoch_exhausted && !quota_exhausted {
-        let root_record = state.roots.get_mut(&root).expect("root was validated");
-        root_record.state = RootRecoveryState::RecoveryExhausted {
+        state.touch_operation(operation);
+        let operation_record = state
+            .recovery_operations_mut()
+            .get_mut(&operation)
+            .expect("operation was validated");
+        operation_record.state = OperationRecoveryState::RecoveryExhausted {
             crashed,
-            binding_generation,
-            crash_generation: root_record.crash_generation,
+            crash_generation: operation_record.crash_generation,
         };
     }
     Ok(())
 }
 
-/// Fences every estate and returns whether an authority epoch saturated.
-fn fence_estates(state: &mut State, root: RootId) -> Result<bool, CoreError> {
+/// Fences every composite effect and returns whether an authority epoch saturated.
+fn fence_composite_effects(
+    state: &mut impl StateAccessMut,
+    operation: OperationId,
+) -> Result<bool, CoreError> {
     let mut authority_epoch_exhausted = false;
-    let effect_ids: Vec<EffectId> = state
-        .root_effects
-        .get(&root)
-        .into_iter()
-        .flat_map(|effects| effects.iter().copied())
-        .collect();
-    let estate_ids: Vec<EffectId> = effect_ids
-        .iter()
+    let composite_ids: Vec<EffectId> = state
+        .composite_effects()
+        .keys()
         .copied()
-        .filter(|effect| state.estates.contains_key(effect))
-        .collect();
-    for effect in estate_ids {
-        let estate = state
-            .estates
-            .get_mut(&effect)
-            .expect("estate was collected from state");
-        if estate.retirement == RetirementState::Released {
-            continue;
-        }
-        if estate.authority != AuthorityState::Revoked {
-            if estate.authority == AuthorityState::Active {
-                match estate.authority_epoch.checked_add(1) {
-                    Some(next) => estate.authority_epoch = next,
-                    None => authority_epoch_exhausted = true,
-                }
-            }
-            estate.authority = AuthorityState::Fenced;
-            estate.custodian = CustodyState::KernelEstate;
-        }
-        if estate.commit == CommitState::CommitIntentDurable {
-            let reason = estate
-                .commit_operation
-                .ok_or(CoreError::InvariantViolation)?;
-            estate.commit = CommitState::Committed;
-            estate.commit_nonce = None;
-            estate.outcome = OutcomeState::Indeterminate(reason);
-        }
-        if estate.commit == CommitState::Committed {
-            initialize_committed_disposition(estate)?;
-            if estate.obligation_policy == ObligationPolicy::SuccessorSettlement {
-                reclaim_settlement(estate)?;
-            }
-        }
-        refresh_retirement(estate);
-    }
-    let composite_ids: Vec<EffectId> = effect_ids
-        .into_iter()
-        .filter(|effect| state.composite_effects.contains_key(effect))
+        .filter(|effect| effect.operation() == operation)
         .collect();
     for effect in composite_ids {
+        state.touch_composite(effect);
         let composite = state
-            .composite_effects
+            .composite_effects_mut()
             .get_mut(&effect)
             .expect("composite was collected from state");
         if composite_escape_state(composite) == EffectEscapeState::Released {
@@ -11389,7 +10656,7 @@ fn fence_estates(state: &mut State, root: RootId) -> Result<bool, CoreError> {
                 }
             }
             composite.authority = AuthorityState::Fenced;
-            composite.custodian = CustodyState::KernelEstate;
+            composite.custodian = CustodyState::CoreOwned;
         }
         for component in composite.components.values_mut() {
             if component.commit == CommitState::CommitIntentDurable {
@@ -11410,90 +10677,6 @@ fn fence_estates(state: &mut State, root: RootId) -> Result<bool, CoreError> {
         }
     }
     Ok(authority_epoch_exhausted)
-}
-
-fn reclaim_settlement(estate: &mut EstateRecord) -> Result<(), CoreError> {
-    let next_generation =
-        match estate.settlement {
-            SettlementState::Unavailable => 1,
-            SettlementState::NotRequired => return Ok(()),
-            SettlementState::Open { generation } | SettlementState::Claimed { generation, .. } => {
-                generation
-                    .checked_add(u64::from(!matches!(
-                        estate.settlement,
-                        SettlementState::Open { .. }
-                    )))
-                    .ok_or(CoreError::GenerationExhausted)?
-            }
-            SettlementState::ApplyIntentDurable { generation, .. }
-            | SettlementState::AppliedUnacknowledged { generation, .. }
-            | SettlementState::ReconciliationRequired { generation, .. } => generation
-                .checked_add(1)
-                .ok_or(CoreError::GenerationExhausted)?,
-            SettlementState::Settled | SettlementState::Revoked => return Ok(()),
-        };
-    estate.settlement = match estate.settlement {
-        SettlementState::Claimed { .. } => match estate.claim_stage {
-            Some(ClaimStage::Fresh) => SettlementState::Open {
-                generation: next_generation,
-            },
-            Some(ClaimStage::ReconcileIntent) => SettlementState::ReconciliationRequired {
-                generation: next_generation,
-                applied: false,
-            },
-            Some(ClaimStage::ReconcileApplied) => SettlementState::ReconciliationRequired {
-                generation: next_generation,
-                applied: true,
-            },
-            _ => return Err(CoreError::InvariantViolation),
-        },
-        SettlementState::ApplyIntentDurable { .. } => SettlementState::ReconciliationRequired {
-            generation: next_generation,
-            applied: false,
-        },
-        SettlementState::AppliedUnacknowledged { .. } => SettlementState::ReconciliationRequired {
-            generation: next_generation,
-            applied: true,
-        },
-        SettlementState::ReconciliationRequired { applied, .. } => {
-            SettlementState::ReconciliationRequired {
-                generation: next_generation,
-                applied,
-            }
-        }
-        SettlementState::Settled | SettlementState::Revoked | SettlementState::NotRequired => {
-            estate.settlement
-        }
-        _ => SettlementState::Open {
-            generation: next_generation,
-        },
-    };
-    estate.settlement_nonce = None;
-    estate.claim_stage = None;
-    Ok(())
-}
-
-fn initialize_committed_disposition(estate: &mut EstateRecord) -> Result<(), CoreError> {
-    match (estate.obligation_policy, estate.settlement) {
-        (ObligationPolicy::SuccessorSettlement, SettlementState::Unavailable) => {
-            estate.settlement = SettlementState::Open { generation: 1 };
-        }
-        (ObligationPolicy::RetirementEvidence, SettlementState::Unavailable) => {
-            estate.settlement = SettlementState::NotRequired;
-        }
-        (ObligationPolicy::SuccessorSettlement, SettlementState::NotRequired)
-        | (ObligationPolicy::RetirementEvidence, SettlementState::Open { .. })
-        | (
-            ObligationPolicy::RetirementEvidence,
-            SettlementState::Claimed { .. }
-            | SettlementState::ApplyIntentDurable { .. }
-            | SettlementState::AppliedUnacknowledged { .. }
-            | SettlementState::ReconciliationRequired { .. }
-            | SettlementState::Settled,
-        ) => return Err(CoreError::InvariantViolation),
-        _ => {}
-    }
-    Ok(())
 }
 
 fn initialize_component_disposition(component: &mut ComponentRecord) -> Result<(), CoreError> {
@@ -11580,58 +10763,67 @@ fn reclaim_component_settlement(component: &mut ComponentRecord) -> Result<(), C
     Ok(())
 }
 
-fn fence_root_for_boot(state: &mut State, root: RootId, max_crashes: u64) -> Result<(), CoreError> {
+fn fence_operation_for_boot(
+    state: &mut impl StateAccessMut,
+    operation: OperationId,
+    max_crashes: u64,
+) -> Result<(), CoreError> {
     if matches!(
-        state.roots.get(&root).ok_or(CoreError::UnknownRoot)?.state,
-        RootRecoveryState::Fenced { .. } | RootRecoveryState::RecoveryExhausted { .. }
+        state
+            .recovery_operations()
+            .get(&operation)
+            .ok_or(CoreError::UnknownOperation)?
+            .state,
+        OperationRecoveryState::Fenced { .. } | OperationRecoveryState::RecoveryExhausted { .. }
     ) {
         return Ok(());
     }
-    let (crashed, binding_generation, quota_exhausted) = {
-        let root_record = state.roots.get_mut(&root).ok_or(CoreError::UnknownRoot)?;
-        let crashed = match root_record.state {
-            RootRecoveryState::Active { incarnation, .. }
-            | RootRecoveryState::Rebound {
-                successor: incarnation,
+    let (crashed, quota_exhausted) = {
+        state.touch_operation(operation);
+        let operation_record = state
+            .recovery_operations_mut()
+            .get_mut(&operation)
+            .ok_or(CoreError::UnknownOperation)?;
+        let crashed = match operation_record.state {
+            OperationRecoveryState::Active { executor, .. }
+            | OperationRecoveryState::Rebound {
+                successor: executor,
                 ..
-            } => incarnation,
-            RootRecoveryState::Fenced { .. } | RootRecoveryState::RecoveryExhausted { .. } => {
+            } => executor,
+            OperationRecoveryState::Fenced { .. }
+            | OperationRecoveryState::RecoveryExhausted { .. } => {
                 unreachable!("terminal fence states returned above")
             }
-            RootRecoveryState::Snapshotted { .. } | RootRecoveryState::Ready { .. } => {
-                PrincipalIncarnation::new(
-                    root_record.origin.principal(),
-                    root_record.last_incarnation_generation,
-                )
-                .map_err(|_| CoreError::InvariantViolation)?
+            OperationRecoveryState::Snapshotted { .. } | OperationRecoveryState::Ready { .. } => {
+                operation_record.last_executor
             }
         };
         let (crash_generation, quota_exhausted) =
-            next_crash_generation(root_record.crash_generation, max_crashes);
-        root_record.crash_generation = crash_generation;
-        let binding_generation = root_record.last_binding_generation;
-        root_record.state = if quota_exhausted {
-            RootRecoveryState::RecoveryExhausted {
+            next_crash_generation(operation_record.crash_generation, max_crashes);
+        operation_record.crash_generation = crash_generation;
+        operation_record.state = if quota_exhausted {
+            OperationRecoveryState::RecoveryExhausted {
                 crashed,
-                binding_generation,
                 crash_generation,
             }
         } else {
-            RootRecoveryState::Fenced {
+            OperationRecoveryState::Fenced {
                 crashed,
-                binding_generation,
                 crash_generation,
             }
         };
-        (crashed, binding_generation, quota_exhausted)
+        (crashed, quota_exhausted)
     };
-    let authority_epoch_exhausted = fence_estates(state, root)?;
+    let authority_epoch_exhausted = fence_composite_effects(state, operation)?;
     if authority_epoch_exhausted && !quota_exhausted {
-        let root_record = state.roots.get_mut(&root).expect("root was validated");
-        root_record.state = RootRecoveryState::RecoveryExhausted {
+        state.touch_operation(operation);
+        let operation_record = state
+            .recovery_operations_mut()
+            .get_mut(&operation)
+            .expect("operation was validated");
+        operation_record.state = OperationRecoveryState::RecoveryExhausted {
             crashed,
-            binding_generation,
-            crash_generation: root_record.crash_generation,
+            crash_generation: operation_record.crash_generation,
         };
     }
     Ok(())
@@ -11646,16 +10838,16 @@ fn next_crash_generation(current: u64, max_crashes: u64) -> (u64, bool) {
 
 fn acknowledge_component_commit(
     catalog: &DomainCatalog,
-    state: &mut State,
+    state: &mut impl StateAccessMut,
     effect: EffectId,
     component: ComponentId,
     fact: VerifiedEffectFact,
 ) -> Result<AppliedOutput, CoreError> {
     {
         let composite = state
-            .composite_effects
+            .composite_effects()
             .get(&effect)
-            .ok_or(CoreError::UnknownEstate)?;
+            .ok_or(CoreError::UnknownEffect)?;
         let component_record = composite
             .components
             .get(&component)
@@ -11670,10 +10862,11 @@ fn acknowledge_component_commit(
             return Err(CoreError::StaleCommitIntent);
         }
     }
+    state.touch_composite(effect);
     let composite = state
-        .composite_effects
+        .composite_effects_mut()
         .get_mut(&effect)
-        .ok_or(CoreError::UnknownEstate)?;
+        .ok_or(CoreError::UnknownEffect)?;
     let authority = composite.authority;
     let component_record = composite
         .components
@@ -11697,31 +10890,31 @@ fn acknowledge_component_commit(
 }
 
 fn claim_component_settlement(
-    state: &mut State,
+    state: &mut impl StateAccessMut,
     effect: EffectId,
     component: ComponentId,
-    claimant: PrincipalIncarnation,
+    claimant: ExecutorCoordinate,
 ) -> Result<AppliedOutput, CoreError> {
-    let root = state
-        .roots
-        .get(&effect.root())
-        .ok_or(CoreError::UnknownRoot)?;
-    let live_claimant = match root.state {
-        RootRecoveryState::Active { incarnation, .. } => incarnation,
-        RootRecoveryState::Rebound { successor, .. } => successor,
-        RootRecoveryState::RecoveryExhausted { .. } => {
+    let operation = state
+        .recovery_operations()
+        .get(&effect.operation())
+        .ok_or(CoreError::UnknownOperation)?;
+    let live_claimant = match operation.state {
+        OperationRecoveryState::Active { executor, .. } => executor,
+        OperationRecoveryState::Rebound { successor, .. } => successor,
+        OperationRecoveryState::RecoveryExhausted { .. } => {
             return Err(CoreError::RecoveryExhausted);
         }
         _ => return Err(CoreError::WrongRecoveryState),
     };
     if live_claimant != claimant {
-        return Err(CoreError::StaleIncarnation);
+        return Err(CoreError::StaleExecutor);
     }
     let (generation, stage) = {
         let composite = state
-            .composite_effects
+            .composite_effects()
             .get(&effect)
-            .ok_or(CoreError::UnknownEstate)?;
+            .ok_or(CoreError::UnknownEffect)?;
         let component_record = composite
             .components
             .get(&component)
@@ -11759,10 +10952,10 @@ fn claim_component_settlement(
         };
         let custody_matches = matches!(
             (composite.authority, composite.custodian),
-            (AuthorityState::Active, CustodyState::Principal(current)) if current == claimant
+            (AuthorityState::Active, CustodyState::Executor(current)) if current == claimant
         ) || matches!(
             (composite.authority, composite.custodian),
-            (AuthorityState::Fenced, CustodyState::KernelEstate)
+            (AuthorityState::Fenced, CustodyState::CoreOwned)
         );
         if component_record.commit != CommitState::Committed || !custody_matches {
             return Err(CoreError::WrongCommitState);
@@ -11770,8 +10963,9 @@ fn claim_component_settlement(
         claimable
     };
     let nonce = allocate_nonce(state)?;
+    state.touch_composite(effect);
     let component_record = state
-        .composite_effects
+        .composite_effects_mut()
         .get_mut(&effect)
         .and_then(|composite| composite.components.get_mut(&component))
         .expect("component validated before nonce allocation");
@@ -11785,7 +10979,7 @@ fn claim_component_settlement(
         event: TransitionEvent::SettlementClaimed,
         output: OutputData::Settlement {
             effect,
-            component: Some(component),
+            component,
             claimant,
             generation,
             nonce,
@@ -11796,16 +10990,16 @@ fn claim_component_settlement(
 
 fn record_component_applied(
     catalog: &DomainCatalog,
-    state: &mut State,
+    state: &mut impl StateAccessMut,
     effect: EffectId,
     component: ComponentId,
     fact: VerifiedEffectFact,
 ) -> Result<AppliedOutput, CoreError> {
     {
         let composite = state
-            .composite_effects
+            .composite_effects()
             .get(&effect)
-            .ok_or(CoreError::UnknownEstate)?;
+            .ok_or(CoreError::UnknownEffect)?;
         let component_record = composite
             .components
             .get(&component)
@@ -11841,7 +11035,7 @@ fn record_component_applied(
         event: TransitionEvent::AppliedUnacknowledged,
         output: OutputData::Settlement {
             effect,
-            component: Some(component),
+            component,
             claimant: fact.actor,
             generation: fact.generation,
             nonce: fact.nonce,
@@ -11852,16 +11046,16 @@ fn record_component_applied(
 
 fn settle_component(
     catalog: &DomainCatalog,
-    state: &mut State,
+    state: &mut impl StateAccessMut,
     effect: EffectId,
     component: ComponentId,
     fact: VerifiedEffectFact,
 ) -> Result<AppliedOutput, CoreError> {
     {
         let composite = state
-            .composite_effects
+            .composite_effects()
             .get(&effect)
-            .ok_or(CoreError::UnknownEstate)?;
+            .ok_or(CoreError::UnknownEffect)?;
         let component_record = composite
             .components
             .get(&component)
@@ -11878,7 +11072,7 @@ fn settle_component(
         }
     }
     let authority = state
-        .composite_effects
+        .composite_effects()
         .get(&effect)
         .expect("composite was validated")
         .authority;
@@ -11905,21 +11099,21 @@ fn settle_component(
 }
 
 fn revoke_composite_effect(
-    state: &mut State,
+    state: &mut impl StateAccessMut,
     effect: EffectId,
-    expected_actor: PrincipalIncarnation,
+    expected_actor: ExecutorCoordinate,
     authority_epoch: u64,
 ) -> Result<AppliedOutput, CoreError> {
     let composite = state
-        .composite_effects
-        .get_mut(&effect)
-        .ok_or(CoreError::UnknownEstate)?;
+        .composite_effects()
+        .get(&effect)
+        .ok_or(CoreError::UnknownEffect)?;
     if composite.authority_epoch != authority_epoch {
         return Err(CoreError::StaleAuthorityEpoch);
     }
     match (composite.authority, composite.custodian) {
-        (AuthorityState::Active, CustodyState::Principal(actor)) if actor == expected_actor => {}
-        (AuthorityState::Fenced, CustodyState::KernelEstate) => {}
+        (AuthorityState::Active, CustodyState::Executor(actor)) if actor == expected_actor => {}
+        (AuthorityState::Fenced, CustodyState::CoreOwned) => {}
         (AuthorityState::Revoked, _) => return Err(CoreError::GateClosed),
         _ => return Err(CoreError::StaleAuthorityEpoch),
     }
@@ -11971,7 +11165,7 @@ fn revoke_composite_effect(
         .collect::<Vec<_>>();
     for (component, claim, _, _, resource, resource_generation, _) in &claims {
         let record = state
-            .resources
+            .resources()
             .get(resource)
             .ok_or(CoreError::InvariantViolation)?;
         if record.generation != *resource_generation {
@@ -11983,7 +11177,7 @@ fn revoke_composite_effect(
                 ResourcePhase::Claimed {
                     pending_reuse: Some(PendingReuse {
                         effect: pending_effect,
-                        component: Some(pending_component),
+                        component: pending_component,
                         claim: pending_claim,
                         ..
                     })
@@ -11998,30 +11192,17 @@ fn revoke_composite_effect(
         }
     }
 
-    composite.authority_epoch = composite
-        .authority_epoch
-        .checked_add(1)
-        .ok_or(CoreError::GenerationExhausted)?;
-    composite.authority = AuthorityState::Revoked;
-    composite.custodian = CustodyState::KernelEstate;
-    for component in composite.components.values_mut() {
-        component.settlement = SettlementState::Revoked;
-        component.claims.clear();
-        component.settlement_nonce = None;
-        component.claim_stage = None;
-    }
-
     let mut released_device_scopes = BTreeSet::new();
     for (component, claim, credit_class, scope, resource, resource_generation, units) in claims {
         let charged = state
-            .charges
+            .charges_mut()
             .get_mut(&(charge_owner, credit_class))
             .ok_or(CoreError::InvariantViolation)?;
         *charged = charged
             .checked_sub(units)
             .ok_or(CoreError::InvariantViolation)?;
         let entries = state
-            .composite_resource_index
+            .composite_resource_index_mut()
             .get_mut(&resource)
             .ok_or(CoreError::InvariantViolation)?;
         let before = entries.len();
@@ -12030,13 +11211,11 @@ fn revoke_composite_effect(
             return Err(CoreError::InvariantViolation);
         }
         if entries.is_empty() {
-            state.composite_resource_index.remove_mut(&resource);
+            state.composite_resource_index_mut().remove_mut(&resource);
         }
-        if !state.resource_index.contains_key(&resource)
-            && !state.composite_resource_index.contains_key(&resource)
-        {
+        if !state.composite_resource_index().contains_key(&resource) {
             let record = *state
-                .resources
+                .resources()
                 .get(&resource)
                 .ok_or(CoreError::InvariantViolation)?;
             if record.generation != resource_generation
@@ -12048,7 +11227,8 @@ fn revoke_composite_effect(
                 ResourcePhase::Claimed {
                     pending_reuse: Some(pending),
                 } => {
-                    state.resources.insert_mut(
+                    state.touch_resource(resource);
+                    state.resources_mut().insert_mut(
                         resource,
                         ResourceRecord {
                             scope: record.scope,
@@ -12060,7 +11240,8 @@ fn revoke_composite_effect(
                 ResourcePhase::Claimed {
                     pending_reuse: None,
                 } => {
-                    state.resources.remove_mut(&resource);
+                    state.touch_resource(resource);
+                    state.resources_mut().remove_mut(&resource);
                 }
                 ResourcePhase::Retired => return Err(CoreError::InvariantViolation),
             }
@@ -12069,222 +11250,48 @@ fn revoke_composite_effect(
             released_device_scopes.insert(scope);
         }
     }
+    state.touch_composite(effect);
     let composite = state
-        .composite_effects
+        .composite_effects_mut()
         .get_mut(&effect)
         .expect("composite remains present during atomic abort");
+    composite.authority_epoch = composite
+        .authority_epoch
+        .checked_add(1)
+        .ok_or(CoreError::GenerationExhausted)?;
+    composite.authority = AuthorityState::Revoked;
+    composite.custodian = CustodyState::CoreOwned;
     for component in composite.components.values_mut() {
+        component.settlement = SettlementState::Revoked;
+        component.claims.clear();
+        component.settlement_nonce = None;
+        component.claim_stage = None;
         refresh_component_retirement(component, composite.authority);
     }
     for scope in released_device_scopes {
         if !device_scope_has_retained_claim(state, scope) {
-            state.device_quarantine.remove_mut(&scope);
+            state.touch_device(scope);
+            state.device_quarantine_mut().remove_mut(&scope);
         }
     }
     Ok(AppliedOutput::none(TransitionEvent::Revoked))
 }
 
-fn apply_evidence(
-    catalog: &DomainCatalog,
-    state: &mut State,
-    effect: EffectId,
-    claim_id: ClaimId,
-    evidence: RetirementEvidence,
-) -> Result<AppliedOutput, CoreError> {
-    require_digest(evidence.stamp.receipt_digest)?;
-    let root = state
-        .roots
-        .get(&effect.root())
-        .ok_or(CoreError::UnknownRoot)?;
-    let binding_generation = root.last_binding_generation;
-    let claim_record = state
-        .estates
-        .get(&effect)
-        .and_then(|estate| estate.claims.get(&claim_id))
-        .ok_or(CoreError::UnknownClaim)?;
-    let claim_scope = claim_record.scope;
-    let declared = catalog
-        .claim_rule(claim_record.domain, claim_record.kind)
-        .ok_or(CoreError::UnknownClaimClass)?
-        .evidence()
-        .iter()
-        .find(|rule| rule.kind() == evidence.kind)
-        .copied()
-        .ok_or(CoreError::UnexpectedEvidence)?;
-    validate_state_verifier_identity(
-        state,
-        effect,
-        None,
-        evidence.stamp.identity,
-        declared.verifier(),
-        declared.receipt_schema(),
-    )?;
-    validate_state_verification_scope(
-        state,
-        effect,
-        None,
-        evidence.verification_scope,
-        declared.verifier(),
-        declared.receipt_schema(),
-    )?;
-    if declared.device_generation() == DeviceGenerationEffect::AdvanceOne {
-        let ClaimScope::Device(device_scope) = claim_scope else {
-            return Err(CoreError::InvariantViolation);
-        };
-        let current = state
-            .device_generations
-            .get(&device_scope)
-            .copied()
-            .ok_or(CoreError::WrongClaimScope)?;
-        let observed = evidence.freshness.device();
-        let next = current
-            .get()
-            .checked_add(1)
-            .and_then(|value| DeviceGeneration::new(value).ok())
-            .ok_or(CoreError::GenerationExhausted)?;
-        if observed == next {
-            state.device_generations.insert_mut(device_scope, next);
-        } else if observed != current || observed.get() <= evidence.subject.device().get() {
-            return Err(CoreError::InvalidDeviceGenerationAdvance);
-        }
-    }
-    let current_freshness = scoped_freshness(state, claim_scope, binding_generation)?;
-    let (charge_owner, credit_class, resource, resource_generation, units, retired_now) = {
-        let estate = state
-            .estates
-            .get_mut(&effect)
-            .ok_or(CoreError::UnknownEstate)?;
-        if estate.authority == AuthorityState::Active && estate.commit != CommitState::Committed {
-            return Err(CoreError::WrongCommitState);
-        }
-        if estate.retirement == RetirementState::Released {
-            return Err(CoreError::EstateNotReleasable);
-        }
-        let claim = estate
-            .claims
-            .get_mut(&claim_id)
-            .ok_or(CoreError::UnknownClaim)?;
-        let rule = catalog
-            .claim_rule(claim.domain, claim.kind)
-            .ok_or(CoreError::UnknownClaimClass)?;
-        if rule.evidence().len() != claim.requirements.len() {
-            return Err(CoreError::InvariantViolation);
-        }
-        if claim.retired {
-            return Err(CoreError::DuplicateEvidence);
-        }
-        let requirement_index = claim
-            .requirements
-            .iter()
-            .position(|requirement| requirement.kind == evidence.kind)
-            .ok_or(CoreError::UnexpectedEvidence)?;
-        let requirement = &claim.requirements[requirement_index];
-        if requirement.accepted.is_some() {
-            return Err(CoreError::DuplicateEvidence);
-        }
-        if let Some(prerequisite) = requirement.prerequisite
-            && !claim
-                .requirements
-                .iter()
-                .any(|candidate| candidate.kind == prerequisite && candidate.accepted.is_some())
-        {
-            return Err(CoreError::EvidenceOutOfOrder);
-        }
-        validate_evidence_freshness(
-            requirement,
-            evidence,
-            claim.enrolled_freshness,
-            current_freshness,
-            binding_generation,
-        )?;
-        claim.requirements[requirement_index].accepted = Some(AcceptedEvidence {
-            subject: evidence.subject,
-            observation: evidence.freshness,
-            stamp: evidence.stamp,
-            verification_scope: evidence.verification_scope,
-        });
-        let retired_now = claim
-            .requirements
-            .iter()
-            .all(|requirement| requirement.accepted.is_some());
-        if retired_now {
-            claim.retired = true;
-        }
-        (
-            estate.charge_owner,
-            claim.credit_class,
-            claim.resource,
-            claim.resource_generation,
-            claim.units,
-            retired_now,
-        )
-    };
-
-    if retired_now {
-        let charged = state
-            .charges
-            .get_mut(&(charge_owner, credit_class))
-            .ok_or(CoreError::InvariantViolation)?;
-        *charged = charged
-            .checked_sub(units)
-            .ok_or(CoreError::InvariantViolation)?;
-        let entries = state
-            .resource_index
-            .get_mut(&resource)
-            .ok_or(CoreError::InvariantViolation)?;
-        let before = entries.len();
-        entries.retain(|entry| *entry != (effect, claim_id));
-        if entries.len() + 1 != before {
-            return Err(CoreError::InvariantViolation);
-        }
-        if entries.is_empty() {
-            state.resource_index.remove_mut(&resource);
-        }
-        if !state.resource_index.contains_key(&resource)
-            && !state.composite_resource_index.contains_key(&resource)
-        {
-            let record = state
-                .resources
-                .get_mut(&resource)
-                .ok_or(CoreError::InvariantViolation)?;
-            if record.generation != resource_generation
-                || !matches!(record.phase, ResourcePhase::Claimed { .. })
-            {
-                return Err(CoreError::InvariantViolation);
-            }
-            record.phase = ResourcePhase::Retired;
-        }
-        let estate = state
-            .estates
-            .get_mut(&effect)
-            .expect("estate remains present while evidence retires");
-        refresh_retirement(estate);
-        if let ClaimScope::Device(scope) = claim_scope
-            && !device_scope_has_retained_claim(state, scope)
-        {
-            state.device_quarantine.remove_mut(&scope);
-        }
-    }
-
-    Ok(AppliedOutput::none(TransitionEvent::EvidenceAccepted))
-}
-
 fn apply_component_evidence(
     catalog: &DomainCatalog,
-    state: &mut State,
+    state: &mut impl StateAccessMut,
     effect: EffectId,
     component: ComponentId,
     claim_id: ClaimId,
     evidence: RetirementEvidence,
 ) -> Result<AppliedOutput, CoreError> {
     require_digest(evidence.stamp.receipt_digest)?;
-    let binding_generation = state
-        .roots
-        .get(&effect.root())
-        .ok_or(CoreError::UnknownRoot)?
-        .last_binding_generation;
+    state
+        .recovery_operations()
+        .get(&effect.operation())
+        .ok_or(CoreError::UnknownOperation)?;
     let claim_record = state
-        .composite_effects
+        .composite_effects()
         .get(&effect)
         .and_then(|composite| composite.components.get(&component))
         .and_then(|component| component.claims.get(&claim_id))
@@ -12301,7 +11308,7 @@ fn apply_component_evidence(
     validate_state_verifier_identity(
         state,
         effect,
-        Some(component),
+        component,
         evidence.stamp.identity,
         declared.verifier(),
         declared.receipt_schema(),
@@ -12309,7 +11316,7 @@ fn apply_component_evidence(
     validate_state_verification_scope(
         state,
         effect,
-        Some(component),
+        component,
         evidence.verification_scope,
         declared.verifier(),
         declared.receipt_schema(),
@@ -12319,7 +11326,7 @@ fn apply_component_evidence(
             return Err(CoreError::InvariantViolation);
         };
         let current = state
-            .device_generations
+            .device_generations()
             .get(&device_scope)
             .copied()
             .ok_or(CoreError::WrongClaimScope)?;
@@ -12330,20 +11337,24 @@ fn apply_component_evidence(
             .and_then(|value| DeviceGeneration::new(value).ok())
             .ok_or(CoreError::GenerationExhausted)?;
         if observed == next {
-            state.device_generations.insert_mut(device_scope, next);
+            state.touch_device(device_scope);
+            state
+                .device_generations_mut()
+                .insert_mut(device_scope, next);
         } else if observed != current || observed.get() <= evidence.subject.device().get() {
             return Err(CoreError::InvalidDeviceGenerationAdvance);
         }
     }
-    let current_freshness = scoped_freshness(state, claim_scope, binding_generation)?;
+    let current_freshness = scoped_freshness(state, claim_scope)?;
     let (charge_owner, authority, credit_class, resource, resource_generation, units, retired_now) = {
+        state.touch_composite(effect);
         let composite = state
-            .composite_effects
+            .composite_effects_mut()
             .get_mut(&effect)
-            .ok_or(CoreError::UnknownEstate)?;
+            .ok_or(CoreError::UnknownEffect)?;
         let authority = composite.authority;
         if composite.custodian == CustodyState::Released {
-            return Err(CoreError::EstateNotReleasable);
+            return Err(CoreError::EffectNotReleasable);
         }
         let component_record = composite
             .components
@@ -12353,7 +11364,7 @@ fn apply_component_evidence(
             return Err(CoreError::WrongCommitState);
         }
         if component_record.retirement == RetirementState::Released {
-            return Err(CoreError::EstateNotReleasable);
+            return Err(CoreError::EffectNotReleasable);
         }
         let claim = component_record
             .claims
@@ -12390,7 +11401,6 @@ fn apply_component_evidence(
             evidence,
             claim.enrolled_freshness,
             current_freshness,
-            binding_generation,
         )?;
         claim.requirements[requirement_index].accepted = Some(AcceptedEvidence {
             subject: evidence.subject,
@@ -12417,14 +11427,14 @@ fn apply_component_evidence(
     };
     if retired_now {
         let charged = state
-            .charges
+            .charges_mut()
             .get_mut(&(charge_owner, credit_class))
             .ok_or(CoreError::InvariantViolation)?;
         *charged = charged
             .checked_sub(units)
             .ok_or(CoreError::InvariantViolation)?;
         let entries = state
-            .composite_resource_index
+            .composite_resource_index_mut()
             .get_mut(&resource)
             .ok_or(CoreError::InvariantViolation)?;
         let before = entries.len();
@@ -12433,13 +11443,12 @@ fn apply_component_evidence(
             return Err(CoreError::InvariantViolation);
         }
         if entries.is_empty() {
-            state.composite_resource_index.remove_mut(&resource);
+            state.composite_resource_index_mut().remove_mut(&resource);
         }
-        if !state.resource_index.contains_key(&resource)
-            && !state.composite_resource_index.contains_key(&resource)
-        {
+        if !state.composite_resource_index().contains_key(&resource) {
+            state.touch_resource(resource);
             let record = state
-                .resources
+                .resources_mut()
                 .get_mut(&resource)
                 .ok_or(CoreError::InvariantViolation)?;
             if record.generation != resource_generation
@@ -12449,8 +11458,9 @@ fn apply_component_evidence(
             }
             record.phase = ResourcePhase::Retired;
         }
+        state.touch_composite(effect);
         let composite = state
-            .composite_effects
+            .composite_effects_mut()
             .get_mut(&effect)
             .expect("composite remains present while evidence retires");
         let component_record = composite
@@ -12461,19 +11471,15 @@ fn apply_component_evidence(
         if let ClaimScope::Device(scope) = claim_scope
             && !device_scope_has_retained_claim(state, scope)
         {
-            state.device_quarantine.remove_mut(&scope);
+            state.touch_device(scope);
+            state.device_quarantine_mut().remove_mut(&scope);
         }
     }
     Ok(AppliedOutput::none(TransitionEvent::EvidenceAccepted))
 }
 
-fn device_scope_has_retained_claim(state: &State, scope: DeviceScopeId) -> bool {
-    state.estates.values().any(|estate| {
-        estate
-            .claims
-            .values()
-            .any(|claim| !claim.retired && claim.scope == ClaimScope::Device(scope))
-    }) || state.composite_effects.values().any(|composite| {
+fn device_scope_has_retained_claim(state: &impl StateAccess, scope: DeviceScopeId) -> bool {
+    state.composite_effects().values().any(|composite| {
         composite.components.values().any(|component| {
             component
                 .claims
@@ -12484,17 +11490,12 @@ fn device_scope_has_retained_claim(state: &State, scope: DeviceScopeId) -> bool 
 }
 
 fn device_scope_has_retained_claim_outside_composite(
-    state: &State,
+    state: &impl StateAccess,
     scope: DeviceScopeId,
     effect: EffectId,
 ) -> bool {
-    state.estates.values().any(|estate| {
-        estate
-            .claims
-            .values()
-            .any(|claim| !claim.retired && claim.scope == ClaimScope::Device(scope))
-    }) || state
-        .composite_effects
+    state
+        .composite_effects()
         .iter()
         .any(|(candidate, composite)| {
             *candidate != effect
@@ -12508,31 +11509,15 @@ fn device_scope_has_retained_claim_outside_composite(
 }
 
 fn device_scope_has_stale_retained_claim(
-    state: &State,
+    state: &impl StateAccess,
     scope: DeviceScopeId,
 ) -> Result<bool, CoreError> {
-    for estate in state.estates.values() {
-        let binding_generation = state
-            .roots
-            .get(&estate.effect.root())
-            .ok_or(CoreError::InvariantViolation)?
-            .last_binding_generation;
-        let current = scoped_freshness(state, ClaimScope::Device(scope), binding_generation)?;
-        if estate.claims.values().any(|claim| {
-            !claim.retired
-                && claim.scope == ClaimScope::Device(scope)
-                && claim.enrolled_freshness != current
-        }) {
-            return Ok(true);
-        }
-    }
-    for composite in state.composite_effects.values() {
-        let binding_generation = state
-            .roots
-            .get(&composite.effect.root())
-            .ok_or(CoreError::InvariantViolation)?
-            .last_binding_generation;
-        let current = scoped_freshness(state, ClaimScope::Device(scope), binding_generation)?;
+    for composite in state.composite_effects().values() {
+        state
+            .recovery_operations()
+            .get(&composite.effect.operation())
+            .ok_or(CoreError::InvariantViolation)?;
+        let current = scoped_freshness(state, ClaimScope::Device(scope))?;
         if composite.components.values().any(|component| {
             component.claims.values().any(|claim| {
                 !claim.retired
@@ -12546,65 +11531,16 @@ fn device_scope_has_stale_retained_claim(
     Ok(false)
 }
 
-fn validate_effect_fact(
-    catalog: &DomainCatalog,
-    state: &State,
-    estate: &EstateRecord,
-    fact: VerifiedEffectFact,
-) -> Result<(), CoreError> {
-    require_digest(fact.stamp.receipt_digest)?;
-    if fact.effect != estate.effect || fact.freshness != estate_freshness(state, estate)? {
-        return Err(CoreError::StaleEvidence);
-    }
-    let receipts = catalog
-        .obligation_rule(estate.domain, estate.obligation)
-        .ok_or(CoreError::UnknownObligationClass)?
-        .receipts();
-    let binding = match fact.kind {
-        EffectFactKind::CommitOutcome => Some(receipts.commit_outcome()),
-        EffectFactKind::ApplyCompleted => receipts.apply_completed(),
-        EffectFactKind::SettlementAcknowledged => receipts.settlement_acknowledged(),
-    }
-    .ok_or(CoreError::WrongSettlementStage)?;
-    validate_state_verifier_identity(
-        state,
-        estate.effect,
-        None,
-        fact.stamp.identity,
-        binding.verifier(),
-        binding.receipt_schema(),
-    )?;
-    validate_state_verification_scope(
-        state,
-        estate.effect,
-        None,
-        fact.verification_scope,
-        binding.verifier(),
-        binding.receipt_schema(),
-    )?;
-    if matches!(
-        (fact.kind, fact.outcome),
-        (EffectFactKind::CommitOutcome, None)
-            | (
-                EffectFactKind::ApplyCompleted | EffectFactKind::SettlementAcknowledged,
-                Some(_)
-            )
-    ) {
-        return Err(CoreError::VerificationFailed);
-    }
-    Ok(())
-}
-
 fn validate_component_fact(
     catalog: &DomainCatalog,
-    state: &State,
+    state: &impl StateAccess,
     composite: &CompositeEffectRecord,
     component: &ComponentRecord,
     fact: VerifiedEffectFact,
 ) -> Result<(), CoreError> {
     require_digest(fact.stamp.receipt_digest)?;
     if fact.effect != composite.effect
-        || fact.component != Some(component.id)
+        || fact.component != component.id
         || fact.freshness != component_freshness(state, composite, component)?
     {
         return Err(CoreError::StaleEvidence);
@@ -12622,7 +11558,7 @@ fn validate_component_fact(
     validate_state_verifier_identity(
         state,
         composite.effect,
-        Some(component.id),
+        component.id,
         fact.stamp.identity,
         binding.verifier(),
         binding.receipt_schema(),
@@ -12630,7 +11566,7 @@ fn validate_component_fact(
     validate_state_verification_scope(
         state,
         composite.effect,
-        Some(component.id),
+        component.id,
         fact.verification_scope,
         binding.verifier(),
         binding.receipt_schema(),
@@ -12649,7 +11585,7 @@ fn validate_component_fact(
 }
 
 fn fact_stamp_matches(
-    state: &State,
+    state: &impl StateAccess,
     fact: VerifiedEffectFact,
     verifier: VerifierId,
     receipt_schema: ReceiptSchemaId,
@@ -12670,10 +11606,7 @@ fn fact_stamp_matches(
             fact.component,
             verifier,
             receipt_schema,
-        )
-        .ok()
-        .flatten()
-            == fact.verification_scope
+        ) == Ok(fact.verification_scope)
 }
 
 fn validate_evidence_freshness(
@@ -12681,37 +11614,27 @@ fn validate_evidence_freshness(
     evidence: RetirementEvidence,
     enrolled: Freshness,
     active: Freshness,
-    binding_generation: u64,
 ) -> Result<(), CoreError> {
-    if !freshness_matches(
-        requirement.subject_freshness,
-        evidence.subject,
-        enrolled,
-        enrolled.binding(),
-    ) || !freshness_matches(
-        requirement.observation_freshness,
-        evidence.freshness,
-        active,
-        binding_generation,
-    ) || !freshness_strictly_advances(
-        requirement.strictly_advanced,
-        evidence.subject,
-        evidence.freshness,
-    ) {
+    if !freshness_matches(requirement.subject_freshness, evidence.subject, enrolled)
+        || !freshness_matches(
+            requirement.observation_freshness,
+            evidence.freshness,
+            active,
+        )
+        || !freshness_strictly_advances(
+            requirement.strictly_advanced,
+            evidence.subject,
+            evidence.freshness,
+        )
+    {
         return Err(CoreError::StaleEvidence);
     }
     Ok(())
 }
 
-fn freshness_matches(
-    axes: FreshnessAxes,
-    presented: Freshness,
-    expected: Freshness,
-    expected_binding: u64,
-) -> bool {
+fn freshness_matches(axes: FreshnessAxes, presented: Freshness, expected: Freshness) -> bool {
     (!axes.contains(FreshnessAxes::BOOT) || presented.boot() == expected.boot())
         && (!axes.contains(FreshnessAxes::REGISTRY) || presented.registry() == expected.registry())
-        && (!axes.contains(FreshnessAxes::BINDING) || presented.binding() == expected_binding)
         && (!axes.contains(FreshnessAxes::DEVICE) || presented.device() == expected.device())
         && (!axes.contains(FreshnessAxes::JOURNAL) || presented.journal() == expected.journal())
 }
@@ -12724,33 +11647,10 @@ fn freshness_strictly_advances(
     (!axes.contains(FreshnessAxes::BOOT) || observation.boot().get() > subject.boot().get())
         && (!axes.contains(FreshnessAxes::REGISTRY)
             || observation.registry().get() > subject.registry().get())
-        && (!axes.contains(FreshnessAxes::BINDING) || observation.binding() > subject.binding())
         && (!axes.contains(FreshnessAxes::DEVICE)
             || observation.device().get() > subject.device().get())
         && (!axes.contains(FreshnessAxes::JOURNAL)
             || observation.journal().get() > subject.journal().get())
-}
-
-fn refresh_retirement(estate: &mut EstateRecord) {
-    if estate.retirement == RetirementState::Released {
-        return;
-    }
-    if estate.claims.is_empty() {
-        estate.retirement = if estate.commit == CommitState::Committed {
-            RetirementState::Retired
-        } else {
-            RetirementState::Held
-        };
-        return;
-    }
-    estate.retirement = if estate.claims.values().all(|claim| claim.retired) {
-        RetirementState::Retired
-    } else if estate.commit == CommitState::Committed || estate.authority != AuthorityState::Active
-    {
-        RetirementState::RetirementPending
-    } else {
-        RetirementState::Held
-    };
 }
 
 fn refresh_component_retirement(component: &mut ComponentRecord, authority: AuthorityState) {
@@ -12776,49 +11676,31 @@ fn refresh_component_retirement(component: &mut ComponentRecord, authority: Auth
     };
 }
 
-fn project_estate(estate: &EstateRecord) -> EstateProjection {
-    EstateProjection {
-        effect: estate.effect,
-        causal_owner: estate.causal_owner,
-        custodian: estate.custodian,
-        charge_owner: estate.charge_owner,
-        obligation: (estate.domain, estate.obligation),
-        obligation_policy: estate.obligation_policy,
-        authority: estate.authority,
-        authority_epoch: estate.authority_epoch,
-        commit: estate.commit,
-        outcome: estate.outcome,
-        settlement: estate.settlement,
-        retirement: estate.retirement,
-        claim_count: estate.claims.len(),
-        retained_claims: estate
-            .claims
-            .values()
-            .filter(|claim| !claim.retired)
-            .count(),
-    }
-}
-
 fn project_composite_effect(
     composite: &CompositeEffectRecord,
-    state: &State,
+    state: &impl StateAccess,
 ) -> CompositeEffectProjection {
+    let provenance = state
+        .scoped_composites()
+        .get(&composite.effect)
+        .map(|scoped| &scoped.bindings)
+        .or_else(|| {
+            composite
+                .released_provenance
+                .as_ref()
+                .map(|provenance| &provenance.bindings)
+        });
     CompositeEffectProjection {
         effect: composite.effect,
         kind: composite.kind,
+        catalog_digest: composite.catalog_digest,
         causal_owner: composite.causal_owner,
         custodian: composite.custodian,
         charge_owner: composite.charge_owner,
-        operation: state
-            .scoped_composites
-            .get(&composite.effect)
-            .map(|scoped| scoped.operation),
-        provider_bindings: state
-            .scoped_composites
-            .get(&composite.effect)
-            .map(|scoped| {
-                scoped
-                    .bindings
+        operation: composite.effect.operation(),
+        provider_bindings: provenance
+            .map(|bindings| {
+                bindings
                     .iter()
                     .map(|(component, provider)| {
                         ComponentProviderBinding::new(*component, *provider)
@@ -12842,7 +11724,7 @@ fn project_composite_effect(
 
 fn project_single_hop_handoff(
     composite: &CompositeEffectRecord,
-    state: Option<&State>,
+    state: Option<&impl StateAccess>,
 ) -> SingleHopHandoffProjection {
     match &composite.handoff {
         SingleHopRole::None => SingleHopHandoffProjection::None,
@@ -12850,19 +11732,22 @@ fn project_single_hop_handoff(
             descriptor,
             terminal_receipt_digest,
             descriptor_receipt_digest,
+            recovery_fact,
         } => SingleHopHandoffProjection::Source {
             descriptor: descriptor.clone(),
             terminal_receipt_digest: *terminal_receipt_digest,
             descriptor_receipt_digest: *descriptor_receipt_digest,
+            recovery_fact: *recovery_fact,
             child_installed: state.is_some_and(|state| {
-                descriptor.child_effect().ok().and_then(|child| state.composite_effects.get(&child)).is_some_and(|child| {
-                    matches!(child.handoff, SingleHopRole::Target { parent, descriptor_digest } if parent == composite.effect && descriptor_digest == handoff_descriptor_digest(**descriptor))
+                descriptor.child_effect().ok().and_then(|child| state.composite_effects().get(&child)).is_some_and(|child| {
+                    matches!(child.handoff, SingleHopRole::Target { parent, descriptor_digest, recovery_fact: _ } if parent == composite.effect && descriptor_digest == handoff_descriptor_digest(**descriptor))
                 })
             }),
         },
-        SingleHopRole::Target { parent, descriptor_digest } => SingleHopHandoffProjection::Target {
+        SingleHopRole::Target { parent, descriptor_digest, recovery_fact } => SingleHopHandoffProjection::Target {
             parent: *parent,
             descriptor_digest: *descriptor_digest,
+            recovery_fact: *recovery_fact,
         },
     }
 }
@@ -12896,7 +11781,7 @@ fn project_component_claim(
         ClaimCustodian::Released
     } else {
         match claim.scope {
-            ClaimScope::Logical => ClaimCustodian::KernelEstate,
+            ClaimScope::Logical => ClaimCustodian::CoreOwned,
             ClaimScope::Device(scope) => ClaimCustodian::DeviceProvider(scope),
         }
     };
@@ -12917,87 +11802,35 @@ fn project_component_claim(
     }
 }
 
-fn project_claim(effect: EffectId, claim: &ClaimRecord) -> ClaimProjection {
-    ClaimProjection {
-        effect,
-        claim: claim.id,
-        domain: claim.domain,
-        kind: claim.kind,
-        credit_class: claim.credit_class,
-        scope: claim.scope,
-        resource: claim.resource,
-        resource_generation: claim.resource_generation,
-        units: claim.units,
-        enrolled_freshness: claim.enrolled_freshness,
-        retired: claim.retired,
-    }
-}
-
 fn build_recovery_snapshot(
-    catalog: &DomainCatalog,
-    state: &State,
-    root: RootId,
+    catalogs: &CatalogSet,
+    state: &impl StateAccess,
+    operation: OperationId,
     snapshot: SnapshotId,
 ) -> Result<RecoverySnapshot, CoreError> {
-    let root_record = state.roots.get(&root).ok_or(CoreError::UnknownRoot)?;
-    match root_record.state {
-        RootRecoveryState::Fenced { .. } => {}
-        RootRecoveryState::RecoveryExhausted { .. } => {
+    let operation_record = state
+        .recovery_operations()
+        .get(&operation)
+        .ok_or(CoreError::UnknownOperation)?;
+    match operation_record.state {
+        OperationRecoveryState::Fenced { .. } => {}
+        OperationRecoveryState::RecoveryExhausted { .. } => {
             return Err(CoreError::RecoveryExhausted);
         }
         _ => return Err(CoreError::WrongRecoveryState),
     }
-    let mut items = Vec::new();
-    for estate in state
-        .estates
-        .values()
-        .filter(|estate| estate.effect.root() == root)
-    {
-        let adoption = catalog
-            .obligation_rule(estate.domain, estate.obligation)
-            .ok_or(CoreError::UnknownObligationClass)?
-            .adoption();
-        items.push(RecoveryItem {
-            effect: estate.effect,
-            custodian: estate.custodian,
-            obligation: (estate.domain, estate.obligation),
-            authority: estate.authority,
-            authority_epoch: estate.authority_epoch,
-            commit: estate.commit,
-            outcome: estate.outcome,
-            settlement: estate.settlement,
-            retirement: estate.retirement,
-            claim_count: estate.claims.len(),
-            retained_claims: estate
-                .claims
-                .values()
-                .filter(|claim| !claim.retired)
-                .count(),
-            adoptable: adoption == crate::AdoptionPolicy::UncommittedOnly
-                && estate.authority == AuthorityState::Fenced
-                && matches!(
-                    estate.commit,
-                    CommitState::Registered | CommitState::Prepared
-                )
-                && estate.settlement == SettlementState::Unavailable
-                && estate.custodian == CustodyState::KernelEstate,
-            settlement_required: estate.obligation_policy == ObligationPolicy::SuccessorSettlement
-                && estate.commit == CommitState::Committed
-                && !matches!(
-                    estate.settlement,
-                    SettlementState::Settled
-                        | SettlementState::Revoked
-                        | SettlementState::NotRequired
-                ),
-        });
-    }
     let mut composites = Vec::new();
-    let mut component_items = Vec::new();
     for composite in state
-        .composite_effects
+        .composite_effects()
         .values()
-        .filter(|composite| composite.effect.root() == root)
+        .filter(|composite| composite.effect.operation() == operation)
     {
+        let catalog = catalogs
+            .get(composite.catalog_digest)
+            .ok_or(CoreError::SchemaMismatch)?;
+        if catalog.composite_rule(composite.kind).is_none() {
+            return Err(CoreError::InvariantViolation);
+        }
         let mut components = Vec::new();
         let mut retained_claims = Vec::new();
         for component in composite.components.values() {
@@ -13029,7 +11862,6 @@ fn build_recovery_snapshot(
                     ),
             };
             components.push(item);
-            component_items.push(item);
             for claim in component.claims.values().filter(|claim| !claim.retired) {
                 let mut accepted_evidence = Vec::new();
                 let mut pending_evidence = Vec::new();
@@ -13055,6 +11887,7 @@ fn build_recovery_snapshot(
         composites.push(CompositeRecoveryItem {
             effect: composite.effect,
             kind: composite.kind,
+            catalog_digest: composite.catalog_digest,
             causal_owner: composite.causal_owner,
             custodian: composite.custodian,
             charge_owner: composite.charge_owner,
@@ -13067,9 +11900,9 @@ fn build_recovery_snapshot(
         });
     }
     let artifacts = state
-        .artifact_leases
+        .artifact_leases()
         .values()
-        .filter(|lease| lease.binding().effect().root() == root)
+        .filter(|lease| lease.binding().effect().operation() == operation)
         .map(|lease| ArtifactRecoveryItem {
             binding: lease.binding(),
             lease: *lease,
@@ -13077,35 +11910,19 @@ fn build_recovery_snapshot(
         })
         .collect::<Vec<_>>();
     let mut hasher = Sha256::new();
-    hasher.update(b"nexus.cser.recovery-snapshot.v2");
+    hasher.update(b"nexus.cser.recovery-snapshot.v6");
     hasher.update(crate::CSER_CORE_API_PROFILE_VERSION.to_le_bytes());
     hasher.update(crate::RECOVERY_SNAPSHOT_VERSION.to_le_bytes());
     hasher.update(crate::JOURNAL_SCHEMA_VERSION.to_le_bytes());
-    hasher.update(catalog.digest().bytes());
-    hasher.update(root.get().to_le_bytes());
+    hasher.update(catalogs.digest().bytes());
+    hasher.update(operation.get().to_le_bytes());
     hasher.update(snapshot.get().to_le_bytes());
-    hasher.update(state.revision.to_le_bytes());
-    hasher.update(state.head.bytes());
-    hash_root_state(&mut hasher, root_record.state);
-    for item in &items {
-        hasher.update(item.effect.root().get().to_le_bytes());
-        hasher.update(item.effect.sequence().to_le_bytes());
-        hash_custody(&mut hasher, item.custodian);
-        hasher.update(item.obligation.0.get().to_le_bytes());
-        hasher.update(item.obligation.1.get().to_le_bytes());
-        hasher.update([authority_tag(item.authority)]);
-        hasher.update(item.authority_epoch.to_le_bytes());
-        hasher.update([commit_tag(item.commit)]);
-        hash_outcome(&mut hasher, item.outcome);
-        hash_settlement(&mut hasher, item.settlement);
-        hasher.update([retirement_tag(item.retirement)]);
-        hasher.update((item.claim_count as u64).to_le_bytes());
-        hasher.update((item.retained_claims as u64).to_le_bytes());
-        hasher.update([u8::from(item.adoptable), u8::from(item.settlement_required)]);
-    }
+    hasher.update(state.revision().to_le_bytes());
+    hasher.update(state.head().bytes());
+    hash_operation_state(&mut hasher, operation_record.state);
     hasher.update([0xfd]);
     for composite in &composites {
-        hasher.update(composite.effect.root().get().to_le_bytes());
+        hasher.update(composite.effect.operation().get().to_le_bytes());
         hasher.update(composite.effect.sequence().to_le_bytes());
         hasher.update(composite.kind.get().to_le_bytes());
         hash_incarnation(&mut hasher, composite.causal_owner);
@@ -13154,7 +11971,7 @@ fn build_recovery_snapshot(
                 hasher.update(evidence.kind.get().to_le_bytes());
                 hash_freshness(&mut hasher, evidence.subject);
                 hash_freshness(&mut hasher, evidence.observation);
-                hash_optional_provider_verification_scope(&mut hasher, evidence.verification_scope);
+                hash_provider_verification_scope(&mut hasher, evidence.verification_scope);
                 hash_verifier_stamp(&mut hasher, evidence.stamp);
             }
             hasher.update((item.pending_evidence.len() as u64).to_le_bytes());
@@ -13174,41 +11991,29 @@ fn build_recovery_snapshot(
         core_api_profile: crate::CSER_CORE_API_PROFILE_VERSION,
         snapshot_version: crate::RECOVERY_SNAPSHOT_VERSION,
         journal_schema: crate::JOURNAL_SCHEMA_VERSION,
-        catalog_digest: catalog.digest(),
-        root,
+        catalog_digest: catalogs.digest(),
+        operation,
         snapshot,
         digest: Digest::new(hasher.finalize().into()),
-        covered_revision: state.revision,
-        covered_head: state.head,
-        items,
+        covered_revision: state.revision(),
+        covered_head: state.head(),
         composites,
-        component_items,
         artifacts,
     })
 }
 
 fn check_invariants(
-    catalog: &DomainCatalog,
+    catalogs: &CatalogSet,
     limits: CoreLimits,
-    state: &State,
+    state: &impl StateAccess,
 ) -> Result<(), CoreError> {
-    if (!state.provider_high_water.is_empty()
-        || !state.provider_generations.is_empty()
-        || !state.scoped_composites.is_empty())
-        && state.world.is_none()
-    {
+    if state.world().get() == 0 {
         return Err(CoreError::InvariantViolation);
     }
-    let mut expected_root_effects: StateMap<RootId, StateSet<EffectId>> = StateMap::new();
-    for effect in state.estates.keys().chain(state.composite_effects.keys()) {
-        expected_root_effects
-            .get_or_insert_with_mut(effect.root(), StateSet::new)
-            .insert_mut(*effect);
-    }
-    if state.root_effects != expected_root_effects {
-        return Err(CoreError::InvariantViolation);
-    }
-    for (coordinate, record) in &state.provider_generations {
+    for (coordinate, record) in state.provider_generations() {
+        let catalog = catalogs
+            .get(record.catalog_digest)
+            .ok_or(CoreError::SchemaMismatch)?;
         let required_verifiers: Vec<_> = catalog.verifier_class_bindings().into_iter().collect();
         let verifier_digest = validate_verifier_set(&record.verifier_bindings, &required_verifiers)
             .map_err(|_| CoreError::InvariantViolation)?;
@@ -13218,7 +12023,7 @@ fn check_invariants(
             ProviderEffectState::SettlementOnly { epoch } => epoch >= 3,
             ProviderEffectState::Retired { epoch } => epoch >= 4,
         };
-        if state.world != Some(coordinate.world())
+        if state.world() != coordinate.world()
             || record.coordinate != *coordinate
             || record.catalog_digest != catalog.digest()
             || record.verifier_set_digest != verifier_digest
@@ -13226,21 +12031,21 @@ fn check_invariants(
             || !epoch_valid
             || record.live_component_bindings == 0
                 && state
-                    .scoped_composites
+                    .scoped_composites()
                     .values()
                     .any(|scoped| scoped.bindings.values().any(|bound| bound == coordinate))
             || state
-                .provider_high_water
+                .provider_high_water()
                 .get(&coordinate.provider())
                 .is_none_or(|high| *high < coordinate.generation())
         {
             return Err(CoreError::InvariantViolation);
         }
     }
-    for (provider, high) in &state.provider_high_water {
+    for (provider, high) in state.provider_high_water() {
         if high.get() == 0
             || state
-                .provider_generations
+                .provider_generations()
                 .keys()
                 .filter(|coordinate| coordinate.provider() == *provider)
                 .any(|coordinate| coordinate.generation() > *high)
@@ -13250,15 +12055,18 @@ fn check_invariants(
     }
     let mut expected_provider_bindings: BTreeMap<ProviderCoordinate, usize> = BTreeMap::new();
     let mut expected_artifacts = BTreeMap::new();
-    for (effect, scoped) in &state.scoped_composites {
+    for (effect, scoped) in state.scoped_composites() {
         let composite = state
-            .composite_effects
+            .composite_effects()
             .get(effect)
             .ok_or(CoreError::InvariantViolation)?;
+        let catalog = catalogs
+            .get(composite.catalog_digest)
+            .ok_or(CoreError::SchemaMismatch)?;
         let schema = catalog
             .composite_rule(composite.kind)
             .ok_or(CoreError::InvariantViolation)?;
-        if scoped.operation.get() == 0
+        if scoped.catalog_digest != composite.catalog_digest
             || scoped.bindings.len() != composite.components.len()
             || scoped
                 .bindings
@@ -13268,8 +12076,11 @@ fn check_invariants(
             return Err(CoreError::InvariantViolation);
         }
         for (component, provider) in &scoped.bindings {
-            if state.world != Some(provider.world())
-                || !state.provider_generations.contains_key(provider)
+            let provider_record = state.provider_generations().get(provider);
+            if state.world() != provider.world()
+                || provider_record.is_none()
+                || provider_record
+                    .is_some_and(|record| record.catalog_digest != composite.catalog_digest)
             {
                 return Err(CoreError::InvariantViolation);
             }
@@ -13283,13 +12094,10 @@ fn check_invariants(
                 .ok_or(CoreError::InvariantViolation)?;
             match (declared.artifact_policy(), scoped.artifacts.get(component)) {
                 (crate::RecoveryArtifactPolicy::Required, Some(binding)) => {
-                    let provider_record = state
-                        .provider_generations
-                        .get(provider)
-                        .ok_or(CoreError::InvariantViolation)?;
+                    let provider_record = provider_record.ok_or(CoreError::InvariantViolation)?;
                     if provider_record.artifact_receipts.is_none()
                         || binding.provider() != *provider
-                        || binding.operation() != scoped.operation
+                        || binding.operation() != effect.operation()
                         || binding.effect() != *effect
                         || binding.component() != *component
                         || binding.catalog_digest() != catalog.digest()
@@ -13308,7 +12116,7 @@ fn check_invariants(
             }
         }
     }
-    for (coordinate, record) in &state.provider_generations {
+    for (coordinate, record) in state.provider_generations() {
         if record.live_component_bindings
             != expected_provider_bindings
                 .get(coordinate)
@@ -13319,7 +12127,7 @@ fn check_invariants(
         }
         if matches!(record.state, ProviderEffectState::Retired { .. })
             && (record.live_component_bindings != 0
-                || state.artifact_leases.values().any(|lease| {
+                || state.artifact_leases().values().any(|lease| {
                     lease.binding().provider() == *coordinate
                         && !matches!(lease, ArtifactLeaseState::Released { .. })
                 }))
@@ -13327,7 +12135,7 @@ fn check_invariants(
             return Err(CoreError::InvariantViolation);
         }
     }
-    for (artifact, lease) in &state.artifact_leases {
+    for (artifact, lease) in state.artifact_leases() {
         let binding = lease.binding();
         if *artifact != binding.artifact_id()
             || lease.pin_stamp().is_zero()
@@ -13340,15 +12148,25 @@ fn check_invariants(
             Some(expected) if *expected == binding => {}
             None if matches!(lease, ArtifactLeaseState::Released { .. }) => {
                 let composite = state
-                    .composite_effects
+                    .composite_effects()
                     .get(&binding.effect())
                     .ok_or(CoreError::InvariantViolation)?;
                 let component = composite
                     .components
                     .get(&binding.component())
                     .ok_or(CoreError::InvariantViolation)?;
+                let provider_record = state
+                    .provider_generations()
+                    .get(&binding.provider())
+                    .ok_or(CoreError::InvariantViolation)?;
                 if component.retirement != RetirementState::Released
-                    || !state.provider_generations.contains_key(&binding.provider())
+                    || binding.catalog_digest() != composite.catalog_digest
+                    || provider_record.catalog_digest != composite.catalog_digest
+                    || composite
+                        .released_provenance
+                        .as_ref()
+                        .and_then(|provenance| provenance.artifacts.get(&binding.component()))
+                        != Some(&binding)
                 {
                     return Err(CoreError::InvariantViolation);
                 }
@@ -13358,322 +12176,55 @@ fn check_invariants(
     }
     if expected_artifacts.keys().any(|artifact| {
         state
-            .artifact_leases
+            .artifact_leases()
             .get(artifact)
             .is_some_and(|lease| lease.binding() != expected_artifacts[artifact])
     }) {
         return Err(CoreError::InvariantViolation);
     }
-    if state.roots.len() > limits.max_roots
-        || state.estates.len() + state.composite_effects.len() > limits.max_estates
-        || state.resources.len() > limits.max_resource_records
+    if state.recovery_operations().len() > limits.max_operations
+        || state.composite_effects().len() > limits.max_effects
+        || state.resources().len() > limits.max_resource_records
     {
         return Err(CoreError::InvariantViolation);
     }
     let total_claims = count_state_claims(state)?;
-    if state.total_claims != total_claims
+    if state.total_claims() != total_claims
         || total_claims > limits.max_total_claims
-        || state.next_nonce == 0
+        || state.next_nonce() == 0
     {
         return Err(CoreError::InvariantViolation);
     }
 
     let mut expected_charges: StateMap<(ChargeAccountId, CreditClassId), u64> = StateMap::new();
-    let mut expected_resources: StateMap<ResourceId, Vec<(EffectId, ClaimId)>> = StateMap::new();
+    let mut expected_catalog_charges: BTreeMap<(Digest, ChargeAccountId, CreditClassId), u64> =
+        BTreeMap::new();
     let mut expected_composite_resources: StateMap<
         ResourceId,
         Vec<(EffectId, ComponentId, ClaimId)>,
     > = StateMap::new();
     let mut active_resource_generations: BTreeMap<ResourceId, ResourceGeneration> = BTreeMap::new();
     let mut active_resource_scopes: BTreeMap<ResourceId, ClaimScope> = BTreeMap::new();
-    for estate in state.estates.values() {
-        let obligation_rule = catalog
-            .obligation_rule(estate.domain, estate.obligation)
-            .ok_or(CoreError::InvariantViolation)?;
-        if !state.roots.contains_key(&estate.effect.root())
-            || obligation_rule.policy() != estate.obligation_policy
-            || estate.claims.len() > limits.max_claims_per_estate
-            || estate.authority_epoch == 0
+    for composite in state.composite_effects().values() {
+        let catalog = catalogs
+            .get(composite.catalog_digest)
+            .ok_or(CoreError::SchemaMismatch)?;
+        if !state.scoped_composites().contains_key(&composite.effect)
+            && composite.released_provenance.is_none()
         {
-            return Err(CoreError::InvariantViolation);
+            // A primary composite without immutable provider provenance can
+            // only come from a predecessor checkpoint. Do not let recovery
+            // or replay turn that image into a live unscoped effect.
+            return Err(CoreError::IncompatibleApiProfile);
         }
-        for cardinality in obligation_rule.claims() {
-            let count = estate
-                .claims
-                .values()
-                .filter(|claim| claim.kind == cardinality.kind())
-                .count();
-            if count > usize::from(cardinality.maximum())
-                || (estate.commit != CommitState::Registered
-                    && count < usize::from(cardinality.minimum()))
-            {
-                return Err(CoreError::InvariantViolation);
-            }
-        }
-        if estate.claims.values().any(|claim| {
-            !obligation_rule
-                .claims()
-                .iter()
-                .any(|allowed| allowed.kind() == claim.kind)
-        }) {
-            return Err(CoreError::InvariantViolation);
-        }
-        if estate.commit != CommitState::Registered
-            && estate.claims.len() < usize::from(obligation_rule.minimum_total_claims())
-        {
-            return Err(CoreError::InvariantViolation);
-        }
-        match estate.commit {
-            CommitState::CommitIntentDurable
-                if estate.commit_nonce.is_none() || estate.commit_operation.is_none() =>
-            {
-                return Err(CoreError::InvariantViolation);
-            }
-            CommitState::CommitIntentDurable => {}
-            _ if estate.commit_nonce.is_some() => return Err(CoreError::InvariantViolation),
-            _ => {}
-        }
-        let receipts = obligation_rule.receipts();
-        if let Some(fact) = estate.commit_fact {
-            if estate.commit != CommitState::Committed
-                || fact.kind != EffectFactKind::CommitOutcome
-                || fact.effect != estate.effect
-                || fact.actor != estate.causal_owner
-                || fact.operation != estate.commit_operation.unwrap_or(Digest::ZERO)
-                || fact.predecessor.is_some()
-                || fact.outcome.is_none()
-                || !fact_stamp_matches(
-                    state,
-                    fact,
-                    receipts.commit_outcome().verifier(),
-                    receipts.commit_outcome().receipt_schema(),
-                )
-            {
-                return Err(CoreError::InvariantViolation);
-            }
-            if matches!(
-                estate.outcome,
-                OutcomeState::KnownSuccess(digest) | OutcomeState::KnownFailure(digest)
-                    if digest != fact.stamp.receipt_digest
-            ) {
-                return Err(CoreError::InvariantViolation);
-            }
-        } else if matches!(
-            estate.outcome,
-            OutcomeState::KnownSuccess(_) | OutcomeState::KnownFailure(_)
-        ) {
-            return Err(CoreError::InvariantViolation);
-        }
-        if let Some(fact) = estate.applied_fact {
-            let Some(binding) = receipts.apply_completed() else {
-                return Err(CoreError::InvariantViolation);
-            };
-            if fact.kind != EffectFactKind::ApplyCompleted
-                || fact.effect != estate.effect
-                || fact.operation != estate.settlement_intent.unwrap_or(Digest::ZERO)
-                || fact.predecessor.is_some()
-                || fact.outcome.is_some()
-                || !fact_stamp_matches(state, fact, binding.verifier(), binding.receipt_schema())
-            {
-                return Err(CoreError::InvariantViolation);
-            }
-        }
-        let applied_required = matches!(
-            estate.settlement,
-            SettlementState::AppliedUnacknowledged { .. }
-                | SettlementState::ReconciliationRequired { applied: true, .. }
-                | SettlementState::Settled
-        ) || matches!(
-            estate.claim_stage,
-            Some(ClaimStage::Applied | ClaimStage::ReconcileApplied)
-        );
-        if applied_required != estate.applied_fact.is_some() {
-            return Err(CoreError::InvariantViolation);
-        }
-        if let Some(fact) = estate.settlement_fact {
-            let Some(binding) = receipts.settlement_acknowledged() else {
-                return Err(CoreError::InvariantViolation);
-            };
-            if estate.settlement != SettlementState::Settled
-                || fact.kind != EffectFactKind::SettlementAcknowledged
-                || fact.effect != estate.effect
-                || fact.operation != estate.settlement_intent.unwrap_or(Digest::ZERO)
-                || fact.predecessor
-                    != estate
-                        .applied_fact
-                        .map(|applied| applied.stamp.receipt_digest)
-                || fact.outcome.is_some()
-                || !fact_stamp_matches(state, fact, binding.verifier(), binding.receipt_schema())
-            {
-                return Err(CoreError::InvariantViolation);
-            }
-        } else if estate.settlement == SettlementState::Settled {
-            return Err(CoreError::InvariantViolation);
-        }
-        let claim_authority_live = matches!(
-            estate.settlement,
-            SettlementState::Claimed { .. }
-                | SettlementState::ApplyIntentDurable { .. }
-                | SettlementState::AppliedUnacknowledged { .. }
-        );
-        if claim_authority_live
-            != (estate.settlement_nonce.is_some() && estate.claim_stage.is_some())
-        {
-            return Err(CoreError::InvariantViolation);
-        }
-        if estate.retirement == RetirementState::Released
-            && (!estate.claims.values().all(|claim| claim.retired)
-                || !matches!(
-                    estate.settlement,
-                    SettlementState::Settled
-                        | SettlementState::Revoked
-                        | SettlementState::NotRequired
-                )
-                || estate.custodian != CustodyState::Released)
-        {
-            return Err(CoreError::InvariantViolation);
-        }
-        if estate.retirement != RetirementState::Released
-            && estate.custodian == CustodyState::Released
-        {
-            return Err(CoreError::InvariantViolation);
-        }
-        match estate.obligation_policy {
-            ObligationPolicy::SuccessorSettlement
-                if estate.settlement == SettlementState::NotRequired =>
-            {
-                return Err(CoreError::InvariantViolation);
-            }
-            ObligationPolicy::RetirementEvidence
-                if estate.commit == CommitState::Committed
-                    && estate.settlement != SettlementState::NotRequired =>
-            {
-                return Err(CoreError::InvariantViolation);
-            }
-            _ => {}
-        }
-
-        for claim in estate.claims.values() {
-            let rule = catalog
-                .claim_rule(claim.domain, claim.kind)
-                .ok_or(CoreError::InvariantViolation)?;
-            if rule.evidence().len() != claim.requirements.len()
-                || claim.domain != estate.domain
-                || claim.credit_class != rule.credit_class()
-                || !matches!(
-                    (rule.scope(), claim.scope),
-                    (ClaimScopePolicy::Logical, ClaimScope::Logical)
-                        | (ClaimScopePolicy::Device, ClaimScope::Device(_))
-                )
-                || claim.retired
-                    != claim
-                        .requirements
-                        .iter()
-                        .all(|requirement| requirement.accepted.is_some())
-            {
-                return Err(CoreError::InvariantViolation);
-            }
-            for (requirement, declared) in claim.requirements.iter().zip(rule.evidence().iter()) {
-                if requirement.kind != declared.kind()
-                    || requirement.verifier != declared.verifier()
-                    || requirement.receipt_schema != declared.receipt_schema()
-                    || requirement.subject_freshness != declared.subject_freshness()
-                    || requirement.observation_freshness != declared.observation_freshness()
-                    || requirement.strictly_advanced != declared.strictly_advanced()
-                    || requirement.device_generation != declared.device_generation()
-                    || requirement.prerequisite != declared.prerequisite()
-                {
-                    return Err(CoreError::InvariantViolation);
-                }
-                if let Some(accepted) = requirement.accepted
-                    && (validate_state_verifier_identity(
-                        state,
-                        estate.effect,
-                        None,
-                        accepted.stamp.identity,
-                        requirement.verifier,
-                        requirement.receipt_schema,
-                    )
-                    .is_err()
-                        || accepted.stamp.receipt_digest == Digest::ZERO
-                        || accepted.stamp.identity.verifier() != requirement.verifier
-                        || accepted.stamp.identity.receipt_schema() != requirement.receipt_schema
-                        || accepted.stamp.identity.epoch() == 0
-                        || !freshness_matches(
-                            requirement.subject_freshness,
-                            accepted.subject,
-                            claim.enrolled_freshness,
-                            claim.enrolled_freshness.binding(),
-                        )
-                        || !freshness_strictly_advances(
-                            requirement.strictly_advanced,
-                            accepted.subject,
-                            accepted.observation,
-                        )
-                        || requirement.prerequisite.is_some_and(|prerequisite| {
-                            !claim.requirements.iter().any(|candidate| {
-                                candidate.kind == prerequisite && candidate.accepted.is_some()
-                            })
-                        }))
-                {
-                    return Err(CoreError::InvariantViolation);
-                }
-            }
-            if !claim.retired {
-                let charged = expected_charges
-                    .get_or_insert_with_mut((estate.charge_owner, claim.credit_class), || 0);
-                *charged = charged
-                    .checked_add(claim.units)
-                    .ok_or(CoreError::InvariantViolation)?;
-                expected_resources
-                    .get_or_insert_with_mut(claim.resource, Vec::new)
-                    .push((estate.effect, claim.id));
-                if active_resource_generations
-                    .insert(claim.resource, claim.resource_generation)
-                    .is_some_and(|generation| generation != claim.resource_generation)
-                {
-                    return Err(CoreError::InvariantViolation);
-                }
-                if active_resource_scopes
-                    .insert(claim.resource, claim.scope)
-                    .is_some_and(|scope| scope != claim.scope)
-                {
-                    return Err(CoreError::InvariantViolation);
-                }
-            }
-        }
-        let projected = project_estate(estate);
-        let expected_retirement = if estate.retirement == RetirementState::Released {
-            RetirementState::Released
-        } else if estate.claims.is_empty() {
-            if estate.commit == CommitState::Committed {
-                RetirementState::Retired
-            } else {
-                RetirementState::Held
-            }
-        } else if projected.retained_claims == 0 {
-            RetirementState::Retired
-        } else if estate.commit == CommitState::Committed
-            || estate.authority != AuthorityState::Active
-        {
-            RetirementState::RetirementPending
-        } else {
-            RetirementState::Held
-        };
-        if estate.retirement != expected_retirement {
-            return Err(CoreError::InvariantViolation);
-        }
-    }
-    for composite in state.composite_effects.values() {
         let composite_rule = catalog
             .composite_rule(composite.kind)
             .ok_or(CoreError::InvariantViolation)?;
-        let root = state
-            .roots
-            .get(&composite.effect.root())
+        let operation = state
+            .recovery_operations()
+            .get(&composite.effect.operation())
             .ok_or(CoreError::InvariantViolation)?;
-        if state.estates.contains_key(&composite.effect)
-            || root.origin.principal() != composite.causal_owner.principal()
+        if operation.origin.executor() != composite.causal_owner.executor()
             || composite.authority_epoch == 0
             || composite.components.len() != composite_rule.components().len()
             || !composite_rule.components().iter().all(|declared| {
@@ -13687,15 +12238,75 @@ fn check_invariants(
             })
             || !matches!(
                 (composite.authority, composite.custodian),
-                (AuthorityState::Active, CustodyState::Principal(_))
+                (AuthorityState::Active, CustodyState::Executor(_))
                     | (
                         AuthorityState::Fenced | AuthorityState::Revoked,
-                        CustodyState::KernelEstate
+                        CustodyState::CoreOwned
                     )
                     | (AuthorityState::Revoked, CustodyState::Released)
             )
         {
             return Err(CoreError::InvariantViolation);
+        }
+        if let Some(provenance) = &composite.released_provenance {
+            if composite.authority != AuthorityState::Revoked
+                || composite.custodian != CustodyState::Released
+                || state.scoped_composites().contains_key(&composite.effect)
+                || provenance.catalog_digest != composite.catalog_digest
+                || provenance.bindings.len() != composite.components.len()
+                || provenance
+                    .bindings
+                    .keys()
+                    .any(|component| !composite.components.contains_key(component))
+            {
+                return Err(CoreError::InvariantViolation);
+            }
+            for (component, provider) in &provenance.bindings {
+                let provider_record = state
+                    .provider_generations()
+                    .get(provider)
+                    .ok_or(CoreError::InvariantViolation)?;
+                if state.world() != provider.world()
+                    || provider_record.catalog_digest != catalog.digest()
+                {
+                    return Err(CoreError::InvariantViolation);
+                }
+                let schema = composite_rule
+                    .component(*component)
+                    .ok_or(CoreError::InvariantViolation)?;
+                let artifact = provenance.artifacts.get(component);
+                match (schema.artifact_policy(), artifact) {
+                    (crate::RecoveryArtifactPolicy::Required, Some(binding)) => {
+                        if binding.provider() != *provider
+                            || binding.operation() != composite.effect.operation()
+                            || binding.effect() != composite.effect
+                            || binding.component() != *component
+                            || binding.catalog_digest() != catalog.digest()
+                            || binding.verifier_set_digest() != provider_record.verifier_set_digest
+                            || !matches!(
+                                state.artifact_leases().get(&binding.artifact_id()),
+                                Some(ArtifactLeaseState::Released { .. })
+                            )
+                        {
+                            return Err(CoreError::InvariantViolation);
+                        }
+                    }
+                    (crate::RecoveryArtifactPolicy::Required, None)
+                        if composite
+                            .components
+                            .get(component)
+                            .is_some_and(|record| component_abort_terminal(composite, record)) => {}
+                    (crate::RecoveryArtifactPolicy::NotRequired, None) => {}
+                    _ => return Err(CoreError::InvariantViolation),
+                }
+            }
+            if provenance
+                .artifacts
+                .keys()
+                .any(|component| !provenance.bindings.contains_key(component))
+            {
+                return Err(CoreError::InvariantViolation);
+            }
         }
         let released = composite.custodian == CustodyState::Released;
         if released
@@ -13712,13 +12323,46 @@ fn check_invariants(
                 descriptor,
                 terminal_receipt_digest,
                 descriptor_receipt_digest,
+                recovery_fact,
             } => {
+                let fact_valid = recovery_fact.is_none_or(|fact| {
+                    composite
+                        .components
+                        .get(&descriptor.parent_component)
+                        .and_then(|component| component.commit_operation)
+                        .is_some_and(|operation| {
+                            component_freshness(
+                                state,
+                                composite,
+                                composite
+                                    .components
+                                    .get(&descriptor.parent_component)
+                                    .expect("validated component"),
+                            )
+                            .is_ok_and(|freshness| {
+                                handoff_recovery_fact_matches(
+                                    state,
+                                    catalog,
+                                    fact,
+                                    HandoffRecoveryCoordinates::new(
+                                        HandoffRecoveryRole::Parent,
+                                        composite.effect,
+                                        descriptor.parent_component,
+                                        operation,
+                                        handoff_descriptor_digest(**descriptor),
+                                        freshness,
+                                    ),
+                                ) && fact.stamp.receipt_digest == *terminal_receipt_digest
+                            })
+                        })
+                });
                 if descriptor.parent != composite.effect
                     || descriptor.catalog_digest != catalog.digest()
                     || descriptor.child_effect().is_err()
                     || !matches!(catalog.single_hop_handoff_rule(composite.kind), Some(rule) if rule.target() == descriptor.child_kind)
                     || terminal_receipt_digest.is_zero()
                     || descriptor_receipt_digest.is_zero()
+                    || !fact_valid
                     || !matches!(
                         composite.components.get(&descriptor.parent_component).map(|component| component.outcome),
                         Some(OutcomeState::KnownSuccess(receipt)) if receipt == *terminal_receipt_digest
@@ -13730,11 +12374,43 @@ fn check_invariants(
             SingleHopRole::Target {
                 parent,
                 descriptor_digest,
+                recovery_fact,
             } => {
-                if parent.root() != composite.effect.root()
+                let fact_valid = recovery_fact.is_none_or(|fact| {
+                    composite
+                        .components
+                        .get(&fact.component)
+                        .is_some_and(|component| {
+                            component.commit_operation.is_some_and(|operation| {
+                                component_freshness(state, composite, component).is_ok_and(
+                                    |freshness| {
+                                        handoff_recovery_fact_matches(
+                                            state,
+                                            catalog,
+                                            fact,
+                                            HandoffRecoveryCoordinates::new(
+                                                HandoffRecoveryRole::Child,
+                                                composite.effect,
+                                                fact.component,
+                                                operation,
+                                                *descriptor_digest,
+                                                freshness,
+                                            ),
+                                        ) && matches!(
+                                            component.outcome,
+                                            OutcomeState::KnownSuccess(receipt)
+                                                if receipt == fact.stamp.receipt_digest
+                                        )
+                                    },
+                                )
+                            })
+                        })
+                });
+                if parent.operation() != composite.effect.operation()
                     || descriptor_digest.is_zero()
+                    || !fact_valid
                     || composite.components.len() != 1
-                    || !matches!(state.composite_effects.get(parent).map(|source| (&source.handoff, source.kind)), Some((SingleHopRole::Source { descriptor, .. }, source_kind)) if catalog.single_hop_handoff_rule(source_kind).is_some_and(|rule| rule.target() == composite.kind) && handoff_descriptor_digest(**descriptor) == *descriptor_digest)
+                    || !matches!(state.composite_effects().get(parent).map(|source| (&source.handoff, source.kind, source.catalog_digest)), Some((SingleHopRole::Source { descriptor, .. }, source_kind, source_catalog_digest)) if source_catalog_digest == composite.catalog_digest && catalog.single_hop_handoff_rule(source_kind).is_some_and(|rule| rule.target() == composite.kind) && handoff_descriptor_digest(**descriptor) == *descriptor_digest)
                 {
                     return Err(CoreError::InvariantViolation);
                 }
@@ -13746,7 +12422,7 @@ fn check_invariants(
                 .obligation_rule(component.domain, component.obligation)
                 .ok_or(CoreError::InvariantViolation)?;
             if obligation_rule.policy() != component.obligation_policy
-                || component.claims.len() > limits.max_claims_per_estate
+                || component.claims.len() > limits.max_claims_per_effect
                 || component.id.get() == 0
             {
                 return Err(CoreError::InvariantViolation);
@@ -13793,7 +12469,7 @@ fn check_invariants(
                 if component.commit != CommitState::Committed
                     || fact.kind != EffectFactKind::CommitOutcome
                     || fact.effect != composite.effect
-                    || fact.component != Some(component.id)
+                    || fact.component != component.id
                     || fact.actor != composite.causal_owner
                     || fact.operation != component.commit_operation.unwrap_or(Digest::ZERO)
                     || fact.predecessor.is_some()
@@ -13839,7 +12515,7 @@ fn check_invariants(
                 };
                 if fact.kind != EffectFactKind::ApplyCompleted
                     || fact.effect != composite.effect
-                    || fact.component != Some(component.id)
+                    || fact.component != component.id
                     || fact.operation != component.settlement_intent.unwrap_or(Digest::ZERO)
                     || fact.predecessor.is_some()
                     || fact.outcome.is_some()
@@ -13872,7 +12548,7 @@ fn check_invariants(
                 if component.settlement != SettlementState::Settled
                     || fact.kind != EffectFactKind::SettlementAcknowledged
                     || fact.effect != composite.effect
-                    || fact.component != Some(component.id)
+                    || fact.component != component.id
                     || fact.operation != component.settlement_intent.unwrap_or(Digest::ZERO)
                     || fact.predecessor
                         != component
@@ -13956,12 +12632,21 @@ fn check_invariants(
                         && (validate_state_verifier_identity(
                             state,
                             composite.effect,
-                            Some(component.id),
+                            component.id,
                             accepted.stamp.identity,
                             requirement.verifier,
                             requirement.receipt_schema,
                         )
                         .is_err()
+                            || validate_state_verification_scope(
+                                state,
+                                composite.effect,
+                                component.id,
+                                accepted.verification_scope,
+                                requirement.verifier,
+                                requirement.receipt_schema,
+                            )
+                            .is_err()
                             || accepted.stamp.receipt_digest == Digest::ZERO
                             || accepted.stamp.identity.verifier() != requirement.verifier
                             || accepted.stamp.identity.receipt_schema()
@@ -13971,7 +12656,6 @@ fn check_invariants(
                                 requirement.subject_freshness,
                                 accepted.subject,
                                 claim.enrolled_freshness,
-                                claim.enrolled_freshness.binding(),
                             )
                             || !freshness_strictly_advances(
                                 requirement.strictly_advanced,
@@ -13993,6 +12677,16 @@ fn check_invariants(
                     let charged = expected_charges
                         .get_or_insert_with_mut((composite.charge_owner, claim.credit_class), || 0);
                     *charged = charged
+                        .checked_add(claim.units)
+                        .ok_or(CoreError::InvariantViolation)?;
+                    let catalog_charged = expected_catalog_charges
+                        .entry((
+                            composite.catalog_digest,
+                            composite.charge_owner,
+                            claim.credit_class,
+                        ))
+                        .or_insert(0);
+                    *catalog_charged = catalog_charged
                         .checked_add(claim.units)
                         .ok_or(CoreError::InvariantViolation)?;
                     expected_composite_resources
@@ -14041,29 +12735,34 @@ fn check_invariants(
             }
         }
     }
-    for key in state.charges.keys().chain(expected_charges.keys()) {
-        let actual = state.charges.get(key).copied().unwrap_or(0);
+    for key in state.charges().keys().chain(expected_charges.keys()) {
+        let actual = state.charges().get(key).copied().unwrap_or(0);
         let expected = expected_charges.get(key).copied().unwrap_or(0);
-        let class_limit = catalog
-            .credit_rule(key.1)
-            .ok_or(CoreError::InvariantViolation)?
-            .max_units_per_account()
-            .min(limits.max_units_per_account);
-        if actual != expected || actual > class_limit {
+        if actual != expected {
             return Err(CoreError::InvariantViolation);
         }
     }
-    if state.resource_index != expected_resources {
+    for ((catalog_digest, _charge_owner, credit_class), charged) in expected_catalog_charges {
+        let catalog = catalogs
+            .get(catalog_digest)
+            .ok_or(CoreError::SchemaMismatch)?;
+        let class_limit = catalog
+            .credit_rule(credit_class)
+            .ok_or(CoreError::InvariantViolation)?
+            .max_units_per_account()
+            .min(limits.max_units_per_account);
+        if charged > class_limit {
+            return Err(CoreError::InvariantViolation);
+        }
+    }
+    if *state.composite_resource_index() != expected_composite_resources {
         return Err(CoreError::InvariantViolation);
     }
-    if state.composite_resource_index != expected_composite_resources {
-        return Err(CoreError::InvariantViolation);
-    }
-    for (resource, record) in &state.resources {
+    for (resource, record) in state.resources() {
         match record.phase {
             ResourcePhase::Claimed { pending_reuse } => {
-                let (custodians, all_shared) = live_resource_conflict_summary(
-                    catalog,
+                let (custodians, all_shared) = live_resource_conflict_summary_for_set(
+                    catalogs,
                     state,
                     *resource,
                     record.generation,
@@ -14072,40 +12771,36 @@ fn check_invariants(
                 if custodians == 0 || (custodians > 1 && !all_shared) {
                     return Err(CoreError::InvariantViolation);
                 }
-                let pending_is_invalid = pending_reuse.is_some_and(|pending| {
-                    pending.nonce == 0
-                        || pending.binding_generation == 0
-                        || pending.authority_epoch == 0
-                        || pending.catalog_digest != catalog.digest()
-                        || pending.retirement_digest.is_zero()
-                        || pending.reuse_contract.is_zero()
-                        || pending.previous_generation.get().checked_add(1)
-                            != Some(record.generation.get())
-                        || match pending.component {
-                            Some(component) => !state
-                                .composite_effects
+                let pending_is_invalid =
+                    pending_reuse.is_some_and(|pending| {
+                        let Some(pending_catalog) = catalogs.get(pending.catalog_digest) else {
+                            return true;
+                        };
+                        pending.nonce == 0
+                            || pending.authority_epoch == 0
+                            || pending.catalog_digest != pending_catalog.digest()
+                            || state.composite_effects().get(&pending.effect).is_none_or(
+                                |composite| composite.catalog_digest != pending.catalog_digest,
+                            )
+                            || pending.retirement_digest.is_zero()
+                            || pending.reuse_contract.is_zero()
+                            || pending.previous_generation.get().checked_add(1)
+                                != Some(record.generation.get())
+                            || !state
+                                .composite_effects()
                                 .get(&pending.effect)
-                                .and_then(|composite| composite.components.get(&component))
+                                .and_then(|composite| composite.components.get(&pending.component))
                                 .is_some_and(|component| {
                                     component.claims.get(&pending.claim).is_some_and(|claim| {
                                         !claim.retired
                                             && claim.resource == *resource
                                             && claim.resource_generation == record.generation
                                     })
-                                }),
-                            None => !state.estates.get(&pending.effect).is_some_and(|estate| {
-                                estate.claims.get(&pending.claim).is_some_and(|claim| {
-                                    !claim.retired
-                                        && claim.resource == *resource
-                                        && claim.resource_generation == record.generation
                                 })
-                            }),
-                        }
-                });
-                if (expected_resources.get(resource).is_none_or(Vec::is_empty)
-                    && expected_composite_resources
-                        .get(resource)
-                        .is_none_or(Vec::is_empty))
+                    });
+                if expected_composite_resources
+                    .get(resource)
+                    .is_none_or(Vec::is_empty)
                     || active_resource_generations.get(resource) != Some(&record.generation)
                     || active_resource_scopes.get(resource) != Some(&record.scope)
                     || pending_is_invalid
@@ -14114,42 +12809,52 @@ fn check_invariants(
                 }
             }
             ResourcePhase::Retired => {
-                if expected_resources.contains_key(resource)
-                    || expected_composite_resources.contains_key(resource)
-                {
+                if expected_composite_resources.contains_key(resource) {
                     return Err(CoreError::InvariantViolation);
                 }
             }
         }
     }
-    if expected_resources
+    if expected_composite_resources
         .keys()
-        .chain(expected_composite_resources.keys())
-        .any(|resource| !state.resources.contains_key(resource))
+        .any(|resource| !state.resources().contains_key(resource))
     {
         return Err(CoreError::InvariantViolation);
     }
-    for root in state.roots.values() {
-        let crash_state_matches = match root.state {
-            RootRecoveryState::Fenced {
+    for operation in state.recovery_operations().values() {
+        let crash_state_matches = match operation.state {
+            OperationRecoveryState::Fenced {
                 crash_generation, ..
             }
-            | RootRecoveryState::RecoveryExhausted {
+            | OperationRecoveryState::RecoveryExhausted {
                 crash_generation, ..
-            } => crash_generation == root.crash_generation,
+            } => crash_generation == operation.crash_generation,
             _ => true,
         };
-        let over_quota_is_exhausted = root.crash_generation <= limits.max_crashes_per_root
-            || matches!(root.state, RootRecoveryState::RecoveryExhausted { .. });
+        let over_quota_is_exhausted = operation.crash_generation
+            <= limits.max_crashes_per_operation
+            || matches!(
+                operation.state,
+                OperationRecoveryState::RecoveryExhausted { .. }
+            );
         if !over_quota_is_exhausted
             || !crash_state_matches
-            || root.last_binding_generation == 0
-            || root.last_incarnation_generation < root.origin.generation()
+            || operation.last_executor.generation() < operation.origin.generation()
         {
             return Err(CoreError::InvariantViolation);
         }
     }
     Ok(())
+}
+
+/// Runs the complete invariant oracle against the exact catalog recorded by
+/// every provider generation and composite effect.
+fn check_invariants_for_catalog_set(
+    catalogs: &CatalogSet,
+    limits: CoreLimits,
+    state: &impl StateAccess,
+) -> Result<(), CoreError> {
+    check_invariants(catalogs, limits, state)
 }
 
 fn verifier_bindings_are_canonical(bindings: &[VerifierBinding]) -> bool {
@@ -14163,53 +12868,46 @@ fn verifier_bindings_are_canonical(bindings: &[VerifierBinding]) -> bool {
 }
 
 fn state_scoped_verifier_binding(
-    state: &State,
+    state: &impl StateAccess,
     effect: EffectId,
-    component: Option<ComponentId>,
+    component: ComponentId,
     verifier: VerifierId,
     receipt_schema: ReceiptSchemaId,
-) -> Result<Option<VerifierBinding>, CoreError> {
-    let Some(scoped) = state.scoped_composites.get(&effect) else {
-        return Ok(None);
-    };
-    let component = component.ok_or(CoreError::ProviderBindingMismatch)?;
-    let provider = scoped
-        .bindings
-        .get(&component)
-        .ok_or(CoreError::ProviderBindingMismatch)?;
-    let record = state
-        .provider_generations
-        .get(provider)
-        .ok_or(CoreError::UnknownProviderGeneration)?;
-    record
-        .verifier_bindings
-        .iter()
-        .find(|binding| {
-            binding.verifier() == verifier && binding.receipt_schema() == receipt_schema
-        })
-        .copied()
-        .ok_or(CoreError::VerifierSetMismatch)
-        .map(Some)
+) -> Result<VerifierBinding, CoreError> {
+    Ok(
+        state_scoped_verification_scope(state, effect, component, verifier, receipt_schema)?
+            .verifier_binding(),
+    )
 }
 
 fn state_scoped_verification_scope(
-    state: &State,
+    state: &impl StateAccess,
     effect: EffectId,
-    component: Option<ComponentId>,
+    component: ComponentId,
     verifier: VerifierId,
     receipt_schema: ReceiptSchemaId,
-) -> Result<Option<ProviderVerificationScope>, CoreError> {
-    let Some(scoped) = state.scoped_composites.get(&effect) else {
-        return Ok(None);
+) -> Result<ProviderVerificationScope, CoreError> {
+    let Some(scope_source) = state
+        .scoped_composites()
+        .get(&effect)
+        .map(|scoped| (scoped.catalog_digest, &scoped.bindings))
+        .or_else(|| {
+            state
+                .composite_effects()
+                .get(&effect)
+                .and_then(|composite| composite.released_provenance.as_ref())
+                .map(|provenance| (provenance.catalog_digest, &provenance.bindings))
+        })
+    else {
+        return Err(CoreError::UnknownEffect);
     };
-    let component = component.ok_or(CoreError::ProviderBindingMismatch)?;
-    let provider = scoped
-        .bindings
+    let provider = *scope_source
+        .1
         .get(&component)
         .ok_or(CoreError::ProviderBindingMismatch)?;
     let record = state
-        .provider_generations
-        .get(provider)
+        .provider_generations()
+        .get(&provider)
         .ok_or(CoreError::UnknownProviderGeneration)?;
     let binding = record
         .verifier_bindings
@@ -14219,24 +12917,24 @@ fn state_scoped_verification_scope(
         })
         .copied()
         .ok_or(CoreError::VerifierSetMismatch)?;
-    let world = state.world.ok_or(CoreError::InvariantViolation)?;
-    if world != provider.world() || record.catalog_digest.is_zero() {
+    let world = state.world();
+    if world != provider.world() || scope_source.0 != record.catalog_digest {
         return Err(CoreError::ProviderBindingMismatch);
     }
-    Ok(Some(ProviderVerificationScope::new(
+    Ok(ProviderVerificationScope::new(
         world,
-        *provider,
-        scoped.operation,
+        provider,
+        effect.operation(),
         record.catalog_digest,
         binding,
-    )))
+    ))
 }
 
 fn validate_state_verification_scope(
-    state: &State,
+    state: &impl StateAccess,
     effect: EffectId,
-    component: Option<ComponentId>,
-    provided: Option<ProviderVerificationScope>,
+    component: ComponentId,
+    provided: ProviderVerificationScope,
     verifier: VerifierId,
     receipt_schema: ReceiptSchemaId,
 ) -> Result<(), CoreError> {
@@ -14249,9 +12947,9 @@ fn validate_state_verification_scope(
 }
 
 fn validate_state_verifier_identity(
-    state: &State,
+    state: &impl StateAccess,
     effect: EffectId,
-    component: Option<ComponentId>,
+    component: ComponentId,
     identity: VerifierIdentity,
     verifier: VerifierId,
     receipt_schema: ReceiptSchemaId,
@@ -14262,18 +12960,12 @@ fn validate_state_verifier_identity(
     if identity.receipt_schema() != receipt_schema {
         return Err(CoreError::ReceiptSchemaMismatch);
     }
-    if let Some(binding) =
-        state_scoped_verifier_binding(state, effect, component, verifier, receipt_schema)?
-    {
-        if identity.implementation_digest() != Some(binding.implementation_digest()) {
-            return Err(CoreError::UnknownVerifier);
-        }
-        if identity.epoch() != binding.generation().get() {
-            return Err(CoreError::StaleVerifierEpoch);
-        }
-        return Ok(());
+    let binding =
+        state_scoped_verifier_binding(state, effect, component, verifier, receipt_schema)?;
+    if identity.implementation_digest() != binding.implementation_digest() {
+        return Err(CoreError::UnknownVerifier);
     }
-    if state.verifier_epochs.get(&verifier).copied() != Some(identity.epoch()) {
+    if identity.epoch() != binding.generation().get() {
         return Err(CoreError::StaleVerifierEpoch);
     }
     Ok(())
@@ -14281,12 +12973,12 @@ fn validate_state_verifier_identity(
 
 fn retirement_contract_digest(
     catalog_digest: Digest,
-    state: &State,
+    state: &impl StateAccess,
     resource: ResourceId,
     generation: ResourceGeneration,
 ) -> Result<Digest, CoreError> {
     let record = state
-        .resources
+        .resources()
         .get(&resource)
         .ok_or(CoreError::UnknownResource)?;
     if record.generation != generation || record.phase != ResourcePhase::Retired {
@@ -14294,14 +12986,7 @@ fn retirement_contract_digest(
     }
 
     let mut claims = Vec::new();
-    for (effect, estate) in &state.estates {
-        for claim in estate.claims.values() {
-            if claim.resource == resource && claim.resource_generation == generation {
-                claims.push((*effect, None, claim));
-            }
-        }
-    }
-    for (effect, composite) in &state.composite_effects {
+    for (effect, composite) in state.composite_effects() {
         for (component, record) in &composite.components {
             for claim in record.claims.values() {
                 if claim.resource == resource && claim.resource_generation == generation {
@@ -14330,7 +13015,7 @@ fn retirement_contract_digest(
     hash_claim_scope(&mut hasher, record.scope);
     hasher.update((claims.len() as u64).to_le_bytes());
     for (effect, component, claim) in claims {
-        hasher.update(effect.root().get().to_le_bytes());
+        hasher.update(effect.operation().get().to_le_bytes());
         hasher.update(effect.sequence().to_le_bytes());
         hash_optional_component(&mut hasher, component);
         hasher.update(claim.id.get().to_le_bytes());
@@ -14350,7 +13035,7 @@ fn retirement_contract_digest(
             let accepted = requirement.accepted.ok_or(CoreError::InvariantViolation)?;
             hash_freshness(&mut hasher, accepted.subject);
             hash_freshness(&mut hasher, accepted.observation);
-            hash_optional_provider_verification_scope(&mut hasher, accepted.verification_scope);
+            hash_provider_verification_scope(&mut hasher, accepted.verification_scope);
             hash_verifier_stamp(&mut hasher, accepted.stamp);
         }
     }
@@ -14358,35 +13043,26 @@ fn retirement_contract_digest(
 }
 
 #[allow(dead_code)]
-fn legacy_projection_digest(state: &State, catalog: Digest) -> Digest {
+fn full_projection_digest(state: &impl StateAccess, catalog: Digest) -> Digest {
     let mut hasher = Sha256::new();
-    hasher.update(b"nexus.cser.projection.v6");
+    hasher.update(b"nexus.cser.projection.v10");
     hasher.update(crate::CSER_CORE_API_PROFILE_VERSION.to_le_bytes());
     hasher.update(crate::PROJECTION_VERSION.to_le_bytes());
     hasher.update(crate::JOURNAL_SCHEMA_VERSION.to_le_bytes());
     hasher.update(catalog.bytes());
-    hasher.update(state.revision.to_le_bytes());
-    hasher.update(state.head.bytes());
-    hash_freshness(&mut hasher, state.freshness);
-    hasher.update(state.next_nonce.to_le_bytes());
-    if state.world.is_some()
-        || !state.provider_high_water.is_empty()
-        || !state.provider_generations.is_empty()
-        || !state.scoped_composites.is_empty()
+    hasher.update(state.revision().to_le_bytes());
+    hasher.update(state.head().bytes());
+    hash_freshness(&mut hasher, state.freshness());
+    hasher.update(state.next_nonce().to_le_bytes());
     {
-        match state.world {
-            Some(world) => {
-                hasher.update([1]);
-                hasher.update(world.get().to_le_bytes());
-            }
-            None => hasher.update([0]),
-        }
-        for (provider, high) in &state.provider_high_water {
+        hasher.update([1]);
+        hasher.update(state.world().get().to_le_bytes());
+        for (provider, high) in state.provider_high_water() {
             hasher.update(provider.get().to_le_bytes());
             hasher.update(high.get().to_le_bytes());
         }
         hasher.update([0xf0]);
-        for (coordinate, record) in &state.provider_generations {
+        for (coordinate, record) in state.provider_generations() {
             hasher.update(coordinate.world().get().to_le_bytes());
             hasher.update(coordinate.provider().get().to_le_bytes());
             hasher.update(coordinate.generation().get().to_le_bytes());
@@ -14409,10 +13085,9 @@ fn legacy_projection_digest(state: &State, catalog: Digest) -> Digest {
             hasher.update((record.live_component_bindings as u64).to_le_bytes());
         }
         hasher.update([0xf1]);
-        for (effect, scoped) in &state.scoped_composites {
-            hasher.update(effect.root().get().to_le_bytes());
+        for (effect, scoped) in state.scoped_composites() {
+            hasher.update(effect.operation().get().to_le_bytes());
             hasher.update(effect.sequence().to_le_bytes());
-            hasher.update(scoped.operation.get().to_le_bytes());
             hasher.update((scoped.bindings.len() as u64).to_le_bytes());
             for (component, provider) in &scoped.bindings {
                 hasher.update(component.get().to_le_bytes());
@@ -14428,97 +13103,28 @@ fn legacy_projection_digest(state: &State, catalog: Digest) -> Digest {
             }
         }
         hasher.update([0xf2]);
-        hasher.update((state.artifact_leases.len() as u64).to_le_bytes());
-        for (artifact, lease) in &state.artifact_leases {
+        hasher.update((state.artifact_leases().len() as u64).to_le_bytes());
+        for (artifact, lease) in state.artifact_leases() {
             hasher.update(artifact.get().to_le_bytes());
             hash_artifact_lease(&mut hasher, *lease);
         }
         hasher.update([0xf4]);
     }
-    hasher.update([u8::from(state.recovery_target.is_some())]);
-    if let Some(target) = state.recovery_target {
+    hasher.update([u8::from(state.recovery_target().is_some())]);
+    if let Some(target) = state.recovery_target() {
         hash_freshness(&mut hasher, target);
     }
-    for (root_id, root) in &state.roots {
-        hasher.update(root_id.get().to_le_bytes());
-        hash_incarnation(&mut hasher, root.origin);
-        hasher.update(root.last_binding_generation.to_le_bytes());
-        hasher.update(root.last_incarnation_generation.to_le_bytes());
-        hasher.update(root.crash_generation.to_le_bytes());
-        hash_root_state(&mut hasher, root.state);
+    for (operation_id, operation) in state.recovery_operations() {
+        hasher.update(operation_id.get().to_le_bytes());
+        hash_incarnation(&mut hasher, operation.origin);
+        hash_incarnation(&mut hasher, operation.last_executor);
+        hasher.update(operation.crash_generation.to_le_bytes());
+        hash_operation_state(&mut hasher, operation.state);
     }
     hasher.update([0xfe]);
-    for (effect_id, estate) in &state.estates {
-        hasher.update(effect_id.root().get().to_le_bytes());
-        hasher.update(effect_id.sequence().to_le_bytes());
-        hash_incarnation(&mut hasher, estate.causal_owner);
-        hash_custody(&mut hasher, estate.custodian);
-        hasher.update(estate.charge_owner.get().to_le_bytes());
-        hasher.update(estate.domain.get().to_le_bytes());
-        hasher.update(estate.obligation.get().to_le_bytes());
-        hasher.update([estate.obligation_policy.tag()]);
-        hasher.update(estate.authority_epoch.to_le_bytes());
-        hasher.update([
-            authority_tag(estate.authority),
-            commit_tag(estate.commit),
-            retirement_tag(estate.retirement),
-        ]);
-        hash_outcome(&mut hasher, estate.outcome);
-        hash_settlement(&mut hasher, estate.settlement);
-        hash_optional_u64(&mut hasher, estate.commit_nonce);
-        hash_optional_digest(&mut hasher, estate.commit_operation);
-        hash_optional_effect_fact(&mut hasher, estate.commit_fact);
-        hash_optional_u64(&mut hasher, estate.settlement_nonce);
-        hasher.update([estate.claim_stage.map(claim_stage_tag).unwrap_or(0)]);
-        hash_optional_digest(&mut hasher, estate.settlement_intent);
-        hash_optional_effect_fact(&mut hasher, estate.applied_fact);
-        hash_optional_effect_fact(&mut hasher, estate.settlement_fact);
-        for (claim_id, claim) in &estate.claims {
-            hasher.update(claim_id.get().to_le_bytes());
-            hasher.update(claim.domain.get().to_le_bytes());
-            hasher.update(claim.kind.get().to_le_bytes());
-            hasher.update(claim.credit_class.get().to_le_bytes());
-            hash_claim_scope(&mut hasher, claim.scope);
-            hasher.update(claim.resource.get().to_le_bytes());
-            hasher.update(claim.resource_generation.get().to_le_bytes());
-            hasher.update(claim.units.to_le_bytes());
-            hash_freshness(&mut hasher, claim.enrolled_freshness);
-            hasher.update([u8::from(claim.retired)]);
-            for requirement in &claim.requirements {
-                hasher.update(requirement.kind.get().to_le_bytes());
-                hasher.update(requirement.verifier.get().to_le_bytes());
-                hasher.update(requirement.receipt_schema.get().to_le_bytes());
-                hasher.update([requirement.subject_freshness.bits()]);
-                hasher.update([requirement.observation_freshness.bits()]);
-                hasher.update([requirement.strictly_advanced.bits()]);
-                hasher.update([match requirement.device_generation {
-                    DeviceGenerationEffect::None => 1,
-                    DeviceGenerationEffect::AdvanceOne => 2,
-                }]);
-                hasher.update(
-                    requirement
-                        .prerequisite
-                        .map(EvidenceKindId::get)
-                        .unwrap_or(0)
-                        .to_le_bytes(),
-                );
-                hasher.update([u8::from(requirement.accepted.is_some())]);
-                if let Some(accepted) = requirement.accepted {
-                    hash_freshness(&mut hasher, accepted.subject);
-                    hash_freshness(&mut hasher, accepted.observation);
-                    hash_optional_provider_verification_scope(
-                        &mut hasher,
-                        accepted.verification_scope,
-                    );
-                    hash_verifier_stamp(&mut hasher, accepted.stamp);
-                }
-            }
-        }
-        hasher.update([0xfd]);
-    }
     hasher.update([0xf9]);
-    for (effect_id, composite) in &state.composite_effects {
-        hasher.update(effect_id.root().get().to_le_bytes());
+    for (effect_id, composite) in state.composite_effects() {
+        hasher.update(effect_id.operation().get().to_le_bytes());
         hasher.update(effect_id.sequence().to_le_bytes());
         hasher.update(composite.kind.get().to_le_bytes());
         hash_incarnation(&mut hasher, composite.causal_owner);
@@ -14535,20 +13141,24 @@ fn legacy_projection_digest(state: &State, catalog: Digest) -> Digest {
                 descriptor,
                 terminal_receipt_digest,
                 descriptor_receipt_digest,
+                recovery_fact,
             } => {
                 hasher.update([1]);
                 hasher.update(handoff_descriptor_digest(**descriptor).bytes());
                 hasher.update(terminal_receipt_digest.bytes());
                 hasher.update(descriptor_receipt_digest.bytes());
+                hash_optional_handoff_recovery_fact(&mut hasher, *recovery_fact);
             }
             SingleHopRole::Target {
                 parent,
                 descriptor_digest,
+                recovery_fact,
             } => {
                 hasher.update([2]);
-                hasher.update(parent.root().get().to_le_bytes());
+                hasher.update(parent.operation().get().to_le_bytes());
                 hasher.update(parent.sequence().to_le_bytes());
                 hasher.update(descriptor_digest.bytes());
+                hash_optional_handoff_recovery_fact(&mut hasher, *recovery_fact);
             }
         }
         for (component_id, component) in &composite.components {
@@ -14603,10 +13213,7 @@ fn legacy_projection_digest(state: &State, catalog: Digest) -> Digest {
                     if let Some(accepted) = requirement.accepted {
                         hash_freshness(&mut hasher, accepted.subject);
                         hash_freshness(&mut hasher, accepted.observation);
-                        hash_optional_provider_verification_scope(
-                            &mut hasher,
-                            accepted.verification_scope,
-                        );
+                        hash_provider_verification_scope(&mut hasher, accepted.verification_scope);
                         hash_verifier_stamp(&mut hasher, accepted.stamp);
                     }
                 }
@@ -14616,7 +13223,7 @@ fn legacy_projection_digest(state: &State, catalog: Digest) -> Digest {
         hasher.update([0xf7]);
     }
     hasher.update([0xfc]);
-    for (resource, record) in &state.resources {
+    for (resource, record) in state.resources() {
         hasher.update(resource.get().to_le_bytes());
         hash_claim_scope(&mut hasher, record.scope);
         hasher.update(record.generation.get().to_le_bytes());
@@ -14624,11 +13231,10 @@ fn legacy_projection_digest(state: &State, catalog: Digest) -> Digest {
             ResourcePhase::Claimed { pending_reuse } => {
                 hasher.update([1, u8::from(pending_reuse.is_some())]);
                 if let Some(pending) = pending_reuse {
-                    hasher.update(pending.effect.root().get().to_le_bytes());
+                    hasher.update(pending.effect.operation().get().to_le_bytes());
                     hasher.update(pending.effect.sequence().to_le_bytes());
-                    hash_optional_component(&mut hasher, pending.component);
+                    hash_component(&mut hasher, pending.component);
                     hash_incarnation(&mut hasher, pending.actor);
-                    hasher.update(pending.binding_generation.to_le_bytes());
                     hasher.update(pending.authority_epoch.to_le_bytes());
                     hasher.update(pending.claim.get().to_le_bytes());
                     hasher.update(pending.previous_generation.get().to_le_bytes());
@@ -14643,15 +13249,10 @@ fn legacy_projection_digest(state: &State, catalog: Digest) -> Digest {
         }
     }
     hasher.update([0xfb]);
-    for (scope, generation) in &state.device_generations {
+    for (scope, generation) in state.device_generations() {
         hasher.update(scope.get().to_le_bytes());
         hasher.update(generation.get().to_le_bytes());
-        hasher.update([u8::from(state.device_quarantine.contains(scope))]);
-    }
-    hasher.update([0xfa]);
-    for (verifier, epoch) in &state.verifier_epochs {
-        hasher.update(verifier.get().to_le_bytes());
-        hasher.update(epoch.to_le_bytes());
+        hasher.update([u8::from(state.device_quarantine().contains(scope))]);
     }
     Digest::new(hasher.finalize().into())
 }
@@ -14663,12 +13264,10 @@ const LEAF_PROVIDER_HIGH_WATER: u8 = 1;
 const LEAF_PROVIDER_RECORD: u8 = 2;
 const LEAF_SCOPED_EFFECT: u8 = 3;
 const LEAF_ARTIFACT_LEASE: u8 = 4;
-const LEAF_ROOT: u8 = 5;
-const LEAF_ESTATE: u8 = 6;
+const LEAF_OPERATION: u8 = 5;
 const LEAF_COMPOSITE: u8 = 7;
 const LEAF_RESOURCE: u8 = 8;
 const LEAF_DEVICE: u8 = 9;
-const LEAF_VERIFIER_EPOCH: u8 = 10;
 
 fn projection_record_digest(tag: &[u8], write: impl FnOnce(&mut Sha256)) -> Digest {
     let mut hasher = Sha256::new();
@@ -14693,7 +13292,7 @@ fn projection_key_u64(value: u64) -> [u8; 8] {
 
 fn projection_key_effect(effect: EffectId) -> [u8; 16] {
     let mut key = [0; 16];
-    key[..8].copy_from_slice(&effect.root().get().to_le_bytes());
+    key[..8].copy_from_slice(&effect.operation().get().to_le_bytes());
     key[8..].copy_from_slice(&effect.sequence().to_le_bytes());
     key
 }
@@ -14731,9 +13330,10 @@ fn hash_provider_record(record: &ProviderGenerationRecord) -> Digest {
     })
 }
 
-fn hash_scoped_record(record: &ScopedCompositeRecord) -> Digest {
+fn hash_scoped_record(effect: EffectId, record: &ScopedCompositeRecord) -> Digest {
     projection_record_digest(b"scoped", |hasher| {
-        hasher.update(record.operation.get().to_le_bytes());
+        hasher.update(effect.operation().get().to_le_bytes());
+        hasher.update(record.catalog_digest.bytes());
         hasher.update((record.bindings.len() as u64).to_le_bytes());
         for (component, provider) in &record.bindings {
             hasher.update(component.get().to_le_bytes());
@@ -14749,13 +13349,12 @@ fn hash_scoped_record(record: &ScopedCompositeRecord) -> Digest {
     })
 }
 
-fn hash_root_record(record: &RootRecord) -> Digest {
-    projection_record_digest(b"root", |hasher| {
+fn hash_operation_record(record: &CompositeRecoveryRecord) -> Digest {
+    projection_record_digest(b"operation", |hasher| {
         hash_incarnation(hasher, record.origin);
-        hasher.update(record.last_binding_generation.to_le_bytes());
-        hasher.update(record.last_incarnation_generation.to_le_bytes());
+        hash_incarnation(hasher, record.last_executor);
         hasher.update(record.crash_generation.to_le_bytes());
-        hash_root_state(hasher, record.state);
+        hash_operation_state(hasher, record.state);
     })
 }
 
@@ -14782,7 +13381,7 @@ fn hash_requirement_record(requirement: &RequirementState, hasher: &mut Sha256) 
             hasher.update([1]);
             hash_freshness(hasher, accepted.subject);
             hash_freshness(hasher, accepted.observation);
-            hash_optional_provider_verification_scope(hasher, accepted.verification_scope);
+            hash_provider_verification_scope(hasher, accepted.verification_scope);
             hash_verifier_stamp(hasher, accepted.stamp);
         }
         None => hasher.update([0]),
@@ -14804,40 +13403,6 @@ fn hash_claim_record(claim: &ClaimRecord, hasher: &mut Sha256) {
     for requirement in &claim.requirements {
         hash_requirement_record(requirement, hasher);
     }
-}
-
-fn hash_estate_record(record: &EstateRecord) -> Digest {
-    projection_record_digest(b"estate", |hasher| {
-        hasher.update(record.effect.root().get().to_le_bytes());
-        hasher.update(record.effect.sequence().to_le_bytes());
-        hash_incarnation(hasher, record.causal_owner);
-        hash_custody(hasher, record.custodian);
-        hasher.update(record.charge_owner.get().to_le_bytes());
-        hasher.update(record.domain.get().to_le_bytes());
-        hasher.update(record.obligation.get().to_le_bytes());
-        hasher.update([record.obligation_policy.tag()]);
-        hasher.update(record.authority_epoch.to_le_bytes());
-        hasher.update([
-            authority_tag(record.authority),
-            commit_tag(record.commit),
-            retirement_tag(record.retirement),
-        ]);
-        hash_outcome(hasher, record.outcome);
-        hash_settlement(hasher, record.settlement);
-        hash_optional_u64(hasher, record.commit_nonce);
-        hash_optional_digest(hasher, record.commit_operation);
-        hash_optional_effect_fact(hasher, record.commit_fact);
-        hash_optional_u64(hasher, record.settlement_nonce);
-        hasher.update([record.claim_stage.map(claim_stage_tag).unwrap_or(0)]);
-        hash_optional_digest(hasher, record.settlement_intent);
-        hash_optional_effect_fact(hasher, record.applied_fact);
-        hash_optional_effect_fact(hasher, record.settlement_fact);
-        hasher.update((record.claims.len() as u64).to_le_bytes());
-        for (claim_id, claim) in &record.claims {
-            hasher.update(claim_id.get().to_le_bytes());
-            hash_claim_record(claim, hasher);
-        }
-    })
 }
 
 fn hash_component_record(record: &ComponentRecord, hasher: &mut Sha256) {
@@ -14868,9 +13433,10 @@ fn hash_component_record(record: &ComponentRecord, hasher: &mut Sha256) {
 
 fn hash_composite_record(record: &CompositeEffectRecord) -> Digest {
     projection_record_digest(b"composite", |hasher| {
-        hasher.update(record.effect.root().get().to_le_bytes());
+        hasher.update(record.effect.operation().get().to_le_bytes());
         hasher.update(record.effect.sequence().to_le_bytes());
         hasher.update(record.kind.get().to_le_bytes());
+        hasher.update(record.catalog_digest.bytes());
         hash_incarnation(hasher, record.causal_owner);
         hash_custody(hasher, record.custodian);
         hasher.update(record.charge_owner.get().to_le_bytes());
@@ -14885,21 +13451,31 @@ fn hash_composite_record(record: &CompositeEffectRecord) -> Digest {
                 descriptor,
                 terminal_receipt_digest,
                 descriptor_receipt_digest,
+                recovery_fact,
             } => {
                 hasher.update([1]);
                 hasher.update(handoff_descriptor_digest(**descriptor).bytes());
                 hasher.update(terminal_receipt_digest.bytes());
                 hasher.update(descriptor_receipt_digest.bytes());
+                hash_optional_handoff_recovery_fact(hasher, *recovery_fact);
             }
             SingleHopRole::Target {
                 parent,
                 descriptor_digest,
+                recovery_fact,
             } => {
                 hasher.update([2]);
-                hasher.update(parent.root().get().to_le_bytes());
+                hasher.update(parent.operation().get().to_le_bytes());
                 hasher.update(parent.sequence().to_le_bytes());
                 hasher.update(descriptor_digest.bytes());
+                hash_optional_handoff_recovery_fact(hasher, *recovery_fact);
             }
+        }
+        if let Some(provenance) = &record.released_provenance {
+            // Absence preserves the pre-provenance encoding for every live
+            // composite. Released provenance is an additive terminal suffix.
+            hasher.update(b"released-provenance-v1");
+            hash_released_provenance(hasher, provenance);
         }
         hasher.update((record.components.len() as u64).to_le_bytes());
         for (component_id, component) in &record.components {
@@ -14907,6 +13483,22 @@ fn hash_composite_record(record: &CompositeEffectRecord) -> Digest {
             hash_component_record(component, hasher);
         }
     })
+}
+
+fn hash_released_provenance(hasher: &mut Sha256, provenance: &ReleasedCompositeProvenance) {
+    hasher.update(provenance.catalog_digest.bytes());
+    hasher.update((provenance.bindings.len() as u64).to_le_bytes());
+    for (component, provider) in &provenance.bindings {
+        hasher.update(component.get().to_le_bytes());
+        hasher.update(provider.world().get().to_le_bytes());
+        hasher.update(provider.provider().get().to_le_bytes());
+        hasher.update(provider.generation().get().to_le_bytes());
+    }
+    hasher.update((provenance.artifacts.len() as u64).to_le_bytes());
+    for (component, binding) in &provenance.artifacts {
+        hasher.update(component.get().to_le_bytes());
+        hash_artifact_binding(hasher, *binding);
+    }
 }
 
 fn hash_resource_record(record: &ResourceRecord) -> Digest {
@@ -14917,11 +13509,10 @@ fn hash_resource_record(record: &ResourceRecord) -> Digest {
             ResourcePhase::Claimed { pending_reuse } => {
                 hasher.update([1, u8::from(pending_reuse.is_some())]);
                 if let Some(pending) = pending_reuse {
-                    hasher.update(pending.effect.root().get().to_le_bytes());
+                    hasher.update(pending.effect.operation().get().to_le_bytes());
                     hasher.update(pending.effect.sequence().to_le_bytes());
-                    hash_optional_component(hasher, pending.component);
+                    hash_component(hasher, pending.component);
                     hash_incarnation(hasher, pending.actor);
-                    hasher.update(pending.binding_generation.to_le_bytes());
                     hasher.update(pending.authority_epoch.to_le_bytes());
                     hasher.update(pending.claim.get().to_le_bytes());
                     hasher.update(pending.previous_generation.get().to_le_bytes());
@@ -14950,19 +13541,13 @@ fn hash_device_record(generation: Option<DeviceGeneration>, quarantined: bool) -
     })
 }
 
-fn hash_verifier_epoch(epoch: u64) -> Digest {
-    projection_record_digest(b"verifier-epoch", |hasher| {
-        hasher.update(epoch.to_le_bytes());
-    })
-}
-
 fn insert_projection_leaf(leaves: &mut AuthenticatedMap, category: u8, key: &[u8], value: Digest) {
     let _ = leaves.insert_mut(projection_leaf_key(category, key), value);
 }
 
-fn build_projection_cache(state: &State, catalog: Digest) -> ProjectionCache {
+fn build_projection_cache(state: &impl StateAccess, catalog: Digest) -> ProjectionCache {
     let mut leaves = AuthenticatedMap::new();
-    for (provider, generation) in &state.provider_high_water {
+    for (provider, generation) in state.provider_high_water() {
         insert_projection_leaf(
             &mut leaves,
             LEAF_PROVIDER_HIGH_WATER,
@@ -14972,7 +13557,7 @@ fn build_projection_cache(state: &State, catalog: Digest) -> ProjectionCache {
             }),
         );
     }
-    for (coordinate, record) in &state.provider_generations {
+    for (coordinate, record) in state.provider_generations() {
         insert_projection_leaf(
             &mut leaves,
             LEAF_PROVIDER_RECORD,
@@ -14980,15 +13565,15 @@ fn build_projection_cache(state: &State, catalog: Digest) -> ProjectionCache {
             hash_provider_record(record),
         );
     }
-    for (effect, record) in &state.scoped_composites {
+    for (effect, record) in state.scoped_composites() {
         insert_projection_leaf(
             &mut leaves,
             LEAF_SCOPED_EFFECT,
             &projection_key_effect(*effect),
-            hash_scoped_record(record),
+            hash_scoped_record(*effect, record),
         );
     }
-    for (artifact, lease) in &state.artifact_leases {
+    for (artifact, lease) in state.artifact_leases() {
         insert_projection_leaf(
             &mut leaves,
             LEAF_ARTIFACT_LEASE,
@@ -14998,23 +13583,15 @@ fn build_projection_cache(state: &State, catalog: Digest) -> ProjectionCache {
             }),
         );
     }
-    for (root, record) in &state.roots {
+    for (operation, record) in state.recovery_operations() {
         insert_projection_leaf(
             &mut leaves,
-            LEAF_ROOT,
-            &projection_key_u64(root.get()),
-            hash_root_record(record),
+            LEAF_OPERATION,
+            &projection_key_u64(operation.get()),
+            hash_operation_record(record),
         );
     }
-    for (effect, record) in &state.estates {
-        insert_projection_leaf(
-            &mut leaves,
-            LEAF_ESTATE,
-            &projection_key_effect(*effect),
-            hash_estate_record(record),
-        );
-    }
-    for (effect, record) in &state.composite_effects {
+    for (effect, record) in state.composite_effects() {
         insert_projection_leaf(
             &mut leaves,
             LEAF_COMPOSITE,
@@ -15022,7 +13599,7 @@ fn build_projection_cache(state: &State, catalog: Digest) -> ProjectionCache {
             hash_composite_record(record),
         );
     }
-    for (resource, record) in &state.resources {
+    for (resource, record) in state.resources() {
         insert_projection_leaf(
             &mut leaves,
             LEAF_RESOURCE,
@@ -15030,49 +13607,36 @@ fn build_projection_cache(state: &State, catalog: Digest) -> ProjectionCache {
             hash_resource_record(record),
         );
     }
-    let mut device_scopes = state.device_quarantine.clone();
-    device_scopes.extend(state.device_generations.keys().copied());
+    let mut device_scopes = state.device_quarantine().clone();
+    device_scopes.extend(state.device_generations().keys().copied());
     for scope in &device_scopes {
         insert_projection_leaf(
             &mut leaves,
             LEAF_DEVICE,
             &projection_key_u64(scope.get()),
             hash_device_record(
-                state.device_generations.get(scope).copied(),
-                state.device_quarantine.contains(scope),
+                state.device_generations().get(scope).copied(),
+                state.device_quarantine().contains(scope),
             ),
-        );
-    }
-    for (verifier, epoch) in &state.verifier_epochs {
-        insert_projection_leaf(
-            &mut leaves,
-            LEAF_VERIFIER_EPOCH,
-            &projection_key_u64(verifier.get().into()),
-            hash_verifier_epoch(*epoch),
         );
     }
     ProjectionCache::from_leaves(state, catalog, leaves)
 }
 
-fn projection_envelope(state: &State, catalog: Digest, leaves_root: Digest) -> Digest {
+fn projection_envelope(state: &impl StateAccess, catalog: Digest, leaves_root: Digest) -> Digest {
     let mut hasher = Sha256::new();
-    hasher.update(b"nexus.cser.projection.v6");
+    hasher.update(b"nexus.cser.projection.v10");
     hasher.update(crate::CSER_CORE_API_PROFILE_VERSION.to_le_bytes());
     hasher.update(crate::PROJECTION_VERSION.to_le_bytes());
     hasher.update(crate::JOURNAL_SCHEMA_VERSION.to_le_bytes());
     hasher.update(catalog.bytes());
-    hasher.update(state.revision.to_le_bytes());
-    hasher.update(state.head.bytes());
-    hash_freshness(&mut hasher, state.freshness);
-    hasher.update(state.next_nonce.to_le_bytes());
-    match state.world {
-        Some(world) => {
-            hasher.update([1]);
-            hasher.update(world.get().to_le_bytes());
-        }
-        None => hasher.update([0]),
-    }
-    match state.recovery_target {
+    hasher.update(state.revision().to_le_bytes());
+    hasher.update(state.head().bytes());
+    hash_freshness(&mut hasher, state.freshness());
+    hasher.update(state.next_nonce().to_le_bytes());
+    hasher.update([1]);
+    hasher.update(state.world().get().to_le_bytes());
+    match state.recovery_target() {
         Some(target) => {
             hasher.update([1]);
             hash_freshness(&mut hasher, target);
@@ -15089,264 +13653,58 @@ struct ProjectionTouches {
     provider_generations: BTreeSet<ProviderCoordinate>,
     scoped_composites: BTreeSet<EffectId>,
     artifact_leases: BTreeSet<crate::RecoveryArtifactId>,
-    unpinned_artifact_removals: BTreeSet<crate::RecoveryArtifactId>,
-    roots: BTreeSet<RootId>,
-    estates: BTreeSet<EffectId>,
+    operations: BTreeSet<OperationId>,
     composites: BTreeSet<EffectId>,
     resources: BTreeSet<ResourceId>,
     devices: BTreeSet<DeviceScopeId>,
-    verifier_epochs: BTreeSet<VerifierId>,
 }
 
-fn touch_effect_coordinates(state: &State, effect: EffectId, touches: &mut ProjectionTouches) {
-    touches.roots.insert(effect.root());
-    if let Some(estate) = state.estates.get(&effect) {
-        touches.estates.insert(effect);
-        for claim in estate.claims.values() {
-            touches.resources.insert(claim.resource);
-            if let ClaimScope::Device(scope) = claim.scope {
-                touches.devices.insert(scope);
-            }
-        }
-    }
-    if let Some(composite) = state.composite_effects.get(&effect) {
-        touches.composites.insert(effect);
-        for component in composite.components.values() {
-            for claim in component.claims.values() {
-                touches.resources.insert(claim.resource);
-                if let ClaimScope::Device(scope) = claim.scope {
-                    touches.devices.insert(scope);
-                }
-            }
-        }
-    }
-    if let Some(scoped) = state.scoped_composites.get(&effect) {
-        touches.scoped_composites.insert(effect);
-        for provider in scoped.bindings.values() {
-            touches.provider_generations.insert(*provider);
-        }
-        for binding in scoped.artifacts.values() {
-            touches.artifact_leases.insert(binding.artifact_id());
-        }
-    }
-}
-
-fn touch_all_projection_records(state: &State, touches: &mut ProjectionTouches) {
+fn touch_all_projection_records(state: &impl StateAccess, touches: &mut ProjectionTouches) {
     touches
         .provider_high_water
-        .extend(state.provider_high_water.keys().copied());
+        .extend(state.provider_high_water().keys().copied());
     touches
         .provider_generations
-        .extend(state.provider_generations.keys().copied());
+        .extend(state.provider_generations().keys().copied());
     touches
         .scoped_composites
-        .extend(state.scoped_composites.keys().copied());
+        .extend(state.scoped_composites().keys().copied());
     touches
         .artifact_leases
-        .extend(state.artifact_leases.keys().copied());
-    touches.roots.extend(state.roots.keys().copied());
-    touches.estates.extend(state.estates.keys().copied());
+        .extend(state.artifact_leases().keys().copied());
+    touches
+        .operations
+        .extend(state.recovery_operations().keys().copied());
     touches
         .composites
-        .extend(state.composite_effects.keys().copied());
-    touches.resources.extend(state.resources.keys().copied());
+        .extend(state.composite_effects().keys().copied());
+    touches.resources.extend(state.resources().keys().copied());
     touches
         .devices
-        .extend(state.device_generations.keys().copied());
+        .extend(state.device_generations().keys().copied());
     touches
         .devices
-        .extend(state.device_quarantine.iter().copied());
-    touches
-        .verifier_epochs
-        .extend(state.verifier_epochs.keys().copied());
-}
-
-fn touch_root_projection_records(state: &State, root: RootId, touches: &mut ProjectionTouches) {
-    touches.roots.insert(root);
-    if let Some(effects) = state.root_effects.get(&root) {
-        for effect in effects {
-            touch_effect_coordinates(state, *effect, touches);
-        }
-    }
-}
-
-fn collect_projection_touches(
-    previous: &State,
-    candidate: &State,
-    command: &CommandKind,
-) -> ProjectionTouches {
-    let mut touches = ProjectionTouches::default();
-    let mut effect = |id: EffectId| {
-        touch_effect_coordinates(previous, id, &mut touches);
-        touch_effect_coordinates(candidate, id, &mut touches);
-    };
-    match command {
-        CommandKind::RegisterProviderGeneration { coordinate, .. } => {
-            touches.provider_high_water.insert(coordinate.provider());
-            touches.provider_generations.insert(*coordinate);
-        }
-        CommandKind::BindArtifactReceiptVerifiers { coordinate, .. }
-        | CommandKind::FenceProviderEffects { coordinate, .. }
-        | CommandKind::EnterProviderSettlementOnly { coordinate, .. }
-        | CommandKind::RetireProviderEffects { coordinate, .. } => {
-            touches.provider_generations.insert(*coordinate);
-        }
-        CommandKind::RecordArtifactPin { binding, .. }
-        | CommandKind::RecordArtifactRelease { binding, .. } => {
-            effect(binding.effect());
-            touches.artifact_leases.insert(binding.artifact_id());
-        }
-        CommandKind::AuthorizeArtifactRelease { effect: id, .. }
-        | CommandKind::CreateEstate { effect: id, .. }
-        | CommandKind::CreateCompositeEffect { effect: id, .. }
-        | CommandKind::PrepareEffect { effect: id, .. }
-        | CommandKind::PrepareCompositeEffect { effect: id, .. }
-        | CommandKind::RecordCommitIntent { effect: id, .. }
-        | CommandKind::RecordComponentCommitIntent { effect: id, .. }
-        | CommandKind::RecordCompositeCommitIntents { effect: id, .. }
-        | CommandKind::AcknowledgeCommit {
-            fact: VerifiedEffectFact { effect: id, .. },
-        }
-        | CommandKind::AdoptEffect { effect: id, .. }
-        | CommandKind::RebaseCompositePrecommitClaims { effect: id, .. }
-        | CommandKind::ClaimSettlement { effect: id, .. }
-        | CommandKind::ClaimComponentSettlement { effect: id, .. }
-        | CommandKind::RecordApplyIntent { effect: id, .. }
-        | CommandKind::RecordComponentApplyIntent { effect: id, .. }
-        | CommandKind::RecordApplied {
-            fact: VerifiedEffectFact { effect: id, .. },
-        }
-        | CommandKind::Settle {
-            fact: VerifiedEffectFact { effect: id, .. },
-        }
-        | CommandKind::MarkIndeterminate { effect: id, .. }
-        | CommandKind::MarkComponentIndeterminate { effect: id, .. }
-        | CommandKind::BeginRevoke { effect: id, .. }
-        | CommandKind::SubmitEvidence { effect: id, .. }
-        | CommandKind::SubmitComponentEvidence { effect: id, .. }
-        | CommandKind::ReleaseEstate { effect: id }
-        | CommandKind::ReleaseCompositeEffect { effect: id }
-        | CommandKind::ReserveReuse { effect: id, .. }
-        | CommandKind::ReserveComponentReuse { effect: id, .. }
-        | CommandKind::ActivateResourceReuse { effect: id, .. }
-        | CommandKind::ReclaimResourceReuse { effect: id, .. }
-        | CommandKind::AcknowledgeHandoffParent {
-            fact: VerifiedEffectFact { effect: id, .. },
-            ..
-        } => effect(*id),
-        CommandKind::AbortUnescapedEffect { effect: id } => {
-            effect(*id);
-            if let Some(scoped) = previous.scoped_composites.get(id) {
-                for binding in scoped.artifacts.values() {
-                    if !previous
-                        .artifact_leases
-                        .contains_key(&binding.artifact_id())
-                    {
-                        touches
-                            .unpinned_artifact_removals
-                            .insert(binding.artifact_id());
-                    }
-                }
-            }
-        }
-        CommandKind::AddClaim {
-            effect: id,
-            resource,
-            scope,
-            ..
-        }
-        | CommandKind::AddComponentClaim {
-            effect: id,
-            resource,
-            scope,
-            ..
-        } => {
-            effect(*id);
-            touches.resources.insert(*resource);
-            if let ClaimScope::Device(scope) = scope {
-                touches.devices.insert(*scope);
-            }
-        }
-        CommandKind::FenceIncarnation { root, .. } => {
-            touch_root_projection_records(previous, *root, &mut touches);
-            touch_root_projection_records(candidate, *root, &mut touches);
-        }
-        CommandKind::Snapshot { root, .. }
-        | CommandKind::Ready { root, .. }
-        | CommandKind::Rebind { root, .. } => {
-            touches.roots.insert(*root);
-        }
-        CommandKind::CheckpointRecovery { .. } => {
-            touch_all_projection_records(previous, &mut touches);
-            touch_all_projection_records(candidate, &mut touches);
-        }
-        CommandKind::WholeStateCheckpointV1 { .. } => {}
-        CommandKind::AdmitScopedCompositeEffect {
-            effect: id,
-            bindings,
-            ..
-        } => {
-            effect(*id);
-            for binding in bindings {
-                touches.provider_generations.insert(binding.provider());
-            }
-        }
-        CommandKind::InstallHandoffChild { descriptor, .. } => {
-            effect(descriptor.parent);
-            if let Ok(child) = descriptor.child_effect() {
-                effect(child);
-            }
-            touches.resources.insert(descriptor.resource);
-            if let ClaimScope::Device(scope) = descriptor.scope {
-                touches.devices.insert(scope);
-            }
-        }
-        CommandKind::ReleaseHandoffSourceAndRecordTargetIntent { descriptor, .. }
-        | CommandKind::ResolveIndeterminateHandoffParent { descriptor, .. } => {
-            effect(descriptor.parent);
-            if let Ok(child) = descriptor.child_effect() {
-                effect(child);
-            }
-            touches.resources.insert(descriptor.resource);
-            if let ClaimScope::Device(scope) = descriptor.scope {
-                touches.devices.insert(scope);
-            }
-        }
-    }
-    touches
+        .extend(state.device_quarantine().iter().copied());
 }
 
 fn transition_total_claims(
-    previous: &State,
-    candidate: &State,
+    previous: &impl StateAccess,
+    candidate: &impl StateAccess,
     touches: &ProjectionTouches,
 ) -> Result<usize, CoreError> {
     let mut effects = BTreeSet::new();
-    effects.extend(touches.estates.iter().copied());
     effects.extend(touches.composites.iter().copied());
-    let mut total = previous.total_claims;
+    let mut total = previous.total_claims();
     for effect in effects {
         let before = previous
-            .estates
+            .composite_effects()
             .get(&effect)
-            .map(|estate| estate.claims.len())
-            .or_else(|| {
-                previous
-                    .composite_effects
-                    .get(&effect)
-                    .map(|composite| composite.components.values().map(|c| c.claims.len()).sum())
-            })
+            .map(|composite| composite.components.values().map(|c| c.claims.len()).sum())
             .unwrap_or(0);
         let after = candidate
-            .estates
+            .composite_effects()
             .get(&effect)
-            .map(|estate| estate.claims.len())
-            .or_else(|| {
-                candidate
-                    .composite_effects
-                    .get(&effect)
-                    .map(|composite| composite.components.values().map(|c| c.claims.len()).sum())
-            })
+            .map(|composite| composite.components.values().map(|c| c.claims.len()).sum())
             .unwrap_or(0);
         if after >= before {
             total = total
@@ -15367,57 +13725,53 @@ fn transition_total_claims(
 /// `check_invariants` remains the differential oracle in test builds and is
 /// retained at initialization/recovery/checkpoint admission boundaries.
 fn check_transition_local_invariants(
-    catalog: &DomainCatalog,
+    catalog: Option<&DomainCatalog>,
     limits: CoreLimits,
-    previous: &State,
-    candidate: &State,
+    previous: &impl StateAccess,
+    candidate: &impl StateAccess,
     touches: &ProjectionTouches,
 ) -> Result<(), CoreError> {
     let _ = catalog;
-    if candidate.next_nonce == 0
-        || candidate.total_claims > limits.max_total_claims
-        || candidate.roots.len() > limits.max_roots
-        || candidate.estates.len() + candidate.composite_effects.len() > limits.max_estates
-        || candidate.resources.len() > limits.max_resource_records
+    if candidate.next_nonce() == 0
+        || candidate.total_claims() > limits.max_total_claims
+        || candidate.recovery_operations().len() > limits.max_operations
+        || candidate.composite_effects().len() > limits.max_effects
+        || candidate.resources().len() > limits.max_resource_records
     {
         return Err(CoreError::InvariantViolation);
     }
 
-    for root in &touches.roots {
-        if !candidate.roots.contains_key(root) {
+    for operation in &touches.operations {
+        if !candidate.recovery_operations().contains_key(operation) {
             return Err(CoreError::InvariantViolation);
         }
-        if let Some(effects) = candidate.root_effects.get(root) {
-            for effect in effects {
-                if effect.root() != *root
-                    || (!candidate.estates.contains_key(effect)
-                        && !candidate.composite_effects.contains_key(effect))
-                {
-                    return Err(CoreError::InvariantViolation);
-                }
-            }
+        if candidate
+            .composite_effects()
+            .keys()
+            .any(|effect| effect.operation() == *operation)
+            && !candidate.recovery_operations().contains_key(operation)
+        {
+            return Err(CoreError::InvariantViolation);
         }
     }
-    for effect in touches.estates.iter().chain(touches.composites.iter()) {
-        if (!candidate.estates.contains_key(effect)
-            && !candidate.composite_effects.contains_key(effect))
+    for effect in &touches.composites {
+        if !candidate.composite_effects().contains_key(effect)
             || !candidate
-                .root_effects
-                .get(&effect.root())
-                .is_some_and(|effects| effects.contains(effect))
+                .recovery_operations()
+                .contains_key(&effect.operation())
         {
             return Err(CoreError::InvariantViolation);
         }
     }
 
     for provider in &touches.provider_generations {
-        if !candidate.provider_generations.contains_key(provider) {
+        if !candidate.provider_generations().contains_key(provider) {
             return Err(CoreError::InvariantViolation);
         }
     }
     for provider in &touches.provider_high_water {
         if candidate
-            .provider_high_water
+            .provider_high_water()
             .get(provider)
             .is_none_or(|generation| generation.get() == 0)
         {
@@ -15425,12 +13779,12 @@ fn check_transition_local_invariants(
         }
     }
     for effect in &touches.scoped_composites {
-        if candidate.scoped_composites.contains_key(effect) {
+        if candidate.scoped_composites().contains_key(effect) {
             continue;
         }
-        let released = previous.scoped_composites.contains_key(effect)
+        let released = previous.scoped_composites().contains_key(effect)
             && candidate
-                .composite_effects
+                .composite_effects()
                 .get(effect)
                 .is_some_and(|composite| {
                     composite.authority == AuthorityState::Revoked
@@ -15447,7 +13801,7 @@ fn check_transition_local_invariants(
     for artifact in &touches.artifact_leases {
         let admitted_unpinned = touches.scoped_composites.iter().any(|effect| {
             candidate
-                .scoped_composites
+                .scoped_composites()
                 .get(effect)
                 .is_some_and(|scoped| {
                     scoped
@@ -15456,16 +13810,13 @@ fn check_transition_local_invariants(
                         .any(|binding| binding.artifact_id() == *artifact)
                 })
         });
-        if !candidate.artifact_leases.contains_key(artifact)
-            && !admitted_unpinned
-            && !touches.unpinned_artifact_removals.contains(artifact)
-        {
+        if !candidate.artifact_leases().contains_key(artifact) && !admitted_unpinned {
             return Err(CoreError::InvariantViolation);
         }
     }
     for scope in &touches.devices {
-        if candidate.device_quarantine.contains(scope)
-            && candidate.device_generations.get(scope).is_none()
+        if candidate.device_quarantine().contains(scope)
+            && candidate.device_generations().get(scope).is_none()
         {
             return Err(CoreError::InvariantViolation);
         }
@@ -15474,23 +13825,10 @@ fn check_transition_local_invariants(
     // Validate reverse-index references for every touched resource. This is
     // bounded by the custodians of touched resources, not unrelated effects.
     for resource in &touches.resources {
-        if let Some(entries) = candidate.resource_index.get(resource) {
-            for (effect, claim) in entries {
-                let Some(record) = candidate.estates.get(effect) else {
-                    return Err(CoreError::InvariantViolation);
-                };
-                let Some(claim_record) = record.claims.get(claim) else {
-                    return Err(CoreError::InvariantViolation);
-                };
-                if claim_record.retired || claim_record.resource != *resource {
-                    return Err(CoreError::InvariantViolation);
-                }
-            }
-        }
-        if let Some(entries) = candidate.composite_resource_index.get(resource) {
+        if let Some(entries) = candidate.composite_resource_index().get(resource) {
             for (effect, component, claim) in entries {
                 let Some(claim_record) = candidate
-                    .composite_effects
+                    .composite_effects()
                     .get(effect)
                     .and_then(|composite| composite.components.get(component))
                     .and_then(|component| component.claims.get(claim))
@@ -15503,51 +13841,28 @@ fn check_transition_local_invariants(
             }
         }
         let indexed = candidate
-            .resource_index
+            .composite_resource_index()
             .get(resource)
-            .is_some_and(|entries| !entries.is_empty())
-            || candidate
-                .composite_resource_index
-                .get(resource)
-                .is_some_and(|entries| !entries.is_empty());
-        if indexed && !candidate.resources.contains_key(resource) {
+            .is_some_and(|entries| !entries.is_empty());
+        if indexed && !candidate.resources().contains_key(resource) {
             return Err(CoreError::InvariantViolation);
         }
     }
 
     // A touched active claim must have a matching charge and reverse index.
-    // `previous` is also used above to distinguish the one valid scoped-record
-    // deletion (terminal effect release) from index loss.
-    for effect in touches.estates.iter().copied() {
-        if let Some(estate) = candidate.estates.get(&effect) {
-            for claim in estate.claims.values().filter(|claim| !claim.retired) {
-                if candidate
-                    .resource_index
-                    .get(&claim.resource)
-                    .is_none_or(|entries| !entries.contains(&(effect, claim.id)))
-                    || candidate
-                        .charges
-                        .get(&(estate.charge_owner, claim.credit_class))
-                        .is_none_or(|units| *units < claim.units)
-                {
-                    return Err(CoreError::InvariantViolation);
-                }
-            }
-        }
-    }
     for effect in touches.composites.iter().copied() {
-        if let Some(composite) = candidate.composite_effects.get(&effect) {
+        if let Some(composite) = candidate.composite_effects().get(&effect) {
             for component in composite.components.values() {
                 for claim in component.claims.values().filter(|claim| !claim.retired) {
                     if prepared_handoff_target_claim(candidate, composite, component, claim) {
                         continue;
                     }
                     if candidate
-                        .composite_resource_index
+                        .composite_resource_index()
                         .get(&claim.resource)
                         .is_none_or(|entries| !entries.contains(&(effect, component.id, claim.id)))
                         || candidate
-                            .charges
+                            .charges()
                             .get(&(composite.charge_owner, claim.credit_class))
                             .is_none_or(|units| *units < claim.units)
                     {
@@ -15579,19 +13894,18 @@ fn sync_projection_leaf<T>(
 }
 
 fn refresh_projection_cache(
-    previous: &State,
-    candidate: &mut State,
-    command: &CommandKind,
+    previous: &impl StateAccess,
+    candidate: &mut impl StateAccessMut,
+    touches: &ProjectionTouches,
     catalog: Digest,
 ) {
-    let touches = collect_projection_touches(previous, candidate, command);
-    let mut leaves = previous.projection_cache.leaves.clone();
-    for provider in touches.provider_high_water {
+    let mut leaves = previous.projection_cache().leaves.clone();
+    for provider in &touches.provider_high_water {
         sync_projection_leaf(
             &mut leaves,
             LEAF_PROVIDER_HIGH_WATER,
             &projection_key_u64(provider.get()),
-            candidate.provider_high_water.get(&provider),
+            candidate.provider_high_water().get(provider),
             |generation| {
                 projection_record_digest(b"provider-high-water", |hasher| {
                     hasher.update(generation.get().to_le_bytes());
@@ -15599,30 +13913,30 @@ fn refresh_projection_cache(
             },
         );
     }
-    for coordinate in touches.provider_generations {
+    for coordinate in &touches.provider_generations {
         sync_projection_leaf(
             &mut leaves,
             LEAF_PROVIDER_RECORD,
-            &projection_key_provider(coordinate),
-            candidate.provider_generations.get(&coordinate),
+            &projection_key_provider(*coordinate),
+            candidate.provider_generations().get(coordinate),
             hash_provider_record,
         );
     }
-    for effect in touches.scoped_composites {
+    for effect in &touches.scoped_composites {
         sync_projection_leaf(
             &mut leaves,
             LEAF_SCOPED_EFFECT,
-            &projection_key_effect(effect),
-            candidate.scoped_composites.get(&effect),
-            hash_scoped_record,
+            &projection_key_effect(*effect),
+            candidate.scoped_composites().get(effect),
+            |record| hash_scoped_record(*effect, record),
         );
     }
-    for artifact in touches.artifact_leases {
+    for artifact in &touches.artifact_leases {
         sync_projection_leaf(
             &mut leaves,
             LEAF_ARTIFACT_LEASE,
             &projection_key_u64(artifact.get()),
-            candidate.artifact_leases.get(&artifact),
+            candidate.artifact_leases().get(artifact),
             |lease| {
                 projection_record_digest(b"artifact-lease", |hasher| {
                     hash_artifact_lease(hasher, *lease);
@@ -15630,45 +13944,36 @@ fn refresh_projection_cache(
             },
         );
     }
-    for root in touches.roots {
+    for operation in &touches.operations {
         sync_projection_leaf(
             &mut leaves,
-            LEAF_ROOT,
-            &projection_key_u64(root.get()),
-            candidate.roots.get(&root),
-            hash_root_record,
+            LEAF_OPERATION,
+            &projection_key_u64(operation.get()),
+            candidate.recovery_operations().get(operation),
+            hash_operation_record,
         );
     }
-    for effect in touches.estates {
-        sync_projection_leaf(
-            &mut leaves,
-            LEAF_ESTATE,
-            &projection_key_effect(effect),
-            candidate.estates.get(&effect),
-            hash_estate_record,
-        );
-    }
-    for effect in touches.composites {
+    for effect in &touches.composites {
         sync_projection_leaf(
             &mut leaves,
             LEAF_COMPOSITE,
-            &projection_key_effect(effect),
-            candidate.composite_effects.get(&effect),
+            &projection_key_effect(*effect),
+            candidate.composite_effects().get(effect),
             hash_composite_record,
         );
     }
-    for resource in touches.resources {
+    for resource in &touches.resources {
         sync_projection_leaf(
             &mut leaves,
             LEAF_RESOURCE,
             &projection_key_u64(resource.get()),
-            candidate.resources.get(&resource),
+            candidate.resources().get(resource),
             hash_resource_record,
         );
     }
-    for scope in touches.devices {
-        let generation = candidate.device_generations.get(&scope).copied();
-        let quarantined = candidate.device_quarantine.contains(&scope);
+    for scope in &touches.devices {
+        let generation = candidate.device_generations().get(scope).copied();
+        let quarantined = candidate.device_quarantine().contains(scope);
         let key = projection_leaf_key(LEAF_DEVICE, &projection_key_u64(scope.get()));
         if generation.is_some() || quarantined {
             let _ = leaves.insert_mut(key, hash_device_record(generation, quarantined));
@@ -15676,41 +13981,87 @@ fn refresh_projection_cache(
             let _ = leaves.remove_mut(&key);
         }
     }
-    for verifier in touches.verifier_epochs {
-        sync_projection_leaf(
-            &mut leaves,
-            LEAF_VERIFIER_EPOCH,
-            &projection_key_u64(verifier.get().into()),
-            candidate.verifier_epochs.get(&verifier),
-            |epoch| hash_verifier_epoch(*epoch),
+    let projection = ProjectionCache::from_leaves(candidate, catalog, leaves);
+    candidate.set_projection_cache(projection);
+
+    #[cfg(feature = "test-support")]
+    {
+        let rebuilt = build_projection_cache(candidate, catalog);
+        if candidate.projection_cache() != &rebuilt {
+            let report = |category: u8, key: &[u8], label: &str| {
+                let key = projection_leaf_key(category, key);
+                let incremental = candidate.projection_cache().leaves.get(&key);
+                let full = rebuilt.leaves.get(&key);
+                if incremental != full {
+                    panic!(
+                        "projection mismatch {label}: key={key:?} incremental={incremental:?} full={full:?}"
+                    );
+                }
+            };
+            for provider in candidate.provider_high_water().keys() {
+                report(
+                    LEAF_PROVIDER_HIGH_WATER,
+                    &projection_key_u64(provider.get()),
+                    "provider-high-water",
+                );
+            }
+            for coordinate in candidate.provider_generations().keys() {
+                report(
+                    LEAF_PROVIDER_RECORD,
+                    &projection_key_provider(*coordinate),
+                    "provider",
+                );
+            }
+            for effect in candidate.scoped_composites().keys() {
+                report(
+                    LEAF_SCOPED_EFFECT,
+                    &projection_key_effect(*effect),
+                    "scoped",
+                );
+            }
+            for operation in candidate.recovery_operations().keys() {
+                report(
+                    LEAF_OPERATION,
+                    &projection_key_u64(operation.get()),
+                    "operation",
+                );
+            }
+            for effect in candidate.composite_effects().keys() {
+                report(LEAF_COMPOSITE, &projection_key_effect(*effect), "composite");
+            }
+            for resource in candidate.resources().keys() {
+                report(
+                    LEAF_RESOURCE,
+                    &projection_key_u64(resource.get()),
+                    "resource",
+                );
+            }
+            for scope in candidate.device_generations().keys() {
+                report(
+                    LEAF_DEVICE,
+                    &projection_key_u64(scope.get()),
+                    "device scope",
+                );
+            }
+        }
+        assert_eq!(
+            candidate.projection_cache(),
+            &rebuilt,
+            "incremental projection cache diverged from a full rebuild"
         );
     }
-    candidate.projection_cache = ProjectionCache::from_leaves(candidate, catalog, leaves);
-
-    #[cfg(any(test, feature = "test-support"))]
-    assert_eq!(
-        candidate.projection_cache,
-        build_projection_cache(candidate, catalog),
-        "incremental projection cache diverged from a full rebuild"
-    );
 }
 
 #[allow(dead_code)]
-fn projection_digest(state: &State, catalog: Digest) -> Digest {
-    legacy_projection_digest(state, catalog)
+fn projection_digest(state: &impl StateAccess, catalog: Digest) -> Digest {
+    full_projection_digest(state, catalog)
 }
 
 fn hash_verifier_stamp(hasher: &mut Sha256, stamp: VerifierStamp) {
     hasher.update(stamp.identity.verifier().get().to_le_bytes());
     hasher.update(stamp.identity.epoch().to_le_bytes());
     hasher.update(stamp.identity.receipt_schema().get().to_le_bytes());
-    match stamp.identity.implementation_digest() {
-        Some(digest) => {
-            hasher.update([1]);
-            hasher.update(digest.bytes());
-        }
-        None => hasher.update([0]),
-    }
+    hasher.update(stamp.identity.implementation_digest().bytes());
     hasher.update(stamp.receipt_digest.bytes());
 }
 
@@ -15727,7 +14078,7 @@ fn hash_artifact_binding(hasher: &mut Sha256, binding: ArtifactBinding) {
     hasher.update(binding.provider().provider().get().to_le_bytes());
     hasher.update(binding.provider().generation().get().to_le_bytes());
     hasher.update(binding.operation().get().to_le_bytes());
-    hasher.update(binding.effect().root().get().to_le_bytes());
+    hasher.update(binding.effect().operation().get().to_le_bytes());
     hasher.update(binding.effect().sequence().to_le_bytes());
     hasher.update(binding.component().get().to_le_bytes());
     hasher.update(binding.catalog_digest().bytes());
@@ -15772,16 +14123,16 @@ fn hash_optional_effect_fact(hasher: &mut Sha256, fact: Option<VerifiedEffectFac
     hasher.update([u8::from(fact.is_some())]);
     if let Some(fact) = fact {
         hasher.update([fact.kind.tag()]);
-        hasher.update(fact.effect.root().get().to_le_bytes());
+        hasher.update(fact.effect.operation().get().to_le_bytes());
         hasher.update(fact.effect.sequence().to_le_bytes());
-        hash_optional_component(hasher, fact.component);
+        hash_component(hasher, fact.component);
         hash_incarnation(hasher, fact.actor);
         hasher.update(fact.generation.to_le_bytes());
         hasher.update(fact.nonce.to_le_bytes());
         hasher.update(fact.operation.bytes());
         hash_optional_digest(hasher, fact.predecessor);
         hash_freshness(hasher, fact.freshness);
-        hash_optional_provider_verification_scope(hasher, fact.verification_scope);
+        hash_provider_verification_scope(hasher, fact.verification_scope);
         hash_verifier_stamp(hasher, fact.stamp);
         hasher.update([match fact.outcome {
             None => 0,
@@ -15791,23 +14142,40 @@ fn hash_optional_effect_fact(hasher: &mut Sha256, fact: Option<VerifiedEffectFac
     }
 }
 
-fn hash_optional_provider_verification_scope(
+fn hash_optional_handoff_recovery_fact(
     hasher: &mut Sha256,
-    scope: Option<ProviderVerificationScope>,
+    fact: Option<VerifiedHandoffRecoveryFact>,
 ) {
-    match scope {
-        None => hasher.update([0]),
-        Some(scope) => {
-            hasher.update([1]);
-            hasher.update(scope.world.get().to_le_bytes());
-            hasher.update(scope.provider.world().get().to_le_bytes());
-            hasher.update(scope.provider.provider().get().to_le_bytes());
-            hasher.update(scope.provider.generation().get().to_le_bytes());
-            hasher.update(scope.operation.get().to_le_bytes());
-            hasher.update(scope.catalog_digest.bytes());
-            hash_verifier_binding(hasher, scope.verifier_binding);
-        }
-    }
+    hasher.update([u8::from(fact.is_some())]);
+    let Some(fact) = fact else {
+        return;
+    };
+    hasher.update([match fact.role {
+        HandoffRecoveryRole::Parent => 1,
+        HandoffRecoveryRole::Child => 2,
+    }]);
+    hasher.update(fact.effect.operation().get().to_le_bytes());
+    hasher.update(fact.effect.sequence().to_le_bytes());
+    hash_component(hasher, fact.component);
+    hasher.update(fact.operation.bytes());
+    hasher.update(fact.descriptor_digest.bytes());
+    hash_freshness(hasher, fact.freshness);
+    hash_provider_verification_scope(hasher, fact.verification_scope);
+    hash_verifier_stamp(hasher, fact.stamp);
+}
+
+fn hash_provider_verification_scope(hasher: &mut Sha256, scope: ProviderVerificationScope) {
+    hasher.update(scope.world.get().to_le_bytes());
+    hasher.update(scope.provider.world().get().to_le_bytes());
+    hasher.update(scope.provider.provider().get().to_le_bytes());
+    hasher.update(scope.provider.generation().get().to_le_bytes());
+    hasher.update(scope.operation.get().to_le_bytes());
+    hasher.update(scope.catalog_digest.bytes());
+    hash_verifier_binding(hasher, scope.verifier_binding);
+}
+
+fn hash_component(hasher: &mut Sha256, component: ComponentId) {
+    hasher.update(component.get().to_le_bytes());
 }
 
 fn hash_optional_component(hasher: &mut Sha256, component: Option<ComponentId>) {
@@ -15849,30 +14217,29 @@ fn hash_claim_scope(hasher: &mut Sha256, scope: ClaimScope) {
 fn hash_freshness(hasher: &mut Sha256, freshness: Freshness) {
     hasher.update(freshness.boot().get().to_le_bytes());
     hasher.update(freshness.registry().get().to_le_bytes());
-    hasher.update(freshness.binding().to_le_bytes());
     hasher.update(freshness.device().get().to_le_bytes());
     hasher.update(freshness.journal().get().to_le_bytes());
 }
 
-fn hash_incarnation(hasher: &mut Sha256, incarnation: PrincipalIncarnation) {
-    hasher.update(incarnation.principal().get().to_le_bytes());
-    hasher.update(incarnation.generation().to_le_bytes());
+fn hash_incarnation(hasher: &mut Sha256, executor: ExecutorCoordinate) {
+    hasher.update(executor.executor().get().to_le_bytes());
+    hasher.update(executor.generation().get().to_le_bytes());
 }
 
 fn hash_custody(hasher: &mut Sha256, custody: CustodyState) {
     match custody {
-        CustodyState::Principal(incarnation) => {
+        CustodyState::Executor(executor) => {
             hasher.update([1]);
-            hash_incarnation(hasher, incarnation);
+            hash_incarnation(hasher, executor);
         }
-        CustodyState::KernelEstate => hasher.update([2]),
+        CustodyState::CoreOwned => hasher.update([2]),
         CustodyState::Released => hasher.update([3]),
     }
 }
 
 fn hash_claim_custodian(hasher: &mut Sha256, custody: ClaimCustodian) {
     match custody {
-        ClaimCustodian::KernelEstate => hasher.update([1]),
+        ClaimCustodian::CoreOwned => hasher.update([1]),
         ClaimCustodian::DeviceProvider(scope) => {
             hasher.update([2]);
             hasher.update(scope.get().to_le_bytes());
@@ -15881,32 +14248,26 @@ fn hash_claim_custodian(hasher: &mut Sha256, custody: ClaimCustodian) {
     }
 }
 
-fn hash_root_state(hasher: &mut Sha256, state: RootRecoveryState) {
+fn hash_operation_state(hasher: &mut Sha256, state: OperationRecoveryState) {
     match state {
-        RootRecoveryState::Active {
-            incarnation,
-            binding_generation,
-        } => {
+        OperationRecoveryState::Active { executor } => {
             hasher.update([1]);
-            hash_incarnation(hasher, incarnation);
-            hasher.update(binding_generation.to_le_bytes());
+            hash_incarnation(hasher, executor);
         }
-        RootRecoveryState::Fenced {
+        OperationRecoveryState::Fenced {
             crashed,
-            binding_generation,
             crash_generation,
         } => {
             hasher.update([2]);
             hash_incarnation(hasher, crashed);
-            hasher.update(binding_generation.to_le_bytes());
             hasher.update(crash_generation.to_le_bytes());
         }
-        RootRecoveryState::Snapshotted { snapshot, digest } => {
+        OperationRecoveryState::Snapshotted { snapshot, digest } => {
             hasher.update([3]);
             hasher.update(snapshot.get().to_le_bytes());
             hasher.update(digest.bytes());
         }
-        RootRecoveryState::Ready {
+        OperationRecoveryState::Ready {
             snapshot,
             successor,
         } => {
@@ -15914,22 +14275,16 @@ fn hash_root_state(hasher: &mut Sha256, state: RootRecoveryState) {
             hasher.update(snapshot.get().to_le_bytes());
             hash_incarnation(hasher, successor);
         }
-        RootRecoveryState::Rebound {
-            successor,
-            binding_generation,
-        } => {
+        OperationRecoveryState::Rebound { successor } => {
             hasher.update([5]);
             hash_incarnation(hasher, successor);
-            hasher.update(binding_generation.to_le_bytes());
         }
-        RootRecoveryState::RecoveryExhausted {
+        OperationRecoveryState::RecoveryExhausted {
             crashed,
-            binding_generation,
             crash_generation,
         } => {
             hasher.update([6]);
             hash_incarnation(hasher, crashed);
-            hasher.update(binding_generation.to_le_bytes());
             hasher.update(crash_generation.to_le_bytes());
         }
     }
@@ -16024,22 +14379,26 @@ fn hash_single_hop_handoff_projection(hasher: &mut Sha256, handoff: SingleHopHan
             descriptor,
             terminal_receipt_digest,
             descriptor_receipt_digest,
+            recovery_fact,
             child_installed,
         } => {
             hasher.update([1]);
             hasher.update(handoff_descriptor_digest(*descriptor).bytes());
             hasher.update(terminal_receipt_digest.bytes());
             hasher.update(descriptor_receipt_digest.bytes());
+            hash_optional_handoff_recovery_fact(hasher, recovery_fact);
             hasher.update([u8::from(child_installed)]);
         }
         SingleHopHandoffProjection::Target {
             parent,
             descriptor_digest,
+            recovery_fact,
         } => {
             hasher.update([2]);
-            hasher.update(parent.root().get().to_le_bytes());
+            hasher.update(parent.operation().get().to_le_bytes());
             hasher.update(parent.sequence().to_le_bytes());
             hasher.update(descriptor_digest.bytes());
+            hash_optional_handoff_recovery_fact(hasher, recovery_fact);
         }
     }
 }
@@ -16234,18 +14593,14 @@ impl CommandKind {
             }
             Self::AdmitScopedCompositeEffect {
                 effect,
-                operation,
                 origin,
-                binding_generation,
                 kind,
                 charge_account,
                 bindings,
             } => {
                 put_u8(&mut bytes, 46);
                 put_effect(&mut bytes, effect);
-                put_u64(&mut bytes, operation.get());
                 put_incarnation(&mut bytes, origin);
-                put_u64(&mut bytes, binding_generation);
                 put_u32(&mut bytes, kind.get());
                 put_u64(&mut bytes, charge_account.get());
                 put_u32(&mut bytes, bindings.len() as u32);
@@ -16291,132 +14646,44 @@ impl CommandKind {
                 put_u64(&mut bytes, nonce);
                 put_digest(&mut bytes, release_stamp);
             }
-            Self::CreateEstate {
-                effect,
-                origin,
-                binding_generation,
-                domain,
-                obligation,
-                charge_account,
-            } => {
-                put_u8(&mut bytes, 1);
-                put_effect(&mut bytes, effect);
-                put_incarnation(&mut bytes, origin);
-                put_u64(&mut bytes, binding_generation);
-                put_u32(&mut bytes, domain.get());
-                put_u32(&mut bytes, obligation.get());
-                put_u64(&mut bytes, charge_account.get());
-            }
-            Self::AddClaim {
-                effect,
-                actor,
-                binding_generation,
-                claim,
-                domain,
-                kind,
-                scope,
-                resource,
-                resource_generation,
-                units,
-            } => {
-                put_u8(&mut bytes, 2);
-                put_effect(&mut bytes, effect);
-                put_incarnation(&mut bytes, actor);
-                put_u64(&mut bytes, binding_generation);
-                put_u64(&mut bytes, claim.get());
-                put_u32(&mut bytes, domain.get());
-                put_u32(&mut bytes, kind.get());
-                put_claim_scope(&mut bytes, scope);
-                put_u64(&mut bytes, resource.get());
-                put_u64(&mut bytes, resource_generation.get());
-                put_u64(&mut bytes, units);
-            }
-            Self::PrepareEffect {
-                effect,
-                actor,
-                binding_generation,
-            } => {
-                put_u8(&mut bytes, 3);
-                put_effect(&mut bytes, effect);
-                put_incarnation(&mut bytes, actor);
-                put_u64(&mut bytes, binding_generation);
-            }
-            Self::RecordCommitIntent {
-                effect,
-                actor,
-                binding_generation,
-                operation,
-            } => {
-                put_u8(&mut bytes, 4);
-                put_effect(&mut bytes, effect);
-                put_incarnation(&mut bytes, actor);
-                put_u64(&mut bytes, binding_generation);
-                put_digest(&mut bytes, operation);
-            }
             Self::AcknowledgeCommit { fact } => {
                 put_u8(&mut bytes, 5);
                 put_effect_fact(&mut bytes, fact);
             }
-            Self::FenceIncarnation {
-                root,
-                crashed,
-                binding_generation,
-            } => {
+            Self::FenceExecutor { operation, crashed } => {
                 put_u8(&mut bytes, 6);
-                put_u64(&mut bytes, root.get());
+                put_u64(&mut bytes, operation.get());
                 put_incarnation(&mut bytes, crashed);
-                put_u64(&mut bytes, binding_generation);
             }
             Self::Snapshot {
-                root,
+                operation,
                 snapshot,
                 digest,
             } => {
                 put_u8(&mut bytes, 7);
-                put_u64(&mut bytes, root.get());
+                put_u64(&mut bytes, operation.get());
                 put_u64(&mut bytes, snapshot.get());
                 put_digest(&mut bytes, digest);
             }
             Self::Ready {
-                root,
+                operation,
                 snapshot,
                 successor,
             } => {
                 put_u8(&mut bytes, 8);
-                put_u64(&mut bytes, root.get());
+                put_u64(&mut bytes, operation.get());
                 put_u64(&mut bytes, snapshot.get());
                 put_incarnation(&mut bytes, successor);
             }
             Self::Rebind {
-                root,
+                operation,
                 snapshot,
                 successor,
-                binding_generation,
             } => {
                 put_u8(&mut bytes, 9);
-                put_u64(&mut bytes, root.get());
+                put_u64(&mut bytes, operation.get());
                 put_u64(&mut bytes, snapshot.get());
                 put_incarnation(&mut bytes, successor);
-                put_u64(&mut bytes, binding_generation);
-            }
-            Self::ClaimSettlement { effect, claimant } => {
-                put_u8(&mut bytes, 10);
-                put_effect(&mut bytes, effect);
-                put_incarnation(&mut bytes, claimant);
-            }
-            Self::RecordApplyIntent {
-                effect,
-                claimant,
-                generation,
-                nonce,
-                intent,
-            } => {
-                put_u8(&mut bytes, 11);
-                put_effect(&mut bytes, effect);
-                put_incarnation(&mut bytes, claimant);
-                put_u64(&mut bytes, generation);
-                put_u64(&mut bytes, nonce);
-                put_digest(&mut bytes, intent);
             }
             Self::RecordApplied { fact } => {
                 put_u8(&mut bytes, 12);
@@ -16426,46 +14693,15 @@ impl CommandKind {
                 put_u8(&mut bytes, 13);
                 put_effect_fact(&mut bytes, fact);
             }
-            Self::MarkIndeterminate {
-                effect,
-                claimant,
-                generation,
-                nonce,
-                reason,
-            } => {
-                put_u8(&mut bytes, 14);
-                put_effect(&mut bytes, effect);
-                put_incarnation(&mut bytes, claimant);
-                put_u64(&mut bytes, generation);
-                put_u64(&mut bytes, nonce);
-                put_digest(&mut bytes, reason);
-            }
             Self::BeginRevoke {
                 effect,
                 expected_actor,
-                binding_generation,
                 authority_epoch,
             } => {
                 put_u8(&mut bytes, 15);
                 put_effect(&mut bytes, effect);
                 put_incarnation(&mut bytes, expected_actor);
-                put_u64(&mut bytes, binding_generation);
                 put_u64(&mut bytes, authority_epoch);
-            }
-            Self::SubmitEvidence {
-                effect,
-                claim,
-                evidence,
-            } => {
-                put_u8(&mut bytes, 16);
-                put_effect(&mut bytes, effect);
-                put_u64(&mut bytes, claim.get());
-                put_u32(&mut bytes, evidence.kind.get());
-                put_freshness(&mut bytes, evidence.subject);
-                put_freshness(&mut bytes, evidence.freshness);
-                put_optional_provider_verification_scope(&mut bytes, evidence.verification_scope);
-                put_verifier_identity(&mut bytes, evidence.stamp.identity);
-                put_digest(&mut bytes, evidence.stamp.receipt_digest);
             }
             Self::CheckpointRecovery {
                 boot,
@@ -16477,51 +14713,15 @@ impl CommandKind {
                 put_u64(&mut bytes, journal.get());
                 put_u64(&mut bytes, device.get());
             }
-            Self::ReleaseEstate { effect } => {
-                put_u8(&mut bytes, 20);
-                put_effect(&mut bytes, effect);
-            }
-            Self::AdoptEffect {
-                effect,
-                successor,
-                binding_generation,
-            } => {
+            Self::AdoptEffect { effect, successor } => {
                 put_u8(&mut bytes, 21);
                 put_effect(&mut bytes, effect);
                 put_incarnation(&mut bytes, successor);
-                put_u64(&mut bytes, binding_generation);
-            }
-            Self::ReserveReuse {
-                effect,
-                actor,
-                binding_generation,
-                claim,
-                domain,
-                kind,
-                scope,
-                resource,
-                expected_generation,
-                units,
-                reuse_contract,
-            } => {
-                put_u8(&mut bytes, 22);
-                put_effect(&mut bytes, effect);
-                put_incarnation(&mut bytes, actor);
-                put_u64(&mut bytes, binding_generation);
-                put_u64(&mut bytes, claim.get());
-                put_u32(&mut bytes, domain.get());
-                put_u32(&mut bytes, kind.get());
-                put_claim_scope(&mut bytes, scope);
-                put_u64(&mut bytes, resource.get());
-                put_u64(&mut bytes, expected_generation.get());
-                put_u64(&mut bytes, units);
-                put_digest(&mut bytes, reuse_contract);
             }
             Self::ActivateResourceReuse {
                 effect,
                 component,
                 actor,
-                binding_generation,
                 authority_epoch,
                 claim,
                 resource,
@@ -16535,9 +14735,8 @@ impl CommandKind {
             } => {
                 put_u8(&mut bytes, 23);
                 put_effect(&mut bytes, effect);
-                put_optional_component(&mut bytes, component);
+                put_u32(&mut bytes, component.get());
                 put_incarnation(&mut bytes, actor);
-                put_u64(&mut bytes, binding_generation);
                 put_u64(&mut bytes, authority_epoch);
                 put_u64(&mut bytes, claim.get());
                 put_u64(&mut bytes, resource.get());
@@ -16553,7 +14752,6 @@ impl CommandKind {
                 effect,
                 component,
                 actor,
-                binding_generation,
                 authority_epoch,
                 claim,
                 resource,
@@ -16561,33 +14759,17 @@ impl CommandKind {
             } => {
                 put_u8(&mut bytes, 24);
                 put_effect(&mut bytes, effect);
-                put_optional_component(&mut bytes, component);
+                put_u32(&mut bytes, component.get());
                 put_incarnation(&mut bytes, actor);
-                put_u64(&mut bytes, binding_generation);
                 put_u64(&mut bytes, authority_epoch);
                 put_u64(&mut bytes, claim.get());
                 put_u64(&mut bytes, resource.get());
                 put_u64(&mut bytes, resource_generation.get());
             }
-            Self::CreateCompositeEffect {
-                effect,
-                origin,
-                binding_generation,
-                kind,
-                charge_account,
-            } => {
-                put_u8(&mut bytes, 25);
-                put_effect(&mut bytes, effect);
-                put_incarnation(&mut bytes, origin);
-                put_u64(&mut bytes, binding_generation);
-                put_u32(&mut bytes, kind.get());
-                put_u64(&mut bytes, charge_account.get());
-            }
             Self::AddComponentClaim {
                 effect,
                 component,
                 actor,
-                binding_generation,
                 claim,
                 kind,
                 scope,
@@ -16599,7 +14781,6 @@ impl CommandKind {
                 put_effect(&mut bytes, effect);
                 put_u32(&mut bytes, component.get());
                 put_incarnation(&mut bytes, actor);
-                put_u64(&mut bytes, binding_generation);
                 put_u64(&mut bytes, claim.get());
                 put_u32(&mut bytes, kind.get());
                 put_claim_scope(&mut bytes, scope);
@@ -16607,28 +14788,21 @@ impl CommandKind {
                 put_u64(&mut bytes, resource_generation.get());
                 put_u64(&mut bytes, units);
             }
-            Self::PrepareCompositeEffect {
-                effect,
-                actor,
-                binding_generation,
-            } => {
+            Self::PrepareCompositeEffect { effect, actor } => {
                 put_u8(&mut bytes, 27);
                 put_effect(&mut bytes, effect);
                 put_incarnation(&mut bytes, actor);
-                put_u64(&mut bytes, binding_generation);
             }
             Self::RecordComponentCommitIntent {
                 effect,
                 component,
                 actor,
-                binding_generation,
                 operation,
             } => {
                 put_u8(&mut bytes, 28);
                 put_effect(&mut bytes, effect);
                 put_u32(&mut bytes, component.get());
                 put_incarnation(&mut bytes, actor);
-                put_u64(&mut bytes, binding_generation);
                 put_digest(&mut bytes, operation);
             }
             Self::ClaimComponentSettlement {
@@ -16686,7 +14860,7 @@ impl CommandKind {
                 put_u32(&mut bytes, evidence.kind.get());
                 put_freshness(&mut bytes, evidence.subject);
                 put_freshness(&mut bytes, evidence.freshness);
-                put_optional_provider_verification_scope(&mut bytes, evidence.verification_scope);
+                put_provider_verification_scope(&mut bytes, evidence.verification_scope);
                 put_verifier_identity(&mut bytes, evidence.stamp.identity);
                 put_digest(&mut bytes, evidence.stamp.receipt_digest);
             }
@@ -16698,7 +14872,6 @@ impl CommandKind {
                 effect,
                 component,
                 actor,
-                binding_generation,
                 claim,
                 kind,
                 scope,
@@ -16711,7 +14884,6 @@ impl CommandKind {
                 put_effect(&mut bytes, effect);
                 put_u32(&mut bytes, component.get());
                 put_incarnation(&mut bytes, actor);
-                put_u64(&mut bytes, binding_generation);
                 put_u64(&mut bytes, claim.get());
                 put_u32(&mut bytes, kind.get());
                 put_claim_scope(&mut bytes, scope);
@@ -16723,28 +14895,21 @@ impl CommandKind {
             Self::RecordCompositeCommitIntents {
                 effect,
                 actor,
-                binding_generation,
                 operations,
             } => {
                 put_u8(&mut bytes, 35);
                 put_effect(&mut bytes, effect);
                 put_incarnation(&mut bytes, actor);
-                put_u64(&mut bytes, binding_generation);
                 put_u32(&mut bytes, operations.len() as u32);
                 for operation in operations {
                     put_u32(&mut bytes, operation.component().get());
                     put_digest(&mut bytes, operation.operation());
                 }
             }
-            Self::RebaseCompositePrecommitClaims {
-                effect,
-                actor,
-                binding_generation,
-            } => {
+            Self::RebaseCompositePrecommitClaims { effect, actor } => {
                 put_u8(&mut bytes, 36);
                 put_effect(&mut bytes, effect);
                 put_incarnation(&mut bytes, actor);
-                put_u64(&mut bytes, binding_generation);
             }
             Self::WholeStateCheckpointV1 { state, projection } => {
                 put_u8(&mut bytes, 37);
@@ -16765,36 +14930,34 @@ impl CommandKind {
             Self::InstallHandoffChild {
                 descriptor,
                 origin,
-                binding_generation,
                 charge_account,
+                provider,
             } => {
                 put_u8(&mut bytes, 39);
                 put_child_descriptor(&mut bytes, descriptor);
                 put_incarnation(&mut bytes, origin);
-                put_u64(&mut bytes, binding_generation);
                 put_u64(&mut bytes, charge_account.get());
+                put_component_provider_binding(&mut bytes, provider);
             }
             Self::ReleaseHandoffSourceAndRecordTargetIntent {
                 descriptor,
                 actor,
-                binding_generation,
                 operation,
             } => {
                 put_u8(&mut bytes, 40);
                 put_child_descriptor(&mut bytes, descriptor);
                 put_incarnation(&mut bytes, actor);
-                put_u64(&mut bytes, binding_generation);
                 put_digest(&mut bytes, operation);
             }
             Self::ResolveIndeterminateHandoffParent {
                 descriptor,
-                terminal_receipt_digest,
                 descriptor_receipt_digest,
+                fact,
             } => {
                 put_u8(&mut bytes, 41);
                 put_child_descriptor(&mut bytes, descriptor);
-                put_digest(&mut bytes, terminal_receipt_digest);
                 put_digest(&mut bytes, descriptor_receipt_digest);
+                put_handoff_recovery_fact(&mut bytes, fact);
             }
         }
         bytes
@@ -16851,10 +15014,7 @@ impl CommandKind {
             },
             46 => {
                 let effect = cursor.effect()?;
-                let operation = OperationId::new(cursor.u64()?)
-                    .map_err(|_| CommandDecodeError::InvalidIdentity)?;
-                let origin = cursor.incarnation()?;
-                let binding_generation = cursor.nonzero_u64()?;
+                let origin = cursor.executor()?;
                 let kind = CompositeKindId::new(cursor.u32()?)
                     .map_err(|_| CommandDecodeError::InvalidIdentity)?;
                 let charge_account = ChargeAccountId::new(cursor.u64()?)
@@ -16880,9 +15040,7 @@ impl CommandKind {
                 }
                 Self::AdmitScopedCompositeEffect {
                     effect,
-                    operation,
                     origin,
-                    binding_generation,
                     kind,
                     charge_account,
                     bindings,
@@ -16917,133 +15075,50 @@ impl CommandKind {
                 nonce: cursor.nonzero_u64()?,
                 release_stamp: cursor.digest()?,
             },
-            1 => Self::CreateEstate {
-                effect: cursor.effect()?,
-                origin: cursor.incarnation()?,
-                binding_generation: cursor.nonzero_u64()?,
-                domain: DomainId::new(cursor.u32()?)
-                    .map_err(|_| CommandDecodeError::InvalidIdentity)?,
-                obligation: ObligationKindId::new(cursor.u32()?)
-                    .map_err(|_| CommandDecodeError::InvalidIdentity)?,
-                charge_account: ChargeAccountId::new(cursor.u64()?)
-                    .map_err(|_| CommandDecodeError::InvalidIdentity)?,
-            },
-            2 => Self::AddClaim {
-                effect: cursor.effect()?,
-                actor: cursor.incarnation()?,
-                binding_generation: cursor.nonzero_u64()?,
-                claim: ClaimId::new(cursor.u64()?)
-                    .map_err(|_| CommandDecodeError::InvalidIdentity)?,
-                domain: DomainId::new(cursor.u32()?)
-                    .map_err(|_| CommandDecodeError::InvalidIdentity)?,
-                kind: ClaimKindId::new(cursor.u32()?)
-                    .map_err(|_| CommandDecodeError::InvalidIdentity)?,
-                scope: cursor.claim_scope()?,
-                resource: ResourceId::new(cursor.u64()?)
-                    .map_err(|_| CommandDecodeError::InvalidIdentity)?,
-                resource_generation: ResourceGeneration::new(cursor.u64()?)
-                    .map_err(|_| CommandDecodeError::InvalidIdentity)?,
-                units: cursor.nonzero_u64()?,
-            },
-            3 => Self::PrepareEffect {
-                effect: cursor.effect()?,
-                actor: cursor.incarnation()?,
-                binding_generation: cursor.nonzero_u64()?,
-            },
-            4 => Self::RecordCommitIntent {
-                effect: cursor.effect()?,
-                actor: cursor.incarnation()?,
-                binding_generation: cursor.nonzero_u64()?,
-                operation: cursor.digest()?,
-            },
+            1..=4 => return Err(CommandDecodeError::InvalidTag),
             5 => Self::AcknowledgeCommit {
                 fact: cursor.effect_fact()?,
             },
-            6 => Self::FenceIncarnation {
-                root: RootId::new(cursor.u64()?)
+            6 => Self::FenceExecutor {
+                operation: OperationId::new(cursor.u64()?)
                     .map_err(|_| CommandDecodeError::InvalidIdentity)?,
-                crashed: cursor.incarnation()?,
-                binding_generation: cursor.nonzero_u64()?,
+                crashed: cursor.executor()?,
             },
             7 => Self::Snapshot {
-                root: RootId::new(cursor.u64()?)
+                operation: OperationId::new(cursor.u64()?)
                     .map_err(|_| CommandDecodeError::InvalidIdentity)?,
                 snapshot: SnapshotId::new(cursor.u64()?)
                     .map_err(|_| CommandDecodeError::InvalidIdentity)?,
                 digest: cursor.digest()?,
             },
             8 => Self::Ready {
-                root: RootId::new(cursor.u64()?)
+                operation: OperationId::new(cursor.u64()?)
                     .map_err(|_| CommandDecodeError::InvalidIdentity)?,
                 snapshot: SnapshotId::new(cursor.u64()?)
                     .map_err(|_| CommandDecodeError::InvalidIdentity)?,
-                successor: cursor.incarnation()?,
+                successor: cursor.executor()?,
             },
             9 => Self::Rebind {
-                root: RootId::new(cursor.u64()?)
+                operation: OperationId::new(cursor.u64()?)
                     .map_err(|_| CommandDecodeError::InvalidIdentity)?,
                 snapshot: SnapshotId::new(cursor.u64()?)
                     .map_err(|_| CommandDecodeError::InvalidIdentity)?,
-                successor: cursor.incarnation()?,
-                binding_generation: cursor.nonzero_u64()?,
+                successor: cursor.executor()?,
             },
-            10 => Self::ClaimSettlement {
-                effect: cursor.effect()?,
-                claimant: cursor.incarnation()?,
-            },
-            11 => Self::RecordApplyIntent {
-                effect: cursor.effect()?,
-                claimant: cursor.incarnation()?,
-                generation: cursor.nonzero_u64()?,
-                nonce: cursor.nonzero_u64()?,
-                intent: cursor.digest()?,
-            },
+            10..=11 => return Err(CommandDecodeError::InvalidTag),
             12 => Self::RecordApplied {
                 fact: cursor.effect_fact()?,
             },
             13 => Self::Settle {
                 fact: cursor.effect_fact()?,
             },
-            14 => Self::MarkIndeterminate {
-                effect: cursor.effect()?,
-                claimant: cursor.incarnation()?,
-                generation: cursor.nonzero_u64()?,
-                nonce: cursor.nonzero_u64()?,
-                reason: cursor.digest()?,
-            },
+            14 => return Err(CommandDecodeError::InvalidTag),
             15 => Self::BeginRevoke {
                 effect: cursor.effect()?,
-                expected_actor: cursor.incarnation()?,
-                binding_generation: cursor.nonzero_u64()?,
+                expected_actor: cursor.executor()?,
                 authority_epoch: cursor.nonzero_u64()?,
             },
-            16 => Self::SubmitEvidence {
-                effect: cursor.effect()?,
-                claim: ClaimId::new(cursor.u64()?)
-                    .map_err(|_| CommandDecodeError::InvalidIdentity)?,
-                evidence: RetirementEvidence {
-                    kind: EvidenceKindId::new(cursor.u32()?)
-                        .map_err(|_| CommandDecodeError::InvalidIdentity)?,
-                    subject: cursor.freshness()?,
-                    freshness: cursor.freshness()?,
-                    verification_scope: cursor.optional_provider_verification_scope()?,
-                    stamp: VerifierStamp {
-                        identity: VerifierIdentity {
-                            verifier: VerifierId::new(cursor.u32()?)
-                                .map_err(|_| CommandDecodeError::InvalidIdentity)?,
-                            epoch: cursor.nonzero_u64()?,
-                            receipt_schema: ReceiptSchemaId::new(cursor.u32()?)
-                                .map_err(|_| CommandDecodeError::InvalidIdentity)?,
-                            implementation_digest: match cursor.u8()? {
-                                0 => None,
-                                1 => Some(cursor.digest()?),
-                                _ => return Err(CommandDecodeError::InvalidTag),
-                            },
-                        },
-                        receipt_digest: cursor.digest()?,
-                    },
-                },
-            },
+            16 => return Err(CommandDecodeError::InvalidTag),
             17 => Self::CheckpointRecovery {
                 boot: BootGeneration::new(cursor.u64()?)
                     .map_err(|_| CommandDecodeError::InvalidIdentity)?,
@@ -17052,37 +15127,15 @@ impl CommandKind {
                 device: DeviceGeneration::new(cursor.u64()?)
                     .map_err(|_| CommandDecodeError::InvalidIdentity)?,
             },
-            20 => Self::ReleaseEstate {
-                effect: cursor.effect()?,
-            },
             21 => Self::AdoptEffect {
                 effect: cursor.effect()?,
-                successor: cursor.incarnation()?,
-                binding_generation: cursor.nonzero_u64()?,
+                successor: cursor.executor()?,
             },
-            22 => Self::ReserveReuse {
-                effect: cursor.effect()?,
-                actor: cursor.incarnation()?,
-                binding_generation: cursor.nonzero_u64()?,
-                claim: ClaimId::new(cursor.u64()?)
-                    .map_err(|_| CommandDecodeError::InvalidIdentity)?,
-                domain: DomainId::new(cursor.u32()?)
-                    .map_err(|_| CommandDecodeError::InvalidIdentity)?,
-                kind: ClaimKindId::new(cursor.u32()?)
-                    .map_err(|_| CommandDecodeError::InvalidIdentity)?,
-                scope: cursor.claim_scope()?,
-                resource: ResourceId::new(cursor.u64()?)
-                    .map_err(|_| CommandDecodeError::InvalidIdentity)?,
-                expected_generation: ResourceGeneration::new(cursor.u64()?)
-                    .map_err(|_| CommandDecodeError::InvalidIdentity)?,
-                units: cursor.nonzero_u64()?,
-                reuse_contract: cursor.digest()?,
-            },
+            22 => return Err(CommandDecodeError::InvalidTag),
             23 => Self::ActivateResourceReuse {
                 effect: cursor.effect()?,
-                component: cursor.optional_component()?,
-                actor: cursor.incarnation()?,
-                binding_generation: cursor.nonzero_u64()?,
+                component: cursor.component()?,
+                actor: cursor.executor()?,
                 authority_epoch: cursor.nonzero_u64()?,
                 claim: ClaimId::new(cursor.u64()?)
                     .map_err(|_| CommandDecodeError::InvalidIdentity)?,
@@ -17100,9 +15153,8 @@ impl CommandKind {
             },
             24 => Self::ReclaimResourceReuse {
                 effect: cursor.effect()?,
-                component: cursor.optional_component()?,
-                actor: cursor.incarnation()?,
-                binding_generation: cursor.nonzero_u64()?,
+                component: cursor.component()?,
+                actor: cursor.executor()?,
                 authority_epoch: cursor.nonzero_u64()?,
                 claim: ClaimId::new(cursor.u64()?)
                     .map_err(|_| CommandDecodeError::InvalidIdentity)?,
@@ -17111,21 +15163,14 @@ impl CommandKind {
                 resource_generation: ResourceGeneration::new(cursor.u64()?)
                     .map_err(|_| CommandDecodeError::InvalidIdentity)?,
             },
-            25 => Self::CreateCompositeEffect {
-                effect: cursor.effect()?,
-                origin: cursor.incarnation()?,
-                binding_generation: cursor.nonzero_u64()?,
-                kind: CompositeKindId::new(cursor.u32()?)
-                    .map_err(|_| CommandDecodeError::InvalidIdentity)?,
-                charge_account: ChargeAccountId::new(cursor.u64()?)
-                    .map_err(|_| CommandDecodeError::InvalidIdentity)?,
-            },
+            // The unbound composite constructor is an internal helper for
+            // scoped admission/handoff only and is never a journal grammar.
+            25 => return Err(CommandDecodeError::InvalidTag),
             26 => Self::AddComponentClaim {
                 effect: cursor.effect()?,
                 component: ComponentId::new(cursor.u32()?)
                     .map_err(|_| CommandDecodeError::InvalidIdentity)?,
-                actor: cursor.incarnation()?,
-                binding_generation: cursor.nonzero_u64()?,
+                actor: cursor.executor()?,
                 claim: ClaimId::new(cursor.u64()?)
                     .map_err(|_| CommandDecodeError::InvalidIdentity)?,
                 kind: ClaimKindId::new(cursor.u32()?)
@@ -17139,28 +15184,26 @@ impl CommandKind {
             },
             27 => Self::PrepareCompositeEffect {
                 effect: cursor.effect()?,
-                actor: cursor.incarnation()?,
-                binding_generation: cursor.nonzero_u64()?,
+                actor: cursor.executor()?,
             },
             28 => Self::RecordComponentCommitIntent {
                 effect: cursor.effect()?,
                 component: ComponentId::new(cursor.u32()?)
                     .map_err(|_| CommandDecodeError::InvalidIdentity)?,
-                actor: cursor.incarnation()?,
-                binding_generation: cursor.nonzero_u64()?,
+                actor: cursor.executor()?,
                 operation: cursor.digest()?,
             },
             29 => Self::ClaimComponentSettlement {
                 effect: cursor.effect()?,
                 component: ComponentId::new(cursor.u32()?)
                     .map_err(|_| CommandDecodeError::InvalidIdentity)?,
-                claimant: cursor.incarnation()?,
+                claimant: cursor.executor()?,
             },
             30 => Self::RecordComponentApplyIntent {
                 effect: cursor.effect()?,
                 component: ComponentId::new(cursor.u32()?)
                     .map_err(|_| CommandDecodeError::InvalidIdentity)?,
-                claimant: cursor.incarnation()?,
+                claimant: cursor.executor()?,
                 generation: cursor.nonzero_u64()?,
                 nonce: cursor.nonzero_u64()?,
                 intent: cursor.digest()?,
@@ -17169,7 +15212,7 @@ impl CommandKind {
                 effect: cursor.effect()?,
                 component: ComponentId::new(cursor.u32()?)
                     .map_err(|_| CommandDecodeError::InvalidIdentity)?,
-                claimant: cursor.incarnation()?,
+                claimant: cursor.executor()?,
                 generation: cursor.nonzero_u64()?,
                 nonce: cursor.nonzero_u64()?,
                 reason: cursor.digest()?,
@@ -17185,7 +15228,7 @@ impl CommandKind {
                         .map_err(|_| CommandDecodeError::InvalidIdentity)?,
                     subject: cursor.freshness()?,
                     freshness: cursor.freshness()?,
-                    verification_scope: cursor.optional_provider_verification_scope()?,
+                    verification_scope: cursor.provider_verification_scope()?,
                     stamp: VerifierStamp {
                         identity: VerifierIdentity {
                             verifier: VerifierId::new(cursor.u32()?)
@@ -17193,11 +15236,7 @@ impl CommandKind {
                             epoch: cursor.nonzero_u64()?,
                             receipt_schema: ReceiptSchemaId::new(cursor.u32()?)
                                 .map_err(|_| CommandDecodeError::InvalidIdentity)?,
-                            implementation_digest: match cursor.u8()? {
-                                0 => None,
-                                1 => Some(cursor.digest()?),
-                                _ => return Err(CommandDecodeError::InvalidTag),
-                            },
+                            implementation_digest: cursor.digest()?,
                         },
                         receipt_digest: cursor.digest()?,
                     },
@@ -17210,8 +15249,7 @@ impl CommandKind {
                 effect: cursor.effect()?,
                 component: ComponentId::new(cursor.u32()?)
                     .map_err(|_| CommandDecodeError::InvalidIdentity)?,
-                actor: cursor.incarnation()?,
-                binding_generation: cursor.nonzero_u64()?,
+                actor: cursor.executor()?,
                 claim: ClaimId::new(cursor.u64()?)
                     .map_err(|_| CommandDecodeError::InvalidIdentity)?,
                 kind: ClaimKindId::new(cursor.u32()?)
@@ -17226,8 +15264,7 @@ impl CommandKind {
             },
             35 => {
                 let effect = cursor.effect()?;
-                let actor = cursor.incarnation()?;
-                let binding_generation = cursor.nonzero_u64()?;
+                let actor = cursor.executor()?;
                 let count = cursor.u32()? as usize;
                 let encoded_len = count
                     .checked_mul(core::mem::size_of::<u32>() + 32)
@@ -17246,14 +15283,12 @@ impl CommandKind {
                 Self::RecordCompositeCommitIntents {
                     effect,
                     actor,
-                    binding_generation,
                     operations,
                 }
             }
             36 => Self::RebaseCompositePrecommitClaims {
                 effect: cursor.effect()?,
-                actor: cursor.incarnation()?,
-                binding_generation: cursor.nonzero_u64()?,
+                actor: cursor.executor()?,
             },
             37 => {
                 let projection = cursor.digest()?;
@@ -17271,21 +15306,20 @@ impl CommandKind {
             },
             39 => Self::InstallHandoffChild {
                 descriptor: cursor.child_descriptor()?,
-                origin: cursor.incarnation()?,
-                binding_generation: cursor.nonzero_u64()?,
+                origin: cursor.executor()?,
                 charge_account: ChargeAccountId::new(cursor.u64()?)
                     .map_err(|_| CommandDecodeError::InvalidIdentity)?,
+                provider: cursor.component_provider_binding()?,
             },
             40 => Self::ReleaseHandoffSourceAndRecordTargetIntent {
                 descriptor: cursor.child_descriptor()?,
-                actor: cursor.incarnation()?,
-                binding_generation: cursor.nonzero_u64()?,
+                actor: cursor.executor()?,
                 operation: cursor.digest()?,
             },
             41 => Self::ResolveIndeterminateHandoffParent {
                 descriptor: cursor.child_descriptor()?,
-                terminal_receipt_digest: cursor.digest()?,
                 descriptor_receipt_digest: cursor.digest()?,
+                fact: cursor.handoff_recovery_fact()?,
             },
             _ => return Err(CommandDecodeError::InvalidTag),
         };
@@ -17302,13 +15336,25 @@ fn put_verifier_identity(bytes: &mut Vec<u8>, identity: VerifierIdentity) {
     put_u32(bytes, identity.verifier().get());
     put_u64(bytes, identity.epoch());
     put_u32(bytes, identity.receipt_schema().get());
-    match identity.implementation_digest() {
-        Some(digest) => {
-            put_u8(bytes, 1);
-            put_digest(bytes, digest);
-        }
-        None => put_u8(bytes, 0),
-    }
+    put_digest(bytes, identity.implementation_digest());
+}
+
+fn put_handoff_recovery_fact(bytes: &mut Vec<u8>, fact: VerifiedHandoffRecoveryFact) {
+    put_u8(
+        bytes,
+        match fact.role {
+            HandoffRecoveryRole::Parent => 1,
+            HandoffRecoveryRole::Child => 2,
+        },
+    );
+    put_effect(bytes, fact.effect);
+    put_u32(bytes, fact.component.get());
+    put_digest(bytes, fact.operation);
+    put_digest(bytes, fact.descriptor_digest);
+    put_freshness(bytes, fact.freshness);
+    put_provider_verification_scope(bytes, fact.verification_scope);
+    put_verifier_identity(bytes, fact.stamp.identity);
+    put_digest(bytes, fact.stamp.receipt_digest);
 }
 
 // The compact checkpoint codec deliberately lives beside the journal command
@@ -17316,30 +15362,26 @@ fn put_verifier_identity(bytes: &mut Vec<u8>, identity: VerifierIdentity) {
 // importantly, leaves no fallback to an embedded journal image.  The primary
 // collection codecs are added below this framing as each State variant gains a
 // bounded decoder.
-const WHOLE_STATE_CHECKPOINT_MAGIC: &[u8; 8] = b"CSERWS2\0";
+const WHOLE_STATE_CHECKPOINT_MAGIC: &[u8; 8] = b"CSERWS3\0";
+const PREVIOUS_WHOLE_STATE_CHECKPOINT_MAGIC: &[u8; 8] = b"CSERWS2\0";
 
-fn encode_whole_state_checkpoint(state: &State) -> Vec<u8> {
+fn encode_whole_state_checkpoint(state: &impl StateAccess) -> Vec<u8> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(WHOLE_STATE_CHECKPOINT_MAGIC);
-    put_u16(&mut bytes, 1);
-    put_u64(&mut bytes, state.revision);
-    put_digest(&mut bytes, state.head);
-    put_u64(&mut bytes, state.next_nonce);
-    put_freshness(&mut bytes, state.freshness);
-    match state.world {
-        Some(world) => {
-            put_u8(&mut bytes, 1);
-            put_u64(&mut bytes, world.get());
-        }
-        None => put_u8(&mut bytes, 0),
-    }
-    put_u32(&mut bytes, state.provider_high_water.len() as u32);
-    for (provider, generation) in &state.provider_high_water {
+    put_u16(&mut bytes, 3);
+    put_u64(&mut bytes, state.revision());
+    put_digest(&mut bytes, state.head());
+    put_u64(&mut bytes, state.next_nonce());
+    put_freshness(&mut bytes, state.freshness());
+    put_u8(&mut bytes, 1);
+    put_u64(&mut bytes, state.world().get());
+    put_u32(&mut bytes, state.provider_high_water().len() as u32);
+    for (provider, generation) in state.provider_high_water() {
         put_u64(&mut bytes, provider.get());
         put_u64(&mut bytes, generation.get());
     }
-    put_u32(&mut bytes, state.provider_generations.len() as u32);
-    for (coordinate, record) in &state.provider_generations {
+    put_u32(&mut bytes, state.provider_generations().len() as u32);
+    for (coordinate, record) in state.provider_generations() {
         put_provider_coordinate(&mut bytes, *coordinate);
         put_digest(&mut bytes, record.catalog_digest);
         put_digest(&mut bytes, record.verifier_set_digest);
@@ -17359,10 +15401,10 @@ fn encode_whole_state_checkpoint(state: &State) -> Vec<u8> {
         put_u64(&mut bytes, provider_epoch(record.state));
         put_u64(&mut bytes, record.live_component_bindings as u64);
     }
-    put_u32(&mut bytes, state.scoped_composites.len() as u32);
-    for (effect, scoped) in &state.scoped_composites {
+    put_u32(&mut bytes, state.scoped_composites().len() as u32);
+    for (effect, scoped) in state.scoped_composites() {
         put_effect(&mut bytes, *effect);
-        put_u64(&mut bytes, scoped.operation.get());
+        put_digest(&mut bytes, scoped.catalog_digest);
         put_u32(&mut bytes, scoped.bindings.len() as u32);
         for (component, provider) in &scoped.bindings {
             put_u32(&mut bytes, component.get());
@@ -17374,8 +15416,8 @@ fn encode_whole_state_checkpoint(state: &State) -> Vec<u8> {
             put_artifact_binding(&mut bytes, *binding);
         }
     }
-    put_u32(&mut bytes, state.artifact_leases.len() as u32);
-    for (artifact, lease) in &state.artifact_leases {
+    put_u32(&mut bytes, state.artifact_leases().len() as u32);
+    for (artifact, lease) in state.artifact_leases() {
         put_u64(&mut bytes, artifact.get());
         match lease {
             ArtifactLeaseState::Pinned { binding, pin_stamp } => {
@@ -17409,49 +15451,44 @@ fn encode_whole_state_checkpoint(state: &State) -> Vec<u8> {
     }
     // Collections are emitted in BTree order.  Derived reverse indexes and
     // charges deliberately do not appear in this image.
-    put_u32(&mut bytes, state.roots.len() as u32);
-    for (id, root) in &state.roots {
-        checkpoint_put_root(&mut bytes, *id, root);
+    put_u32(&mut bytes, state.recovery_operations().len() as u32);
+    for (id, operation) in state.recovery_operations() {
+        checkpoint_put_operation(&mut bytes, *id, operation);
     }
-    put_u32(&mut bytes, state.estates.len() as u32);
-    for (effect, estate) in &state.estates {
-        checkpoint_put_estate(&mut bytes, *effect, estate);
-    }
-    put_u32(&mut bytes, state.composite_effects.len() as u32);
-    for (effect, composite) in &state.composite_effects {
+    put_u32(&mut bytes, state.composite_effects().len() as u32);
+    for (effect, composite) in state.composite_effects() {
         checkpoint_put_composite(&mut bytes, *effect, composite);
     }
-    put_u32(&mut bytes, state.resources.len() as u32);
-    for (resource, record) in &state.resources {
+    put_u32(&mut bytes, state.resources().len() as u32);
+    for (resource, record) in state.resources() {
         checkpoint_put_resource(&mut bytes, *resource, *record);
     }
-    put_u32(&mut bytes, state.device_generations.len() as u32);
-    for (scope, generation) in &state.device_generations {
+    put_u32(&mut bytes, state.device_generations().len() as u32);
+    for (scope, generation) in state.device_generations() {
         put_u64(&mut bytes, scope.get());
         put_u64(&mut bytes, generation.get());
     }
-    put_u32(&mut bytes, state.device_quarantine.len() as u32);
-    for scope in &state.device_quarantine {
+    put_u32(&mut bytes, state.device_quarantine().len() as u32);
+    for scope in state.device_quarantine() {
         put_u64(&mut bytes, scope.get());
-    }
-    put_u32(&mut bytes, state.verifier_epochs.len() as u32);
-    for (verifier, epoch) in &state.verifier_epochs {
-        put_u32(&mut bytes, verifier.get());
-        put_u64(&mut bytes, *epoch);
     }
     bytes
 }
 
 fn decode_whole_state_checkpoint(
     bytes: &[u8],
-    catalog: &DomainCatalog,
+    catalogs: &CatalogSet,
     limits: CoreLimits,
 ) -> Result<State, CoreError> {
     let mut cursor = Cursor::new(bytes);
-    if cursor.take(8).map_err(|_| CoreError::InvariantViolation)? != WHOLE_STATE_CHECKPOINT_MAGIC {
+    let magic = cursor.take(8).map_err(|_| CoreError::InvariantViolation)?;
+    if magic == PREVIOUS_WHOLE_STATE_CHECKPOINT_MAGIC {
+        return Err(CoreError::UnsupportedCheckpointState);
+    }
+    if magic != WHOLE_STATE_CHECKPOINT_MAGIC {
         return Err(CoreError::InvariantViolation);
     }
-    if cursor.u16().map_err(|_| CoreError::InvariantViolation)? != 1 {
+    if cursor.u16().map_err(|_| CoreError::InvariantViolation)? != 3 {
         return Err(CoreError::InvariantViolation);
     }
     let revision = cursor.u64().map_err(|_| CoreError::InvariantViolation)?;
@@ -17462,16 +15499,13 @@ fn decode_whole_state_checkpoint(
     let freshness = cursor
         .freshness()
         .map_err(|_| CoreError::InvariantViolation)?;
-    let world = match cursor.u8().map_err(|_| CoreError::InvariantViolation)? {
-        0 => None,
-        1 => Some(
-            WorldId::new(cursor.u64().map_err(|_| CoreError::InvariantViolation)?)
-                .map_err(|_| CoreError::InvariantViolation)?,
-        ),
-        _ => return Err(CoreError::InvariantViolation),
-    };
+    if cursor.u8().map_err(|_| CoreError::InvariantViolation)? != 1 {
+        return Err(CoreError::InvariantViolation);
+    }
+    let world = WorldId::new(cursor.u64().map_err(|_| CoreError::InvariantViolation)?)
+        .map_err(|_| CoreError::InvariantViolation)?;
     let high_water_count = cursor.u32().map_err(|_| CoreError::InvariantViolation)? as usize;
-    if high_water_count > limits.max_estates {
+    if high_water_count > limits.max_effects {
         return Err(CoreError::InvariantViolation);
     }
     let mut provider_high_water = BTreeMap::new();
@@ -17486,7 +15520,7 @@ fn decode_whole_state_checkpoint(
         }
     }
     let provider_count = cursor.u32().map_err(|_| CoreError::InvariantViolation)? as usize;
-    if provider_count > limits.max_estates {
+    if provider_count > limits.max_effects {
         return Err(CoreError::InvariantViolation);
     }
     let mut provider_generations = BTreeMap::new();
@@ -17495,6 +15529,9 @@ fn decode_whole_state_checkpoint(
             .provider_coordinate()
             .map_err(|_| CoreError::InvariantViolation)?;
         let catalog_digest = cursor.digest().map_err(|_| CoreError::InvariantViolation)?;
+        if !catalogs.contains(catalog_digest) {
+            return Err(CoreError::SchemaMismatch);
+        }
         let verifier_set_digest = cursor.digest().map_err(|_| CoreError::InvariantViolation)?;
         let verifier_count = cursor.u32().map_err(|_| CoreError::InvariantViolation)? as usize;
         let mut verifier_bindings = Vec::new();
@@ -17549,14 +15586,16 @@ fn decode_whole_state_checkpoint(
         }
     }
     let scoped_count = cursor.u32().map_err(|_| CoreError::InvariantViolation)? as usize;
-    if scoped_count > limits.max_estates {
+    if scoped_count > limits.max_effects {
         return Err(CoreError::InvariantViolation);
     }
     let mut scoped_composites = BTreeMap::new();
     for _ in 0..scoped_count {
         let effect = cursor.effect().map_err(|_| CoreError::InvariantViolation)?;
-        let operation = OperationId::new(cursor.u64().map_err(|_| CoreError::InvariantViolation)?)
-            .map_err(|_| CoreError::InvariantViolation)?;
+        let catalog_digest = cursor.digest().map_err(|_| CoreError::InvariantViolation)?;
+        if !catalogs.contains(catalog_digest) {
+            return Err(CoreError::SchemaMismatch);
+        }
         let binding_count = cursor.u32().map_err(|_| CoreError::InvariantViolation)? as usize;
         let mut bindings = BTreeMap::new();
         for _ in 0..binding_count {
@@ -17590,7 +15629,7 @@ fn decode_whole_state_checkpoint(
             .insert(
                 effect,
                 ScopedCompositeRecord {
-                    operation,
+                    catalog_digest,
                     bindings,
                     artifacts,
                 },
@@ -17639,28 +15678,17 @@ fn decode_whole_state_checkpoint(
             return Err(CoreError::InvariantViolation);
         }
     }
-    let root_count = cursor.u32().map_err(|_| CoreError::InvariantViolation)? as usize;
-    if root_count > limits.max_roots {
+    let operation_count = cursor.u32().map_err(|_| CoreError::InvariantViolation)? as usize;
+    if operation_count > limits.max_operations {
         return Err(CoreError::InvariantViolation);
     }
-    let roots = checkpoint_read_roots_count(&mut cursor, root_count)?;
-    let estate_count = cursor.u32().map_err(|_| CoreError::InvariantViolation)? as usize;
-    if estate_count > limits.max_estates {
-        return Err(CoreError::InvariantViolation);
-    }
-    let (estates, estate_claims) =
-        checkpoint_read_estates(&mut cursor, catalog, estate_count, limits)?;
+    let operations = checkpoint_read_operations_count(&mut cursor, operation_count)?;
     let composite_count = cursor.u32().map_err(|_| CoreError::InvariantViolation)? as usize;
-    if composite_count > limits.max_estates {
+    if composite_count > limits.max_effects {
         return Err(CoreError::InvariantViolation);
     }
-    let composites = checkpoint_read_composites_count(
-        &mut cursor,
-        catalog,
-        composite_count,
-        limits,
-        estate_claims,
-    )?;
+    let composites =
+        checkpoint_read_composites_count(&mut cursor, catalogs, composite_count, limits)?;
     let resource_count = cursor.u32().map_err(|_| CoreError::InvariantViolation)? as usize;
     if resource_count > limits.max_resource_records {
         return Err(CoreError::InvariantViolation);
@@ -17699,26 +15727,6 @@ fn decode_whole_state_checkpoint(
             return Err(CoreError::InvariantViolation);
         }
     }
-    let verifier_count = cursor.u32().map_err(|_| CoreError::InvariantViolation)? as usize;
-    if verifier_count != catalog.verifier_ids().len() {
-        return Err(CoreError::SchemaMismatch);
-    }
-    let mut verifier_epochs = BTreeMap::new();
-    for _ in 0..verifier_count {
-        let verifier = VerifierId::new(cursor.u32().map_err(|_| CoreError::InvariantViolation)?)
-            .map_err(|_| CoreError::InvariantViolation)?;
-        let epoch = cursor
-            .nonzero_u64()
-            .map_err(|_| CoreError::InvariantViolation)?;
-        if verifier_epochs.insert(verifier, epoch).is_some() {
-            return Err(CoreError::InvariantViolation);
-        }
-    }
-    if verifier_epochs.keys().copied().collect::<BTreeSet<_>>()
-        != catalog.verifier_ids().into_iter().collect()
-    {
-        return Err(CoreError::SchemaMismatch);
-    }
     if cursor.finish().is_err() {
         return Err(CoreError::InvariantViolation);
     }
@@ -17728,17 +15736,13 @@ fn decode_whole_state_checkpoint(
         provider_high_water: provider_high_water.into_iter().collect(),
         scoped_composites: scoped_composites.into_iter().collect(),
         artifact_leases: artifact_leases.into_iter().collect(),
-        roots: roots.into_iter().collect(),
-        root_effects: StateMap::new(),
-        estates: estates.into_iter().collect(),
+        recovery_operations: operations.into_iter().collect(),
         composite_effects: composites.into_iter().collect(),
-        resource_index: StateMap::new(),
         composite_resource_index: StateMap::new(),
         resources: resources.into_iter().collect(),
         charges: StateMap::new(),
         device_generations: device_generations.into_iter().collect(),
         device_quarantine: device_quarantine.into_iter().collect(),
-        verifier_epochs: verifier_epochs.into_iter().collect(),
         revision,
         head,
         next_nonce,
@@ -17751,175 +15755,104 @@ fn decode_whole_state_checkpoint(
         },
     };
     checkpoint_rebuild_derived(&mut state)?;
-    rebuild_root_effect_index(&mut state);
-    state.total_claims = count_state_claims(&state)?;
-    state.projection_cache = build_projection_cache(&state, catalog.digest());
-    check_invariants(catalog, limits, &state)?;
+    state.set_total_claims(count_state_claims(&state)?);
+    let projection = build_projection_cache(&state, catalogs.digest());
+    state.projection_cache = projection;
+    check_invariants_for_catalog_set(catalogs, limits, &state)?;
     Ok(state)
 }
 
 fn checkpoint_put_composite(bytes: &mut Vec<u8>, effect: EffectId, record: &CompositeEffectRecord) {
     put_effect(bytes, effect);
     put_u32(bytes, record.kind.get());
+    put_digest(bytes, record.catalog_digest);
     put_incarnation(bytes, record.causal_owner);
     checkpoint_put_custody(bytes, record.custodian);
     put_u64(bytes, record.charge_owner.get());
     put_u8(bytes, authority_tag(record.authority));
     put_u64(bytes, record.authority_epoch);
     checkpoint_put_handoff(bytes, record.handoff.clone());
+    checkpoint_put_released_provenance(bytes, record.released_provenance.as_ref());
     put_u32(bytes, record.components.len() as u32);
     for component in record.components.values() {
         checkpoint_put_component(bytes, component);
     }
 }
 
-fn checkpoint_put_estate(bytes: &mut Vec<u8>, effect: EffectId, estate: &EstateRecord) {
-    put_effect(bytes, effect);
-    put_incarnation(bytes, estate.causal_owner);
-    checkpoint_put_custody(bytes, estate.custodian);
-    put_u64(bytes, estate.charge_owner.get());
-    put_u32(bytes, estate.domain.get());
-    put_u32(bytes, estate.obligation.get());
-    put_u8(bytes, authority_tag(estate.authority));
-    put_u64(bytes, estate.authority_epoch);
-    checkpoint_put_estate_dynamic(bytes, estate);
-}
-
-fn checkpoint_put_estate_dynamic(bytes: &mut Vec<u8>, estate: &EstateRecord) {
-    put_u8(bytes, commit_tag(estate.commit));
-    checkpoint_put_option_u64(bytes, estate.commit_nonce);
-    checkpoint_put_option_digest(bytes, estate.commit_operation);
-    checkpoint_put_option_fact(bytes, estate.commit_fact);
-    checkpoint_put_outcome(bytes, estate.outcome);
-    checkpoint_put_settlement(bytes, estate.settlement);
-    checkpoint_put_option_u64(bytes, estate.settlement_nonce);
-    checkpoint_put_option_stage(bytes, estate.claim_stage);
-    checkpoint_put_option_digest(bytes, estate.settlement_intent);
-    checkpoint_put_option_fact(bytes, estate.applied_fact);
-    checkpoint_put_option_fact(bytes, estate.settlement_fact);
-    put_u8(bytes, retirement_tag(estate.retirement));
-    put_u32(bytes, estate.claims.len() as u32);
-    for claim in estate.claims.values() {
-        checkpoint_put_claim(bytes, claim);
+fn checkpoint_put_released_provenance(
+    bytes: &mut Vec<u8>,
+    provenance: Option<&ReleasedCompositeProvenance>,
+) {
+    let Some(provenance) = provenance else {
+        put_u8(bytes, 0);
+        return;
+    };
+    put_u8(bytes, 1);
+    put_digest(bytes, provenance.catalog_digest);
+    put_u32(bytes, provenance.bindings.len() as u32);
+    for (component, provider) in &provenance.bindings {
+        put_u32(bytes, component.get());
+        put_provider_coordinate(bytes, *provider);
+    }
+    put_u32(bytes, provenance.artifacts.len() as u32);
+    for (component, binding) in &provenance.artifacts {
+        put_u32(bytes, component.get());
+        put_artifact_binding(bytes, *binding);
     }
 }
 
-fn checkpoint_read_estates(
+fn checkpoint_read_released_provenance(
     cursor: &mut Cursor<'_>,
-    catalog: &DomainCatalog,
-    count: usize,
+    catalogs: &CatalogSet,
     limits: CoreLimits,
-) -> Result<(BTreeMap<EffectId, EstateRecord>, usize), CoreError> {
-    let mut estates = BTreeMap::new();
-    let mut total_claims = 0usize;
-    for _ in 0..count {
-        let effect = cursor.effect().map_err(|_| CoreError::InvariantViolation)?;
-        let causal_owner = cursor
-            .incarnation()
-            .map_err(|_| CoreError::InvariantViolation)?;
-        let custodian = checkpoint_read_custody(cursor)?;
-        let charge_owner =
-            ChargeAccountId::new(cursor.u64().map_err(|_| CoreError::InvariantViolation)?)
-                .map_err(|_| CoreError::InvariantViolation)?;
-        let domain = DomainId::new(cursor.u32().map_err(|_| CoreError::InvariantViolation)?)
-            .map_err(|_| CoreError::InvariantViolation)?;
-        let obligation =
-            ObligationKindId::new(cursor.u32().map_err(|_| CoreError::InvariantViolation)?)
-                .map_err(|_| CoreError::InvariantViolation)?;
-        let obligation_policy = catalog
-            .obligation_rule(domain, obligation)
-            .ok_or(CoreError::SchemaMismatch)?
-            .policy();
-        let authority = checkpoint_read_authority(cursor)?;
-        let authority_epoch = cursor
-            .nonzero_u64()
-            .map_err(|_| CoreError::InvariantViolation)?;
-        let estate = checkpoint_read_estate_dynamic(
-            cursor,
-            effect,
-            causal_owner,
-            custodian,
-            charge_owner,
-            domain,
-            obligation,
-            obligation_policy,
-            authority,
-            authority_epoch,
-            catalog,
-            limits,
-        )?;
-        total_claims = total_claims
-            .checked_add(estate.claims.len())
-            .ok_or(CoreError::InvariantViolation)?;
-        if total_claims > limits.max_total_claims || estates.insert(effect, estate).is_some() {
-            return Err(CoreError::InvariantViolation);
+) -> Result<Option<ReleasedCompositeProvenance>, CoreError> {
+    match cursor.u8().map_err(|_| CoreError::InvariantViolation)? {
+        0 => Ok(None),
+        1 => {
+            let catalog_digest = cursor.digest().map_err(|_| CoreError::InvariantViolation)?;
+            if !catalogs.contains(catalog_digest) {
+                return Err(CoreError::SchemaMismatch);
+            }
+            let binding_count = cursor.u32().map_err(|_| CoreError::InvariantViolation)? as usize;
+            if binding_count > limits.max_effects {
+                return Err(CoreError::InvariantViolation);
+            }
+            let mut bindings = BTreeMap::new();
+            for _ in 0..binding_count {
+                let component =
+                    ComponentId::new(cursor.u32().map_err(|_| CoreError::InvariantViolation)?)
+                        .map_err(|_| CoreError::InvariantViolation)?;
+                let provider = cursor
+                    .provider_coordinate()
+                    .map_err(|_| CoreError::InvariantViolation)?;
+                if bindings.insert(component, provider).is_some() {
+                    return Err(CoreError::InvariantViolation);
+                }
+            }
+            let artifact_count = cursor.u32().map_err(|_| CoreError::InvariantViolation)? as usize;
+            if artifact_count > binding_count {
+                return Err(CoreError::InvariantViolation);
+            }
+            let mut artifacts = BTreeMap::new();
+            for _ in 0..artifact_count {
+                let component =
+                    ComponentId::new(cursor.u32().map_err(|_| CoreError::InvariantViolation)?)
+                        .map_err(|_| CoreError::InvariantViolation)?;
+                let binding = cursor
+                    .artifact_binding()
+                    .map_err(|_| CoreError::InvariantViolation)?;
+                if artifacts.insert(component, binding).is_some() {
+                    return Err(CoreError::InvariantViolation);
+                }
+            }
+            Ok(Some(ReleasedCompositeProvenance {
+                catalog_digest,
+                bindings,
+                artifacts,
+            }))
         }
+        _ => Err(CoreError::InvariantViolation),
     }
-    Ok((estates, total_claims))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn checkpoint_read_estate_dynamic(
-    cursor: &mut Cursor<'_>,
-    effect: EffectId,
-    causal_owner: PrincipalIncarnation,
-    custody: CustodyState,
-    charge_owner: ChargeAccountId,
-    domain: DomainId,
-    obligation: ObligationKindId,
-    obligation_policy: ObligationPolicy,
-    authority: AuthorityState,
-    authority_epoch: u64,
-    catalog: &DomainCatalog,
-    limits: CoreLimits,
-) -> Result<EstateRecord, CoreError> {
-    let commit = checkpoint_read_commit(cursor)?;
-    let commit_nonce = checkpoint_read_option_u64(cursor)?;
-    let commit_operation = checkpoint_read_option_digest(cursor)?;
-    let commit_fact = checkpoint_read_option_fact(cursor)?;
-    let outcome = checkpoint_read_outcome(cursor)?;
-    let settlement = checkpoint_read_settlement(cursor)?;
-    let settlement_nonce = checkpoint_read_option_u64(cursor)?;
-    let claim_stage = checkpoint_read_option_stage(cursor)?;
-    let settlement_intent = checkpoint_read_option_digest(cursor)?;
-    let applied_fact = checkpoint_read_option_fact(cursor)?;
-    let settlement_fact = checkpoint_read_option_fact(cursor)?;
-    let retirement = checkpoint_read_retirement(cursor)?;
-    let count = cursor.u32().map_err(|_| CoreError::InvariantViolation)? as usize;
-    if count > limits.max_claims_per_estate {
-        return Err(CoreError::InvariantViolation);
-    }
-    let mut claims = BTreeMap::new();
-    for _ in 0..count {
-        let claim = checkpoint_read_claim(cursor, domain, catalog)?;
-        if claims.insert(claim.id, claim).is_some() {
-            return Err(CoreError::InvariantViolation);
-        }
-    }
-    Ok(EstateRecord {
-        effect,
-        causal_owner,
-        custodian: custody,
-        charge_owner,
-        domain,
-        obligation,
-        obligation_policy,
-        authority,
-        authority_epoch,
-        commit,
-        commit_nonce,
-        commit_operation,
-        commit_fact,
-        outcome,
-        settlement,
-        settlement_nonce,
-        claim_stage,
-        settlement_intent,
-        applied_fact,
-        settlement_fact,
-        retirement,
-        claims,
-    })
 }
 
 fn checkpoint_put_handoff(bytes: &mut Vec<u8>, handoff: SingleHopRole) {
@@ -17929,19 +15862,29 @@ fn checkpoint_put_handoff(bytes: &mut Vec<u8>, handoff: SingleHopRole) {
             descriptor,
             terminal_receipt_digest,
             descriptor_receipt_digest,
+            recovery_fact,
         } => {
             put_u8(bytes, 1);
             put_child_descriptor(bytes, *descriptor);
             put_digest(bytes, terminal_receipt_digest);
             put_digest(bytes, descriptor_receipt_digest);
+            put_u8(bytes, u8::from(recovery_fact.is_some()));
+            if let Some(fact) = recovery_fact {
+                put_handoff_recovery_fact(bytes, fact);
+            }
         }
         SingleHopRole::Target {
             parent,
             descriptor_digest,
+            recovery_fact,
         } => {
             put_u8(bytes, 2);
             put_effect(bytes, parent);
             put_digest(bytes, descriptor_digest);
+            put_u8(bytes, u8::from(recovery_fact.is_some()));
+            if let Some(fact) = recovery_fact {
+                put_handoff_recovery_fact(bytes, fact);
+            }
         }
     }
 }
@@ -17959,10 +15902,12 @@ fn checkpoint_read_handoff(cursor: &mut Cursor<'_>) -> Result<SingleHopRole, Cor
             descriptor_receipt_digest: cursor
                 .digest()
                 .map_err(|_| CoreError::InvariantViolation)?,
+            recovery_fact: checkpoint_read_option_handoff_fact(cursor)?,
         }),
         2 => Ok(SingleHopRole::Target {
             parent: cursor.effect().map_err(|_| CoreError::InvariantViolation)?,
             descriptor_digest: cursor.digest().map_err(|_| CoreError::InvariantViolation)?,
+            recovery_fact: checkpoint_read_option_handoff_fact(cursor)?,
         }),
         _ => Err(CoreError::InvariantViolation),
     }
@@ -17970,18 +15915,22 @@ fn checkpoint_read_handoff(cursor: &mut Cursor<'_>) -> Result<SingleHopRole, Cor
 
 fn checkpoint_read_composites_count(
     cursor: &mut Cursor<'_>,
-    catalog: &DomainCatalog,
+    catalogs: &CatalogSet,
     count: usize,
     limits: CoreLimits,
-    mut total_claims: usize,
 ) -> Result<BTreeMap<EffectId, CompositeEffectRecord>, CoreError> {
+    let mut total_claims = 0usize;
     let mut composites = BTreeMap::new();
     for _ in 0..count {
         let effect = cursor.effect().map_err(|_| CoreError::InvariantViolation)?;
         let kind = CompositeKindId::new(cursor.u32().map_err(|_| CoreError::InvariantViolation)?)
             .map_err(|_| CoreError::InvariantViolation)?;
+        let catalog_digest = cursor.digest().map_err(|_| CoreError::InvariantViolation)?;
+        let catalog = catalogs
+            .get(catalog_digest)
+            .ok_or(CoreError::SchemaMismatch)?;
         let causal_owner = cursor
-            .incarnation()
+            .executor()
             .map_err(|_| CoreError::InvariantViolation)?;
         let custodian = checkpoint_read_custody(cursor)?;
         let charge_owner =
@@ -17992,6 +15941,7 @@ fn checkpoint_read_composites_count(
             .nonzero_u64()
             .map_err(|_| CoreError::InvariantViolation)?;
         let handoff = checkpoint_read_handoff(cursor)?;
+        let released_provenance = checkpoint_read_released_provenance(cursor, catalogs, limits)?;
         let component_count = cursor.u32().map_err(|_| CoreError::InvariantViolation)? as usize;
         let schema = catalog
             .composite_rule(kind)
@@ -18015,12 +15965,14 @@ fn checkpoint_read_composites_count(
         let record = CompositeEffectRecord {
             effect,
             kind,
+            catalog_digest,
             causal_owner,
             custodian,
             charge_owner,
             authority,
             authority_epoch,
             handoff,
+            released_provenance,
             components,
         };
         if composites.insert(effect, record).is_some() {
@@ -18099,7 +16051,7 @@ fn checkpoint_read_component_dynamic(
     let settlement_fact = checkpoint_read_option_fact(cursor)?;
     let retirement = checkpoint_read_retirement(cursor)?;
     let count = cursor.u32().map_err(|_| CoreError::InvariantViolation)? as usize;
-    if count > limits.max_claims_per_estate {
+    if count > limits.max_claims_per_effect {
         return Err(CoreError::InvariantViolation);
     }
     let mut claims = BTreeMap::new();
@@ -18265,9 +16217,8 @@ fn checkpoint_read_resource(
 }
 fn checkpoint_put_pending_reuse(bytes: &mut Vec<u8>, p: PendingReuse) {
     put_effect(bytes, p.effect);
-    put_optional_component(bytes, p.component);
+    put_u32(bytes, p.component.get());
     put_incarnation(bytes, p.actor);
-    put_u64(bytes, p.binding_generation);
     put_u64(bytes, p.authority_epoch);
     put_u64(bytes, p.claim.get());
     put_u64(bytes, p.previous_generation.get());
@@ -18280,14 +16231,10 @@ fn checkpoint_put_pending_reuse(bytes: &mut Vec<u8>, p: PendingReuse) {
 fn checkpoint_read_pending_reuse(cursor: &mut Cursor<'_>) -> Result<PendingReuse, CoreError> {
     Ok(PendingReuse {
         effect: cursor.effect().map_err(|_| CoreError::InvariantViolation)?,
-        component: cursor
-            .optional_component()
+        component: ComponentId::new(cursor.u32().map_err(|_| CoreError::InvariantViolation)?)
             .map_err(|_| CoreError::InvariantViolation)?,
         actor: cursor
-            .incarnation()
-            .map_err(|_| CoreError::InvariantViolation)?,
-        binding_generation: cursor
-            .nonzero_u64()
+            .executor()
             .map_err(|_| CoreError::InvariantViolation)?,
         authority_epoch: cursor
             .nonzero_u64()
@@ -18310,46 +16257,30 @@ fn checkpoint_read_pending_reuse(cursor: &mut Cursor<'_>) -> Result<PendingReuse
     })
 }
 
-fn checkpoint_rebuild_derived(state: &mut State) -> Result<(), CoreError> {
-    for (effect, estate) in &state.estates {
-        for claim in estate.claims.values() {
-            if !claim.retired {
-                state
-                    .resource_index
-                    .get_or_insert_with_mut(claim.resource, Vec::new)
-                    .push((*effect, claim.id));
-                let charged = state
-                    .charges
-                    .get(&(estate.charge_owner, claim.credit_class))
-                    .copied()
-                    .unwrap_or(0)
-                    .checked_add(claim.units)
-                    .ok_or(CoreError::InvariantViolation)?;
-                *state
-                    .charges
-                    .get_or_insert_with_mut((estate.charge_owner, claim.credit_class), || 0) =
-                    charged;
-            }
-        }
-    }
-    for (effect, composite) in &state.composite_effects {
+fn checkpoint_rebuild_derived(state: &mut impl StateAccessMut) -> Result<(), CoreError> {
+    let composites: Vec<_> = state
+        .composite_effects()
+        .iter()
+        .map(|(effect, composite)| (*effect, composite.clone()))
+        .collect();
+    for (effect, composite) in &composites {
         for (component_id, component) in &composite.components {
             for claim in component.claims.values() {
                 if !claim.retired
                     && !prepared_handoff_target_claim(state, composite, component, claim)
                 {
                     state
-                        .composite_resource_index
+                        .composite_resource_index_mut()
                         .get_or_insert_with_mut(claim.resource, Vec::new)
                         .push((*effect, *component_id, claim.id));
                     let charged = state
-                        .charges
+                        .charges()
                         .get(&(composite.charge_owner, claim.credit_class))
                         .copied()
                         .unwrap_or(0)
                         .checked_add(claim.units)
                         .ok_or(CoreError::InvariantViolation)?;
-                    *state.charges.get_or_insert_with_mut(
+                    *state.charges_mut().get_or_insert_with_mut(
                         (composite.charge_owner, claim.credit_class),
                         || 0,
                     ) = charged;
@@ -18357,18 +16288,11 @@ fn checkpoint_rebuild_derived(state: &mut State) -> Result<(), CoreError> {
             }
         }
     }
-    let composite_resource_keys: Vec<_> = state.composite_resource_index.keys().copied().collect();
+    let composite_resource_keys: Vec<_> =
+        state.composite_resource_index().keys().copied().collect();
     for resource in composite_resource_keys {
         state
-            .composite_resource_index
-            .get_mut(&resource)
-            .expect("resource index key was collected")
-            .sort_unstable();
-    }
-    let resource_keys: Vec<_> = state.resource_index.keys().copied().collect();
-    for resource in resource_keys {
-        state
-            .resource_index
+            .composite_resource_index_mut()
             .get_mut(&resource)
             .expect("resource index key was collected")
             .sort_unstable();
@@ -18376,28 +16300,12 @@ fn checkpoint_rebuild_derived(state: &mut State) -> Result<(), CoreError> {
     Ok(())
 }
 
-fn rebuild_root_effect_index(state: &mut State) {
-    state.root_effects.clear();
-    for effect in state.estates.keys().chain(state.composite_effects.keys()) {
-        state
-            .root_effects
-            .get_or_insert_with_mut(effect.root(), StateSet::new)
-            .insert_mut(*effect);
-    }
-}
-
-fn count_state_claims(state: &State) -> Result<usize, CoreError> {
+fn count_state_claims(state: &impl StateAccess) -> Result<usize, CoreError> {
     state
-        .estates
+        .composite_effects()
         .values()
-        .map(|estate| estate.claims.len())
-        .chain(
-            state
-                .composite_effects
-                .values()
-                .flat_map(|composite| composite.components.values())
-                .map(|component| component.claims.len()),
-        )
+        .flat_map(|composite| composite.components.values())
+        .map(|component| component.claims.len())
         .try_fold(0usize, |count, claims| {
             count
                 .checked_add(claims)
@@ -18455,12 +16363,25 @@ fn checkpoint_read_option_fact(
         _ => Err(CoreError::InvariantViolation),
     }
 }
+
+fn checkpoint_read_option_handoff_fact(
+    cursor: &mut Cursor<'_>,
+) -> Result<Option<VerifiedHandoffRecoveryFact>, CoreError> {
+    match cursor.u8().map_err(|_| CoreError::InvariantViolation)? {
+        0 => Ok(None),
+        1 => cursor
+            .handoff_recovery_fact()
+            .map(Some)
+            .map_err(|_| CoreError::InvariantViolation),
+        _ => Err(CoreError::InvariantViolation),
+    }
+}
 fn checkpoint_put_option_accepted(bytes: &mut Vec<u8>, value: Option<AcceptedEvidence>) {
     put_u8(bytes, u8::from(value.is_some()));
     if let Some(value) = value {
         put_freshness(bytes, value.subject);
         put_freshness(bytes, value.observation);
-        put_optional_provider_verification_scope(bytes, value.verification_scope);
+        put_provider_verification_scope(bytes, value.verification_scope);
         put_verifier_identity(bytes, value.stamp.identity);
         put_digest(bytes, value.stamp.receipt_digest);
     }
@@ -18480,7 +16401,7 @@ fn checkpoint_read_option_accepted(
         .freshness()
         .map_err(|_| CoreError::InvariantViolation)?;
     let verification_scope = cursor
-        .optional_provider_verification_scope()
+        .provider_verification_scope()
         .map_err(|_| CoreError::InvariantViolation)?;
     let verifier = VerifierId::new(cursor.u32().map_err(|_| CoreError::InvariantViolation)?)
         .map_err(|_| CoreError::InvariantViolation)?;
@@ -18490,11 +16411,7 @@ fn checkpoint_read_option_accepted(
     let receipt_schema =
         ReceiptSchemaId::new(cursor.u32().map_err(|_| CoreError::InvariantViolation)?)
             .map_err(|_| CoreError::InvariantViolation)?;
-    let implementation_digest = match cursor.u8().map_err(|_| CoreError::InvariantViolation)? {
-        0 => None,
-        1 => Some(cursor.digest().map_err(|_| CoreError::InvariantViolation)?),
-        _ => return Err(CoreError::InvariantViolation),
-    };
+    let implementation_digest = cursor.digest().map_err(|_| CoreError::InvariantViolation)?;
     let receipt_digest = cursor.digest().map_err(|_| CoreError::InvariantViolation)?;
     Ok(Some(AcceptedEvidence {
         subject,
@@ -18623,7 +16540,7 @@ fn checkpoint_read_settlement(cursor: &mut Cursor<'_>) -> Result<SettlementState
     let tag = cursor.u8().map_err(|_| CoreError::InvariantViolation)?;
     let generation_value =
         |c: &mut Cursor<'_>| c.nonzero_u64().map_err(|_| CoreError::InvariantViolation);
-    let actor = |c: &mut Cursor<'_>| c.incarnation().map_err(|_| CoreError::InvariantViolation);
+    let actor = |c: &mut Cursor<'_>| c.executor().map_err(|_| CoreError::InvariantViolation);
     match tag {
         1 => Ok(SettlementState::Unavailable),
         2 => Ok(SettlementState::NotRequired),
@@ -18662,22 +16579,22 @@ fn checkpoint_read_settlement(cursor: &mut Cursor<'_>) -> Result<SettlementState
 
 fn checkpoint_put_custody(bytes: &mut Vec<u8>, custody: CustodyState) {
     match custody {
-        CustodyState::Principal(incarnation) => {
+        CustodyState::Executor(executor) => {
             put_u8(bytes, 1);
-            put_incarnation(bytes, incarnation);
+            put_incarnation(bytes, executor);
         }
-        CustodyState::KernelEstate => put_u8(bytes, 2),
+        CustodyState::CoreOwned => put_u8(bytes, 2),
         CustodyState::Released => put_u8(bytes, 3),
     }
 }
 fn checkpoint_read_custody(cursor: &mut Cursor<'_>) -> Result<CustodyState, CoreError> {
     match cursor.u8().map_err(|_| CoreError::InvariantViolation)? {
-        1 => Ok(CustodyState::Principal(
+        1 => Ok(CustodyState::Executor(
             cursor
-                .incarnation()
+                .executor()
                 .map_err(|_| CoreError::InvariantViolation)?,
         )),
-        2 => Ok(CustodyState::KernelEstate),
+        2 => Ok(CustodyState::CoreOwned),
         3 => Ok(CustodyState::Released),
         _ => Err(CoreError::InvariantViolation),
     }
@@ -18691,37 +16608,34 @@ fn checkpoint_read_authority(cursor: &mut Cursor<'_>) -> Result<AuthorityState, 
     }
 }
 
-fn checkpoint_put_root(bytes: &mut Vec<u8>, id: RootId, root: &RootRecord) {
+fn checkpoint_put_operation(
+    bytes: &mut Vec<u8>,
+    id: OperationId,
+    operation: &CompositeRecoveryRecord,
+) {
     put_u64(bytes, id.get());
-    put_incarnation(bytes, root.origin);
-    put_u64(bytes, root.last_binding_generation);
-    put_u64(bytes, root.last_incarnation_generation);
-    put_u64(bytes, root.crash_generation);
-    match root.state {
-        RootRecoveryState::Active {
-            incarnation,
-            binding_generation,
-        } => {
+    put_incarnation(bytes, operation.origin);
+    put_incarnation(bytes, operation.last_executor);
+    put_u64(bytes, operation.crash_generation);
+    match operation.state {
+        OperationRecoveryState::Active { executor } => {
             put_u8(bytes, 1);
-            put_incarnation(bytes, incarnation);
-            put_u64(bytes, binding_generation);
+            put_incarnation(bytes, executor);
         }
-        RootRecoveryState::Fenced {
+        OperationRecoveryState::Fenced {
             crashed,
-            binding_generation,
             crash_generation,
         } => {
             put_u8(bytes, 2);
             put_incarnation(bytes, crashed);
-            put_u64(bytes, binding_generation);
             put_u64(bytes, crash_generation);
         }
-        RootRecoveryState::Snapshotted { snapshot, digest } => {
+        OperationRecoveryState::Snapshotted { snapshot, digest } => {
             put_u8(bytes, 3);
             put_u64(bytes, snapshot.get());
             put_digest(bytes, digest);
         }
-        RootRecoveryState::Ready {
+        OperationRecoveryState::Ready {
             snapshot,
             successor,
         } => {
@@ -18729,102 +16643,80 @@ fn checkpoint_put_root(bytes: &mut Vec<u8>, id: RootId, root: &RootRecord) {
             put_u64(bytes, snapshot.get());
             put_incarnation(bytes, successor);
         }
-        RootRecoveryState::Rebound {
-            successor,
-            binding_generation,
-        } => {
+        OperationRecoveryState::Rebound { successor } => {
             put_u8(bytes, 5);
             put_incarnation(bytes, successor);
-            put_u64(bytes, binding_generation);
         }
-        RootRecoveryState::RecoveryExhausted {
+        OperationRecoveryState::RecoveryExhausted {
             crashed,
-            binding_generation,
             crash_generation,
         } => {
             put_u8(bytes, 6);
             put_incarnation(bytes, crashed);
-            put_u64(bytes, binding_generation);
             put_u64(bytes, crash_generation);
         }
     }
 }
 
-fn checkpoint_read_roots_count(
+fn checkpoint_read_operations_count(
     cursor: &mut Cursor<'_>,
     count: usize,
-) -> Result<BTreeMap<RootId, RootRecord>, CoreError> {
-    let mut roots = BTreeMap::new();
+) -> Result<BTreeMap<OperationId, CompositeRecoveryRecord>, CoreError> {
+    let mut operations = BTreeMap::new();
     for _ in 0..count {
-        let id = RootId::new(cursor.u64().map_err(|_| CoreError::InvariantViolation)?)
+        let id = OperationId::new(cursor.u64().map_err(|_| CoreError::InvariantViolation)?)
             .map_err(|_| CoreError::InvariantViolation)?;
         let origin = cursor
-            .incarnation()
+            .executor()
             .map_err(|_| CoreError::InvariantViolation)?;
-        let last_binding_generation = cursor
-            .nonzero_u64()
-            .map_err(|_| CoreError::InvariantViolation)?;
-        let last_incarnation_generation = cursor
-            .nonzero_u64()
+        let last_executor = cursor
+            .executor()
             .map_err(|_| CoreError::InvariantViolation)?;
         let crash_generation = cursor.u64().map_err(|_| CoreError::InvariantViolation)?;
         let state = match cursor.u8().map_err(|_| CoreError::InvariantViolation)? {
-            1 => RootRecoveryState::Active {
-                incarnation: cursor
-                    .incarnation()
-                    .map_err(|_| CoreError::InvariantViolation)?,
-                binding_generation: cursor
-                    .nonzero_u64()
+            1 => OperationRecoveryState::Active {
+                executor: cursor
+                    .executor()
                     .map_err(|_| CoreError::InvariantViolation)?,
             },
-            2 => RootRecoveryState::Fenced {
+            2 => OperationRecoveryState::Fenced {
                 crashed: cursor
-                    .incarnation()
-                    .map_err(|_| CoreError::InvariantViolation)?,
-                binding_generation: cursor
-                    .nonzero_u64()
+                    .executor()
                     .map_err(|_| CoreError::InvariantViolation)?,
                 crash_generation: cursor.u64().map_err(|_| CoreError::InvariantViolation)?,
             },
-            3 => RootRecoveryState::Snapshotted {
+            3 => OperationRecoveryState::Snapshotted {
                 snapshot: SnapshotId::new(cursor.u64().map_err(|_| CoreError::InvariantViolation)?)
                     .map_err(|_| CoreError::InvariantViolation)?,
                 digest: cursor.digest().map_err(|_| CoreError::InvariantViolation)?,
             },
-            4 => RootRecoveryState::Ready {
+            4 => OperationRecoveryState::Ready {
                 snapshot: SnapshotId::new(cursor.u64().map_err(|_| CoreError::InvariantViolation)?)
                     .map_err(|_| CoreError::InvariantViolation)?,
                 successor: cursor
-                    .incarnation()
+                    .executor()
                     .map_err(|_| CoreError::InvariantViolation)?,
             },
-            5 => RootRecoveryState::Rebound {
+            5 => OperationRecoveryState::Rebound {
                 successor: cursor
-                    .incarnation()
-                    .map_err(|_| CoreError::InvariantViolation)?,
-                binding_generation: cursor
-                    .nonzero_u64()
+                    .executor()
                     .map_err(|_| CoreError::InvariantViolation)?,
             },
-            6 => RootRecoveryState::RecoveryExhausted {
+            6 => OperationRecoveryState::RecoveryExhausted {
                 crashed: cursor
-                    .incarnation()
-                    .map_err(|_| CoreError::InvariantViolation)?,
-                binding_generation: cursor
-                    .nonzero_u64()
+                    .executor()
                     .map_err(|_| CoreError::InvariantViolation)?,
                 crash_generation: cursor.u64().map_err(|_| CoreError::InvariantViolation)?,
             },
             _ => return Err(CoreError::InvariantViolation),
         };
-        if roots
+        if operations
             .insert(
                 id,
-                RootRecord {
+                CompositeRecoveryRecord {
                     origin,
                     state,
-                    last_binding_generation,
-                    last_incarnation_generation,
+                    last_executor,
                     crash_generation,
                 },
             )
@@ -18833,7 +16725,7 @@ fn checkpoint_read_roots_count(
             return Err(CoreError::InvariantViolation);
         }
     }
-    Ok(roots)
+    Ok(operations)
 }
 
 fn put_u16(bytes: &mut Vec<u8>, value: u16) {
@@ -18853,7 +16745,7 @@ fn put_digest(bytes: &mut Vec<u8>, digest: Digest) {
 }
 
 fn put_effect(bytes: &mut Vec<u8>, effect: EffectId) {
-    put_u64(bytes, effect.root().get());
+    put_u64(bytes, effect.operation().get());
     put_u64(bytes, effect.sequence());
 }
 
@@ -18861,6 +16753,20 @@ fn put_provider_coordinate(bytes: &mut Vec<u8>, coordinate: ProviderCoordinate) 
     put_u64(bytes, coordinate.world().get());
     put_u64(bytes, coordinate.provider().get());
     put_u64(bytes, coordinate.generation().get());
+}
+
+fn put_component_provider_binding(bytes: &mut Vec<u8>, binding: ComponentProviderBinding) {
+    put_u32(bytes, binding.component().get());
+    put_provider_coordinate(bytes, binding.provider());
+    match binding.artifact() {
+        Some(artifact) => {
+            put_u8(bytes, 1);
+            put_u64(bytes, artifact.artifact().get());
+            put_digest(bytes, artifact.schema_digest());
+            put_digest(bytes, artifact.closure_digest());
+        }
+        None => put_u8(bytes, 0),
+    }
 }
 
 fn put_verifier_binding(bytes: &mut Vec<u8>, binding: VerifierBinding) {
@@ -18900,13 +16806,9 @@ fn put_child_descriptor(bytes: &mut Vec<u8>, value: ChildDescriptorV1) {
     put_digest(bytes, value.catalog_digest);
 }
 
-fn put_optional_component(bytes: &mut Vec<u8>, component: Option<ComponentId>) {
-    put_u32(bytes, component.map(ComponentId::get).unwrap_or(0));
-}
-
-fn put_incarnation(bytes: &mut Vec<u8>, incarnation: PrincipalIncarnation) {
-    put_u64(bytes, incarnation.principal().get());
-    put_u64(bytes, incarnation.generation());
+fn put_incarnation(bytes: &mut Vec<u8>, executor: ExecutorCoordinate) {
+    put_u64(bytes, executor.executor().get());
+    put_u64(bytes, executor.generation().get());
 }
 
 fn put_claim_scope(bytes: &mut Vec<u8>, scope: ClaimScope) {
@@ -18922,7 +16824,6 @@ fn put_claim_scope(bytes: &mut Vec<u8>, scope: ClaimScope) {
 fn put_freshness(bytes: &mut Vec<u8>, freshness: Freshness) {
     put_u64(bytes, freshness.boot().get());
     put_u64(bytes, freshness.registry().get());
-    put_u64(bytes, freshness.binding());
     put_u64(bytes, freshness.device().get());
     put_u64(bytes, freshness.journal().get());
 }
@@ -18930,7 +16831,7 @@ fn put_freshness(bytes: &mut Vec<u8>, freshness: Freshness) {
 fn put_effect_fact(bytes: &mut Vec<u8>, fact: VerifiedEffectFact) {
     put_u8(bytes, fact.kind.tag());
     put_effect(bytes, fact.effect);
-    put_optional_component(bytes, fact.component);
+    put_u32(bytes, fact.component.get());
     put_incarnation(bytes, fact.actor);
     put_u64(bytes, fact.generation);
     put_u64(bytes, fact.nonce);
@@ -18940,7 +16841,7 @@ fn put_effect_fact(bytes: &mut Vec<u8>, fact: VerifiedEffectFact) {
         put_digest(bytes, predecessor);
     }
     put_freshness(bytes, fact.freshness);
-    put_optional_provider_verification_scope(bytes, fact.verification_scope);
+    put_provider_verification_scope(bytes, fact.verification_scope);
     put_verifier_identity(bytes, fact.stamp.identity);
     put_digest(bytes, fact.stamp.receipt_digest);
     put_u8(
@@ -18953,21 +16854,12 @@ fn put_effect_fact(bytes: &mut Vec<u8>, fact: VerifiedEffectFact) {
     );
 }
 
-fn put_optional_provider_verification_scope(
-    bytes: &mut Vec<u8>,
-    scope: Option<ProviderVerificationScope>,
-) {
-    match scope {
-        None => put_u8(bytes, 0),
-        Some(scope) => {
-            put_u8(bytes, 1);
-            put_u64(bytes, scope.world.get());
-            put_provider_coordinate(bytes, scope.provider);
-            put_u64(bytes, scope.operation.get());
-            put_digest(bytes, scope.catalog_digest);
-            put_verifier_binding(bytes, scope.verifier_binding);
-        }
-    }
+fn put_provider_verification_scope(bytes: &mut Vec<u8>, scope: ProviderVerificationScope) {
+    put_u64(bytes, scope.world.get());
+    put_provider_coordinate(bytes, scope.provider);
+    put_u64(bytes, scope.operation.get());
+    put_digest(bytes, scope.catalog_digest);
+    put_verifier_binding(bytes, scope.verifier_binding);
 }
 
 struct Cursor<'a> {
@@ -19068,8 +16960,9 @@ impl<'a> Cursor<'a> {
     }
 
     fn effect(&mut self) -> Result<EffectId, CommandDecodeError> {
-        let root = RootId::new(self.u64()?).map_err(|_| CommandDecodeError::InvalidIdentity)?;
-        EffectId::new(root, self.u64()?).map_err(|_| CommandDecodeError::InvalidIdentity)
+        let operation =
+            OperationId::new(self.u64()?).map_err(|_| CommandDecodeError::InvalidIdentity)?;
+        EffectId::new(operation, self.u64()?).map_err(|_| CommandDecodeError::InvalidIdentity)
     }
 
     fn provider_coordinate(&mut self) -> Result<ProviderCoordinate, CommandDecodeError> {
@@ -19079,6 +16972,25 @@ impl<'a> Cursor<'a> {
         let generation = ProviderGeneration::new(self.u64()?)
             .map_err(|_| CommandDecodeError::InvalidIdentity)?;
         Ok(ProviderCoordinate::new(world, provider, generation))
+    }
+
+    fn component_provider_binding(
+        &mut self,
+    ) -> Result<ComponentProviderBinding, CommandDecodeError> {
+        let component =
+            ComponentId::new(self.u32()?).map_err(|_| CommandDecodeError::InvalidIdentity)?;
+        let provider = self.provider_coordinate()?;
+        let binding = ComponentProviderBinding::new(component, provider);
+        match self.u8()? {
+            0 => Ok(binding),
+            1 => Ok(binding.with_artifact(ArtifactAdmission::new(
+                crate::RecoveryArtifactId::new(self.u64()?)
+                    .map_err(|_| CommandDecodeError::InvalidIdentity)?,
+                self.digest()?,
+                self.digest()?,
+            ))),
+            _ => Err(CommandDecodeError::InvalidTag),
+        }
     }
 
     fn verifier_binding(&mut self) -> Result<VerifierBinding, CommandDecodeError> {
@@ -19092,29 +17004,22 @@ impl<'a> Cursor<'a> {
             .map_err(|_| CommandDecodeError::InvalidIdentity)
     }
 
-    fn optional_provider_verification_scope(
+    fn provider_verification_scope(
         &mut self,
-    ) -> Result<Option<ProviderVerificationScope>, CommandDecodeError> {
-        match self.u8()? {
-            0 => Ok(None),
-            1 => {
-                let world =
-                    WorldId::new(self.u64()?).map_err(|_| CommandDecodeError::InvalidIdentity)?;
-                let provider = self.provider_coordinate()?;
-                let operation = OperationId::new(self.u64()?)
-                    .map_err(|_| CommandDecodeError::InvalidIdentity)?;
-                let catalog_digest = self.digest()?;
-                let verifier_binding = self.verifier_binding()?;
-                Ok(Some(ProviderVerificationScope::new(
-                    world,
-                    provider,
-                    operation,
-                    catalog_digest,
-                    verifier_binding,
-                )))
-            }
-            _ => Err(CommandDecodeError::InvalidTag),
-        }
+    ) -> Result<ProviderVerificationScope, CommandDecodeError> {
+        let world = WorldId::new(self.u64()?).map_err(|_| CommandDecodeError::InvalidIdentity)?;
+        let provider = self.provider_coordinate()?;
+        let operation =
+            OperationId::new(self.u64()?).map_err(|_| CommandDecodeError::InvalidIdentity)?;
+        let catalog_digest = self.digest()?;
+        let verifier_binding = self.verifier_binding()?;
+        Ok(ProviderVerificationScope::new(
+            world,
+            provider,
+            operation,
+            catalog_digest,
+            verifier_binding,
+        ))
     }
 
     fn artifact_binding(&mut self) -> Result<ArtifactBinding, CommandDecodeError> {
@@ -19140,22 +17045,16 @@ impl<'a> Cursor<'a> {
         .map_err(|_| CommandDecodeError::InvalidIdentity)
     }
 
-    fn incarnation(&mut self) -> Result<PrincipalIncarnation, CommandDecodeError> {
-        let principal = crate::PrincipalId::new(self.u64()?)
+    fn executor(&mut self) -> Result<ExecutorCoordinate, CommandDecodeError> {
+        let executor =
+            crate::ExecutorId::new(self.u64()?).map_err(|_| CommandDecodeError::InvalidIdentity)?;
+        let generation = crate::ExecutorGeneration::new(self.u64()?)
             .map_err(|_| CommandDecodeError::InvalidIdentity)?;
-        PrincipalIncarnation::new(principal, self.u64()?)
-            .map_err(|_| CommandDecodeError::InvalidIdentity)
+        Ok(ExecutorCoordinate::new(executor, generation))
     }
 
-    fn optional_component(&mut self) -> Result<Option<ComponentId>, CommandDecodeError> {
-        let raw = self.u32()?;
-        if raw == 0 {
-            Ok(None)
-        } else {
-            ComponentId::new(raw)
-                .map(Some)
-                .map_err(|_| CommandDecodeError::InvalidIdentity)
-        }
+    fn component(&mut self) -> Result<ComponentId, CommandDecodeError> {
+        ComponentId::new(self.u32()?).map_err(|_| CommandDecodeError::InvalidIdentity)
     }
 
     fn claim_scope(&mut self) -> Result<ClaimScope, CommandDecodeError> {
@@ -19173,13 +17072,50 @@ impl<'a> Cursor<'a> {
             BootGeneration::new(self.u64()?).map_err(|_| CommandDecodeError::InvalidIdentity)?;
         let registry =
             RegistryInstance::new(self.u64()?).map_err(|_| CommandDecodeError::InvalidIdentity)?;
-        let binding = self.nonzero_u64()?;
         let device =
             DeviceGeneration::new(self.u64()?).map_err(|_| CommandDecodeError::InvalidIdentity)?;
         let journal =
             JournalGeneration::new(self.u64()?).map_err(|_| CommandDecodeError::InvalidIdentity)?;
-        Freshness::new(boot, registry, binding, device, journal)
-            .map_err(|_| CommandDecodeError::InvalidIdentity)
+        Ok(Freshness::new(boot, registry, device, journal))
+    }
+
+    fn handoff_recovery_fact(&mut self) -> Result<VerifiedHandoffRecoveryFact, CommandDecodeError> {
+        let role = match self.u8()? {
+            1 => HandoffRecoveryRole::Parent,
+            2 => HandoffRecoveryRole::Child,
+            _ => return Err(CommandDecodeError::InvalidTag),
+        };
+        let effect = self.effect()?;
+        let component = self.component()?;
+        let operation = self.digest()?;
+        let descriptor_digest = self.digest()?;
+        let freshness = self.freshness()?;
+        let verification_scope = self.provider_verification_scope()?;
+        let verifier =
+            VerifierId::new(self.u32()?).map_err(|_| CommandDecodeError::InvalidIdentity)?;
+        let epoch = self.nonzero_u64()?;
+        let receipt_schema =
+            ReceiptSchemaId::new(self.u32()?).map_err(|_| CommandDecodeError::InvalidIdentity)?;
+        let implementation_digest = self.digest()?;
+        let receipt_digest = self.digest()?;
+        Ok(VerifiedHandoffRecoveryFact {
+            role,
+            effect,
+            component,
+            operation,
+            descriptor_digest,
+            freshness,
+            stamp: VerifierStamp {
+                identity: VerifierIdentity {
+                    verifier,
+                    epoch,
+                    receipt_schema,
+                    implementation_digest,
+                },
+                receipt_digest,
+            },
+            verification_scope,
+        })
     }
 
     fn effect_fact(&mut self) -> Result<VerifiedEffectFact, CommandDecodeError> {
@@ -19190,8 +17126,8 @@ impl<'a> Cursor<'a> {
             _ => return Err(CommandDecodeError::InvalidTag),
         };
         let effect = self.effect()?;
-        let component = self.optional_component()?;
-        let actor = self.incarnation()?;
+        let component = self.component()?;
+        let actor = self.executor()?;
         let generation = self.nonzero_u64()?;
         let nonce = self.nonzero_u64()?;
         let operation = self.digest()?;
@@ -19201,17 +17137,13 @@ impl<'a> Cursor<'a> {
             _ => return Err(CommandDecodeError::InvalidTag),
         };
         let freshness = self.freshness()?;
-        let verification_scope = self.optional_provider_verification_scope()?;
+        let verification_scope = self.provider_verification_scope()?;
         let verifier =
             VerifierId::new(self.u32()?).map_err(|_| CommandDecodeError::InvalidIdentity)?;
         let epoch = self.nonzero_u64()?;
         let receipt_schema =
             ReceiptSchemaId::new(self.u32()?).map_err(|_| CommandDecodeError::InvalidIdentity)?;
-        let implementation_digest = match self.u8()? {
-            0 => None,
-            1 => Some(self.digest()?),
-            _ => return Err(CommandDecodeError::InvalidTag),
-        };
+        let implementation_digest = self.digest()?;
         let receipt_digest = self.digest()?;
         let outcome = match self.u8()? {
             0 => None,
@@ -19253,127 +17185,157 @@ impl<'a> Cursor<'a> {
 }
 
 #[cfg(test)]
-mod prepared_transition_tests {
+mod handoff_recovery_fact_tests {
     use super::*;
 
     fn freshness() -> Freshness {
         Freshness::new(
             BootGeneration::new(1).unwrap(),
             RegistryInstance::new(1).unwrap(),
-            1,
             DeviceGeneration::new(1).unwrap(),
             JournalGeneration::new(1).unwrap(),
         )
-        .unwrap()
     }
 
-    fn create_composite() -> Command {
-        Command(CommandKind::CreateCompositeEffect {
-            effect: EffectId::new(RootId::new(401).unwrap(), 1).unwrap(),
-            origin: PrincipalIncarnation::new(crate::PrincipalId::new(401).unwrap(), 1).unwrap(),
-            binding_generation: 1,
-            kind: crate::AGENT_OPERATION_COMPOSITE,
-            charge_account: ChargeAccountId::new(401).unwrap(),
-        })
+    fn descriptor() -> ChildDescriptorV1 {
+        ChildDescriptorV1 {
+            schema: 1,
+            sequence: 1,
+            parent: EffectId::new(OperationId::new(9).unwrap(), 1).unwrap(),
+            parent_component: ComponentId::new(1).unwrap(),
+            route_digest: Digest::new([0x21; 32]),
+            child_kind: CompositeKindId::new(2).unwrap(),
+            child_component: ComponentId::new(2).unwrap(),
+            claim: ClaimId::new(3).unwrap(),
+            claim_kind: ClaimKindId::new(4).unwrap(),
+            scope: ClaimScope::Logical,
+            resource: ResourceId::new(5).unwrap(),
+            resource_generation: ResourceGeneration::new(1).unwrap(),
+            units: 1,
+            input_digest: Digest::new([0x22; 32]),
+            catalog_digest: Digest::new([0x23; 32]),
+        }
     }
 
     #[test]
-    fn prepare_rejection_does_not_call_persistence() {
-        let mut engine = Engine::new(
-            WorldId::new(1).unwrap(),
-            crate::standard_catalog(),
-            CoreLimits::bounded_default(),
-            freshness(),
+    fn tag_41_and_checkpoint_roundtrip_preserve_the_complete_fact() {
+        let descriptor = descriptor();
+        let provider = ProviderCoordinate::new(
+            WorldId::new(7).unwrap(),
+            ProviderId::new(8).unwrap(),
+            ProviderGeneration::new(1).unwrap(),
         );
-        let mut persist_calls = 0;
-        let result = engine.transact(
-            Command(CommandKind::CreateEstate {
-                effect: EffectId::new(RootId::new(402).unwrap(), 1).unwrap(),
-                origin: PrincipalIncarnation::new(crate::PrincipalId::new(402).unwrap(), 1)
-                    .unwrap(),
-                binding_generation: 1,
-                domain: crate::REPLY_DOMAIN,
-                obligation: crate::REPLY_OBLIGATION_PUBLICATION,
-                charge_account: ChargeAccountId::new(402).unwrap(),
-            }),
-            |_| {
-                persist_calls += 1;
-                Ok::<(), ()>(())
+        let binding = VerifierBinding::new(
+            VerifierId::new(9).unwrap(),
+            VerifierGeneration::new(1).unwrap(),
+            ReceiptSchemaId::new(10).unwrap(),
+            Digest::new([0x24; 32]),
+        )
+        .unwrap();
+        let scope = ProviderVerificationScope::new(
+            WorldId::new(7).unwrap(),
+            provider,
+            descriptor.parent.operation(),
+            descriptor.catalog_digest,
+            binding,
+        );
+        let challenge = HandoffResolutionChallenge {
+            effect: descriptor.parent,
+            component: descriptor.parent_component,
+            domain: DomainId::new(1).unwrap(),
+            obligation: ObligationKindId::new(1).unwrap(),
+            operation: Digest::new([0x25; 32]),
+            descriptor,
+            current_observation: freshness(),
+            expected_verifier: binding.verifier(),
+            expected_receipt_schema: binding.receipt_schema(),
+            verification_scope: scope,
+        };
+        let fact = VerifiedHandoffRecoveryFact::from_challenge(
+            HandoffRecoveryRole::Parent,
+            challenge,
+            VerifierStamp {
+                identity: VerifierIdentity::new_exact(binding),
+                receipt_digest: Digest::new([0x26; 32]),
             },
         );
+        let command = CommandKind::ResolveIndeterminateHandoffParent {
+            descriptor,
+            descriptor_receipt_digest: Digest::new([0x27; 32]),
+            fact,
+        };
         assert_eq!(
-            result,
-            Err(TxError::Core(CoreError::IncompatibleApiProfile))
+            CommandKind::decode_payload(&command.encode_payload()).unwrap(),
+            command
         );
-        assert_eq!(persist_calls, 0);
-    }
 
-    #[test]
-    fn persistence_error_keeps_the_semantic_state_unchanged() {
-        let mut engine = Engine::new_scoped_legacy_compatibility(
-            WorldId::new(1).unwrap(),
-            crate::standard_catalog(),
-            CoreLimits::bounded_default(),
-            freshness(),
-        );
-        let before = (engine.revision(), engine.head(), engine.projection_digest());
-        let result = engine.transact(create_composite(), |_| Err::<(), _>(42));
-        assert_eq!(result, Err(TxError::Persist(42)));
+        let handoff = SingleHopRole::Source {
+            descriptor: Box::new(descriptor),
+            terminal_receipt_digest: fact.stamp.receipt_digest,
+            descriptor_receipt_digest: Digest::new([0x27; 32]),
+            recovery_fact: Some(fact),
+        };
+        let mut bytes = Vec::new();
+        checkpoint_put_handoff(&mut bytes, handoff.clone());
         assert_eq!(
-            before,
-            (engine.revision(), engine.head(), engine.projection_digest())
+            checkpoint_read_handoff(&mut Cursor::new(&bytes)).unwrap(),
+            handoff
         );
-        assert!(engine.persistence_recovery_required());
-    }
-
-    #[test]
-    fn successful_receipt_projection_matches_published_engine() {
-        let mut engine = Engine::new_scoped_legacy_compatibility(
-            WorldId::new(1).unwrap(),
-            crate::standard_catalog(),
-            CoreLimits::bounded_default(),
-            freshness(),
-        );
-        let receipt = engine
-            .transact(create_composite(), |_| Ok::<(), ()>(()))
-            .unwrap();
-        assert_eq!(receipt.revision(), engine.revision());
-        assert_eq!(receipt.head(), engine.head());
-        assert_eq!(receipt.projection(), engine.projection_digest());
     }
 }
 
 #[cfg(test)]
 mod whole_state_checkpoint_tests {
-    use alloc::vec;
-
     use super::*;
     use crate::{
         AGENT_COMPONENT_DMA, AGENT_COMPONENT_REPLY, AGENT_OPERATION_COMPOSITE, DEVICE_CLAIM_IOVA,
         DEVICE_CLAIM_PINNED_PAGE, DEVICE_CLAIM_QUEUE_SLOT, REPLY_CLAIM_PUBLICATION_SLOT,
-        standard_catalog,
+        standard_catalog, tool_dma_catalog,
     };
+    use alloc::vec;
 
     fn freshness() -> Freshness {
         Freshness::new(
             BootGeneration::new(1).unwrap(),
             RegistryInstance::new(1).unwrap(),
-            1,
             DeviceGeneration::new(1).unwrap(),
             JournalGeneration::new(1).unwrap(),
         )
-        .unwrap()
     }
 
-    fn seed(journal: &mut Vec<u8>) -> (Engine, EffectId, PrincipalIncarnation) {
-        let mut engine = Engine::new_scoped_legacy_compatibility(
+    fn seed(journal: &mut Vec<u8>) -> (Engine, EffectId, ExecutorCoordinate) {
+        let catalog = standard_catalog();
+        let catalog_set = CatalogSet::new(core::slice::from_ref(&catalog)).unwrap();
+        let mut engine = Engine::new(
             WorldId::new(1).unwrap(),
-            standard_catalog(),
+            catalog_set,
             CoreLimits::bounded_default(),
             freshness(),
         );
-        let effect = EffectId::new(RootId::new(91).unwrap(), 1).unwrap();
-        let actor = PrincipalIncarnation::new(crate::PrincipalId::new(9).unwrap(), 1).unwrap();
+        let effect = EffectId::new(OperationId::new(91).unwrap(), 1).unwrap();
+        let actor = ExecutorCoordinate::new(
+            crate::ExecutorId::new(9).unwrap(),
+            crate::ExecutorGeneration::new(1).unwrap(),
+        );
+        let provider = ProviderCoordinate::new(
+            WorldId::new(1).unwrap(),
+            ProviderId::new(1).unwrap(),
+            ProviderGeneration::new(1).unwrap(),
+        );
+        let catalog_digest = catalog.digest();
+        let verifier_bindings = catalog
+            .verifier_class_bindings()
+            .into_iter()
+            .map(|class| {
+                VerifierBinding::new(
+                    class.verifier(),
+                    VerifierGeneration::new(1).unwrap(),
+                    class.receipt_schema(),
+                    Digest::new([0x91; 32]),
+                )
+                .unwrap()
+            })
+            .collect();
         let mut request = |engine: &mut Engine, request| {
             engine
                 .transact(request, |record| {
@@ -19384,12 +17346,23 @@ mod whole_state_checkpoint_tests {
         };
         request(
             &mut engine,
-            CommandRequest::CreateCompositeEffect {
+            CommandRequest::RegisterProviderGeneration {
+                coordinate: provider,
+                catalog_digest,
+                verifier_bindings,
+            },
+        );
+        request(
+            &mut engine,
+            CommandRequest::AdmitScopedCompositeEffect {
                 effect,
                 origin: actor,
-                binding_generation: 1,
                 kind: AGENT_OPERATION_COMPOSITE,
                 charge_account: ChargeAccountId::new(1).unwrap(),
+                bindings: vec![
+                    ComponentProviderBinding::new(AGENT_COMPONENT_REPLY, provider),
+                    ComponentProviderBinding::new(AGENT_COMPONENT_DMA, provider),
+                ],
             },
         );
         let device = ClaimScope::Device(DeviceScopeId::new(7).unwrap());
@@ -19429,7 +17402,6 @@ mod whole_state_checkpoint_tests {
                     effect,
                     component,
                     actor,
-                    binding_generation: 1,
                     claim,
                     kind,
                     scope,
@@ -19441,11 +17413,7 @@ mod whole_state_checkpoint_tests {
         }
         request(
             &mut engine,
-            CommandRequest::PrepareCompositeEffect {
-                effect,
-                actor,
-                binding_generation: 1,
-            },
+            CommandRequest::PrepareCompositeEffect { effect, actor },
         );
         (engine, effect, actor)
     }
@@ -19464,7 +17432,190 @@ mod whole_state_checkpoint_tests {
     }
 
     #[test]
-    fn profile_two_tool_dma_checkpoint_roundtrip_and_suffix_replay() {
+    fn mixed_catalog_provider_generations_use_exact_material_in_full_invariants() {
+        let standard = standard_catalog();
+        let tool = tool_dma_catalog();
+        let standard_digest = standard.digest();
+        let tool_digest = tool.digest();
+        assert_ne!(standard_digest, tool_digest);
+        let catalogs = CatalogSet::new(&[standard.clone(), tool.clone()]).unwrap();
+        let mut engine = Engine::new(
+            WorldId::new(1).unwrap(),
+            catalogs,
+            CoreLimits::bounded_default(),
+            freshness(),
+        );
+        for (provider_id, catalog, digest) in [
+            (ProviderId::new(11).unwrap(), standard, standard_digest),
+            (ProviderId::new(12).unwrap(), tool, tool_digest),
+        ] {
+            let coordinate = ProviderCoordinate::new(
+                WorldId::new(1).unwrap(),
+                provider_id,
+                ProviderGeneration::new(1).unwrap(),
+            );
+            let verifier_bindings = catalog
+                .verifier_class_bindings()
+                .into_iter()
+                .map(|class| {
+                    VerifierBinding::new(
+                        class.verifier(),
+                        VerifierGeneration::new(1).unwrap(),
+                        class.receipt_schema(),
+                        Digest::new([provider_id.get() as u8; 32]),
+                    )
+                    .unwrap()
+                })
+                .collect();
+            engine
+                .transact(
+                    CommandRequest::RegisterProviderGeneration {
+                        coordinate,
+                        catalog_digest: digest,
+                        verifier_bindings,
+                    },
+                    |_| Ok::<(), ()>(()),
+                )
+                .unwrap();
+        }
+        check_invariants_for_catalog_set(&engine.catalog, engine.limits, &engine.state).unwrap();
+
+        let coordinate = ProviderCoordinate::new(
+            WorldId::new(1).unwrap(),
+            ProviderId::new(12).unwrap(),
+            ProviderGeneration::new(1).unwrap(),
+        );
+        engine
+            .state
+            .provider_generations_mut()
+            .get_mut(&coordinate)
+            .unwrap()
+            .catalog_digest = standard_digest;
+        assert!(
+            check_invariants_for_catalog_set(&engine.catalog, engine.limits, &engine.state)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn scoped_admission_uses_catalog_consensus_not_binding_order() {
+        let standard = standard_catalog();
+        let tool = tool_dma_catalog();
+        let standard_digest = standard.digest();
+        let tool_digest = tool.digest();
+        let mut engine = Engine::new(
+            WorldId::new(1).unwrap(),
+            CatalogSet::new(&[standard.clone(), tool.clone()]).unwrap(),
+            CoreLimits::bounded_default(),
+            freshness(),
+        );
+        let register =
+            |engine: &mut Engine, provider: ProviderCoordinate, catalog: &DomainCatalog| {
+                let verifier_bindings = catalog
+                    .verifier_class_bindings()
+                    .into_iter()
+                    .map(|class| {
+                        VerifierBinding::new(
+                            class.verifier(),
+                            VerifierGeneration::new(1).unwrap(),
+                            class.receipt_schema(),
+                            Digest::new([provider.provider().get() as u8; 32]),
+                        )
+                        .unwrap()
+                    })
+                    .collect();
+                engine
+                    .transact(
+                        CommandRequest::RegisterProviderGeneration {
+                            coordinate: provider,
+                            catalog_digest: catalog.digest(),
+                            verifier_bindings,
+                        },
+                        |_| Ok::<(), ()>(()),
+                    )
+                    .unwrap();
+            };
+        let standard_a = ProviderCoordinate::new(
+            WorldId::new(1).unwrap(),
+            ProviderId::new(21).unwrap(),
+            ProviderGeneration::new(1).unwrap(),
+        );
+        let standard_b = ProviderCoordinate::new(
+            WorldId::new(1).unwrap(),
+            ProviderId::new(22).unwrap(),
+            ProviderGeneration::new(1).unwrap(),
+        );
+        let tool_provider = ProviderCoordinate::new(
+            WorldId::new(1).unwrap(),
+            ProviderId::new(23).unwrap(),
+            ProviderGeneration::new(1).unwrap(),
+        );
+        register(&mut engine, standard_a, &standard);
+        register(&mut engine, standard_b, &standard);
+        register(&mut engine, tool_provider, &tool);
+
+        // Reordering equal-catalog bindings must not change the selected
+        // semantic material or the resulting admission.
+        let valid = engine.transact(
+            CommandRequest::AdmitScopedCompositeEffect {
+                effect: EffectId::new(OperationId::new(301).unwrap(), 1).unwrap(),
+                origin: ExecutorCoordinate::new(
+                    crate::ExecutorId::new(301).unwrap(),
+                    crate::ExecutorGeneration::new(1).unwrap(),
+                ),
+                kind: AGENT_OPERATION_COMPOSITE,
+                charge_account: ChargeAccountId::new(301).unwrap(),
+                bindings: vec![
+                    ComponentProviderBinding::new(AGENT_COMPONENT_DMA, standard_b),
+                    ComponentProviderBinding::new(AGENT_COMPONENT_REPLY, standard_a),
+                ],
+            },
+            |_| Ok::<(), ()>(()),
+        );
+        assert!(valid.is_ok());
+
+        // A mixed set is rejected before any first binding can select a
+        // catalog, regardless of which component appears first on the wire.
+        for bindings in [
+            vec![
+                ComponentProviderBinding::new(AGENT_COMPONENT_REPLY, standard_a),
+                ComponentProviderBinding::new(AGENT_COMPONENT_DMA, tool_provider),
+            ],
+            vec![
+                ComponentProviderBinding::new(AGENT_COMPONENT_DMA, tool_provider),
+                ComponentProviderBinding::new(AGENT_COMPONENT_REPLY, standard_a),
+            ],
+        ] {
+            let error = engine
+                .transact(
+                    CommandRequest::AdmitScopedCompositeEffect {
+                        effect: EffectId::new(OperationId::new(302).unwrap(), 1).unwrap(),
+                        origin: ExecutorCoordinate::new(
+                            crate::ExecutorId::new(302).unwrap(),
+                            crate::ExecutorGeneration::new(1).unwrap(),
+                        ),
+                        kind: AGENT_OPERATION_COMPOSITE,
+                        charge_account: ChargeAccountId::new(302).unwrap(),
+                        bindings,
+                    },
+                    |_| Ok::<(), ()>(()),
+                )
+                .unwrap_err();
+            assert!(matches!(error, TxError::Core(CoreError::CatalogMismatch)));
+        }
+        assert_eq!(
+            engine.catalog.get(standard_digest).unwrap().digest(),
+            standard_digest
+        );
+        assert_eq!(
+            engine.catalog.get(tool_digest).unwrap().digest(),
+            tool_digest
+        );
+        check_invariants_for_catalog_set(&engine.catalog, engine.limits, &engine.state).unwrap();
+    }
+
+    #[test]
+    fn bounded_tool_dma_checkpoint_roundtrip_and_suffix_replay() {
         let mut journal = Vec::new();
         let (mut engine, effect, actor) = seed(&mut journal);
         append_checkpoint(&mut engine, &mut journal);
@@ -19473,7 +17624,6 @@ mod whole_state_checkpoint_tests {
                 CommandRequest::RecordCompositeCommitIntents {
                     effect,
                     actor,
-                    binding_generation: 1,
                     operations: vec![
                         ComponentCommitOperation::new(AGENT_COMPONENT_REPLY, Digest::new([3; 32])),
                         ComponentCommitOperation::new(AGENT_COMPONENT_DMA, Digest::new([4; 32])),
@@ -19487,7 +17637,7 @@ mod whole_state_checkpoint_tests {
             .unwrap();
         let decoded = decode_whole_state_checkpoint(
             &encode_whole_state_checkpoint(&engine.state),
-            &engine.catalog,
+            engine.catalog_set(),
             engine.limits,
         )
         .unwrap();
@@ -19495,47 +17645,39 @@ mod whole_state_checkpoint_tests {
         let target = Freshness::new(
             BootGeneration::new(2).unwrap(),
             RegistryInstance::new(1).unwrap(),
-            1,
             DeviceGeneration::new(1).unwrap(),
             JournalGeneration::new(2).unwrap(),
-        )
-        .unwrap();
+        );
         let anchor = RecoveryAnchor::from_trusted_provider(
             RecoveryBinding::new(
                 crate::RecoveryProfile::current(),
                 WorldId::new(1).unwrap(),
                 engine.catalog.digest(),
-                engine.state.freshness.registry(),
-                crate::AuthorityBindingGeneration::new(engine.state.freshness.binding()).unwrap(),
+                engine.state.freshness().registry(),
             )
             .unwrap(),
-            engine.state.freshness,
+            engine.state.freshness(),
             target,
-            engine.state.revision,
-            engine.state.head,
+            engine.state.revision(),
+            engine.state.head(),
             engine.projection_digest(),
         )
         .unwrap();
-        let recovered = Engine::recover_legacy_compatibility(
-            engine.catalog.clone(),
-            engine.limits,
-            anchor,
-            &journal,
-        )
-        .unwrap()
-        .into_engine();
-        assert_eq!(recovered.state.revision, engine.state.revision);
-        assert_eq!(recovered.state.head, engine.state.head);
+        let recovered = Engine::recover(engine.catalog.clone(), engine.limits, anchor, &journal)
+            .unwrap()
+            .into_engine();
+        assert_eq!(recovered.state.revision(), engine.state.revision());
+        assert_eq!(recovered.state.head(), engine.state.head());
         assert_eq!(
             recovered
                 .state
-                .composite_effects
+                .composite_effects()
                 .get(&effect)
                 .unwrap()
                 .components,
             engine
                 .state
-                .composite_effects
+                .composite_effects()
                 .get(&effect)
                 .unwrap()
                 .components
@@ -19543,13 +17685,27 @@ mod whole_state_checkpoint_tests {
     }
 
     #[test]
-    fn profile_two_tool_dma_checkpoint_rejects_corruption() {
+    fn bounded_tool_dma_checkpoint_rejects_corruption() {
         let mut journal = Vec::new();
         let (engine, _, _) = seed(&mut journal);
         let mut image = encode_whole_state_checkpoint(&engine.state);
-        let offset = image.len() / 2;
-        image[offset] ^= 0x80;
-        assert!(decode_whole_state_checkpoint(&image, &engine.catalog, engine.limits).is_err());
+        image[0] ^= 0x80;
+        assert!(
+            decode_whole_state_checkpoint(&image, engine.catalog_set(), engine.limits).is_err()
+        );
+    }
+
+    #[test]
+    fn whole_state_schema_two_is_recognized_and_rejected() {
+        let mut journal = Vec::new();
+        let (engine, _, _) = seed(&mut journal);
+        let mut image = encode_whole_state_checkpoint(&engine.state);
+        image[..8].copy_from_slice(PREVIOUS_WHOLE_STATE_CHECKPOINT_MAGIC);
+        image[8..10].copy_from_slice(&2u16.to_le_bytes());
+        assert_eq!(
+            decode_whole_state_checkpoint(&image, engine.catalog_set(), engine.limits),
+            Err(CoreError::UnsupportedCheckpointState)
+        );
     }
 
     #[test]
@@ -19561,21 +17717,21 @@ mod whole_state_checkpoint_tests {
         // serialized; recovery rebuilds the canonical empty cache.
         let (_, credit_class) = engine
             .state
-            .charges
+            .charges()
             .keys()
             .next()
             .copied()
             .expect("seeded charge");
         engine
             .state
-            .charges
+            .charges_mut()
             .insert_mut((ChargeAccountId::new(2).unwrap(), credit_class), 0);
-        check_invariants(&engine.catalog, engine.limits, &engine.state).unwrap();
+        check_invariants_for_catalog_set(&engine.catalog, engine.limits, &engine.state).unwrap();
 
         append_checkpoint(&mut engine, &mut journal);
         let rebuilt = decode_whole_state_checkpoint(
             &encode_whole_state_checkpoint(&engine.state),
-            &engine.catalog,
+            engine.catalog_set(),
             engine.limits,
         )
         .unwrap();
@@ -19586,87 +17742,27 @@ mod whole_state_checkpoint_tests {
         assert_eq!(rebuilt.projection_cache.digest, engine.projection_digest());
     }
 
-    #[cfg(feature = "test-support")]
-    #[test]
-    fn mixed_estate_and_composite_checkpoint_roundtrip() {
-        let mut engine = Engine::new_scoped_legacy_compatibility(
-            WorldId::new(1).unwrap(),
-            standard_catalog(),
-            CoreLimits::bounded_default(),
-            freshness(),
-        );
-        let effect = EffectId::new(RootId::new(92).unwrap(), 1).unwrap();
-        let actor = PrincipalIncarnation::new(crate::PrincipalId::new(9).unwrap(), 1).unwrap();
-        engine
-            .transact(
-                CommandRequest::CreateEstate {
-                    effect,
-                    origin: actor,
-                    binding_generation: 1,
-                    domain: crate::REPLY_DOMAIN,
-                    obligation: crate::REPLY_OBLIGATION_PUBLICATION,
-                    charge_account: ChargeAccountId::new(2).unwrap(),
-                },
-                |_| Ok::<(), ()>(()),
-            )
-            .unwrap();
-        engine
-            .transact(
-                CommandRequest::AddClaim {
-                    effect,
-                    actor,
-                    binding_generation: 1,
-                    claim: ClaimId::new(9).unwrap(),
-                    domain: crate::REPLY_DOMAIN,
-                    kind: REPLY_CLAIM_PUBLICATION_SLOT,
-                    scope: ClaimScope::Logical,
-                    resource: ResourceId::new(9).unwrap(),
-                    resource_generation: ResourceGeneration::new(1).unwrap(),
-                    units: 1,
-                },
-                |_| Ok::<(), ()>(()),
-            )
-            .unwrap();
-        let composite_effect = EffectId::new(RootId::new(93).unwrap(), 1).unwrap();
-        engine
-            .transact(
-                CommandRequest::CreateCompositeEffect {
-                    effect: composite_effect,
-                    origin: actor,
-                    binding_generation: 1,
-                    kind: AGENT_OPERATION_COMPOSITE,
-                    charge_account: ChargeAccountId::new(3).unwrap(),
-                },
-                |_| Ok::<(), ()>(()),
-            )
-            .unwrap();
-        let decoded = decode_whole_state_checkpoint(
-            &encode_whole_state_checkpoint(&engine.state),
-            &engine.catalog,
-            engine.limits,
-        )
-        .unwrap();
-        assert_eq!(decoded, engine.state);
-    }
-
     #[test]
     fn checkpoint_rejects_noncanonical_acceptance_and_oversized_counts() {
         assert!(checkpoint_read_option_accepted(&mut Cursor::new(&[2])).is_err());
         let engine = Engine::new(
             WorldId::new(1).unwrap(),
-            standard_catalog(),
+            CatalogSet::new(&[standard_catalog()]).unwrap(),
             CoreLimits::bounded_default(),
             freshness(),
         );
         let mut image = encode_whole_state_checkpoint(&engine.state);
-        // framing (8+2), revision, head, nonce and freshness precede roots.
-        let roots_offset = 8 + 2 + 8 + 32 + 8 + (5 * 8);
-        image[roots_offset..roots_offset + 4].copy_from_slice(
-            &u32::try_from(engine.limits.max_roots + 1)
+        // framing (8+2), revision, head, nonce and freshness precede the
+        // world-presence tag.
+        let operations_offset = 8 + 2 + 8 + 32 + 8 + (4 * 8);
+        image[operations_offset..operations_offset + 4].copy_from_slice(
+            &u32::try_from(engine.limits.max_operations + 1)
                 .unwrap()
                 .to_le_bytes(),
         );
-        assert!(decode_whole_state_checkpoint(&image, &engine.catalog, engine.limits).is_err());
+        assert!(
+            decode_whole_state_checkpoint(&image, engine.catalog_set(), engine.limits).is_err()
+        );
 
         let mut payload = vec![37];
         payload.extend_from_slice(&Digest::ZERO.bytes());
@@ -19680,949 +17776,248 @@ mod whole_state_checkpoint_tests {
             Err(CommandDecodeError::UnexpectedEof)
         ));
     }
-}
 
-#[cfg(test)]
-mod handoff_guard_tests {
-    use super::*;
-    use crate::{
-        TOOL_CLAIM_OUTCOME_SLOT, TOOL_COMMIT_RECEIPT_SCHEMA, TOOL_HANDOFF_CHILD_COMPOSITE,
-        TOOL_HANDOFF_COMPONENT, TOOL_HANDOFF_SOURCE_COMPONENT, TOOL_HANDOFF_SOURCE_COMPOSITE,
-        TOOL_VERIFIER, tool_dma_catalog,
-    };
-    use alloc::vec;
-
-    fn freshness() -> Freshness {
-        Freshness::new(
-            BootGeneration::new(1).unwrap(),
-            RegistryInstance::new(1).unwrap(),
-            1,
-            DeviceGeneration::new(1).unwrap(),
-            JournalGeneration::new(1).unwrap(),
-        )
-        .unwrap()
-    }
-
-    fn transact(engine: &mut Engine, command: impl Into<Command>) -> TransitionReceipt {
-        engine.transact(command, |_| Ok::<(), ()>(())).unwrap()
-    }
-
-    fn recover_at_checkpoint(engine: &mut Engine) -> Engine {
+    #[test]
+    fn handoff_recovery_fact_rejects_cross_role_descriptor_provider_and_verifier_replay() {
         let mut journal = Vec::new();
-        let checkpoint = Command(CommandKind::WholeStateCheckpointV1 {
-            state: encode_whole_state_checkpoint(&engine.state),
-            projection: engine.projection_digest(),
-        });
-        engine
-            .transact(checkpoint, |record| {
-                journal.extend_from_slice(record.bytes());
-                Ok::<(), ()>(())
-            })
+        let (engine, effect, _) = seed(&mut journal);
+        let component = engine
+            .state
+            .composite_effects()
+            .get(&effect)
+            .unwrap()
+            .components
+            .get(&AGENT_COMPONENT_REPLY)
             .unwrap();
-        let target = Freshness::new(
-            BootGeneration::new(2).unwrap(),
-            RegistryInstance::new(1).unwrap(),
-            1,
-            DeviceGeneration::new(1).unwrap(),
-            JournalGeneration::new(2).unwrap(),
-        )
-        .unwrap();
-        let anchor = RecoveryAnchor::from_trusted_provider(
-            RecoveryBinding::new(
-                crate::RecoveryProfile::current(),
-                WorldId::new(1).unwrap(),
-                engine.catalog.digest(),
-                engine.state.freshness.registry(),
-                crate::AuthorityBindingGeneration::new(engine.state.freshness.binding()).unwrap(),
+        let catalog = engine
+            .catalog
+            .get(
+                engine
+                    .state
+                    .composite_effects()
+                    .get(&effect)
+                    .unwrap()
+                    .catalog_digest,
+            )
+            .unwrap();
+        let receipt = catalog
+            .obligation_rule(component.domain, component.obligation)
+            .unwrap()
+            .receipts()
+            .commit_outcome();
+        let scope = engine
+            .scoped_verification_scope(
+                effect,
+                AGENT_COMPONENT_REPLY,
+                receipt.verifier(),
+                receipt.receipt_schema(),
+            )
+            .unwrap();
+        let operation = Digest::new([0x51; 32]);
+        let descriptor_digest = Digest::new([0x52; 32]);
+        let fact = VerifiedHandoffRecoveryFact {
+            role: HandoffRecoveryRole::Parent,
+            effect,
+            component: AGENT_COMPONENT_REPLY,
+            operation,
+            descriptor_digest,
+            freshness: component_freshness(
+                &engine.state,
+                engine.state.composite_effects().get(&effect).unwrap(),
+                component,
             )
             .unwrap(),
-            engine.state.freshness,
-            target,
-            engine.state.revision,
-            engine.state.head,
-            engine.projection_digest(),
+            stamp: VerifierStamp {
+                identity: VerifierIdentity::new_exact(scope.verifier_binding()),
+                receipt_digest: Digest::new([0x53; 32]),
+            },
+            verification_scope: scope,
+        };
+        let expected = HandoffRecoveryCoordinates::new(
+            HandoffRecoveryRole::Parent,
+            effect,
+            AGENT_COMPONENT_REPLY,
+            operation,
+            descriptor_digest,
+            fact.freshness,
+        );
+        assert!(handoff_recovery_fact_matches(
+            &engine.state,
+            catalog,
+            fact,
+            expected,
+        ));
+        assert!(!handoff_recovery_fact_matches(
+            &engine.state,
+            catalog,
+            VerifiedHandoffRecoveryFact {
+                role: HandoffRecoveryRole::Child,
+                ..fact
+            },
+            expected,
+        ));
+        assert!(!handoff_recovery_fact_matches(
+            &engine.state,
+            catalog,
+            VerifiedHandoffRecoveryFact {
+                descriptor_digest: Digest::new([0x54; 32]),
+                ..fact
+            },
+            expected,
+        ));
+        let wrong_provider = ProviderCoordinate::new(
+            scope.world(),
+            ProviderId::new(99).unwrap(),
+            scope.provider().generation(),
+        );
+        assert!(!handoff_recovery_fact_matches(
+            &engine.state,
+            catalog,
+            VerifiedHandoffRecoveryFact {
+                verification_scope: ProviderVerificationScope::new(
+                    scope.world(),
+                    wrong_provider,
+                    scope.operation(),
+                    scope.catalog_digest(),
+                    scope.verifier_binding(),
+                ),
+                ..fact
+            },
+            expected,
+        ));
+        let wrong_binding = VerifierBinding::new(
+            scope.verifier_binding().verifier(),
+            scope.verifier_binding().generation(),
+            scope.verifier_binding().receipt_schema(),
+            Digest::new([0x55; 32]),
         )
         .unwrap();
-        Engine::recover_legacy_compatibility(
-            engine.catalog.clone(),
-            engine.limits,
-            anchor,
-            &journal,
-        )
-        .unwrap()
-        .into_engine()
-    }
-
-    fn setup() -> (Engine, EffectId, PrincipalIncarnation, ChildDescriptorV1) {
-        setup_with_resources(10, 10)
-    }
-
-    fn setup_with_resources(
-        source_resource: u64,
-        child_resource: u64,
-    ) -> (Engine, EffectId, PrincipalIncarnation, ChildDescriptorV1) {
-        let mut engine = Engine::new_scoped_legacy_compatibility(
-            WorldId::new(1).unwrap(),
-            tool_dma_catalog(),
-            CoreLimits::bounded_default(),
-            freshness(),
-        );
-        let parent = EffectId::new(RootId::new(77).unwrap(), 2).unwrap();
-        let actor = PrincipalIncarnation::new(crate::PrincipalId::new(7).unwrap(), 1).unwrap();
-        transact(
-            &mut engine,
-            CommandRequest::CreateCompositeEffect {
-                effect: parent,
-                origin: actor,
-                binding_generation: 1,
-                kind: TOOL_HANDOFF_SOURCE_COMPOSITE,
-                charge_account: ChargeAccountId::new(1).unwrap(),
-            },
-        );
-        transact(
-            &mut engine,
-            CommandRequest::AddComponentClaim {
-                effect: parent,
-                component: TOOL_HANDOFF_SOURCE_COMPONENT,
-                actor,
-                binding_generation: 1,
-                claim: ClaimId::new(1).unwrap(),
-                kind: TOOL_CLAIM_OUTCOME_SLOT,
-                scope: ClaimScope::Logical,
-                resource: ResourceId::new(source_resource).unwrap(),
-                resource_generation: ResourceGeneration::new(1).unwrap(),
-                units: 1,
-            },
-        );
-        transact(
-            &mut engine,
-            CommandRequest::PrepareCompositeEffect {
-                effect: parent,
-                actor,
-                binding_generation: 1,
-            },
-        );
-        let receipt = transact(
-            &mut engine,
-            CommandRequest::RecordComponentCommitIntent {
-                effect: parent,
-                component: TOOL_HANDOFF_SOURCE_COMPONENT,
-                actor,
-                binding_generation: 1,
-                operation: Digest::new([9; 32]),
-            },
-        );
-        let TransitionOutput::CommitIntent(intent) = receipt.output else {
-            panic!("commit intent");
-        };
-        let descriptor = ChildDescriptorV1 {
-            schema: 1,
-            sequence: 1,
-            parent,
-            parent_component: TOOL_HANDOFF_SOURCE_COMPONENT,
-            route_digest: Digest::new([1; 32]),
-            child_kind: TOOL_HANDOFF_CHILD_COMPOSITE,
-            child_component: TOOL_HANDOFF_COMPONENT,
-            claim: ClaimId::new(1).unwrap(),
-            claim_kind: TOOL_CLAIM_OUTCOME_SLOT,
-            scope: ClaimScope::Logical,
-            resource: ResourceId::new(child_resource).unwrap(),
-            resource_generation: ResourceGeneration::new(1).unwrap(),
-            units: 1,
-            input_digest: Digest::new([2; 32]),
-            catalog_digest: engine.catalog.digest(),
-        };
-        let fact = VerifiedEffectFact {
-            kind: EffectFactKind::CommitOutcome,
-            effect: parent,
-            component: Some(TOOL_HANDOFF_SOURCE_COMPONENT),
-            actor,
-            generation: 1,
-            nonce: intent.nonce,
-            operation: Digest::new([9; 32]),
-            predecessor: None,
-            freshness: engine.state.freshness,
-            stamp: VerifierStamp {
-                identity: VerifierIdentity {
-                    verifier: TOOL_VERIFIER,
-                    epoch: 1,
-                    receipt_schema: TOOL_COMMIT_RECEIPT_SCHEMA,
-                    implementation_digest: None,
+        assert!(!handoff_recovery_fact_matches(
+            &engine.state,
+            catalog,
+            VerifiedHandoffRecoveryFact {
+                stamp: VerifierStamp {
+                    identity: VerifierIdentity::new_exact(wrong_binding),
+                    ..fact.stamp
                 },
-                receipt_digest: Digest::new([3; 32]),
+                ..fact
             },
-            verification_scope: None,
-            outcome: Some(ExternalOutcome::Success),
-        };
-        transact(
-            &mut engine,
-            Command(CommandKind::AcknowledgeHandoffParent {
-                fact,
-                descriptor,
-                descriptor_receipt_digest: Digest::new([16; 32]),
-            }),
-        );
-        (engine, parent, actor, descriptor)
-    }
-
-    struct TestChildDescriptorVerifier;
-
-    impl ChildDescriptorVerifier for TestChildDescriptorVerifier {
-        type Receipt = ();
-
-        fn verify_child_descriptor(
-            &self,
-            _descriptor: ChildDescriptorV1,
-            _receipt: &Self::Receipt,
-        ) -> Result<Digest, VerificationError> {
-            Ok(Digest::new([0x41; 32]))
-        }
-    }
-
-    struct TestHandoffResolutionVerifier;
-
-    impl HandoffResolutionVerifier for TestHandoffResolutionVerifier {
-        type Receipt = ();
-
-        fn identity(&self) -> VerifierIdentity {
-            VerifierIdentity {
-                verifier: TOOL_VERIFIER,
-                epoch: 1,
-                receipt_schema: TOOL_COMMIT_RECEIPT_SCHEMA,
-                implementation_digest: None,
-            }
-        }
-
-        fn verify_handoff_parent_success(
-            &self,
-            challenge: &HandoffResolutionChallenge,
-            _receipt: &Self::Receipt,
-        ) -> Result<Digest, VerificationError> {
-            assert_eq!(challenge.component(), TOOL_HANDOFF_SOURCE_COMPONENT);
-            assert_eq!(challenge.operation(), Digest::new([9; 32]));
-            Ok(Digest::new([0x42; 32]))
-        }
-    }
-
-    impl HandoffChildResolutionVerifier for TestHandoffResolutionVerifier {
-        type Receipt = ();
-        fn identity(&self) -> VerifierIdentity {
-            HandoffResolutionVerifier::identity(self)
-        }
-        fn verify_handoff_child_success(
-            &self,
-            challenge: &HandoffResolutionChallenge,
-            _: &(),
-        ) -> Result<Digest, VerificationError> {
-            assert_eq!(challenge.component(), TOOL_HANDOFF_COMPONENT);
-            Ok(Digest::new([0x43; 32]))
-        }
-    }
-
-    #[test]
-    fn indeterminate_fenced_handoff_parent_resolves_only_through_dedicated_proof_and_recovers() {
-        let (mut engine, parent, actor, descriptor) = setup();
-        let operation = Digest::new([9; 32]);
-        let root = engine.state.roots.get_mut(&parent.root()).unwrap();
-        root.crash_generation = 1;
-        root.state = RootRecoveryState::Fenced {
-            crashed: actor,
-            binding_generation: 1,
-            crash_generation: 1,
-        };
-        let composite = engine.state.composite_effects.get_mut(&parent).unwrap();
-        composite.authority = AuthorityState::Fenced;
-        composite.custodian = CustodyState::KernelEstate;
-        composite.handoff = SingleHopRole::None;
-        let component = composite
-            .components
-            .get_mut(&TOOL_HANDOFF_SOURCE_COMPONENT)
-            .unwrap();
-        component.commit = CommitState::Committed;
-        component.commit_nonce = None;
-        component.commit_fact = None;
-        component.commit_operation = Some(operation);
-        component.outcome = OutcomeState::Indeterminate(operation);
-
-        let verified_descriptor = engine
-            .verify_child_descriptor(descriptor, &TestChildDescriptorVerifier, &())
-            .unwrap();
-        let challenge = engine
-            .handoff_resolution_challenge(&verified_descriptor)
-            .unwrap();
-        assert_eq!(challenge.effect(), parent);
-        assert_eq!(challenge.descriptor(), descriptor);
-        let command = engine
-            .verify_handoff_resolution(verified_descriptor, &TestHandoffResolutionVerifier, &())
-            .unwrap()
-            .resolve();
-        let payload = command.0.encode_payload();
-        assert_eq!(CommandKind::decode_payload(&payload).unwrap(), command.0);
-        transact(&mut engine, command);
-
-        let projection = engine.composite_effect(parent).unwrap();
-        assert_eq!(projection.authority, AuthorityState::Fenced);
-        assert_eq!(projection.custodian, CustodyState::KernelEstate);
-        assert!(matches!(
-            projection.handoff,
-            SingleHopHandoffProjection::Source { .. }
+            expected,
         ));
-        let component = engine
-            .component(parent, TOOL_HANDOFF_SOURCE_COMPONENT)
-            .unwrap();
-        assert_eq!(component.commit, CommitState::Committed);
-        assert_eq!(component.commit_operation, Some(operation));
-        assert_eq!(
-            component.outcome,
-            OutcomeState::KnownSuccess(Digest::new([0x42; 32]))
-        );
-
-        let recovered = recover_at_checkpoint(&mut engine);
-        assert!(matches!(
-            recovered.composite_effect(parent).unwrap().handoff,
-            SingleHopHandoffProjection::Source { descriptor: ref saved, .. } if **saved == descriptor
-        ));
-    }
-
-    #[test]
-    fn child_handoff_resolution_requires_saved_descriptor_receipt_and_traces_child() {
-        let (mut engine, parent, actor, descriptor) = setup();
-        let child = descriptor.child_effect().unwrap();
-        transact(
-            &mut engine,
-            Command(CommandKind::InstallHandoffChild {
-                descriptor,
-                origin: actor,
-                binding_generation: 1,
-                charge_account: ChargeAccountId::new(1).unwrap(),
-            }),
-        );
-        let operation = Digest::new([0x91; 32]);
-        engine.state.roots.get_mut(&parent.root()).unwrap().state = RootRecoveryState::Fenced {
-            crashed: actor,
-            binding_generation: 1,
-            crash_generation: 1,
-        };
-        let child_composite = engine.state.composite_effects.get_mut(&child).unwrap();
-        child_composite.authority = AuthorityState::Fenced;
-        child_composite.custodian = CustodyState::KernelEstate;
-        let child_component = child_composite
-            .components
-            .get_mut(&TOOL_HANDOFF_COMPONENT)
-            .unwrap();
-        child_component.commit = CommitState::Committed;
-        child_component.commit_nonce = None;
-        child_component.commit_fact = None;
-        child_component.commit_operation = Some(operation);
-        child_component.outcome = OutcomeState::Indeterminate(operation);
-
-        let bad = CommandKind::ResolveIndeterminateHandoffParent {
-            descriptor,
-            terminal_receipt_digest: Digest::new([0x42; 32]),
-            descriptor_receipt_digest: Digest::new([0x17; 32]),
-        };
-        assert_eq!(
-            apply_command(
-                &engine.catalog,
-                engine.limits,
-                &mut engine.state.clone(),
-                &bad
-            ),
-            Err(CoreError::HandoffGuardRequired)
-        );
-
-        let command = CommandKind::ResolveIndeterminateHandoffParent {
-            descriptor,
-            terminal_receipt_digest: Digest::new([0x42; 32]),
-            descriptor_receipt_digest: Digest::new([16; 32]),
-        };
-        assert!(matches!(
-            &engine.state.composite_effects.get(&parent).unwrap().handoff,
-            SingleHopRole::Source { descriptor: saved, descriptor_receipt_digest, .. }
-                if **saved == descriptor && *descriptor_receipt_digest == Digest::new([16; 32])
-        ));
-        assert!(matches!(
-            engine.state.composite_effects.get(&child).unwrap().handoff,
-            SingleHopRole::Target { parent: saved, descriptor_digest }
-                if saved == parent && descriptor_digest == handoff_descriptor_digest(descriptor)
-        ));
-        assert_eq!(
-            command.coordinates_for_state(&engine.state),
-            TransitionCoordinates::new(
-                Some(child.root()),
-                Some(child),
-                Some(TOOL_HANDOFF_COMPONENT),
-                None,
-            )
-        );
-        let result = apply_command(&engine.catalog, engine.limits, &mut engine.state, &command);
-        assert!(result.is_ok(), "{result:?}");
-    }
-
-    #[test]
-    fn prepared_target_does_not_preempt_parent_handoff_resolution() {
-        let (mut engine, parent, actor, descriptor) = setup();
-        let child = descriptor.child_effect().unwrap();
-        transact(
-            &mut engine,
-            Command(CommandKind::InstallHandoffChild {
-                descriptor,
-                origin: actor,
-                binding_generation: 1,
-                charge_account: ChargeAccountId::new(1).unwrap(),
-            }),
-        );
-
-        engine.state.roots.get_mut(&parent.root()).unwrap().state = RootRecoveryState::Fenced {
-            crashed: actor,
-            binding_generation: 1,
-            crash_generation: 1,
-        };
-        let parent_composite = engine.state.composite_effects.get_mut(&parent).unwrap();
-        parent_composite.authority = AuthorityState::Fenced;
-        parent_composite.custodian = CustodyState::KernelEstate;
-        parent_composite.handoff = SingleHopRole::None;
-        let parent_component = parent_composite
-            .components
-            .get_mut(&TOOL_HANDOFF_SOURCE_COMPONENT)
-            .unwrap();
-        parent_component.commit = CommitState::Committed;
-        parent_component.commit_nonce = None;
-        parent_component.commit_fact = None;
-        parent_component.commit_operation = Some(Digest::new([9; 32]));
-        parent_component.outcome = OutcomeState::Indeterminate(Digest::new([9; 32]));
-
-        let child_composite = engine.state.composite_effects.get_mut(&child).unwrap();
-        child_composite.authority = AuthorityState::Fenced;
-        child_composite.custodian = CustodyState::KernelEstate;
-        assert_eq!(
-            child_composite
-                .components
-                .get(&TOOL_HANDOFF_COMPONENT)
-                .unwrap()
-                .commit,
-            CommitState::Prepared
-        );
-
-        let command = CommandKind::ResolveIndeterminateHandoffParent {
-            descriptor,
-            terminal_receipt_digest: Digest::new([0x44; 32]),
-            descriptor_receipt_digest: Digest::new([0x45; 32]),
-        };
-        assert_eq!(
-            command.coordinates_for_state(&engine.state),
-            TransitionCoordinates::new(
-                Some(parent.root()),
-                Some(parent),
-                Some(TOOL_HANDOFF_SOURCE_COMPONENT),
-                None,
-            )
-        );
-        let result = apply_command(&engine.catalog, engine.limits, &mut engine.state, &command);
-        assert!(result.is_ok(), "{result:?}");
-        assert_eq!(
-            engine
-                .component(parent, TOOL_HANDOFF_SOURCE_COMPONENT)
-                .unwrap()
-                .outcome,
-            OutcomeState::KnownSuccess(Digest::new([0x44; 32]))
-        );
-        assert_eq!(
-            engine
-                .component(child, TOOL_HANDOFF_COMPONENT)
-                .unwrap()
-                .commit,
-            CommitState::Prepared
-        );
-    }
-
-    #[test]
-    fn handoff_descriptor_tamper_and_generic_bypasses_fail_closed() {
-        let (mut engine, parent, actor, descriptor) = setup();
-        let mut tampered = descriptor;
-        tampered.input_digest = Digest::new([4; 32]);
-        assert_eq!(
-            engine
-                .transact(
-                    Command(CommandKind::InstallHandoffChild {
-                        descriptor: tampered,
-                        origin: actor,
-                        binding_generation: 1,
-                        charge_account: ChargeAccountId::new(1).unwrap()
-                    }),
-                    |_| Ok::<(), ()>(())
-                )
-                .unwrap_err(),
-            TxError::Core(CoreError::HandoffGuardRequired)
-        );
-        transact(
-            &mut engine,
-            Command(CommandKind::InstallHandoffChild {
-                descriptor,
-                origin: actor,
-                binding_generation: 1,
-                charge_account: ChargeAccountId::new(1).unwrap(),
-            }),
-        );
-        let child = descriptor.child_effect().unwrap();
-        assert_eq!(engine.composite_effect(child).unwrap().component_count, 1);
-        assert_eq!(
-            engine
-                .transact(
-                    CommandRequest::RecordComponentCommitIntent {
-                        effect: child,
-                        component: TOOL_HANDOFF_COMPONENT,
-                        actor,
-                        binding_generation: 1,
-                        operation: Digest::new([8; 32])
-                    },
-                    |_| Ok::<(), ()>(())
-                )
-                .unwrap_err(),
-            TxError::Core(CoreError::HandoffGuardRequired)
-        );
-        assert_eq!(
-            engine
-                .transact(
-                    CommandRequest::ReleaseCompositeEffect { effect: parent },
-                    |_| Ok::<(), ()>(())
-                )
-                .unwrap_err(),
-            TxError::Core(CoreError::HandoffGuardRequired)
-        );
-    }
-
-    #[test]
-    fn exact_coordinate_handoff_reserves_without_double_active_custody() {
-        let (mut engine, parent, actor, descriptor) = setup_with_resources(10, 10);
-        let child = descriptor.child_effect().unwrap();
-        let resource = descriptor.resource;
-        let before = engine.projection_digest();
-
-        let mut wrong_coordinate = descriptor;
-        wrong_coordinate.resource = ResourceId::new(11).unwrap();
-        assert_eq!(
-            engine
-                .transact(
-                    Command(CommandKind::InstallHandoffChild {
-                        descriptor: wrong_coordinate,
-                        origin: actor,
-                        binding_generation: 1,
-                        charge_account: ChargeAccountId::new(1).unwrap(),
-                    }),
-                    |_| Ok::<(), ()>(())
-                )
-                .unwrap_err(),
-            TxError::Core(CoreError::HandoffGuardRequired)
-        );
-        assert_eq!(engine.projection_digest(), before);
-
-        let mut tampered = descriptor;
-        tampered.units = 2;
-        assert_eq!(
-            engine
-                .transact(
-                    Command(CommandKind::InstallHandoffChild {
-                        descriptor: tampered,
-                        origin: actor,
-                        binding_generation: 1,
-                        charge_account: ChargeAccountId::new(1).unwrap(),
-                    }),
-                    |_| Ok::<(), ()>(())
-                )
-                .unwrap_err(),
-            TxError::Core(CoreError::HandoffGuardRequired)
-        );
-        assert_eq!(engine.projection_digest(), before);
-
-        transact(
-            &mut engine,
-            Command(CommandKind::InstallHandoffChild {
-                descriptor,
-                origin: actor,
-                binding_generation: 1,
-                charge_account: ChargeAccountId::new(1).unwrap(),
-            }),
-        );
-        assert_eq!(
-            engine.state.composite_resource_index.get(&resource),
-            Some(&vec![(
-                parent,
-                TOOL_HANDOFF_SOURCE_COMPONENT,
-                ClaimId::new(1).unwrap()
-            )])
-        );
-        assert_eq!(
-            engine.state.charges.get(&(
-                ChargeAccountId::new(1).unwrap(),
-                crate::CREDIT_TOOL_OUTCOME_SLOT
-            )),
-            Some(&1)
-        );
-        let recovered = recover_at_checkpoint(&mut engine);
-        assert_eq!(
-            recovered.state.composite_resource_index.get(&resource),
-            Some(&vec![(
-                parent,
-                TOOL_HANDOFF_SOURCE_COMPONENT,
-                ClaimId::new(1).unwrap()
-            )])
-        );
-
-        let unrelated = EffectId::new(parent.root(), 3).unwrap();
-        transact(
-            &mut engine,
-            CommandRequest::CreateCompositeEffect {
-                effect: unrelated,
-                origin: actor,
-                binding_generation: 1,
-                kind: TOOL_HANDOFF_CHILD_COMPOSITE,
-                charge_account: ChargeAccountId::new(1).unwrap(),
-            },
-        );
-        assert_eq!(
-            engine
-                .transact(
-                    CommandRequest::AddComponentClaim {
-                        effect: unrelated,
-                        component: TOOL_HANDOFF_COMPONENT,
-                        actor,
-                        binding_generation: 1,
-                        claim: ClaimId::new(88).unwrap(),
-                        kind: TOOL_CLAIM_OUTCOME_SLOT,
-                        scope: ClaimScope::Logical,
-                        resource,
-                        resource_generation: ResourceGeneration::new(1).unwrap(),
-                        units: 1,
-                    },
-                    |_| Ok::<(), ()>(())
-                )
-                .unwrap_err(),
-            TxError::Core(CoreError::ResourceRetained)
-        );
-
-        transact(
-            &mut engine,
-            Command(CommandKind::ReleaseHandoffSourceAndRecordTargetIntent {
-                descriptor,
-                actor,
-                binding_generation: 1,
-                operation: Digest::new([0x71; 32]),
-            }),
-        );
-        assert_eq!(
-            engine.state.composite_resource_index.get(&resource),
-            Some(&vec![(child, TOOL_HANDOFF_COMPONENT, descriptor.claim)])
-        );
-        assert_eq!(
-            engine.state.charges.get(&(
-                ChargeAccountId::new(1).unwrap(),
-                crate::CREDIT_TOOL_OUTCOME_SLOT
-            )),
-            Some(&1)
-        );
-        assert!(
-            engine
-                .state
-                .composite_effects
-                .get(&parent)
-                .unwrap()
-                .components
-                .get(&TOOL_HANDOFF_SOURCE_COMPONENT)
-                .unwrap()
-                .claims
-                .is_empty()
-        );
-        let recovered = recover_at_checkpoint(&mut engine);
-        assert_eq!(
-            recovered.state.composite_resource_index.get(&resource),
-            Some(&vec![(child, TOOL_HANDOFF_COMPONENT, descriptor.claim)])
-        );
-    }
-
-    #[test]
-    fn handoff_install_is_atomic_and_checkpoint_binds_role() {
-        let (mut engine, _parent, actor, descriptor) = setup();
-        let mut invalid = descriptor;
-        invalid.claim_kind = ClaimKindId::new(99).unwrap();
-        let before = engine.projection_digest();
-        assert!(
-            engine
-                .transact(
-                    Command(CommandKind::InstallHandoffChild {
-                        descriptor: invalid,
-                        origin: actor,
-                        binding_generation: 1,
-                        charge_account: ChargeAccountId::new(1).unwrap()
-                    }),
-                    |_| Ok::<(), ()>(())
-                )
-                .is_err()
-        );
-        assert_eq!(engine.projection_digest(), before);
-        let image = encode_whole_state_checkpoint(&engine.state);
-        let decoded =
-            decode_whole_state_checkpoint(&image, &engine.catalog, engine.limits).unwrap();
-        assert_eq!(decoded.projection_cache.digest, engine.projection_digest());
-        let mut tampered = image;
-        *tampered.last_mut().unwrap() ^= 1;
-        assert!(decode_whole_state_checkpoint(&tampered, &engine.catalog, engine.limits).is_err());
-    }
-
-    #[test]
-    fn child_descriptor_wire_is_fixed_width_canonical_for_logical_and_device_scopes() {
-        let (_, _, _, logical) = setup();
-        let logical_wire = logical.encode_wire();
-        assert_eq!(logical_wire.len(), CHILD_DESCRIPTOR_V1_WIRE_LEN);
-        assert_eq!(&logical_wire[..8], b"NXSCHD03");
-        // scope tag then its always-present zero scope id
-        assert_eq!(logical_wire[90], 0);
-        assert_eq!(&logical_wire[91..99], &[0; 8]);
-        assert_eq!(
-            ChildDescriptorV1::decode_wire(&logical_wire).unwrap(),
-            logical
-        );
-
-        let mut device = logical;
-        device.scope = ClaimScope::Device(DeviceScopeId::new(9).unwrap());
-        let device_wire = device.encode_wire();
-        assert_eq!(device_wire.len(), CHILD_DESCRIPTOR_V1_WIRE_LEN);
-        assert_eq!(&device_wire[..8], b"NXSCHD03");
-        assert_eq!(device_wire[90], 1);
-        assert_eq!(&device_wire[91..99], &9_u64.to_le_bytes());
-        assert_eq!(
-            ChildDescriptorV1::decode_wire(&device_wire).unwrap(),
-            device
-        );
-        assert_ne!(
-            handoff_descriptor_digest(logical),
-            handoff_descriptor_digest(device)
-        );
-    }
-
-    #[test]
-    fn child_descriptor_wire_rejects_truncation_trailing_and_noncanonical_scope() {
-        let (_, _, _, descriptor) = setup();
-        let wire = descriptor.encode_wire();
-        assert_eq!(
-            ChildDescriptorV1::decode_wire(&wire[..wire.len() - 1]),
-            Err(ChildDescriptorDecodeError::InvalidEncoding)
-        );
-        let mut trailing = wire.to_vec();
-        trailing.push(0);
-        assert_eq!(
-            ChildDescriptorV1::decode_wire(&trailing),
-            Err(ChildDescriptorDecodeError::InvalidEncoding)
-        );
-        let mut noncanonical = wire;
-        noncanonical[91] = 1;
-        assert_eq!(
-            ChildDescriptorV1::decode_wire(&noncanonical),
-            Err(ChildDescriptorDecodeError::InvalidEncoding)
-        );
-    }
-
-    #[test]
-    fn handoff_release_atomically_releases_source_and_arms_child() {
-        let mut engine = Engine::new_scoped_legacy_compatibility(
-            WorldId::new(1).unwrap(),
-            tool_dma_catalog(),
-            CoreLimits::bounded_default(),
-            freshness(),
-        );
-        let parent = EffectId::new(RootId::new(88).unwrap(), 2).unwrap();
-        let actor = PrincipalIncarnation::new(crate::PrincipalId::new(8).unwrap(), 1).unwrap();
-        transact(
-            &mut engine,
-            CommandRequest::CreateCompositeEffect {
-                effect: parent,
-                origin: actor,
-                binding_generation: 1,
-                kind: TOOL_HANDOFF_SOURCE_COMPOSITE,
-                charge_account: ChargeAccountId::new(1).unwrap(),
-            },
-        );
-        transact(
-            &mut engine,
-            CommandRequest::AddComponentClaim {
-                effect: parent,
-                component: crate::TOOL_HANDOFF_SOURCE_COMPONENT,
-                actor,
-                binding_generation: 1,
-                claim: ClaimId::new(39).unwrap(),
-                kind: TOOL_CLAIM_OUTCOME_SLOT,
-                scope: ClaimScope::Logical,
-                resource: ResourceId::new(399).unwrap(),
-                resource_generation: ResourceGeneration::new(1).unwrap(),
-                units: 1,
-            },
-        );
-        transact(
-            &mut engine,
-            CommandRequest::PrepareCompositeEffect {
-                effect: parent,
-                actor,
-                binding_generation: 1,
-            },
-        );
-        let receipt = transact(
-            &mut engine,
-            CommandRequest::RecordComponentCommitIntent {
-                effect: parent,
-                component: crate::TOOL_HANDOFF_SOURCE_COMPONENT,
-                actor,
-                binding_generation: 1,
-                operation: Digest::new([10; 32]),
-            },
-        );
-        let TransitionOutput::CommitIntent(intent) = receipt.output else {
-            panic!("commit intent");
-        };
-        let descriptor = ChildDescriptorV1 {
-            schema: 1,
-            sequence: 1,
-            parent,
-            parent_component: crate::TOOL_HANDOFF_SOURCE_COMPONENT,
-            route_digest: Digest::new([11; 32]),
-            child_kind: TOOL_HANDOFF_CHILD_COMPOSITE,
-            child_component: TOOL_HANDOFF_COMPONENT,
-            claim: ClaimId::new(39).unwrap(),
-            claim_kind: TOOL_CLAIM_OUTCOME_SLOT,
-            scope: ClaimScope::Logical,
-            resource: ResourceId::new(399).unwrap(),
-            resource_generation: ResourceGeneration::new(1).unwrap(),
-            units: 1,
-            input_digest: Digest::new([12; 32]),
-            catalog_digest: engine.catalog.digest(),
-        };
-        let fact = VerifiedEffectFact {
-            kind: EffectFactKind::CommitOutcome,
-            effect: parent,
-            component: Some(crate::TOOL_HANDOFF_SOURCE_COMPONENT),
-            actor,
-            generation: 1,
-            nonce: intent.nonce,
-            operation: Digest::new([10; 32]),
-            predecessor: None,
-            freshness: engine.state.freshness,
-            stamp: VerifierStamp {
-                identity: VerifierIdentity {
-                    verifier: TOOL_VERIFIER,
-                    epoch: 1,
-                    receipt_schema: TOOL_COMMIT_RECEIPT_SCHEMA,
-                    implementation_digest: None,
-                },
-                receipt_digest: Digest::new([13; 32]),
-            },
-            verification_scope: None,
-            outcome: Some(ExternalOutcome::Success),
-        };
-        transact(
-            &mut engine,
-            Command(CommandKind::AcknowledgeHandoffParent {
-                fact,
-                descriptor,
-                descriptor_receipt_digest: Digest::new([16; 32]),
-            }),
-        );
-        transact(
-            &mut engine,
-            Command(CommandKind::InstallHandoffChild {
-                descriptor,
-                origin: actor,
-                binding_generation: 1,
-                charge_account: ChargeAccountId::new(1).unwrap(),
-            }),
-        );
-        let receipt = transact(
-            &mut engine,
-            Command(CommandKind::ReleaseHandoffSourceAndRecordTargetIntent {
-                descriptor,
-                actor,
-                binding_generation: 1,
-                operation: Digest::new([14; 32]),
-            }),
-        );
-        let TransitionOutput::CommitIntent(child_intent) = receipt.output else {
-            panic!("child intent");
-        };
-        assert_eq!(child_intent.effect(), descriptor.child_effect().unwrap());
-        assert_eq!(child_intent.component(), Some(TOOL_HANDOFF_COMPONENT));
-        assert_eq!(
-            engine.composite_effect(parent).unwrap().custodian,
-            CustodyState::Released
-        );
-        assert_eq!(
-            engine
-                .component(descriptor.child_effect().unwrap(), TOOL_HANDOFF_COMPONENT)
-                .unwrap()
-                .commit,
-            CommitState::CommitIntentDurable
-        );
-    }
-
-    #[test]
-    fn handoff_ack_install_and_release_each_survive_checkpoint_recovery() {
-        let (mut engine, parent, actor, descriptor) = setup();
-        let recovered_ack = recover_at_checkpoint(&mut engine);
-        assert!(matches!(
-            recovered_ack.composite_effect(parent).unwrap().handoff,
-            SingleHopHandoffProjection::Source { child_installed: false, descriptor: ref saved, .. }
-                if **saved == descriptor
-        ));
-
-        transact(
-            &mut engine,
-            Command(CommandKind::InstallHandoffChild {
-                descriptor,
-                origin: actor,
-                binding_generation: 1,
-                charge_account: ChargeAccountId::new(1).unwrap(),
-            }),
-        );
-        let child = descriptor.child_effect().unwrap();
-        let recovered_install = recover_at_checkpoint(&mut engine);
-        assert!(matches!(
-            recovered_install.composite_effect(parent).unwrap().handoff,
-            SingleHopHandoffProjection::Source {
-                child_installed: true,
-                ..
-            }
-        ));
-        assert!(matches!(
-            recovered_install.composite_effect(child).unwrap().handoff,
-            SingleHopHandoffProjection::Target { parent: saved, .. } if saved == parent
-        ));
-
-        transact(
-            &mut engine,
-            Command(CommandKind::ReleaseHandoffSourceAndRecordTargetIntent {
-                descriptor,
-                actor,
-                binding_generation: 1,
-                operation: Digest::new([0x88; 32]),
-            }),
-        );
-        let recovered_release = recover_at_checkpoint(&mut engine);
-        assert_eq!(
-            recovered_release
-                .composite_effect(parent)
-                .unwrap()
-                .custodian,
-            CustodyState::Released
-        );
-        assert_eq!(
-            recovered_release
-                .component(child, TOOL_HANDOFF_COMPONENT)
-                .unwrap()
-                .commit,
-            CommitState::CommitIntentDurable
-        );
     }
 }
 
 #[cfg(test)]
-mod projection_v8_tests {
+mod prepared_delta_tests {
+    use super::*;
+
+    fn empty_state() -> State {
+        State {
+            world: WorldId::new(1).unwrap(),
+            provider_generations: StateMap::new(),
+            provider_high_water: StateMap::new(),
+            scoped_composites: StateMap::new(),
+            artifact_leases: StateMap::new(),
+            recovery_operations: StateMap::new(),
+            composite_effects: StateMap::new(),
+            composite_resource_index: StateMap::new(),
+            resources: StateMap::new(),
+            charges: StateMap::new(),
+            device_generations: StateMap::new(),
+            device_quarantine: StateSet::new(),
+            revision: 0,
+            head: Digest::ZERO,
+            next_nonce: 1,
+            total_claims: 0,
+            freshness: Freshness::new(
+                BootGeneration::new(1).unwrap(),
+                RegistryInstance::new(1).unwrap(),
+                DeviceGeneration::new(1).unwrap(),
+                JournalGeneration::new(1).unwrap(),
+            ),
+            recovery_target: None,
+            projection_cache: ProjectionCache {
+                leaves: AuthenticatedMap::new(),
+                digest: Digest::ZERO,
+            },
+        }
+    }
+
+    #[test]
+    fn keep_slots_preserve_every_untouched_root() {
+        let base = empty_state();
+        let mut published = base.clone();
+        let mut builder = DeltaBuilder::new(&base);
+        builder.set_revision(1);
+        let prepared = builder.finish();
+        prepared.apply(&mut published);
+
+        assert_eq!(published.revision, 1);
+        assert!(
+            published
+                .provider_generations
+                .ptr_eq(&base.provider_generations)
+        );
+        assert!(
+            published
+                .provider_high_water
+                .ptr_eq(&base.provider_high_water)
+        );
+        assert!(published.scoped_composites.ptr_eq(&base.scoped_composites));
+        assert!(published.artifact_leases.ptr_eq(&base.artifact_leases));
+        assert!(
+            published
+                .recovery_operations
+                .ptr_eq(&base.recovery_operations)
+        );
+        assert!(published.composite_effects.ptr_eq(&base.composite_effects));
+        assert!(
+            published
+                .composite_resource_index
+                .ptr_eq(&base.composite_resource_index)
+        );
+        assert!(published.resources.ptr_eq(&base.resources));
+        assert!(published.charges.ptr_eq(&base.charges));
+        assert!(
+            published
+                .device_generations
+                .ptr_eq(&base.device_generations)
+        );
+        assert!(published.device_quarantine.ptr_eq(&base.device_quarantine));
+        assert!(
+            published
+                .projection_cache
+                .leaves
+                .ptr_eq(&base.projection_cache.leaves)
+        );
+    }
+
+    #[test]
+    fn first_mutation_copies_only_the_touched_root() {
+        let base = empty_state();
+        let mut published = base.clone();
+        let resource = ResourceId::new(1).unwrap();
+        let mut builder = DeltaBuilder::new(&base);
+        builder.ensure_resources().insert_mut(
+            resource,
+            ResourceRecord {
+                scope: ClaimScope::Logical,
+                generation: ResourceGeneration::new(1).unwrap(),
+                phase: ResourcePhase::Retired,
+            },
+        );
+        builder.finish().apply(&mut published);
+
+        assert!(published.resources.get(&resource).is_some());
+        assert!(!published.resources.ptr_eq(&base.resources));
+        assert!(published.composite_effects.ptr_eq(&base.composite_effects));
+        assert!(published.charges.ptr_eq(&base.charges));
+        assert!(published.device_quarantine.ptr_eq(&base.device_quarantine));
+    }
+}
+
+#[cfg(test)]
+mod projection_v10_tests {
     use super::*;
     use crate::{
         AGENT_COMPONENT_DMA, AGENT_OPERATION_COMPOSITE, CREDIT_QUEUE_SLOT, DEVICE_CLAIM_QUEUE_SLOT,
@@ -20633,19 +18028,20 @@ mod projection_v8_tests {
         Digest::new([tag; 32])
     }
 
-    fn freshness(binding: u64, device: u64) -> Freshness {
+    fn freshness(device: u64) -> Freshness {
         Freshness::new(
             BootGeneration::new(1).unwrap(),
             RegistryInstance::new(2).unwrap(),
-            binding,
             DeviceGeneration::new(device).unwrap(),
             JournalGeneration::new(3).unwrap(),
         )
-        .unwrap()
     }
 
-    fn pending_reuse_mut(state: &mut State, resource: ResourceId) -> &mut PendingReuse {
-        match &mut state.resources.get_mut(&resource).unwrap().phase {
+    fn pending_reuse_mut(
+        state: &mut impl StateAccessMut,
+        resource: ResourceId,
+    ) -> &mut PendingReuse {
+        match &mut state.resources_mut().get_mut(&resource).unwrap().phase {
             ResourcePhase::Claimed {
                 pending_reuse: Some(pending),
             } => pending,
@@ -20669,17 +18065,20 @@ mod projection_v8_tests {
     }
 
     #[test]
-    fn projection_v9_binds_composite_claim_and_pending_reuse_fields_at_fixed_head() {
+    fn projection_v10_binds_composite_claim_and_pending_reuse_fields_at_fixed_head() {
         let catalog = crate::standard_catalog();
         let catalog_digest = catalog.digest();
         let mut engine = Engine::new(
             WorldId::new(1).unwrap(),
-            catalog,
+            CatalogSet::new(&[catalog]).unwrap(),
             CoreLimits::bounded_default(),
-            freshness(1, 1),
+            freshness(1),
         );
-        let effect = EffectId::new(RootId::new(0xc607).unwrap(), 11).unwrap();
-        let actor = PrincipalIncarnation::new(crate::PrincipalId::new(7).unwrap(), 3).unwrap();
+        let effect = EffectId::new(OperationId::new(0xc607).unwrap(), 11).unwrap();
+        let actor = ExecutorCoordinate::new(
+            crate::ExecutorId::new(7).unwrap(),
+            crate::ExecutorGeneration::new(3).unwrap(),
+        );
         let claim = ClaimId::new(17).unwrap();
         let resource = ResourceId::new(23).unwrap();
         let scope = ClaimScope::Device(DeviceScopeId::new(29).unwrap());
@@ -20695,7 +18094,7 @@ mod projection_v8_tests {
                 resource,
                 resource_generation: ResourceGeneration::new(2).unwrap(),
                 units: 1,
-                enrolled_freshness: freshness(3, 2),
+                enrolled_freshness: freshness(2),
                 requirements: Vec::new(),
                 retired: false,
             },
@@ -20723,21 +18122,23 @@ mod projection_v8_tests {
                 claims,
             },
         );
-        engine.state.composite_effects.insert_mut(
+        engine.state.composite_effects_mut().insert_mut(
             effect,
             CompositeEffectRecord {
                 effect,
                 kind: AGENT_OPERATION_COMPOSITE,
+                catalog_digest,
                 causal_owner: actor,
-                custodian: CustodyState::Principal(actor),
+                custodian: CustodyState::Executor(actor),
                 charge_owner: ChargeAccountId::new(31).unwrap(),
                 authority: AuthorityState::Active,
                 authority_epoch: 1,
                 handoff: SingleHopRole::None,
+                released_provenance: None,
                 components,
             },
         );
-        engine.state.resources.insert_mut(
+        engine.state.resources_mut().insert_mut(
             resource,
             ResourceRecord {
                 scope,
@@ -20745,9 +18146,8 @@ mod projection_v8_tests {
                 phase: ResourcePhase::Claimed {
                     pending_reuse: Some(PendingReuse {
                         effect,
-                        component: Some(AGENT_COMPONENT_DMA),
+                        component: AGENT_COMPONENT_DMA,
                         actor,
-                        binding_generation: 3,
                         authority_epoch: 1,
                         claim,
                         previous_generation: ResourceGeneration::new(1).unwrap(),
@@ -20755,7 +18155,7 @@ mod projection_v8_tests {
                         retirement_digest: digest(0x41),
                         reuse_contract: digest(0x42),
                         nonce: 5,
-                        freshness: freshness(3, 2),
+                        freshness: freshness(2),
                     }),
                 },
             },
@@ -20771,21 +18171,21 @@ mod projection_v8_tests {
         assert_eq!(
             golden.bytes(),
             [
-                68, 220, 35, 94, 28, 146, 133, 235, 122, 94, 128, 226, 238, 217, 99, 112, 226, 102,
-                157, 22, 71, 249, 252, 155, 67, 6, 76, 128, 48, 160, 227, 144,
+                172, 92, 8, 238, 195, 229, 38, 54, 117, 132, 206, 85, 235, 2, 22, 207, 158, 101,
+                43, 98, 103, 64, 25, 33, 72, 13, 156, 191, 121, 60, 38, 149,
             ]
         );
 
         assert_projection_changes(&baseline, catalog_digest, |state| {
             state
-                .composite_effects
+                .composite_effects_mut()
                 .get_mut(&effect)
                 .unwrap()
                 .authority_epoch = 2;
         });
         assert_projection_changes(&baseline, catalog_digest, |state| {
             state
-                .composite_effects
+                .composite_effects_mut()
                 .get_mut(&effect)
                 .unwrap()
                 .components
@@ -20795,7 +18195,7 @@ mod projection_v8_tests {
         });
         assert_projection_changes(&baseline, catalog_digest, |state| {
             state
-                .composite_effects
+                .composite_effects_mut()
                 .get_mut(&effect)
                 .unwrap()
                 .components
@@ -20823,7 +18223,7 @@ mod projection_v8_tests {
             pending_reuse_mut(state, resource).reuse_contract = digest(0x53);
         });
         assert_projection_changes(&baseline, catalog_digest, |state| {
-            pending_reuse_mut(state, resource).freshness = freshness(4, 2);
+            pending_reuse_mut(state, resource).freshness = freshness(3);
         });
     }
 }
@@ -20836,7 +18236,7 @@ mod projection_v8_tests {
 // cargo test -p cser-core --release --features std --lib \
 //   portable_core_state_work_profile -- --ignored --nocapture
 //
-// `transition_no_persist_median_ns` covers the same candidate construction,
+// `transition_no_persist_median_ns` covers the same prepared-delta construction,
 // command application, canonical invariant check, journal-record construction,
 // and projection digest that `Engine::transact` performs, but deliberately
 // excludes an embedding's journal write/readback/flush and anchor advance.
@@ -20852,13 +18252,13 @@ mod performance_profile_tests {
     use crate::{
         AGENT_COMPONENT_DMA, AGENT_COMPONENT_REPLY, AGENT_OPERATION_COMPOSITE, DEVICE_CLAIM_IOVA,
         DEVICE_CLAIM_PINNED_PAGE, DEVICE_CLAIM_QUEUE_SLOT, DeviceScopeId,
-        REPLY_CLAIM_PUBLICATION_SLOT, REPLY_DOMAIN, REPLY_OBLIGATION_PUBLICATION, standard_catalog,
+        REPLY_CLAIM_PUBLICATION_SLOT, standard_catalog,
     };
 
     // Stable comparison points, not a capacity promise. The development plan
     // intentionally keeps these few sizes fixed while allowing repetitions
     // and workload shape to evolve.
-    const SIZES: [usize; 4] = [1, 64, 512, 4096];
+    const SIZES: [usize; 4] = [4, 64, 512, 4096];
     const WARMUPS: usize = 3;
     const SAMPLES: usize = 11;
 
@@ -20866,39 +18266,87 @@ mod performance_profile_tests {
         Freshness::new(
             BootGeneration::new(1).unwrap(),
             RegistryInstance::new(1).unwrap(),
-            1,
             DeviceGeneration::new(1).unwrap(),
             JournalGeneration::new(1).unwrap(),
         )
-        .unwrap()
     }
 
     fn transact(engine: &mut Engine, request: CommandRequest) {
         engine.transact(request, |_| Ok::<(), ()>(())).unwrap();
     }
 
+    fn exact_catalog(engine: &Engine) -> &DomainCatalog {
+        let digest = engine
+            .state
+            .composite_effects()
+            .values()
+            .next()
+            .expect("fixture composite")
+            .catalog_digest;
+        engine.catalog.get(digest).expect("fixture catalog")
+    }
+
     fn seed_one_composite() -> Engine {
         let limits = CoreLimits::new(1, 1024, 4096, 4096, 64, 1 << 20, 1).unwrap();
-        let mut engine = Engine::new_scoped_legacy_compatibility(
+        let catalog = standard_catalog();
+        let catalog_digest = catalog.digest();
+        let mut engine = Engine::new(
             WorldId::new(1).unwrap(),
-            standard_catalog(),
+            CatalogSet::new(&[catalog]).unwrap(),
             limits,
             freshness(),
         );
-        let root = RootId::new(1).unwrap();
-        let effect = EffectId::new(root, 1).unwrap();
-        let actor = PrincipalIncarnation::new(crate::PrincipalId::new(1).unwrap(), 1).unwrap();
+        let operation = OperationId::new(1).unwrap();
+        let effect = EffectId::new(operation, 1).unwrap();
+        let actor = ExecutorCoordinate::new(
+            crate::ExecutorId::new(1).unwrap(),
+            crate::ExecutorGeneration::new(1).unwrap(),
+        );
         let account = ChargeAccountId::new(1).unwrap();
         let generation = ResourceGeneration::new(1).unwrap();
         let device_scope = ClaimScope::Device(DeviceScopeId::new(1).unwrap());
+        let provider = ProviderCoordinate::new(
+            WorldId::new(1).unwrap(),
+            ProviderId::new(1).unwrap(),
+            ProviderGeneration::new(1).unwrap(),
+        );
+        let verifier_bindings = engine
+            .catalog
+            .iter()
+            .next()
+            .map(|(_, catalog)| catalog)
+            .expect("catalog set is non-empty")
+            .verifier_class_bindings()
+            .into_iter()
+            .map(|class| {
+                VerifierBinding::new(
+                    class.verifier(),
+                    VerifierGeneration::new(1).unwrap(),
+                    class.receipt_schema(),
+                    Digest::new([0x92; 32]),
+                )
+                .unwrap()
+            })
+            .collect();
         transact(
             &mut engine,
-            CommandRequest::CreateCompositeEffect {
+            CommandRequest::RegisterProviderGeneration {
+                coordinate: provider,
+                catalog_digest,
+                verifier_bindings,
+            },
+        );
+        transact(
+            &mut engine,
+            CommandRequest::AdmitScopedCompositeEffect {
                 effect,
                 origin: actor,
-                binding_generation: 1,
                 kind: AGENT_OPERATION_COMPOSITE,
                 charge_account: account,
+                bindings: vec![
+                    ComponentProviderBinding::new(AGENT_COMPONENT_REPLY, provider),
+                    ComponentProviderBinding::new(AGENT_COMPONENT_DMA, provider),
+                ],
             },
         );
         for (component, claim, kind, scope, resource) in [
@@ -20937,7 +18385,6 @@ mod performance_profile_tests {
                     effect,
                     component,
                     actor,
-                    binding_generation: 1,
                     claim,
                     kind,
                     scope,
@@ -20949,117 +18396,103 @@ mod performance_profile_tests {
         }
         transact(
             &mut engine,
-            CommandRequest::PrepareCompositeEffect {
-                effect,
-                actor,
-                binding_generation: 1,
-            },
+            CommandRequest::PrepareCompositeEffect { effect, actor },
         );
-        check_invariants(&engine.catalog, engine.limits, &engine.state).unwrap();
+        check_invariants_for_catalog_set(&engine.catalog, engine.limits, &engine.state).unwrap();
         engine
     }
 
-    fn seed_one_estate() -> Engine {
-        let limits = CoreLimits::new(1, 1024, 4096, 4096, 64, 1 << 20, 1).unwrap();
-        let mut engine = Engine::new_legacy_compatibility(standard_catalog(), limits, freshness());
-        let effect = EffectId::new(RootId::new(1).unwrap(), 1).unwrap();
-        let actor = PrincipalIncarnation::new(crate::PrincipalId::new(1).unwrap(), 1).unwrap();
+    fn append_composite(engine: &mut Engine, sequence: u64) {
+        let operation = OperationId::new(1).unwrap();
+        let effect = EffectId::new(operation, sequence).unwrap();
+        let actor = engine
+            .state
+            .recovery_operations()
+            .get(&operation)
+            .expect("fixture operation")
+            .last_executor;
+        let provider = *engine
+            .state
+            .provider_generations()
+            .keys()
+            .next()
+            .expect("fixture provider");
+        let account = ChargeAccountId::new(1).unwrap();
+        let generation = ResourceGeneration::new(1).unwrap();
+        let device_scope = ClaimScope::Device(DeviceScopeId::new(1).unwrap());
         transact(
-            &mut engine,
-            CommandRequest::CreateEstate {
+            engine,
+            CommandRequest::AdmitScopedCompositeEffect {
                 effect,
                 origin: actor,
-                binding_generation: 1,
-                domain: REPLY_DOMAIN,
-                obligation: REPLY_OBLIGATION_PUBLICATION,
-                charge_account: ChargeAccountId::new(1).unwrap(),
+                kind: AGENT_OPERATION_COMPOSITE,
+                charge_account: account,
+                bindings: vec![
+                    ComponentProviderBinding::new(AGENT_COMPONENT_REPLY, provider),
+                    ComponentProviderBinding::new(AGENT_COMPONENT_DMA, provider),
+                ],
             },
         );
+        for (component, claim, kind, scope, resource) in [
+            (
+                AGENT_COMPONENT_REPLY,
+                ClaimId::new(1).unwrap(),
+                REPLY_CLAIM_PUBLICATION_SLOT,
+                ClaimScope::Logical,
+                ResourceId::new((sequence - 1) * 4 + 1).unwrap(),
+            ),
+            (
+                AGENT_COMPONENT_DMA,
+                ClaimId::new(2).unwrap(),
+                DEVICE_CLAIM_QUEUE_SLOT,
+                device_scope,
+                ResourceId::new((sequence - 1) * 4 + 2).unwrap(),
+            ),
+            (
+                AGENT_COMPONENT_DMA,
+                ClaimId::new(3).unwrap(),
+                DEVICE_CLAIM_PINNED_PAGE,
+                device_scope,
+                ResourceId::new((sequence - 1) * 4 + 3).unwrap(),
+            ),
+            (
+                AGENT_COMPONENT_DMA,
+                ClaimId::new(4).unwrap(),
+                DEVICE_CLAIM_IOVA,
+                device_scope,
+                ResourceId::new((sequence - 1) * 4 + 4).unwrap(),
+            ),
+        ] {
+            transact(
+                engine,
+                CommandRequest::AddComponentClaim {
+                    effect,
+                    component,
+                    actor,
+                    claim,
+                    kind,
+                    scope,
+                    resource,
+                    resource_generation: generation,
+                    units: 1,
+                },
+            );
+        }
         transact(
-            &mut engine,
-            CommandRequest::AddClaim {
-                effect,
-                actor,
-                binding_generation: 1,
-                claim: ClaimId::new(1).unwrap(),
-                domain: REPLY_DOMAIN,
-                kind: REPLY_CLAIM_PUBLICATION_SLOT,
-                scope: ClaimScope::Logical,
-                resource: ResourceId::new(1).unwrap(),
-                resource_generation: ResourceGeneration::new(1).unwrap(),
-                units: 1,
-            },
+            engine,
+            CommandRequest::PrepareCompositeEffect { effect, actor },
         );
-        check_invariants(&engine.catalog, engine.limits, &engine.state).unwrap();
-        engine
     }
 
     fn fixture(live_claims: usize) -> Engine {
         assert!(SIZES.contains(&live_claims));
-        if live_claims == 1 {
-            return seed_one_estate();
-        }
         assert_eq!(live_claims % 4, 0, "composite fixture has four claims");
         let mut engine = seed_one_composite();
-        let composite_template = engine
-            .state
-            .composite_effects
-            .values()
-            .next()
-            .unwrap()
-            .clone();
-        let resource_template = engine.state.resources.clone();
-        let index_template = engine
-            .state
-            .composite_resource_index
-            .values()
-            .flatten()
-            .copied()
-            .collect::<Vec<_>>();
         let composites = live_claims / 4;
         for sequence in 2..=u64::try_from(composites).unwrap() {
-            let effect = EffectId::new(RootId::new(1).unwrap(), sequence).unwrap();
-            let mut composite = composite_template.clone();
-            composite.effect = effect;
-            for component in composite.components.values_mut() {
-                for claim in component.claims.values_mut() {
-                    let offset = (sequence - 1) * 4;
-                    claim.resource = ResourceId::new(claim.resource.get() + offset).unwrap();
-                }
-            }
-            engine.state.composite_effects.insert_mut(effect, composite);
-            for (base_resource, record) in &resource_template {
-                let resource = ResourceId::new(base_resource.get() + (sequence - 1) * 4).unwrap();
-                engine.state.resources.insert_mut(resource, *record);
-            }
-            for (_, component, claim) in &index_template {
-                let resource = engine
-                    .state
-                    .composite_effects
-                    .get(&effect)
-                    .unwrap()
-                    .components
-                    .get(component)
-                    .unwrap()
-                    .claims
-                    .get(claim)
-                    .unwrap()
-                    .resource;
-                engine
-                    .state
-                    .composite_resource_index
-                    .insert_mut(resource, vec![(effect, *component, *claim)]);
-            }
+            append_composite(&mut engine, sequence);
         }
-        let charge_keys: Vec<_> = engine.state.charges.keys().copied().collect();
-        for key in charge_keys {
-            *engine
-                .state
-                .charges
-                .get_mut(&key)
-                .expect("charge key was collected") *= u64::try_from(composites).unwrap();
-        }
-        check_invariants(&engine.catalog, engine.limits, &engine.state).unwrap();
+        check_invariants_for_catalog_set(&engine.catalog, engine.limits, &engine.state).unwrap();
         engine
     }
 
@@ -21082,43 +18515,46 @@ mod performance_profile_tests {
     }
 
     fn profile_command() -> CommandKind {
-        CommandKind::FenceIncarnation {
-            root: RootId::new(1).unwrap(),
-            crashed: PrincipalIncarnation::new(crate::PrincipalId::new(1).unwrap(), 1).unwrap(),
-            binding_generation: 1,
+        CommandKind::FenceExecutor {
+            operation: OperationId::new(1).unwrap(),
+            crashed: ExecutorCoordinate::new(
+                crate::ExecutorId::new(1).unwrap(),
+                crate::ExecutorGeneration::new(1).unwrap(),
+            ),
         }
     }
 
-    /// Measures command application alone. Candidates are intentionally built
-    /// before timing, so this does not silently fold clone cost into command
-    /// work. Each invocation receives a fresh candidate because fencing is a
-    /// state-changing operation.
-    fn measure_candidate_apply(engine: &Engine, command: &CommandKind) -> u128 {
-        let candidates = (0..WARMUPS + SAMPLES)
-            .map(|_| engine.state.clone())
-            .collect::<Vec<_>>();
-        let mut candidates = candidates.into_iter();
+    /// Measures command application into a prepared delta. Each invocation
+    /// starts with a borrowed committed root; only roots touched by the
+    /// command are path-copied by `DeltaBuilder`.
+    fn measure_delta_apply(engine: &Engine, make_command: fn() -> CommandKind) -> u128 {
         for _ in 0..WARMUPS {
-            let mut candidate = candidates.next().unwrap();
+            let mut delta = DeltaBuilder::new(&engine.state);
+            let command = make_command();
             black_box(apply_command(
                 &engine.catalog,
+                Some(exact_catalog(engine)),
                 engine.limits,
-                &mut candidate,
-                command,
+                &mut delta,
+                &command,
             ))
             .unwrap();
+            black_box(delta.finish());
         }
         let mut values = Vec::with_capacity(SAMPLES);
         for _ in 0..SAMPLES {
-            let mut candidate = candidates.next().unwrap();
+            let mut delta = DeltaBuilder::new(&engine.state);
+            let command = make_command();
             let started = Instant::now();
             black_box(apply_command(
                 &engine.catalog,
+                Some(exact_catalog(engine)),
                 engine.limits,
-                &mut candidate,
-                command,
+                &mut delta,
+                &command,
             ))
             .unwrap();
+            black_box(delta.finish());
             values.push(started.elapsed().as_nanos());
         }
         median_ns(values)
@@ -21127,73 +18563,34 @@ mod performance_profile_tests {
     /// Measures the portable, non-I/O portion of one transition. It mirrors
     /// the ordering in `transact_with_freshness` while retaining the base
     /// engine so every sample starts at the same revision and semantic state.
-    fn measure_transition_without_persistence(engine: &Engine, command: &CommandKind) -> u128 {
-        let candidates = (0..WARMUPS + SAMPLES)
-            .map(|_| engine.state.clone())
-            .collect::<Vec<_>>();
-        let mut candidates = candidates.into_iter();
-        let run = |candidate: State| {
-            let mut candidate = candidate;
-            let output =
-                apply_command(&engine.catalog, engine.limits, &mut candidate, command).unwrap();
-            check_invariants(&engine.catalog, engine.limits, &candidate).unwrap();
-            let record = JournalRecord::build(
-                engine.state.revision,
-                engine.state.freshness,
-                RecoveryBinding::new(
-                    crate::RecoveryProfile::current(),
-                    engine
-                        .state
-                        .world
-                        .unwrap_or_else(|| WorldId::new(1).unwrap()),
-                    engine.catalog.digest(),
-                    engine.state.freshness.registry(),
-                    crate::AuthorityBindingGeneration::new(engine.state.freshness.binding())
-                        .unwrap(),
-                )
-                .unwrap(),
-                engine.projection_digest(),
-                engine.state.head,
-                command.clone(),
-            )
-            .unwrap();
-            candidate.revision = record.revision();
-            candidate.head = record.digest();
-            black_box((
-                output,
-                record,
-                projection_digest(&candidate, engine.catalog.digest()),
-            ));
-        };
+    fn measure_transition_without_persistence(
+        engine: &Engine,
+        make_command: fn() -> CommandKind,
+    ) -> u128 {
         for _ in 0..WARMUPS {
-            run(candidates.next().unwrap());
+            black_box(engine.prepare_transition(Command(make_command())).unwrap());
         }
         let mut values = Vec::with_capacity(SAMPLES);
         for _ in 0..SAMPLES {
             let started = Instant::now();
-            run(candidates.next().unwrap());
+            black_box(engine.prepare_transition(Command(make_command())).unwrap());
             values.push(started.elapsed().as_nanos());
         }
         median_ns(values)
     }
 
-    fn live_claim_count(state: &State) -> usize {
+    fn live_claim_count(state: &impl StateAccess) -> usize {
         state
-            .estates
+            .composite_effects()
             .values()
-            .map(|estate| estate.claims.len())
+            .map(|effect| {
+                effect
+                    .components
+                    .values()
+                    .map(|component| component.claims.len())
+                    .sum::<usize>()
+            })
             .sum::<usize>()
-            + state
-                .composite_effects
-                .values()
-                .map(|effect| {
-                    effect
-                        .components
-                        .values()
-                        .map(|component| component.claims.len())
-                        .sum::<usize>()
-                })
-                .sum::<usize>()
     }
 
     #[test]
@@ -21201,13 +18598,8 @@ mod performance_profile_tests {
     fn portable_core_state_work_profile() {
         for live_claims in SIZES {
             let engine = fixture(live_claims);
-            let command = profile_command();
-            let clone_ns = measure(|| {
-                let state = black_box(engine.state.clone());
-                black_box(state);
-            });
             let invariant_ns = measure(|| {
-                black_box(check_invariants(
+                black_box(check_invariants_for_catalog_set(
                     &engine.catalog,
                     engine.limits,
                     &engine.state,
@@ -21217,16 +18609,14 @@ mod performance_profile_tests {
             let digest_ns = measure(|| {
                 black_box(projection_digest(&engine.state, engine.catalog.digest()));
             });
-            let apply_ns = measure_candidate_apply(&engine, &command);
+            let apply_ns = measure_delta_apply(&engine, profile_command);
             let transition_no_persist_ns =
-                measure_transition_without_persistence(&engine, &command);
+                measure_transition_without_persistence(&engine, profile_command);
             println!(
-                "CSER_CORE_STATE_PROFILE {{\"profile_version\":2,\"scope\":\"portable_core_no_persistence\",\"live_claims\":{},\"estates\":{},\"composites\":{},\"resources\":{},\"candidate_clone_median_ns\":{},\"candidate_apply_median_ns\":{},\"invariant_median_ns\":{},\"projection_digest_median_ns\":{},\"transition_no_persist_median_ns\":{},\"warmups\":{},\"samples\":{}}}",
+                "CSER_CORE_STATE_PROFILE {{\"profile_version\":3,\"scope\":\"portable_core_no_persistence\",\"live_claims\":{},\"composites\":{},\"resources\":{},\"delta_apply_median_ns\":{},\"invariant_median_ns\":{},\"projection_digest_median_ns\":{},\"transition_no_persist_median_ns\":{},\"warmups\":{},\"samples\":{}}}",
                 live_claim_count(&engine.state),
-                engine.state.estates.len(),
-                engine.state.composite_effects.len(),
-                engine.state.resources.len(),
-                clone_ns,
+                engine.state.composite_effects().len(),
+                engine.state.resources().len(),
                 apply_ns,
                 invariant_ns,
                 digest_ns,
@@ -21236,6 +18626,6 @@ mod performance_profile_tests {
             );
         }
         // Keep a non-timing semantic assertion at the end of the manual run.
-        assert_eq!(fixture(4096).state.composite_effects.len(), 1024);
+        assert_eq!(fixture(4096).state.composite_effects().len(), 1024);
     }
 }

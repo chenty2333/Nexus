@@ -1,14 +1,18 @@
 use cser_core::{
     AGENT_COMPONENT_DMA, AGENT_COMPONENT_REPLY, AGENT_OPERATION_COMPOSITE, BootGeneration,
-    ChildDescriptorV1, ChildDescriptorVerifier, ClaimId, ClaimScope, CommandRequest,
+    CatalogSet, ChildDescriptorV1, ChildDescriptorVerifier, ClaimId, ClaimScope, CommandRequest,
     ComponentProviderBinding, CoreError, CoreLimits, DeviceGeneration, Digest, DomainCatalog,
-    EffectId, EffectReceiptVerifier, Engine, ExternalOutcome, Freshness, JournalGeneration,
-    OperationId, PrincipalId, PrincipalIncarnation, ProviderCoordinate, ProviderEffectState,
-    ProviderGeneration, ProviderId, RegistryInstance, ResourceGeneration, ResourceId, RootId,
-    TOOL_CLAIM_OUTCOME_SLOT, TOOL_COMMIT_RECEIPT_SCHEMA, TOOL_HANDOFF_CHILD_COMPOSITE,
-    TOOL_HANDOFF_COMPONENT, TOOL_HANDOFF_SOURCE_COMPONENT, TOOL_HANDOFF_SOURCE_COMPOSITE,
-    TOOL_VERIFIER, TransitionOutput, VerifiedEffectObservation, VerifierBinding,
-    VerifierGeneration, VerifierIdentity, WorldId, standard_catalog, tool_dma_catalog,
+    EffectFactChallenge, EffectFactKind, EffectId, EffectReceiptVerifier, Engine,
+    ExecutorCoordinate, ExecutorGeneration, ExecutorId, ExternalOutcome, Freshness,
+    JournalGeneration, OperationId, ProviderCoordinate, ProviderEffectState, ProviderGeneration,
+    ProviderId, ReceiptVerifier, RecoveryAnchor, RecoveryBinding, RecoveryProfile,
+    RegistryInstance, ResourceGeneration, ResourceId, TOOL_APPLY_RECEIPT_SCHEMA,
+    TOOL_CLAIM_OUTCOME_SLOT, TOOL_COMMIT_RECEIPT_SCHEMA, TOOL_EVIDENCE_OUTCOME_ACK,
+    TOOL_HANDOFF_CHILD_COMPOSITE, TOOL_HANDOFF_COMPONENT, TOOL_HANDOFF_SOURCE_COMPONENT,
+    TOOL_HANDOFF_SOURCE_COMPOSITE, TOOL_RECEIPT_SCHEMA, TOOL_SETTLEMENT_RECEIPT_SCHEMA,
+    TOOL_VERIFIER, TransitionOutput, VerifiedEffectObservation, VerifiedObservation,
+    VerifierBinding, VerifierGeneration, VerifierIdentity, WorldId, standard_catalog,
+    tool_dma_catalog,
 };
 
 struct AcceptDescriptor;
@@ -55,13 +59,107 @@ impl EffectReceiptVerifier for AcceptEffect {
     }
 }
 
+#[derive(Clone, Copy)]
+struct ScopedEffectVerifier {
+    identity: VerifierIdentity,
+}
+
+impl EffectReceiptVerifier for ScopedEffectVerifier {
+    type Receipt = ();
+
+    fn identity(&self) -> VerifierIdentity {
+        self.identity
+    }
+
+    fn verify(
+        &self,
+        challenge: &EffectFactChallenge,
+        _receipt: &Self::Receipt,
+    ) -> Result<VerifiedEffectObservation, cser_core::VerificationError> {
+        let digest = Digest::new([challenge.kind() as u8 + 0x80; 32]);
+        Ok(match challenge.kind() {
+            EffectFactKind::CommitOutcome => VerifiedEffectObservation::commit(
+                challenge.current_observation(),
+                ExternalOutcome::Success,
+                digest,
+            ),
+            EffectFactKind::ApplyCompleted | EffectFactKind::SettlementAcknowledged => {
+                VerifiedEffectObservation::fact(challenge.current_observation(), digest)
+            }
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ScopedEvidenceVerifier {
+    identity: VerifierIdentity,
+}
+
+impl ReceiptVerifier for ScopedEvidenceVerifier {
+    type Receipt = ();
+
+    fn identity(&self) -> VerifierIdentity {
+        self.identity
+    }
+
+    fn verify(
+        &self,
+        challenge: &cser_core::EvidenceChallenge,
+        _receipt: &Self::Receipt,
+    ) -> Result<VerifiedObservation, cser_core::VerificationError> {
+        Ok(VerifiedObservation::new(
+            challenge.subject(),
+            challenge.current_observation(),
+            Digest::new([0xb7; 32]),
+        ))
+    }
+}
+
+fn scoped_identity(
+    catalog: &DomainCatalog,
+    verifier: cser_core::VerifierId,
+    schema: cser_core::ReceiptSchemaId,
+    implementation: u8,
+) -> VerifierIdentity {
+    let index = catalog
+        .verifier_class_bindings()
+        .into_iter()
+        .enumerate()
+        .find(|(_, binding)| binding.verifier() == verifier && binding.receipt_schema() == schema)
+        .map(|(index, _)| index)
+        .unwrap();
+    VerifierIdentity::new_exact(
+        VerifierBinding::new(
+            verifier,
+            VerifierGeneration::new(1).unwrap(),
+            schema,
+            Digest::new([implementation.wrapping_add(index as u8); 32]),
+        )
+        .unwrap(),
+    )
+}
+
 fn freshness() -> Freshness {
     Freshness::new(
         BootGeneration::new(1).unwrap(),
         RegistryInstance::new(1).unwrap(),
-        1,
         DeviceGeneration::new(1).unwrap(),
         JournalGeneration::new(1).unwrap(),
+    )
+}
+
+fn recovery_binding(
+    world: WorldId,
+    catalog: &DomainCatalog,
+    current: Freshness,
+) -> RecoveryBinding {
+    RecoveryBinding::new(
+        RecoveryProfile::current(),
+        world,
+        CatalogSet::new(std::slice::from_ref(catalog))
+            .unwrap()
+            .digest(),
+        current.registry(),
     )
     .unwrap()
 }
@@ -91,7 +189,7 @@ fn verifiers_for(catalog: &DomainCatalog, implementation: u8) -> Vec<VerifierBin
         .collect()
 }
 
-fn tx(engine: &mut Engine, request: CommandRequest) -> Result<(), CoreError> {
+fn tx<C: Into<cser_core::Command>>(engine: &mut Engine, request: C) -> Result<(), CoreError> {
     engine.transact_volatile(request).map(|_| ())
 }
 
@@ -100,11 +198,11 @@ fn provider_generation_high_water_is_monotonic_and_scoped() {
     let world = WorldId::new(7).unwrap();
     let mut engine = Engine::new(
         world,
-        standard_catalog(),
+        CatalogSet::new(&[standard_catalog()]).unwrap(),
         CoreLimits::bounded_default(),
         freshness(),
     );
-    let digest = engine.catalog_digest();
+    let digest = standard_catalog().digest();
     let first = coordinate(7, 11, 1);
     tx(
         &mut engine,
@@ -115,7 +213,7 @@ fn provider_generation_high_water_is_monotonic_and_scoped() {
         },
     )
     .unwrap();
-    assert_eq!(engine.world(), Some(world));
+    assert_eq!(engine.world(), world);
     assert_eq!(
         engine.provider_generation_projection(first).unwrap().state,
         ProviderEffectState::Active
@@ -148,12 +246,12 @@ fn provider_generation_high_water_is_monotonic_and_scoped() {
 fn provider_effect_lifecycle_is_ordered_and_retirement_is_exact() {
     let mut engine = Engine::new(
         WorldId::new(7).unwrap(),
-        standard_catalog(),
+        CatalogSet::new(&[standard_catalog()]).unwrap(),
         CoreLimits::bounded_default(),
         freshness(),
     );
     let provider = coordinate(7, 12, 1);
-    let digest = engine.catalog_digest();
+    let digest = standard_catalog().digest();
     tx(
         &mut engine,
         CommandRequest::RegisterProviderGeneration {
@@ -208,12 +306,12 @@ fn fenced_precommit_effect_can_abort_before_settlement_only() {
     let world = WorldId::new(71).unwrap();
     let mut engine = Engine::new(
         world,
-        standard_catalog(),
+        CatalogSet::new(&[standard_catalog()]).unwrap(),
         CoreLimits::bounded_default(),
         freshness(),
     );
     let provider = coordinate(71, 72, 1);
-    let digest = engine.catalog_digest();
+    let digest = standard_catalog().digest();
     tx(
         &mut engine,
         CommandRequest::RegisterProviderGeneration {
@@ -223,15 +321,16 @@ fn fenced_precommit_effect_can_abort_before_settlement_only() {
         },
     )
     .unwrap();
-    let effect = EffectId::new(RootId::new(7101).unwrap(), 1).unwrap();
-    let actor = PrincipalIncarnation::new(PrincipalId::new(7101).unwrap(), 1).unwrap();
+    let effect = EffectId::new(OperationId::new(7101).unwrap(), 1).unwrap();
+    let actor = ExecutorCoordinate::new(
+        ExecutorId::new(7101).unwrap(),
+        ExecutorGeneration::new(1).unwrap(),
+    );
     tx(
         &mut engine,
         CommandRequest::AdmitScopedCompositeEffect {
             effect,
-            operation: OperationId::new(7101).unwrap(),
             origin: actor,
-            binding_generation: 1,
             kind: AGENT_OPERATION_COMPOSITE,
             charge_account: cser_core::ChargeAccountId::new(7101).unwrap(),
             bindings: vec![
@@ -300,42 +399,17 @@ fn fenced_precommit_effect_can_abort_before_settlement_only() {
 }
 
 #[test]
-fn scoped_engine_rejects_legacy_unbound_composite_constructor() {
-    let world = WorldId::new(73).unwrap();
-    let mut engine = Engine::new(
-        world,
-        standard_catalog(),
-        CoreLimits::bounded_default(),
-        freshness(),
-    );
-    let effect = EffectId::new(RootId::new(7301).unwrap(), 1).unwrap();
-    let actor = PrincipalIncarnation::new(PrincipalId::new(7301).unwrap(), 1).unwrap();
-    assert_eq!(
-        tx(
-            &mut engine,
-            CommandRequest::CreateCompositeEffect {
-                effect,
-                origin: actor,
-                binding_generation: 1,
-                kind: AGENT_OPERATION_COMPOSITE,
-                charge_account: cser_core::ChargeAccountId::new(7301).unwrap(),
-            },
-        ),
-        Err(CoreError::IncompatibleApiProfile)
-    );
-}
-
-#[test]
 fn handoff_source_release_removes_scoped_binding_at_the_pivot() {
     let world = WorldId::new(74).unwrap();
     let mut engine = Engine::new(
         world,
-        tool_dma_catalog(),
+        CatalogSet::new(&[tool_dma_catalog()]).unwrap(),
         CoreLimits::bounded_default(),
         freshness(),
     );
     let provider = coordinate(74, 75, 1);
-    let digest = engine.catalog_digest();
+    let target_provider = coordinate(74, 76, 1);
+    let digest = tool_dma_catalog().digest();
     tx(
         &mut engine,
         CommandRequest::RegisterProviderGeneration {
@@ -345,15 +419,25 @@ fn handoff_source_release_removes_scoped_binding_at_the_pivot() {
         },
     )
     .unwrap();
-    let parent = EffectId::new(RootId::new(7401).unwrap(), 1).unwrap();
-    let actor = PrincipalIncarnation::new(PrincipalId::new(7401).unwrap(), 1).unwrap();
+    tx(
+        &mut engine,
+        CommandRequest::RegisterProviderGeneration {
+            coordinate: target_provider,
+            catalog_digest: digest,
+            verifier_bindings: verifiers_for(&tool_dma_catalog(), 0x75),
+        },
+    )
+    .unwrap();
+    let parent = EffectId::new(OperationId::new(7401).unwrap(), 1).unwrap();
+    let actor = ExecutorCoordinate::new(
+        ExecutorId::new(7401).unwrap(),
+        ExecutorGeneration::new(1).unwrap(),
+    );
     tx(
         &mut engine,
         CommandRequest::AdmitScopedCompositeEffect {
             effect: parent,
-            operation: OperationId::new(7401).unwrap(),
             origin: actor,
-            binding_generation: 1,
             kind: TOOL_HANDOFF_SOURCE_COMPOSITE,
             charge_account: cser_core::ChargeAccountId::new(7401).unwrap(),
             bindings: vec![ComponentProviderBinding::new(
@@ -369,7 +453,6 @@ fn handoff_source_release_removes_scoped_binding_at_the_pivot() {
             effect: parent,
             component: TOOL_HANDOFF_SOURCE_COMPONENT,
             actor,
-            binding_generation: 1,
             claim: ClaimId::new(7401).unwrap(),
             kind: TOOL_CLAIM_OUTCOME_SLOT,
             scope: ClaimScope::Logical,
@@ -384,7 +467,6 @@ fn handoff_source_release_removes_scoped_binding_at_the_pivot() {
         CommandRequest::PrepareCompositeEffect {
             effect: parent,
             actor,
-            binding_generation: 1,
         },
     )
     .unwrap();
@@ -393,7 +475,6 @@ fn handoff_source_release_removes_scoped_binding_at_the_pivot() {
             effect: parent,
             component: TOOL_HANDOFF_SOURCE_COMPONENT,
             actor,
-            binding_generation: 1,
             operation: Digest::new([0x75; 32]),
         })
         .unwrap();
@@ -436,19 +517,17 @@ fn handoff_source_release_removes_scoped_binding_at_the_pivot() {
     engine
         .transact_volatile(verified.install(
             actor,
-            1,
             cser_core::ChargeAccountId::new(7401).unwrap(),
+            ComponentProviderBinding::new(TOOL_HANDOFF_COMPONENT, target_provider),
         ))
         .unwrap();
     let verified = engine
         .verify_child_descriptor(descriptor, &AcceptDescriptor, &())
         .unwrap();
     engine
-        .transact_volatile(verified.release_source_and_record_target_intent(
-            actor,
-            1,
-            Digest::new([0x78; 32]),
-        ))
+        .transact_volatile(
+            verified.release_source_and_record_target_intent(actor, Digest::new([0x78; 32])),
+        )
         .unwrap();
     assert_eq!(
         engine
@@ -456,6 +535,13 @@ fn handoff_source_release_removes_scoped_binding_at_the_pivot() {
             .unwrap()
             .live_component_bindings,
         0
+    );
+    assert_eq!(
+        engine
+            .provider_generation_projection(target_provider)
+            .unwrap()
+            .live_component_bindings,
+        1
     );
     tx(
         &mut engine,
@@ -480,13 +566,13 @@ fn scoped_admission_binds_exact_operation_and_components() {
     let world = WorldId::new(9).unwrap();
     let mut engine = Engine::new(
         world,
-        standard_catalog(),
+        CatalogSet::new(&[standard_catalog()]).unwrap(),
         CoreLimits::bounded_default(),
         freshness(),
     );
     let reply = coordinate(9, 21, 1);
     let dma = coordinate(9, 22, 1);
-    let digest = engine.catalog_digest();
+    let digest = standard_catalog().digest();
     for provider in [reply, dma] {
         tx(
             &mut engine,
@@ -498,15 +584,16 @@ fn scoped_admission_binds_exact_operation_and_components() {
         )
         .unwrap();
     }
-    let effect = EffectId::new(RootId::new(91).unwrap(), 1).unwrap();
-    let actor = PrincipalIncarnation::new(PrincipalId::new(91).unwrap(), 1).unwrap();
+    let effect = EffectId::new(OperationId::new(91).unwrap(), 1).unwrap();
+    let actor = ExecutorCoordinate::new(
+        ExecutorId::new(91).unwrap(),
+        ExecutorGeneration::new(1).unwrap(),
+    );
     tx(
         &mut engine,
         CommandRequest::AdmitScopedCompositeEffect {
             effect,
-            operation: OperationId::new(1).unwrap(),
             origin: actor,
-            binding_generation: 1,
             kind: cser_core::AGENT_OPERATION_COMPOSITE,
             charge_account: cser_core::ChargeAccountId::new(91).unwrap(),
             bindings: vec![
@@ -517,7 +604,7 @@ fn scoped_admission_binds_exact_operation_and_components() {
     )
     .unwrap();
     let projection = engine.composite_effect(effect).unwrap();
-    assert_eq!(projection.operation, Some(OperationId::new(1).unwrap()));
+    assert_eq!(projection.operation, effect.operation());
     assert_eq!(projection.provider_bindings.len(), 2);
     assert_eq!(
         engine
@@ -533,4 +620,256 @@ fn scoped_admission_binds_exact_operation_and_components() {
             .live_component_bindings,
         1
     );
+}
+
+#[test]
+fn profile6_scoped_commit_settle_retire_release_keeps_provenance() {
+    let world = WorldId::new(801).unwrap();
+    let catalog = tool_dma_catalog();
+    let mut engine = Engine::new(
+        world,
+        CatalogSet::new(std::slice::from_ref(&catalog)).unwrap(),
+        CoreLimits::bounded_default(),
+        freshness(),
+    );
+    let mut journal = Vec::new();
+    macro_rules! durable {
+        ($request:expr $(,)?) => {
+            engine
+                .transact($request, |record| {
+                    journal.extend_from_slice(record.bytes());
+                    Ok::<(), ()>(())
+                })
+                .unwrap()
+        };
+    }
+    let provider = coordinate(801, 802, 1);
+    durable!(CommandRequest::RegisterProviderGeneration {
+        coordinate: provider,
+        catalog_digest: catalog.digest(),
+        verifier_bindings: verifiers_for(&catalog, 0x80),
+    },);
+    let effect = EffectId::new(OperationId::new(8011).unwrap(), 1).unwrap();
+    let actor = ExecutorCoordinate::new(
+        ExecutorId::new(8011).unwrap(),
+        ExecutorGeneration::new(1).unwrap(),
+    );
+    durable!(CommandRequest::AdmitScopedCompositeEffect {
+        effect,
+        origin: actor,
+        kind: TOOL_HANDOFF_SOURCE_COMPOSITE,
+        charge_account: cser_core::ChargeAccountId::new(8011).unwrap(),
+        bindings: vec![ComponentProviderBinding::new(
+            TOOL_HANDOFF_SOURCE_COMPONENT,
+            provider,
+        )],
+    },);
+    durable!(CommandRequest::AddComponentClaim {
+        effect,
+        component: TOOL_HANDOFF_SOURCE_COMPONENT,
+        actor,
+        claim: ClaimId::new(8011).unwrap(),
+        kind: TOOL_CLAIM_OUTCOME_SLOT,
+        scope: ClaimScope::Logical,
+        resource: ResourceId::new(8011).unwrap(),
+        resource_generation: ResourceGeneration::new(1).unwrap(),
+        units: 1,
+    },);
+    durable!(CommandRequest::PrepareCompositeEffect { effect, actor },);
+    let commit_intent = match durable!(CommandRequest::RecordComponentCommitIntent {
+        effect,
+        component: TOOL_HANDOFF_SOURCE_COMPONENT,
+        actor,
+        operation: Digest::new([0x81; 32]),
+    })
+    .into_output()
+    {
+        TransitionOutput::CommitIntent(intent) => intent,
+        other => panic!("expected commit intent, got {other:?}"),
+    };
+    let commit_verifier = ScopedEffectVerifier {
+        identity: scoped_identity(&catalog, TOOL_VERIFIER, TOOL_COMMIT_RECEIPT_SCHEMA, 0x80),
+    };
+    let outcome = engine
+        .verify_commit_outcome(&commit_intent, &commit_verifier, &())
+        .unwrap();
+    durable!(commit_intent.acknowledge(outcome).unwrap());
+
+    durable!(CommandRequest::FenceProviderEffects {
+        coordinate: provider,
+        expected_epoch: 1,
+    },);
+    durable!(CommandRequest::EnterProviderSettlementOnly {
+        coordinate: provider,
+        expected_epoch: 2,
+    },);
+
+    let settlement = match durable!(CommandRequest::ClaimComponentSettlement {
+        effect,
+        component: TOOL_HANDOFF_SOURCE_COMPONENT,
+        claimant: actor,
+    })
+    .into_output()
+    {
+        TransitionOutput::SettlementClaim(claim) => claim,
+        other => panic!("expected settlement claim, got {other:?}"),
+    };
+    let settlement = match durable!(
+        settlement
+            .record_apply_intent(Digest::new([0x82; 32]))
+            .unwrap()
+    )
+    .into_output()
+    {
+        TransitionOutput::SettlementClaim(claim) => claim,
+        other => panic!("expected apply-intent claim, got {other:?}"),
+    };
+    let apply_verifier = ScopedEffectVerifier {
+        identity: scoped_identity(&catalog, TOOL_VERIFIER, TOOL_APPLY_RECEIPT_SCHEMA, 0x80),
+    };
+    let applied = engine
+        .verify_apply_completion(&settlement, &apply_verifier, &())
+        .unwrap();
+    let settlement = match durable!(settlement.record_applied(applied).unwrap()).into_output() {
+        TransitionOutput::SettlementClaim(claim) => claim,
+        other => panic!("expected applied claim, got {other:?}"),
+    };
+    let settle_verifier = ScopedEffectVerifier {
+        identity: scoped_identity(
+            &catalog,
+            TOOL_VERIFIER,
+            TOOL_SETTLEMENT_RECEIPT_SCHEMA,
+            0x80,
+        ),
+    };
+    let acknowledgement = engine
+        .verify_settlement_ack(&settlement, &settle_verifier, &())
+        .unwrap();
+    durable!(settlement.settle(acknowledgement).unwrap());
+
+    let evidence = engine
+        .verify_component_retirement_evidence(
+            effect,
+            TOOL_HANDOFF_SOURCE_COMPONENT,
+            ClaimId::new(8011).unwrap(),
+            TOOL_EVIDENCE_OUTCOME_ACK,
+            &ScopedEvidenceVerifier {
+                identity: scoped_identity(&catalog, TOOL_VERIFIER, TOOL_RECEIPT_SCHEMA, 0x80),
+            },
+            &(),
+        )
+        .unwrap();
+    durable!(evidence.submit());
+    assert_eq!(
+        engine
+            .component(effect, TOOL_HANDOFF_SOURCE_COMPONENT)
+            .unwrap()
+            .retirement,
+        cser_core::RetirementState::Retired
+    );
+    durable!(CommandRequest::ReleaseCompositeEffect { effect },);
+    let projection = engine.composite_effect(effect).unwrap();
+    assert_eq!(projection.operation, effect.operation());
+    assert_eq!(
+        projection.provider_bindings,
+        vec![ComponentProviderBinding::new(
+            TOOL_HANDOFF_SOURCE_COMPONENT,
+            provider,
+        )]
+    );
+    assert_eq!(
+        engine
+            .provider_generation_projection(provider)
+            .unwrap()
+            .live_component_bindings,
+        0
+    );
+    assert!(matches!(
+        engine
+            .provider_generation_projection(provider)
+            .unwrap()
+            .state,
+        ProviderEffectState::SettlementOnly { .. }
+    ));
+    durable!(CommandRequest::RetireProviderEffects {
+        coordinate: provider,
+        expected_epoch: 3,
+    },);
+    assert!(matches!(
+        engine
+            .provider_generation_projection(provider)
+            .unwrap()
+            .state,
+        ProviderEffectState::Retired { .. }
+    ));
+
+    let next_freshness = Freshness::new(
+        BootGeneration::new(2).unwrap(),
+        RegistryInstance::new(1).unwrap(),
+        DeviceGeneration::new(1).unwrap(),
+        JournalGeneration::new(2).unwrap(),
+    );
+    let replayed = Engine::recover(
+        CatalogSet::new(std::slice::from_ref(&catalog)).unwrap(),
+        CoreLimits::bounded_default(),
+        RecoveryAnchor::from_trusted_provider(
+            recovery_binding(world, &catalog, freshness()),
+            freshness(),
+            next_freshness,
+            engine.revision(),
+            engine.head(),
+            engine.projection_digest(),
+        )
+        .unwrap(),
+        &journal,
+    )
+    .unwrap()
+    .into_engine();
+    assert_eq!(
+        replayed.composite_effect(effect).unwrap().operation,
+        effect.operation()
+    );
+    assert_eq!(
+        replayed
+            .provider_generation_projection(provider)
+            .unwrap()
+            .live_component_bindings,
+        0
+    );
+
+    let checkpoint = engine.journal_checkpoint(&journal).unwrap();
+    let recovered = Engine::recover(
+        CatalogSet::new(std::slice::from_ref(&catalog)).unwrap(),
+        CoreLimits::bounded_default(),
+        RecoveryAnchor::from_trusted_provider(
+            recovery_binding(world, &catalog, freshness()),
+            freshness(),
+            next_freshness,
+            checkpoint.anchor().revision(),
+            checkpoint.anchor().head(),
+            checkpoint.anchor().projection(),
+        )
+        .unwrap(),
+        checkpoint.image(),
+    )
+    .unwrap()
+    .into_engine();
+    assert_eq!(
+        recovered.composite_effect(effect).unwrap().operation,
+        effect.operation()
+    );
+    assert_eq!(
+        recovered
+            .provider_generation_projection(provider)
+            .unwrap()
+            .live_component_bindings,
+        0
+    );
+    assert!(matches!(
+        recovered
+            .provider_generation_projection(provider)
+            .unwrap()
+            .state,
+        ProviderEffectState::Retired { .. }
+    ));
 }

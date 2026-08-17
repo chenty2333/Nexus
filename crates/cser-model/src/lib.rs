@@ -11,24 +11,11 @@
 extern crate alloc;
 
 pub mod composite_effect_oracle;
-pub mod core_rebaseline_oracle;
+pub mod identity;
 pub mod provider_lifecycle_oracle;
 pub mod recovery_artifact_oracle;
 
-/// Stable identifier of a composite effect in the independent oracle.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct EffectId(u64);
-
-impl EffectId {
-    /// Constructs an effect identifier for an oracle fixture.
-    #[must_use]
-    pub const fn new(raw: u64) -> Self {
-        Self(raw)
-    }
-
-    /// Returns the numeric representation.
-    #[must_use]
-    pub const fn get(self) -> u64 {
-        self.0
-    }
-}
+pub use identity::{
+    ArtifactId, ComponentId, EffectId, ExecutorCoordinate, ExecutorGeneration, ExecutorId,
+    OperationId, ProviderCoordinate, ProviderGeneration, ProviderId, WorldId,
+};

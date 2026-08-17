@@ -7,9 +7,11 @@ use cser_core::{
     VerifiedEffectObservation, VerifierId, VerifierIdentity,
 };
 use support::{
-    Harness, charge, claim, committed_reply, digest, effect, fence_and_rebind, freshness,
-    principal, resource, resource_generation, test_effect_receipt, verified_apply_completion,
-    verified_commit_outcome, verified_settlement_ack,
+    EFFECT_APPLY_RECEIPT_SCHEMA, EFFECT_CLAIM_KIND, EFFECT_COMMIT_RECEIPT_SCHEMA, EFFECT_COMPONENT,
+    EFFECT_SETTLEMENT_RECEIPT_SCHEMA, EFFECT_VERIFIER, Harness, admit_command, claim,
+    committed_reply, digest, effect, executor, fence_and_rebind, freshness, resource,
+    resource_generation, test_effect_receipt, verified_apply_completion, verified_commit_outcome,
+    verified_settlement_ack, verifier_binding,
 };
 
 #[derive(Clone, Copy)]
@@ -36,45 +38,34 @@ impl EffectReceiptVerifier for ControlledVerifier {
 
 fn open_commit_intent(
     harness: &mut Harness,
-    root_value: u64,
+    operation_value: u64,
 ) -> (cser_core::CommitIntent, cser_core::EffectId) {
-    let effect = effect(root_value, 1);
-    let origin = principal(root_value, 1);
+    let effect = effect(operation_value, 1);
+    let origin = executor(operation_value, 1);
+    harness.tx(admit_command(effect, operation_value)).unwrap();
     harness
-        .tx(Command::CreateEstate {
+        .tx(Command::AddComponentClaim {
             effect,
-            origin,
-            binding_generation: 1,
-            domain: cser_core::REPLY_DOMAIN,
-            obligation: cser_core::REPLY_OBLIGATION_PUBLICATION,
-            charge_account: charge(root_value),
-        })
-        .unwrap();
-    harness
-        .tx(Command::AddClaim {
-            effect,
+            component: EFFECT_COMPONENT,
             actor: origin,
-            binding_generation: 1,
-            claim: claim(root_value),
-            domain: cser_core::REPLY_DOMAIN,
-            kind: cser_core::REPLY_CLAIM_PUBLICATION_SLOT,
+            claim: claim(operation_value),
+            kind: EFFECT_CLAIM_KIND,
             scope: ClaimScope::Logical,
-            resource: resource(root_value),
+            resource: resource(operation_value),
             resource_generation: resource_generation(1),
             units: 1,
         })
         .unwrap();
     harness
-        .tx(Command::PrepareEffect {
+        .tx(Command::PrepareCompositeEffect {
             effect,
             actor: origin,
-            binding_generation: 1,
         })
         .unwrap();
-    let intent = match harness.output(Command::RecordCommitIntent {
+    let intent = match harness.output(Command::RecordComponentCommitIntent {
         effect,
+        component: EFFECT_COMPONENT,
         actor: origin,
-        binding_generation: 1,
         operation: digest(1),
     }) {
         TransitionOutput::CommitIntent(intent) => intent,
@@ -92,12 +83,16 @@ fn commit_facts_require_the_exact_verifier_schema_epoch_freshness_and_shape() {
     let revision = harness.engine.revision();
 
     let wrong_verifier = ControlledVerifier {
-        identity: VerifierIdentity::new(
-            VerifierId::new(99).unwrap(),
-            1,
-            cser_core::REPLY_COMMIT_RECEIPT_SCHEMA,
-        )
-        .unwrap(),
+        identity: VerifierIdentity::new_exact(
+            cser_core::VerifierBinding::new(
+                VerifierId::new(99).unwrap(),
+                cser_core::VerifierGeneration::new(1).unwrap(),
+                EFFECT_COMMIT_RECEIPT_SCHEMA,
+                verifier_binding(EFFECT_VERIFIER, EFFECT_COMMIT_RECEIPT_SCHEMA)
+                    .implementation_digest(),
+            )
+            .unwrap(),
+        ),
         observation: Ok(VerifiedEffectObservation::commit(
             challenge.current_observation(),
             ExternalOutcome::Success,
@@ -112,12 +107,16 @@ fn commit_facts_require_the_exact_verifier_schema_epoch_freshness_and_shape() {
     );
 
     let wrong_schema = ControlledVerifier {
-        identity: VerifierIdentity::new(
-            cser_core::REPLY_VERIFIER,
-            1,
-            ReceiptSchemaId::new(99).unwrap(),
-        )
-        .unwrap(),
+        identity: VerifierIdentity::new_exact(
+            cser_core::VerifierBinding::new(
+                EFFECT_VERIFIER,
+                cser_core::VerifierGeneration::new(1).unwrap(),
+                ReceiptSchemaId::new(99).unwrap(),
+                verifier_binding(EFFECT_VERIFIER, EFFECT_COMMIT_RECEIPT_SCHEMA)
+                    .implementation_digest(),
+            )
+            .unwrap(),
+        ),
         observation: wrong_verifier.observation,
     };
     assert_eq!(
@@ -127,13 +126,43 @@ fn commit_facts_require_the_exact_verifier_schema_epoch_freshness_and_shape() {
         Err(CoreError::ReceiptSchemaMismatch)
     );
 
+    let expected_implementation_digest =
+        verifier_binding(EFFECT_VERIFIER, EFFECT_COMMIT_RECEIPT_SCHEMA).implementation_digest();
+    let wrong_implementation_digest = if expected_implementation_digest == digest(0x99) {
+        digest(0x98)
+    } else {
+        digest(0x99)
+    };
+    let wrong_implementation = ControlledVerifier {
+        identity: VerifierIdentity::new_exact(
+            cser_core::VerifierBinding::new(
+                EFFECT_VERIFIER,
+                cser_core::VerifierGeneration::new(1).unwrap(),
+                EFFECT_COMMIT_RECEIPT_SCHEMA,
+                wrong_implementation_digest,
+            )
+            .unwrap(),
+        ),
+        observation: wrong_verifier.observation,
+    };
+    assert_eq!(
+        harness
+            .engine
+            .verify_commit_outcome(&intent, &wrong_implementation, &()),
+        Err(CoreError::UnknownVerifier)
+    );
+
     let stale_epoch = ControlledVerifier {
-        identity: VerifierIdentity::new(
-            cser_core::REPLY_VERIFIER,
-            2,
-            cser_core::REPLY_COMMIT_RECEIPT_SCHEMA,
-        )
-        .unwrap(),
+        identity: VerifierIdentity::new_exact(
+            cser_core::VerifierBinding::new(
+                EFFECT_VERIFIER,
+                cser_core::VerifierGeneration::new(2).unwrap(),
+                EFFECT_COMMIT_RECEIPT_SCHEMA,
+                verifier_binding(EFFECT_VERIFIER, EFFECT_COMMIT_RECEIPT_SCHEMA)
+                    .implementation_digest(),
+            )
+            .unwrap(),
+        ),
         observation: wrong_verifier.observation,
     };
     assert_eq!(
@@ -144,14 +173,12 @@ fn commit_facts_require_the_exact_verifier_schema_epoch_freshness_and_shape() {
     );
 
     let wrong_freshness = ControlledVerifier {
-        identity: VerifierIdentity::new(
-            cser_core::REPLY_VERIFIER,
-            1,
-            cser_core::REPLY_COMMIT_RECEIPT_SCHEMA,
-        )
-        .unwrap(),
+        identity: VerifierIdentity::new_exact(verifier_binding(
+            EFFECT_VERIFIER,
+            EFFECT_COMMIT_RECEIPT_SCHEMA,
+        )),
         observation: Ok(VerifiedEffectObservation::commit(
-            freshness(2, 1, 1, 1, 1),
+            freshness(2, 1, 1, 1),
             ExternalOutcome::Success,
             digest(3),
         )),
@@ -210,13 +237,13 @@ fn commit_facts_require_the_exact_verifier_schema_epoch_freshness_and_shape() {
     let outcome = verified_commit_outcome(
         &harness,
         &intent,
-        cser_core::REPLY_VERIFIER,
-        cser_core::REPLY_COMMIT_RECEIPT_SCHEMA,
+        EFFECT_VERIFIER,
+        EFFECT_COMMIT_RECEIPT_SCHEMA,
         ExternalOutcome::Success,
         digest(5),
     );
     harness.tx(intent.acknowledge(outcome).unwrap()).unwrap();
-    assert!(harness.engine.estate(effect).is_some());
+    assert!(harness.engine.component(effect, EFFECT_COMPONENT).is_some());
 }
 
 #[test]
@@ -224,28 +251,22 @@ fn verified_apply_and_settlement_facts_cannot_cross_effects() {
     let mut harness = Harness::new();
     let (left, left_origin) = committed_reply(&mut harness, 910);
     let (right, right_origin) = committed_reply(&mut harness, 911);
-    let left_successor = principal(910, 2);
-    let right_successor = principal(911, 2);
-    fence_and_rebind(&mut harness, left, left_origin, left_successor, 1, 2, 9100);
-    fence_and_rebind(
-        &mut harness,
-        right,
-        right_origin,
-        right_successor,
-        1,
-        2,
-        9110,
-    );
+    let left_successor = executor(910, 2);
+    let right_successor = executor(911, 2);
+    fence_and_rebind(&mut harness, left, left_origin, left_successor, 9100);
+    fence_and_rebind(&mut harness, right, right_origin, right_successor, 9110);
 
-    let left_claim = match harness.output(Command::ClaimSettlement {
+    let left_claim = match harness.output(Command::ClaimComponentSettlement {
         effect: left,
+        component: EFFECT_COMPONENT,
         claimant: left_successor,
     }) {
         TransitionOutput::SettlementClaim(claim) => claim,
         other => panic!("expected left settlement claim, got {other:?}"),
     };
-    let right_claim = match harness.output(Command::ClaimSettlement {
+    let right_claim = match harness.output(Command::ClaimComponentSettlement {
         effect: right,
+        component: EFFECT_COMPONENT,
         claimant: right_successor,
     }) {
         TransitionOutput::SettlementClaim(claim) => claim,
@@ -263,8 +284,8 @@ fn verified_apply_and_settlement_facts_cannot_cross_effects() {
     let left_evidence = verified_apply_completion(
         &harness,
         &left_claim,
-        cser_core::REPLY_VERIFIER,
-        cser_core::REPLY_APPLY_RECEIPT_SCHEMA,
+        EFFECT_VERIFIER,
+        EFFECT_APPLY_RECEIPT_SCHEMA,
         digest(12),
     );
     let before = harness.engine.projection_digest();
@@ -280,8 +301,8 @@ fn verified_apply_and_settlement_facts_cannot_cross_effects() {
     let right_evidence = verified_apply_completion(
         &harness,
         &right_claim,
-        cser_core::REPLY_VERIFIER,
-        cser_core::REPLY_APPLY_RECEIPT_SCHEMA,
+        EFFECT_VERIFIER,
+        EFFECT_APPLY_RECEIPT_SCHEMA,
         digest(13),
     );
     let right_claim = match harness.output(right_claim.record_applied(right_evidence).unwrap()) {
@@ -292,8 +313,8 @@ fn verified_apply_and_settlement_facts_cannot_cross_effects() {
     let left_evidence = verified_apply_completion(
         &harness,
         &left_claim,
-        cser_core::REPLY_VERIFIER,
-        cser_core::REPLY_APPLY_RECEIPT_SCHEMA,
+        EFFECT_VERIFIER,
+        EFFECT_APPLY_RECEIPT_SCHEMA,
         digest(14),
     );
     let left_claim = match harness.output(left_claim.record_applied(left_evidence).unwrap()) {
@@ -304,8 +325,8 @@ fn verified_apply_and_settlement_facts_cannot_cross_effects() {
     let right_ack = verified_settlement_ack(
         &harness,
         &right_claim,
-        cser_core::REPLY_VERIFIER,
-        cser_core::REPLY_SETTLEMENT_RECEIPT_SCHEMA,
+        EFFECT_VERIFIER,
+        EFFECT_SETTLEMENT_RECEIPT_SCHEMA,
         digest(15),
     );
     let rejected = left_claim
@@ -317,16 +338,16 @@ fn verified_apply_and_settlement_facts_cannot_cross_effects() {
     let left_ack = verified_settlement_ack(
         &harness,
         &left_claim,
-        cser_core::REPLY_VERIFIER,
-        cser_core::REPLY_SETTLEMENT_RECEIPT_SCHEMA,
+        EFFECT_VERIFIER,
+        EFFECT_SETTLEMENT_RECEIPT_SCHEMA,
         digest(16),
     );
     harness.tx(left_claim.settle(left_ack).unwrap()).unwrap();
     let right_ack = verified_settlement_ack(
         &harness,
         &right_claim,
-        cser_core::REPLY_VERIFIER,
-        cser_core::REPLY_SETTLEMENT_RECEIPT_SCHEMA,
+        EFFECT_VERIFIER,
+        EFFECT_SETTLEMENT_RECEIPT_SCHEMA,
         digest(17),
     );
     harness.tx(right_claim.settle(right_ack).unwrap()).unwrap();
@@ -336,10 +357,11 @@ fn verified_apply_and_settlement_facts_cannot_cross_effects() {
 fn a_verified_fact_loses_the_race_to_a_real_fence_without_mutation() {
     let mut harness = Harness::new();
     let (effect, origin) = committed_reply(&mut harness, 920);
-    let successor = principal(920, 2);
-    fence_and_rebind(&mut harness, effect, origin, successor, 1, 2, 9200);
-    let claim = match harness.output(Command::ClaimSettlement {
+    let successor = executor(920, 2);
+    fence_and_rebind(&mut harness, effect, origin, successor, 9200);
+    let claim = match harness.output(Command::ClaimComponentSettlement {
         effect,
+        component: EFFECT_COMPONENT,
         claimant: successor,
     }) {
         TransitionOutput::SettlementClaim(claim) => claim,
@@ -352,17 +374,16 @@ fn a_verified_fact_loses_the_race_to_a_real_fence_without_mutation() {
     let evidence = verified_apply_completion(
         &harness,
         &claim,
-        cser_core::REPLY_VERIFIER,
-        cser_core::REPLY_APPLY_RECEIPT_SCHEMA,
+        EFFECT_VERIFIER,
+        EFFECT_APPLY_RECEIPT_SCHEMA,
         digest(21),
     );
     let stale_command = claim.record_applied(evidence).unwrap();
 
     harness
-        .tx(Command::FenceIncarnation {
-            root: effect.root(),
+        .tx(Command::FenceExecutor {
+            operation: effect.operation(),
             crashed: successor,
-            binding_generation: 2,
         })
         .unwrap();
     let before = harness.engine.projection_digest();
@@ -374,7 +395,11 @@ fn a_verified_fact_loses_the_race_to_a_real_fence_without_mutation() {
     assert_eq!(harness.engine.projection_digest(), before);
     assert_eq!(harness.engine.revision(), revision);
     assert!(matches!(
-        harness.engine.estate(effect).unwrap().settlement,
+        harness
+            .engine
+            .component(effect, EFFECT_COMPONENT)
+            .unwrap()
+            .settlement,
         cser_core::SettlementState::ReconciliationRequired {
             generation: 2,
             applied: false

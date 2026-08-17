@@ -767,7 +767,7 @@ impl FreshnessAxes {
     pub const BOOT: Self = Self(1 << 0);
     /// Evidence must match the Registry instance.
     pub const REGISTRY: Self = Self(1 << 1);
-    /// Evidence must match the active principal binding.
+    /// Evidence must match the active executor binding.
     pub const BINDING: Self = Self(1 << 2);
     /// Evidence must match the active device generation.
     pub const DEVICE: Self = Self(1 << 3);
@@ -1126,7 +1126,7 @@ pub enum DomainCatalogError {
     /// An evidence capability contradicts its subject binding.
     ///
     /// Quiescence must be bound to an exactly enrolled physical generation,
-    /// because permitting reuse requires knowing which incarnation of the
+    /// because permitting reuse requires knowing which executor of the
     /// resource has fallen silent. Outcome evidence must be bound to the
     /// logical effect, because settlement is a fact about the operation rather
     /// than about a resource generation.
@@ -1188,6 +1188,35 @@ pub enum DomainCatalogError {
     NonSingletonSingleHopHandoff,
     /// An explicit logical claim role cannot be attached to a device scope.
     NonGenericClaimRoleOnDeviceScope,
+}
+
+/// Maximum number of immutable catalogs held by one [`CatalogSet`].
+///
+/// A world normally needs only the catalogs referenced by its live provider
+/// generations.  Keeping the set bounded makes construction and every future
+/// persistence representation explicitly finite without putting a policy on
+/// the individual [`DomainCatalog`] builder.
+pub const MAX_CATALOG_SET_CATALOGS: usize = 64;
+
+/// Error returned while constructing an immutable [`CatalogSet`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CatalogSetError {
+    /// At least one catalog is required.
+    Empty,
+    /// The input exceeds the set's explicit cardinality bound.
+    TooManyCatalogs,
+    /// The same catalog digest occurs more than once.
+    DuplicateDigest,
+    /// One digest was presented with more than one catalog materialization.
+    ///
+    /// This is kept distinct from [`Self::DuplicateDigest`] so a future
+    /// loader cannot silently select one materialization when a digest
+    /// collision or corrupt catalog image is encountered.
+    DigestMaterialAmbiguity,
+    /// A catalog's advertised digest does not match its canonical material.
+    InvalidCatalogDigest,
+    /// The reserved zero digest cannot identify a catalog.
+    ZeroDigest,
 }
 
 /// Builder for a sealed, digest-bound domain catalog.
@@ -1617,7 +1646,7 @@ impl DomainCatalogBuilder {
 }
 
 /// Sealed domain schema used by the authoritative engine and journal replay.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DomainCatalog {
     credits: BTreeMap<CreditClassId, CreditRule>,
     obligations: BTreeMap<(DomainId, ObligationKindId), ObligationRule>,
@@ -1708,12 +1737,116 @@ impl DomainCatalog {
         self.credits.get(&class).copied()
     }
 
-    pub(crate) fn verifier_ids(&self) -> BTreeSet<VerifierId> {
-        self.verifier_class_bindings()
-            .into_iter()
-            .map(|binding| binding.verifier())
-            .collect()
+    fn canonical_digest(&self) -> Digest {
+        catalog_digest(
+            &self.credits,
+            &self.obligations,
+            &self.claims,
+            &self.composites,
+            &self.handoffs,
+        )
     }
+}
+
+/// Immutable, canonical collection of the catalogs available to one world.
+///
+/// Catalogs are keyed by their exact schema digest.  Once constructed, the
+/// collection exposes only shared references and deterministic iteration; a
+/// caller that needs a different world catalog set constructs a new value.
+/// This makes a provider generation's catalog coordinate stable and prevents
+/// late mutation from changing the meaning of an admitted effect.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CatalogSet {
+    catalogs: BTreeMap<Digest, DomainCatalog>,
+    digest: Digest,
+}
+
+impl CatalogSet {
+    /// Constructs a non-empty set using [`MAX_CATALOG_SET_CATALOGS`].
+    pub fn new(catalogs: &[DomainCatalog]) -> Result<Self, CatalogSetError> {
+        Self::with_max_catalogs(catalogs, MAX_CATALOG_SET_CATALOGS)
+    }
+
+    /// Constructs a non-empty set with an explicit finite cardinality bound.
+    ///
+    /// The bound is checked before any catalog is copied, so callers can use
+    /// it as an admission guard for untrusted or persisted catalog lists.
+    pub fn with_max_catalogs(
+        catalogs: &[DomainCatalog],
+        max_catalogs: usize,
+    ) -> Result<Self, CatalogSetError> {
+        if catalogs.is_empty() {
+            return Err(CatalogSetError::Empty);
+        }
+        if catalogs.len() > max_catalogs {
+            return Err(CatalogSetError::TooManyCatalogs);
+        }
+
+        let mut keyed = BTreeMap::new();
+        for catalog in catalogs {
+            let digest = catalog.digest();
+            if digest.is_zero() {
+                return Err(CatalogSetError::ZeroDigest);
+            }
+            if let Some(existing) = keyed.get(&digest) {
+                return Err(if existing == catalog {
+                    CatalogSetError::DuplicateDigest
+                } else {
+                    CatalogSetError::DigestMaterialAmbiguity
+                });
+            }
+            if catalog.canonical_digest() != digest {
+                return Err(CatalogSetError::InvalidCatalogDigest);
+            }
+            keyed.insert(digest, catalog.clone());
+        }
+
+        let digest = catalog_set_digest(&keyed);
+        Ok(Self {
+            catalogs: keyed,
+            digest,
+        })
+    }
+
+    /// Returns the deterministic aggregate digest of this catalog set.
+    pub const fn digest(&self) -> Digest {
+        self.digest
+    }
+
+    /// Returns the number of catalogs in this set.
+    pub fn len(&self) -> usize {
+        self.catalogs.len()
+    }
+
+    /// Returns whether this set contains no catalogs.
+    pub fn is_empty(&self) -> bool {
+        self.catalogs.is_empty()
+    }
+
+    /// Looks up one catalog by its exact schema digest.
+    pub fn get(&self, digest: Digest) -> Option<&DomainCatalog> {
+        self.catalogs.get(&digest)
+    }
+
+    /// Returns whether a catalog with this exact digest is present.
+    pub fn contains(&self, digest: Digest) -> bool {
+        self.catalogs.contains_key(&digest)
+    }
+
+    /// Iterates over `(catalog_digest, catalog)` pairs in canonical order.
+    pub fn iter(&self) -> impl Iterator<Item = (&Digest, &DomainCatalog)> {
+        self.catalogs.iter()
+    }
+}
+
+fn catalog_set_digest(catalogs: &BTreeMap<Digest, DomainCatalog>) -> Digest {
+    let mut hasher = Sha256::new();
+    hasher.update(b"nexus.cser.domain-catalog-set.v1");
+    hasher.update((catalogs.len() as u64).to_le_bytes());
+    for digest in catalogs.keys() {
+        hasher.update(digest.bytes());
+    }
+    Digest::new(hasher.finalize().into())
 }
 
 fn catalog_digest(
@@ -1860,6 +1993,70 @@ mod handoff_rule_tests {
         assert_eq!(
             builder.build().unwrap_err(),
             DomainCatalogError::NonSingletonSingleHopHandoff
+        );
+    }
+}
+
+#[cfg(test)]
+mod catalog_set_tests {
+    use super::*;
+
+    fn catalog(class: u32) -> DomainCatalog {
+        DomainCatalogBuilder::new()
+            .credit_class(CreditClassId::new(class).unwrap(), 1)
+            .unwrap()
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn set_is_non_empty_bounded_and_exactly_digest_keyed() {
+        let first = catalog(1);
+        let second = catalog(2);
+        let set = CatalogSet::with_max_catalogs(&[first.clone(), second.clone()], 2).unwrap();
+
+        assert_eq!(set.len(), 2);
+        assert!(!set.is_empty());
+        assert_eq!(set.get(first.digest()), Some(&first));
+        assert_eq!(set.get(second.digest()), Some(&second));
+        assert!(set.contains(first.digest()));
+        assert!(!set.contains(Digest::ZERO));
+        assert_eq!(
+            CatalogSet::with_max_catalogs(&[first.clone(), second.clone()], 1),
+            Err(CatalogSetError::TooManyCatalogs)
+        );
+        assert_eq!(
+            CatalogSet::with_max_catalogs(&[], 2),
+            Err(CatalogSetError::Empty)
+        );
+    }
+
+    #[test]
+    fn aggregate_digest_and_iteration_are_independent_of_insertion_order() {
+        let first = catalog(1);
+        let second = catalog(2);
+        let left = CatalogSet::new(&[first.clone(), second.clone()]).unwrap();
+        let right = CatalogSet::new(&[second.clone(), first.clone()]).unwrap();
+
+        assert_eq!(left.digest(), right.digest());
+        let left_digests: Vec<_> = left.iter().map(|(digest, _)| *digest).collect();
+        let right_digests: Vec<_> = right.iter().map(|(digest, _)| *digest).collect();
+        assert_eq!(left_digests, right_digests);
+    }
+
+    #[test]
+    fn duplicate_digest_and_invalid_material_are_rejected() {
+        let first = catalog(1);
+        assert_eq!(
+            CatalogSet::new(&[first.clone(), first]),
+            Err(CatalogSetError::DuplicateDigest)
+        );
+
+        let mut invalid = catalog(2);
+        invalid.digest = Digest::new([0xabu8; 32]);
+        assert_eq!(
+            CatalogSet::new(&[invalid]),
+            Err(CatalogSetError::InvalidCatalogDigest)
         );
     }
 }

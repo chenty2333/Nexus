@@ -86,6 +86,12 @@ impl<K> StateSet<K> {
     pub(crate) const fn is_empty(&self) -> bool {
         self.map.is_empty()
     }
+
+    /// Returns whether two sets share the exact persistent root.
+    #[cfg(test)]
+    pub(crate) fn ptr_eq(&self, other: &Self) -> bool {
+        self.map.ptr_eq(&other.map)
+    }
 }
 
 impl<K: Ord> StateSet<K> {
@@ -221,6 +227,21 @@ impl<K, V> StateMap<K, V> {
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    /// Returns whether two maps share the exact persistent root.
+    ///
+    /// Transition preparation uses this identity check to turn unchanged
+    /// top-level collections into `Change::Keep` slots without walking their
+    /// contents. Digest/equality remains the semantic comparison.
+    #[cfg(test)]
+    pub(crate) fn ptr_eq(&self, other: &Self) -> bool {
+        self.len == other.len
+            && match (&self.root, &other.root) {
+                (None, None) => true,
+                (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+                _ => false,
+            }
     }
 
     /// Removes every entry from the map in place.

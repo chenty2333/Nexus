@@ -11,142 +11,12 @@
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
-use crate::EffectId;
+use crate::{
+    ComponentId, EffectId, OperationId, ProviderCoordinate, ProviderGeneration, ProviderId, WorldId,
+};
 
 /// Maximum number of components in this bounded composite profile.
 pub const MAX_COMPONENTS: usize = 4;
-
-/// Stable world identity allocated by the embedding kernel.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct WorldId(u64);
-
-impl WorldId {
-    /// Constructs a non-zero world identity.
-    #[must_use]
-    pub const fn new(raw: u64) -> Option<Self> {
-        if raw == 0 { None } else { Some(Self(raw)) }
-    }
-
-    /// Returns the numeric identity.
-    #[must_use]
-    pub const fn get(self) -> u64 {
-        self.0
-    }
-}
-
-/// Stable provider identity within a world.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct ProviderId(u64);
-
-impl ProviderId {
-    /// Constructs a non-zero provider identity.
-    #[must_use]
-    pub const fn new(raw: u64) -> Option<Self> {
-        if raw == 0 { None } else { Some(Self(raw)) }
-    }
-
-    /// Returns the numeric identity.
-    #[must_use]
-    pub const fn get(self) -> u64 {
-        self.0
-    }
-}
-
-/// Monotonic provider-generation identity.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct ProviderGeneration(u64);
-
-impl ProviderGeneration {
-    /// Constructs a non-zero provider generation.
-    #[must_use]
-    pub const fn new(raw: u64) -> Option<Self> {
-        if raw == 0 { None } else { Some(Self(raw)) }
-    }
-
-    /// Returns the numeric generation.
-    #[must_use]
-    pub const fn get(self) -> u64 {
-        self.0
-    }
-}
-
-/// Stable operation identity for one admitted effect.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct OperationId(u64);
-
-impl OperationId {
-    /// Constructs a non-zero operation identity.
-    #[must_use]
-    pub const fn new(raw: u64) -> Option<Self> {
-        if raw == 0 { None } else { Some(Self(raw)) }
-    }
-
-    /// Returns the numeric identity.
-    #[must_use]
-    pub const fn get(self) -> u64 {
-        self.0
-    }
-}
-
-/// Exact world/provider/generation coordinate bound to an effect.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct ProviderCoordinate {
-    world: WorldId,
-    provider: ProviderId,
-    generation: ProviderGeneration,
-}
-
-impl ProviderCoordinate {
-    /// Creates an exact provider coordinate.
-    #[must_use]
-    pub const fn new(world: WorldId, provider: ProviderId, generation: ProviderGeneration) -> Self {
-        Self {
-            world,
-            provider,
-            generation,
-        }
-    }
-
-    /// Returns the owning world.
-    #[must_use]
-    pub const fn world(self) -> WorldId {
-        self.world
-    }
-
-    /// Returns the provider identity.
-    #[must_use]
-    pub const fn provider(self) -> ProviderId {
-        self.provider
-    }
-
-    /// Returns the provider generation.
-    #[must_use]
-    pub const fn generation(self) -> ProviderGeneration {
-        self.generation
-    }
-}
-
-/// Bounded component identity within one scoped effect.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct ComponentId(u8);
-
-impl ComponentId {
-    /// Constructs a component identity in the bounded profile.
-    #[must_use]
-    pub const fn new(raw: u8) -> Option<Self> {
-        if (raw as usize) < MAX_COMPONENTS {
-            Some(Self(raw))
-        } else {
-            None
-        }
-    }
-
-    /// Returns the zero-based component slot.
-    #[must_use]
-    pub const fn get(self) -> u8 {
-        self.0
-    }
-}
 
 /// Provider lifecycle phase.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -230,8 +100,6 @@ impl ComponentLifecycle {
 pub struct EffectProjection {
     /// Effect identity.
     pub effect: EffectId,
-    /// Operation identity bound at admission.
-    pub operation: OperationId,
     /// Provider generation bound at admission.
     pub provider: ProviderCoordinate,
     /// Number of active component slots in this effect.
@@ -448,17 +316,17 @@ impl ProviderLifecycleOracle {
     pub fn admit_effect(
         &mut self,
         effect: EffectId,
-        operation: OperationId,
         coordinate: ProviderCoordinate,
         component_count: u8,
     ) -> Result<(), LifecycleError> {
         if self.effects.contains_key(&effect) {
             return Err(LifecycleError::EffectAlreadyExists);
         }
+        let operation = effect.operation();
         if self.operations.contains_key(&operation) {
             return Err(LifecycleError::OperationAlreadyExists);
         }
-        if coordinate.world != self.world {
+        if coordinate.world() != self.world {
             return Err(LifecycleError::WrongWorld);
         }
         if component_count == 0 || component_count as usize > MAX_COMPONENTS {
@@ -470,7 +338,6 @@ impl ProviderLifecycleOracle {
         }
         let projection = EffectProjection {
             effect,
-            operation,
             provider: coordinate,
             component_count,
             components: [ComponentLifecycle::Staged; MAX_COMPONENTS],
@@ -692,13 +559,11 @@ impl ProviderLifecycleOracle {
             } => self.register_provider(provider, generation).map(|_| ()),
             LifecycleCommand::Admit {
                 effect,
-                operation,
                 provider,
                 generation,
                 components,
             } => self.admit_effect(
                 effect,
-                operation,
                 ProviderCoordinate::new(self.world, provider, generation),
                 components,
             ),
@@ -761,7 +626,7 @@ impl ProviderLifecycleOracle {
         }
         for (coordinate, record) in &self.providers {
             if record.coordinate != *coordinate
-                || record.coordinate.world != self.world
+                || record.coordinate.world() != self.world
                 || record.phase.epoch() == 0
                 || record.live_components
                     != computed_live_components
@@ -791,7 +656,7 @@ impl ProviderLifecycleOracle {
         self.operations.iter().all(|(operation, effect)| {
             self.effects
                 .get(effect)
-                .is_some_and(|record| record.projection.operation == *operation)
+                .is_some_and(|record| record.projection.effect.operation() == *operation)
         })
     }
 
@@ -799,11 +664,11 @@ impl ProviderLifecycleOracle {
         &mut self,
         coordinate: ProviderCoordinate,
     ) -> Result<&mut ProviderRecord, LifecycleError> {
-        if coordinate.world != self.world {
+        if coordinate.world() != self.world {
             return Err(LifecycleError::WrongWorld);
         }
-        let current = self.current.get(&coordinate.provider).copied();
-        if current != Some(coordinate.generation) {
+        let current = self.current.get(&coordinate.provider()).copied();
+        if current != Some(coordinate.generation()) {
             return Err(if self.providers.contains_key(&coordinate) {
                 LifecycleError::NotCurrentGeneration
             } else {
@@ -831,7 +696,7 @@ impl ProviderLifecycleOracle {
             .effects
             .get(&effect)
             .ok_or(LifecycleError::UnknownEffect)?;
-        let index = component.get() as usize;
+        let index = component.get().saturating_sub(1) as usize;
         if index >= record.projection.component_count as usize {
             return Err(LifecycleError::ComponentOutOfBounds);
         }
@@ -845,7 +710,7 @@ impl ProviderLifecycleOracle {
         state: ComponentLifecycle,
     ) {
         if let Some(record) = self.effects.get_mut(&effect) {
-            record.projection.components[component.get() as usize] = state;
+            record.projection.components[component.get().saturating_sub(1) as usize] = state;
         }
     }
 
@@ -880,8 +745,6 @@ pub enum LifecycleCommand {
     Admit {
         /// Stable effect identity.
         effect: EffectId,
-        /// Stable causal operation identity.
-        operation: OperationId,
         /// Stable provider identity.
         provider: ProviderId,
         /// Exact provider generation.
@@ -997,24 +860,20 @@ mod tests {
     #[test]
     fn fence_and_intent_have_one_serial_winner() {
         let (world, provider, generation, coordinate) = ids();
-        let effect = EffectId::new(10);
         let operation = OperationId::new(20).unwrap();
-        let component = ComponentId::new(0).unwrap();
+        let effect = EffectId::new(operation, 1).unwrap();
+        let component = ComponentId::new(1).unwrap();
 
         let mut fence_first = ProviderLifecycleOracle::new(world);
         fence_first.register_provider(provider, generation).unwrap();
         fence_first.fence_provider(coordinate).unwrap();
-        fence_first
-            .admit_effect(effect, operation, coordinate, 1)
-            .unwrap_err();
+        fence_first.admit_effect(effect, coordinate, 1).unwrap_err();
 
         let mut intent_first = ProviderLifecycleOracle::new(world);
         intent_first
             .register_provider(provider, generation)
             .unwrap();
-        intent_first
-            .admit_effect(effect, operation, coordinate, 1)
-            .unwrap();
+        intent_first.admit_effect(effect, coordinate, 1).unwrap();
         intent_first.commit_intent(effect, component).unwrap();
         intent_first.fence_provider(coordinate).unwrap();
         assert_eq!(
@@ -1030,14 +889,12 @@ mod tests {
     #[test]
     fn settlement_only_allows_only_outcome_settle_release() {
         let (world, provider, generation, coordinate) = ids();
-        let effect = EffectId::new(30);
         let operation = OperationId::new(40).unwrap();
-        let component = ComponentId::new(0).unwrap();
+        let effect = EffectId::new(operation, 1).unwrap();
+        let component = ComponentId::new(1).unwrap();
         let mut oracle = ProviderLifecycleOracle::new(world);
         oracle.register_provider(provider, generation).unwrap();
-        oracle
-            .admit_effect(effect, operation, coordinate, 1)
-            .unwrap();
+        oracle.admit_effect(effect, coordinate, 1).unwrap();
         oracle.commit_intent(effect, component).unwrap();
         oracle.fence_provider(coordinate).unwrap();
         assert_eq!(
@@ -1067,16 +924,18 @@ mod tests {
         oracle.register_provider(provider, generation).unwrap();
         oracle
             .admit_effect(
-                EffectId::new(50),
-                OperationId::new(51).unwrap(),
+                EffectId::new(OperationId::new(51).unwrap(), 1).unwrap(),
                 coordinate,
                 3,
             )
             .unwrap();
         assert_eq!(oracle.projection().providers[0].live_components, 3);
-        for raw in 0..3 {
+        for raw in 1..=3 {
             oracle
-                .release(EffectId::new(50), ComponentId::new(raw).unwrap())
+                .release(
+                    EffectId::new(OperationId::new(51).unwrap(), 1).unwrap(),
+                    ComponentId::new(raw).unwrap(),
+                )
                 .unwrap();
         }
         let provider_projection = &oracle.projection().providers[0];

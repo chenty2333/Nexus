@@ -17,13 +17,17 @@
 
 use cser_core::{
     ChargeAccountId, ClaimId, ClaimScope, Command, CommandRequest, CommitIntent,
-    ComponentCommitOperation, ComponentProjection, CompositeEffectProjection,
-    CoordinatedPersistenceError, CoreError, CoreLimits, DEVICE_CLAIM_IOVA,
-    DEVICE_CLAIM_PINNED_PAGE, DEVICE_CLAIM_QUEUE_SLOT, DeviceScopeId, Digest, EffectEscapeState,
-    EffectId, Freshness, PrincipalIncarnation, ResourceGeneration, ResourceId, RetirementState,
-    SettlementState, TOOL_CLAIM_OUTCOME_SLOT, TOOL_DMA_COMPONENT_DMA, TOOL_DMA_COMPONENT_TOOL,
-    TOOL_DMA_OPERATION_COMPOSITE, TransitionDurability, TransitionOutput, TransitionReceipt,
-    TrustedAnchorBackend, TxError, WorldId, tool_dma_catalog,
+    ComponentCommitOperation, ComponentProjection, ComponentProviderBinding,
+    CompositeEffectProjection, CoordinatedPersistenceError, CoreError, CoreLimits,
+    DEVICE_CLAIM_IOVA, DEVICE_CLAIM_PINNED_PAGE, DEVICE_CLAIM_QUEUE_SLOT,
+    DEVICE_COMMIT_RECEIPT_SCHEMA, DEVICE_RECEIPT_SCHEMA, DEVICE_VERIFIER, DeviceScopeId, Digest,
+    EffectEscapeState, EffectId, ExecutorCoordinate, Freshness, ProviderCoordinate,
+    ProviderEffectState, ProviderGeneration, ProviderId, ResourceGeneration, ResourceId,
+    RetirementState, SettlementState, TOOL_APPLY_RECEIPT_SCHEMA, TOOL_CLAIM_OUTCOME_SLOT,
+    TOOL_COMMIT_RECEIPT_SCHEMA, TOOL_DMA_COMPONENT_DMA, TOOL_DMA_COMPONENT_TOOL,
+    TOOL_DMA_OPERATION_COMPOSITE, TOOL_RECEIPT_SCHEMA, TOOL_SETTLEMENT_RECEIPT_SCHEMA,
+    TOOL_VERIFIER, TransitionDurability, TransitionOutput, TransitionReceipt, TrustedAnchorBackend,
+    TxError, VerifierBinding, VerifierGeneration, WorldId, tool_dma_catalog,
 };
 
 use super::{
@@ -148,8 +152,7 @@ pub(crate) trait ToolDmaBarrierHook {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ToolDmaCoordinates {
     effect: EffectId,
-    actor: PrincipalIncarnation,
-    binding_generation: u64,
+    actor: ExecutorCoordinate,
     account: ChargeAccountId,
     tool_claim: ClaimId,
     tool_resource: ResourceId,
@@ -164,12 +167,84 @@ pub(crate) struct ToolDmaCoordinates {
     device_generation: ResourceGeneration,
 }
 
+/// Exact provider generation used by the isolated profile-5 tool-plus-DMA
+/// experiment. Both catalog components bind to this same provider generation;
+/// the component identities remain distinct in the scoped admission.
+pub(crate) const TOOL_DMA_PROVIDER: ProviderCoordinate = ProviderCoordinate::new(
+    match WorldId::new(1) {
+        Ok(value) => value,
+        Err(_) => unreachable!(),
+    },
+    match ProviderId::new(2) {
+        Ok(value) => value,
+        Err(_) => unreachable!(),
+    },
+    match ProviderGeneration::new(1) {
+        Ok(value) => value,
+        Err(_) => unreachable!(),
+    },
+);
+
+const TOOL_RECEIPT_IMPLEMENTATION_DIGEST: Digest = Digest::new([0x71; 32]);
+const TOOL_COMMIT_IMPLEMENTATION_DIGEST: Digest = Digest::new([0x72; 32]);
+const TOOL_APPLY_IMPLEMENTATION_DIGEST: Digest = Digest::new([0x73; 32]);
+const TOOL_SETTLEMENT_IMPLEMENTATION_DIGEST: Digest = Digest::new([0x74; 32]);
+const DEVICE_RECEIPT_IMPLEMENTATION_DIGEST: Digest = Digest::new([0x61; 32]);
+const DEVICE_COMMIT_IMPLEMENTATION_DIGEST: Digest = Digest::new([0x62; 32]);
+
+fn tool_dma_verifier_bindings() -> alloc::vec::Vec<VerifierBinding> {
+    let generation = VerifierGeneration::new(1).expect("tool-DMA verifier generation is non-zero");
+    alloc::vec![
+        VerifierBinding::new(
+            DEVICE_VERIFIER,
+            generation,
+            DEVICE_RECEIPT_SCHEMA,
+            DEVICE_RECEIPT_IMPLEMENTATION_DIGEST,
+        )
+        .expect("tool-DMA device receipt verifier binding is valid"),
+        VerifierBinding::new(
+            DEVICE_VERIFIER,
+            generation,
+            DEVICE_COMMIT_RECEIPT_SCHEMA,
+            DEVICE_COMMIT_IMPLEMENTATION_DIGEST,
+        )
+        .expect("tool-DMA device commit verifier binding is valid"),
+        VerifierBinding::new(
+            TOOL_VERIFIER,
+            generation,
+            TOOL_RECEIPT_SCHEMA,
+            TOOL_RECEIPT_IMPLEMENTATION_DIGEST,
+        )
+        .expect("tool-DMA tool receipt verifier binding is valid"),
+        VerifierBinding::new(
+            TOOL_VERIFIER,
+            generation,
+            TOOL_COMMIT_RECEIPT_SCHEMA,
+            TOOL_COMMIT_IMPLEMENTATION_DIGEST,
+        )
+        .expect("tool-DMA tool commit verifier binding is valid"),
+        VerifierBinding::new(
+            TOOL_VERIFIER,
+            generation,
+            TOOL_APPLY_RECEIPT_SCHEMA,
+            TOOL_APPLY_IMPLEMENTATION_DIGEST,
+        )
+        .expect("tool-DMA tool apply verifier binding is valid"),
+        VerifierBinding::new(
+            TOOL_VERIFIER,
+            generation,
+            TOOL_SETTLEMENT_RECEIPT_SCHEMA,
+            TOOL_SETTLEMENT_IMPLEMENTATION_DIGEST,
+        )
+        .expect("tool-DMA tool settlement verifier binding is valid"),
+    ]
+}
+
 impl ToolDmaCoordinates {
     #[allow(clippy::too_many_arguments)]
     pub(crate) const fn new(
         effect: EffectId,
-        actor: PrincipalIncarnation,
-        binding_generation: u64,
+        actor: ExecutorCoordinate,
         account: ChargeAccountId,
         tool_claim: ClaimId,
         tool_resource: ResourceId,
@@ -183,8 +258,7 @@ impl ToolDmaCoordinates {
         device_scope: DeviceScopeId,
         device_generation: ResourceGeneration,
     ) -> Option<Self> {
-        if binding_generation == 0
-            || tool_claim.get() == queue_claim.get()
+        if tool_claim.get() == queue_claim.get()
             || tool_claim.get() == page_claim.get()
             || tool_claim.get() == iova_claim.get()
             || queue_claim.get() == page_claim.get()
@@ -202,7 +276,6 @@ impl ToolDmaCoordinates {
         Some(Self {
             effect,
             actor,
-            binding_generation,
             account,
             tool_claim,
             tool_resource,
@@ -221,11 +294,8 @@ impl ToolDmaCoordinates {
     pub(crate) const fn effect(self) -> EffectId {
         self.effect
     }
-    pub(crate) const fn actor(self) -> PrincipalIncarnation {
+    pub(crate) const fn actor(self) -> ExecutorCoordinate {
         self.actor
-    }
-    pub(crate) const fn binding_generation(self) -> u64 {
-        self.binding_generation
     }
 
     fn tool_plan(self, run_id: [u8; 16], payload: &[u8]) -> Result<ToolOperationPlan, CoreError> {
@@ -244,18 +314,20 @@ impl ToolDmaCoordinates {
 
     fn topology(self) -> [CommandRequest; 5] {
         [
-            CommandRequest::CreateCompositeEffect {
+            CommandRequest::AdmitScopedCompositeEffect {
                 effect: self.effect,
                 origin: self.actor,
-                binding_generation: self.binding_generation,
                 kind: TOOL_DMA_OPERATION_COMPOSITE,
                 charge_account: self.account,
+                bindings: alloc::vec![
+                    ComponentProviderBinding::new(TOOL_DMA_COMPONENT_TOOL, TOOL_DMA_PROVIDER),
+                    ComponentProviderBinding::new(TOOL_DMA_COMPONENT_DMA, TOOL_DMA_PROVIDER),
+                ],
             },
             CommandRequest::AddComponentClaim {
                 effect: self.effect,
                 component: TOOL_DMA_COMPONENT_TOOL,
                 actor: self.actor,
-                binding_generation: self.binding_generation,
                 claim: self.tool_claim,
                 kind: TOOL_CLAIM_OUTCOME_SLOT,
                 scope: ClaimScope::Logical,
@@ -267,7 +339,6 @@ impl ToolDmaCoordinates {
                 effect: self.effect,
                 component: TOOL_DMA_COMPONENT_DMA,
                 actor: self.actor,
-                binding_generation: self.binding_generation,
                 claim: self.queue_claim,
                 kind: DEVICE_CLAIM_QUEUE_SLOT,
                 scope: ClaimScope::Device(self.device_scope),
@@ -279,7 +350,6 @@ impl ToolDmaCoordinates {
                 effect: self.effect,
                 component: TOOL_DMA_COMPONENT_DMA,
                 actor: self.actor,
-                binding_generation: self.binding_generation,
                 claim: self.page_claim,
                 kind: DEVICE_CLAIM_PINNED_PAGE,
                 scope: ClaimScope::Device(self.device_scope),
@@ -295,7 +365,6 @@ impl ToolDmaCoordinates {
                 effect: self.effect,
                 component: TOOL_DMA_COMPONENT_DMA,
                 actor: self.actor,
-                binding_generation: self.binding_generation,
                 claim: self.iova_claim,
                 kind: DEVICE_CLAIM_IOVA,
                 scope: ClaimScope::Device(self.device_scope),
@@ -314,10 +383,13 @@ impl ToolDmaCoordinates {
 /// authority until the experiment ATA/TPM recovery layer has selected and
 /// authenticated its journal prefix.
 pub(crate) fn new_tool_dma_runtime<P>(persistence: P, freshness: Freshness) -> OstdCserRuntime<P> {
+    let catalog = tool_dma_catalog();
+    let catalogs = cser_core::CatalogSet::new(core::slice::from_ref(&catalog))
+        .expect("tool DMA catalog set is non-empty and canonical");
     OstdCserRuntime::from_engine(
         cser_core::Engine::new(
             WorldId::new(1).expect("tool DMA runtime world is non-zero"),
-            tool_dma_catalog(),
+            catalogs,
             CoreLimits::bounded_default(),
             freshness,
         ),
@@ -553,6 +625,14 @@ pub(crate) fn arm_tool_dma<O: ToolDmaCoreOwner, H: ToolDmaBarrierHook>(
     {
         return Err(ToolDmaExperimentError::Core(CoreError::InvalidPayload));
     }
+    ensure_tool_dma_provider(runtime).map_err(|error| match error {
+        ToolDmaExperimentError::Transition(error) => ToolDmaExperimentError::Transition(error),
+        ToolDmaExperimentError::Core(error) => ToolDmaExperimentError::Core(error),
+        ToolDmaExperimentError::UnexpectedTransitionOutput => {
+            ToolDmaExperimentError::UnexpectedTransitionOutput
+        }
+        _ => unreachable!("provider registration has no barrier or intent error"),
+    })?;
     for command in coordinates.topology() {
         expect_none(runtime.transact(command.into()))?;
     }
@@ -561,7 +641,6 @@ pub(crate) fn arm_tool_dma<O: ToolDmaCoreOwner, H: ToolDmaBarrierHook>(
             CommandRequest::PrepareCompositeEffect {
                 effect: coordinates.effect,
                 actor: coordinates.actor,
-                binding_generation: coordinates.binding_generation,
             }
             .into(),
         ),
@@ -576,7 +655,6 @@ pub(crate) fn arm_tool_dma<O: ToolDmaCoreOwner, H: ToolDmaBarrierHook>(
                 CommandRequest::RecordCompositeCommitIntents {
                     effect: coordinates.effect,
                     actor: coordinates.actor,
-                    binding_generation: coordinates.binding_generation,
                     operations: alloc::vec![
                         ComponentCommitOperation::new(
                             TOOL_DMA_COMPONENT_TOOL,
@@ -600,6 +678,40 @@ pub(crate) fn arm_tool_dma<O: ToolDmaCoreOwner, H: ToolDmaBarrierHook>(
         tool_intent: Some(tool_intent),
         dma_intent: Some(dma_intent),
     })
+}
+
+/// Durably registers the profile-5 provider generation before any component
+/// can be admitted. A matching active projection is reused after a crash that
+/// occurred between registration and scoped admission; a mismatch is
+/// fail-closed rather than repaired by selecting another provider epoch.
+pub(crate) fn ensure_tool_dma_provider<O: ToolDmaCoreOwner>(
+    runtime: &mut O,
+) -> Result<(), ToolDmaExperimentError<O::PersistenceError>> {
+    let catalog_digest = tool_dma_catalog().digest();
+    let expected = tool_dma_verifier_bindings();
+    match runtime.observe(|engine| engine.provider_generation_projection(TOOL_DMA_PROVIDER)) {
+        Some(projection)
+            if projection.coordinate == TOOL_DMA_PROVIDER
+                && projection.catalog_digest == catalog_digest
+                && projection.verifier_bindings == expected
+                && projection.state == ProviderEffectState::Active =>
+        {
+            Ok(())
+        }
+        Some(_) => Err(ToolDmaExperimentError::Core(
+            CoreError::ProviderBindingMismatch,
+        )),
+        None => expect_none(
+            runtime.transact(
+                CommandRequest::RegisterProviderGeneration {
+                    coordinate: TOOL_DMA_PROVIDER,
+                    catalog_digest,
+                    verifier_bindings: expected,
+                }
+                .into(),
+            ),
+        ),
+    }
 }
 
 /// Recovery classification derived solely from the replayed core projection.
@@ -785,7 +897,7 @@ fn take_component_intent(
     let mut found = None;
     let mut index = 0;
     while index < intents.len() {
-        if intents[index].component() == Some(component) {
+        if intents[index].component() == component {
             if found.is_some() {
                 return Err(ToolDmaResumeError::UnexpectedCommitIntent);
             }
@@ -817,12 +929,12 @@ fn split_intents<E, B>(
     };
     let tool_index = intents
         .iter()
-        .position(|intent| intent.component() == Some(TOOL_DMA_COMPONENT_TOOL))
+        .position(|intent| intent.component() == TOOL_DMA_COMPONENT_TOOL)
         .ok_or(ToolDmaExperimentError::MissingToolIntent)?;
     let tool = intents.swap_remove(tool_index);
     let dma_index = intents
         .iter()
-        .position(|intent| intent.component() == Some(TOOL_DMA_COMPONENT_DMA))
+        .position(|intent| intent.component() == TOOL_DMA_COMPONENT_DMA)
         .ok_or(ToolDmaExperimentError::MissingDmaIntent)?;
     let dma = intents.swap_remove(dma_index);
     if !intents.is_empty() || tool.effect() != dma.effect() {
@@ -836,8 +948,8 @@ mod tests {
     use core::convert::Infallible;
 
     use cser_core::{
-        BootGeneration, DeviceGeneration, JournalGeneration, JournalRecord, PrincipalId,
-        RegistryInstance, RootId,
+        BootGeneration, DeviceGeneration, ExecutorCoordinate, ExecutorGeneration, ExecutorId,
+        JournalGeneration, JournalRecord, OperationId, RegistryInstance,
     };
     use ostd::prelude::ktest;
 
@@ -882,13 +994,15 @@ mod tests {
     }
 
     fn coordinates() -> ToolDmaCoordinates {
-        let root = RootId::new(1).unwrap();
-        let effect = EffectId::new(root, 1).unwrap();
-        let actor = PrincipalIncarnation::new(PrincipalId::new(1).unwrap(), 1).unwrap();
+        let operation = OperationId::new(1).unwrap();
+        let effect = EffectId::new(operation, 1).unwrap();
+        let actor = ExecutorCoordinate::new(
+            ExecutorId::new(1).unwrap(),
+            ExecutorGeneration::new(1).unwrap(),
+        );
         ToolDmaCoordinates::new(
             effect,
             actor,
-            1,
             ChargeAccountId::new(1).unwrap(),
             ClaimId::new(1).unwrap(),
             ResourceId::new(1).unwrap(),
@@ -937,14 +1051,14 @@ mod tests {
             }
         );
         let (tool, dma) = resumed.into_outstanding_intents();
-        assert_eq!(tool.unwrap().component(), Some(TOOL_DMA_COMPONENT_TOOL));
-        assert_eq!(dma.unwrap().component(), Some(TOOL_DMA_COMPONENT_DMA));
+        assert_eq!(tool.unwrap().component, TOOL_DMA_COMPONENT_TOOL);
+        assert_eq!(dma.unwrap().component, TOOL_DMA_COMPONENT_DMA);
     }
 
     #[ktest]
     fn resume_absent_has_no_reconstructed_authority() {
         let runtime = new_tool_dma_runtime(TestDurability, freshness());
-        let effect = EffectId::new(RootId::new(9).unwrap(), 1).unwrap();
+        let effect = EffectId::new(OperationId::new(9).unwrap(), 1).unwrap();
         let resumed = resume_tool_dma(&runtime, effect).unwrap();
         assert_eq!(resumed.state(), ToolDmaResumeState::Absent);
         assert_eq!(resumed.into_outstanding_intents(), (None, None));

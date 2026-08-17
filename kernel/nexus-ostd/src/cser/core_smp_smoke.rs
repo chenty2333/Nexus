@@ -14,9 +14,10 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use cser_core::{
     AGENT_COMPONENT_DMA, AGENT_COMPONENT_REPLY, AGENT_OPERATION_COMPOSITE, BootGeneration,
     ChargeAccountId, CommandRequest, ComponentProviderBinding, CoreLimits, Digest, EffectId,
-    Freshness, JournalGeneration, JournalRecord, OperationId, PrincipalId, PrincipalIncarnation,
-    ProviderCoordinate, ProviderGeneration, ProviderId, RegistryInstance, RootId,
-    TransitionDurability, TxError, VerifierBinding, VerifierGeneration, WorldId, standard_catalog,
+    ExecutorCoordinate, ExecutorGeneration, ExecutorId, Freshness, JournalGeneration,
+    JournalRecord, OperationId, ProviderCoordinate, ProviderGeneration, ProviderId,
+    RegistryInstance, TransitionDurability, TxError, VerifierBinding, VerifierGeneration, WorldId,
+    standard_catalog,
 };
 use ostd::{
     cpu::{CpuId, CpuSet, num_cpus},
@@ -107,17 +108,17 @@ pub(crate) fn launch() -> ! {
 
 fn run_bsp_fail_closed_persistence_smoke() -> super::core_runtime::RuntimeSerializationMetrics {
     let world = WorldId::new(1).expect("smoke world is non-zero");
-    let root = RootId::new(1).expect("smoke root is non-zero");
-    let principal = PrincipalId::new(1).expect("smoke principal is non-zero");
-    let origin = PrincipalIncarnation::new(principal, 1).expect("smoke incarnation is non-zero");
+    let operation = OperationId::new(1).expect("smoke operation is non-zero");
+    let origin = ExecutorCoordinate::new(
+        ExecutorId::new(1).expect("smoke executor is non-zero"),
+        ExecutorGeneration::new(1).expect("smoke executor generation is non-zero"),
+    );
     let freshness = Freshness::new(
         BootGeneration::new(1).expect("smoke boot is non-zero"),
         RegistryInstance::new(1).expect("smoke registry instance is non-zero"),
-        1,
         cser_core::DeviceGeneration::new(1).expect("smoke device generation is non-zero"),
         JournalGeneration::new(1).expect("smoke journal is non-zero"),
-    )
-    .expect("smoke freshness is complete");
+    );
     let catalog = standard_catalog();
     let provider = ProviderCoordinate::new(
         world,
@@ -140,12 +141,10 @@ fn run_bsp_fail_closed_persistence_smoke() -> super::core_runtime::RuntimeSerial
             .expect("smoke verifier binding is valid")
         })
         .collect();
-    let mut engine = cser_core::Engine::new(
-        world,
-        catalog.clone(),
-        CoreLimits::bounded_default(),
-        freshness,
-    );
+    let catalogs = cser_core::CatalogSet::new(core::slice::from_ref(&catalog))
+        .expect("smoke catalog set is valid");
+    let mut engine =
+        cser_core::Engine::new(world, catalogs, CoreLimits::bounded_default(), freshness);
     engine
         .transact(
             CommandRequest::RegisterProviderGeneration {
@@ -158,14 +157,12 @@ fn run_bsp_fail_closed_persistence_smoke() -> super::core_runtime::RuntimeSerial
         .expect("smoke provider setup is valid");
     let base_revision = engine.revision();
     let runtime = OstdCserRuntime::from_engine(engine, UnavailableJournal);
-    let effect = EffectId::new(root, 1).expect("smoke effect is non-zero");
+    let effect = EffectId::new(operation, 1).expect("smoke effect is non-zero");
     runtime.set_serialization_timing(true);
     assert!(matches!(
         runtime.transact(CommandRequest::AdmitScopedCompositeEffect {
             effect,
-            operation: OperationId::new(1).expect("smoke operation is non-zero"),
             origin,
-            binding_generation: 1,
             kind: AGENT_OPERATION_COMPOSITE,
             charge_account: ChargeAccountId::new(1).expect("smoke account is non-zero"),
             bindings: vec![

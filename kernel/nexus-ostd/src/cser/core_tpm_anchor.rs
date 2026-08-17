@@ -46,9 +46,9 @@ use core::{
 };
 
 use cser_core::{
-    AuthorityBindingGeneration, BootGeneration, DeviceGeneration, Digest, Freshness,
-    JournalGeneration, PersistenceProtocolError, RecoveryBinding, RecoveryLease, RecoveryProfile,
-    RegistryInstance, TrustedAnchorBackend, TrustedAnchorSnapshot, WorldId,
+    BootGeneration, DeviceGeneration, Digest, Freshness, JournalGeneration,
+    PersistenceProtocolError, RecoveryBinding, RecoveryLease, RecoveryProfile, RegistryInstance,
+    TrustedAnchorBackend, TrustedAnchorSnapshot, WorldId,
 };
 use ostd::{
     io::IoMem,
@@ -134,36 +134,34 @@ const DEFAULT_POLL_BUDGET: u32 = 20_000_000;
 // algorithm's 32-byte digest size.
 const MAX_INDEX_AUTH: usize = 32;
 
-// vNext deliberately has no decoder path for the predecessor CSERTPM1
+// vNext deliberately has no decoder path for the predecessor CSERTPM2
 // payload.  The magic and version both change so a stale slot is rejected
 // before any field is interpreted.
-const SLOT_MAGIC: [u8; 8] = *b"CSERTPM2";
-const SLOT_VERSION: u16 = 2;
+const SLOT_MAGIC: [u8; 8] = *b"CSERTPM3";
+const SLOT_VERSION: u16 = 3;
 const SLOT_KIND_TIP: u8 = 1;
 const SLOT_KIND_LEASE: u8 = 2;
 const SLOT_PREFIX_LEN: usize = 20;
-// prefix + RecoveryBinding (profile 8 + catalog 32 + world 8 + Registry 8
-// + authority binding 8) + Freshness (5 * u64) + revision + head + projection
-const TIP_BODY_LEN: usize = 196;
+// prefix + RecoveryBinding (profile 8 + catalog 32 + world 8 + Registry 8)
+// + Freshness (4 * u64) + revision + head + projection
+const TIP_BODY_LEN: usize = 180;
 const TIP_SLOT_LEN: usize = TIP_BODY_LEN + 32;
-const LEASE_BODY_LEN: usize = 124;
+const LEASE_BODY_LEN: usize = 108;
 const LEASE_SLOT_LEN: usize = LEASE_BODY_LEN + 32;
 
-// The OSTD fixture has one stable semantic world and one stable recovery
-// authority binding.  Genesis projection is the digest of
+// The OSTD fixture has one stable semantic world. Genesis projection is the digest of
 // Engine::new(WorldId(1), standard_catalog(), bounded_default(),
-// Freshness(1, 1, 1, 1, 1)); the shell provisioner carries this exact fixed
+// Freshness(1, 1, 1, 1)); the shell provisioner carries this exact fixed
 // value because it cannot instantiate the scoped Core engine itself.
 const OSTD_WORLD_ID: u64 = 1;
-const OSTD_AUTHORITY_BINDING_GENERATION: u64 = 1;
 const OSTD_REGISTRY_INSTANCE: u64 = 1;
 const OSTD_STANDARD_CATALOG_DIGEST: Digest = Digest::new([
-    0x07, 0x82, 0xc4, 0x85, 0x8f, 0x2a, 0x99, 0x78, 0x76, 0xa4, 0xbe, 0xe9, 0xba, 0x30, 0xeb, 0xf0,
-    0xca, 0xdf, 0x65, 0xd9, 0x9d, 0x93, 0xdc, 0xcc, 0x0d, 0x77, 0xc6, 0xa1, 0x58, 0x1c, 0xa8, 0xee,
+    0x1d, 0x69, 0xf2, 0xfc, 0x7e, 0x9c, 0x1b, 0xdc, 0x60, 0xbc, 0x99, 0x18, 0x7f, 0x8c, 0x38, 0xdc,
+    0x6b, 0xcd, 0xe1, 0x46, 0x7e, 0x11, 0xae, 0xd9, 0x19, 0xa2, 0xf4, 0x6d, 0x93, 0x6c, 0x03, 0xb1,
 ]);
 const OSTD_GENESIS_PROJECTION: Digest = Digest::new([
-    0x77, 0xc5, 0x77, 0x9d, 0x00, 0x60, 0x4b, 0xc6, 0xa6, 0xf7, 0xe6, 0x4a, 0x74, 0xc5, 0x62, 0x14,
-    0x3d, 0xb5, 0xa1, 0x83, 0x63, 0xf7, 0xca, 0x72, 0x7d, 0xa9, 0x99, 0x8f, 0x36, 0xa6, 0xcc, 0xf5,
+    0xa3, 0x10, 0x75, 0x61, 0x4d, 0x23, 0x36, 0x5a, 0x05, 0xfe, 0x24, 0xeb, 0xc8, 0x2a, 0xcb, 0x6b,
+    0x9f, 0x6d, 0x85, 0x86, 0x5d, 0xf5, 0x70, 0x3a, 0x15, 0x0b, 0x71, 0x2f, 0xe4, 0x4e, 0x11, 0x8e,
 ]);
 
 // TPM2 ordinary NV has no compare-and-swap command. The double-slot selector
@@ -1050,14 +1048,7 @@ where
 
         let next_boot = next_boot(self.issued)?;
         let next_journal = next_journal(self.issued)?;
-        let next = Freshness::new(
-            next_boot,
-            binding.registry(),
-            binding.binding().get(),
-            observed_device,
-            next_journal,
-        )
-        .map_err(|_| PersistenceProtocolError::InvalidAnchor)?;
+        let next = Freshness::new(next_boot, binding.registry(), observed_device, next_journal);
         let next_sequence =
             self.lease_sequence
                 .checked_add(1)
@@ -1200,10 +1191,7 @@ fn validate_inspected_state<E>(
     lease_binding: RecoveryBinding,
     issued: Freshness,
 ) -> Result<(), TpmNvAnchorError<E>> {
-    if committed.binding() != lease_binding
-        || issued.registry() != lease_binding.registry()
-        || issued.binding() != lease_binding.binding().get()
-    {
+    if committed.binding() != lease_binding || issued.registry() != lease_binding.registry() {
         return Err(PersistenceProtocolError::BindingMismatch.into());
     }
     let committed_freshness = committed.committed_freshness();
@@ -1369,10 +1357,7 @@ fn decode_lease_slot(
     let mut cursor = SLOT_PREFIX_LEN;
     let binding = decode_binding(bytes, &mut cursor)?;
     let freshness = decode_freshness(bytes, &mut cursor)?;
-    if cursor != LEASE_BODY_LEN
-        || freshness.registry().get() != binding.registry().get()
-        || freshness.binding() != binding.binding().get()
-    {
+    if cursor != LEASE_BODY_LEN || freshness.registry().get() != binding.registry().get() {
         return None;
     }
     Some((binding, freshness))
@@ -1420,7 +1405,6 @@ fn encode_binding(bytes: &mut [u8], cursor: &mut usize, binding: RecoveryBinding
     put_bytes(bytes, cursor, &binding.catalog_digest().bytes());
     put_u64(bytes, cursor, binding.world().get());
     put_u64(bytes, cursor, binding.registry().get());
-    put_u64(bytes, cursor, binding.binding().get());
 }
 
 fn decode_binding(bytes: &[u8], cursor: &mut usize) -> Option<RecoveryBinding> {
@@ -1434,14 +1418,12 @@ fn decode_binding(bytes: &[u8], cursor: &mut usize) -> Option<RecoveryBinding> {
     let catalog = Digest::new(take_array::<32>(bytes, cursor)?);
     let world = WorldId::new(take_u64(bytes, cursor)?).ok()?;
     let registry = RegistryInstance::new(take_u64(bytes, cursor)?).ok()?;
-    let binding = AuthorityBindingGeneration::new(take_u64(bytes, cursor)?).ok()?;
-    RecoveryBinding::new(profile, world, catalog, registry, binding).ok()
+    RecoveryBinding::new(profile, world, catalog, registry).ok()
 }
 
 fn encode_freshness(bytes: &mut [u8], cursor: &mut usize, freshness: Freshness) {
     put_u64(bytes, cursor, freshness.boot().get());
     put_u64(bytes, cursor, freshness.registry().get());
-    put_u64(bytes, cursor, freshness.binding());
     put_u64(bytes, cursor, freshness.device().get());
     put_u64(bytes, cursor, freshness.journal().get());
 }
@@ -1449,10 +1431,9 @@ fn encode_freshness(bytes: &mut [u8], cursor: &mut usize, freshness: Freshness) 
 fn decode_freshness(bytes: &[u8], cursor: &mut usize) -> Option<Freshness> {
     let boot = BootGeneration::new(take_u64(bytes, cursor)?).ok()?;
     let registry = RegistryInstance::new(take_u64(bytes, cursor)?).ok()?;
-    let binding = take_u64(bytes, cursor)?;
     let device = DeviceGeneration::new(take_u64(bytes, cursor)?).ok()?;
     let journal = JournalGeneration::new(take_u64(bytes, cursor)?).ok()?;
-    Freshness::new(boot, registry, binding, device, journal).ok()
+    Some(Freshness::new(boot, registry, device, journal))
 }
 
 fn put_u64(bytes: &mut [u8], cursor: &mut usize, value: u64) {
@@ -1986,8 +1967,6 @@ pub(crate) fn launch() -> ! {
         OSTD_STANDARD_CATALOG_DIGEST,
         RegistryInstance::new(OSTD_REGISTRY_INSTANCE)
             .expect("fixture Registry identity is nonzero"),
-        AuthorityBindingGeneration::new(OSTD_AUTHORITY_BINDING_GENERATION)
-            .expect("fixture authority binding is nonzero"),
     )
     .expect("fixture recovery binding is valid");
     let transport =
@@ -2266,7 +2245,6 @@ mod tests {
             WorldId::new(7).unwrap(),
             digest(7),
             RegistryInstance::new(9).unwrap(),
-            AuthorityBindingGeneration::new(11).unwrap(),
         )
         .unwrap()
     }
@@ -2275,11 +2253,9 @@ mod tests {
         Freshness::new(
             BootGeneration::new(boot).unwrap(),
             RegistryInstance::new(9).unwrap(),
-            11,
             DeviceGeneration::new(device).unwrap(),
             JournalGeneration::new(journal).unwrap(),
         )
-        .unwrap()
     }
 
     fn auth() -> TpmNvIndexAuth {
@@ -2301,7 +2277,6 @@ mod tests {
             observed_binding.world(),
             digest(8),
             observed_binding.registry(),
-            observed_binding.binding(),
         )
         .unwrap();
         let (candidate, error) = match candidate.bind(expected_binding) {
@@ -2498,7 +2473,6 @@ mod tests {
             expected_binding.world(),
             digest(8),
             expected_binding.registry(),
-            expected_binding.binding(),
         )
         .unwrap();
         let selected = slot_for_sequence(layout.lease_slots, 1);

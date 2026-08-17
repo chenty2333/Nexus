@@ -9,10 +9,13 @@
 //! retired in this lane.
 
 use cser_core::{
-    ChargeAccountId, ClaimId, ClaimScope, CommandRequest, CommitIntent, CoreError, Digest,
-    EffectId, Engine, PrincipalIncarnation, ResourceGeneration, ResourceId,
-    TOOL_CLAIM_OUTCOME_SLOT, TOOL_HANDOFF_SOURCE_COMPONENT, TOOL_HANDOFF_SOURCE_COMPOSITE,
-    TransitionDurability, TransitionOutput,
+    ChargeAccountId, ClaimId, ClaimScope, CommandRequest, CommitIntent, ComponentProviderBinding,
+    CoreError, DEVICE_COMMIT_RECEIPT_SCHEMA, DEVICE_RECEIPT_SCHEMA, DEVICE_VERIFIER, Digest,
+    EffectId, ExecutorCoordinate, ProviderCoordinate, ProviderEffectState, ProviderGeneration,
+    ProviderId, ResourceGeneration, ResourceId, TOOL_APPLY_RECEIPT_SCHEMA, TOOL_CLAIM_OUTCOME_SLOT,
+    TOOL_COMMIT_RECEIPT_SCHEMA, TOOL_HANDOFF_SOURCE_COMPONENT, TOOL_HANDOFF_SOURCE_COMPOSITE,
+    TOOL_RECEIPT_SCHEMA, TOOL_SETTLEMENT_RECEIPT_SCHEMA, TOOL_VERIFIER, TransitionDurability,
+    TransitionOutput, VerifierBinding, VerifierGeneration, WorldId, tool_dma_catalog,
 };
 
 use super::{
@@ -44,8 +47,7 @@ impl HandoffBarrier {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct HandoffSourceCoordinates {
     pub(crate) effect: EffectId,
-    pub(crate) actor: PrincipalIncarnation,
-    pub(crate) binding_generation: u64,
+    pub(crate) actor: ExecutorCoordinate,
     pub(crate) charge_account: ChargeAccountId,
     pub(crate) claim: ClaimId,
     pub(crate) resource: ResourceId,
@@ -68,14 +70,18 @@ pub(crate) fn arm_handoff_source<P: TransitionDurability>(
     {
         return Err(CoreError::InvalidPayload);
     }
+    ensure_handoff_provider(runtime)?;
     expect_none(must_transact(
         runtime,
-        CommandRequest::CreateCompositeEffect {
+        CommandRequest::AdmitScopedCompositeEffect {
             effect: coordinates.effect,
             origin: coordinates.actor,
-            binding_generation: coordinates.binding_generation,
             kind: TOOL_HANDOFF_SOURCE_COMPOSITE,
             charge_account: coordinates.charge_account,
+            bindings: alloc::vec![ComponentProviderBinding::new(
+                TOOL_HANDOFF_SOURCE_COMPONENT,
+                HANDOFF_PROVIDER,
+            )],
         },
     ))?;
     expect_none(must_transact(
@@ -84,7 +90,6 @@ pub(crate) fn arm_handoff_source<P: TransitionDurability>(
             effect: coordinates.effect,
             component: TOOL_HANDOFF_SOURCE_COMPONENT,
             actor: coordinates.actor,
-            binding_generation: coordinates.binding_generation,
             claim: coordinates.claim,
             kind: TOOL_CLAIM_OUTCOME_SLOT,
             scope: ClaimScope::Logical,
@@ -98,7 +103,6 @@ pub(crate) fn arm_handoff_source<P: TransitionDurability>(
         CommandRequest::PrepareCompositeEffect {
             effect: coordinates.effect,
             actor: coordinates.actor,
-            binding_generation: coordinates.binding_generation,
         },
     ))?;
     match must_transact(
@@ -107,7 +111,6 @@ pub(crate) fn arm_handoff_source<P: TransitionDurability>(
             effect: coordinates.effect,
             component: TOOL_HANDOFF_SOURCE_COMPONENT,
             actor: coordinates.actor,
-            binding_generation: coordinates.binding_generation,
             operation: source.operation_digest(),
         },
     )
@@ -140,7 +143,7 @@ pub(crate) fn settle_and_retire<P: TransitionDurability>(
     runtime: &mut OstdCserRuntime<P>,
     effect: EffectId,
     component: cser_core::ComponentId,
-    claimant: PrincipalIncarnation,
+    claimant: ExecutorCoordinate,
     tool: ToolDmaRuntime,
     observation: &DurableToolObservation,
 ) -> Result<(), CoreError> {
@@ -188,8 +191,7 @@ pub(crate) fn install_child<P: TransitionDurability>(
     runtime: &mut OstdCserRuntime<P>,
     source: ToolDmaRuntime,
     observation: &DurableToolObservation,
-    actor: PrincipalIncarnation,
-    binding_generation: u64,
+    actor: ExecutorCoordinate,
     charge_account: ChargeAccountId,
 ) -> Result<cser_core::ChildDescriptorV1, CoreError> {
     let (command, descriptor) = runtime.observe(|engine| {
@@ -197,12 +199,112 @@ pub(crate) fn install_child<P: TransitionDurability>(
             engine,
             observation,
             actor,
-            binding_generation,
             charge_account,
+            ComponentProviderBinding::new(cser_core::TOOL_HANDOFF_COMPONENT, HANDOFF_PROVIDER),
         )
     })?;
     expect_none(must_transact(runtime, command))?;
     Ok(descriptor)
+}
+
+/// Exact provider generation used by the logical-only handoff lane. The
+/// handoff feature is intentionally independent of the Tool+DMA feature, so
+/// it carries the same catalog verifier bindings locally rather than reaching
+/// across a feature-gated module.
+const HANDOFF_PROVIDER: ProviderCoordinate = ProviderCoordinate::new(
+    match WorldId::new(1) {
+        Ok(value) => value,
+        Err(_) => unreachable!(),
+    },
+    match ProviderId::new(2) {
+        Ok(value) => value,
+        Err(_) => unreachable!(),
+    },
+    match ProviderGeneration::new(1) {
+        Ok(value) => value,
+        Err(_) => unreachable!(),
+    },
+);
+
+const TOOL_RECEIPT_IMPLEMENTATION_DIGEST: Digest = Digest::new([0x71; 32]);
+const TOOL_COMMIT_IMPLEMENTATION_DIGEST: Digest = Digest::new([0x72; 32]);
+const TOOL_APPLY_IMPLEMENTATION_DIGEST: Digest = Digest::new([0x73; 32]);
+const TOOL_SETTLEMENT_IMPLEMENTATION_DIGEST: Digest = Digest::new([0x74; 32]);
+const DEVICE_RECEIPT_IMPLEMENTATION_DIGEST: Digest = Digest::new([0x61; 32]);
+const DEVICE_COMMIT_IMPLEMENTATION_DIGEST: Digest = Digest::new([0x62; 32]);
+
+fn handoff_verifier_bindings() -> alloc::vec::Vec<VerifierBinding> {
+    let generation = VerifierGeneration::new(1).expect("handoff verifier generation is non-zero");
+    alloc::vec![
+        VerifierBinding::new(
+            DEVICE_VERIFIER,
+            generation,
+            DEVICE_RECEIPT_SCHEMA,
+            DEVICE_RECEIPT_IMPLEMENTATION_DIGEST,
+        )
+        .expect("handoff device receipt verifier binding is valid"),
+        VerifierBinding::new(
+            DEVICE_VERIFIER,
+            generation,
+            DEVICE_COMMIT_RECEIPT_SCHEMA,
+            DEVICE_COMMIT_IMPLEMENTATION_DIGEST,
+        )
+        .expect("handoff device commit verifier binding is valid"),
+        VerifierBinding::new(
+            TOOL_VERIFIER,
+            generation,
+            TOOL_RECEIPT_SCHEMA,
+            TOOL_RECEIPT_IMPLEMENTATION_DIGEST,
+        )
+        .expect("handoff tool receipt verifier binding is valid"),
+        VerifierBinding::new(
+            TOOL_VERIFIER,
+            generation,
+            TOOL_COMMIT_RECEIPT_SCHEMA,
+            TOOL_COMMIT_IMPLEMENTATION_DIGEST,
+        )
+        .expect("handoff tool commit verifier binding is valid"),
+        VerifierBinding::new(
+            TOOL_VERIFIER,
+            generation,
+            TOOL_APPLY_RECEIPT_SCHEMA,
+            TOOL_APPLY_IMPLEMENTATION_DIGEST,
+        )
+        .expect("handoff tool apply verifier binding is valid"),
+        VerifierBinding::new(
+            TOOL_VERIFIER,
+            generation,
+            TOOL_SETTLEMENT_RECEIPT_SCHEMA,
+            TOOL_SETTLEMENT_IMPLEMENTATION_DIGEST,
+        )
+        .expect("handoff tool settlement verifier binding is valid"),
+    ]
+}
+
+fn ensure_handoff_provider<P: TransitionDurability>(
+    runtime: &mut OstdCserRuntime<P>,
+) -> Result<(), CoreError> {
+    let catalog_digest = tool_dma_catalog().digest();
+    let expected = handoff_verifier_bindings();
+    match runtime.observe(|engine| engine.provider_generation_projection(HANDOFF_PROVIDER)) {
+        Some(projection)
+            if projection.coordinate == HANDOFF_PROVIDER
+                && projection.catalog_digest == catalog_digest
+                && projection.verifier_bindings == expected
+                && projection.state == ProviderEffectState::Active =>
+        {
+            Ok(())
+        }
+        Some(_) => Err(CoreError::ProviderBindingMismatch),
+        None => expect_none(must_transact(
+            runtime,
+            CommandRequest::RegisterProviderGeneration {
+                coordinate: HANDOFF_PROVIDER,
+                catalog_digest,
+                verifier_bindings: expected,
+            },
+        )),
+    }
 }
 
 /// The authority pivot occurs only after source retirement: atomically
@@ -213,8 +315,7 @@ pub(crate) fn release_source_and_record_child_intent<P: TransitionDurability>(
     source: ToolDmaRuntime,
     observation: &DurableToolObservation,
     child: ToolOperationPlan,
-    actor: PrincipalIncarnation,
-    binding_generation: u64,
+    actor: ExecutorCoordinate,
 ) -> Result<CommitIntent, CoreError> {
     if !child.is_cser3_child() {
         return Err(CoreError::InvalidPayload);
@@ -229,13 +330,7 @@ pub(crate) fn release_source_and_record_child_intent<P: TransitionDurability>(
         Ok::<_, CoreError>(descriptor)
     })?;
     let command = runtime.observe(|engine| {
-        source.release_handoff_source_and_record_target_intent(
-            engine,
-            observation,
-            child,
-            actor,
-            binding_generation,
-        )
+        source.release_handoff_source_and_record_target_intent(engine, observation, child, actor)
     })?;
     match must_transact(runtime, command).into_output() {
         TransitionOutput::CommitIntent(intent)

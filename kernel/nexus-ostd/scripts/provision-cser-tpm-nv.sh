@@ -35,7 +35,7 @@ catalog_hex=${2:-}
 tip_revision=${3:-0}
 tip_head_hex=${4:-}
 if [[ $mode == cser && -z $catalog_hex ]]; then
-    catalog_hex=0782c4858f2a997876a4bee9ba30ebf0cadf65d99d93dcc0dc77c6a1581ca8ee
+    catalog_hex=1d69f2fc7e9c1bdc60bc99187f8c38dc6bcde1467e11aed919a2f46d936c03b1
 fi
 if [[ $mode == cser && ! $catalog_hex =~ ^[[:xdigit:]]{64}$ ]]; then
     echo "catalog digest must be exactly 64 hexadecimal characters" >&2
@@ -169,8 +169,8 @@ readonly TIP_SLOT_1=0x01800102
 readonly LEASE_COUNTER=0x01800103
 readonly LEASE_SLOT_0=0x01800104
 readonly LEASE_SLOT_1=0x01800105
-readonly TIP_SIZE=228
-readonly LEASE_SIZE=156
+readonly TIP_SIZE=212
+readonly LEASE_SIZE=140
 readonly COUNTER_ATTRIBUTES=0x42040414
 readonly SLOT_ATTRIBUTES=0x42041404
 readonly DELETE_POLICY_SHA256=47ce3032d8bad1f3089cb0c09088de43501491d460402b90cd1b7fc0b68ca92f
@@ -202,13 +202,13 @@ fi
 
 readonly one=0000000000000001
 readonly zero=0000000000000000
-readonly profile_hex=0005000900090002
+readonly profile_hex=0006000a000a0003
 readonly world_hex=0000000000000001
-readonly genesis_projection_hex=77c5779d00604bc6a6f7e64a74c562143db5a18363f7ca727da9998f36a6ccf5
-readonly prefix_tip=4353455254504d32000201000000000000000001
-readonly prefix_lease=4353455254504d32000202000000000000000001
-readonly binding_hex="${profile_hex}${catalog_hex}${world_hex}${one}${one}"
-readonly freshness_hex="${one}${one}${one}${one}${one}"
+readonly genesis_projection_hex=a31075614d23365a05fe24ebc82acb6b9f6d85865df5703a150b712fe44e118e
+readonly prefix_tip=4353455254504d33000301000000000000000001
+readonly prefix_lease=4353455254504d33000302000000000000000001
+readonly binding_hex="${profile_hex}${catalog_hex}${world_hex}${one}"
+readonly freshness_hex="${one}${one}${one}${one}"
 readonly tip_body_hex="${prefix_tip}${binding_hex}${freshness_hex}${tip_revision_hex}${tip_head_hex}${genesis_projection_hex}"
 readonly lease_body_hex="${prefix_lease}${binding_hex}${freshness_hex}"
 

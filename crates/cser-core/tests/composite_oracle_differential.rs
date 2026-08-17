@@ -2,32 +2,36 @@
 mod support;
 
 use cser_core::{
-    AGENT_COMPONENT_DMA, AGENT_COMPONENT_REPLY, AGENT_OPERATION_COMPOSITE, AuthorityState, ClaimId,
-    ClaimScope, Command as AuthorizedCommand, CommandRequest as Command, CommitState,
-    ComponentCommitOperation, ComponentId, CoreError, CoreLimits, DEVICE_CLAIM_IOVA,
-    DEVICE_CLAIM_PINNED_PAGE, DEVICE_CLAIM_QUEUE_SLOT, DEVICE_COMMIT_RECEIPT_SCHEMA,
-    DEVICE_EVIDENCE_IOTLB, DEVICE_EVIDENCE_IRQ_DRAINED, DEVICE_EVIDENCE_RESET,
-    DEVICE_RECEIPT_SCHEMA, DEVICE_VERIFIER, DMA_ARENA_REUSE_COMPOSITE, DeviceScopeId, EffectId,
-    Engine, EvidenceKindId, ExternalOutcome, Freshness, REPLY_APPLY_RECEIPT_SCHEMA,
-    REPLY_CLAIM_PUBLICATION_SLOT, REPLY_COMMIT_RECEIPT_SCHEMA, REPLY_EVIDENCE_PUBLICATION_ACK,
-    REPLY_RECEIPT_SCHEMA, REPLY_SETTLEMENT_RECEIPT_SCHEMA, REPLY_VERIFIER, ReceiptBinding,
-    ResourceId, SettlementState, TransitionOutput, standard_catalog,
+    AGENT_COMPONENT_DMA, AGENT_COMPONENT_REPLY, AGENT_OPERATION_COMPOSITE, AuthorityState,
+    CatalogSet, ClaimId, ClaimScope, Command as AuthorizedCommand, CommandRequest as Command,
+    CommitState, ComponentCommitOperation, ComponentId, ComponentProviderBinding, CoreError,
+    CoreLimits, DEVICE_CLAIM_IOVA, DEVICE_CLAIM_PINNED_PAGE, DEVICE_CLAIM_QUEUE_SLOT,
+    DEVICE_COMMIT_RECEIPT_SCHEMA, DEVICE_EVIDENCE_IOTLB, DEVICE_EVIDENCE_IRQ_DRAINED,
+    DEVICE_EVIDENCE_RESET, DEVICE_RECEIPT_SCHEMA, DEVICE_VERIFIER, DMA_ARENA_REUSE_COMPOSITE,
+    DeviceScopeId, EffectId, Engine, EvidenceKindId, ExecutorCoordinate, ExternalOutcome,
+    Freshness, OperationId, REPLY_APPLY_RECEIPT_SCHEMA, REPLY_CLAIM_PUBLICATION_SLOT,
+    REPLY_COMMIT_RECEIPT_SCHEMA, REPLY_EVIDENCE_PUBLICATION_ACK, REPLY_RECEIPT_SCHEMA,
+    REPLY_SETTLEMENT_RECEIPT_SCHEMA, REPLY_VERIFIER, ReceiptBinding, ResourceId, SettlementState,
+    TransitionOutput, standard_catalog,
 };
-use cser_model::EffectId as OracleEffectId;
 use cser_model::composite_effect_oracle::{
     ClaimKind as OracleClaimKind, ClaimState as OracleClaimState, ComponentId as OracleComponentId,
     CompositeAuthority as OracleAuthority, CompositeEffectOracle, CompositeResources,
     DmaOutcome as OracleDmaOutcome, EscapeState as OracleEscape, ReplyState as OracleReplyState,
     ResourceId as OracleResourceId,
 };
+use cser_model::{
+    EffectId as OracleEffectId, ExecutorCoordinate as OracleExecutorCoordinate,
+    ExecutorGeneration as OracleExecutorGeneration, ExecutorId as OracleExecutorId,
+    OperationId as OracleOperationId,
+};
 use support::{
-    ExactTestVerifier, Harness, TestReceipt, charge, claim, digest, effect, freshness, principal,
-    recovery_anchor, resource, resource_generation, snapshot, verified_apply_completion,
+    ExactTestVerifier, Harness, TestReceipt, charge, claim, digest, effect, executor, freshness,
+    provider, recovery_anchor, resource, resource_generation, snapshot, verified_apply_completion,
     verified_commit_outcome, verified_settlement_ack,
 };
 
-const ROOT: u64 = 0xce07;
-const ORACLE_EFFECT: OracleEffectId = OracleEffectId::new(0xce07_0001);
+const OPERATION: u64 = 0xce07;
 const DEVICE_SCOPE_RAW: u64 = 0xce07;
 const FIRST_SNAPSHOT_RAW: u64 = 0x00ce_0701;
 const SECOND_SNAPSHOT_RAW: u64 = 0x00ce_0702;
@@ -57,10 +61,22 @@ enum NormalizedAuthority {
 enum NormalizedReply {
     Staged,
     Open(u64),
-    Claimed { claimant: u64, generation: u64 },
-    IntentDurable { claimant: u64, generation: u64 },
-    Applied { claimant: u64, generation: u64 },
-    Reconcile { generation: u64, applied: bool },
+    Claimed {
+        claimant: OracleExecutorCoordinate,
+        generation: u64,
+    },
+    IntentDurable {
+        claimant: OracleExecutorCoordinate,
+        generation: u64,
+    },
+    Applied {
+        claimant: OracleExecutorCoordinate,
+        generation: u64,
+    },
+    Reconcile {
+        generation: u64,
+        applied: bool,
+    },
     Settled,
     Tombstoned,
 }
@@ -107,8 +123,7 @@ impl NormalizedClaim {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct NormalizedPermitOwner {
-    actor: u64,
-    binding_generation: u64,
+    actor: OracleExecutorCoordinate,
     next_generation: u64,
     device_generation: u64,
 }
@@ -207,6 +222,25 @@ fn device_scope() -> DeviceScopeId {
     DeviceScopeId::new(DEVICE_SCOPE_RAW).unwrap()
 }
 
+fn oracle_operation(operation: OperationId) -> OracleOperationId {
+    OracleOperationId::new(operation.get()).unwrap()
+}
+
+fn oracle_effect(effect: EffectId) -> OracleEffectId {
+    OracleEffectId::new(oracle_operation(effect.operation()), effect.sequence()).unwrap()
+}
+
+fn standard_catalog_set() -> CatalogSet {
+    CatalogSet::new(&[standard_catalog()]).expect("standard catalog set must be valid")
+}
+
+fn oracle_executor(executor: ExecutorCoordinate) -> OracleExecutorCoordinate {
+    OracleExecutorCoordinate::new(
+        OracleExecutorId::new(executor.executor().get()).unwrap(),
+        OracleExecutorGeneration::new(executor.generation().get()).unwrap(),
+    )
+}
+
 fn oracle_resources() -> CompositeResources {
     CompositeResources {
         reply_output: OracleResourceId::new(REPLY_RESOURCE_RAW),
@@ -220,7 +254,6 @@ fn next_device_freshness(current: Freshness) -> Freshness {
     freshness(
         current.boot().get(),
         current.registry().get(),
-        current.binding(),
         current.device().get() + 1,
         current.journal().get(),
     )
@@ -333,21 +366,21 @@ fn core_reply(committed: bool, settlement: SettlementState) -> NormalizedReply {
             claimant,
             generation,
         } => NormalizedReply::Claimed {
-            claimant: claimant.generation(),
+            claimant: oracle_executor(claimant),
             generation,
         },
         SettlementState::ApplyIntentDurable {
             claimant,
             generation,
         } => NormalizedReply::IntentDurable {
-            claimant: claimant.generation(),
+            claimant: oracle_executor(claimant),
             generation,
         },
         SettlementState::AppliedUnacknowledged {
             claimant,
             generation,
         } => NormalizedReply::Applied {
-            claimant: claimant.generation(),
+            claimant: oracle_executor(claimant),
             generation,
         },
         SettlementState::ReconciliationRequired {
@@ -476,7 +509,7 @@ fn core_claim(
                 "only an unconsumed reservation has a live bearer"
             );
             let target = context.target.expect("reuse has one explicit lease effect");
-            assert_eq!(target.root(), original.root());
+            assert_eq!(target.operation(), original.operation());
             assert_eq!(target.sequence(), original.sequence() + 1);
             let target_projection = engine.composite_effect(target).unwrap();
             assert_eq!(target_projection.kind, DMA_ARENA_REUSE_COMPOSITE);
@@ -545,7 +578,6 @@ fn oracle_claim(
             .pending_reuse
             .map(|pending| NormalizedPermitOwner {
                 actor: pending.actor,
-                binding_generation: pending.binding_generation,
                 next_generation: pending.next_generation,
                 device_generation: pending.device_generation,
             }),
@@ -581,7 +613,7 @@ fn normalize_core(
         allocator_released: evidence(claim(PAGE_CLAIM_RAW), DEVICE_EVIDENCE_IOTLB),
     };
     NormalizedProjection {
-        effect: (original.root().get(), original.sequence()),
+        effect: (original.operation().get(), original.sequence()),
         authority: core_authority(parent.authority),
         authority_epoch: parent.authority_epoch,
         reply_committed,
@@ -599,7 +631,7 @@ fn normalize_oracle(
     context: DifferentialContext,
 ) -> NormalizedProjection {
     let projection = oracle.projection();
-    assert_eq!(projection.effect, ORACLE_EFFECT);
+    assert_eq!(projection.effect, oracle_effect(original));
     let reply_component = oracle.component(OracleComponentId::Reply);
     let dma_component = oracle.component(OracleComponentId::Dma);
     let claims = core::array::from_fn(|index| oracle_claim(oracle, context, index));
@@ -612,7 +644,7 @@ fn normalize_oracle(
         allocator_released: projection.allocator_released,
     };
     NormalizedProjection {
-        effect: (original.root().get(), original.sequence()),
+        effect: (original.operation().get(), original.sequence()),
         authority: oracle_authority(projection.authority),
         authority_epoch: projection.authority_epoch,
         reply_committed: reply_component.committed,
@@ -660,13 +692,12 @@ fn recover_prefix(harness: &Harness, label: &str) -> Engine {
     let next = freshness(
         committed.boot().get() + 1,
         committed.registry().get(),
-        committed.binding(),
         committed.device().get() + 98,
         committed.journal().get() + 1,
     );
     let anchor = || {
         recovery_anchor(
-            standard_catalog().digest(),
+            standard_catalog_set().digest(),
             committed,
             next,
             harness.engine.revision(),
@@ -674,8 +705,8 @@ fn recover_prefix(harness: &Harness, label: &str) -> Engine {
             harness.engine.projection_digest(),
         )
     };
-    let first = Engine::recover_legacy_compatibility(
-        standard_catalog(),
+    let first = Engine::recover(
+        standard_catalog_set(),
         CoreLimits::bounded_default(),
         anchor(),
         &harness.journal,
@@ -688,8 +719,8 @@ fn recover_prefix(harness: &Harness, label: &str) -> Engine {
     );
     assert_eq!(first.acknowledged_head(), harness.engine.head(), "{label}");
     let first = first.into_engine();
-    let second = Engine::recover_legacy_compatibility(
-        standard_catalog(),
+    let second = Engine::recover(
+        standard_catalog_set(),
         CoreLimits::bounded_default(),
         anchor(),
         &harness.journal,
@@ -761,7 +792,7 @@ fn assert_failed_core_command_is_atomic(
     assert!(
         matches!(
             harness.tx(command),
-            Err(CoreError::StaleIncarnation | CoreError::StaleAuthorityEpoch)
+            Err(CoreError::StaleExecutor | CoreError::StaleAuthorityEpoch)
         ),
         "{label}: an old reuse bearer must fail closed"
     );
@@ -777,28 +808,83 @@ fn assert_failed_core_command_is_atomic(
     );
 }
 
-fn record_snapshot(harness: &mut Harness, root_effect: EffectId, id: u64) -> AuthorizedCommand {
+fn assert_unnecessary_rebase_is_atomic(harness: &mut Harness, command: Command, label: &str) {
+    let before = (
+        harness.engine.revision(),
+        harness.engine.head(),
+        harness.engine.projection_digest(),
+        harness.journal.len(),
+    );
+    assert_eq!(
+        harness.tx(command),
+        Err(CoreError::StaleEvidence),
+        "{label}: executor adoption alone must not age scoped claim freshness"
+    );
+    assert_eq!(
+        (
+            harness.engine.revision(),
+            harness.engine.head(),
+            harness.engine.projection_digest(),
+            harness.journal.len(),
+        ),
+        before,
+        "{label}: rejected rebase must not mutate or append"
+    );
+}
+
+fn record_snapshot(harness: &mut Harness, effect: EffectId, id: u64) -> AuthorizedCommand {
     let recovery = harness
         .engine
-        .snapshot_root(root_effect.root(), snapshot(id))
+        .snapshot_operation(effect.operation(), snapshot(id))
         .unwrap();
-    let items = recovery.component_items();
-    assert_eq!(items[0].component, AGENT_COMPONENT_REPLY);
-    assert_eq!(items[1].component, AGENT_COMPONENT_DMA);
+    let composite = recovery
+        .composites()
+        .iter()
+        .find(|item| item.effect == effect)
+        .expect("composite operation must be present");
+    assert_eq!(composite.components.len(), 2);
+    assert_eq!(composite.components[0].effect, effect);
+    assert_eq!(composite.components[0].component, AGENT_COMPONENT_REPLY);
+    assert_eq!(composite.components[1].effect, effect);
+    assert_eq!(composite.components[1].component, AGENT_COMPONENT_DMA);
     recovery.record()
 }
 
+fn admit_composite(
+    effect: EffectId,
+    origin: ExecutorCoordinate,
+    kind: cser_core::CompositeKindId,
+) -> Command {
+    let bindings = if kind == AGENT_OPERATION_COMPOSITE {
+        vec![
+            ComponentProviderBinding::new(AGENT_COMPONENT_REPLY, provider()),
+            ComponentProviderBinding::new(AGENT_COMPONENT_DMA, provider()),
+        ]
+    } else {
+        vec![ComponentProviderBinding::new(
+            AGENT_COMPONENT_DMA,
+            provider(),
+        )]
+    };
+    Command::AdmitScopedCompositeEffect {
+        effect,
+        origin,
+        kind,
+        charge_account: charge(effect.operation().get()),
+        bindings,
+    }
+}
+
 #[test]
-fn profile2_core_and_independent_oracle_match_every_durable_prefix() {
-    let original = effect(ROOT, 1);
-    let origin = principal(ROOT, 1);
-    let first_successor = principal(ROOT, 2);
-    let second_successor = principal(ROOT, 3);
-    let mut harness = Harness::new();
+fn provider_scoped_core_and_independent_oracle_match_every_durable_prefix() {
+    let original = effect(OPERATION, 1);
+    let origin = executor(OPERATION, 1);
+    let first_successor = executor(OPERATION, 2);
+    let second_successor = executor(OPERATION, 3);
+    let mut harness = Harness::standard();
     let mut oracle = CompositeEffectOracle::new(
-        ORACLE_EFFECT,
-        origin.generation(),
-        1,
+        oracle_effect(original),
+        oracle_executor(origin),
         1,
         1,
         oracle_resources(),
@@ -806,13 +892,7 @@ fn profile2_core_and_independent_oracle_match_every_durable_prefix() {
     let mut context = DifferentialContext::new();
 
     harness
-        .tx(Command::CreateCompositeEffect {
-            effect: original,
-            origin,
-            binding_generation: 1,
-            kind: AGENT_OPERATION_COMPOSITE,
-            charge_account: charge(ROOT),
-        })
+        .tx(admit_composite(original, origin, AGENT_OPERATION_COMPOSITE))
         .unwrap();
     assert_checkpoint(&harness, &oracle, original, context, "composite-created");
 
@@ -854,7 +934,6 @@ fn profile2_core_and_independent_oracle_match_every_durable_prefix() {
                 effect: original,
                 component,
                 actor: origin,
-                binding_generation: 1,
                 claim: claim_id,
                 kind,
                 scope,
@@ -879,13 +958,12 @@ fn profile2_core_and_independent_oracle_match_every_durable_prefix() {
     }
 
     harness
-        .tx(Command::FenceIncarnation {
-            root: original.root(),
+        .tx(Command::FenceExecutor {
+            operation: original.operation(),
             crashed: origin,
-            binding_generation: 1,
         })
         .unwrap();
-    oracle.fence_incarnation(origin.generation(), 1).unwrap();
+    oracle.fence_executor(oracle_executor(origin)).unwrap();
     assert_checkpoint(&harness, &oracle, original, context, "precommit-fence");
 
     let snapshot_record = record_snapshot(&mut harness, original, FIRST_SNAPSHOT_RAW);
@@ -893,7 +971,7 @@ fn profile2_core_and_independent_oracle_match_every_durable_prefix() {
     assert_checkpoint(&harness, &oracle, original, context, "precommit-snapshot");
     harness
         .tx(Command::Ready {
-            root: original.root(),
+            operation: original.operation(),
             snapshot: snapshot(FIRST_SNAPSHOT_RAW),
             successor: first_successor,
         })
@@ -901,45 +979,43 @@ fn profile2_core_and_independent_oracle_match_every_durable_prefix() {
     assert_checkpoint(&harness, &oracle, original, context, "precommit-ready");
     harness
         .tx(Command::Rebind {
-            root: original.root(),
+            operation: original.operation(),
             snapshot: snapshot(FIRST_SNAPSHOT_RAW),
             successor: first_successor,
-            binding_generation: 2,
         })
         .unwrap();
-    oracle.rebind(first_successor.generation(), 2).unwrap();
+    oracle.rebind(oracle_executor(first_successor)).unwrap();
     assert_checkpoint(&harness, &oracle, original, context, "precommit-rebind");
     harness
         .tx(Command::AdoptEffect {
             effect: original,
             successor: first_successor,
-            binding_generation: 2,
         })
         .unwrap();
     oracle
         .adopt_effect(oracle.observe_authority().unwrap())
         .unwrap();
     assert_checkpoint(&harness, &oracle, original, context, "precommit-adopt");
-    harness
-        .tx(Command::RebaseCompositePrecommitClaims {
+    assert_unnecessary_rebase_is_atomic(
+        &mut harness,
+        Command::RebaseCompositePrecommitClaims {
             effect: original,
             actor: first_successor,
-            binding_generation: 2,
-        })
-        .unwrap();
+        },
+        "precommit claim rebase without a freshness change",
+    );
     assert_checkpoint(
         &harness,
         &oracle,
         original,
         context,
-        "precommit-claim-rebase",
+        "precommit-claim-freshness-unchanged",
     );
 
     harness
         .tx(Command::PrepareCompositeEffect {
             effect: original,
             actor: first_successor,
-            binding_generation: 2,
         })
         .unwrap();
     assert_checkpoint(&harness, &oracle, original, context, "prepared");
@@ -947,7 +1023,6 @@ fn profile2_core_and_independent_oracle_match_every_durable_prefix() {
     let mut intents = match harness.output(Command::RecordCompositeCommitIntents {
         effect: original,
         actor: first_successor,
-        binding_generation: 2,
         operations: vec![
             ComponentCommitOperation::new(AGENT_COMPONENT_REPLY, digest(20)),
             ComponentCommitOperation::new(AGENT_COMPONENT_DMA, digest(21)),
@@ -975,7 +1050,7 @@ fn profile2_core_and_independent_oracle_match_every_durable_prefix() {
     );
 
     let reply_intent = intents.remove(0);
-    assert_eq!(reply_intent.component(), Some(AGENT_COMPONENT_REPLY));
+    assert_eq!(reply_intent.component(), AGENT_COMPONENT_REPLY);
     let reply_outcome = verified_commit_outcome(
         &harness,
         &reply_intent,
@@ -999,7 +1074,7 @@ fn profile2_core_and_independent_oracle_match_every_durable_prefix() {
     );
 
     let dma_intent = intents.remove(0);
-    assert_eq!(dma_intent.component(), Some(AGENT_COMPONENT_DMA));
+    assert_eq!(dma_intent.component(), AGENT_COMPONENT_DMA);
     let dma_outcome = verified_commit_outcome(
         &harness,
         &dma_intent,
@@ -1118,16 +1193,14 @@ fn profile2_core_and_independent_oracle_match_every_durable_prefix() {
         "physical closure must not discharge the logical output claim"
     );
 
-    let target = effect(ROOT, 2);
+    let target = effect(OPERATION, 2);
     context.target = Some(target);
     harness
-        .tx(Command::CreateCompositeEffect {
-            effect: target,
-            origin: first_successor,
-            binding_generation: 2,
-            kind: DMA_ARENA_REUSE_COMPOSITE,
-            charge_account: charge(ROOT),
-        })
+        .tx(admit_composite(
+            target,
+            first_successor,
+            DMA_ARENA_REUSE_COMPOSITE,
+        ))
         .unwrap();
     assert_eq!(
         harness
@@ -1175,7 +1248,6 @@ fn profile2_core_and_independent_oracle_match_every_durable_prefix() {
             effect: target,
             component: AGENT_COMPONENT_DMA,
             actor: first_successor,
-            binding_generation: 2,
             claim: claim_id,
             kind,
             scope: ClaimScope::Device(device_scope()),
@@ -1191,7 +1263,7 @@ fn profile2_core_and_independent_oracle_match_every_durable_prefix() {
             .issue_reuse_permit(oracle.observe_authority().unwrap(), oracle_kind, 2)
             .unwrap();
         assert_eq!(core_permit.effect(), target);
-        assert_eq!(core_permit.component(), Some(AGENT_COMPONENT_DMA));
+        assert_eq!(core_permit.component(), AGENT_COMPONENT_DMA);
         assert_eq!(core_permit.claim(), claim_id);
         assert_eq!(core_permit.resource(), resource_id);
         assert_eq!(core_permit.previous_generation(), resource_generation(1));
@@ -1199,13 +1271,15 @@ fn profile2_core_and_independent_oracle_match_every_durable_prefix() {
         assert_eq!(core_permit.catalog_digest(), standard_catalog().digest());
         assert!(!core_permit.retirement_digest().is_zero());
         assert_eq!(core_permit.reuse_contract(), digest(40 + reuse as u8));
-        assert_eq!(core_permit.freshness().binding(), 2);
-        assert_eq!(oracle_permit.effect(), ORACLE_EFFECT);
+        assert_eq!(
+            oracle_permit.operation(),
+            oracle_operation(original.operation())
+        );
         assert_eq!(oracle_permit.resource().get(), resource_id.get());
         assert_eq!(oracle_permit.retired_generation(), 1);
         assert_eq!(oracle_permit.next_generation(), 2);
-        assert_eq!(oracle_permit.actor(), first_successor.generation());
-        assert_eq!(oracle_permit.binding_generation(), 2);
+        assert_eq!(oracle_permit.actor(), oracle_executor(first_successor));
+        assert_eq!(oracle_permit.actor().generation().get(), 2);
         assert_eq!(oracle_permit.device_generation(), 2);
         assert_eq!(
             oracle_permit.authority_epoch(),
@@ -1214,8 +1288,7 @@ fn profile2_core_and_independent_oracle_match_every_durable_prefix() {
         );
         context.reuse[reuse] = ReuseStage::Reserved;
         context.permit[reuse] = Some(NormalizedPermitOwner {
-            actor: first_successor.generation(),
-            binding_generation: 2,
+            actor: oracle_executor(first_successor),
             next_generation: 2,
             device_generation: core_permit.freshness().device().get(),
         });
@@ -1236,14 +1309,13 @@ fn profile2_core_and_independent_oracle_match_every_durable_prefix() {
     }
 
     harness
-        .tx(Command::FenceIncarnation {
-            root: original.root(),
+        .tx(Command::FenceExecutor {
+            operation: original.operation(),
             crashed: first_successor,
-            binding_generation: 2,
         })
         .unwrap();
     oracle
-        .fence_incarnation(first_successor.generation(), 2)
+        .fence_executor(oracle_executor(first_successor))
         .unwrap();
     assert_checkpoint(
         &harness,
@@ -1263,7 +1335,7 @@ fn profile2_core_and_independent_oracle_match_every_durable_prefix() {
     );
     harness
         .tx(Command::Ready {
-            root: original.root(),
+            operation: original.operation(),
             snapshot: snapshot(SECOND_SNAPSHOT_RAW),
             successor: second_successor,
         })
@@ -1271,19 +1343,17 @@ fn profile2_core_and_independent_oracle_match_every_durable_prefix() {
     assert_checkpoint(&harness, &oracle, original, context, "second-crash-ready");
     harness
         .tx(Command::Rebind {
-            root: original.root(),
+            operation: original.operation(),
             snapshot: snapshot(SECOND_SNAPSHOT_RAW),
             successor: second_successor,
-            binding_generation: 3,
         })
         .unwrap();
-    oracle.rebind(second_successor.generation(), 3).unwrap();
+    oracle.rebind(oracle_executor(second_successor)).unwrap();
     assert_checkpoint(&harness, &oracle, original, context, "second-crash-rebind");
     harness
         .tx(Command::AdoptEffect {
             effect: target,
             successor: second_successor,
-            binding_generation: 3,
         })
         .unwrap();
     assert_checkpoint(
@@ -1305,7 +1375,6 @@ fn profile2_core_and_independent_oracle_match_every_durable_prefix() {
     let probe_freshness = freshness(
         committed.boot().get() + 1,
         committed.registry().get(),
-        committed.binding(),
         committed.device().get() + 98,
         committed.journal().get() + 1,
     );
@@ -1316,40 +1385,37 @@ fn profile2_core_and_independent_oracle_match_every_durable_prefix() {
             device: probe_freshness.device(),
         })
         .unwrap();
-    let probe_successor = principal(ROOT, 4);
+    let probe_successor = executor(OPERATION, 4);
     let probe_snapshot = recovered_probe
-        .snapshot_root(target.root(), snapshot(PROBE_SNAPSHOT_RAW))
+        .snapshot_operation(target.operation(), snapshot(PROBE_SNAPSHOT_RAW))
         .unwrap();
     recovered_probe
         .transact_volatile(probe_snapshot.record())
         .unwrap();
     recovered_probe
         .transact_volatile(Command::Ready {
-            root: target.root(),
+            operation: target.operation(),
             snapshot: snapshot(PROBE_SNAPSHOT_RAW),
             successor: probe_successor,
         })
         .unwrap();
     recovered_probe
         .transact_volatile(Command::Rebind {
-            root: target.root(),
+            operation: target.operation(),
             snapshot: snapshot(PROBE_SNAPSHOT_RAW),
             successor: probe_successor,
-            binding_generation: 4,
         })
         .unwrap();
     recovered_probe
         .transact_volatile(Command::AdoptEffect {
             effect: target,
             successor: probe_successor,
-            binding_generation: 4,
         })
         .unwrap();
     recovered_probe
         .transact_volatile(Command::RebaseCompositePrecommitClaims {
             effect: target,
             actor: probe_successor,
-            binding_generation: 4,
         })
         .unwrap();
     for (reuse, (_, claim_id, _, resource_id)) in reuse_specs.into_iter().enumerate() {
@@ -1358,7 +1424,6 @@ fn profile2_core_and_independent_oracle_match_every_durable_prefix() {
                 target,
                 AGENT_COMPONENT_DMA,
                 probe_successor,
-                4,
                 resource_id,
                 resource_generation(2),
             )
@@ -1372,7 +1437,7 @@ fn profile2_core_and_independent_oracle_match_every_durable_prefix() {
             other => panic!("expected recovered reuse permit, got {other:?}"),
         };
         assert_eq!(permit.effect(), target);
-        assert_eq!(permit.component(), Some(AGENT_COMPONENT_DMA));
+        assert_eq!(permit.component(), AGENT_COMPONENT_DMA);
         assert_eq!(permit.claim(), claim_id);
         assert_eq!(permit.resource(), resource_id);
         assert_eq!(permit.previous_generation(), resource_generation(1));
@@ -1380,20 +1445,20 @@ fn profile2_core_and_independent_oracle_match_every_durable_prefix() {
         assert_eq!(permit.catalog_digest(), standard_catalog().digest());
         assert_eq!(permit.retirement_digest(), reuse_retirement_digests[reuse]);
         assert_eq!(permit.reuse_contract(), digest(40 + reuse as u8));
-        assert_eq!(permit.freshness().binding(), 4);
         assert_eq!(permit.freshness().device(), probe_freshness.device());
         recovered_probe
             .transact_volatile(permit.activate())
             .unwrap();
     }
 
-    harness
-        .tx(Command::RebaseCompositePrecommitClaims {
+    assert_unnecessary_rebase_is_atomic(
+        &mut harness,
+        Command::RebaseCompositePrecommitClaims {
             effect: target,
             actor: second_successor,
-            binding_generation: 3,
-        })
-        .unwrap();
+        },
+        "reuse claim rebase without a freshness change",
+    );
     assert_eq!(
         harness
             .engine
@@ -1408,7 +1473,7 @@ fn profile2_core_and_independent_oracle_match_every_durable_prefix() {
         &oracle,
         original,
         context,
-        "reuse-lease-claims-rebased",
+        "reuse-lease-claim-freshness-unchanged",
     );
 
     for (index, command) in old_core_activation.into_iter().enumerate() {
@@ -1441,7 +1506,6 @@ fn profile2_core_and_independent_oracle_match_every_durable_prefix() {
                 target,
                 AGENT_COMPONENT_DMA,
                 second_successor,
-                3,
                 resource_id,
                 resource_generation(2),
             )
@@ -1456,14 +1520,12 @@ fn profile2_core_and_independent_oracle_match_every_durable_prefix() {
         assert_eq!(core_permit.effect(), target);
         assert_eq!(core_permit.resource(), resource_id);
         assert_eq!(core_permit.generation(), resource_generation(2));
-        assert_eq!(core_permit.freshness().binding(), 3);
-        assert_eq!(oracle_permit.actor(), second_successor.generation());
-        assert_eq!(oracle_permit.binding_generation(), 3);
+        assert_eq!(oracle_permit.actor(), oracle_executor(second_successor));
+        assert_eq!(oracle_permit.actor().generation().get(), 3);
         assert_eq!(oracle_permit.device_generation(), 2);
         assert!(oracle_permit.authority_epoch() > old_oracle_permits[reuse].authority_epoch());
         context.permit[reuse] = Some(NormalizedPermitOwner {
-            actor: second_successor.generation(),
-            binding_generation: 3,
+            actor: oracle_executor(second_successor),
             next_generation: 2,
             device_generation: core_permit.freshness().device().get(),
         });

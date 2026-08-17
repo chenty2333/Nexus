@@ -27,11 +27,6 @@ loom = "=0.7.2"
 proptest = "=1.11.0"
 
 [[bin]]
-name = "cser-restart-fixture"
-path = "src/bin/cser-restart-fixture.rs"
-required-features = ["std", "test-support"]
-
-[[bin]]
 name = "cser-catalog-digest"
 path = "src/bin/cser-catalog-digest.rs"
 required-features = ["std"]

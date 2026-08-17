@@ -15,8 +15,8 @@
 use alloc::sync::Arc;
 
 use cser_core::{
-    Command, CommandRequest, ComponentId, CoreError, EffectId, PrincipalIncarnation,
-    RecoverySnapshot, RootId, SnapshotId, TransitionDurability, TransitionReceipt, TxError,
+    Command, CommandRequest, ComponentId, CoreError, EffectId, ExecutorCoordinate, OperationId,
+    RecoverySnapshot, SnapshotId, TransitionDurability, TransitionReceipt, TxError,
 };
 
 use super::core_runtime::OstdCserRuntime;
@@ -37,9 +37,9 @@ pub(crate) trait RecoveredCoreAuthority: Send + Sync {
     type PersistenceError;
 
     /// Generates one exact, non-authorizing snapshot from authoritative state.
-    fn snapshot_root(
+    fn snapshot_operation(
         &self,
-        root: RootId,
+        operation: OperationId,
         snapshot: SnapshotId,
     ) -> Result<RecoverySnapshot, CoreError>;
 
@@ -56,12 +56,12 @@ where
 {
     type PersistenceError = P::Error;
 
-    fn snapshot_root(
+    fn snapshot_operation(
         &self,
-        root: RootId,
+        operation: OperationId,
         snapshot: SnapshotId,
     ) -> Result<RecoverySnapshot, CoreError> {
-        self.observe(|engine| engine.snapshot_root(root, snapshot))
+        self.observe(|engine| engine.snapshot_operation(operation, snapshot))
     }
 
     fn transact(
@@ -98,7 +98,7 @@ impl FenceSnapshotTransitions {
     }
 }
 
-/// Failure after a root was already known to be durably fenced.
+/// Failure after an operation was already known to be durably fenced.
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum SnapshotTransitionError<E> {
     /// Authoritative state could not generate the requested exact cohort.
@@ -118,7 +118,7 @@ pub(crate) enum FenceSnapshotError<E> {
     /// Fencing committed, but snapshot preparation or persistence failed.
     ///
     /// The exact fence receipt is retained so the manager never retries under
-    /// the false assumption that the crashed incarnation is still live.
+    /// the false assumption that the crashed executor is still live.
     Snapshot {
         /// Exact successful fence receipt, with linear output untouched.
         fence: TransitionReceipt,
@@ -145,7 +145,7 @@ impl<A> CoreSupervisorVNext<A> {
 }
 
 impl<A: RecoveredCoreAuthority> CoreSupervisorVNext<A> {
-    /// Durably fences one crashed incarnation and records its exact snapshot.
+    /// Durably fences one crashed executor and records its exact snapshot.
     ///
     /// Snapshot generation happens after the fence commits. If another core
     /// transition races between generation and persistence, the core rejects
@@ -157,42 +157,34 @@ impl<A: RecoveredCoreAuthority> CoreSupervisorVNext<A> {
     #[allow(clippy::result_large_err)]
     pub(crate) fn fence_and_snapshot(
         &self,
-        root: RootId,
-        crashed: PrincipalIncarnation,
-        binding_generation: u64,
+        operation: OperationId,
+        crashed: ExecutorCoordinate,
         snapshot: SnapshotId,
     ) -> Result<FenceSnapshotTransitions, FenceSnapshotError<A::PersistenceError>> {
         let fence = self
             .authority
-            .transact(
-                CommandRequest::FenceIncarnation {
-                    root,
-                    crashed,
-                    binding_generation,
-                }
-                .into(),
-            )
+            .transact(CommandRequest::FenceExecutor { operation, crashed }.into())
             .map_err(FenceSnapshotError::Fence)?;
 
-        match self.snapshot_fenced(root, snapshot) {
+        match self.snapshot_fenced(operation, snapshot) {
             Ok(snapshot) => Ok(FenceSnapshotTransitions { fence, snapshot }),
             Err(error) => Err(FenceSnapshotError::Snapshot { fence, error }),
         }
     }
 
-    /// Records a new exact snapshot for a root which is already durably fenced.
+    /// Records a new exact snapshot for an operation which is already durably fenced.
     ///
     /// This is the retry path after a snapshot-stage failure and the boot-time
-    /// path when replay already proves the root is fenced. It never synthesizes
+    /// path when replay already proves the operation is fenced. It never synthesizes
     /// or caches a cohort outside the portable core.
     pub(crate) fn snapshot_fenced(
         &self,
-        root: RootId,
+        operation: OperationId,
         snapshot: SnapshotId,
     ) -> Result<TransitionReceipt, SnapshotTransitionError<A::PersistenceError>> {
         let command = self
             .authority
-            .snapshot_root(root, snapshot)
+            .snapshot_operation(operation, snapshot)
             .map_err(SnapshotTransitionError::Prepare)?
             .record();
         self.authority
@@ -203,13 +195,13 @@ impl<A: RecoveredCoreAuthority> CoreSupervisorVNext<A> {
     /// Durably marks a fresh successor ready for one exact snapshot.
     pub(crate) fn ready(
         &self,
-        root: RootId,
+        operation: OperationId,
         snapshot: SnapshotId,
-        successor: PrincipalIncarnation,
+        successor: ExecutorCoordinate,
     ) -> Result<TransitionReceipt, TxError<A::PersistenceError>> {
         self.authority.transact(
             CommandRequest::Ready {
-                root,
+                operation,
                 snapshot,
                 successor,
             }
@@ -220,17 +212,15 @@ impl<A: RecoveredCoreAuthority> CoreSupervisorVNext<A> {
     /// Durably installs one fresh binding without implicit effect adoption.
     pub(crate) fn rebind(
         &self,
-        root: RootId,
+        operation: OperationId,
         snapshot: SnapshotId,
-        successor: PrincipalIncarnation,
-        binding_generation: u64,
+        successor: ExecutorCoordinate,
     ) -> Result<TransitionReceipt, TxError<A::PersistenceError>> {
         self.authority.transact(
             CommandRequest::Rebind {
-                root,
+                operation,
                 snapshot,
                 successor,
-                binding_generation,
             }
             .into(),
         )
@@ -240,30 +230,10 @@ impl<A: RecoveredCoreAuthority> CoreSupervisorVNext<A> {
     pub(crate) fn adopt_effect(
         &self,
         effect: EffectId,
-        successor: PrincipalIncarnation,
-        binding_generation: u64,
-    ) -> Result<TransitionReceipt, TxError<A::PersistenceError>> {
-        self.authority.transact(
-            CommandRequest::AdoptEffect {
-                effect,
-                successor,
-                binding_generation,
-            }
-            .into(),
-        )
-    }
-
-    /// Durably mints one successor-settlement claim.
-    ///
-    /// On success the exact receipt still contains its non-cloneable
-    /// `TransitionOutput::SettlementClaim`; this method does not inspect it.
-    pub(crate) fn claim_settlement(
-        &self,
-        effect: EffectId,
-        claimant: PrincipalIncarnation,
+        successor: ExecutorCoordinate,
     ) -> Result<TransitionReceipt, TxError<A::PersistenceError>> {
         self.authority
-            .transact(CommandRequest::ClaimSettlement { effect, claimant }.into())
+            .transact(CommandRequest::AdoptEffect { effect, successor }.into())
     }
 
     /// Durably mints one exact component-local successor-settlement claim.
@@ -271,7 +241,7 @@ impl<A: RecoveredCoreAuthority> CoreSupervisorVNext<A> {
         &self,
         effect: EffectId,
         component: ComponentId,
-        claimant: PrincipalIncarnation,
+        claimant: ExecutorCoordinate,
     ) -> Result<TransitionReceipt, TxError<A::PersistenceError>> {
         self.authority.transact(
             CommandRequest::ClaimComponentSettlement {
@@ -287,10 +257,12 @@ impl<A: RecoveredCoreAuthority> CoreSupervisorVNext<A> {
 #[cfg(test)]
 mod tests {
     use cser_core::{
-        AGENT_COMPONENT_REPLY, AGENT_OPERATION_COMPOSITE, BootGeneration, ChargeAccountId,
-        CoreLimits, DeviceGeneration, Digest, Engine, Freshness, JournalGeneration, JournalRecord,
-        PrincipalId, RegistryInstance, TransitionEvent, TransitionOutput, WorldId,
-        standard_catalog,
+        AGENT_COMPONENT_DMA, AGENT_COMPONENT_REPLY, AGENT_OPERATION_COMPOSITE, BootGeneration,
+        CatalogSet, ChargeAccountId, ComponentProviderBinding, CoreLimits, DeviceGeneration,
+        Digest, Engine, ExecutorCoordinate, ExecutorGeneration, ExecutorId, Freshness,
+        JournalGeneration, JournalRecord, ProviderCoordinate, ProviderGeneration, ProviderId,
+        RegistryInstance, TransitionEvent, TransitionOutput, VerifierBinding, VerifierGeneration,
+        WorldId, standard_catalog,
     };
 
     use super::*;
@@ -324,34 +296,34 @@ mod tests {
         Freshness::new(
             BootGeneration::new(1).unwrap(),
             RegistryInstance::new(2).unwrap(),
-            1,
             DeviceGeneration::new(1).unwrap(),
             JournalGeneration::new(1).unwrap(),
         )
-        .unwrap()
-    }
-
-    fn root() -> RootId {
-        RootId::new(7).unwrap()
     }
 
     fn effect() -> EffectId {
-        EffectId::new(root(), 1).unwrap()
+        EffectId::new(OperationId::new(7).unwrap(), 1).unwrap()
     }
 
-    fn origin() -> PrincipalIncarnation {
-        PrincipalIncarnation::new(PrincipalId::new(7).unwrap(), 1).unwrap()
+    fn origin() -> ExecutorCoordinate {
+        ExecutorCoordinate::new(
+            ExecutorId::new(7).unwrap(),
+            ExecutorGeneration::new(1).unwrap(),
+        )
     }
 
-    fn successor() -> PrincipalIncarnation {
-        PrincipalIncarnation::new(PrincipalId::new(7).unwrap(), 2).unwrap()
+    fn successor() -> ExecutorCoordinate {
+        ExecutorCoordinate::new(
+            ExecutorId::new(7).unwrap(),
+            ExecutorGeneration::new(2).unwrap(),
+        )
     }
 
     fn runtime(fail_at: Option<usize>) -> Arc<OstdCserRuntime<TestDurability>> {
         Arc::new(OstdCserRuntime::from_engine(
             Engine::new(
                 WorldId::new(1).unwrap(),
-                standard_catalog(),
+                CatalogSet::new(&[standard_catalog()]).unwrap(),
                 CoreLimits::bounded_default(),
                 freshness(),
             ),
@@ -360,13 +332,60 @@ mod tests {
     }
 
     fn seed_uncommitted_reply(runtime: &OstdCserRuntime<TestDurability>) {
+        let catalog = standard_catalog();
+        let verifier_generation = VerifierGeneration::new(1).unwrap();
+        let verifier_bindings = || {
+            catalog
+                .verifier_class_bindings()
+                .into_iter()
+                .map(|class| {
+                    VerifierBinding::new(
+                        class.verifier(),
+                        verifier_generation,
+                        class.receipt_schema(),
+                        Digest::new([0x51; 32]),
+                    )
+                    .unwrap()
+                })
+                .collect()
+        };
+        for provider in [1, 2] {
+            runtime
+                .transact(CommandRequest::RegisterProviderGeneration {
+                    coordinate: ProviderCoordinate::new(
+                        WorldId::new(1).unwrap(),
+                        ProviderId::new(provider).unwrap(),
+                        ProviderGeneration::new(1).unwrap(),
+                    ),
+                    catalog_digest: catalog.digest(),
+                    verifier_bindings: verifier_bindings(),
+                })
+                .unwrap();
+        }
         runtime
-            .transact(CommandRequest::CreateCompositeEffect {
+            .transact(CommandRequest::AdmitScopedCompositeEffect {
                 effect: effect(),
                 origin: origin(),
-                binding_generation: 1,
                 kind: AGENT_OPERATION_COMPOSITE,
                 charge_account: ChargeAccountId::new(7).unwrap(),
+                bindings: vec![
+                    ComponentProviderBinding::new(
+                        AGENT_COMPONENT_REPLY,
+                        ProviderCoordinate::new(
+                            WorldId::new(1).unwrap(),
+                            ProviderId::new(1).unwrap(),
+                            ProviderGeneration::new(1).unwrap(),
+                        ),
+                    ),
+                    ComponentProviderBinding::new(
+                        AGENT_COMPONENT_DMA,
+                        ProviderCoordinate::new(
+                            WorldId::new(1).unwrap(),
+                            ProviderId::new(2).unwrap(),
+                            ProviderGeneration::new(1).unwrap(),
+                        ),
+                    ),
+                ],
             })
             .unwrap();
     }
@@ -382,12 +401,9 @@ mod tests {
         assert_eq!(Arc::strong_count(&authority), 2);
 
         let transitions = supervisor
-            .fence_and_snapshot(root(), origin(), 1, snapshot)
+            .fence_and_snapshot(effect().operation(), origin(), snapshot)
             .unwrap();
-        assert_eq!(
-            transitions.fence().event(),
-            TransitionEvent::IncarnationFenced
-        );
+        assert_eq!(transitions.fence().event(), TransitionEvent::ExecutorFenced);
         assert_eq!(transitions.snapshot().event(), TransitionEvent::Snapshot);
         let (fence, snapshot_receipt) = transitions.into_parts();
         assert_eq!(fence.into_output(), TransitionOutput::None);
@@ -395,21 +411,21 @@ mod tests {
 
         assert_eq!(
             supervisor
-                .ready(root(), snapshot, successor())
+                .ready(effect().operation(), snapshot, successor())
                 .unwrap()
                 .event(),
             TransitionEvent::Ready
         );
         assert_eq!(
             supervisor
-                .rebind(root(), snapshot, successor(), 2)
+                .rebind(effect().operation(), snapshot, successor())
                 .unwrap()
                 .event(),
             TransitionEvent::Rebound
         );
         assert_eq!(
             supervisor
-                .adopt_effect(effect(), successor(), 2)
+                .adopt_effect(effect(), successor())
                 .unwrap()
                 .event(),
             TransitionEvent::EffectAdopted
@@ -427,12 +443,12 @@ mod tests {
         let supervisor = CoreSupervisorVNext::new(authority);
 
         let error = supervisor
-            .fence_and_snapshot(root(), origin(), 1, SnapshotId::new(13).unwrap())
+            .fence_and_snapshot(effect().operation(), origin(), SnapshotId::new(13).unwrap())
             .unwrap_err();
         let FenceSnapshotError::Snapshot { fence, error } = error else {
             panic!("fence must have committed before the injected failure");
         };
-        assert_eq!(fence.event(), TransitionEvent::IncarnationFenced);
+        assert_eq!(fence.event(), TransitionEvent::ExecutorFenced);
         assert_eq!(fence.into_output(), TransitionOutput::None);
         assert_eq!(
             error,

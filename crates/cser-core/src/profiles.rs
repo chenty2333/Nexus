@@ -226,7 +226,7 @@ pub const TOOL_DMA_COMPONENT_DMA: ComponentId = match ComponentId::new(4) {
     Ok(value) => value,
     Err(_) => unreachable!(),
 };
-/// Sole logical child component of the explicit profile-two handoff pilot.
+/// Sole logical child component of the explicit bounded single-hop handoff pilot.
 pub const TOOL_HANDOFF_COMPONENT: ComponentId = match ComponentId::new(5) {
     Ok(value) => value,
     Err(_) => unreachable!(),

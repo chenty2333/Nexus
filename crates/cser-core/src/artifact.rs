@@ -581,7 +581,7 @@ mod tests {
     use super::{ArtifactBinding, ArtifactLeaseState, ArtifactProtocolError};
     use crate::{
         ComponentId, Digest, EffectId, OperationId, ProviderCoordinate, ProviderGeneration,
-        ProviderId, RecoveryArtifactId, RootId, WorldId,
+        ProviderId, RecoveryArtifactId, WorldId,
     };
 
     fn id<T>(result: Result<T, crate::IdentityError>) -> T {
@@ -597,7 +597,7 @@ mod tests {
                 id(ProviderGeneration::new(3)),
             ),
             id(OperationId::new(4)),
-            id(EffectId::new(id(RootId::new(5)), 6)),
+            id(EffectId::new(id(OperationId::new(5)), 6)),
             id(ComponentId::new(7)),
             Digest::new([suffix; 32]),
             Digest::new([suffix.wrapping_add(1); 32]),

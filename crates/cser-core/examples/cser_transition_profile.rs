@@ -20,17 +20,17 @@ use std::hint::black_box;
 use std::time::Instant;
 
 use cser_core::{
-    AGENT_COMPONENT_DMA, AGENT_COMPONENT_REPLY, AGENT_OPERATION_COMPOSITE, BootGeneration, ClaimId,
-    ClaimScope, CommandRequest, ComponentProviderBinding, CoreLimits, DeviceGeneration, Digest,
-    Engine, Freshness, JournalGeneration, OperationId, PrincipalId, PrincipalIncarnation,
-    ProviderCoordinate, ProviderEffectState, ProviderGeneration, ProviderId, RegistryInstance,
-    ResourceGeneration, ResourceId, RootId, VerifierBinding, VerifierGeneration, WorldId,
-    standard_catalog,
+    AGENT_COMPONENT_DMA, AGENT_COMPONENT_REPLY, AGENT_OPERATION_COMPOSITE, BootGeneration,
+    CatalogSet, ClaimId, ClaimScope, CommandRequest, ComponentProviderBinding, CoreLimits,
+    DeviceGeneration, Digest, Engine, ExecutorCoordinate, ExecutorGeneration, ExecutorId,
+    Freshness, JournalGeneration, OperationId, ProviderCoordinate, ProviderEffectState,
+    ProviderGeneration, ProviderId, RegistryInstance, ResourceGeneration, ResourceId,
+    VerifierBinding, VerifierGeneration, WorldId, standard_catalog,
 };
 
 const WORLD: u64 = 1;
 const PROVIDER_BASE: u64 = 10_000;
-const ROOT_BASE: u64 = 20_000;
+const OPERATION_BASE: u64 = 20_000;
 const ACTOR_BASE: u64 = 30_000;
 
 const DEFAULT_SIZES: [usize; 4] = [1, 64, 512, 4096];
@@ -41,7 +41,7 @@ const PROJECTION_READS: usize = 100_000;
 struct Target {
     provider: ProviderCoordinate,
     effect: cser_core::EffectId,
-    actor: PrincipalIncarnation,
+    actor: ExecutorCoordinate,
     ordinal: u64,
 }
 
@@ -61,11 +61,9 @@ fn freshness() -> Freshness {
     Freshness::new(
         BootGeneration::new(1).expect("non-zero boot"),
         RegistryInstance::new(1).expect("non-zero registry"),
-        1,
         DeviceGeneration::new(1).expect("non-zero device"),
         JournalGeneration::new(1).expect("non-zero journal"),
     )
-    .expect("valid freshness")
 }
 
 fn limits(n: usize) -> CoreLimits {
@@ -91,7 +89,8 @@ fn fixture(n: usize) -> Fixture {
         .collect();
     let target_records = TARGETS.checked_mul(2).expect("target count fits");
     let record_count = n.checked_add(target_records).expect("fixture size fits");
-    let mut engine = Engine::new(world, catalog.clone(), limits(record_count), freshness());
+    let catalog_set = CatalogSet::new(std::slice::from_ref(&catalog)).expect("valid catalog set");
+    let mut engine = Engine::new(world, catalog_set, limits(record_count), freshness());
     let mut logical_claim_targets = Vec::with_capacity(TARGETS);
     let mut provider_fence_targets = Vec::with_capacity(TARGETS);
 
@@ -111,23 +110,19 @@ fn fixture(n: usize) -> Fixture {
             },
         );
 
-        let effect =
-            cser_core::EffectId::new(RootId::new(ROOT_BASE + ordinal).expect("root id fits"), 1)
-                .expect("effect id fits");
-        let actor = PrincipalIncarnation::new(
-            PrincipalId::new(ACTOR_BASE + ordinal).expect("actor id fits"),
-            1,
-        )
-        .expect("actor incarnation fits");
+        let operation = OperationId::new(OPERATION_BASE + ordinal).expect("operation id fits");
+        let effect = cser_core::EffectId::new(operation, 1).expect("effect id fits");
+        let actor = ExecutorCoordinate::new(
+            ExecutorId::new(ACTOR_BASE + ordinal).expect("executor id fits"),
+            ExecutorGeneration::new(1).expect("executor generation fits"),
+        );
         transact(
             &mut engine,
             CommandRequest::AdmitScopedCompositeEffect {
                 effect,
-                operation: OperationId::new(PROVIDER_BASE + ordinal).expect("operation id fits"),
                 origin: actor,
-                binding_generation: 1,
                 kind: AGENT_OPERATION_COMPOSITE,
-                charge_account: cser_core::ChargeAccountId::new(ROOT_BASE + ordinal)
+                charge_account: cser_core::ChargeAccountId::new(OPERATION_BASE + ordinal)
                     .expect("charge account fits"),
                 bindings: vec![
                     ComponentProviderBinding::new(AGENT_COMPONENT_REPLY, provider),
@@ -179,11 +174,11 @@ fn profile_logical_claim(fixture: &mut Fixture) -> f64 {
                 effect: target.effect,
                 component: AGENT_COMPONENT_REPLY,
                 actor: target.actor,
-                binding_generation: 1,
-                claim: ClaimId::new(ROOT_BASE + target.ordinal).expect("claim id fits"),
+                claim: ClaimId::new(OPERATION_BASE + target.ordinal).expect("claim id fits"),
                 kind: cser_core::REPLY_CLAIM_PUBLICATION_SLOT,
                 scope: ClaimScope::Logical,
-                resource: ResourceId::new(ROOT_BASE + target.ordinal).expect("resource id fits"),
+                resource: ResourceId::new(OPERATION_BASE + target.ordinal)
+                    .expect("resource id fits"),
                 resource_generation: ResourceGeneration::new(1)
                     .expect("non-zero resource generation"),
                 units: 1,

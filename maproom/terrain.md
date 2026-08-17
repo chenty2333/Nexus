@@ -62,9 +62,11 @@ observations never manufacture terminal business evidence.
 ## Authoritative core
 
 `cser-core` is the portable authoritative state machine for escaped effects.
-It owns effect admission, estates and bounded composites, claims, custody,
-effect fencing, commit and settlement authority, retirement evidence, recovery
-projections, journal records, checkpoints, and the invariants connecting them.
+It owns effect admission, bounded composites, claims, custody, effect fencing,
+commit and settlement authority, retirement evidence, recovery projections,
+journal records, checkpoints, and the invariants connecting them. A
+one-component composite is the ordinary representation of one obligation; a
+separate singleton semantic grammar is not part of the final core model.
 
 The core is not a plugin loader, dependency injector, semantic resolver,
 workflow engine, artifact store, network trust stack, or hardware verifier.
@@ -82,8 +84,7 @@ parallel semantic owners.
 
 ## Scope and identity
 
-The next core profile is provider-generation-aware. Its admitted effect scope
-must distinguish at least:
+The current provider-scoped profile distinguishes:
 
 ```text
 WorldId
@@ -98,9 +99,15 @@ The embedding allocates worlds, providers, generations, and operations. CSER
 treats them as opaque exact coordinates and verifies their relationships.
 `OperationId` is a general causal action identity: an agent runtime may bind an
 `AgentActionId` to it, while a kernel or workflow may use another source
-identity. Existing root, principal-incarnation, binding-generation, effect,
-and charge identities must be reconciled with this model rather than retained
-as unexplained parallel coordinates.
+identity. `EffectId` is scoped by that operation. Executor identity and
+generation form one typed authority coordinate; charge accounts remain
+independent of causal identity.
+
+The final grammar must not retain `RootId`, principal incarnation, a raw
+binding generation, or global verifier epochs as parallel explanations of the
+same authority. Compatibility constructors and singleton commands would keep
+those older coordinates semantically live, so predecessor profiles are
+rejected rather than interpreted by a second in-process model.
 
 ## Provider retirement crosses authorities
 
@@ -131,15 +138,17 @@ facts owned by those authorities.
 ## Catalogs and bounded composition
 
 A sealed, digest-bound domain catalog defines the effect products that may
-escape. Logical catalogs may describe remote operations, idempotency slots,
-reply delivery, queued work, recovery custody, retained provider generations,
-and artifact closures. Physical catalogs may describe pinned memory, IOVA,
-queue entries, device generations, and evidence required for safe reuse.
+escape. Logical catalogs describe remote operations, idempotency slots, reply
+delivery, queued work, recovery custody, retained provider generations, and
+artifact closures. Physical catalogs describe pinned memory, IOVA, queue
+entries, device generations, and evidence required for safe reuse.
 
 The resolver may dynamically produce a new locked provider graph and a new
-catalog generation. Effects already admitted under an older digest continue to
-be interpreted and settled under that digest. A live catalog is never mutated
-to change the meaning of an existing effect.
+catalog generation. A world therefore supplies a set of immutable catalogs,
+and each provider generation and admitted effect binds an exact digest.
+Effects already admitted under an older digest continue to be interpreted and
+settled under that digest. A live catalog is never mutated to change the
+meaning of an existing effect.
 
 General workflow graphs remain outside the core. A workflow may admit new
 effects over time, but each escape crosses a bounded admission gate. The
@@ -175,13 +184,23 @@ change before its journal record and trusted anchor commit. Once persistence
 succeeds, applying the prepared transition must be infallible; otherwise the
 journal and in-memory authority can diverge.
 
-The next core profile should make ordinary transition cost depend primarily on
-the effects, claims, resources, and indexes touched by that transition rather
-than on unrelated live state. Whole-state cloning, full invariant scans, and
-full projection hashing on every transition are candidates for replacement by
-prepared deltas, transition-local invariant maintenance, and incremental
-authenticated projections. Recovery and checkpoint validation must still
-rebuild primary state, derived indexes, and the complete canonical projection.
+The current engine prepares an exact delta over persistent collection roots,
+scalars, derived indexes, and authenticated projection leaves. Mutation hooks
+record projection addresses as state is changed, including semantically
+significant idempotent writes during recovery. Preparation completes every
+fallible business check, allocation, nonce reservation, durable record, and
+result construction before persistence. After the journal and trusted anchor
+commit, publication only moves prebuilt roots and scalar values into the
+authoritative state; it performs no map update, hash, verifier call, or
+fallible check.
+
+This removes the structurally shared whole-state candidate as well as earlier
+full collection copying and full projection hashing from ordinary transitions.
+Ordinary cost is therefore governed primarily by the effects, claims,
+resources, indexes, and authenticated paths touched by that transition rather
+than by unrelated live state. Recovery and checkpoint admission deliberately
+remain whole-state operations: they rebuild derived indexes and the complete
+canonical projection and compare them with the incremental authority.
 
 Copy-on-write collections, arenas, batching, journal layout changes, and lock
 decomposition are possible techniques rather than architectural commitments.
@@ -219,12 +238,20 @@ domain fact; the core cannot manufacture it from software state.
 
 ## Open terrain
 
-The next core profile must determine the minimal provider-generation and
-operation identities, the exact receipts connecting separate retirement
-authorities, the recovery-artifact claim vocabulary, and the transition delta
-that can be applied infallibly after persistence. It must also determine which
-invariants can be maintained locally while preserving complete recovery
-validation.
+The current profile has one composite grammar, typed world/provider/operation/
+effect/executor/charge coordinates, exact immutable verifier authority,
+provider-generation retirement, recovery-artifact pinning, retained released
+provenance, and exact prepared-delta publication. Predecessor profiles are
+recognized only to reject them. The next core questions are empirical: where
+remaining per-effect record cloning or authenticated-path allocation matters,
+whether persistence dominates enough to keep one writer, and which workload
+families justify further batching or storage-layout changes.
+
+Clean, source-bound measurements must continue to distinguish hot-path delta
+cost from deliberate recovery/checkpoint reconstruction and from diagnostic
+full-state oracles. A clean QEMU run validates only the declared emulated
+protocol; it is not evidence of physical hardware quiescence or general
+production suitability.
 
 The central applicability question remains where CSER adds value beyond
 coordination a provider or workload already needs. Logical remote effects,

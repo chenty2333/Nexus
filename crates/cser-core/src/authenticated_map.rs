@@ -115,7 +115,7 @@ impl AuthenticatedMap {
     }
 
     /// Returns the value bound to `key`, if one exists.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn get(&self, key: &[u8; 32]) -> Option<Digest> {
         self.root.as_deref().and_then(|node| get_node(node, 0, key))
@@ -125,6 +125,22 @@ impl AuthenticatedMap {
     #[must_use]
     pub const fn root_digest(&self) -> Digest {
         self.root_digest
+    }
+
+    /// Returns whether two maps share the exact persistent root.
+    ///
+    /// This is used by the prepared-delta publisher to distinguish an
+    /// untouched authenticated projection from one whose path was copied.
+    /// Digest equality remains the semantic comparison.
+    #[cfg(test)]
+    pub(crate) fn ptr_eq(&self, other: &Self) -> bool {
+        self.len == other.len
+            && self.root_digest == other.root_digest
+            && match (&self.root, &other.root) {
+                (None, None) => true,
+                (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+                _ => false,
+            }
     }
 
     /// Inserts `value` for `key`, returning the new map and a replaced value.
@@ -259,7 +275,7 @@ fn first_difference(left: &[u8; 32], right: &[u8; 32], start: u16) -> u16 {
     unreachable!("different authenticated-map keys must diverge")
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn get_node(node: &Node, expected_depth: u16, key: &[u8; 32]) -> Option<Digest> {
     match node {
         Node::Leaf {

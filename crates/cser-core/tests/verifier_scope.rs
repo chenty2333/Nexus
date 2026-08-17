@@ -1,22 +1,20 @@
 use cser_core::{
-    AGENT_COMPONENT_DMA, AGENT_COMPONENT_REPLY, AGENT_OPERATION_COMPOSITE, BootGeneration, ClaimId,
-    ClaimScope, CommandRequest, ComponentProviderBinding, CoreLimits, DeviceGeneration, Digest,
-    EffectId, Engine, Freshness, JournalGeneration, OperationId, PrincipalId, PrincipalIncarnation,
-    ProviderCoordinate, ProviderGeneration, ProviderId, REPLY_EVIDENCE_PUBLICATION_ACK,
-    ReceiptVerifier, RegistryInstance, ResourceGeneration, ResourceId, RootId, VerificationError,
-    VerifiedObservation, VerifierBinding, VerifierGeneration, VerifierIdentity, WorldId,
-    standard_catalog,
+    AGENT_COMPONENT_DMA, AGENT_COMPONENT_REPLY, AGENT_OPERATION_COMPOSITE, BootGeneration,
+    CatalogSet, ClaimId, ClaimScope, CommandRequest, ComponentProviderBinding, CoreLimits,
+    DeviceGeneration, Digest, EffectId, Engine, ExecutorCoordinate, ExecutorGeneration, ExecutorId,
+    Freshness, JournalGeneration, OperationId, ProviderCoordinate, ProviderGeneration, ProviderId,
+    REPLY_EVIDENCE_PUBLICATION_ACK, ReceiptVerifier, RegistryInstance, ResourceGeneration,
+    ResourceId, VerificationError, VerifiedObservation, VerifierBinding, VerifierGeneration,
+    VerifierIdentity, WorldId, standard_catalog,
 };
 
 fn freshness() -> Freshness {
     Freshness::new(
         BootGeneration::new(1).unwrap(),
         RegistryInstance::new(1).unwrap(),
-        1,
         DeviceGeneration::new(1).unwrap(),
         JournalGeneration::new(1).unwrap(),
     )
-    .unwrap()
 }
 
 fn provider(world: u64, provider: u64, generation: u64) -> ProviderCoordinate {
@@ -50,29 +48,32 @@ fn scoped_engine(
     effect_seed: u64,
 ) -> (Engine, EffectId, ProviderCoordinate) {
     let catalog = standard_catalog();
+    let catalog_digest = catalog.digest();
     let coordinate = provider(world, provider_id, 1);
     let bindings = verifier_bindings(&catalog);
     let mut engine = Engine::new(
         WorldId::new(world).unwrap(),
-        catalog,
+        CatalogSet::new(&[catalog]).unwrap(),
         CoreLimits::bounded_default(),
         freshness(),
     );
     engine
         .transact_volatile(CommandRequest::RegisterProviderGeneration {
             coordinate,
-            catalog_digest: engine.catalog_digest(),
+            catalog_digest,
             verifier_bindings: bindings,
         })
         .unwrap();
-    let effect = EffectId::new(RootId::new(effect_seed).unwrap(), 1).unwrap();
-    let actor = PrincipalIncarnation::new(PrincipalId::new(effect_seed).unwrap(), 1).unwrap();
+    let operation = OperationId::new(effect_seed).unwrap();
+    let effect = EffectId::new(operation, 1).unwrap();
+    let actor = ExecutorCoordinate::new(
+        ExecutorId::new(effect_seed).unwrap(),
+        ExecutorGeneration::new(1).unwrap(),
+    );
     engine
         .transact_volatile(CommandRequest::AdmitScopedCompositeEffect {
             effect,
-            operation: OperationId::new(effect_seed).unwrap(),
             origin: actor,
-            binding_generation: 1,
             kind: AGENT_OPERATION_COMPOSITE,
             charge_account: cser_core::ChargeAccountId::new(effect_seed).unwrap(),
             bindings: vec![
@@ -86,7 +87,6 @@ fn scoped_engine(
             effect,
             component: AGENT_COMPONENT_REPLY,
             actor,
-            binding_generation: 1,
             claim: ClaimId::new(effect_seed).unwrap(),
             kind: cser_core::REPLY_CLAIM_PUBLICATION_SLOT,
             scope: ClaimScope::Logical,
@@ -116,7 +116,7 @@ impl ReceiptVerifier for ScopeVerifier {
         challenge: &cser_core::EvidenceChallenge,
         _receipt: &Self::Receipt,
     ) -> Result<VerifiedObservation, VerificationError> {
-        if challenge.verification_scope() != Some(self.expected_scope) {
+        if challenge.verification_scope() != self.expected_scope {
             return Err(VerificationError::Rejected);
         }
         Ok(VerifiedObservation::new(
@@ -139,14 +139,14 @@ fn scoped_challenge_and_verified_token_retain_exact_provider_scope() {
             REPLY_EVIDENCE_PUBLICATION_ACK,
         )
         .unwrap();
-    let scope = challenge.verification_scope().expect("scoped challenge");
+    let scope = challenge.verification_scope();
     assert_eq!(scope.world(), WorldId::new(700).unwrap());
     assert_eq!(scope.provider(), coordinate);
     assert_eq!(scope.operation(), OperationId::new(702).unwrap());
-    assert_eq!(scope.catalog_digest(), engine.catalog_digest());
+    assert_eq!(scope.catalog_digest(), standard_catalog().digest());
     assert_eq!(
         challenge.expected_verifier_binding(),
-        Some(scope.verifier_binding())
+        scope.verifier_binding()
     );
 
     let token = engine
@@ -162,7 +162,7 @@ fn scoped_challenge_and_verified_token_retain_exact_provider_scope() {
             &(),
         )
         .unwrap();
-    assert_eq!(token.verification_scope(), Some(scope));
+    assert_eq!(token.verification_scope(), scope);
 
     let obligations = engine.provider_obligations(coordinate);
     assert_eq!(obligations.len(), 2);
@@ -172,7 +172,7 @@ fn scoped_challenge_and_verified_token_retain_exact_provider_scope() {
         .unwrap();
     assert_eq!(reply.effect, effect);
     assert_eq!(reply.operation, OperationId::new(702).unwrap());
-    assert_eq!(reply.catalog_digest, engine.catalog_digest());
+    assert_eq!(reply.catalog_digest, standard_catalog().digest());
     assert!(reply.artifact.is_none());
 }
 
@@ -187,7 +187,7 @@ fn verifier_rejects_cross_world_scope_replay_before_minting_evidence() {
             REPLY_EVIDENCE_PUBLICATION_ACK,
         )
         .unwrap();
-    let first_scope = first_challenge.verification_scope().unwrap();
+    let first_scope = first_challenge.verification_scope();
 
     let (second, second_effect, _) = scoped_engine(720, 721, 722);
     let second_challenge = second
@@ -198,13 +198,10 @@ fn verifier_rejects_cross_world_scope_replay_before_minting_evidence() {
             REPLY_EVIDENCE_PUBLICATION_ACK,
         )
         .unwrap();
-    assert_ne!(first_scope, second_challenge.verification_scope().unwrap());
+    assert_ne!(first_scope, second_challenge.verification_scope());
     let verifier = ScopeVerifier {
         identity: VerifierIdentity::new_exact(
-            second_challenge
-                .verification_scope()
-                .unwrap()
-                .verifier_binding(),
+            second_challenge.verification_scope().verifier_binding(),
         ),
         expected_scope: first_scope,
     };

@@ -10,7 +10,7 @@
 //! state.  Callers supply those at [`PreparedQemuPersistentBoot::recover`].
 
 use cser_core::{
-    CoordinatedPersistence, CoreError, CoreLimits, DeviceGeneration, Digest, DomainCatalog,
+    CatalogSet, CoordinatedPersistence, CoreError, CoreLimits, DeviceGeneration, Digest,
     RecoveryBinding, scan_journal,
 };
 use nexus_ostd_virtio::{
@@ -189,14 +189,14 @@ where
     /// journal or bypass this binding step.
     pub(crate) fn recover(
         self,
-        catalog: DomainCatalog,
+        catalogs: CatalogSet,
         limits: CoreLimits,
         binding: RecoveryBinding,
     ) -> Result<
         QuarantinedRecoveredBoot<J, QemuPersistentAnchor, BootQuarantineGuard>,
         QemuPersistentBootError,
     > {
-        if catalog.digest() != binding.catalog_digest() {
+        if catalogs.digest() != binding.catalog_digest() {
             return Err(QemuPersistentBootError::CatalogBindingMismatch);
         }
         let anchor = self
@@ -204,7 +204,7 @@ where
             .bind(binding)
             .map_err(|_| QemuPersistentBootError::AnchorBinding)?;
         recover_quarantined_boot(
-            catalog,
+            catalogs,
             limits,
             binding,
             self.journal,

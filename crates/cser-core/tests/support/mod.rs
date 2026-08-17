@@ -1,14 +1,31 @@
 use cser_core::{
-    AuthorityBindingGeneration, BootGeneration, ChargeAccountId, ClaimId,
-    Command as AuthorizedCommand, CommandRequest as Command, CoreError, CoreLimits,
+    BootGeneration, CatalogSet, ChargeAccountId, ClaimId, Command as AuthorizedCommand,
+    CommandRequest as Command, ComponentId, ComponentProviderBinding, CoreError, CoreLimits,
     DeviceGeneration, Digest, EffectFactKind, EffectId, EffectReceiptVerifier, Engine,
-    ExternalOutcome, Freshness, JournalCheckpoint, JournalGeneration, PrincipalId,
-    PrincipalIncarnation, ReceiptBinding, ReceiptSchemaId, ReceiptVerifier, RecoveryAnchor,
-    RecoveryBinding, RecoveryProfile, RegistryInstance, ResourceGeneration, ResourceId, RootId,
-    SnapshotId, TransitionOutput, TransitionReceipt, TxError, VerificationError,
-    VerifiedApplyReceipt, VerifiedCommitOutcome, VerifiedEffectObservation, VerifiedObservation,
-    VerifiedSettlementAck, VerifierId, VerifierIdentity, WorldId, standard_catalog,
+    ExecutorCoordinate, ExecutorGeneration, ExecutorId, ExternalOutcome, Freshness,
+    JournalCheckpoint, JournalGeneration, OperationId, ProviderCoordinate, ProviderGeneration,
+    ProviderId, ReceiptBinding, ReceiptSchemaId, ReceiptVerifier, RecoveryAnchor, RecoveryBinding,
+    RecoveryProfile, RegistryInstance, ResourceGeneration, ResourceId, SnapshotId,
+    TransitionOutput, TransitionReceipt, TxError, VerificationError, VerifiedApplyReceipt,
+    VerifiedCommitOutcome, VerifiedEffectObservation, VerifiedObservation, VerifiedSettlementAck,
+    VerifierBinding, VerifierClassBinding, VerifierGeneration, VerifierId, VerifierIdentity,
+    WorldId, standard_catalog, tool_dma_catalog,
 };
+
+pub const EFFECT_CATALOG_KIND: cser_core::CompositeKindId =
+    cser_core::TOOL_HANDOFF_SOURCE_COMPOSITE;
+pub const EFFECT_COMPONENT: ComponentId = cser_core::TOOL_HANDOFF_SOURCE_COMPONENT;
+pub const EFFECT_DOMAIN: cser_core::DomainId = cser_core::TOOL_DOMAIN;
+pub const EFFECT_OBLIGATION: cser_core::ObligationKindId = cser_core::TOOL_OBLIGATION_INVOCATION;
+pub const EFFECT_CLAIM_KIND: cser_core::ClaimKindId = cser_core::TOOL_CLAIM_OUTCOME_SLOT;
+pub const EFFECT_EVIDENCE_KIND: cser_core::EvidenceKindId = cser_core::TOOL_EVIDENCE_OUTCOME_ACK;
+pub const EFFECT_VERIFIER: VerifierId = cser_core::TOOL_VERIFIER;
+pub const EFFECT_RECEIPT_SCHEMA: ReceiptSchemaId = cser_core::TOOL_RECEIPT_SCHEMA;
+pub const EFFECT_COMMIT_RECEIPT_SCHEMA: ReceiptSchemaId = cser_core::TOOL_COMMIT_RECEIPT_SCHEMA;
+pub const EFFECT_APPLY_RECEIPT_SCHEMA: ReceiptSchemaId = cser_core::TOOL_APPLY_RECEIPT_SCHEMA;
+pub const EFFECT_SETTLEMENT_RECEIPT_SCHEMA: ReceiptSchemaId =
+    cser_core::TOOL_SETTLEMENT_RECEIPT_SCHEMA;
+pub const EFFECT_CREDIT: cser_core::CreditClassId = cser_core::CREDIT_TOOL_OUTCOME_SLOT;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TestReceipt {
@@ -29,8 +46,9 @@ pub struct ExactTestVerifier {
 
 impl ExactTestVerifier {
     pub fn new(verifier: VerifierId, receipt_schema: ReceiptSchemaId) -> Self {
+        let binding = verifier_binding(verifier, receipt_schema);
         Self {
-            identity: VerifierIdentity::new(verifier, 1, receipt_schema).unwrap(),
+            identity: VerifierIdentity::new_exact(binding),
         }
     }
 }
@@ -71,7 +89,7 @@ pub struct TestEffectReceipt {
     pub effect: EffectId,
     pub domain: cser_core::DomainId,
     pub obligation: cser_core::ObligationKindId,
-    pub actor: PrincipalIncarnation,
+    pub actor: ExecutorCoordinate,
     pub generation: u64,
     pub nonce: u64,
     pub operation: Digest,
@@ -88,8 +106,9 @@ pub struct ExactEffectVerifier {
 
 impl ExactEffectVerifier {
     pub fn new(verifier: VerifierId, receipt_schema: ReceiptSchemaId) -> Self {
+        let binding = verifier_binding(verifier, receipt_schema);
         Self {
-            identity: VerifierIdentity::new(verifier, 1, receipt_schema).unwrap(),
+            identity: VerifierIdentity::new_exact(binding),
         }
     }
 }
@@ -139,43 +158,25 @@ pub struct Harness {
 
 impl Harness {
     pub fn new() -> Self {
-        Self {
-            engine: Engine::new_scoped_legacy_compatibility(
-                test_world(),
-                standard_catalog(),
-                CoreLimits::bounded_default(),
-                freshness(1, 1, 1, 1, 1),
-            ),
-            journal: Vec::new(),
-        }
+        Self::with_catalog(tool_dma_catalog(), CoreLimits::bounded_default())
     }
 
     pub fn with_limits(limits: CoreLimits) -> Self {
-        Self {
-            engine: Engine::new_scoped_legacy_compatibility(
-                test_world(),
-                standard_catalog(),
-                limits,
-                freshness(1, 1, 1, 1, 1),
-            ),
-            journal: Vec::new(),
-        }
+        Self::with_catalog(tool_dma_catalog(), limits)
     }
 
-    pub fn new_profile_two() -> Self {
-        Self::profile_two_with_limits(CoreLimits::bounded_default())
+    pub fn standard() -> Self {
+        Self::with_catalog(standard_catalog(), CoreLimits::bounded_default())
     }
 
-    pub fn profile_two_with_limits(limits: CoreLimits) -> Self {
-        Self {
-            engine: Engine::new(
-                test_world(),
-                standard_catalog(),
-                limits,
-                freshness(1, 1, 1, 1, 1),
-            ),
+    pub fn with_catalog(catalog: cser_core::DomainCatalog, limits: CoreLimits) -> Self {
+        let catalog_set = CatalogSet::new(core::slice::from_ref(&catalog)).unwrap();
+        let mut harness = Self {
+            engine: Engine::new(test_world(), catalog_set, limits, freshness(1, 1, 1, 1)),
             journal: Vec::new(),
-        }
+        };
+        harness.tx(register_provider_command(&catalog)).unwrap();
+        harness
     }
 
     pub fn tx<C>(&mut self, command: C) -> Result<TransitionReceipt, CoreError>
@@ -223,17 +224,58 @@ pub fn recovery_binding(catalog_digest: Digest, freshness: Freshness) -> Recover
         test_world(),
         catalog_digest,
         freshness.registry(),
-        AuthorityBindingGeneration::new(freshness.binding()).unwrap(),
     )
     .unwrap()
+}
+
+pub fn provider() -> ProviderCoordinate {
+    ProviderCoordinate::new(
+        test_world(),
+        ProviderId::new(1).unwrap(),
+        ProviderGeneration::new(1).unwrap(),
+    )
+}
+
+pub fn verifier_binding(verifier: VerifierId, receipt_schema: ReceiptSchemaId) -> VerifierBinding {
+    VerifierBinding::new(
+        verifier,
+        VerifierGeneration::new(1).unwrap(),
+        receipt_schema,
+        digest((verifier.get() as u8).wrapping_add(receipt_schema.get() as u8)),
+    )
+    .unwrap()
+}
+
+pub fn register_provider_command(catalog: &cser_core::DomainCatalog) -> Command {
+    Command::RegisterProviderGeneration {
+        coordinate: provider(),
+        catalog_digest: catalog.digest(),
+        verifier_bindings: catalog
+            .verifier_class_bindings()
+            .into_iter()
+            .map(|class: VerifierClassBinding| {
+                verifier_binding(class.verifier(), class.receipt_schema())
+            })
+            .collect(),
+    }
+}
+
+pub fn admit_command(effect: EffectId, operation_value: u64) -> Command {
+    Command::AdmitScopedCompositeEffect {
+        effect,
+        origin: executor(operation_value, 1),
+        kind: EFFECT_CATALOG_KIND,
+        charge_account: charge(operation_value),
+        bindings: vec![ComponentProviderBinding::new(EFFECT_COMPONENT, provider())],
+    }
 }
 
 pub fn genesis_projection() -> Digest {
     Engine::new(
         test_world(),
-        standard_catalog(),
+        CatalogSet::new(&[standard_catalog()]).unwrap(),
         CoreLimits::bounded_default(),
-        freshness(1, 1, 1, 1, 1),
+        freshness(1, 1, 1, 1),
     )
     .projection_digest()
 }
@@ -257,16 +299,15 @@ pub fn recovery_anchor(
     .unwrap()
 }
 
-pub fn root(value: u64) -> RootId {
-    RootId::new(value).unwrap()
+pub fn effect(operation_value: u64, sequence: u64) -> EffectId {
+    EffectId::new(OperationId::new(operation_value).unwrap(), sequence).unwrap()
 }
 
-pub fn effect(root_value: u64, sequence: u64) -> EffectId {
-    EffectId::new(root(root_value), sequence).unwrap()
-}
-
-pub fn principal(id: u64, generation: u64) -> PrincipalIncarnation {
-    PrincipalIncarnation::new(PrincipalId::new(id).unwrap(), generation).unwrap()
+pub fn executor(id: u64, generation: u64) -> ExecutorCoordinate {
+    ExecutorCoordinate::new(
+        ExecutorId::new(id).unwrap(),
+        ExecutorGeneration::new(generation).unwrap(),
+    )
 }
 
 pub fn charge(value: u64) -> ChargeAccountId {
@@ -306,7 +347,7 @@ pub fn verified_evidence_command(
 ) -> AuthorizedCommand {
     let challenge = harness
         .engine
-        .evidence_challenge(effect, claim, kind)
+        .component_evidence_challenge(effect, EFFECT_COMPONENT, claim, kind)
         .unwrap();
     let verifier =
         ExactTestVerifier::new(receipt_binding.verifier(), receipt_binding.receipt_schema());
@@ -322,7 +363,14 @@ pub fn verified_evidence_command(
     };
     harness
         .engine
-        .verify_retirement_evidence(effect, claim, kind, &verifier, &receipt)
+        .verify_component_retirement_evidence(
+            effect,
+            EFFECT_COMPONENT,
+            claim,
+            kind,
+            &verifier,
+            &receipt,
+        )
         .unwrap()
         .submit()
 }
@@ -337,7 +385,7 @@ pub fn current_evidence_command(
 ) -> AuthorizedCommand {
     let observation = harness
         .engine
-        .evidence_challenge(effect, claim, kind)
+        .component_evidence_challenge(effect, EFFECT_COMPONENT, claim, kind)
         .unwrap()
         .current_observation();
     verified_evidence_command(
@@ -353,12 +401,12 @@ pub fn current_evidence_command(
 
 pub fn snapshot_command(
     harness: &Harness,
-    root: RootId,
+    operation: OperationId,
     snapshot: SnapshotId,
 ) -> AuthorizedCommand {
     harness
         .engine
-        .snapshot_root(root, snapshot)
+        .snapshot_operation(operation, snapshot)
         .unwrap()
         .record()
 }
@@ -477,55 +525,24 @@ pub fn verified_settlement_ack_for_engine(
         .unwrap()
 }
 
-pub fn freshness(boot: u64, registry: u64, binding: u64, device: u64, journal: u64) -> Freshness {
+pub fn freshness(boot: u64, registry: u64, device: u64, journal: u64) -> Freshness {
     Freshness::new(
         BootGeneration::new(boot).unwrap(),
         RegistryInstance::new(registry).unwrap(),
-        binding,
         DeviceGeneration::new(device).unwrap(),
         JournalGeneration::new(journal).unwrap(),
     )
-    .unwrap()
 }
 
-pub fn committed_reply(harness: &mut Harness, root_value: u64) -> (EffectId, PrincipalIncarnation) {
-    let effect = effect(root_value, 1);
-    let origin = principal(root_value, 1);
-    harness
-        .tx(Command::CreateEstate {
-            effect,
-            origin,
-            binding_generation: 1,
-            domain: cser_core::REPLY_DOMAIN,
-            obligation: cser_core::REPLY_OBLIGATION_PUBLICATION,
-            charge_account: charge(root_value),
-        })
-        .unwrap();
-    harness
-        .tx(Command::AddClaim {
-            effect,
-            actor: origin,
-            binding_generation: 1,
-            claim: claim(root_value),
-            domain: cser_core::REPLY_DOMAIN,
-            kind: cser_core::REPLY_CLAIM_PUBLICATION_SLOT,
-            scope: cser_core::ClaimScope::Logical,
-            resource: resource(root_value),
-            resource_generation: resource_generation(1),
-            units: 1,
-        })
-        .unwrap();
-    harness
-        .tx(Command::PrepareEffect {
-            effect,
-            actor: origin,
-            binding_generation: 1,
-        })
-        .unwrap();
-    let intent = match harness.output(Command::RecordCommitIntent {
+pub fn committed_reply(
+    harness: &mut Harness,
+    operation_value: u64,
+) -> (EffectId, ExecutorCoordinate) {
+    let (effect, origin) = prepared_reply(harness, operation_value);
+    let intent = match harness.output(Command::RecordComponentCommitIntent {
         effect,
+        component: EFFECT_COMPONENT,
         actor: origin,
-        binding_generation: 1,
         operation: digest(10),
     }) {
         TransitionOutput::CommitIntent(intent) => intent,
@@ -534,8 +551,8 @@ pub fn committed_reply(harness: &mut Harness, root_value: u64) -> (EffectId, Pri
     let outcome = verified_commit_outcome(
         harness,
         &intent,
-        cser_core::REPLY_VERIFIER,
-        cser_core::REPLY_COMMIT_RECEIPT_SCHEMA,
+        EFFECT_VERIFIER,
+        EFFECT_COMMIT_RECEIPT_SCHEMA,
         ExternalOutcome::Success,
         digest(11),
     );
@@ -543,38 +560,63 @@ pub fn committed_reply(harness: &mut Harness, root_value: u64) -> (EffectId, Pri
     (effect, origin)
 }
 
+pub fn prepared_reply(
+    harness: &mut Harness,
+    operation_value: u64,
+) -> (EffectId, ExecutorCoordinate) {
+    let effect = effect(operation_value, 1);
+    let origin = executor(operation_value, 1);
+    harness.tx(admit_command(effect, operation_value)).unwrap();
+    harness
+        .tx(Command::AddComponentClaim {
+            effect,
+            component: EFFECT_COMPONENT,
+            actor: origin,
+            claim: claim(operation_value),
+            kind: EFFECT_CLAIM_KIND,
+            scope: cser_core::ClaimScope::Logical,
+            resource: resource(operation_value),
+            resource_generation: resource_generation(1),
+            units: 1,
+        })
+        .unwrap();
+    harness
+        .tx(Command::PrepareCompositeEffect {
+            effect,
+            actor: origin,
+        })
+        .unwrap();
+    (effect, origin)
+}
+
 pub fn fence_and_rebind(
     harness: &mut Harness,
     effect: EffectId,
-    crashed: PrincipalIncarnation,
-    successor: PrincipalIncarnation,
-    old_binding: u64,
-    new_binding: u64,
+    crashed: ExecutorCoordinate,
+    successor: ExecutorCoordinate,
     snapshot_value: u64,
 ) {
     harness
-        .tx(Command::FenceIncarnation {
-            root: effect.root(),
+        .tx(Command::FenceExecutor {
+            operation: effect.operation(),
             crashed,
-            binding_generation: old_binding,
         })
         .unwrap();
     let snapshot = snapshot(snapshot_value);
-    let snapshot_record = snapshot_command(harness, effect.root(), snapshot);
+    let snapshot_record = snapshot_command(harness, effect.operation(), snapshot);
     harness.tx(snapshot_record).unwrap();
     harness
         .tx(Command::Ready {
-            root: effect.root(),
+            operation: effect.operation(),
             snapshot,
             successor,
         })
         .unwrap();
     harness
         .tx(Command::Rebind {
-            root: effect.root(),
+            operation: effect.operation(),
             snapshot,
             successor,
-            binding_generation: new_binding,
         })
         .unwrap();
 }

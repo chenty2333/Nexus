@@ -6,18 +6,17 @@
 
 //! Portable authoritative implementation of the CSER semantic core.
 //!
-//! The core owns causal estates, authority fencing, settlement gates, typed
+//! The core owns causal effects, authority fencing, settlement gates, typed
 //! resource claims, bounded charging, journal records, and deterministic
 //! recovery. It deliberately owns no task, device, wire, clock, or storage
-//! implementation. Callers persist a prepared record before the core swaps its
-//! candidate state.
+//! implementation. Callers persist a prepared record before the core publishes
+//! the resulting authoritative state.
 
 extern crate alloc;
 #[cfg(feature = "std")]
 extern crate std;
 
-/// Frozen semantic API profile established by the CSER Core vNext rebaseline.
-/// slices both passed without an adapter-owned semantic escape hatch.
+/// Frozen semantic API profile for the current CSER Core grammar.
 ///
 /// This is the transition/journal semantic compatibility coordinate, not a
 /// Rust ABI promise. An incompatible transition or journal contract change
@@ -25,18 +24,18 @@ extern crate std;
 /// migration. Standard catalog grammar and validation evolve under the
 /// separate [`STANDARD_CATALOG_VERSION`] coordinate and exact catalog digest;
 /// recovery never reinterprets a journal bound to an older catalog digest.
-pub const CSER_CORE_API_PROFILE_VERSION: u16 = 5;
+pub const CSER_CORE_API_PROFILE_VERSION: u16 = 6;
 
-/// Frozen standard catalog format used by semantic API profile 5.
+/// Frozen standard catalog format used by the current semantic API profile.
 pub const STANDARD_CATALOG_VERSION: u16 = 8;
 
-/// Frozen deterministic projection format used by semantic API profile 5.
-pub const PROJECTION_VERSION: u16 = 9;
+/// Frozen deterministic projection format used by the current semantic API profile.
+pub const PROJECTION_VERSION: u16 = 10;
 
-/// Frozen recovery snapshot format used by semantic API profile 5.
-pub const RECOVERY_SNAPSHOT_VERSION: u16 = 5;
+/// Frozen recovery snapshot format used by the current semantic API profile.
+pub const RECOVERY_SNAPSHOT_VERSION: u16 = 6;
 
-/// Frozen normalized transition trace format used by semantic API profile 5.
+/// Frozen normalized transition trace format used by the current semantic API profile.
 pub const NORMALIZED_TRACE_VERSION: u16 = 3;
 
 mod artifact;
@@ -58,13 +57,13 @@ pub use artifact::{
     ArtifactReleasePermit, ArtifactReleaseVerifier,
 };
 pub use domain::{
-    AdoptionPolicy, ClaimCardinality, ClaimRule, ClaimScopePolicy, CompositeComponentSpec,
-    CompositeRule, ConflictMode, CreditRule, DeviceGenerationEffect, DomainCatalog,
-    DomainCatalogBuilder, DomainCatalogError, EvidenceCapability, EvidenceRecovery, EvidenceRule,
-    EvidenceSubjectBinding, FreshnessAxes, LogicalClaimRole, ObligationPolicy, ObligationReceipts,
-    ObligationRule, ObligationSpec, ReceiptBinding, RecoveryArtifactPolicy, SingleHopHandoffRule,
-    VerifierBinding, VerifierClassBinding, VerifierSetError, canonical_verifier_set_digest,
-    validate_verifier_set,
+    AdoptionPolicy, CatalogSet, CatalogSetError, ClaimCardinality, ClaimRule, ClaimScopePolicy,
+    CompositeComponentSpec, CompositeRule, ConflictMode, CreditRule, DeviceGenerationEffect,
+    DomainCatalog, DomainCatalogBuilder, DomainCatalogError, EvidenceCapability, EvidenceRecovery,
+    EvidenceRule, EvidenceSubjectBinding, FreshnessAxes, LogicalClaimRole,
+    MAX_CATALOG_SET_CATALOGS, ObligationPolicy, ObligationReceipts, ObligationRule, ObligationSpec,
+    ReceiptBinding, RecoveryArtifactPolicy, SingleHopHandoffRule, VerifierBinding,
+    VerifierClassBinding, VerifierSetError, canonical_verifier_set_digest, validate_verifier_set,
 };
 pub use engine::CHILD_DESCRIPTOR_V1_WIRE_LEN;
 pub use engine::{
@@ -75,26 +74,26 @@ pub use engine::{
     ComponentClaimRecoveryItem, ComponentCommitOperation, ComponentProjection,
     ComponentProviderBinding, ComponentRecoveryItem, CompositeEffectProjection,
     CompositeRecoveryItem, CoreError, CoreLimits, CustodyState, EffectEscapeState,
-    EffectFactChallenge, EffectFactKind, EffectReceiptVerifier, Engine, EstateProjection,
-    EvidenceChallenge, ExternalOutcome, HandoffChildResolutionVerifier, HandoffResolutionChallenge,
-    HandoffResolutionVerifier, JournalFailure, OutcomeState, PressureProjection,
-    ProviderEffectState, ProviderGenerationProjection, ProviderObligation,
+    EffectFactChallenge, EffectFactKind, EffectReceiptVerifier, Engine, EvidenceChallenge,
+    ExternalOutcome, HandoffChildResolutionVerifier, HandoffResolutionChallenge,
+    HandoffResolutionVerifier, JournalFailure, OperationRecoveryState, OutcomeState,
+    PressureProjection, ProviderEffectState, ProviderGenerationProjection, ProviderObligation,
     ProviderVerificationScope, ReceiptVerifier, RecoveryAnchor, RecoveryAnchorError,
-    RecoveryEvidenceItem, RecoveryItem, RecoveryReport, RecoverySnapshot, RetirementState,
-    ReusePermit, RootRecoveryState, SettlementClaim, SettlementState, SingleHopHandoffProjection,
-    TransitionCoordinates, TransitionEvent, TransitionOutput, TransitionReceipt, TransitionResult,
-    TxError, VerificationError, VerifiedApplyReceipt, VerifiedArtifactPin, VerifiedArtifactRelease,
+    RecoveryEvidenceItem, RecoveryReport, RecoverySnapshot, RetirementState, ReusePermit,
+    SettlementClaim, SettlementState, SingleHopHandoffProjection, TransitionCoordinates,
+    TransitionEvent, TransitionOutput, TransitionReceipt, TransitionResult, TxError,
+    VerificationError, VerifiedApplyReceipt, VerifiedArtifactPin, VerifiedArtifactRelease,
     VerifiedChildDescriptor, VerifiedCommitOutcome, VerifiedEffectObservation,
     VerifiedHandoffChildResolution, VerifiedHandoffResolution, VerifiedObservation,
     VerifiedRetirementEvidence, VerifiedSettlementAck, VerifierIdentity, VerifierStamp,
 };
 pub use identity::{
-    AuthorityBindingGeneration, BootGeneration, ChargeAccountId, ClaimId, ClaimKindId, ComponentId,
-    CompositeKindId, CreditClassId, DeviceGeneration, DeviceScopeId, Digest, DomainId, EffectId,
-    EvidenceKindId, Freshness, IdentityError, JournalGeneration, ObligationKindId, OperationId,
-    PrincipalId, PrincipalIncarnation, ProviderCoordinate, ProviderGeneration, ProviderId,
-    ReceiptSchemaId, RecoveryArtifactId, RegistryInstance, ResourceGeneration, ResourceId, RootId,
-    SnapshotId, VerifierGeneration, VerifierId, WorldId,
+    BootGeneration, ChargeAccountId, ClaimId, ClaimKindId, ComponentId, CompositeKindId,
+    CreditClassId, DeviceGeneration, DeviceScopeId, Digest, DomainId, EffectId, EvidenceKindId,
+    ExecutorCoordinate, ExecutorGeneration, ExecutorId, Freshness, IdentityError,
+    JournalGeneration, ObligationKindId, OperationId, ProviderCoordinate, ProviderGeneration,
+    ProviderId, ReceiptSchemaId, RecoveryArtifactId, RegistryInstance, ResourceGeneration,
+    ResourceId, SnapshotId, VerifierGeneration, VerifierId, WorldId,
 };
 pub use journal::{
     JOURNAL_CHECKPOINT_MAGIC, JOURNAL_CHECKPOINT_VERSION, JOURNAL_CORE_API_PROFILE, JOURNAL_MAGIC,

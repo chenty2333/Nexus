@@ -8,6 +8,7 @@
 //! fixed-capacity custody before an untrusted response can be formed.
 
 use alloc::{
+    boxed::Box,
     sync::{Arc, Weak},
     vec,
     vec::Vec,
@@ -17,8 +18,8 @@ use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use cser_core::{
     Command, CommandRequest, CommitIntent, ComponentProviderBinding, CoreError,
     DEVICE_COMMIT_RECEIPT_SCHEMA, DEVICE_RECEIPT_SCHEMA, DEVICE_VERIFIER, Digest, EffectId, Engine,
-    OperationId, PrincipalIncarnation, ProviderCoordinate, ProviderGeneration,
-    ProviderGenerationProjection, ProviderId, REPLY_APPLY_RECEIPT_SCHEMA,
+    ExecutorCoordinate, ExecutorGeneration, ExecutorId, OperationId, ProviderCoordinate,
+    ProviderGeneration, ProviderGenerationProjection, ProviderId, REPLY_APPLY_RECEIPT_SCHEMA,
     REPLY_COMMIT_RECEIPT_SCHEMA, REPLY_RECEIPT_SCHEMA, REPLY_SETTLEMENT_RECEIPT_SCHEMA,
     REPLY_VERIFIER, TransitionDurability, TransitionOutput, TransitionReceipt, TxError,
     VerifierBinding, VerifierGeneration, WorldId,
@@ -147,52 +148,36 @@ pub(crate) fn standard_verifier_bindings() -> Vec<VerifierBinding> {
     ]
 }
 
-/// Exact task/root binding admitted through the production portal.
+/// Exact task/operation binding admitted through the production portal.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ProductionIngressIdentity {
-    root: cser_core::RootId,
-    incarnation: cser_core::PrincipalIncarnation,
-    binding_generation: u64,
+    operation: OperationId,
+    executor: ExecutorCoordinate,
 }
 
 impl ProductionIngressIdentity {
-    /// Constructs one non-zero binding whose principal owns the named root.
-    pub(crate) fn new(
-        root: cser_core::RootId,
-        incarnation: cser_core::PrincipalIncarnation,
-        binding_generation: u64,
-    ) -> Result<Self, ProductionIngressError> {
-        if root.get() != incarnation.principal().get() || binding_generation == 0 {
-            return Err(ProductionIngressError::InvalidIdentity);
+    /// Constructs one exact executor binding for the named operation.
+    pub(crate) const fn new(operation: OperationId, executor: ExecutorCoordinate) -> Self {
+        Self {
+            operation,
+            executor,
         }
-        Ok(Self {
-            root,
-            incarnation,
-            binding_generation,
-        })
     }
 
-    /// Returns the causal root admitted by this binding.
-    pub(crate) const fn root(self) -> cser_core::RootId {
-        self.root
+    /// Returns the causal operation admitted by this binding.
+    pub(crate) const fn operation(self) -> OperationId {
+        self.operation
     }
 
-    /// Returns the exact admitted principal incarnation.
-    pub(crate) const fn incarnation(self) -> cser_core::PrincipalIncarnation {
-        self.incarnation
-    }
-
-    /// Returns the exact admitted root binding generation.
-    pub(crate) const fn binding_generation(self) -> u64 {
-        self.binding_generation
+    /// Returns the exact admitted executor coordinate.
+    pub(crate) const fn executor(self) -> ExecutorCoordinate {
+        self.executor
     }
 }
 
 /// Atomic production-ingress admission failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ProductionIngressError {
-    /// The requested identity is structurally invalid.
-    InvalidIdentity,
     /// No production service task currently owns ingress.
     Closed,
     /// Another exact task binding already owns ingress.
@@ -245,20 +230,18 @@ impl<S> ProductionIngressTaskData<S> {
 
 struct ProductionIngressGate {
     state: AtomicU8,
-    root: AtomicU64,
-    principal: AtomicU64,
-    incarnation_generation: AtomicU64,
-    binding_generation: AtomicU64,
+    operation: AtomicU64,
+    executor: AtomicU64,
+    executor_generation: AtomicU64,
 }
 
 impl ProductionIngressGate {
     const fn closed() -> Self {
         Self {
             state: AtomicU8::new(INGRESS_CLOSED),
-            root: AtomicU64::new(0),
-            principal: AtomicU64::new(0),
-            incarnation_generation: AtomicU64::new(0),
-            binding_generation: AtomicU64::new(0),
+            operation: AtomicU64::new(0),
+            executor: AtomicU64::new(0),
+            executor_generation: AtomicU64::new(0),
         }
     }
 
@@ -271,13 +254,12 @@ impl ProductionIngressGate {
                 Ordering::Acquire,
             )
             .map_err(|_| ProductionIngressError::AlreadyOpen)?;
-        self.root.store(identity.root().get(), Ordering::Relaxed);
-        self.principal
-            .store(identity.incarnation().principal().get(), Ordering::Relaxed);
-        self.incarnation_generation
-            .store(identity.incarnation().generation(), Ordering::Relaxed);
-        self.binding_generation
-            .store(identity.binding_generation(), Ordering::Relaxed);
+        self.operation
+            .store(identity.operation().get(), Ordering::Relaxed);
+        self.executor
+            .store(identity.executor().executor().get(), Ordering::Relaxed);
+        self.executor_generation
+            .store(identity.executor().generation().get(), Ordering::Relaxed);
         self.state.store(INGRESS_OPEN, Ordering::Release);
         Ok(())
     }
@@ -286,19 +268,14 @@ impl ProductionIngressGate {
         if self.state.load(Ordering::Acquire) != INGRESS_OPEN {
             return None;
         }
-        let root = cser_core::RootId::new(self.root.load(Ordering::Relaxed)).ok()?;
-        let principal = cser_core::PrincipalId::new(self.principal.load(Ordering::Relaxed)).ok()?;
-        let incarnation = cser_core::PrincipalIncarnation::new(
-            principal,
-            self.incarnation_generation.load(Ordering::Relaxed),
-        )
-        .ok()?;
+        let operation = OperationId::new(self.operation.load(Ordering::Relaxed)).ok()?;
+        let executor = ExecutorId::new(self.executor.load(Ordering::Relaxed)).ok()?;
+        let generation =
+            ExecutorGeneration::new(self.executor_generation.load(Ordering::Relaxed)).ok()?;
         let identity = ProductionIngressIdentity::new(
-            root,
-            incarnation,
-            self.binding_generation.load(Ordering::Relaxed),
-        )
-        .ok()?;
+            operation,
+            ExecutorCoordinate::new(executor, generation),
+        );
         (self.state.load(Ordering::Acquire) == INGRESS_OPEN).then_some(identity)
     }
 
@@ -364,8 +341,6 @@ pub(crate) enum ProductionRegistryError<E> {
     LinearCustodyFull,
     /// A caller tried to bypass the portal's trusted-command policy.
     TrustedPathRequired,
-    /// A profile-1 singleton command reached the profile-2 production owner.
-    ProfileOneCommandForbidden,
     /// A committed client transition returned an unexpected bearer kind.
     UnexpectedLinearOutput,
     /// Commit intent became durable without returning its required bearer.
@@ -385,9 +360,6 @@ impl<S> ProductionCoreOwner<S> {
     where
         S: InstalledCore,
     {
-        if installed.observe(Engine::profile_one_estate_count) != 0 {
-            return Err((CoreError::IncompatibleApiProfile, installed));
-        }
         Ok(Self {
             installed,
             linear_custody: Mutex::new(Vec::with_capacity(MAX_LINEAR_PORTAL_BEARERS)),
@@ -477,13 +449,13 @@ impl<S> ProductionCoreOwner<S> {
         effect: cser_core::EffectId,
         component: cser_core::ComponentId,
     ) -> Option<CommitIntent> {
-        self.take_matching_commit_intent(effect, Some(component))
+        self.take_matching_commit_intent(effect, component)
     }
 
     fn take_matching_commit_intent(
         &self,
         effect: cser_core::EffectId,
-        component: Option<cser_core::ComponentId>,
+        component: cser_core::ComponentId,
     ) -> Option<CommitIntent> {
         let mut custody = self.linear_custody.lock();
         let index = custody.iter().position(|output| {
@@ -543,9 +515,6 @@ impl<S: InstalledCore> ProductionCoreOwner<S> {
         C: Into<Command>,
     {
         let command = command.into();
-        if !command.is_profile_two_compatible() {
-            return Err(TxError::Core(CoreError::IncompatibleApiProfile));
-        }
         self.installed.transact(command)
     }
 
@@ -574,18 +543,14 @@ impl<S: InstalledCore> ProductionCoreOwner<S> {
     pub(crate) fn admit_scoped_composite_effect(
         &self,
         effect: EffectId,
-        operation: OperationId,
-        origin: PrincipalIncarnation,
-        binding_generation: u64,
+        origin: ExecutorCoordinate,
         kind: cser_core::CompositeKindId,
         charge_account: cser_core::ChargeAccountId,
         bindings: Vec<ComponentProviderBinding>,
     ) -> Result<TransitionReceipt, TxError<S::PersistenceError>> {
         self.transact_trusted(CommandRequest::AdmitScopedCompositeEffect {
             effect,
-            operation,
             origin,
-            binding_generation,
             kind,
             charge_account,
             bindings,
@@ -622,9 +587,6 @@ impl<S: InstalledCore + 'static> CoreRegistry for ProductionCoreOwner<S> {
     type Error = ProductionRegistryError<S::PersistenceError>;
 
     fn transact(&self, request: CommandRequest) -> Result<CoreTransitionView, Self::Error> {
-        if !request.is_profile_two_compatible() {
-            return Err(ProductionRegistryError::ProfileOneCommandForbidden);
-        }
         if !matches!(
             &request,
             CommandRequest::AddComponentClaim { .. }
@@ -677,7 +639,7 @@ impl<S: InstalledCore + 'static> CoreRegistry for ProductionCoreOwner<S> {
                         !intents.is_empty()
                             && intents.len() == components.len()
                             && intents.iter().zip(components).all(|(intent, component)| {
-                                intent.effect() == *effect && intent.component() == Some(*component)
+                                intent.effect() == *effect && intent.component() == *component
                             })
                     }
                     _ => false,
@@ -706,7 +668,7 @@ impl<S: InstalledCore + 'static> CoreRegistry for ProductionCoreOwner<S> {
                 CoreQuery::CompositeEffect(effect) => Ok(CoreObservation::CompositeEffect {
                     stamp,
                     effect,
-                    composite: engine.composite_effect(effect),
+                    composite: engine.composite_effect(effect).map(Box::new),
                 }),
                 CoreQuery::Component(effect, component) => Ok(CoreObservation::Component {
                     stamp,
@@ -734,37 +696,20 @@ impl<S: InstalledCore + 'static> CoreRegistry for ProductionCoreOwner<S> {
 }
 
 fn command_ingress_identity(request: &CommandRequest) -> Option<ProductionIngressIdentity> {
-    let (root, incarnation, binding_generation) = match request {
-        CommandRequest::AddComponentClaim {
-            effect,
-            actor,
-            binding_generation,
-            ..
+    let (operation, executor) = match request {
+        CommandRequest::AddComponentClaim { effect, actor, .. }
+        | CommandRequest::PrepareCompositeEffect { effect, actor }
+        | CommandRequest::RecordComponentCommitIntent { effect, actor, .. }
+        | CommandRequest::RecordCompositeCommitIntents { effect, actor, .. } => {
+            (effect.operation(), *actor)
         }
-        | CommandRequest::PrepareCompositeEffect {
-            effect,
-            actor,
-            binding_generation,
-        }
-        | CommandRequest::RecordComponentCommitIntent {
-            effect,
-            actor,
-            binding_generation,
-            ..
-        }
-        | CommandRequest::RecordCompositeCommitIntents {
-            effect,
-            actor,
-            binding_generation,
-            ..
-        } => (effect.root(), *actor, *binding_generation),
         _ => return None,
     };
-    ProductionIngressIdentity::new(root, incarnation, binding_generation).ok()
+    Some(ProductionIngressIdentity::new(operation, executor))
 }
 
 enum ExpectedCommitIntent {
-    Single(cser_core::EffectId, Option<cser_core::ComponentId>),
+    Single(cser_core::EffectId, cser_core::ComponentId),
     Composite {
         effect: cser_core::EffectId,
         components: Vec<cser_core::ComponentId>,
@@ -775,7 +720,7 @@ fn command_commit_intent_identity(request: &CommandRequest) -> Option<ExpectedCo
     match request {
         CommandRequest::RecordComponentCommitIntent {
             effect, component, ..
-        } => Some(ExpectedCommitIntent::Single(*effect, Some(*component))),
+        } => Some(ExpectedCommitIntent::Single(*effect, *component)),
         CommandRequest::RecordCompositeCommitIntents {
             effect, operations, ..
         } => Some(ExpectedCommitIntent::Composite {
@@ -792,22 +737,19 @@ fn command_commit_intent_identity(request: &CommandRequest) -> Option<ExpectedCo
 impl<S: InstalledCore> RecoveredCoreAuthority for ProductionCoreOwner<S> {
     type PersistenceError = S::PersistenceError;
 
-    fn snapshot_root(
+    fn snapshot_operation(
         &self,
-        root: cser_core::RootId,
+        operation: OperationId,
         snapshot: cser_core::SnapshotId,
     ) -> Result<cser_core::RecoverySnapshot, CoreError> {
         self.installed
-            .observe(|engine| engine.snapshot_root(root, snapshot))
+            .observe(|engine| engine.snapshot_operation(operation, snapshot))
     }
 
     fn transact(
         &self,
         command: Command,
     ) -> Result<TransitionReceipt, TxError<Self::PersistenceError>> {
-        if !command.is_profile_two_compatible() {
-            return Err(TxError::Core(CoreError::IncompatibleApiProfile));
-        }
         self.installed.transact(command)
     }
 }

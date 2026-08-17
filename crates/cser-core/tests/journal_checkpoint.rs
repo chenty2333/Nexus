@@ -2,29 +2,41 @@
 mod support;
 
 use cser_core::{
-    AGENT_COMPONENT_DMA, AGENT_OPERATION_COMPOSITE, ClaimScope, CommandRequest as Command,
-    CoreError, CoreLimits, DEVICE_CLAIM_QUEUE_SLOT, DeviceScopeId, Engine, JournalCheckpoint,
-    RootRecoveryState, standard_catalog,
+    AGENT_COMPONENT_DMA, AGENT_OPERATION_COMPOSITE, CatalogSet, ClaimScope,
+    CommandRequest as Command, ComponentProviderBinding, CoreError, CoreLimits,
+    DEVICE_CLAIM_QUEUE_SLOT, DeviceScopeId, Engine, JournalCheckpoint, OperationRecoveryState,
+    standard_catalog,
 };
 use support::{
-    Harness, charge, claim, effect, freshness, principal, recovery_anchor, resource,
+    Harness, charge, claim, effect, executor, freshness, provider, recovery_anchor, resource,
     resource_generation,
 };
 
-#[test]
-fn exact_replay_checkpoint_requires_advancing_anchor_and_fences_the_root() {
-    let mut harness = Harness::new();
-    let operation = effect(0xce01, 1);
-    let origin = principal(0xce01, 1);
+fn admit(
+    harness: &mut Harness,
+    effect: cser_core::EffectId,
+    origin: cser_core::ExecutorCoordinate,
+) {
     harness
-        .tx(Command::CreateCompositeEffect {
-            effect: operation,
+        .tx(Command::AdmitScopedCompositeEffect {
+            effect,
             origin,
-            binding_generation: 1,
             kind: AGENT_OPERATION_COMPOSITE,
-            charge_account: charge(0xce01),
+            charge_account: charge(effect.operation().get()),
+            bindings: vec![
+                ComponentProviderBinding::new(cser_core::AGENT_COMPONENT_REPLY, provider()),
+                ComponentProviderBinding::new(AGENT_COMPONENT_DMA, provider()),
+            ],
         })
         .unwrap();
+}
+
+#[test]
+fn exact_replay_checkpoint_requires_advancing_anchor_and_fences_the_operation() {
+    let mut harness = Harness::standard();
+    let operation = effect(0xce01, 1);
+    let origin = executor(0xce01, 1);
+    admit(&mut harness, operation, origin);
 
     let checkpoint = harness.checkpoint();
     let checkpoint_anchor = checkpoint.anchor();
@@ -38,13 +50,13 @@ fn exact_replay_checkpoint_requires_advancing_anchor_and_fences_the_root() {
 
     let encoded = checkpoint.encode();
     let decoded = JournalCheckpoint::decode(&encoded).unwrap();
-    let mut recovered = Engine::recover_legacy_compatibility(
-        standard_catalog(),
+    let mut recovered = Engine::recover(
+        CatalogSet::new(&[standard_catalog()]).unwrap(),
         CoreLimits::bounded_default(),
         recovery_anchor(
-            standard_catalog().digest(),
-            freshness(1, 1, 1, 1, 1),
-            freshness(2, 1, 1, 1, 2),
+            CatalogSet::new(&[standard_catalog()]).unwrap().digest(),
+            freshness(1, 1, 1, 1),
+            freshness(2, 1, 1, 2),
             harness.engine.revision(),
             harness.engine.head(),
             harness.engine.projection_digest(),
@@ -69,12 +81,11 @@ fn exact_replay_checkpoint_requires_advancing_anchor_and_fences_the_root() {
             |_| Ok::<(), ()>(()),
         )
         .unwrap();
-    assert_eq!(recovered.freshness(), freshness(2, 1, 1, 1, 2));
+    assert_eq!(recovered.freshness(), freshness(2, 1, 1, 2));
     assert_eq!(
-        recovered.root(operation.root()),
-        Some(RootRecoveryState::Fenced {
+        recovered.operation(operation.operation()),
+        Some(OperationRecoveryState::Fenced {
             crashed: origin,
-            binding_generation: 1,
             crash_generation: 1,
         })
     );
@@ -89,24 +100,15 @@ fn exact_replay_checkpoint_requires_advancing_anchor_and_fences_the_root() {
 
 #[test]
 fn checkpoint_recovery_quarantines_retained_device_claims() {
-    let mut harness = Harness::new();
+    let mut harness = Harness::standard();
     let operation = effect(0xce03, 1);
-    let origin = principal(0xce03, 1);
-    harness
-        .tx(Command::CreateCompositeEffect {
-            effect: operation,
-            origin,
-            binding_generation: 1,
-            kind: AGENT_OPERATION_COMPOSITE,
-            charge_account: charge(0xce03),
-        })
-        .unwrap();
+    let origin = executor(0xce03, 1);
+    admit(&mut harness, operation, origin);
     harness
         .tx(Command::AddComponentClaim {
             effect: operation,
             component: AGENT_COMPONENT_DMA,
             actor: origin,
-            binding_generation: 1,
             claim: claim(0xce03),
             kind: DEVICE_CLAIM_QUEUE_SLOT,
             scope: ClaimScope::Device(DeviceScopeId::new(0xce03).unwrap()),
@@ -116,13 +118,13 @@ fn checkpoint_recovery_quarantines_retained_device_claims() {
         })
         .unwrap();
     let checkpoint = harness.checkpoint();
-    let mut recovered = Engine::recover_legacy_compatibility(
-        standard_catalog(),
+    let mut recovered = Engine::recover(
+        CatalogSet::new(&[standard_catalog()]).unwrap(),
         CoreLimits::bounded_default(),
         recovery_anchor(
-            standard_catalog().digest(),
-            freshness(1, 1, 1, 1, 1),
-            freshness(2, 1, 1, 1, 2),
+            CatalogSet::new(&[standard_catalog()]).unwrap().digest(),
+            freshness(1, 1, 1, 1),
+            freshness(2, 1, 1, 2),
             harness.engine.revision(),
             harness.engine.head(),
             harness.engine.projection_digest(),
@@ -143,32 +145,24 @@ fn checkpoint_recovery_quarantines_retained_device_claims() {
         )
         .unwrap();
     assert!(matches!(
-        recovered.root(operation.root()),
-        Some(RootRecoveryState::Fenced { .. })
+        recovered.operation(operation.operation()),
+        Some(OperationRecoveryState::Fenced { .. })
     ));
 }
 
 #[test]
 fn checkpoint_refuses_the_uncheckpointed_recovery_epoch() {
-    let mut harness = Harness::new();
+    let mut harness = Harness::standard();
     let operation = effect(0xce02, 1);
-    harness
-        .tx(Command::CreateCompositeEffect {
-            effect: operation,
-            origin: principal(0xce02, 1),
-            binding_generation: 1,
-            kind: AGENT_OPERATION_COMPOSITE,
-            charge_account: charge(0xce02),
-        })
-        .unwrap();
+    admit(&mut harness, operation, executor(0xce02, 1));
 
-    let recovered = Engine::recover_legacy_compatibility(
-        standard_catalog(),
+    let recovered = Engine::recover(
+        CatalogSet::new(&[standard_catalog()]).unwrap(),
         CoreLimits::bounded_default(),
         recovery_anchor(
-            standard_catalog().digest(),
-            freshness(1, 1, 1, 1, 1),
-            freshness(2, 1, 1, 1, 2),
+            CatalogSet::new(&[standard_catalog()]).unwrap().digest(),
+            freshness(1, 1, 1, 1),
+            freshness(2, 1, 1, 2),
             harness.engine.revision(),
             harness.engine.head(),
             harness.engine.projection_digest(),

@@ -24,19 +24,38 @@ external effect.
 ## Journal and anchor order is an authority boundary
 
 The durable journal publication must precede trusted-anchor advancement. After
-any disk mutation error, a vNext instance is poisoned; its cache cannot decide
-the committed endpoint. Advancing the anchor first, trusting an uncommitted
-tail, or continuing from a stale cache can make recovery accept state that was
-never durably published.
+any disk mutation error, the active persistence instance is poisoned; its cache
+cannot decide the committed endpoint. Advancing the anchor first, trusting an
+uncommitted tail, or continuing from a stale cache can make recovery accept
+state that was never durably published.
 
 ## A persisted prepared transition must be infallible to apply
 
 A transition redesign may validate against immutable state and persist an
 exact delta before updating the in-memory authority. Once that record is
 durable, applying the prepared delta cannot perform another fallible business
-check or allocate an unreserved resource. A post-persistence apply failure
-would leave the journal ahead of the active authority and make the running
-instance unable to represent its committed state.
+check, allocate an unreserved resource, or hide a whole-state candidate clone.
+A post-persistence apply failure would leave the journal ahead of the active
+authority and make the running instance unable to represent its committed
+state.
+
+## A compatibility path is a second semantic owner
+
+Legacy constructors, command variants, portal policies, fixtures, and replay
+modes can keep an obsolete authority model executable even when production
+uses a newer profile. Reusing one of those paths in a new adapter or evidence
+run silently restores two meanings for admission, identity, or recovery. A
+predecessor format may be recognized to reject it fail-closed; it must not keep
+an active compatibility engine alive.
+
+## A renamed global generation is still parallel authority
+
+Wrapping a former raw binding generation in a newtype does not remove its
+semantics. If a global authority-binding generation remains in state, journal
+records, checkpoints, or trusted anchors, it can reject replay independently
+of the exact world, provider, operation, effect, and executor coordinates. A
+typed hard cut must remove that scalar from the wire and replay gate, not only
+rename it. Static cutover checks should reject its reintroduction.
 
 ## Retirement fences belong to distinct authorities
 
@@ -56,6 +75,22 @@ Pinning after dispatch creates a crash window with no recovery capability;
 unpinning after logical outcome but before physical retirement can strand a
 live claim.
 
+## Live accounting and immutable verification provenance are different state
+
+Releasing an effect may remove its live provider binding and decrement the
+provider's drain counter, but persisted facts and evidence still require the
+exact world, operation, provider generation, catalog, schema, and verifier
+generation that authenticated them. Deleting that provenance makes a locally
+accepted release unrecoverable; retaining it as a live binding prevents honest
+provider retirement. Terminal transitions must release live accounting while
+preserving immutable provenance, and full recovery invariants must validate
+both sides independently.
+
+An unpinned artifact placeholder is not historical artifact provenance. A
+pre-escape abort may retract it, while a real pinned lease must reach exact
+release confirmation before a normal release or handoff pivot can discard its
+live scope.
+
 ## Incremental state must remain fully reconstructable
 
 Transition-local indexes, invariants, and projection digests may remove
@@ -64,6 +99,25 @@ Recovery and checkpoint admission must rebuild derived indexes and the complete
 canonical projection from primary state and reject any mismatch. Accepting an
 incremental root without that reconstruction can preserve silent drift across
 reboot.
+
+An idempotent primary-state write may still be a semantic projection touch.
+Cold recovery deliberately keeps the trusted anchor projection while adding a
+fail-closed quarantine overlay; the following checkpoint can write the same
+device generation and quarantine values already present in primary state while
+needing to update the authenticated leaf. Filtering touches only by before/after
+primary equality leaves a stale projection. Mutation helpers must record exact
+write coordinates, and the full rebuild oracle must remain enabled in the
+diagnostic profile.
+
+## Durability publication cannot acquire new ownership
+
+Every allocation and potentially fallible ownership conversion must finish
+before journal append and trusted-anchor advance. In particular, caching an
+owned whole-state checkpoint by cloning its journal record after the anchor
+has advanced can fail or abort with durable state ahead of the in-memory
+publication. Prepare the owned checkpoint replacement before entering the
+durability boundary; the post-anchor suffix may only move prepared values and
+clear latches.
 
 ## Handoff custody is exact and recovery data is not authority
 

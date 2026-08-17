@@ -23,7 +23,7 @@
 extern crate alloc as __cser_alloc;
 extern crate core as __cser_core;
 
-use __cser_alloc::{sync::Arc, vec::Vec};
+use __cser_alloc::{boxed::Box, sync::Arc, vec::Vec};
 use cser_core::{
     CommandRequest, ComponentClaimProjection, ComponentId, ComponentProjection,
     CompositeEffectProjection, Digest, EffectId, Freshness, PressureProjection,
@@ -292,7 +292,7 @@ pub(crate) enum CoreObservation {
         /// Stable identity requested by the caller.
         effect: EffectId,
         /// Current core projection.
-        composite: Option<CompositeEffectProjection>,
+        composite: Option<Box<CompositeEffectProjection>>,
     },
     /// Exact component projection, or absence at the observed revision.
     Component {
@@ -346,7 +346,7 @@ pub(crate) enum TrustedTransition {
     ScopedAdmission,
     /// Recovery-artifact verifier binding and release are owner-owned.
     ArtifactLifecycle,
-    /// Immediate incarnation fencing is supervisor-owned.
+    /// Immediate executor fencing is supervisor-owned.
     Fence,
     /// Snapshot readiness and binding installation are supervisor-owned.
     Recovery,
@@ -358,7 +358,7 @@ pub(crate) enum TrustedTransition {
     Revocation,
     /// Cross-boot freshness activation is boot-owner-only.
     FreshnessCheckpoint,
-    /// Estate retirement and release require trusted evidence paths.
+    /// Effect retirement and release require trusted evidence paths.
     Retirement,
     /// Resource reuse requires a linear, durable permit.
     ResourceReuse,
@@ -367,8 +367,6 @@ pub(crate) enum TrustedTransition {
 /// Policy rejection before the production owner is called.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PortalPolicyError {
-    /// A profile-1 singleton command cannot enter production profile 2.
-    ProfileOneCommandForbidden,
     /// The operation belongs to a trusted domain or supervisor interface.
     TrustedPathRequired(TrustedTransition),
 }
@@ -473,21 +471,11 @@ impl<R: CoreRegistry> CorePortalVNext<R> {
 }
 
 fn require_client_command(request: &CommandRequest) -> Result<(), PortalPolicyError> {
-    if !request.is_profile_two_compatible() {
-        return Err(PortalPolicyError::ProfileOneCommandForbidden);
-    }
     let trusted = match request {
         CommandRequest::AddComponentClaim { .. }
         | CommandRequest::PrepareCompositeEffect { .. }
         | CommandRequest::RecordComponentCommitIntent { .. }
         | CommandRequest::RecordCompositeCommitIntents { .. } => return Ok(()),
-        CommandRequest::CreateEstate { .. }
-        | CommandRequest::CreateCompositeEffect { .. }
-        | CommandRequest::AddClaim { .. }
-        | CommandRequest::PrepareEffect { .. }
-        | CommandRequest::RecordCommitIntent { .. } => {
-            return Err(PortalPolicyError::ProfileOneCommandForbidden);
-        }
         CommandRequest::RegisterProviderGeneration { .. }
         | CommandRequest::FenceProviderEffects { .. }
         | CommandRequest::EnterProviderSettlementOnly { .. }
@@ -496,20 +484,15 @@ fn require_client_command(request: &CommandRequest) -> Result<(), PortalPolicyEr
         CommandRequest::BindArtifactReceiptVerifiers { .. }
         | CommandRequest::AuthorizeArtifactRelease { .. } => TrustedTransition::ArtifactLifecycle,
         CommandRequest::AbortUnescapedEffect { .. } => TrustedTransition::Retirement,
-        CommandRequest::FenceIncarnation { .. } => TrustedTransition::Fence,
+        CommandRequest::FenceExecutor { .. } => TrustedTransition::Fence,
         CommandRequest::Ready { .. } | CommandRequest::Rebind { .. } => TrustedTransition::Recovery,
         CommandRequest::AdoptEffect { .. }
         | CommandRequest::RebaseCompositePrecommitClaims { .. } => TrustedTransition::Adoption,
-        CommandRequest::ClaimSettlement { .. }
-        | CommandRequest::ClaimComponentSettlement { .. } => TrustedTransition::Settlement,
+        CommandRequest::ClaimComponentSettlement { .. } => TrustedTransition::Settlement,
         CommandRequest::BeginRevoke { .. } => TrustedTransition::Revocation,
         CommandRequest::CheckpointRecovery { .. } => TrustedTransition::FreshnessCheckpoint,
-        CommandRequest::ReleaseEstate { .. } | CommandRequest::ReleaseCompositeEffect { .. } => {
-            TrustedTransition::Retirement
-        }
-        CommandRequest::ReserveReuse { .. } | CommandRequest::ReserveComponentReuse { .. } => {
-            TrustedTransition::ResourceReuse
-        }
+        CommandRequest::ReleaseCompositeEffect { .. } => TrustedTransition::Retirement,
+        CommandRequest::ReserveComponentReuse { .. } => TrustedTransition::ResourceReuse,
     };
     Err(PortalPolicyError::TrustedPathRequired(trusted))
 }
@@ -521,10 +504,11 @@ mod tests {
 
     use cser_core::{
         BootGeneration, ChargeAccountId, ClaimId, ClaimScope, CommandRequest,
-        ComponentCommitOperation, ComponentId, CompositeKindId, CoreError, DeviceGeneration,
-        DomainId, EffectId, Freshness, JournalGeneration, ObligationKindId, PrincipalId,
-        PrincipalIncarnation, RegistryInstance, ResourceGeneration, ResourceId, RootId, SnapshotId,
-        TransitionEvent,
+        ComponentCommitOperation, ComponentId, ComponentProviderBinding, CompositeKindId,
+        CoreError, DeviceGeneration, EffectId, ExecutorCoordinate, ExecutorGeneration, ExecutorId,
+        Freshness, JournalGeneration, OperationId, ProviderCoordinate, ProviderGeneration,
+        ProviderId, RegistryInstance, ResourceGeneration, ResourceId, SnapshotId, TransitionEvent,
+        WorldId,
     };
 
     use super::*;
@@ -549,15 +533,13 @@ mod tests {
         fn transact(&self, request: CommandRequest) -> Result<CoreTransitionView, Self::Error> {
             let count = self.transacts.fetch_add(1, Ordering::AcqRel) + 1;
             let event = match request {
-                CommandRequest::CreateEstate { .. }
-                | CommandRequest::CreateCompositeEffect { .. } => TransitionEvent::EstateCreated,
-                CommandRequest::AddClaim { .. } | CommandRequest::AddComponentClaim { .. } => {
-                    TransitionEvent::ClaimAdded
+                CommandRequest::AdmitScopedCompositeEffect { .. } => {
+                    TransitionEvent::ScopedCompositeAdmitted
                 }
-                CommandRequest::PrepareEffect { .. }
-                | CommandRequest::PrepareCompositeEffect { .. } => TransitionEvent::EffectPrepared,
-                CommandRequest::RecordCommitIntent { .. }
-                | CommandRequest::RecordComponentCommitIntent { .. } => {
+                CommandRequest::AddComponentClaim { .. } => TransitionEvent::ClaimAdded,
+                CommandRequest::PrepareCompositeEffect { .. } => TransitionEvent::EffectPrepared,
+                CommandRequest::RecordComponentCommitIntent { .. }
+                | CommandRequest::RecordCompositeCommitIntents { .. } => {
                     TransitionEvent::CommitIntentDurable
                 }
                 _ => return Err(CoreError::InvariantViolation),
@@ -603,8 +585,8 @@ mod tests {
                 CoreQuery::Pressure => Ok(CoreObservation::Pressure {
                     stamp,
                     pressure: PressureProjection {
-                        roots: 0,
-                        estates: 0,
+                        operations: 0,
+                        composites: 0,
                         retained_claims: 0,
                         quarantined: false,
                         persistence_recovery_required: false,
@@ -614,20 +596,23 @@ mod tests {
         }
     }
 
-    fn root() -> RootId {
-        RootId::new(7).unwrap()
+    fn operation() -> OperationId {
+        OperationId::new(7).unwrap()
     }
 
     fn effect() -> EffectId {
-        EffectId::new(root(), 11).unwrap()
+        EffectId::new(operation(), 11).unwrap()
     }
 
     fn component() -> ComponentId {
         ComponentId::new(17).unwrap()
     }
 
-    fn actor() -> PrincipalIncarnation {
-        PrincipalIncarnation::new(PrincipalId::new(13).unwrap(), 2).unwrap()
+    fn actor() -> ExecutorCoordinate {
+        ExecutorCoordinate::new(
+            ExecutorId::new(13).unwrap(),
+            ExecutorGeneration::new(2).unwrap(),
+        )
     }
 
     fn digest(tag: u8) -> Digest {
@@ -638,46 +623,25 @@ mod tests {
         Freshness::new(
             BootGeneration::new(2).unwrap(),
             RegistryInstance::new(3).unwrap(),
-            4,
             DeviceGeneration::new(5).unwrap(),
             JournalGeneration::new(6).unwrap(),
         )
-        .unwrap()
     }
 
-    fn create() -> CommandRequest {
-        CommandRequest::CreateEstate {
+    fn admit() -> CommandRequest {
+        CommandRequest::AdmitScopedCompositeEffect {
             effect: effect(),
             origin: actor(),
-            binding_generation: 4,
-            domain: DomainId::new(17).unwrap(),
-            obligation: ObligationKindId::new(19).unwrap(),
-            charge_account: ChargeAccountId::new(23).unwrap(),
-        }
-    }
-
-    fn add_claim() -> CommandRequest {
-        CommandRequest::AddClaim {
-            effect: effect(),
-            actor: actor(),
-            binding_generation: 4,
-            claim: ClaimId::new(29).unwrap(),
-            domain: DomainId::new(17).unwrap(),
-            kind: cser_core::ClaimKindId::new(31).unwrap(),
-            scope: ClaimScope::Logical,
-            resource: ResourceId::new(37).unwrap(),
-            resource_generation: ResourceGeneration::new(1).unwrap(),
-            units: 1,
-        }
-    }
-
-    fn create_composite() -> CommandRequest {
-        CommandRequest::CreateCompositeEffect {
-            effect: effect(),
-            origin: actor(),
-            binding_generation: 4,
             kind: CompositeKindId::new(41).unwrap(),
             charge_account: ChargeAccountId::new(23).unwrap(),
+            bindings: vec![ComponentProviderBinding::new(
+                component(),
+                ProviderCoordinate::new(
+                    WorldId::new(1).unwrap(),
+                    ProviderId::new(2).unwrap(),
+                    ProviderGeneration::new(1).unwrap(),
+                ),
+            )],
         }
     }
 
@@ -686,7 +650,6 @@ mod tests {
             effect: effect(),
             component: component(),
             actor: actor(),
-            binding_generation: 4,
             claim: ClaimId::new(29).unwrap(),
             kind: cser_core::ClaimKindId::new(31).unwrap(),
             scope: ClaimScope::Logical,
@@ -720,37 +683,16 @@ mod tests {
     }
 
     #[test]
-    fn predecessor_client_prefix_is_rejected_before_the_shared_owner() {
+    fn scoped_admission_is_supervisor_only() {
         let owner = Arc::new(FakeRegistry::new());
         let portal = CorePortalVNext::new(Arc::clone(&owner));
-        let commands = [
-            create(),
-            create_composite(),
-            add_claim(),
-            CommandRequest::PrepareEffect {
-                effect: effect(),
-                actor: actor(),
-                binding_generation: 4,
-            },
-            CommandRequest::RecordCommitIntent {
-                effect: effect(),
-                actor: actor(),
-                binding_generation: 4,
-                operation: digest(41),
-            },
-        ];
-
-        for (index, command) in commands.into_iter().enumerate() {
-            let request_id = u64::try_from(index).unwrap() + 1;
-            assert_eq!(
-                portal.dispatch(PortalRequest::transact(request_id, command).unwrap()),
-                Err(PortalDispatchError::Policy(
-                    PortalPolicyError::ProfileOneCommandForbidden
-                ))
-            );
-        }
+        assert_eq!(
+            portal.dispatch(PortalRequest::transact(1, admit()).unwrap()),
+            Err(PortalDispatchError::Policy(
+                PortalPolicyError::TrustedPathRequired(TrustedTransition::ScopedAdmission)
+            ))
+        );
         assert_eq!(owner.transacts.load(Ordering::Acquire), 0);
-        assert_eq!(Arc::strong_count(&owner), 2);
     }
 
     #[test]
@@ -762,19 +704,16 @@ mod tests {
             CommandRequest::PrepareCompositeEffect {
                 effect: effect(),
                 actor: actor(),
-                binding_generation: 4,
             },
             CommandRequest::RecordComponentCommitIntent {
                 effect: effect(),
                 component: component(),
                 actor: actor(),
-                binding_generation: 4,
                 operation: digest(43),
             },
             CommandRequest::RecordCompositeCommitIntents {
                 effect: effect(),
                 actor: actor(),
-                binding_generation: 4,
                 operations: vec![ComponentCommitOperation::new(component(), digest(44))],
             },
         ];
@@ -796,16 +735,15 @@ mod tests {
         let portal = CorePortalVNext::new(Arc::clone(&owner));
         let rejected = [
             (
-                CommandRequest::FenceIncarnation {
-                    root: root(),
+                CommandRequest::FenceExecutor {
+                    operation: operation(),
                     crashed: actor(),
-                    binding_generation: 4,
                 },
                 TrustedTransition::Fence,
             ),
             (
                 CommandRequest::Ready {
-                    root: root(),
+                    operation: operation(),
                     snapshot: SnapshotId::new(43).unwrap(),
                     successor: actor(),
                 },
@@ -813,10 +751,9 @@ mod tests {
             ),
             (
                 CommandRequest::Rebind {
-                    root: root(),
+                    operation: operation(),
                     snapshot: SnapshotId::new(43).unwrap(),
                     successor: actor(),
-                    binding_generation: 4,
                 },
                 TrustedTransition::Recovery,
             ),
@@ -824,7 +761,6 @@ mod tests {
                 CommandRequest::AdoptEffect {
                     effect: effect(),
                     successor: actor(),
-                    binding_generation: 4,
                 },
                 TrustedTransition::Adoption,
             ),
@@ -832,16 +768,8 @@ mod tests {
                 CommandRequest::RebaseCompositePrecommitClaims {
                     effect: effect(),
                     actor: actor(),
-                    binding_generation: 4,
                 },
                 TrustedTransition::Adoption,
-            ),
-            (
-                CommandRequest::ClaimSettlement {
-                    effect: effect(),
-                    claimant: actor(),
-                },
-                TrustedTransition::Settlement,
             ),
             (
                 CommandRequest::ClaimComponentSettlement {
@@ -855,7 +783,6 @@ mod tests {
                 CommandRequest::BeginRevoke {
                     effect: effect(),
                     expected_actor: actor(),
-                    binding_generation: 4,
                     authority_epoch: 1,
                 },
                 TrustedTransition::Revocation,
@@ -869,35 +796,14 @@ mod tests {
                 TrustedTransition::FreshnessCheckpoint,
             ),
             (
-                CommandRequest::ReleaseEstate { effect: effect() },
-                TrustedTransition::Retirement,
-            ),
-            (
                 CommandRequest::ReleaseCompositeEffect { effect: effect() },
                 TrustedTransition::Retirement,
-            ),
-            (
-                CommandRequest::ReserveReuse {
-                    effect: effect(),
-                    actor: actor(),
-                    binding_generation: 4,
-                    claim: ClaimId::new(47).unwrap(),
-                    domain: DomainId::new(17).unwrap(),
-                    kind: cser_core::ClaimKindId::new(31).unwrap(),
-                    scope: ClaimScope::Logical,
-                    resource: ResourceId::new(37).unwrap(),
-                    expected_generation: ResourceGeneration::new(1).unwrap(),
-                    units: 1,
-                    reuse_contract: digest(17),
-                },
-                TrustedTransition::ResourceReuse,
             ),
             (
                 CommandRequest::ReserveComponentReuse {
                     effect: effect(),
                     component: component(),
                     actor: actor(),
-                    binding_generation: 4,
                     claim: ClaimId::new(53).unwrap(),
                     kind: cser_core::ClaimKindId::new(31).unwrap(),
                     scope: ClaimScope::Logical,
@@ -947,10 +853,20 @@ mod tests {
         }
         assert_eq!(owner.observations.load(Ordering::Acquire), 4);
 
-        let request = PortalRequest::transact(60, create_composite()).unwrap();
-        portal.dispatch(request.clone()).unwrap();
-        portal.dispatch(request).unwrap();
-        assert_eq!(owner.transacts.load(Ordering::Acquire), 2);
+        let request = PortalRequest::transact(60, admit()).unwrap();
+        assert_eq!(
+            portal.dispatch(request.clone()),
+            Err(PortalDispatchError::Policy(
+                PortalPolicyError::TrustedPathRequired(TrustedTransition::ScopedAdmission)
+            ))
+        );
+        assert_eq!(
+            portal.dispatch(request),
+            Err(PortalDispatchError::Policy(
+                PortalPolicyError::TrustedPathRequired(TrustedTransition::ScopedAdmission)
+            ))
+        );
+        assert_eq!(owner.transacts.load(Ordering::Acquire), 0);
     }
 
     #[test]
@@ -974,7 +890,7 @@ mod tests {
 
         let portal = CorePortalVNext::new(Arc::new(FailingRegistry));
         assert_eq!(
-            portal.dispatch(PortalRequest::transact(1, create()).unwrap()),
+            portal.dispatch(PortalRequest::transact(1, add_component_claim()).unwrap()),
             Err(PortalDispatchError::Registry(CoreError::Backpressure))
         );
         assert_eq!(

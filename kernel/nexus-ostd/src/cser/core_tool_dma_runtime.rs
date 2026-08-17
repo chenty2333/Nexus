@@ -11,8 +11,9 @@
 //! component independently.
 
 use cser_core::{
-    ChargeAccountId, ChildDescriptorV1, Command, CommitIntent, CoreError, EffectId, Engine,
-    PrincipalIncarnation, SettlementClaim, TOOL_DMA_COMPONENT_TOOL, TOOL_EVIDENCE_OUTCOME_ACK,
+    ChargeAccountId, ChildDescriptorV1, Command, CommitIntent, ComponentProviderBinding, CoreError,
+    EffectId, Engine, ExecutorCoordinate, SettlementClaim, TOOL_DMA_COMPONENT_TOOL,
+    TOOL_EVIDENCE_OUTCOME_ACK,
 };
 
 use super::core_tool_adapter::{
@@ -28,17 +29,17 @@ use super::core_tool_adapter::{
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ToolDmaRuntime {
     plan: ToolOperationPlan,
-    verifier_epoch: u64,
+    verifier_generation: u64,
 }
 
 impl ToolDmaRuntime {
-    pub(crate) const fn new(plan: ToolOperationPlan, verifier_epoch: u64) -> Option<Self> {
-        if verifier_epoch == 0 {
+    pub(crate) const fn new(plan: ToolOperationPlan, verifier_generation: u64) -> Option<Self> {
+        if verifier_generation == 0 {
             None
         } else {
             Some(Self {
                 plan,
-                verifier_epoch,
+                verifier_generation,
             })
         }
     }
@@ -77,7 +78,7 @@ impl ToolDmaRuntime {
         if let Err(error) = self.require_plan_intent(&intent) {
             return Err(ToolCommitFailure { error, intent });
         }
-        let verifier = match ToolFactVerifier::commit(self.plan, self.verifier_epoch) {
+        let verifier = match ToolFactVerifier::commit(self.plan, self.verifier_generation) {
             Some(verifier) => verifier,
             None => {
                 return Err(ToolCommitFailure {
@@ -132,7 +133,7 @@ impl ToolDmaRuntime {
             Ok(verified) => verified,
             Err(error) => return Err(ToolCommitFailure { error, intent }),
         };
-        let outcome_verifier = match ToolFactVerifier::commit(self.plan, self.verifier_epoch) {
+        let outcome_verifier = match ToolFactVerifier::commit(self.plan, self.verifier_generation) {
             Some(verifier) => verifier,
             None => {
                 return Err(ToolCommitFailure {
@@ -171,7 +172,7 @@ impl ToolDmaRuntime {
         let verified_descriptor =
             engine.verify_child_descriptor(descriptor, &descriptor_verifier, observation)?;
         let resolution_verifier =
-            ToolHandoffResolutionVerifier::new(self.plan, self.verifier_epoch)
+            ToolHandoffResolutionVerifier::new(self.plan, self.verifier_generation)
                 .ok_or(CoreError::InvalidPayload)?;
         let resolution = engine.verify_handoff_resolution(
             verified_descriptor,
@@ -202,7 +203,7 @@ impl ToolDmaRuntime {
             self.plan,
             source.plan(),
             descriptor,
-            self.verifier_epoch,
+            self.verifier_generation,
         )
         .ok_or(CoreError::InvalidPayload)?;
         Ok(engine
@@ -217,9 +218,9 @@ impl ToolDmaRuntime {
         &self,
         engine: &Engine,
         observation: &DurableToolObservation,
-        origin: PrincipalIncarnation,
-        binding_generation: u64,
+        origin: ExecutorCoordinate,
         charge_account: ChargeAccountId,
+        provider: ComponentProviderBinding,
     ) -> Result<(Command, ChildDescriptorV1), CoreError> {
         let verifier =
             ToolChildDescriptorVerifier::new(self.plan).ok_or(CoreError::InvalidPayload)?;
@@ -228,7 +229,7 @@ impl ToolDmaRuntime {
             .map_err(|_| CoreError::VerificationFailed)?;
         let verified = engine.verify_child_descriptor(descriptor, &verifier, observation)?;
         Ok((
-            verified.install(origin, binding_generation, charge_account),
+            verified.install(origin, charge_account, provider),
             descriptor,
         ))
     }
@@ -242,8 +243,7 @@ impl ToolDmaRuntime {
         engine: &Engine,
         observation: &DurableToolObservation,
         child_plan: ToolOperationPlan,
-        actor: PrincipalIncarnation,
-        binding_generation: u64,
+        actor: ExecutorCoordinate,
     ) -> Result<Command, CoreError> {
         let verifier =
             ToolChildDescriptorVerifier::new(self.plan).ok_or(CoreError::InvalidPayload)?;
@@ -252,11 +252,7 @@ impl ToolDmaRuntime {
             .map_err(|_| CoreError::VerificationFailed)?;
         let verified = engine.verify_child_descriptor(descriptor, &verifier, observation)?;
         self.require_exact_handoff_child_plan(descriptor, child_plan)?;
-        Ok(verified.release_source_and_record_target_intent(
-            actor,
-            binding_generation,
-            child_plan.operation_digest(),
-        ))
+        Ok(verified.release_source_and_record_target_intent(actor, child_plan.operation_digest()))
     }
 
     /// Records that later settlement refers to the same durable endpoint
@@ -287,7 +283,7 @@ impl ToolDmaRuntime {
         if let Err(error) = self.require_plan_claim(&claim) {
             return Err(ToolSettlementFailure { error, claim });
         }
-        let verifier = match ToolFactVerifier::apply(self.plan, self.verifier_epoch) {
+        let verifier = match ToolFactVerifier::apply(self.plan, self.verifier_generation) {
             Some(verifier) => verifier,
             None => {
                 return Err(ToolSettlementFailure {
@@ -319,7 +315,7 @@ impl ToolDmaRuntime {
         if let Err(error) = self.require_plan_claim(&claim) {
             return Err(ToolSettlementFailure { error, claim });
         }
-        let verifier = match ToolFactVerifier::settlement(self.plan, self.verifier_epoch) {
+        let verifier = match ToolFactVerifier::settlement(self.plan, self.verifier_generation) {
             Some(verifier) => verifier,
             None => {
                 return Err(ToolSettlementFailure {
@@ -348,7 +344,7 @@ impl ToolDmaRuntime {
         engine: &Engine,
         observation: &DurableToolObservation,
     ) -> Result<Command, CoreError> {
-        let verifier = ToolOutcomeVerifier::new(self.plan, self.verifier_epoch)
+        let verifier = ToolOutcomeVerifier::new(self.plan, self.verifier_generation)
             .ok_or(CoreError::InvalidPayload)?;
         Ok(engine
             .verify_component_retirement_evidence(
@@ -363,9 +359,7 @@ impl ToolDmaRuntime {
     }
 
     fn require_plan_intent(&self, intent: &CommitIntent) -> Result<(), CoreError> {
-        if intent.effect() != self.plan.effect()
-            || intent.component() != Some(self.plan.component())
-        {
+        if intent.effect() != self.plan.effect() || intent.component() != self.plan.component() {
             return Err(CoreError::StaleCommitIntent);
         }
         Ok(())
@@ -374,7 +368,7 @@ impl ToolDmaRuntime {
     fn require_handoff_intent(&self, intent: &CommitIntent) -> Result<(), CoreError> {
         if self.plan.component() != cser_core::TOOL_HANDOFF_SOURCE_COMPONENT
             || intent.effect() != self.plan.effect()
-            || intent.component() != Some(self.plan.component())
+            || intent.component() != self.plan.component()
         {
             return Err(CoreError::StaleCommitIntent);
         }
@@ -382,8 +376,7 @@ impl ToolDmaRuntime {
     }
 
     fn require_plan_claim(&self, claim: &SettlementClaim) -> Result<(), CoreError> {
-        if claim.effect() != self.plan.effect() || claim.component() != Some(self.plan.component())
-        {
+        if claim.effect() != self.plan.effect() || claim.component() != self.plan.component() {
             return Err(CoreError::StaleSettlementClaim);
         }
         Ok(())
@@ -449,6 +442,6 @@ pub(crate) const fn tool_component(effect: EffectId) -> (EffectId, cser_core::Co
 
 /// Kept here rather than in the UART transport: the currently active
 /// successor is a core authority coordinate, not endpoint metadata.
-pub(crate) const fn tool_settlement_actor(actor: PrincipalIncarnation) -> PrincipalIncarnation {
+pub(crate) const fn tool_settlement_actor(actor: ExecutorCoordinate) -> ExecutorCoordinate {
     actor
 }

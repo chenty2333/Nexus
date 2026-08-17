@@ -15,8 +15,9 @@ hardware-general recovery.
 ## Production closure
 
 `cser-core` is a non-optional dependency and the default kernel feature list is
-exactly `cser-production`. The installed owner accepts core API profile 2 and
-journal schema 6 only. During boot, one `ProductionCoreOwner` is installed
+exactly `cser-production`. The installed owner accepts core API profile 6,
+catalog 8, projection 10, recovery snapshot 6, and journal schema 10 only.
+During boot, one `ProductionCoreOwner` is installed
 behind an `Arc` shared by:
 
 - the stateless `NXP3` portal;
@@ -32,7 +33,7 @@ and DMA bind distinct `ComponentId` values under that parent. There is no live
 dual-write, singleton-estate command path, or legacy Registry fallback.
 
 [`cser-production-sources.txt`](cser-production-sources.txt) is the exact
-production source manifest. The static cutover gate requires these thirteen
+production source manifest. The static cutover gate requires these fourteen
 files, requires each to be selected once by `cser-production`, and rejects old
 Registry, portal, supervisor, and semantic-mirror sources:
 
@@ -53,12 +54,11 @@ core_tpm_anchor.rs
 ```
 
 The `cser-core-reply-recovery` and `cser-core-dma-recovery` OSDK schemes select
-their matching features with default features disabled. They explicitly use
-the offline profile-1 compatibility constructor and mark their output as
-historical. They are mutually exclusive, test-only evidence profiles: the
-harness runs their real task,
-rebind, reply, and DMA guest slices before `cser-production`, but neither owns
-the production Registry nor substitutes for the persistent cutover proof. The
+their matching features with default features disabled. They are mutually
+exclusive, test-only evidence profiles using the same typed Profile 6 grammar:
+the harness runs their real task, rebind, reply, and DMA guest slices before
+`cser-production`, but neither owns the production Registry nor substitutes
+for the persistent cutover proof. The
 `cser-core-tpm-anchor` feature remains a compile-only development profile. In
 particular, `core_runtime_slice.rs`, `core_runtime_dev.rs`, and
 `core_dma_runtime.rs` are excluded from the production manifest.
@@ -212,7 +212,7 @@ This evidence cannot establish:
   completeness.
 
 The early fence, status reset, ISR drain, and global IOTLB command establish the
-QEMU quarantine protocol before schema-6 replay. The ordered arena overlay and
+QEMU quarantine protocol before schema-10 replay. The ordered arena overlay and
 four-boot trace together establish exact reservation, retirement, and
 generation-plus-one reuse for the declared guest coordinates. They remain
 separate from any claim about host physical PFN identity or an untested device,

@@ -14,7 +14,7 @@
 //! sector, and verification compares that independently recovered record with
 //! every challenge coordinate.  An absent, corrupt, ambiguous, or I/O-failed
 //! observation never becomes a known-failure receipt: it remains
-//! indeterminate so the causal estate continues to own its reply obligation
+//! indeterminate so the causal effect continues to own its reply obligation
 //! and publication slot.
 //!
 //! Evidence boundary: the QEMU raw-image fixture and an acknowledged emulated
@@ -25,12 +25,13 @@
 
 use cser_core::{
     ClaimId, ClaimScope, ComponentId, Digest, EffectFactChallenge, EffectFactKind, EffectId,
-    EffectReceiptVerifier, EvidenceChallenge, ExternalOutcome, PrincipalIncarnation,
-    ProviderVerificationScope, REPLY_APPLY_RECEIPT_SCHEMA, REPLY_COMMIT_RECEIPT_SCHEMA,
-    REPLY_DOMAIN, REPLY_EVIDENCE_PUBLICATION_ACK, REPLY_OBLIGATION_PUBLICATION,
-    REPLY_RECEIPT_SCHEMA, REPLY_SETTLEMENT_RECEIPT_SCHEMA, REPLY_VERIFIER, ReceiptSchemaId,
-    ReceiptVerifier, ResourceGeneration, ResourceId, VerificationError, VerifiedEffectObservation,
-    VerifiedObservation, VerifierBinding, VerifierGeneration, VerifierIdentity,
+    EffectReceiptVerifier, EvidenceChallenge, ExecutorCoordinate, ExecutorGeneration, ExecutorId,
+    ExternalOutcome, ProviderVerificationScope, REPLY_APPLY_RECEIPT_SCHEMA,
+    REPLY_COMMIT_RECEIPT_SCHEMA, REPLY_DOMAIN, REPLY_EVIDENCE_PUBLICATION_ACK,
+    REPLY_OBLIGATION_PUBLICATION, REPLY_RECEIPT_SCHEMA, REPLY_SETTLEMENT_RECEIPT_SCHEMA,
+    REPLY_VERIFIER, ReceiptSchemaId, ReceiptVerifier, ResourceGeneration, ResourceId,
+    VerificationError, VerifiedEffectObservation, VerifiedObservation, VerifierBinding,
+    VerifierGeneration, VerifierIdentity,
 };
 use sha2::{Digest as _, Sha256};
 
@@ -54,7 +55,7 @@ const DELIVERY_SLOTS: u32 = 128;
 const REQUIRED_OUTBOX_SECTORS: u32 = FIRST_DELIVERY_LBA + DELIVERY_SLOTS;
 
 const RECORD_MAGIC: [u8; 8] = *b"CSEROUT\0";
-const RECORD_VERSION: u16 = 2;
+const RECORD_VERSION: u16 = 3;
 const RECORD_LEN: u16 = 208;
 const RECORD_STATE_COMMITTED: u32 = 1;
 
@@ -106,7 +107,7 @@ impl ReplyOutboxIdentity {
 struct ReplyCommitKey {
     reply: ReplyOutboxIdentity,
     component: ComponentId,
-    actor: PrincipalIncarnation,
+    actor: ExecutorCoordinate,
     authority_generation: u64,
     intent_nonce: u64,
     operation: Digest,
@@ -120,9 +121,7 @@ impl ReplyCommitKey {
         let Some(reply) = ReplyOutboxIdentity::new(challenge.effect(), reply_sequence) else {
             return Err(ReplyOutboxRequestError::InvalidReplySequence);
         };
-        let Some(component) = challenge.component() else {
-            return Err(ReplyOutboxRequestError::WrongChallenge);
-        };
+        let component = challenge.component();
         if challenge.kind() != EffectFactKind::CommitOutcome
             || challenge.domain() != REPLY_DOMAIN
             || challenge.obligation() != REPLY_OBLIGATION_PUBLICATION
@@ -161,7 +160,7 @@ impl ReplyCommitReceipt {
         self.key.reply
     }
 
-    pub(crate) const fn actor(self) -> PrincipalIncarnation {
+    pub(crate) const fn actor(self) -> ExecutorCoordinate {
         self.key.actor
     }
 
@@ -434,18 +433,18 @@ impl ReplyRecord {
         bytes[10..12].copy_from_slice(&RECORD_LEN.to_le_bytes());
         bytes[12..16].copy_from_slice(&RECORD_STATE_COMMITTED.to_le_bytes());
         bytes[16..24].copy_from_slice(&self.commit_generation.to_le_bytes());
-        bytes[24..32].copy_from_slice(&self.key.reply.effect().root().get().to_le_bytes());
+        bytes[24..32].copy_from_slice(&self.key.reply.effect().operation().get().to_le_bytes());
         bytes[32..40].copy_from_slice(&self.key.reply.effect().sequence().to_le_bytes());
         bytes[40..48].copy_from_slice(&self.key.reply.sequence().to_le_bytes());
-        bytes[48..56].copy_from_slice(&self.key.actor.principal().get().to_le_bytes());
-        bytes[56..64].copy_from_slice(&self.key.actor.generation().to_le_bytes());
+        bytes[48..56].copy_from_slice(&self.key.actor.executor().get().to_le_bytes());
+        bytes[56..64].copy_from_slice(&self.key.actor.generation().get().to_le_bytes());
         bytes[64..72].copy_from_slice(&self.key.authority_generation.to_le_bytes());
         bytes[72..80].copy_from_slice(&self.key.intent_nonce.to_le_bytes());
         bytes[80..112].copy_from_slice(&self.key.operation.bytes());
         bytes[112..144].copy_from_slice(&self.payload_digest.bytes());
         bytes[144..148].copy_from_slice(&self.key.component.get().to_le_bytes());
         // 148..176 is reserved and must remain zero.  The digest covers the
-        // exact v2 framing plus every reserved and trailing byte.  A v1 record
+        // exact v3 framing plus every reserved and trailing byte.  Older records
         // is intentionally not inferred or upgraded because it did not bind a
         // component identity.
         let checksum = sector_checksum(bytes);
@@ -519,7 +518,7 @@ impl ReplyDeliveryKind {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ReplyDeliveryKey {
     reply: ReplyOutboxIdentity,
-    component: Option<ComponentId>,
+    component: ComponentId,
     claim: ClaimId,
     resource: ResourceId,
     resource_generation: ResourceGeneration,
@@ -598,11 +597,10 @@ impl ReplyDeliveryRecord {
         bytes[10..12].copy_from_slice(&DELIVERY_RECORD_LEN.to_le_bytes());
         bytes[12..16].copy_from_slice(&self.kind.state().to_le_bytes());
         bytes[16..24].copy_from_slice(&self.generation.to_le_bytes());
-        bytes[24..32].copy_from_slice(&self.key.reply.effect().root().get().to_le_bytes());
+        bytes[24..32].copy_from_slice(&self.key.reply.effect().operation().get().to_le_bytes());
         bytes[32..40].copy_from_slice(&self.key.reply.effect().sequence().to_le_bytes());
         bytes[40..48].copy_from_slice(&self.key.reply.sequence().to_le_bytes());
-        bytes[48..52]
-            .copy_from_slice(&self.key.component.map_or(0, ComponentId::get).to_le_bytes());
+        bytes[48..52].copy_from_slice(&self.key.component.get().to_le_bytes());
         bytes[56..64].copy_from_slice(&self.key.claim.get().to_le_bytes());
         bytes[64..72].copy_from_slice(&self.key.resource.get().to_le_bytes());
         bytes[72..80].copy_from_slice(&self.key.resource_generation.get().to_le_bytes());
@@ -699,13 +697,10 @@ fn decode_delivery_structural_key(
         DELIVERY_STATE_ACKNOWLEDGED => ReplyDeliveryKind::Acknowledged,
         _ => return None,
     };
-    let root = cser_core::RootId::new(read_u64(bytes, 24)).ok()?;
-    let effect = EffectId::new(root, read_u64(bytes, 32)).ok()?;
+    let operation = cser_core::OperationId::new(read_u64(bytes, 24)).ok()?;
+    let effect = EffectId::new(operation, read_u64(bytes, 32)).ok()?;
     let reply = ReplyOutboxIdentity::new(effect, read_u64(bytes, 40))?;
-    let component = match read_u32(bytes, 48) {
-        0 => None,
-        value => Some(ComponentId::new(value).ok()?),
-    };
+    let component = ComponentId::new(read_u32(bytes, 48)).ok()?;
     let claim = ClaimId::new(read_u64(bytes, 56)).ok()?;
     let resource = ResourceId::new(read_u64(bytes, 64)).ok()?;
     let resource_generation = ResourceGeneration::new(read_u64(bytes, 72)).ok()?;
@@ -743,11 +738,12 @@ fn decode_structural_key(bytes: &[u8; SECTOR_BYTES]) -> Option<ReplyCommitKey> {
     {
         return None;
     }
-    let root = cser_core::RootId::new(read_u64(bytes, 24)).ok()?;
-    let effect = EffectId::new(root, read_u64(bytes, 32)).ok()?;
+    let operation_id = cser_core::OperationId::new(read_u64(bytes, 24)).ok()?;
+    let effect = EffectId::new(operation_id, read_u64(bytes, 32)).ok()?;
     let reply = ReplyOutboxIdentity::new(effect, read_u64(bytes, 40))?;
-    let principal = cser_core::PrincipalId::new(read_u64(bytes, 48)).ok()?;
-    let actor = PrincipalIncarnation::new(principal, read_u64(bytes, 56)).ok()?;
+    let executor = ExecutorId::new(read_u64(bytes, 48)).ok()?;
+    let actor =
+        ExecutorCoordinate::new(executor, ExecutorGeneration::new(read_u64(bytes, 56)).ok()?);
     let authority_generation = read_u64(bytes, 64);
     let intent_nonce = read_u64(bytes, 72);
     let operation = Digest::new(read_array_32(bytes, 80));
@@ -1526,7 +1522,7 @@ impl EffectReceiptVerifier for ReplyOutboxCommitVerifier {
                 self.epoch,
             )
             || challenge.effect() != receipt.reply().effect()
-            || challenge.component() != Some(receipt.component())
+            || challenge.component() != receipt.component()
             || challenge.actor() != receipt.actor()
             || challenge.generation() != receipt.authority_generation()
             || challenge.nonce() != receipt.intent_nonce()
@@ -1583,6 +1579,7 @@ fn reply_outbox_effect_scope_matches(
     reply_outbox_scope_matches(
         challenge.verification_scope(),
         challenge.expected_verifier_binding(),
+        challenge.effect().operation(),
         schema,
         generation,
     )
@@ -1596,27 +1593,27 @@ fn reply_outbox_evidence_scope_matches(
     reply_outbox_scope_matches(
         challenge.verification_scope(),
         challenge.expected_verifier_binding(),
+        challenge.effect().operation(),
         schema,
         generation,
     )
 }
 
 fn reply_outbox_scope_matches(
-    scope: Option<ProviderVerificationScope>,
-    binding: Option<VerifierBinding>,
+    scope: ProviderVerificationScope,
+    binding: VerifierBinding,
+    operation: cser_core::OperationId,
     schema: ReceiptSchemaId,
     generation: u64,
 ) -> bool {
-    match (scope, binding) {
-        (None, None) => false,
-        (Some(scope), Some(binding)) => {
-            scope.world() == PRODUCTION_WORLD
-                && scope.provider() == STANDARD_REPLY_PROVIDER
-                && scope.verifier_binding() == binding
-                && Some(binding) == reply_outbox_binding(generation, schema)
-        }
-        _ => false,
-    }
+    let Some(expected) = reply_outbox_binding(generation, schema) else {
+        return false;
+    };
+    scope.world() == PRODUCTION_WORLD
+        && scope.provider() == STANDARD_REPLY_PROVIDER
+        && scope.operation() == operation
+        && scope.verifier_binding() == binding
+        && binding == expected
 }
 
 const fn slot_lba(slot: u32) -> u32 {
@@ -1675,10 +1672,13 @@ mod tests {
 
     use cser_core::{
         AGENT_COMPONENT_DMA, AGENT_COMPONENT_REPLY, AGENT_OPERATION_COMPOSITE, BootGeneration,
-        ChargeAccountId, ClaimId, ClaimScope, CommandRequest, ComponentCommitOperation, CoreError,
-        CoreLimits, DEVICE_CLAIM_QUEUE_SLOT, DeviceGeneration, DeviceScopeId, Digest, Engine,
-        Freshness, JournalGeneration, JournalRecord, PrincipalId, RegistryInstance,
-        ResourceGeneration, ResourceId, RootId, TransitionDurability, TransitionOutput, WorldId,
+        CatalogSet, ChargeAccountId, ClaimId, ClaimScope, CommandRequest, ComponentCommitOperation,
+        ComponentProviderBinding, CoreError, CoreLimits, DEVICE_CLAIM_QUEUE_SLOT,
+        DEVICE_COMMIT_RECEIPT_SCHEMA, DEVICE_RECEIPT_SCHEMA, DEVICE_VERIFIER, DeviceGeneration,
+        DeviceScopeId, Digest, Engine, ExecutorCoordinate, ExecutorGeneration, ExecutorId,
+        Freshness, JournalGeneration, JournalRecord, OperationId, ProviderCoordinate,
+        ProviderGeneration, ProviderId, RegistryInstance, ResourceGeneration, ResourceId,
+        TransitionDurability, TransitionOutput, VerifierBinding, VerifierGeneration, WorldId,
         standard_catalog,
     };
     use ostd::prelude::ktest;
@@ -1782,11 +1782,15 @@ mod tests {
     }
 
     fn key(root: u64, reply_sequence: u64, nonce: u64) -> ReplyCommitKey {
-        let effect = EffectId::new(RootId::new(root).unwrap(), 1).unwrap();
+        let operation = OperationId::new(root).unwrap();
+        let effect = EffectId::new(operation, 1).unwrap();
         ReplyCommitKey {
             reply: ReplyOutboxIdentity::new(effect, reply_sequence).unwrap(),
             component: AGENT_COMPONENT_REPLY,
-            actor: PrincipalIncarnation::new(PrincipalId::new(root).unwrap(), 1).unwrap(),
+            actor: ExecutorCoordinate::new(
+                ExecutorId::new(root).unwrap(),
+                ExecutorGeneration::new(1).unwrap(),
+            ),
             authority_generation: 1,
             intent_nonce: nonce,
             operation: digest(0x41),
@@ -1794,7 +1798,7 @@ mod tests {
     }
 
     fn delivery_plan(root_value: u64, component: ComponentId) -> ReplyPlan {
-        let effect = EffectId::new(RootId::new(root_value).unwrap(), 1).unwrap();
+        let effect = EffectId::new(OperationId::new(root_value).unwrap(), 1).unwrap();
         let coordinate = ReplyCoordinate::new_component(
             effect,
             component,
@@ -1809,28 +1813,101 @@ mod tests {
         let freshness = Freshness::new(
             BootGeneration::new(1).unwrap(),
             RegistryInstance::new(1).unwrap(),
-            1,
             DeviceGeneration::new(1).unwrap(),
             JournalGeneration::new(1).unwrap(),
-        )
-        .unwrap();
+        );
+        let catalog_set = CatalogSet::new(&[standard_catalog()]).unwrap();
         let mut engine = Engine::new(
             WorldId::new(1).unwrap(),
-            standard_catalog(),
+            catalog_set,
             CoreLimits::bounded_default(),
             freshness,
         );
         let mut durability = MemoryDurability;
-        let effect = EffectId::new(RootId::new(root_value).unwrap(), 1).unwrap();
-        let actor = PrincipalIncarnation::new(PrincipalId::new(root_value).unwrap(), 1).unwrap();
+        let effect = EffectId::new(OperationId::new(root_value).unwrap(), 1).unwrap();
+        let actor = ExecutorCoordinate::new(
+            ExecutorId::new(root_value).unwrap(),
+            ExecutorGeneration::new(1).unwrap(),
+        );
+        let provider_world = WorldId::new(1).unwrap();
+        let provider_reply = ProviderCoordinate::new(
+            provider_world,
+            ProviderId::new(1).unwrap(),
+            ProviderGeneration::new(1).unwrap(),
+        );
+        let provider_dma = ProviderCoordinate::new(
+            provider_world,
+            ProviderId::new(2).unwrap(),
+            ProviderGeneration::new(1).unwrap(),
+        );
+        let verifier_generation = VerifierGeneration::new(1).unwrap();
+        let verifier_bindings = vec![
+            VerifierBinding::new(
+                REPLY_VERIFIER,
+                verifier_generation,
+                REPLY_COMMIT_RECEIPT_SCHEMA,
+                REPLY_COMMIT_IMPLEMENTATION_DIGEST,
+            )
+            .unwrap(),
+            VerifierBinding::new(
+                REPLY_VERIFIER,
+                verifier_generation,
+                REPLY_APPLY_RECEIPT_SCHEMA,
+                REPLY_APPLY_IMPLEMENTATION_DIGEST,
+            )
+            .unwrap(),
+            VerifierBinding::new(
+                REPLY_VERIFIER,
+                verifier_generation,
+                REPLY_SETTLEMENT_RECEIPT_SCHEMA,
+                REPLY_SETTLEMENT_IMPLEMENTATION_DIGEST,
+            )
+            .unwrap(),
+            VerifierBinding::new(
+                REPLY_VERIFIER,
+                verifier_generation,
+                REPLY_RECEIPT_SCHEMA,
+                REPLY_RECEIPT_IMPLEMENTATION_DIGEST,
+            )
+            .unwrap(),
+            VerifierBinding::new(
+                DEVICE_VERIFIER,
+                verifier_generation,
+                DEVICE_RECEIPT_SCHEMA,
+                Digest::new([0x61; 32]),
+            )
+            .unwrap(),
+            VerifierBinding::new(
+                DEVICE_VERIFIER,
+                verifier_generation,
+                DEVICE_COMMIT_RECEIPT_SCHEMA,
+                Digest::new([0x62; 32]),
+            )
+            .unwrap(),
+        ];
+        for coordinate in [provider_reply, provider_dma] {
+            engine
+                .transact(
+                    CommandRequest::RegisterProviderGeneration {
+                        coordinate,
+                        catalog_digest: standard_catalog().digest(),
+                        verifier_bindings: verifier_bindings.clone(),
+                    },
+                    |_| Ok::<(), core::convert::Infallible>(()),
+                )
+                .unwrap();
+        }
         engine
             .transact_durable(
-                CommandRequest::CreateCompositeEffect {
+                CommandRequest::AdmitScopedCompositeEffect {
                     effect,
                     origin: actor,
-                    binding_generation: 1,
                     kind: AGENT_OPERATION_COMPOSITE,
                     charge_account: ChargeAccountId::new(root_value).unwrap(),
+                    bindings: vec![
+                        ComponentProviderBinding::new(AGENT_COMPONENT_REPLY, provider_reply),
+                        ComponentProviderBinding::new(AGENT_COMPONENT_DMA, provider_dma),
+                    ],
                 },
                 &mut durability,
             )
@@ -1841,7 +1918,6 @@ mod tests {
                     effect,
                     component: AGENT_COMPONENT_REPLY,
                     actor,
-                    binding_generation: 1,
                     claim: ClaimId::new(root_value).unwrap(),
                     kind: cser_core::REPLY_CLAIM_PUBLICATION_SLOT,
                     scope: ClaimScope::Logical,
@@ -1858,7 +1934,6 @@ mod tests {
                     effect,
                     component: AGENT_COMPONENT_DMA,
                     actor,
-                    binding_generation: 1,
                     claim: ClaimId::new(root_value + 1).unwrap(),
                     kind: DEVICE_CLAIM_QUEUE_SLOT,
                     scope: ClaimScope::Device(DeviceScopeId::new(root_value).unwrap()),
@@ -1871,11 +1946,7 @@ mod tests {
             .unwrap();
         engine
             .transact_durable(
-                CommandRequest::PrepareCompositeEffect {
-                    effect,
-                    actor,
-                    binding_generation: 1,
-                },
+                CommandRequest::PrepareCompositeEffect { effect, actor },
                 &mut durability,
             )
             .unwrap();
@@ -1884,7 +1955,6 @@ mod tests {
                 CommandRequest::RecordCompositeCommitIntents {
                     effect,
                     actor,
-                    binding_generation: 1,
                     operations: vec![
                         ComponentCommitOperation::new(AGENT_COMPONENT_REPLY, digest(0x61)),
                         ComponentCommitOperation::new(AGENT_COMPONENT_DMA, digest(0x62)),
@@ -1897,7 +1967,7 @@ mod tests {
         {
             TransitionOutput::CompositeCommitIntents(intents) => intents
                 .into_iter()
-                .find(|intent| intent.component() == Some(AGENT_COMPONENT_REPLY))
+                .find(|intent| intent.component() == AGENT_COMPONENT_REPLY)
                 .expect("atomic arm returns the reply component intent"),
             other => panic!("expected atomic composite commit intents, got {other:?}"),
         };
@@ -2054,7 +2124,7 @@ mod tests {
     }
 
     #[ktest]
-    fn reply_outbox_v2_binds_component_and_v1_fails_closed() {
+    fn reply_outbox_v3_binds_component_and_older_records_fail_closed() {
         let (engine, intent, challenge) = commit_challenge(46);
         let key = ReplyCommitKey::from_challenge(&challenge, 12).unwrap();
         assert_eq!(key.component, AGENT_COMPONENT_REPLY);
@@ -2071,7 +2141,7 @@ mod tests {
         let mut reopened = ReplyOutbox::open(disk).unwrap();
         let forged = match reopened.inspect(key.reply) {
             ReplyCommitInspection::Committed(receipt) => receipt,
-            other => panic!("component-mutated v2 record remained structurally exact: {other:?}"),
+            other => panic!("component-mutated v3 record remained structurally exact: {other:?}"),
         };
         assert_eq!(forged.component(), AGENT_COMPONENT_DMA);
         assert_eq!(

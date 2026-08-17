@@ -11,6 +11,7 @@
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU8, Ordering};
 
+use cser_core::ProviderCoordinate;
 use cser_core::{
     ClaimId, ClaimScope, ComponentId, CoreError, Digest, EffectFactChallenge, EffectFactKind,
     EffectReceiptVerifier, Engine, EvidenceChallenge, REPLY_APPLY_RECEIPT_SCHEMA, REPLY_DOMAIN,
@@ -20,9 +21,8 @@ use cser_core::{
     VerifiedEffectObservation, VerifiedObservation, VerifiedRetirementEvidence,
     VerifiedSettlementAck, VerifierIdentity,
 };
-#[cfg(feature = "cser-core-reply-recovery")]
-use cser_core::{ProviderCoordinate, ProviderGeneration, ProviderId, WorldId};
-#[cfg(any(feature = "cser-production", feature = "cser-core-reply-recovery"))]
+#[cfg(not(feature = "cser-production"))]
+use cser_core::{ProviderGeneration, ProviderId, WorldId};
 use cser_core::{VerifierBinding, VerifierGeneration};
 use ostd::sync::{SpinLock, Waiter, Waker};
 use sha2::{Digest as _, Sha256};
@@ -33,11 +33,11 @@ use super::core_production_registry::{
     REPLY_SETTLEMENT_IMPLEMENTATION_DIGEST, STANDARD_REPLY_PROVIDER,
 };
 
-#[cfg(feature = "cser-core-reply-recovery")]
+#[cfg(not(feature = "cser-production"))]
 const REPLY_RECEIPT_IMPLEMENTATION_DIGEST: Digest = Digest::new([0x51; 32]);
-#[cfg(feature = "cser-core-reply-recovery")]
+#[cfg(not(feature = "cser-production"))]
 const REPLY_APPLY_IMPLEMENTATION_DIGEST: Digest = Digest::new([0x53; 32]);
-#[cfg(feature = "cser-core-reply-recovery")]
+#[cfg(not(feature = "cser-production"))]
 const REPLY_SETTLEMENT_IMPLEMENTATION_DIGEST: Digest = Digest::new([0x54; 32]);
 
 const REPLY_ARMED: u8 = 0;
@@ -50,28 +50,13 @@ const REPLY_INDETERMINATE: u8 = 4;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ReplyCoordinate {
     effect: cser_core::EffectId,
-    component: Option<ComponentId>,
+    component: ComponentId,
     claim: ClaimId,
     resource: ResourceId,
     resource_generation: ResourceGeneration,
 }
 
 impl ReplyCoordinate {
-    pub(crate) const fn new(
-        effect: cser_core::EffectId,
-        claim: ClaimId,
-        resource: ResourceId,
-        resource_generation: ResourceGeneration,
-    ) -> Self {
-        Self {
-            effect,
-            component: None,
-            claim,
-            resource,
-            resource_generation,
-        }
-    }
-
     pub(crate) const fn new_component(
         effect: cser_core::EffectId,
         component: ComponentId,
@@ -81,7 +66,7 @@ impl ReplyCoordinate {
     ) -> Self {
         Self {
             effect,
-            component: Some(component),
+            component,
             claim,
             resource,
             resource_generation,
@@ -92,7 +77,7 @@ impl ReplyCoordinate {
         self.effect
     }
 
-    pub(crate) const fn component(self) -> Option<ComponentId> {
+    pub(crate) const fn component(self) -> ComponentId {
         self.component
     }
 
@@ -177,7 +162,7 @@ pub(crate) struct ReplyReceiver {
     state: Arc<ReplyPhysicalState>,
 }
 
-/// Kernel physical custodian for the reply slot retained by the causal estate.
+/// Kernel physical custodian for the reply slot retained by the causal effect.
 ///
 /// This value is deliberately non-cloneable.  The receiver shares only the
 /// underlying physical endpoint and has no core settlement authority.
@@ -451,23 +436,14 @@ impl ReplyCustody {
         engine: &Engine,
         observation: &ReplyAckObservation,
     ) -> Result<VerifiedRetirementEvidence, CoreError> {
-        match self.coordinate.component {
-            Some(component) => engine.verify_component_retirement_evidence(
-                self.coordinate.effect,
-                component,
-                self.coordinate.claim,
-                REPLY_EVIDENCE_PUBLICATION_ACK,
-                &ReplyRetirementVerifier { custody: self },
-                observation,
-            ),
-            None => engine.verify_retirement_evidence(
-                self.coordinate.effect,
-                self.coordinate.claim,
-                REPLY_EVIDENCE_PUBLICATION_ACK,
-                &ReplyRetirementVerifier { custody: self },
-                observation,
-            ),
-        }
+        engine.verify_component_retirement_evidence(
+            self.coordinate.effect,
+            self.coordinate.component,
+            self.coordinate.claim,
+            REPLY_EVIDENCE_PUBLICATION_ACK,
+            &ReplyRetirementVerifier { custody: self },
+            observation,
+        )
     }
 }
 
@@ -506,18 +482,10 @@ impl EffectReceiptVerifier for ReplyEffectVerifier<'_> {
     type Receipt = ReplyApplyObservation;
 
     fn identity(&self) -> VerifierIdentity {
-        #[cfg(any(feature = "cser-production", feature = "cser-core-reply-recovery"))]
-        {
-            reply_verifier_identity(
-                REPLY_APPLY_RECEIPT_SCHEMA,
-                REPLY_APPLY_IMPLEMENTATION_DIGEST,
-            )
-        }
-        #[cfg(not(any(feature = "cser-production", feature = "cser-core-reply-recovery")))]
-        {
-            VerifierIdentity::new(REPLY_VERIFIER, 1, REPLY_APPLY_RECEIPT_SCHEMA)
-                .expect("legacy reply verifier identity is valid")
-        }
+        reply_verifier_identity(
+            REPLY_APPLY_RECEIPT_SCHEMA,
+            REPLY_APPLY_IMPLEMENTATION_DIGEST,
+        )
     }
 
     fn verify(
@@ -551,18 +519,10 @@ impl EffectReceiptVerifier for ReplyAckVerifier<'_> {
     type Receipt = ReplyAckObservation;
 
     fn identity(&self) -> VerifierIdentity {
-        #[cfg(any(feature = "cser-production", feature = "cser-core-reply-recovery"))]
-        {
-            reply_verifier_identity(
-                REPLY_SETTLEMENT_RECEIPT_SCHEMA,
-                REPLY_SETTLEMENT_IMPLEMENTATION_DIGEST,
-            )
-        }
-        #[cfg(not(any(feature = "cser-production", feature = "cser-core-reply-recovery")))]
-        {
-            VerifierIdentity::new(REPLY_VERIFIER, 1, REPLY_SETTLEMENT_RECEIPT_SCHEMA)
-                .expect("legacy reply acknowledgement verifier identity is valid")
-        }
+        reply_verifier_identity(
+            REPLY_SETTLEMENT_RECEIPT_SCHEMA,
+            REPLY_SETTLEMENT_IMPLEMENTATION_DIGEST,
+        )
     }
 
     fn verify(
@@ -604,15 +564,7 @@ impl ReceiptVerifier for ReplyRetirementVerifier<'_> {
     type Receipt = ReplyAckObservation;
 
     fn identity(&self) -> VerifierIdentity {
-        #[cfg(any(feature = "cser-production", feature = "cser-core-reply-recovery"))]
-        {
-            reply_verifier_identity(REPLY_RECEIPT_SCHEMA, REPLY_RECEIPT_IMPLEMENTATION_DIGEST)
-        }
-        #[cfg(not(any(feature = "cser-production", feature = "cser-core-reply-recovery")))]
-        {
-            VerifierIdentity::new(REPLY_VERIFIER, 1, REPLY_RECEIPT_SCHEMA)
-                .expect("legacy reply retirement verifier identity is valid")
-        }
+        reply_verifier_identity(REPLY_RECEIPT_SCHEMA, REPLY_RECEIPT_IMPLEMENTATION_DIGEST)
     }
 
     fn verify(
@@ -644,10 +596,7 @@ impl ReceiptVerifier for ReplyRetirementVerifier<'_> {
     }
 }
 
-/// Builds the exact production identity registered for one reply receipt
-/// schema.  `VerifierIdentity::new` remains reserved for the unscoped legacy
-/// task probe; a scoped challenge must carry this implementation binding.
-#[cfg(any(feature = "cser-production", feature = "cser-core-reply-recovery"))]
+/// Builds the exact identity registered for one reply receipt schema.
 fn reply_verifier_identity(
     schema: ReceiptSchemaId,
     implementation_digest: Digest,
@@ -658,7 +607,6 @@ fn reply_verifier_identity(
     VerifierIdentity::new_exact(binding)
 }
 
-#[cfg(any(feature = "cser-production", feature = "cser-core-reply-recovery"))]
 fn reply_binding(schema: ReceiptSchemaId) -> Option<VerifierBinding> {
     let implementation_digest = match schema {
         REPLY_RECEIPT_SCHEMA => REPLY_RECEIPT_IMPLEMENTATION_DIGEST,
@@ -675,67 +623,45 @@ fn reply_binding(schema: ReceiptSchemaId) -> Option<VerifierBinding> {
     .ok()
 }
 
-#[cfg(feature = "cser-production")]
-fn reply_provider_coordinate() -> cser_core::ProviderCoordinate {
-    STANDARD_REPLY_PROVIDER
-}
-
-#[cfg(feature = "cser-core-reply-recovery")]
 fn reply_provider_coordinate() -> ProviderCoordinate {
-    ProviderCoordinate::new(
-        WorldId::new(1).expect("reply probe world is non-zero"),
-        ProviderId::new(1).expect("reply probe provider is non-zero"),
-        ProviderGeneration::new(1).expect("reply probe provider generation is non-zero"),
-    )
+    #[cfg(feature = "cser-production")]
+    {
+        STANDARD_REPLY_PROVIDER
+    }
+    #[cfg(not(feature = "cser-production"))]
+    {
+        ProviderCoordinate::new(
+            WorldId::new(1).expect("reply probe world is non-zero"),
+            ProviderId::new(1).expect("reply probe provider is non-zero"),
+            ProviderGeneration::new(1).expect("reply probe provider generation is non-zero"),
+        )
+    }
 }
 
-#[cfg(any(feature = "cser-production", feature = "cser-core-reply-recovery"))]
 fn reply_challenge_scope_matches(challenge: &EffectFactChallenge, schema: ReceiptSchemaId) -> bool {
-    match (
-        challenge.verification_scope(),
-        challenge.expected_verifier_binding(),
-    ) {
-        (None, None) => false,
-        (Some(scope), Some(binding)) => {
-            let provider = reply_provider_coordinate();
-            scope.world() == provider.world()
-                && scope.provider() == provider
-                && scope.verifier_binding() == binding
-                && Some(binding) == reply_binding(schema)
-        }
-        _ => false,
-    }
+    let Some(binding) = reply_binding(schema) else {
+        return false;
+    };
+    let scope = challenge.verification_scope();
+    let provider = reply_provider_coordinate();
+    scope.world() == provider.world()
+        && scope.provider() == provider
+        && scope.operation() == challenge.effect().operation()
+        && scope.verifier_binding() == binding
+        && challenge.expected_verifier_binding() == binding
 }
 
-#[cfg(not(any(feature = "cser-production", feature = "cser-core-reply-recovery")))]
-fn reply_challenge_scope_matches(
-    challenge: &EffectFactChallenge,
-    _schema: ReceiptSchemaId,
-) -> bool {
-    challenge.verification_scope().is_none() && challenge.expected_verifier_binding().is_none()
-}
-
-#[cfg(any(feature = "cser-production", feature = "cser-core-reply-recovery"))]
 fn reply_evidence_scope_matches(challenge: &EvidenceChallenge, schema: ReceiptSchemaId) -> bool {
-    match (
-        challenge.verification_scope(),
-        challenge.expected_verifier_binding(),
-    ) {
-        (None, None) => false,
-        (Some(scope), Some(binding)) => {
-            let provider = reply_provider_coordinate();
-            scope.world() == provider.world()
-                && scope.provider() == provider
-                && scope.verifier_binding() == binding
-                && Some(binding) == reply_binding(schema)
-        }
-        _ => false,
-    }
-}
-
-#[cfg(not(any(feature = "cser-production", feature = "cser-core-reply-recovery")))]
-fn reply_evidence_scope_matches(challenge: &EvidenceChallenge, _schema: ReceiptSchemaId) -> bool {
-    challenge.verification_scope().is_none() && challenge.expected_verifier_binding().is_none()
+    let Some(binding) = reply_binding(schema) else {
+        return false;
+    };
+    let scope = challenge.verification_scope();
+    let provider = reply_provider_coordinate();
+    scope.world() == provider.world()
+        && scope.provider() == provider
+        && scope.operation() == challenge.effect().operation()
+        && scope.verifier_binding() == binding
+        && challenge.expected_verifier_binding() == binding
 }
 
 fn apply_observation(plan: ReplyPlan) -> ReplyApplyObservation {
@@ -790,15 +716,10 @@ fn hash_plan(
 }
 
 fn hash_coordinate(hasher: &mut Sha256, coordinate: ReplyCoordinate) {
-    hasher.update(coordinate.effect.root().get().to_le_bytes());
+    hasher.update(coordinate.effect.operation().get().to_le_bytes());
     hasher.update(coordinate.effect.sequence().to_le_bytes());
-    match coordinate.component {
-        Some(component) => {
-            hasher.update([1]);
-            hasher.update(component.get().to_le_bytes());
-        }
-        None => hasher.update([0]),
-    }
+    hasher.update([1]);
+    hasher.update(coordinate.component.get().to_le_bytes());
     hasher.update(coordinate.claim.get().to_le_bytes());
     hasher.update(coordinate.resource.get().to_le_bytes());
     hasher.update(coordinate.resource_generation.get().to_le_bytes());

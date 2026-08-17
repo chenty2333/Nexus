@@ -22,7 +22,7 @@ use crate::{
 
 const MAGIC: [u8; 8] = *b"CSERAN2\0";
 const VERSION: u16 = 2;
-const BODY_LEN: usize = 194;
+const BODY_LEN: usize = 186;
 const ENCODED_LEN: usize = BODY_LEN + 32;
 
 /// One-shot crash point in the host reference anchor.
@@ -186,14 +186,7 @@ impl TrustedAnchorBackend for HostFileTrustedAnchor {
             .checked_add(1)
             .and_then(|value| JournalGeneration::new(value).ok())
             .ok_or(PersistenceProtocolError::StaleFreshness)?;
-        let next = Freshness::new(
-            next_boot,
-            binding.registry(),
-            binding.binding().get(),
-            observed_device,
-            next_journal,
-        )
-        .map_err(|_| PersistenceProtocolError::InvalidAnchor)?;
+        let next = Freshness::new(next_boot, binding.registry(), observed_device, next_journal);
         let replacement = HostAnchorState {
             committed: self.state.committed,
             issued: next,
@@ -294,11 +287,6 @@ fn encode_state(state: HostAnchorState) -> [u8; ENCODED_LEN] {
     put(
         &mut bytes,
         &mut cursor,
-        &state.committed.binding().binding().get().to_le_bytes(),
-    );
-    put(
-        &mut bytes,
-        &mut cursor,
         &state
             .committed
             .committed_freshness()
@@ -382,34 +370,27 @@ fn decode_state(bytes: &[u8]) -> Result<HostAnchorState, HostAnchorError> {
     let catalog = Digest::new(take_array(bytes, &mut cursor)?);
     let registry = crate::RegistryInstance::new(take_u64(bytes, &mut cursor)?)
         .map_err(|_| HostAnchorError::Corrupt)?;
-    let binding_value = take_u64(bytes, &mut cursor)?;
-    let authority_binding = crate::AuthorityBindingGeneration::new(binding_value)
-        .map_err(|_| HostAnchorError::Corrupt)?;
-    let binding = RecoveryBinding::new(profile, world, catalog, registry, authority_binding)
+    let binding = RecoveryBinding::new(profile, world, catalog, registry)
         .map_err(|_| HostAnchorError::Corrupt)?;
     let committed = Freshness::new(
         BootGeneration::new(take_u64(bytes, &mut cursor)?).map_err(|_| HostAnchorError::Corrupt)?,
         registry,
-        binding_value,
         DeviceGeneration::new(take_u64(bytes, &mut cursor)?)
             .map_err(|_| HostAnchorError::Corrupt)?,
         JournalGeneration::new(take_u64(bytes, &mut cursor)?)
             .map_err(|_| HostAnchorError::Corrupt)?,
-    )
-    .map_err(|_| HostAnchorError::Corrupt)?;
+    );
     let revision = take_u64(bytes, &mut cursor)?;
     let head = Digest::new(take_array(bytes, &mut cursor)?);
     let projection = Digest::new(take_array(bytes, &mut cursor)?);
     let issued = Freshness::new(
         BootGeneration::new(take_u64(bytes, &mut cursor)?).map_err(|_| HostAnchorError::Corrupt)?,
         registry,
-        binding_value,
         DeviceGeneration::new(take_u64(bytes, &mut cursor)?)
             .map_err(|_| HostAnchorError::Corrupt)?,
         JournalGeneration::new(take_u64(bytes, &mut cursor)?)
             .map_err(|_| HostAnchorError::Corrupt)?,
-    )
-    .map_err(|_| HostAnchorError::Corrupt)?;
+    );
     if cursor != BODY_LEN
         || issued.boot().get() < committed.boot().get()
         || issued.journal().get() < committed.journal().get()

@@ -3,37 +3,40 @@ mod support;
 
 use cser_core::{
     AGENT_COMPONENT_DMA, AGENT_COMPONENT_REPLY, AGENT_OPERATION_COMPOSITE, AdoptionPolicy,
-    AuthorityState, CREDIT_QUEUE_SLOT, CREDIT_REPLY_SLOT, ClaimCardinality, ClaimCustodian,
-    ClaimId, ClaimScope, ClaimScopePolicy, Command as AuthorizedCommand, CommandRequest as Command,
-    CommitIntent, CommitState, ComponentCommitOperation, ComponentId, CompositeComponentSpec,
-    CompositeKindId, CoreError, CoreLimits, CustodyState, DEVICE_CLAIM_IOVA,
-    DEVICE_CLAIM_PINNED_PAGE, DEVICE_CLAIM_QUEUE_SLOT, DEVICE_COMMIT_RECEIPT_SCHEMA, DEVICE_DOMAIN,
-    DEVICE_EVIDENCE_IOTLB, DEVICE_EVIDENCE_IRQ_DRAINED, DEVICE_EVIDENCE_RESET,
-    DEVICE_OBLIGATION_DMA, DEVICE_RECEIPT_SCHEMA, DEVICE_VERIFIER, DMA_ARENA_REUSE_COMPOSITE,
-    DeviceScopeId, DomainCatalogBuilder, EffectEscapeState, EffectId, Engine, EvidenceKindId,
-    EvidenceRule, ExternalOutcome, Freshness, FreshnessAxes, JOURNAL_CORE_API_PROFILE,
-    JOURNAL_SCHEMA_VERSION, JournalDecodeError, NORMALIZED_TRACE_VERSION, ObligationKindId,
-    ObligationPolicy, ObligationReceipts, ObligationSpec, PROJECTION_VERSION,
-    RECOVERY_SNAPSHOT_VERSION, REPLY_APPLY_RECEIPT_SCHEMA, REPLY_CLAIM_PUBLICATION_SLOT,
-    REPLY_COMMIT_RECEIPT_SCHEMA, REPLY_DOMAIN, REPLY_EVIDENCE_PUBLICATION_ACK,
-    REPLY_RECEIPT_SCHEMA, REPLY_SETTLEMENT_RECEIPT_SCHEMA, REPLY_VERIFIER, ReceiptBinding,
-    ReceiptSchemaId, RecoveryAnchor, ResourceId, RetirementState, RootRecoveryState,
+    AuthorityState, CREDIT_QUEUE_SLOT, CREDIT_REPLY_SLOT, CatalogSet, ClaimCardinality,
+    ClaimCustodian, ClaimId, ClaimScope, ClaimScopePolicy, Command as AuthorizedCommand,
+    CommandRequest as Command, CommitIntent, CommitState, ComponentCommitOperation, ComponentId,
+    ComponentProviderBinding, CompositeComponentSpec, CompositeKindId, CoreError, CoreLimits,
+    CustodyState, DEVICE_CLAIM_IOVA, DEVICE_CLAIM_PINNED_PAGE, DEVICE_CLAIM_QUEUE_SLOT,
+    DEVICE_COMMIT_RECEIPT_SCHEMA, DEVICE_DOMAIN, DEVICE_EVIDENCE_IOTLB,
+    DEVICE_EVIDENCE_IRQ_DRAINED, DEVICE_EVIDENCE_RESET, DEVICE_RECEIPT_SCHEMA, DEVICE_VERIFIER,
+    DMA_ARENA_REUSE_COMPOSITE, DeviceScopeId, DomainCatalogBuilder, EffectEscapeState, EffectId,
+    Engine, EvidenceKindId, EvidenceRule, ExternalOutcome, Freshness, FreshnessAxes,
+    JOURNAL_CORE_API_PROFILE, JOURNAL_SCHEMA_VERSION, JournalDecodeError, NORMALIZED_TRACE_VERSION,
+    ObligationKindId, ObligationPolicy, ObligationReceipts, ObligationSpec, OperationRecoveryState,
+    PROJECTION_VERSION, RECOVERY_SNAPSHOT_VERSION, REPLY_APPLY_RECEIPT_SCHEMA,
+    REPLY_CLAIM_PUBLICATION_SLOT, REPLY_COMMIT_RECEIPT_SCHEMA, REPLY_DOMAIN,
+    REPLY_EVIDENCE_PUBLICATION_ACK, REPLY_RECEIPT_SCHEMA, REPLY_SETTLEMENT_RECEIPT_SCHEMA,
+    REPLY_VERIFIER, ReceiptBinding, ReceiptSchemaId, RecoveryAnchor, ResourceId, RetirementState,
     SettlementState, TransitionDurability, TransitionEvent, TransitionOutput, TransitionResult,
-    TxError, VerifierId, WorldId, scan_journal, standard_catalog,
+    TxError, VerifierId, scan_journal, standard_catalog,
 };
-use proptest::prelude::*;
 use support::{
-    ExactTestVerifier, Harness, TestReceipt, charge, claim, digest, effect, freshness,
-    genesis_projection, principal, recovery_anchor, resource, resource_generation, snapshot,
-    verified_apply_completion, verified_commit_outcome, verified_settlement_ack,
+    ExactTestVerifier, Harness, TestReceipt, charge, claim, digest, effect, executor, freshness,
+    recovery_anchor, resource, resource_generation, snapshot, verified_apply_completion,
+    verified_commit_outcome, verified_settlement_ack,
 };
 
-const MAIN_ROOT: u64 = 0xc501;
-const SEED_ROOT: u64 = 0xd001;
+const MAIN_OPERATION: u64 = 0xc501;
+const SEED_OPERATION: u64 = 0xd001;
+
+fn standard_catalog_set() -> CatalogSet {
+    CatalogSet::new(&[standard_catalog()]).expect("standard catalog set must be valid")
+}
 
 fn anchor(engine: &Engine, committed: Freshness, next: Freshness) -> RecoveryAnchor {
     recovery_anchor(
-        standard_catalog().digest(),
+        standard_catalog_set().digest(),
         committed,
         next,
         engine.revision(),
@@ -42,30 +45,56 @@ fn anchor(engine: &Engine, committed: Freshness, next: Freshness) -> RecoveryAnc
     )
 }
 
+fn admit_composite(
+    harness: &mut Harness,
+    effect: EffectId,
+    origin: cser_core::ExecutorCoordinate,
+    kind: cser_core::CompositeKindId,
+    charge_account: cser_core::ChargeAccountId,
+    components: &[ComponentId],
+) {
+    let provider = support::provider();
+    harness
+        .tx(Command::AdmitScopedCompositeEffect {
+            effect,
+            origin,
+            kind,
+            charge_account,
+            bindings: components
+                .iter()
+                .copied()
+                .map(|component| ComponentProviderBinding::new(component, provider))
+                .collect(),
+        })
+        .unwrap();
+}
+
 #[test]
-fn profile2_receipt_journal_and_snapshot_are_self_describing() {
-    let mut harness = Harness::new();
-    let operation = effect(MAIN_ROOT, 1);
-    let origin = principal(MAIN_ROOT, 1);
-    let create = Command::CreateCompositeEffect {
+fn composite_receipt_journal_and_snapshot_are_self_describing() {
+    let mut harness = Harness::standard();
+    let operation = effect(MAIN_OPERATION, 1);
+    let origin = executor(MAIN_OPERATION, 1);
+    let create = Command::AdmitScopedCompositeEffect {
         effect: operation,
         origin,
-        binding_generation: 1,
         kind: AGENT_OPERATION_COMPOSITE,
-        charge_account: charge(MAIN_ROOT),
+        charge_account: charge(MAIN_OPERATION),
+        bindings: vec![
+            ComponentProviderBinding::new(AGENT_COMPONENT_REPLY, support::provider()),
+            ComponentProviderBinding::new(AGENT_COMPONENT_DMA, support::provider()),
+        ],
     };
-    assert!(!create.is_profile_two_compatible());
-    let authorized: AuthorizedCommand = create.clone().into();
-    assert!(!authorized.is_profile_two_compatible());
-
     let receipt = harness.tx(create).unwrap();
     assert_eq!(receipt.core_api_profile(), JOURNAL_CORE_API_PROFILE);
     assert_eq!(receipt.journal_schema(), JOURNAL_SCHEMA_VERSION);
-    assert_eq!(receipt.catalog_digest(), standard_catalog().digest());
+    assert_eq!(receipt.catalog_digest(), standard_catalog_set().digest());
     assert_eq!(receipt.projection_version(), PROJECTION_VERSION);
     assert_eq!(receipt.trace_version(), NORMALIZED_TRACE_VERSION);
     assert_eq!(receipt.result(), TransitionResult::Applied);
-    assert_eq!(receipt.coordinates().root(), Some(operation.root()));
+    assert_eq!(
+        receipt.coordinates().operation(),
+        Some(operation.operation())
+    );
     assert_eq!(receipt.coordinates().effect(), Some(operation));
     assert_eq!(receipt.coordinates().component(), None);
     assert_eq!(receipt.coordinates().claim(), None);
@@ -84,65 +113,51 @@ fn profile2_receipt_journal_and_snapshot_are_self_describing() {
         Err(JournalDecodeError::UnsupportedApiProfile { profile: 1 })
     ));
 
-    let legacy = Command::CreateEstate {
-        effect: effect(MAIN_ROOT + 1, 1),
-        origin: principal(MAIN_ROOT + 1, 1),
-        binding_generation: 1,
-        domain: DEVICE_DOMAIN,
-        obligation: DEVICE_OBLIGATION_DMA,
-        charge_account: charge(MAIN_ROOT + 1),
-    };
-    assert!(!legacy.is_profile_two_compatible());
-    let legacy_authorized: AuthorizedCommand = legacy.into();
-    assert!(!legacy_authorized.is_profile_two_compatible());
-
     harness
-        .tx(Command::FenceIncarnation {
-            root: operation.root(),
+        .tx(Command::FenceExecutor {
+            operation: operation.operation(),
             crashed: origin,
-            binding_generation: 1,
         })
         .unwrap();
     let cohort = harness
         .engine
-        .snapshot_root(operation.root(), snapshot(1))
+        .snapshot_operation(operation.operation(), snapshot(1))
         .unwrap();
     assert_eq!(cohort.core_api_profile(), JOURNAL_CORE_API_PROFILE);
     assert_eq!(cohort.snapshot_version(), RECOVERY_SNAPSHOT_VERSION);
     assert_eq!(cohort.journal_schema(), JOURNAL_SCHEMA_VERSION);
-    assert_eq!(cohort.catalog_digest(), standard_catalog().digest());
-    assert!(cohort.items().is_empty());
+    assert_eq!(cohort.catalog_digest(), standard_catalog_set().digest());
     assert_eq!(cohort.composites().len(), 1);
-    assert_eq!(cohort.composites()[0].effect, operation);
-    assert_eq!(cohort.composites()[0].components.len(), 2);
-    assert_eq!(cohort.component_items().len(), 2);
+    let composite = &cohort.composites()[0];
+    assert_eq!(composite.effect, operation);
+    assert_eq!(composite.components.len(), 2);
+    assert_eq!(composite.components[0].component, AGENT_COMPONENT_REPLY);
+    assert_eq!(composite.components[1].component, AGENT_COMPONENT_DMA);
 }
 
 #[test]
-fn profile2_recovery_snapshot_exposes_exact_partial_dma_claim_evidence() {
-    let mut harness = Harness::new();
+fn recovery_snapshot_exposes_exact_partial_dma_claim_evidence() {
+    let mut harness = Harness::standard();
     let operation = effect(0xc502, 1);
-    let origin = principal(0xc502, 1);
+    let origin = executor(0xc502, 1);
     let reply_claim = claim(1);
     let queue_claim = claim(2);
     let queue_resource = resource(0xc502_0001);
     let scope = device_scope();
 
-    harness
-        .tx(Command::CreateCompositeEffect {
-            effect: operation,
-            origin,
-            binding_generation: 1,
-            kind: AGENT_OPERATION_COMPOSITE,
-            charge_account: charge(0xc502),
-        })
-        .unwrap();
+    admit_composite(
+        &mut harness,
+        operation,
+        origin,
+        AGENT_OPERATION_COMPOSITE,
+        charge(0xc502),
+        &[AGENT_COMPONENT_REPLY, AGENT_COMPONENT_DMA],
+    );
     harness
         .tx(Command::AddComponentClaim {
             effect: operation,
             component: AGENT_COMPONENT_REPLY,
             actor: origin,
-            binding_generation: 1,
             claim: reply_claim,
             kind: REPLY_CLAIM_PUBLICATION_SLOT,
             scope: ClaimScope::Logical,
@@ -156,7 +171,6 @@ fn profile2_recovery_snapshot_exposes_exact_partial_dma_claim_evidence() {
             effect: operation,
             component: AGENT_COMPONENT_DMA,
             actor: origin,
-            binding_generation: 1,
             claim: queue_claim,
             kind: DEVICE_CLAIM_QUEUE_SLOT,
             scope: ClaimScope::Device(scope),
@@ -169,10 +183,9 @@ fn profile2_recovery_snapshot_exposes_exact_partial_dma_claim_evidence() {
         .tx(Command::PrepareCompositeEffect {
             effect: operation,
             actor: origin,
-            binding_generation: 1,
         })
         .unwrap();
-    commit_agent_components(&mut harness, operation, origin, 1, 10, 11, 12, 13);
+    commit_agent_components(&mut harness, operation, origin, 10, 11, 12, 13);
 
     let reset_challenge = harness
         .engine
@@ -198,16 +211,15 @@ fn profile2_recovery_snapshot_exposes_exact_partial_dma_claim_evidence() {
     );
     harness.tx(reset).unwrap();
     harness
-        .tx(Command::FenceIncarnation {
-            root: operation.root(),
+        .tx(Command::FenceExecutor {
+            operation: operation.operation(),
             crashed: origin,
-            binding_generation: 1,
         })
         .unwrap();
 
     let snapshot = harness
         .engine
-        .snapshot_root(operation.root(), snapshot(0xc502))
+        .snapshot_operation(operation.operation(), snapshot(0xc502))
         .unwrap();
     let composite = snapshot
         .composites()
@@ -238,7 +250,7 @@ fn profile2_recovery_snapshot_exposes_exact_partial_dma_claim_evidence() {
     assert_eq!(queue.claim.resource, queue_resource);
     assert_eq!(queue.claim.resource_generation, resource_generation(1));
     assert_eq!(queue.claim.units, 3);
-    assert_eq!(queue.claim.enrolled_freshness, freshness(1, 1, 1, 1, 1));
+    assert_eq!(queue.claim.enrolled_freshness, freshness(1, 1, 1, 1));
     assert!(!queue.claim.retired);
 
     assert_eq!(queue.accepted_evidence.len(), 1);
@@ -258,47 +270,44 @@ fn profile2_recovery_snapshot_exposes_exact_partial_dma_claim_evidence() {
 
 #[test]
 fn recovery_checkpoint_preserves_an_already_durable_same_boot_fence() {
-    let mut harness = Harness::new();
+    let mut harness = Harness::standard();
     let operation = effect(0xc503, 1);
-    let origin = principal(0xc503, 1);
+    let origin = executor(0xc503, 1);
+    admit_composite(
+        &mut harness,
+        operation,
+        origin,
+        AGENT_OPERATION_COMPOSITE,
+        charge(0xc503),
+        &[AGENT_COMPONENT_REPLY, AGENT_COMPONENT_DMA],
+    );
     harness
-        .tx(Command::CreateCompositeEffect {
-            effect: operation,
-            origin,
-            binding_generation: 1,
-            kind: AGENT_OPERATION_COMPOSITE,
-            charge_account: charge(0xc503),
-        })
-        .unwrap();
-    harness
-        .tx(Command::FenceIncarnation {
-            root: operation.root(),
+        .tx(Command::FenceExecutor {
+            operation: operation.operation(),
             crashed: origin,
-            binding_generation: 1,
         })
         .unwrap();
 
     let committed_freshness = harness.engine.freshness();
-    let next_freshness = freshness(2, 1, 1, 1, 2);
+    let next_freshness = freshness(2, 1, 1, 2);
     let anchor = anchor(&harness.engine, committed_freshness, next_freshness);
-    let mut recovered = Engine::recover_legacy_compatibility(
-        standard_catalog(),
+    let mut recovered = Engine::recover(
+        standard_catalog_set(),
         CoreLimits::bounded_default(),
         anchor,
         &harness.journal,
     )
     .unwrap()
     .into_engine();
-    let fenced_root = recovered.root(operation.root()).unwrap();
+    let fenced_operation_state = recovered.operation(operation.operation()).unwrap();
     let authority_epoch = recovered
         .composite_effect(operation)
         .unwrap()
         .authority_epoch;
     assert_eq!(
-        fenced_root,
-        RootRecoveryState::Fenced {
+        fenced_operation_state,
+        OperationRecoveryState::Fenced {
             crashed: origin,
-            binding_generation: 1,
             crash_generation: 1,
         }
     );
@@ -312,7 +321,10 @@ fn recovery_checkpoint_preserves_an_already_durable_same_boot_fence() {
         })
         .unwrap();
 
-    assert_eq!(recovered.root(operation.root()), Some(fenced_root));
+    assert_eq!(
+        recovered.operation(operation.operation()),
+        Some(fenced_operation_state)
+    );
     assert_eq!(
         recovered
             .composite_effect(operation)
@@ -329,29 +341,29 @@ fn recovery_checkpoint_preserves_an_already_durable_same_boot_fence() {
 
 #[test]
 fn outstanding_component_commit_intents_track_acknowledgements_across_cold_recovery() {
-    let mut harness = Harness::new();
+    let mut harness = Harness::standard();
     let (operation, origin, _, _) = create_precommit_agent(&mut harness, 0xc504);
     let unknown = effect(0xc505, 1);
 
     assert_eq!(
         harness.engine.outstanding_component_commit_intents(unknown),
-        Err(CoreError::UnknownEstate)
+        Err(CoreError::UnknownEffect)
     );
 
-    arm_agent_components(&mut harness, operation, origin, 1, 10, 11);
+    arm_agent_components(&mut harness, operation, origin, 10, 11);
     let outstanding = harness
         .engine
         .outstanding_component_commit_intents(operation)
         .unwrap();
     assert_eq!(outstanding.len(), 2);
     assert_eq!(outstanding[0].effect(), operation);
-    assert_eq!(outstanding[0].component(), Some(AGENT_COMPONENT_REPLY));
+    assert_eq!(outstanding[0].component(), AGENT_COMPONENT_REPLY);
     assert_eq!(outstanding[1].effect(), operation);
-    assert_eq!(outstanding[1].component(), Some(AGENT_COMPONENT_DMA));
+    assert_eq!(outstanding[1].component(), AGENT_COMPONENT_DMA);
 
     let reply_intent = outstanding
         .into_iter()
-        .find(|intent| intent.component() == Some(AGENT_COMPONENT_REPLY))
+        .find(|intent| intent.component() == AGENT_COMPONENT_REPLY)
         .expect("reply intent must be outstanding");
     acknowledge_component(
         &mut harness,
@@ -367,15 +379,15 @@ fn outstanding_component_commit_intents_track_acknowledgements_across_cold_recov
         .unwrap();
     assert_eq!(outstanding.len(), 1);
     assert_eq!(outstanding[0].effect(), operation);
-    assert_eq!(outstanding[0].component(), Some(AGENT_COMPONENT_DMA));
+    assert_eq!(outstanding[0].component(), AGENT_COMPONENT_DMA);
 
-    let recovered = replay_profile_two_prefix(&harness, "outstanding component commit intents");
+    let recovered = replay_prefix(&harness, "outstanding component commit intents");
     let outstanding = recovered
         .outstanding_component_commit_intents(operation)
         .unwrap();
     assert_eq!(outstanding.len(), 1);
     assert_eq!(outstanding[0].effect(), operation);
-    assert_eq!(outstanding[0].component(), Some(AGENT_COMPONENT_DMA));
+    assert_eq!(outstanding[0].component(), AGENT_COMPONENT_DMA);
 
     let dma_intent = harness
         .engine
@@ -401,61 +413,12 @@ fn outstanding_component_commit_intents_track_acknowledgements_across_cold_recov
 }
 
 #[test]
-fn profile2_rejects_legacy_commands_before_transition_and_replay() {
-    let legacy_command = Command::CreateEstate {
-        effect: effect(MAIN_ROOT + 10, 1),
-        origin: principal(MAIN_ROOT + 10, 1),
-        binding_generation: 1,
-        domain: DEVICE_DOMAIN,
-        obligation: DEVICE_OBLIGATION_DMA,
-        charge_account: charge(MAIN_ROOT + 10),
-    };
-
-    let mut profile_two = Harness::new_profile_two();
-    let before = (
-        profile_two.engine.revision(),
-        profile_two.engine.head(),
-        profile_two.engine.projection_digest(),
-    );
-    assert_eq!(
-        profile_two.engine.transact_volatile(legacy_command.clone()),
-        Err(CoreError::IncompatibleApiProfile)
-    );
-    assert_eq!(
-        (
-            profile_two.engine.revision(),
-            profile_two.engine.head(),
-            profile_two.engine.projection_digest(),
-        ),
-        before
-    );
-
-    let mut legacy = Harness::new();
-    legacy.tx(legacy_command).unwrap();
-    let anchor = anchor(
-        &legacy.engine,
-        freshness(1, 1, 1, 1, 1),
-        freshness(2, 1, 1, 1, 2),
-    );
-    assert!(matches!(
-        Engine::recover(
-            standard_catalog(),
-            CoreLimits::bounded_default(),
-            anchor,
-            &legacy.journal,
-        ),
-        Err(CoreError::IncompatibleApiProfile)
-    ));
-}
-
-#[test]
 fn composite_adoption_requires_every_component_catalog_policy() {
     let component = ComponentId::new(0xf001).unwrap();
     let obligation = ObligationKindId::new(0xf001).unwrap();
     let composite_kind = CompositeKindId::new(0xf001).unwrap();
     let logical_freshness = FreshnessAxes::BOOT
         .union(FreshnessAxes::REGISTRY)
-        .union(FreshnessAxes::BINDING)
         .union(FreshnessAxes::JOURNAL);
     let catalog = DomainCatalogBuilder::new()
         .credit_class(CREDIT_REPLY_SLOT, 8)
@@ -499,33 +462,23 @@ fn composite_adoption_requires_every_component_catalog_policy() {
         .unwrap()
         .build()
         .unwrap();
-    let mut harness = Harness {
-        engine: Engine::new_scoped_legacy_compatibility(
-            WorldId::new(1).unwrap(),
-            catalog.clone(),
-            CoreLimits::bounded_default(),
-            freshness(1, 1, 1, 1, 1),
-        ),
-        journal: Vec::new(),
-    };
+    let mut harness = Harness::with_catalog(catalog.clone(), CoreLimits::bounded_default());
     let operation = effect(0xcf01, 1);
-    let origin = principal(0xcf01, 1);
-    let successor = principal(0xcf01, 2);
-    harness
-        .tx(Command::CreateCompositeEffect {
-            effect: operation,
-            origin,
-            binding_generation: 1,
-            kind: composite_kind,
-            charge_account: charge(0xcf01),
-        })
-        .unwrap();
+    let origin = executor(0xcf01, 1);
+    let successor = executor(0xcf01, 2);
+    admit_composite(
+        &mut harness,
+        operation,
+        origin,
+        composite_kind,
+        charge(0xcf01),
+        &[component],
+    );
     harness
         .tx(Command::AddComponentClaim {
             effect: operation,
             component,
             actor: origin,
-            binding_generation: 1,
             claim: claim(0xcf01),
             kind: REPLY_CLAIM_PUBLICATION_SLOT,
             scope: ClaimScope::Logical,
@@ -538,35 +491,32 @@ fn composite_adoption_requires_every_component_catalog_policy() {
         .tx(Command::PrepareCompositeEffect {
             effect: operation,
             actor: origin,
-            binding_generation: 1,
         })
         .unwrap();
     harness
-        .tx(Command::FenceIncarnation {
-            root: operation.root(),
+        .tx(Command::FenceExecutor {
+            operation: operation.operation(),
             crashed: origin,
-            binding_generation: 1,
         })
         .unwrap();
     let snapshot_id = snapshot(0xcf01);
     let recovery = harness
         .engine
-        .snapshot_root(operation.root(), snapshot_id)
+        .snapshot_operation(operation.operation(), snapshot_id)
         .unwrap();
     harness.tx(recovery.record()).unwrap();
     harness
         .tx(Command::Ready {
-            root: operation.root(),
+            operation: operation.operation(),
             snapshot: snapshot_id,
             successor,
         })
         .unwrap();
     harness
         .tx(Command::Rebind {
-            root: operation.root(),
+            operation: operation.operation(),
             snapshot: snapshot_id,
             successor,
-            binding_generation: 2,
         })
         .unwrap();
 
@@ -579,7 +529,6 @@ fn composite_adoption_requires_every_component_catalog_policy() {
         harness.tx(Command::AdoptEffect {
             effect: operation,
             successor,
-            binding_generation: 2,
         }),
         Err(CoreError::AdoptionForbidden)
     );
@@ -593,34 +542,24 @@ fn composite_adoption_requires_every_component_catalog_policy() {
     );
     let projection = harness.engine.composite_effect(operation).unwrap();
     assert_eq!(projection.authority, AuthorityState::Fenced);
-    assert_eq!(projection.custodian, CustodyState::KernelEstate);
+    assert_eq!(projection.custodian, CustodyState::CoreOwned);
 
-    let mut original_owner = Harness {
-        engine: Engine::new_scoped_legacy_compatibility(
-            WorldId::new(1).unwrap(),
-            catalog,
-            CoreLimits::bounded_default(),
-            freshness(1, 1, 1, 1, 1),
-        ),
-        journal: Vec::new(),
-    };
+    let mut original_owner = Harness::with_catalog(catalog, CoreLimits::bounded_default());
     let commit_effect = effect(0xcf02, 1);
-    let commit_owner = principal(0xcf02, 1);
-    original_owner
-        .tx(Command::CreateCompositeEffect {
-            effect: commit_effect,
-            origin: commit_owner,
-            binding_generation: 1,
-            kind: composite_kind,
-            charge_account: charge(0xcf02),
-        })
-        .unwrap();
+    let commit_owner = executor(0xcf02, 1);
+    admit_composite(
+        &mut original_owner,
+        commit_effect,
+        commit_owner,
+        composite_kind,
+        charge(0xcf02),
+        &[component],
+    );
     original_owner
         .tx(Command::AddComponentClaim {
             effect: commit_effect,
             component,
             actor: commit_owner,
-            binding_generation: 1,
             claim: claim(0xcf02),
             kind: REPLY_CLAIM_PUBLICATION_SLOT,
             scope: ClaimScope::Logical,
@@ -633,7 +572,6 @@ fn composite_adoption_requires_every_component_catalog_policy() {
         .tx(Command::PrepareCompositeEffect {
             effect: commit_effect,
             actor: commit_owner,
-            binding_generation: 1,
         })
         .unwrap();
     assert!(matches!(
@@ -641,7 +579,6 @@ fn composite_adoption_requires_every_component_catalog_policy() {
             effect: commit_effect,
             component,
             actor: commit_owner,
-            binding_generation: 1,
             operation: digest(0xf0),
         }),
         TransitionOutput::CommitIntent(_)
@@ -649,26 +586,24 @@ fn composite_adoption_requires_every_component_catalog_policy() {
 }
 
 #[test]
-fn profile_two_rejects_a_second_live_claim_for_one_resource_id() {
-    let mut harness = Harness::new();
+fn composite_rejects_a_second_live_claim_for_one_resource_id() {
+    let mut harness = Harness::standard();
     let operation = effect(0xcf03, 1);
-    let owner = principal(0xcf03, 1);
+    let owner = executor(0xcf03, 1);
     let shared_resource = resource(0xcf03);
-    harness
-        .tx(Command::CreateCompositeEffect {
-            effect: operation,
-            origin: owner,
-            binding_generation: 1,
-            kind: AGENT_OPERATION_COMPOSITE,
-            charge_account: charge(0xcf03),
-        })
-        .unwrap();
+    admit_composite(
+        &mut harness,
+        operation,
+        owner,
+        AGENT_OPERATION_COMPOSITE,
+        charge(0xcf03),
+        &[AGENT_COMPONENT_REPLY, AGENT_COMPONENT_DMA],
+    );
     harness
         .tx(Command::AddComponentClaim {
             effect: operation,
             component: AGENT_COMPONENT_DMA,
             actor: owner,
-            binding_generation: 1,
             claim: claim(0xcf03),
             kind: DEVICE_CLAIM_QUEUE_SLOT,
             scope: ClaimScope::Device(DeviceScopeId::new(0xcf03).unwrap()),
@@ -687,7 +622,6 @@ fn profile_two_rejects_a_second_live_claim_for_one_resource_id() {
             effect: operation,
             component: AGENT_COMPONENT_DMA,
             actor: owner,
-            binding_generation: 1,
             claim: claim(0xcf04),
             kind: DEVICE_CLAIM_PINNED_PAGE,
             scope: ClaimScope::Device(DeviceScopeId::new(0xcf03).unwrap()),
@@ -775,7 +709,6 @@ fn next_device_freshness(current: Freshness) -> Freshness {
     freshness(
         current.boot().get(),
         current.registry().get(),
-        current.binding(),
         current.device().get() + 1,
         current.journal().get(),
     )
@@ -835,8 +768,7 @@ fn commit_component(
     harness: &mut Harness,
     effect: EffectId,
     component: ComponentId,
-    actor: cser_core::PrincipalIncarnation,
-    binding_generation: u64,
+    actor: cser_core::ExecutorCoordinate,
     operation_marker: u8,
     receipt_marker: u8,
     verifier: VerifierId,
@@ -846,14 +778,13 @@ fn commit_component(
         effect,
         component,
         actor,
-        binding_generation,
         operation: digest(operation_marker),
     }) {
         TransitionOutput::CommitIntent(intent) => intent,
         other => panic!("expected component commit intent, got {other:?}"),
     };
     assert_eq!(intent.effect(), effect);
-    assert_eq!(intent.component(), Some(component));
+    assert_eq!(intent.component(), component);
     let outcome = verified_commit_outcome(
         harness,
         &intent,
@@ -868,15 +799,13 @@ fn commit_component(
 fn arm_agent_components(
     harness: &mut Harness,
     effect: EffectId,
-    actor: cser_core::PrincipalIncarnation,
-    binding_generation: u64,
+    actor: cser_core::ExecutorCoordinate,
     reply_operation: u8,
     dma_operation: u8,
 ) -> Vec<CommitIntent> {
     match harness.output(Command::RecordCompositeCommitIntents {
         effect,
         actor,
-        binding_generation,
         operations: vec![
             ComponentCommitOperation::new(AGENT_COMPONENT_REPLY, digest(reply_operation)),
             ComponentCommitOperation::new(AGENT_COMPONENT_DMA, digest(dma_operation)),
@@ -909,22 +838,14 @@ fn acknowledge_component(
 fn commit_agent_components(
     harness: &mut Harness,
     effect: EffectId,
-    actor: cser_core::PrincipalIncarnation,
-    binding_generation: u64,
+    actor: cser_core::ExecutorCoordinate,
     reply_operation: u8,
     reply_receipt: u8,
     dma_operation: u8,
     dma_receipt: u8,
 ) {
-    let mut intents = arm_agent_components(
-        harness,
-        effect,
-        actor,
-        binding_generation,
-        reply_operation,
-        dma_operation,
-    )
-    .into_iter();
+    let mut intents =
+        arm_agent_components(harness, effect, actor, reply_operation, dma_operation).into_iter();
     acknowledge_component(
         harness,
         intents.next().expect("reply intent"),
@@ -945,41 +866,39 @@ fn commit_agent_components(
 fn fence_snapshot_ready_rebind(
     harness: &mut Harness,
     effect: EffectId,
-    crashed: cser_core::PrincipalIncarnation,
-    successor: cser_core::PrincipalIncarnation,
-    old_binding: u64,
-    new_binding: u64,
+    crashed: cser_core::ExecutorCoordinate,
+    successor: cser_core::ExecutorCoordinate,
     snapshot_value: u64,
 ) {
     harness
-        .tx(Command::FenceIncarnation {
-            root: effect.root(),
+        .tx(Command::FenceExecutor {
+            operation: effect.operation(),
             crashed,
-            binding_generation: old_binding,
         })
         .unwrap();
     let snapshot_id = snapshot(snapshot_value);
     let cohort = harness
         .engine
-        .snapshot_root(effect.root(), snapshot_id)
+        .snapshot_operation(effect.operation(), snapshot_id)
         .unwrap();
-    assert!(cohort.items().is_empty());
-    assert_eq!(cohort.component_items().len(), 2);
-    assert_eq!(cohort.component_items()[0].effect, effect);
-    assert_eq!(cohort.component_items()[0].component, AGENT_COMPONENT_REPLY);
-    assert_eq!(cohort.component_items()[1].effect, effect);
-    assert_eq!(cohort.component_items()[1].component, AGENT_COMPONENT_DMA);
-    let expected_retained = cohort
-        .component_items()
+    let composite = cohort
+        .composites()
+        .iter()
+        .find(|item| item.effect == effect)
+        .expect("composite operation must be present");
+    assert_eq!(composite.components.len(), 2);
+    assert_eq!(composite.components[0].effect, effect);
+    assert_eq!(composite.components[0].component, AGENT_COMPONENT_REPLY);
+    assert_eq!(composite.components[1].effect, effect);
+    assert_eq!(composite.components[1].component, AGENT_COMPONENT_DMA);
+    let expected_retained = composite
+        .components
         .iter()
         .map(|component| component.retained_claims)
         .sum::<usize>();
-    assert_eq!(
-        cohort.composites()[0].retained_claims.len(),
-        expected_retained
-    );
+    assert_eq!(composite.retained_claims.len(), expected_retained);
     assert!(
-        cohort.composites()[0]
+        composite
             .retained_claims
             .iter()
             .all(|item| item.claim.effect == effect && !item.claim.retired)
@@ -987,41 +906,38 @@ fn fence_snapshot_ready_rebind(
     harness.tx(cohort.record()).unwrap();
     harness
         .tx(Command::Ready {
-            root: effect.root(),
+            operation: effect.operation(),
             snapshot: snapshot_id,
             successor,
         })
         .unwrap();
     harness
         .tx(Command::Rebind {
-            root: effect.root(),
+            operation: effect.operation(),
             snapshot: snapshot_id,
             successor,
-            binding_generation: new_binding,
         })
         .unwrap();
 }
 
 fn seed_retired_queue(harness: &mut Harness) -> ResourceId {
-    let seed_effect = effect(SEED_ROOT, 1);
-    let seed_origin = principal(SEED_ROOT, 1);
+    let seed_effect = effect(SEED_OPERATION, 1);
+    let seed_origin = executor(SEED_OPERATION, 1);
     let seed_claim = claim(1);
     let queue = resource(0x7001);
-    harness
-        .tx(Command::CreateCompositeEffect {
-            effect: seed_effect,
-            origin: seed_origin,
-            binding_generation: 1,
-            kind: DMA_ARENA_REUSE_COMPOSITE,
-            charge_account: charge(SEED_ROOT),
-        })
-        .unwrap();
+    admit_composite(
+        harness,
+        seed_effect,
+        seed_origin,
+        DMA_ARENA_REUSE_COMPOSITE,
+        charge(SEED_OPERATION),
+        &[AGENT_COMPONENT_DMA],
+    );
     harness
         .tx(Command::AddComponentClaim {
             effect: seed_effect,
             component: AGENT_COMPONENT_DMA,
             actor: seed_origin,
-            binding_generation: 1,
             claim: seed_claim,
             kind: DEVICE_CLAIM_QUEUE_SLOT,
             scope: ClaimScope::Device(device_scope()),
@@ -1034,14 +950,12 @@ fn seed_retired_queue(harness: &mut Harness) -> ResourceId {
         .tx(Command::PrepareCompositeEffect {
             effect: seed_effect,
             actor: seed_origin,
-            binding_generation: 1,
         })
         .unwrap();
     let intent = match harness.output(Command::RecordComponentCommitIntent {
         effect: seed_effect,
         component: AGENT_COMPONENT_DMA,
         actor: seed_origin,
-        binding_generation: 1,
         operation: digest(1),
     }) {
         TransitionOutput::CommitIntent(intent) => intent,
@@ -1106,30 +1020,28 @@ fn pending_dma_quiescence_release(
     harness: &mut Harness,
 ) -> (
     EffectId,
-    cser_core::PrincipalIncarnation,
+    cser_core::ExecutorCoordinate,
     ClaimId,
     ResourceId,
     AuthorizedCommand,
 ) {
-    let effect = effect(MAIN_ROOT, 1);
-    let origin = principal(MAIN_ROOT, 1);
+    let effect = effect(MAIN_OPERATION, 1);
+    let origin = executor(MAIN_OPERATION, 1);
     let claim_id = claim(1);
     let queue = resource(0x7011);
-    harness
-        .tx(Command::CreateCompositeEffect {
-            effect,
-            origin,
-            binding_generation: 1,
-            kind: DMA_ARENA_REUSE_COMPOSITE,
-            charge_account: charge(MAIN_ROOT),
-        })
-        .unwrap();
+    admit_composite(
+        harness,
+        effect,
+        origin,
+        DMA_ARENA_REUSE_COMPOSITE,
+        charge(MAIN_OPERATION),
+        &[AGENT_COMPONENT_DMA],
+    );
     harness
         .tx(Command::AddComponentClaim {
             effect,
             component: AGENT_COMPONENT_DMA,
             actor: origin,
-            binding_generation: 1,
             claim: claim_id,
             kind: DEVICE_CLAIM_QUEUE_SLOT,
             scope: ClaimScope::Device(device_scope()),
@@ -1142,7 +1054,6 @@ fn pending_dma_quiescence_release(
         .tx(Command::PrepareCompositeEffect {
             effect,
             actor: origin,
-            binding_generation: 1,
         })
         .unwrap();
     commit_component(
@@ -1150,7 +1061,6 @@ fn pending_dma_quiescence_release(
         effect,
         AGENT_COMPONENT_DMA,
         origin,
-        1,
         0x51,
         0x52,
         DEVICE_VERIFIER,
@@ -1171,24 +1081,22 @@ fn pending_dma_quiescence_release(
 
 #[test]
 fn composite_prepare_is_atomic_across_heterogeneous_components() {
-    let mut harness = Harness::new();
+    let mut harness = Harness::standard();
     let effect = effect(0xca01, 1);
-    let origin = principal(0xca01, 1);
-    harness
-        .tx(Command::CreateCompositeEffect {
-            effect,
-            origin,
-            binding_generation: 1,
-            kind: AGENT_OPERATION_COMPOSITE,
-            charge_account: charge(0xca01),
-        })
-        .unwrap();
+    let origin = executor(0xca01, 1);
+    admit_composite(
+        &mut harness,
+        effect,
+        origin,
+        AGENT_OPERATION_COMPOSITE,
+        charge(0xca01),
+        &[AGENT_COMPONENT_REPLY, AGENT_COMPONENT_DMA],
+    );
     harness
         .tx(Command::AddComponentClaim {
             effect,
             component: AGENT_COMPONENT_DMA,
             actor: origin,
-            binding_generation: 1,
             claim: claim(1),
             kind: DEVICE_CLAIM_QUEUE_SLOT,
             scope: ClaimScope::Device(DeviceScopeId::new(11).unwrap()),
@@ -1213,7 +1121,6 @@ fn composite_prepare_is_atomic_across_heterogeneous_components() {
         harness.tx(Command::PrepareCompositeEffect {
             effect,
             actor: origin,
-            binding_generation: 1,
         }),
         Err(CoreError::ClaimCardinalityViolation)
     );
@@ -1242,7 +1149,6 @@ fn composite_prepare_is_atomic_across_heterogeneous_components() {
             effect,
             component: AGENT_COMPONENT_REPLY,
             actor: origin,
-            binding_generation: 1,
             claim: claim(2),
             kind: REPLY_CLAIM_PUBLICATION_SLOT,
             scope: ClaimScope::Logical,
@@ -1256,7 +1162,6 @@ fn composite_prepare_is_atomic_across_heterogeneous_components() {
         .tx(Command::PrepareCompositeEffect {
             effect,
             actor: origin,
-            binding_generation: 1,
         })
         .unwrap();
     assert_eq!(harness.engine.revision(), prepare_revision + 1);
@@ -1279,35 +1184,33 @@ fn composite_prepare_is_atomic_across_heterogeneous_components() {
 }
 
 #[test]
-fn composite_profile2_reuses_one_resource_and_replays_the_complete_projection() {
-    let mut harness = Harness::new();
+fn composite_reuses_one_resource_and_replays_the_complete_projection() {
+    let mut harness = Harness::standard();
     let queue_resource = seed_retired_queue(&mut harness);
-    let effect = effect(MAIN_ROOT, 1);
-    let origin = principal(MAIN_ROOT, 1);
-    let first_successor = principal(MAIN_ROOT, 2);
-    let second_successor = principal(MAIN_ROOT, 3);
-    let settlement_successor = principal(MAIN_ROOT, 4);
-    let reconciliation_successor = principal(MAIN_ROOT, 5);
+    let effect = effect(MAIN_OPERATION, 1);
+    let origin = executor(MAIN_OPERATION, 1);
+    let first_successor = executor(MAIN_OPERATION, 2);
+    let second_successor = executor(MAIN_OPERATION, 3);
+    let settlement_successor = executor(MAIN_OPERATION, 4);
+    let reconciliation_successor = executor(MAIN_OPERATION, 5);
     let reply_claim = claim(10);
     let page_claim = claim(11);
     let iova_claim = claim(12);
     let reused_queue_claim = claim(13);
 
-    harness
-        .tx(Command::CreateCompositeEffect {
-            effect,
-            origin,
-            binding_generation: 1,
-            kind: AGENT_OPERATION_COMPOSITE,
-            charge_account: charge(MAIN_ROOT),
-        })
-        .unwrap();
+    admit_composite(
+        &mut harness,
+        effect,
+        origin,
+        AGENT_OPERATION_COMPOSITE,
+        charge(MAIN_OPERATION),
+        &[AGENT_COMPONENT_REPLY, AGENT_COMPONENT_DMA],
+    );
     harness
         .tx(Command::AddComponentClaim {
             effect,
             component: AGENT_COMPONENT_REPLY,
             actor: origin,
-            binding_generation: 1,
             claim: reply_claim,
             kind: REPLY_CLAIM_PUBLICATION_SLOT,
             scope: ClaimScope::Logical,
@@ -1321,7 +1224,6 @@ fn composite_profile2_reuses_one_resource_and_replays_the_complete_projection() 
             effect,
             component: AGENT_COMPONENT_DMA,
             actor: origin,
-            binding_generation: 1,
             claim: page_claim,
             kind: DEVICE_CLAIM_PINNED_PAGE,
             scope: ClaimScope::Device(device_scope()),
@@ -1335,7 +1237,6 @@ fn composite_profile2_reuses_one_resource_and_replays_the_complete_projection() 
             effect,
             component: AGENT_COMPONENT_DMA,
             actor: origin,
-            binding_generation: 1,
             claim: iova_claim,
             kind: DEVICE_CLAIM_IOVA,
             scope: ClaimScope::Device(device_scope()),
@@ -1345,17 +1246,16 @@ fn composite_profile2_reuses_one_resource_and_replays_the_complete_projection() 
         })
         .unwrap();
 
-    fence_snapshot_ready_rebind(&mut harness, effect, origin, first_successor, 1, 2, 1);
+    fence_snapshot_ready_rebind(&mut harness, effect, origin, first_successor, 1);
     harness
         .tx(Command::AdoptEffect {
             effect,
             successor: first_successor,
-            binding_generation: 2,
         })
         .unwrap();
     assert_eq!(
         harness.engine.composite_effect(effect).unwrap().custodian,
-        CustodyState::Principal(first_successor)
+        CustodyState::Executor(first_successor)
     );
     assert_eq!(
         harness
@@ -1369,7 +1269,6 @@ fn composite_profile2_reuses_one_resource_and_replays_the_complete_projection() 
             effect,
             component: AGENT_COMPONENT_DMA,
             actor: first_successor,
-            binding_generation: 2,
             claim: reused_queue_claim,
             kind: DEVICE_CLAIM_QUEUE_SLOT,
             scope: ClaimScope::Device(device_scope()),
@@ -1382,7 +1281,7 @@ fn composite_profile2_reuses_one_resource_and_replays_the_complete_projection() 
             other => panic!("expected component reuse permit, got {other:?}"),
         };
         assert_eq!(dead_permit.effect(), effect);
-        assert_eq!(dead_permit.component(), Some(AGENT_COMPONENT_DMA));
+        assert_eq!(dead_permit.component(), AGENT_COMPONENT_DMA);
         assert_eq!(dead_permit.claim(), reused_queue_claim);
         assert_eq!(dead_permit.resource(), queue_resource);
         assert_eq!(dead_permit.previous_generation(), resource_generation(1));
@@ -1392,20 +1291,11 @@ fn composite_profile2_reuses_one_resource_and_replays_the_complete_projection() 
         assert_eq!(dead_permit.reuse_contract(), digest(201));
     }
 
-    fence_snapshot_ready_rebind(
-        &mut harness,
-        effect,
-        first_successor,
-        second_successor,
-        2,
-        3,
-        2,
-    );
+    fence_snapshot_ready_rebind(&mut harness, effect, first_successor, second_successor, 2);
     harness
         .tx(Command::AdoptEffect {
             effect,
             successor: second_successor,
-            binding_generation: 3,
         })
         .unwrap();
     let reclaim = harness
@@ -1414,7 +1304,6 @@ fn composite_profile2_reuses_one_resource_and_replays_the_complete_projection() 
             effect,
             AGENT_COMPONENT_DMA,
             second_successor,
-            3,
             queue_resource,
             resource_generation(2),
         )
@@ -1424,7 +1313,7 @@ fn composite_profile2_reuses_one_resource_and_replays_the_complete_projection() 
         other => panic!("expected reclaimed component reuse permit, got {other:?}"),
     };
     assert_eq!(reclaimed_permit.effect(), effect);
-    assert_eq!(reclaimed_permit.component(), Some(AGENT_COMPONENT_DMA));
+    assert_eq!(reclaimed_permit.component(), AGENT_COMPONENT_DMA);
     assert_eq!(reclaimed_permit.generation(), resource_generation(2));
     harness.tx(reclaimed_permit.activate()).unwrap();
 
@@ -1451,7 +1340,6 @@ fn composite_profile2_reuses_one_resource_and_replays_the_complete_projection() 
         .tx(Command::PrepareCompositeEffect {
             effect,
             actor: second_successor,
-            binding_generation: 3,
         })
         .unwrap();
     assert_eq!(harness.engine.revision(), before_prepare + 1);
@@ -1482,7 +1370,6 @@ fn composite_profile2_reuses_one_resource_and_replays_the_complete_projection() 
             effect,
             component: AGENT_COMPONENT_REPLY,
             actor: second_successor,
-            binding_generation: 3,
             operation: digest(19),
         }),
         Err(CoreError::WrongCommitState)
@@ -1497,7 +1384,7 @@ fn composite_profile2_reuses_one_resource_and_replays_the_complete_projection() 
     );
 
     let mut intents =
-        arm_agent_components(&mut harness, effect, second_successor, 3, 20, 22).into_iter();
+        arm_agent_components(&mut harness, effect, second_successor, 20, 22).into_iter();
     acknowledge_component(
         &mut harness,
         intents.next().expect("reply intent"),
@@ -1531,7 +1418,6 @@ fn composite_profile2_reuses_one_resource_and_replays_the_complete_projection() 
         harness.tx(Command::BeginRevoke {
             effect,
             expected_actor: second_successor,
-            binding_generation: 3,
             authority_epoch: committed_authority_epoch,
         }),
         Err(CoreError::WrongCommitState)
@@ -1566,8 +1452,6 @@ fn composite_profile2_reuses_one_resource_and_replays_the_complete_projection() 
         effect,
         second_successor,
         settlement_successor,
-        3,
-        4,
         3,
     );
     // This is a deterministic occupancy measurement, not elapsed time.  The
@@ -1649,7 +1533,7 @@ fn composite_profile2_reuses_one_resource_and_replays_the_complete_projection() 
         other => panic!("expected reply component settlement claim, got {other:?}"),
     };
     assert_eq!(settlement.effect(), effect);
-    assert_eq!(settlement.component(), Some(AGENT_COMPONENT_REPLY));
+    assert_eq!(settlement.component(), AGENT_COMPONENT_REPLY);
     let settlement = match harness.output(settlement.record_apply_intent(digest(40)).unwrap()) {
         TransitionOutput::SettlementClaim(claim) => claim,
         other => panic!("expected intent-stage component claim, got {other:?}"),
@@ -1680,8 +1564,6 @@ fn composite_profile2_reuses_one_resource_and_replays_the_complete_projection() 
         settlement_successor,
         reconciliation_successor,
         4,
-        5,
-        4,
     );
     assert!(matches!(
         harness
@@ -1694,7 +1576,7 @@ fn composite_profile2_reuses_one_resource_and_replays_the_complete_projection() 
             applied: true
         }
     ));
-    assert_eq!(harness.tx(late_ack), Err(CoreError::StaleEvidence));
+    assert_eq!(harness.tx(late_ack), Err(CoreError::StaleSettlementClaim));
 
     let reconciliation = match harness.output(Command::ClaimComponentSettlement {
         effect,
@@ -1809,16 +1691,16 @@ fn composite_profile2_reuses_one_resource_and_replays_the_complete_projection() 
     let head = harness.engine.head();
     let recovery_anchor = || {
         recovery_anchor(
-            standard_catalog().digest(),
-            freshness(1, 1, 1, 1, 1),
-            freshness(2, 1, 1, 3, 2),
+            standard_catalog_set().digest(),
+            freshness(1, 1, 1, 1),
+            freshness(2, 1, 3, 2),
             revision,
             head,
             pre_recovery_projection_digest,
         )
     };
-    let report = Engine::recover_legacy_compatibility(
-        standard_catalog(),
+    let report = Engine::recover(
+        standard_catalog_set(),
         CoreLimits::bounded_default(),
         recovery_anchor(),
         &harness.journal,
@@ -1832,8 +1714,8 @@ fn composite_profile2_reuses_one_resource_and_replays_the_complete_projection() 
         recovered_projection_digest, pre_recovery_projection_digest,
         "the transient recovery overlay retains the trusted base projection until checkpoint"
     );
-    let replayed_again = Engine::recover_legacy_compatibility(
-        standard_catalog(),
+    let replayed_again = Engine::recover(
+        standard_catalog_set(),
         CoreLimits::bounded_default(),
         recovery_anchor(),
         &harness.journal,
@@ -1872,31 +1754,29 @@ fn composite_profile2_reuses_one_resource_and_replays_the_complete_projection() 
 }
 
 #[test]
-fn dma_only_profile2_operation_reuses_a_retired_composite_resource() {
-    let mut harness = Harness::new();
-    let origin = principal(MAIN_ROOT, 1);
-    let original = effect(MAIN_ROOT, 1);
-    let reuse = effect(MAIN_ROOT, 2);
+fn dma_only_operation_reuses_a_retired_composite_resource() {
+    let mut harness = Harness::standard();
+    let origin = executor(MAIN_OPERATION, 1);
+    let original = effect(MAIN_OPERATION, 1);
+    let reuse = effect(MAIN_OPERATION, 2);
     let reply_claim = claim(50);
     let queue_claim = claim(51);
     let reused_queue_claim = claim(52);
     let queue_resource = resource(0xc552);
 
-    harness
-        .tx(Command::CreateCompositeEffect {
-            effect: original,
-            origin,
-            binding_generation: 1,
-            kind: AGENT_OPERATION_COMPOSITE,
-            charge_account: charge(MAIN_ROOT),
-        })
-        .unwrap();
+    admit_composite(
+        &mut harness,
+        original,
+        origin,
+        AGENT_OPERATION_COMPOSITE,
+        charge(MAIN_OPERATION),
+        &[AGENT_COMPONENT_REPLY, AGENT_COMPONENT_DMA],
+    );
     harness
         .tx(Command::AddComponentClaim {
             effect: original,
             component: AGENT_COMPONENT_REPLY,
             actor: origin,
-            binding_generation: 1,
             claim: reply_claim,
             kind: REPLY_CLAIM_PUBLICATION_SLOT,
             scope: ClaimScope::Logical,
@@ -1910,7 +1790,6 @@ fn dma_only_profile2_operation_reuses_a_retired_composite_resource() {
             effect: original,
             component: AGENT_COMPONENT_DMA,
             actor: origin,
-            binding_generation: 1,
             claim: queue_claim,
             kind: DEVICE_CLAIM_QUEUE_SLOT,
             scope: ClaimScope::Device(device_scope()),
@@ -1923,23 +1802,21 @@ fn dma_only_profile2_operation_reuses_a_retired_composite_resource() {
         .tx(Command::PrepareCompositeEffect {
             effect: original,
             actor: origin,
-            binding_generation: 1,
         })
         .unwrap();
-    commit_agent_components(&mut harness, original, origin, 1, 50, 51, 52, 53);
+    commit_agent_components(&mut harness, original, origin, 50, 51, 52, 53);
 
     // A real reservation command, rather than a read-only projection, proves
     // that the retained claim closes the admission gate.  The failed command
     // is deliberately retried unchanged after exact retirement below.
-    harness
-        .tx(Command::CreateCompositeEffect {
-            effect: reuse,
-            origin,
-            binding_generation: 1,
-            kind: DMA_ARENA_REUSE_COMPOSITE,
-            charge_account: charge(MAIN_ROOT),
-        })
-        .unwrap();
+    admit_composite(
+        &mut harness,
+        reuse,
+        origin,
+        DMA_ARENA_REUSE_COMPOSITE,
+        charge(MAIN_OPERATION),
+        &[AGENT_COMPONENT_DMA],
+    );
     let before_retained_reuse_probe = (
         harness.engine.revision(),
         harness.engine.head(),
@@ -1950,7 +1827,6 @@ fn dma_only_profile2_operation_reuses_a_retired_composite_resource() {
             effect: reuse,
             component: AGENT_COMPONENT_DMA,
             actor: origin,
-            binding_generation: 1,
             claim: reused_queue_claim,
             kind: DEVICE_CLAIM_QUEUE_SLOT,
             scope: ClaimScope::Device(device_scope()),
@@ -2002,7 +1878,6 @@ fn dma_only_profile2_operation_reuses_a_retired_composite_resource() {
             effect: reuse,
             component: AGENT_COMPONENT_DMA,
             actor: origin,
-            binding_generation: 1,
             claim: reused_queue_claim,
             kind: DEVICE_CLAIM_QUEUE_SLOT,
             scope: ClaimScope::Device(device_scope()),
@@ -2025,7 +1900,6 @@ fn dma_only_profile2_operation_reuses_a_retired_composite_resource() {
         effect: reuse,
         component: AGENT_COMPONENT_DMA,
         actor: origin,
-        binding_generation: 1,
         claim: reused_queue_claim,
         kind: DEVICE_CLAIM_QUEUE_SLOT,
         scope: ClaimScope::Device(device_scope()),
@@ -2038,7 +1912,7 @@ fn dma_only_profile2_operation_reuses_a_retired_composite_resource() {
         other => panic!("expected cross-effect component reuse permit, got {other:?}"),
     };
     assert_eq!(permit.effect(), reuse);
-    assert_eq!(permit.component(), Some(AGENT_COMPONENT_DMA));
+    assert_eq!(permit.component(), AGENT_COMPONENT_DMA);
     assert_eq!(permit.claim(), reused_queue_claim);
     assert_eq!(permit.previous_generation(), resource_generation(1));
     assert_eq!(permit.generation(), resource_generation(2));
@@ -2050,7 +1924,6 @@ fn dma_only_profile2_operation_reuses_a_retired_composite_resource() {
         .tx(Command::PrepareCompositeEffect {
             effect: reuse,
             actor: origin,
-            binding_generation: 1,
         })
         .unwrap();
     commit_component(
@@ -2058,7 +1931,6 @@ fn dma_only_profile2_operation_reuses_a_retired_composite_resource() {
         reuse,
         AGENT_COMPONENT_DMA,
         origin,
-        1,
         55,
         56,
         DEVICE_VERIFIER,
@@ -2083,47 +1955,47 @@ fn dma_only_profile2_operation_reuses_a_retired_composite_resource() {
     );
 }
 
-struct AdoptedProfileTwoFixture {
+struct AdoptedFixture {
     harness: Harness,
     effect: EffectId,
-    successor: cser_core::PrincipalIncarnation,
+    successor: cser_core::ExecutorCoordinate,
     reply_claim: ClaimId,
     page_claim: ClaimId,
     iova_claim: ClaimId,
     reusable_queue: ResourceId,
 }
 
-fn replay_profile_two_prefix(harness: &Harness, label: &str) -> Engine {
+fn replay_prefix(harness: &Harness, label: &str) -> Engine {
     let revision = harness.engine.revision();
     let head = harness.engine.head();
     let anchor = || {
         recovery_anchor(
-            standard_catalog().digest(),
-            freshness(1, 1, 1, 1, 1),
-            freshness(2, 1, 1, 99, 2),
+            standard_catalog_set().digest(),
+            freshness(1, 1, 1, 1),
+            freshness(2, 1, 99, 2),
             revision,
             head,
             harness.engine.projection_digest(),
         )
     };
-    let recovered = Engine::recover_legacy_compatibility(
-        standard_catalog(),
+    let recovered = Engine::recover(
+        standard_catalog_set(),
         CoreLimits::bounded_default(),
         anchor(),
         &harness.journal,
     )
-    .unwrap_or_else(|error| panic!("{label}: profile-2 recovery failed: {error:?}"));
+    .unwrap_or_else(|error| panic!("{label}: recovery failed: {error:?}"));
     assert_eq!(recovered.acknowledged_revision(), revision, "{label}");
     assert_eq!(recovered.acknowledged_head(), head, "{label}");
     let recovered = recovered.into_engine();
     let recovered_projection_digest = recovered.projection_digest();
-    let replayed_again = Engine::recover_legacy_compatibility(
-        standard_catalog(),
+    let replayed_again = Engine::recover(
+        standard_catalog_set(),
         CoreLimits::bounded_default(),
         anchor(),
         &harness.journal,
     )
-    .unwrap_or_else(|error| panic!("{label}: second profile-2 recovery failed: {error:?}"));
+    .unwrap_or_else(|error| panic!("{label}: second recovery failed: {error:?}"));
     assert_eq!(
         replayed_again.into_engine().projection_digest(),
         recovered_projection_digest,
@@ -2132,46 +2004,45 @@ fn replay_profile_two_prefix(harness: &Harness, label: &str) -> Engine {
     recovered
 }
 
-fn adopted_profile_two_fixture(root: u64) -> AdoptedProfileTwoFixture {
-    let mut harness = Harness::new();
+fn adopted_fixture(operation_value: u64) -> AdoptedFixture {
+    let mut harness = Harness::standard();
     let reusable_queue = seed_retired_queue(&mut harness);
-    let effect = effect(root, 1);
-    let origin = principal(root, 1);
-    let successor = principal(root, 2);
-    let reply_claim = claim(root + 1);
-    let page_claim = claim(root + 2);
-    let iova_claim = claim(root + 3);
+    let effect = effect(operation_value, 1);
+    let origin = executor(operation_value, 1);
+    let successor = executor(operation_value, 2);
+    let reply_claim = claim(operation_value + 1);
+    let page_claim = claim(operation_value + 2);
+    let iova_claim = claim(operation_value + 3);
 
-    harness
-        .tx(Command::CreateCompositeEffect {
-            effect,
-            origin,
-            binding_generation: 1,
-            kind: AGENT_OPERATION_COMPOSITE,
-            charge_account: charge(root),
-        })
-        .unwrap();
+    admit_composite(
+        &mut harness,
+        effect,
+        origin,
+        AGENT_OPERATION_COMPOSITE,
+        charge(operation_value),
+        &[AGENT_COMPONENT_REPLY, AGENT_COMPONENT_DMA],
+    );
     for (component, claim, kind, scope, resource) in [
         (
             AGENT_COMPONENT_REPLY,
             reply_claim,
             REPLY_CLAIM_PUBLICATION_SLOT,
             ClaimScope::Logical,
-            resource(root + 10),
+            resource(operation_value + 10),
         ),
         (
             AGENT_COMPONENT_DMA,
             page_claim,
             DEVICE_CLAIM_PINNED_PAGE,
             ClaimScope::Device(device_scope()),
-            resource(root + 11),
+            resource(operation_value + 11),
         ),
         (
             AGENT_COMPONENT_DMA,
             iova_claim,
             DEVICE_CLAIM_IOVA,
             ClaimScope::Device(device_scope()),
-            resource(root + 12),
+            resource(operation_value + 12),
         ),
     ] {
         harness
@@ -2179,7 +2050,6 @@ fn adopted_profile_two_fixture(root: u64) -> AdoptedProfileTwoFixture {
                 effect,
                 component,
                 actor: origin,
-                binding_generation: 1,
                 claim,
                 kind,
                 scope,
@@ -2189,16 +2059,12 @@ fn adopted_profile_two_fixture(root: u64) -> AdoptedProfileTwoFixture {
             })
             .unwrap();
     }
-    fence_snapshot_ready_rebind(&mut harness, effect, origin, successor, 1, 2, root);
+    fence_snapshot_ready_rebind(&mut harness, effect, origin, successor, operation_value);
     harness
-        .tx(Command::AdoptEffect {
-            effect,
-            successor,
-            binding_generation: 2,
-        })
+        .tx(Command::AdoptEffect { effect, successor })
         .unwrap();
 
-    AdoptedProfileTwoFixture {
+    AdoptedFixture {
         harness,
         effect,
         successor,
@@ -2210,14 +2076,13 @@ fn adopted_profile_two_fixture(root: u64) -> AdoptedProfileTwoFixture {
 }
 
 #[test]
-fn profile2_durable_replay_covers_composite_partial_prefixes() {
-    let mut fixture = adopted_profile_two_fixture(0xcb01);
+fn durable_replay_covers_composite_partial_prefixes() {
+    let mut fixture = adopted_fixture(0xcb01);
     let reuse_claim = claim(0xcb10);
     let issued = match fixture.harness.output(Command::ReserveComponentReuse {
         effect: fixture.effect,
         component: AGENT_COMPONENT_DMA,
         actor: fixture.successor,
-        binding_generation: 2,
         claim: reuse_claim,
         kind: DEVICE_CLAIM_QUEUE_SLOT,
         scope: ClaimScope::Device(device_scope()),
@@ -2229,7 +2094,7 @@ fn profile2_durable_replay_covers_composite_partial_prefixes() {
         TransitionOutput::ReusePermit(permit) => permit,
         other => panic!("expected issued reuse permit, got {other:?}"),
     };
-    let recovered = replay_profile_two_prefix(&fixture.harness, "issued-before-consume");
+    let recovered = replay_prefix(&fixture.harness, "issued-before-consume");
     assert!(
         recovered
             .component_claims(fixture.effect, AGENT_COMPONENT_DMA)
@@ -2242,14 +2107,12 @@ fn profile2_durable_replay_covers_composite_partial_prefixes() {
             })
     );
 
-    let second_successor = principal(0xcb01, 3);
+    let second_successor = executor(0xcb01, 3);
     fence_snapshot_ready_rebind(
         &mut fixture.harness,
         fixture.effect,
         fixture.successor,
         second_successor,
-        2,
-        3,
         0xcb02,
     );
     fixture
@@ -2257,7 +2120,6 @@ fn profile2_durable_replay_covers_composite_partial_prefixes() {
         .tx(Command::AdoptEffect {
             effect: fixture.effect,
             successor: second_successor,
-            binding_generation: 3,
         })
         .unwrap();
     let reclaimed = fixture
@@ -2267,7 +2129,6 @@ fn profile2_durable_replay_covers_composite_partial_prefixes() {
             fixture.effect,
             AGENT_COMPONENT_DMA,
             second_successor,
-            3,
             fixture.reusable_queue,
             resource_generation(2),
         )
@@ -2277,7 +2138,7 @@ fn profile2_durable_replay_covers_composite_partial_prefixes() {
         other => panic!("expected reclaimed reuse permit, got {other:?}"),
     };
     assert_eq!(reclaimed.generation(), issued.generation());
-    let recovered = replay_profile_two_prefix(&fixture.harness, "reclaimed-before-consume");
+    let recovered = replay_prefix(&fixture.harness, "reclaimed-before-consume");
     assert_eq!(
         recovered
             .component_claims(fixture.effect, AGENT_COMPONENT_DMA)
@@ -2289,7 +2150,7 @@ fn profile2_durable_replay_covers_composite_partial_prefixes() {
         resource_generation(2)
     );
     fixture.harness.tx(reclaimed.activate()).unwrap();
-    let recovered = replay_profile_two_prefix(&fixture.harness, "partial-generation-plus-one");
+    let recovered = replay_prefix(&fixture.harness, "partial-generation-plus-one");
     assert!(
         recovered
             .component_claims(fixture.effect, AGENT_COMPONENT_DMA)
@@ -2307,14 +2168,12 @@ fn profile2_durable_replay_covers_composite_partial_prefixes() {
         .tx(Command::PrepareCompositeEffect {
             effect: fixture.effect,
             actor: second_successor,
-            binding_generation: 3,
         })
         .unwrap();
     commit_agent_components(
         &mut fixture.harness,
         fixture.effect,
         second_successor,
-        3,
         212,
         213,
         214,
@@ -2327,7 +2186,7 @@ fn profile2_durable_replay_covers_composite_partial_prefixes() {
         (fixture.page_claim, DEVICE_EVIDENCE_IOTLB, "page-discharge"),
     ] {
         retire_dma_claim(&mut fixture.harness, fixture.effect, claim, terminal, 220);
-        let recovered = replay_profile_two_prefix(&fixture.harness, label);
+        let recovered = replay_prefix(&fixture.harness, label);
         assert!(
             recovered
                 .component_claims(fixture.effect, AGENT_COMPONENT_DMA)
@@ -2367,13 +2226,12 @@ fn profile2_durable_replay_covers_composite_partial_prefixes() {
         .unwrap();
     fixture
         .harness
-        .tx(Command::FenceIncarnation {
-            root: fixture.effect.root(),
+        .tx(Command::FenceExecutor {
+            operation: fixture.effect.operation(),
             crashed: second_successor,
-            binding_generation: 3,
         })
         .unwrap();
-    let recovered = replay_profile_two_prefix(&fixture.harness, "applied-unacknowledged");
+    let recovered = replay_prefix(&fixture.harness, "applied-unacknowledged");
     assert_eq!(
         recovered
             .component(fixture.effect, AGENT_COMPONENT_REPLY)
@@ -2394,17 +2252,16 @@ fn profile2_durable_replay_covers_composite_partial_prefixes() {
 }
 
 #[test]
-fn profile2_activation_persist_failure_replays_the_ambiguous_generation_plus_one_record() {
+fn activation_persist_failure_replays_the_ambiguous_generation_plus_one_record() {
     #[derive(Debug)]
     struct PersistFault;
 
-    let mut fixture = adopted_profile_two_fixture(0xcb21);
+    let mut fixture = adopted_fixture(0xcb21);
     let reuse_claim = claim(0xcb30);
     let permit = match fixture.harness.output(Command::ReserveComponentReuse {
         effect: fixture.effect,
         component: AGENT_COMPONENT_DMA,
         actor: fixture.successor,
-        binding_generation: 2,
         claim: reuse_claim,
         kind: DEVICE_CLAIM_QUEUE_SLOT,
         scope: ClaimScope::Device(device_scope()),
@@ -2416,14 +2273,13 @@ fn profile2_activation_persist_failure_replays_the_ambiguous_generation_plus_one
         TransitionOutput::ReusePermit(permit) => permit,
         other => panic!("expected reusable queue permit, got {other:?}"),
     };
-    let mut expected_fixture = adopted_profile_two_fixture(0xcb21);
+    let mut expected_fixture = adopted_fixture(0xcb21);
     let expected_permit = match expected_fixture
         .harness
         .output(Command::ReserveComponentReuse {
             effect: expected_fixture.effect,
             component: AGENT_COMPONENT_DMA,
             actor: expected_fixture.successor,
-            binding_generation: 2,
             claim: reuse_claim,
             kind: DEVICE_CLAIM_QUEUE_SLOT,
             scope: ClaimScope::Device(device_scope()),
@@ -2440,8 +2296,7 @@ fn profile2_activation_persist_failure_replays_the_ambiguous_generation_plus_one
         .tx(expected_permit.activate())
         .unwrap();
     let expected_projection = expected_fixture.harness.engine.projection_digest();
-    let prefix_revision =
-        replay_profile_two_prefix(&fixture.harness, "activation-persist-prefix").revision();
+    let prefix_revision = replay_prefix(&fixture.harness, "activation-persist-prefix").revision();
     let activation = permit.activate();
     let mut ambiguous_record = Vec::new();
     assert!(matches!(
@@ -2456,15 +2311,15 @@ fn profile2_activation_persist_failure_replays_the_ambiguous_generation_plus_one
     let activated_scan = scan_journal(&fixture.harness.journal).unwrap();
     let activated_record = activated_scan.records().last().unwrap();
     let recovery_anchor = recovery_anchor(
-        standard_catalog().digest(),
-        freshness(1, 1, 1, 1, 1),
-        freshness(2, 1, 1, 99, 2),
+        standard_catalog_set().digest(),
+        freshness(1, 1, 1, 1),
+        freshness(2, 1, 99, 2),
         activated_record.revision(),
         activated_record.digest(),
         expected_projection,
     );
-    let recovered = Engine::recover_legacy_compatibility(
-        standard_catalog(),
+    let recovered = Engine::recover(
+        standard_catalog_set(),
         CoreLimits::bounded_default(),
         recovery_anchor,
         &fixture.harness.journal,
@@ -2487,31 +2342,29 @@ fn profile2_activation_persist_failure_replays_the_ambiguous_generation_plus_one
 
 fn create_precommit_agent(
     harness: &mut Harness,
-    root_value: u64,
-) -> (EffectId, cser_core::PrincipalIncarnation, ClaimId, ClaimId) {
-    let operation = effect(root_value, 1);
-    let origin = principal(root_value, 1);
-    let reply_claim = claim(root_value + 1);
-    let queue_claim = claim(root_value + 2);
-    harness
-        .tx(Command::CreateCompositeEffect {
-            effect: operation,
-            origin,
-            binding_generation: 1,
-            kind: AGENT_OPERATION_COMPOSITE,
-            charge_account: charge(root_value),
-        })
-        .unwrap();
+    operation_value: u64,
+) -> (EffectId, cser_core::ExecutorCoordinate, ClaimId, ClaimId) {
+    let operation = effect(operation_value, 1);
+    let origin = executor(operation_value, 1);
+    let reply_claim = claim(operation_value + 1);
+    let queue_claim = claim(operation_value + 2);
+    admit_composite(
+        harness,
+        operation,
+        origin,
+        AGENT_OPERATION_COMPOSITE,
+        charge(operation_value),
+        &[AGENT_COMPONENT_REPLY, AGENT_COMPONENT_DMA],
+    );
     harness
         .tx(Command::AddComponentClaim {
             effect: operation,
             component: AGENT_COMPONENT_REPLY,
             actor: origin,
-            binding_generation: 1,
             claim: reply_claim,
             kind: REPLY_CLAIM_PUBLICATION_SLOT,
             scope: ClaimScope::Logical,
-            resource: resource(root_value + 10),
+            resource: resource(operation_value + 10),
             resource_generation: resource_generation(1),
             units: 1,
         })
@@ -2521,11 +2374,10 @@ fn create_precommit_agent(
             effect: operation,
             component: AGENT_COMPONENT_DMA,
             actor: origin,
-            binding_generation: 1,
             claim: queue_claim,
             kind: DEVICE_CLAIM_QUEUE_SLOT,
             scope: ClaimScope::Device(device_scope()),
-            resource: resource(root_value + 11),
+            resource: resource(operation_value + 11),
             resource_generation: resource_generation(1),
             units: 1,
         })
@@ -2534,7 +2386,6 @@ fn create_precommit_agent(
         .tx(Command::PrepareCompositeEffect {
             effect: operation,
             actor: origin,
-            binding_generation: 1,
         })
         .unwrap();
     (operation, origin, reply_claim, queue_claim)
@@ -2543,17 +2394,17 @@ fn create_precommit_agent(
 fn recover_checkpoint_and_adopt_precommit(
     harness: &mut Harness,
     operation: EffectId,
-    origin: cser_core::PrincipalIncarnation,
-    successor: cser_core::PrincipalIncarnation,
+    origin: cser_core::ExecutorCoordinate,
+    successor: cser_core::ExecutorCoordinate,
     snapshot_value: u64,
 ) {
     let anchor = anchor(
         &harness.engine,
-        freshness(1, 1, 1, 1, 1),
-        freshness(2, 1, 1, 2, 2),
+        freshness(1, 1, 1, 1),
+        freshness(2, 1, 2, 2),
     );
-    harness.engine = Engine::recover_legacy_compatibility(
-        standard_catalog(),
+    harness.engine = Engine::recover(
+        standard_catalog_set(),
         CoreLimits::bounded_default(),
         anchor,
         &harness.journal,
@@ -2571,7 +2422,6 @@ fn recover_checkpoint_and_adopt_precommit(
         harness.tx(Command::RebaseCompositePrecommitClaims {
             effect: operation,
             actor: origin,
-            binding_generation: 1,
         }),
         Err(CoreError::RecoveryPending)
     );
@@ -2586,47 +2436,45 @@ fn recover_checkpoint_and_adopt_precommit(
 
     harness
         .tx(Command::CheckpointRecovery {
-            boot: freshness(2, 1, 1, 2, 2).boot(),
-            journal: freshness(2, 1, 1, 2, 2).journal(),
-            device: freshness(2, 1, 1, 2, 2).device(),
+            boot: freshness(2, 1, 2, 2).boot(),
+            journal: freshness(2, 1, 2, 2).journal(),
+            device: freshness(2, 1, 2, 2).device(),
         })
         .unwrap();
     let snapshot_id = snapshot(snapshot_value);
     let cohort = harness
         .engine
-        .snapshot_root(operation.root(), snapshot_id)
+        .snapshot_operation(operation.operation(), snapshot_id)
         .unwrap();
     harness.tx(cohort.record()).unwrap();
     harness
         .tx(Command::Ready {
-            root: operation.root(),
+            operation: operation.operation(),
             snapshot: snapshot_id,
             successor,
         })
         .unwrap();
     harness
         .tx(Command::Rebind {
-            root: operation.root(),
+            operation: operation.operation(),
             snapshot: snapshot_id,
             successor,
-            binding_generation: 2,
         })
         .unwrap();
     harness
         .tx(Command::AdoptEffect {
             effect: operation,
             successor,
-            binding_generation: 2,
         })
         .unwrap();
 }
 
 #[test]
-fn adopted_precommit_claim_rebase_clears_quarantine_and_replays_schema_six() {
-    let mut harness = Harness::new();
+fn adopted_precommit_claim_rebase_clears_quarantine_and_replays_current_schema() {
+    let mut harness = Harness::standard();
     let (operation, origin, reply_claim, queue_claim) =
         create_precommit_agent(&mut harness, 0xcd01);
-    let successor = principal(0xcd01, 2);
+    let successor = executor(0xcd01, 2);
     let before_adoption = (
         harness.engine.revision(),
         harness.engine.head(),
@@ -2636,7 +2484,6 @@ fn adopted_precommit_claim_rebase_clears_quarantine_and_replays_schema_six() {
         harness.tx(Command::RebaseCompositePrecommitClaims {
             effect: operation,
             actor: origin,
-            binding_generation: 1,
         }),
         Err(CoreError::WrongCommitState)
     );
@@ -2650,7 +2497,7 @@ fn adopted_precommit_claim_rebase_clears_quarantine_and_replays_schema_six() {
     );
     recover_checkpoint_and_adopt_precommit(&mut harness, operation, origin, successor, 0xcd01);
 
-    let old_freshness = freshness(1, 1, 1, 1, 1);
+    let old_freshness = freshness(1, 1, 1, 1);
     assert_eq!(
         harness
             .engine
@@ -2680,9 +2527,7 @@ fn adopted_precommit_claim_rebase_clears_quarantine_and_replays_schema_six() {
     let request = Command::RebaseCompositePrecommitClaims {
         effect: operation,
         actor: successor,
-        binding_generation: 2,
     };
-    assert!(request.is_profile_two_compatible());
     let receipt = harness.tx(request).unwrap();
     assert_eq!(
         receipt.event(),
@@ -2692,7 +2537,7 @@ fn adopted_precommit_claim_rebase_clears_quarantine_and_replays_schema_six() {
     assert_eq!(receipt.coordinates().component(), None);
     assert_eq!(receipt.into_output(), TransitionOutput::None);
 
-    let current = freshness(2, 1, 2, 2, 2);
+    let current = freshness(2, 1, 2, 2);
     let reply = harness
         .engine
         .component_claims(operation, AGENT_COMPONENT_REPLY)
@@ -2734,7 +2579,6 @@ fn adopted_precommit_claim_rebase_clears_quarantine_and_replays_schema_six() {
         harness.tx(Command::RebaseCompositePrecommitClaims {
             effect: operation,
             actor: successor,
-            binding_generation: 2,
         }),
         Err(CoreError::StaleEvidence)
     );
@@ -2747,13 +2591,13 @@ fn adopted_precommit_claim_rebase_clears_quarantine_and_replays_schema_six() {
         before_duplicate
     );
 
-    let replay = Engine::recover_legacy_compatibility(
-        standard_catalog(),
+    let replay = Engine::recover(
+        standard_catalog_set(),
         CoreLimits::bounded_default(),
         anchor(
             &harness.engine,
-            freshness(2, 1, 1, 2, 2),
-            freshness(3, 1, 1, 2, 3),
+            freshness(2, 1, 2, 2),
+            freshness(3, 1, 2, 3),
         ),
         &harness.journal,
     )
@@ -2781,26 +2625,24 @@ fn adopted_precommit_claim_rebase_clears_quarantine_and_replays_schema_six() {
 
 #[test]
 fn pending_generation_plus_one_survives_rebase_for_explicit_reclaim_only() {
-    let mut harness = Harness::new();
+    let mut harness = Harness::standard();
     let queue = seed_retired_queue(&mut harness);
     let operation = effect(0xcd11, 1);
-    let origin = principal(0xcd11, 1);
-    let successor = principal(0xcd11, 2);
+    let origin = executor(0xcd11, 1);
+    let successor = executor(0xcd11, 2);
     let reuse_claim = claim(0xcd11);
-    harness
-        .tx(Command::CreateCompositeEffect {
-            effect: operation,
-            origin,
-            binding_generation: 1,
-            kind: DMA_ARENA_REUSE_COMPOSITE,
-            charge_account: charge(0xcd11),
-        })
-        .unwrap();
+    admit_composite(
+        &mut harness,
+        operation,
+        origin,
+        DMA_ARENA_REUSE_COMPOSITE,
+        charge(0xcd11),
+        &[AGENT_COMPONENT_DMA],
+    );
     let old_permit = match harness.output(Command::ReserveComponentReuse {
         effect: operation,
         component: AGENT_COMPONENT_DMA,
         actor: origin,
-        binding_generation: 1,
         claim: reuse_claim,
         kind: DEVICE_CLAIM_QUEUE_SLOT,
         scope: ClaimScope::Device(device_scope()),
@@ -2823,7 +2665,6 @@ fn pending_generation_plus_one_survives_rebase_for_explicit_reclaim_only() {
         .tx(Command::PrepareCompositeEffect {
             effect: operation,
             actor: origin,
-            binding_generation: 1,
         })
         .unwrap();
     recover_checkpoint_and_adopt_precommit(&mut harness, operation, origin, successor, 0xcd11);
@@ -2832,7 +2673,6 @@ fn pending_generation_plus_one_survives_rebase_for_explicit_reclaim_only() {
             operation,
             AGENT_COMPONENT_DMA,
             successor,
-            2,
             queue,
             resource_generation(2),
         ),
@@ -2843,7 +2683,6 @@ fn pending_generation_plus_one_survives_rebase_for_explicit_reclaim_only() {
         .tx(Command::RebaseCompositePrecommitClaims {
             effect: operation,
             actor: successor,
-            binding_generation: 2,
         })
         .unwrap();
     assert_eq!(receipt.into_output(), TransitionOutput::None);
@@ -2855,7 +2694,7 @@ fn pending_generation_plus_one_survives_rebase_for_explicit_reclaim_only() {
     );
     assert_eq!(
         harness.tx(old_permit.activate()),
-        Err(CoreError::StaleIncarnation)
+        Err(CoreError::StaleExecutor)
     );
     assert_eq!(
         (
@@ -2872,7 +2711,6 @@ fn pending_generation_plus_one_survives_rebase_for_explicit_reclaim_only() {
             operation,
             AGENT_COMPONENT_DMA,
             successor,
-            2,
             queue,
             resource_generation(2),
         )
@@ -2891,32 +2729,30 @@ fn pending_generation_plus_one_survives_rebase_for_explicit_reclaim_only() {
         ),
         retained_contract
     );
-    assert_eq!(permit.freshness(), freshness(2, 1, 2, 2, 2));
+    assert_eq!(permit.freshness(), freshness(2, 1, 2, 2));
     harness.tx(permit.activate()).unwrap();
 }
 
 #[test]
 fn activated_generation_plus_one_remains_retained_across_precommit_rebase() {
-    let mut harness = Harness::new();
+    let mut harness = Harness::standard();
     let queue = seed_retired_queue(&mut harness);
     let operation = effect(0xcd21, 1);
-    let origin = principal(0xcd21, 1);
-    let successor = principal(0xcd21, 2);
+    let origin = executor(0xcd21, 1);
+    let successor = executor(0xcd21, 2);
     let reuse_claim = claim(0xcd21);
-    harness
-        .tx(Command::CreateCompositeEffect {
-            effect: operation,
-            origin,
-            binding_generation: 1,
-            kind: DMA_ARENA_REUSE_COMPOSITE,
-            charge_account: charge(0xcd21),
-        })
-        .unwrap();
+    admit_composite(
+        &mut harness,
+        operation,
+        origin,
+        DMA_ARENA_REUSE_COMPOSITE,
+        charge(0xcd21),
+        &[AGENT_COMPONENT_DMA],
+    );
     let permit = match harness.output(Command::ReserveComponentReuse {
         effect: operation,
         component: AGENT_COMPONENT_DMA,
         actor: origin,
-        binding_generation: 1,
         claim: reuse_claim,
         kind: DEVICE_CLAIM_QUEUE_SLOT,
         scope: ClaimScope::Device(device_scope()),
@@ -2933,7 +2769,6 @@ fn activated_generation_plus_one_remains_retained_across_precommit_rebase() {
         .tx(Command::PrepareCompositeEffect {
             effect: operation,
             actor: origin,
-            binding_generation: 1,
         })
         .unwrap();
     recover_checkpoint_and_adopt_precommit(&mut harness, operation, origin, successor, 0xcd21);
@@ -2942,7 +2777,6 @@ fn activated_generation_plus_one_remains_retained_across_precommit_rebase() {
             .tx(Command::RebaseCompositePrecommitClaims {
                 effect: operation,
                 actor: successor,
-                binding_generation: 2,
             })
             .unwrap()
             .into_output(),
@@ -2953,7 +2787,6 @@ fn activated_generation_plus_one_remains_retained_across_precommit_rebase() {
             operation,
             AGENT_COMPONENT_DMA,
             successor,
-            2,
             queue,
             resource_generation(2),
         ),
@@ -2972,7 +2805,6 @@ fn activated_generation_plus_one_remains_retained_across_precommit_rebase() {
             effect: operation,
             component: AGENT_COMPONENT_DMA,
             actor: successor,
-            binding_generation: 2,
             operation: digest(0xd3),
         }),
         TransitionOutput::CommitIntent(_)
@@ -2981,26 +2813,24 @@ fn activated_generation_plus_one_remains_retained_across_precommit_rebase() {
 
 #[test]
 fn escaped_claim_in_shared_device_scope_keeps_rebase_fail_closed() {
-    let mut harness = Harness::new();
-    let root_value = 0xcd31;
-    let origin = principal(root_value, 1);
-    let blocker = effect(root_value, 1);
-    let target = effect(root_value, 2);
-    harness
-        .tx(Command::CreateCompositeEffect {
-            effect: blocker,
-            origin,
-            binding_generation: 1,
-            kind: DMA_ARENA_REUSE_COMPOSITE,
-            charge_account: charge(root_value),
-        })
-        .unwrap();
+    let mut harness = Harness::standard();
+    let operation_value = 0xcd31;
+    let origin = executor(operation_value, 1);
+    let blocker = effect(operation_value, 1);
+    let target = effect(operation_value, 2);
+    admit_composite(
+        &mut harness,
+        blocker,
+        origin,
+        DMA_ARENA_REUSE_COMPOSITE,
+        charge(operation_value),
+        &[AGENT_COMPONENT_DMA],
+    );
     harness
         .tx(Command::AddComponentClaim {
             effect: blocker,
             component: AGENT_COMPONENT_DMA,
             actor: origin,
-            binding_generation: 1,
             claim: claim(0xcd31),
             kind: DEVICE_CLAIM_QUEUE_SLOT,
             scope: ClaimScope::Device(device_scope()),
@@ -3013,7 +2843,6 @@ fn escaped_claim_in_shared_device_scope_keeps_rebase_fail_closed() {
         .tx(Command::PrepareCompositeEffect {
             effect: blocker,
             actor: origin,
-            binding_generation: 1,
         })
         .unwrap();
     commit_component(
@@ -3021,7 +2850,6 @@ fn escaped_claim_in_shared_device_scope_keeps_rebase_fail_closed() {
         blocker,
         AGENT_COMPONENT_DMA,
         origin,
-        1,
         0xd4,
         0xd5,
         DEVICE_VERIFIER,
@@ -3036,7 +2864,6 @@ fn escaped_claim_in_shared_device_scope_keeps_rebase_fail_closed() {
         harness.tx(Command::RebaseCompositePrecommitClaims {
             effect: blocker,
             actor: origin,
-            binding_generation: 1,
         }),
         Err(CoreError::WrongCommitState)
     );
@@ -3049,21 +2876,19 @@ fn escaped_claim_in_shared_device_scope_keeps_rebase_fail_closed() {
         escaped_before
     );
 
-    harness
-        .tx(Command::CreateCompositeEffect {
-            effect: target,
-            origin,
-            binding_generation: 1,
-            kind: AGENT_OPERATION_COMPOSITE,
-            charge_account: charge(root_value),
-        })
-        .unwrap();
+    admit_composite(
+        &mut harness,
+        target,
+        origin,
+        AGENT_OPERATION_COMPOSITE,
+        charge(operation_value),
+        &[AGENT_COMPONENT_REPLY, AGENT_COMPONENT_DMA],
+    );
     harness
         .tx(Command::AddComponentClaim {
             effect: target,
             component: AGENT_COMPONENT_REPLY,
             actor: origin,
-            binding_generation: 1,
             claim: claim(0xcd32),
             kind: REPLY_CLAIM_PUBLICATION_SLOT,
             scope: ClaimScope::Logical,
@@ -3077,7 +2902,6 @@ fn escaped_claim_in_shared_device_scope_keeps_rebase_fail_closed() {
             effect: target,
             component: AGENT_COMPONENT_DMA,
             actor: origin,
-            binding_generation: 1,
             claim: claim(0xcd33),
             kind: DEVICE_CLAIM_QUEUE_SLOT,
             scope: ClaimScope::Device(device_scope()),
@@ -3090,11 +2914,10 @@ fn escaped_claim_in_shared_device_scope_keeps_rebase_fail_closed() {
         .tx(Command::PrepareCompositeEffect {
             effect: target,
             actor: origin,
-            binding_generation: 1,
         })
         .unwrap();
 
-    let successor = principal(root_value, 2);
+    let successor = executor(operation_value, 2);
     recover_checkpoint_and_adopt_precommit(&mut harness, target, origin, successor, 0xcd31);
     let before = (
         harness.engine.revision(),
@@ -3105,7 +2928,6 @@ fn escaped_claim_in_shared_device_scope_keeps_rebase_fail_closed() {
         harness.tx(Command::RebaseCompositePrecommitClaims {
             effect: target,
             actor: successor,
-            binding_generation: 2,
         }),
         Err(CoreError::ResourceRetained)
     );
@@ -3124,7 +2946,7 @@ fn escaped_claim_in_shared_device_scope_keeps_rebase_fail_closed() {
             .component_claims(target, AGENT_COMPONENT_DMA)
             .unwrap()[0]
             .enrolled_freshness,
-        freshness(1, 1, 1, 1, 1)
+        freshness(1, 1, 1, 1)
     );
     assert_eq!(
         harness
@@ -3134,111 +2956,6 @@ fn escaped_claim_in_shared_device_scope_keeps_rebase_fail_closed() {
             .commit,
         CommitState::Committed
     );
-}
-
-#[test]
-fn nonempty_profile1_journal_fails_closed_without_pairing_heuristics() {
-    assert!(matches!(
-        scan_journal(b"CSERJR5\0"),
-        Err(JournalDecodeError::UnsupportedVersion { version: 5 })
-    ));
-
-    let mut profile_one = Vec::from(*b"CSERJR5\0");
-    profile_one.extend_from_slice(&5u16.to_le_bytes());
-    profile_one.extend_from_slice(&0u16.to_le_bytes());
-    profile_one.extend_from_slice(&16u32.to_le_bytes());
-    profile_one.extend_from_slice(&MAIN_ROOT.to_le_bytes());
-    profile_one.extend_from_slice(&SEED_ROOT.to_le_bytes());
-    profile_one.extend_from_slice(&1_786_000_000u64.to_le_bytes());
-
-    assert!(matches!(
-        scan_journal(&profile_one),
-        Err(JournalDecodeError::UnsupportedVersion { version: 5 })
-    ));
-    let genesis_anchor = recovery_anchor(
-        standard_catalog().digest(),
-        freshness(1, 1, 1, 1, 1),
-        freshness(2, 1, 1, 1, 2),
-        0,
-        cser_core::Digest::ZERO,
-        genesis_projection(),
-    );
-    assert!(matches!(
-        Engine::recover(
-            standard_catalog(),
-            CoreLimits::bounded_default(),
-            genesis_anchor,
-            &profile_one,
-        ),
-        Err(CoreError::Journal(JournalDecodeError::UnsupportedVersion {
-            version: 5
-        }))
-    ));
-    let anchor = RecoveryAnchor::from_trusted_provider(
-        recovery_anchor(
-            standard_catalog().digest(),
-            freshness(1, 1, 1, 1, 1),
-            freshness(2, 1, 1, 1, 2),
-            0,
-            cser_core::Digest::ZERO,
-            genesis_projection(),
-        )
-        .binding(),
-        freshness(1, 1, 1, 1, 1),
-        freshness(2, 1, 1, 1, 2),
-        1,
-        digest(99),
-        genesis_projection(),
-    )
-    .unwrap();
-    assert!(matches!(
-        Engine::recover(
-            standard_catalog(),
-            CoreLimits::bounded_default(),
-            anchor,
-            &profile_one,
-        ),
-        Err(CoreError::Journal(JournalDecodeError::UnsupportedVersion {
-            version: 5
-        }))
-    ));
-}
-
-#[test]
-fn profile1_pairing_collision_corpus_is_rejected_before_payload_decode() {
-    let collision_payloads = [
-        // Historical root constants.
-        [MAIN_ROOT.to_le_bytes(), SEED_ROOT.to_le_bytes()].concat(),
-        // Adjacent effect sequences.
-        [41u64.to_le_bytes(), 42u64.to_le_bytes()].concat(),
-        // Equal wall-clock-like coordinates.
-        [1_786_000_000u64.to_le_bytes(); 2].concat(),
-        // Shared boot/Registry/device epochs.
-        [7u64.to_le_bytes(); 3].concat(),
-        // Shared resource and charge-account identifiers.
-        [0x7001u64.to_le_bytes(); 2].concat(),
-    ];
-    for payload in collision_payloads {
-        let mut bytes = Vec::from(*b"CSERJR5\0");
-        bytes.extend_from_slice(&payload);
-        assert!(matches!(
-            scan_journal(&bytes),
-            Err(JournalDecodeError::UnsupportedVersion { version: 5 })
-        ));
-    }
-}
-
-proptest! {
-    #[test]
-    fn every_profile1_suffix_is_rejected_without_pairing(payload in prop::collection::vec(any::<u8>(), 0..4096)) {
-        let mut bytes = Vec::from(*b"CSERJR5\0");
-        bytes.extend_from_slice(&payload);
-        let rejected = matches!(
-            scan_journal(&bytes),
-            Err(JournalDecodeError::UnsupportedVersion { version: 5 })
-        );
-        prop_assert!(rejected);
-    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -3270,7 +2987,7 @@ impl TransitionDurability for TestDurability {
 /// releases it reaches the durability boundary.
 #[test]
 fn custody_release_is_not_observable_before_its_evidence_is_durable() {
-    let mut harness = Harness::new();
+    let mut harness = Harness::standard();
     let (effect, origin, claim_id, queue, final_evidence) =
         pending_dma_quiescence_release(&mut harness);
     assert_eq!(
@@ -3299,7 +3016,9 @@ fn custody_release_is_not_observable_before_its_evidence_is_durable() {
             DEVICE_EVIDENCE_IRQ_DRAINED,
         )
         .unwrap();
-    let before_charge = harness.engine.charge(charge(MAIN_ROOT), CREDIT_QUEUE_SLOT);
+    let before_charge = harness
+        .engine
+        .charge(charge(MAIN_OPERATION), CREDIT_QUEUE_SLOT);
     let before_projection = harness.engine.projection_digest();
     let before_revision = harness.engine.revision();
     let before_head = harness.engine.head();
@@ -3353,7 +3072,9 @@ fn custody_release_is_not_observable_before_its_evidence_is_durable() {
         before_irq
     );
     assert_eq!(
-        harness.engine.charge(charge(MAIN_ROOT), CREDIT_QUEUE_SLOT),
+        harness
+            .engine
+            .charge(charge(MAIN_OPERATION), CREDIT_QUEUE_SLOT),
         before_charge
     );
     assert_eq!(
@@ -3370,7 +3091,6 @@ fn custody_release_is_not_observable_before_its_evidence_is_durable() {
                 effect,
                 component: AGENT_COMPONENT_DMA,
                 actor: origin,
-                binding_generation: 1,
                 claim: claim(2),
                 kind: DEVICE_CLAIM_QUEUE_SLOT,
                 scope: ClaimScope::Device(device_scope()),
@@ -3390,10 +3110,12 @@ fn custody_release_is_not_observable_before_its_evidence_is_durable() {
 /// callback fails.
 #[test]
 fn closure_persistence_failure_keeps_final_quiescence_release_unobservable() {
-    let mut harness = Harness::new();
+    let mut harness = Harness::standard();
     let (effect, _, _, queue, final_evidence) = pending_dma_quiescence_release(&mut harness);
     let before_claims = harness.engine.retained_component_claims();
-    let before_charge = harness.engine.charge(charge(MAIN_ROOT), CREDIT_QUEUE_SLOT);
+    let before_charge = harness
+        .engine
+        .charge(charge(MAIN_OPERATION), CREDIT_QUEUE_SLOT);
     let before_projection = harness.engine.projection_digest();
     let before_revision = harness.engine.revision();
     let before_head = harness.engine.head();
@@ -3404,7 +3126,9 @@ fn closure_persistence_failure_keeps_final_quiescence_release_unobservable() {
     );
     assert_eq!(harness.engine.retained_component_claims(), before_claims);
     assert_eq!(
-        harness.engine.charge(charge(MAIN_ROOT), CREDIT_QUEUE_SLOT),
+        harness
+            .engine
+            .charge(charge(MAIN_OPERATION), CREDIT_QUEUE_SLOT),
         before_charge
     );
     assert_eq!(harness.engine.projection_digest(), before_projection);
@@ -3432,7 +3156,7 @@ fn closure_persistence_failure_keeps_final_quiescence_release_unobservable() {
 /// success.
 #[test]
 fn final_quiescence_evidence_releases_custody_after_durable_success() {
-    let mut harness = Harness::new();
+    let mut harness = Harness::standard();
     let (effect, _, claim_id, queue, final_evidence) = pending_dma_quiescence_release(&mut harness);
     let mut persistence = TestDurability {
         fail: false,
@@ -3468,7 +3192,7 @@ fn final_quiescence_evidence_releases_custody_after_durable_success() {
     assert_eq!(
         harness
             .engine
-            .charge(charge(MAIN_ROOT), CREDIT_QUEUE_SLOT)
+            .charge(charge(MAIN_OPERATION), CREDIT_QUEUE_SLOT)
             .retained_units,
         0
     );
@@ -3482,27 +3206,26 @@ fn final_quiescence_evidence_releases_custody_after_durable_success() {
 /// credit class, not per composite.
 ///
 /// The composite admission gate is a second, independent enforcement site from
-/// the simple-estate one, and the paper's custody claims all live on composite
+/// the simple-effect one, and the paper's custody claims all live on composite
 /// effects. This drives the DMA component's queue-slot class to its ceiling and
 /// requires that the reply component -- inside the same sealed topology, on the
 /// same charge account -- still admits its publication slot.
 #[test]
 fn a_saturated_component_does_not_backpressure_its_sibling() {
     let limits = CoreLimits::new(8, 8, 16, 16, 8, 3, 8).unwrap();
-    let mut harness = Harness::with_limits(limits);
+    let mut harness = Harness::with_catalog(standard_catalog(), limits);
     let operation = effect(0xc5b0, 1);
-    let origin = principal(0xc5b0, 1);
+    let origin = executor(0xc5b0, 1);
     let scope = device_scope();
 
-    harness
-        .tx(Command::CreateCompositeEffect {
-            effect: operation,
-            origin,
-            binding_generation: 1,
-            kind: AGENT_OPERATION_COMPOSITE,
-            charge_account: charge(0xc5b0),
-        })
-        .unwrap();
+    admit_composite(
+        &mut harness,
+        operation,
+        origin,
+        AGENT_OPERATION_COMPOSITE,
+        charge(0xc5b0),
+        &[AGENT_COMPONENT_REPLY, AGENT_COMPONENT_DMA],
+    );
 
     // Saturate the DMA component's queue-slot credit class exactly.
     harness
@@ -3510,7 +3233,6 @@ fn a_saturated_component_does_not_backpressure_its_sibling() {
             effect: operation,
             component: AGENT_COMPONENT_DMA,
             actor: origin,
-            binding_generation: 1,
             claim: claim(1),
             kind: DEVICE_CLAIM_QUEUE_SLOT,
             scope: ClaimScope::Device(scope),
@@ -3534,7 +3256,6 @@ fn a_saturated_component_does_not_backpressure_its_sibling() {
             effect: operation,
             component: AGENT_COMPONENT_DMA,
             actor: origin,
-            binding_generation: 1,
             claim: claim(2),
             kind: DEVICE_CLAIM_QUEUE_SLOT,
             scope: ClaimScope::Device(scope),
@@ -3558,22 +3279,20 @@ fn a_saturated_component_does_not_backpressure_its_sibling() {
     // same class and units, but a distinct account. Thus a class-global quota
     // key cannot pass this test merely because the sibling uses another class.
     let unrelated = effect(0xc5b1, 1);
-    let unrelated_origin = principal(0xc5b1, 1);
-    harness
-        .tx(Command::CreateCompositeEffect {
-            effect: unrelated,
-            origin: unrelated_origin,
-            binding_generation: 1,
-            kind: AGENT_OPERATION_COMPOSITE,
-            charge_account: charge(0xc5b1),
-        })
-        .unwrap();
+    let unrelated_origin = executor(0xc5b1, 1);
+    admit_composite(
+        &mut harness,
+        unrelated,
+        unrelated_origin,
+        AGENT_OPERATION_COMPOSITE,
+        charge(0xc5b1),
+        &[AGENT_COMPONENT_REPLY, AGENT_COMPONENT_DMA],
+    );
     harness
         .tx(Command::AddComponentClaim {
             effect: unrelated,
             component: AGENT_COMPONENT_DMA,
             actor: unrelated_origin,
-            binding_generation: 1,
             claim: claim(4),
             kind: DEVICE_CLAIM_QUEUE_SLOT,
             scope: ClaimScope::Device(scope),
@@ -3596,7 +3315,6 @@ fn a_saturated_component_does_not_backpressure_its_sibling() {
             effect: operation,
             component: AGENT_COMPONENT_REPLY,
             actor: origin,
-            binding_generation: 1,
             claim: claim(3),
             kind: REPLY_CLAIM_PUBLICATION_SLOT,
             scope: ClaimScope::Logical,
@@ -3616,25 +3334,26 @@ fn a_saturated_component_does_not_backpressure_its_sibling() {
     // Paired headroom control for the rejected second queue claim. This keeps
     // the effect, account, component, class, and claim shape fixed while only
     // increasing the unit ceiling.
-    let mut headroom = Harness::with_limits(CoreLimits::new(8, 8, 16, 16, 8, 4, 8).unwrap());
+    let mut headroom = Harness::with_catalog(
+        standard_catalog(),
+        CoreLimits::new(8, 8, 16, 16, 8, 4, 8).unwrap(),
+    );
     let operation = effect(0xc5b2, 1);
-    let origin = principal(0xc5b2, 1);
-    headroom
-        .tx(Command::CreateCompositeEffect {
-            effect: operation,
-            origin,
-            binding_generation: 1,
-            kind: AGENT_OPERATION_COMPOSITE,
-            charge_account: charge(0xc5b2),
-        })
-        .unwrap();
+    let origin = executor(0xc5b2, 1);
+    admit_composite(
+        &mut headroom,
+        operation,
+        origin,
+        AGENT_OPERATION_COMPOSITE,
+        charge(0xc5b2),
+        &[AGENT_COMPONENT_REPLY, AGENT_COMPONENT_DMA],
+    );
     for (claim_value, resource_value, units) in [(1, 0xc5b2_0001, 3), (2, 0xc5b2_0002, 1)] {
         headroom
             .tx(Command::AddComponentClaim {
                 effect: operation,
                 component: AGENT_COMPONENT_DMA,
                 actor: origin,
-                binding_generation: 1,
                 claim: claim(claim_value),
                 kind: DEVICE_CLAIM_QUEUE_SLOT,
                 scope: ClaimScope::Device(scope),
