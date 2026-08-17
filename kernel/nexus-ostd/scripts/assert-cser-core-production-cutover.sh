@@ -553,7 +553,9 @@ production_owner_install=$(extract_rust_item \
     "$production_registry") \
     || fail 'cannot isolate production owner installation'
 require_ordered_tokens "$production_owner_install" 'production owner installation' \
-    'linear_custody: Mutex::new(Vec::with_capacity(MAX_LINEAR_PORTAL_BEARERS))'
+    'let linear_custody = Vec::with_capacity(MAX_LINEAR_PORTAL_BEARERS);' \
+    'debug_assert!(linear_custody.capacity() >= MAX_LINEAR_PORTAL_BEARERS);' \
+    'linear_custody: Mutex::new(linear_custody)'
 
 portal_policy=$(extract_rust_item \
     'fn require_client_command(request: &CommandRequest)' \
