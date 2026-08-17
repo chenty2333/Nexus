@@ -14,7 +14,11 @@ use core::iter::FromIterator;
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Node<K, V> {
     key: K,
-    value: V,
+    // Values are independently shared from the path-copying tree nodes.  A
+    // copied ancestor therefore clones this pointer rather than cloning the
+    // (potentially large) record it contains.  `get_mut` makes the target
+    // value unique only when the caller actually mutates it.
+    value: Arc<V>,
     left: Option<Arc<Node<K, V>>>,
     right: Option<Arc<Node<K, V>>>,
     height: u32,
@@ -260,7 +264,7 @@ impl<K: Ord, V> StateMap<K, V> {
             match key.cmp(&node.key) {
                 Ordering::Less => current = node.left.as_deref(),
                 Ordering::Greater => current = node.right.as_deref(),
-                Ordering::Equal => return Some(&node.value),
+                Ordering::Equal => return Some(node.value.as_ref()),
             }
         }
         None
@@ -317,9 +321,10 @@ impl<K: Ord + Clone, V: Clone> StateMap<K, V> {
 
     /// Returns a mutable value for `key`, if present.
     ///
-    /// `Arc::make_mut` clones only the shared nodes on the search path.  A
-    /// unique map therefore mutates its existing nodes without rebuilding the
-    /// rest of the tree, while a cloned map remains isolated.
+    /// `Arc::make_mut` clones only the shared nodes on the search path.  Value
+    /// storage is shared independently from those nodes, so a cloned map
+    /// clones the target value on first mutation but does not deep-clone the
+    /// unrelated ancestor values.
     pub fn get_mut(&mut self, key: &K) -> Option<&mut V> {
         let mut current = self.root.as_mut()?;
         loop {
@@ -331,7 +336,7 @@ impl<K: Ord + Clone, V: Clone> StateMap<K, V> {
                 Ordering::Greater => {
                     current = node.right.as_mut()?;
                 }
-                Ordering::Equal => return Some(&mut node.value),
+                Ordering::Equal => return Some(Arc::make_mut(&mut node.value)),
             }
         }
     }
@@ -448,7 +453,7 @@ fn height<K, V>(node: Option<&Arc<Node<K, V>>>) -> u32 {
 
 fn make_node<K, V>(
     key: K,
-    value: V,
+    value: Arc<V>,
     left: Option<Arc<Node<K, V>>>,
     right: Option<Arc<Node<K, V>>>,
 ) -> Arc<Node<K, V>> {
@@ -473,9 +478,9 @@ fn balance_factor<K, V>(node: &Node<K, V>) -> i32 {
     height(node.left.as_ref()) as i32 - height(node.right.as_ref()) as i32
 }
 
-fn rotate_right<K: Clone, V: Clone>(
+fn rotate_right<K: Clone, V>(
     key: K,
-    value: V,
+    value: Arc<V>,
     left: Arc<Node<K, V>>,
     right: Option<Arc<Node<K, V>>>,
 ) -> Arc<Node<K, V>> {
@@ -488,9 +493,9 @@ fn rotate_right<K: Clone, V: Clone>(
     )
 }
 
-fn rotate_left<K: Clone, V: Clone>(
+fn rotate_left<K: Clone, V>(
     key: K,
-    value: V,
+    value: Arc<V>,
     left: Option<Arc<Node<K, V>>>,
     right: Arc<Node<K, V>>,
 ) -> Arc<Node<K, V>> {
@@ -503,9 +508,9 @@ fn rotate_left<K: Clone, V: Clone>(
     )
 }
 
-fn rebalance<K: Clone, V: Clone>(
+fn rebalance<K: Clone, V>(
     key: K,
-    value: V,
+    value: Arc<V>,
     left: Option<Arc<Node<K, V>>>,
     right: Option<Arc<Node<K, V>>>,
 ) -> Arc<Node<K, V>> {
@@ -559,7 +564,7 @@ fn insert_node<K: Ord + Clone, V: Clone>(
     value: V,
 ) -> (Arc<Node<K, V>>, Option<V>) {
     let Some(node) = node else {
-        return (make_node(key, value, None, None), None);
+        return (make_node(key, Arc::new(value), None, None), None);
     };
     match key.cmp(&node.key) {
         Ordering::Less => {
@@ -589,11 +594,11 @@ fn insert_node<K: Ord + Clone, V: Clone>(
         Ordering::Equal => (
             make_node(
                 node.key.clone(),
-                value,
+                Arc::new(value),
                 node.left.clone(),
                 node.right.clone(),
             ),
-            Some(node.value.clone()),
+            Some(node.value.as_ref().clone()),
         ),
     }
 }
@@ -637,7 +642,7 @@ fn remove_node<K: Ord + Clone, V: Clone>(
             )
         }
         Ordering::Equal => {
-            let old = node.value.clone();
+            let old = node.value.as_ref().clone();
             match (&node.left, &node.right) {
                 (None, _) => (node.right.clone(), Some(old)),
                 (_, None) => (node.left.clone(), Some(old)),
@@ -658,7 +663,9 @@ fn remove_node<K: Ord + Clone, V: Clone>(
     }
 }
 
-fn remove_min<K: Clone, V: Clone>(node: &Arc<Node<K, V>>) -> (K, V, Option<Arc<Node<K, V>>>) {
+type RemoveMinResult<K, V> = (K, Arc<V>, Option<Arc<Node<K, V>>>);
+
+fn remove_min<K: Clone, V>(node: &Arc<Node<K, V>>) -> RemoveMinResult<K, V> {
     let Some(left) = node.left.as_ref() else {
         return (node.key.clone(), node.value.clone(), node.right.clone());
     };
@@ -680,6 +687,19 @@ mod tests {
         vec,
         vec::Vec,
     };
+    use core::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    static VALUE_CLONES: AtomicUsize = AtomicUsize::new(0);
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct CloneCounted(u32);
+
+    impl Clone for CloneCounted {
+        fn clone(&self) -> Self {
+            VALUE_CLONES.fetch_add(1, AtomicOrdering::Relaxed);
+            Self(self.0)
+        }
+    }
 
     fn assert_valid<K: Ord, V>(map: &StateMap<K, V>) -> (u32, usize) {
         fn visit<K: Ord, V>(
@@ -820,6 +840,34 @@ mod tests {
         assert_eq!(map.len(), 3);
         assert_valid(&map);
         assert_valid(&clone);
+    }
+
+    #[test]
+    fn path_copy_clones_only_the_target_value() {
+        let mut map = StateMap::new();
+        for key in 0..128 {
+            assert_eq!(map.insert_mut(key, CloneCounted(key as u32)), None);
+        }
+
+        let mut updated = map.clone();
+        VALUE_CLONES.store(0, AtomicOrdering::Relaxed);
+        updated.get_mut(&73).expect("existing value").0 = 7_300;
+        assert_eq!(VALUE_CLONES.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(map.get(&73), Some(&CloneCounted(73)));
+        assert_eq!(updated.get(&73), Some(&CloneCounted(7_300)));
+
+        VALUE_CLONES.store(0, AtomicOrdering::Relaxed);
+        let (inserted, old) = map.insert(256, CloneCounted(256));
+        assert_eq!(old, None);
+        assert_eq!(VALUE_CLONES.load(AtomicOrdering::Relaxed), 0);
+        assert_eq!(inserted.get(&256), Some(&CloneCounted(256)));
+
+        VALUE_CLONES.store(0, AtomicOrdering::Relaxed);
+        let (removed, old) = map.remove(&73);
+        assert_eq!(old, Some(CloneCounted(73)));
+        assert_eq!(VALUE_CLONES.load(AtomicOrdering::Relaxed), 1);
+        assert!(removed.get(&73).is_none());
+        assert_eq!(map.get(&72), Some(&CloneCounted(72)));
     }
 
     #[test]
