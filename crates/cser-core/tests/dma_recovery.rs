@@ -12,7 +12,7 @@ use cser_core::{
 };
 use support::{
     ExactTestVerifier, Harness, TestReceipt, charge, claim, digest, effect, fence_and_rebind,
-    freshness, principal, resource, verified_commit_outcome,
+    freshness, principal, recovery_anchor, resource, verified_commit_outcome,
     verified_evidence_command as verified_evidence_with_observation,
 };
 
@@ -22,6 +22,17 @@ const IOVA_CLAIM: u64 = 103;
 const QUEUE_RESOURCE: u64 = 201;
 const PAGE_RESOURCE: u64 = 202;
 const IOVA_RESOURCE: u64 = 203;
+
+fn anchor(engine: &Engine, committed: Freshness, next: Freshness) -> RecoveryAnchor {
+    recovery_anchor(
+        standard_catalog().digest(),
+        committed,
+        next,
+        engine.revision(),
+        engine.head(),
+        engine.projection_digest(),
+    )
+}
 
 fn dma_retained_units(harness: &Harness, account_value: u64) -> u64 {
     [CREDIT_QUEUE_SLOT, CREDIT_PINNED_PAGE, CREDIT_IOVA]
@@ -63,14 +74,11 @@ fn replay_exposes_exact_retained_claims_without_an_adapter_side_tombstone_index(
     let report = Engine::recover_legacy_compatibility(
         standard_catalog(),
         CoreLimits::bounded_default(),
-        RecoveryAnchor::from_trusted_provider(
-            standard_catalog().digest(),
+        anchor(
+            &harness.engine,
             freshness(1, 1, 1, 1, 1),
             freshness(2, 1, 1, 2, 2),
-            harness.engine.revision(),
-            harness.engine.head(),
-        )
-        .unwrap(),
+        ),
         &harness.journal,
     )
     .unwrap();
@@ -643,14 +651,11 @@ fn pending_reuse_is_reclaimed_only_after_each_explicit_crash_adoption() {
     let report = Engine::recover_legacy_compatibility(
         standard_catalog(),
         CoreLimits::bounded_default(),
-        RecoveryAnchor::from_trusted_provider(
-            standard_catalog().digest(),
+        anchor(
+            &harness.engine,
             freshness(1, 1, 1, 1, 1),
             freshness(2, 1, 1, 2, 2),
-            harness.engine.revision(),
-            harness.engine.head(),
-        )
-        .unwrap(),
+        ),
         &harness.journal,
     )
     .unwrap();
@@ -774,19 +779,14 @@ fn journal_replay_preserves_exact_subject_and_ordered_retirement_high_water() {
     )
     .unwrap();
 
-    let acknowledged_revision = before_crash.engine.revision();
-    let acknowledged_head = before_crash.engine.head();
     let report = Engine::recover_legacy_compatibility(
         standard_catalog(),
         CoreLimits::bounded_default(),
-        RecoveryAnchor::from_trusted_provider(
-            standard_catalog().digest(),
+        anchor(
+            &before_crash.engine,
             freshness(1, 1, 1, 1, 1),
             freshness(2, 1, 1, 2, 2),
-            acknowledged_revision,
-            acknowledged_head,
-        )
-        .unwrap(),
+        ),
         &before_crash.journal,
     )
     .unwrap();
@@ -923,14 +923,11 @@ fn reboot_recovers_device_tombstones_under_quarantine_until_fresh_evidence() {
     let report = Engine::recover_legacy_compatibility(
         standard_catalog(),
         CoreLimits::bounded_default(),
-        RecoveryAnchor::from_trusted_provider(
-            standard_catalog().digest(),
+        anchor(
+            &before_crash.engine,
             freshness(1, 1, 1, 1, 1),
             freshness(2, 1, 1, 2, 2),
-            acknowledged_revision,
-            acknowledged_head,
-        )
-        .unwrap(),
+        ),
         &before_crash.journal,
     )
     .unwrap();
@@ -1112,14 +1109,11 @@ fn recovery_checkpoint_rejects_a_target_below_any_known_device_scope() {
     let report = Engine::recover_legacy_compatibility(
         standard_catalog(),
         CoreLimits::bounded_default(),
-        RecoveryAnchor::from_trusted_provider(
-            standard_catalog().digest(),
+        anchor(
+            &before_crash.engine,
             freshness(1, 1, 1, 1, 1),
             freshness(2, 1, 1, 1, 2),
-            before_crash.engine.revision(),
-            before_crash.engine.head(),
-        )
-        .unwrap(),
+        ),
         &before_crash.journal,
     )
     .unwrap();
@@ -1190,14 +1184,11 @@ fn recovery_checkpoint_refreshes_a_retired_scope_before_composite_reuse() {
     let report = Engine::recover_legacy_compatibility(
         standard_catalog(),
         CoreLimits::bounded_default(),
-        RecoveryAnchor::from_trusted_provider(
-            standard_catalog().digest(),
+        anchor(
+            &before_crash.engine,
             freshness(1, 1, 1, 1, 1),
             freshness(2, 1, 1, 3, 2),
-            before_crash.engine.revision(),
-            before_crash.engine.head(),
-        )
-        .unwrap(),
+        ),
         &before_crash.journal,
     )
     .unwrap();

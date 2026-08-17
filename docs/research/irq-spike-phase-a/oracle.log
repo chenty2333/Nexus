@@ -1,1 +1,0 @@
-IRQ spike oracle: PASS delivery=observed deliveries=2 delivering_gsis=2 firmware_line_delivered=true pirq_gsi=Some(21) armed_candidates=9 completion_source=polling completion_observed=true intx_tokens=claim+unmask+remask trigger=edge claim=none checkpoint=false

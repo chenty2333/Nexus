@@ -1,12 +1,13 @@
 use cser_core::{
-    BootGeneration, ChargeAccountId, ClaimId, Command as AuthorizedCommand,
-    CommandRequest as Command, CoreError, CoreLimits, DeviceGeneration, Digest, EffectFactKind,
-    EffectId, EffectReceiptVerifier, Engine, ExternalOutcome, Freshness, JournalCheckpoint,
-    JournalGeneration, PrincipalId, PrincipalIncarnation, ReceiptBinding, ReceiptSchemaId,
-    ReceiptVerifier, RegistryInstance, ResourceGeneration, ResourceId, RootId, SnapshotId,
-    TransitionOutput, TransitionReceipt, TxError, VerificationError, VerifiedApplyReceipt,
-    VerifiedCommitOutcome, VerifiedEffectObservation, VerifiedObservation, VerifiedSettlementAck,
-    VerifierId, VerifierIdentity, standard_catalog,
+    AuthorityBindingGeneration, BootGeneration, ChargeAccountId, ClaimId,
+    Command as AuthorizedCommand, CommandRequest as Command, CoreError, CoreLimits,
+    DeviceGeneration, Digest, EffectFactKind, EffectId, EffectReceiptVerifier, Engine,
+    ExternalOutcome, Freshness, JournalCheckpoint, JournalGeneration, PrincipalId,
+    PrincipalIncarnation, ReceiptBinding, ReceiptSchemaId, ReceiptVerifier, RecoveryAnchor,
+    RecoveryBinding, RecoveryProfile, RegistryInstance, ResourceGeneration, ResourceId, RootId,
+    SnapshotId, TransitionOutput, TransitionReceipt, TxError, VerificationError,
+    VerifiedApplyReceipt, VerifiedCommitOutcome, VerifiedEffectObservation, VerifiedObservation,
+    VerifiedSettlementAck, VerifierId, VerifierIdentity, WorldId, standard_catalog,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -139,7 +140,8 @@ pub struct Harness {
 impl Harness {
     pub fn new() -> Self {
         Self {
-            engine: Engine::new_legacy_compatibility(
+            engine: Engine::new_scoped_legacy_compatibility(
+                test_world(),
                 standard_catalog(),
                 CoreLimits::bounded_default(),
                 freshness(1, 1, 1, 1, 1),
@@ -150,7 +152,8 @@ impl Harness {
 
     pub fn with_limits(limits: CoreLimits) -> Self {
         Self {
-            engine: Engine::new_legacy_compatibility(
+            engine: Engine::new_scoped_legacy_compatibility(
+                test_world(),
                 standard_catalog(),
                 limits,
                 freshness(1, 1, 1, 1, 1),
@@ -165,7 +168,12 @@ impl Harness {
 
     pub fn profile_two_with_limits(limits: CoreLimits) -> Self {
         Self {
-            engine: Engine::new(standard_catalog(), limits, freshness(1, 1, 1, 1, 1)),
+            engine: Engine::new(
+                test_world(),
+                standard_catalog(),
+                limits,
+                freshness(1, 1, 1, 1, 1),
+            ),
             journal: Vec::new(),
         }
     }
@@ -175,6 +183,7 @@ impl Harness {
         C: Into<AuthorizedCommand>,
     {
         let journal = &mut self.journal;
+        let command: AuthorizedCommand = command.into();
         self.engine
             .transact(command, |record| {
                 journal.extend_from_slice(record.bytes());
@@ -202,6 +211,50 @@ impl Harness {
     pub fn checkpoint(&self) -> JournalCheckpoint {
         self.engine.journal_checkpoint(&self.journal).unwrap()
     }
+}
+
+pub fn test_world() -> WorldId {
+    WorldId::new(1).unwrap()
+}
+
+pub fn recovery_binding(catalog_digest: Digest, freshness: Freshness) -> RecoveryBinding {
+    RecoveryBinding::new(
+        RecoveryProfile::current(),
+        test_world(),
+        catalog_digest,
+        freshness.registry(),
+        AuthorityBindingGeneration::new(freshness.binding()).unwrap(),
+    )
+    .unwrap()
+}
+
+pub fn genesis_projection() -> Digest {
+    Engine::new(
+        test_world(),
+        standard_catalog(),
+        CoreLimits::bounded_default(),
+        freshness(1, 1, 1, 1, 1),
+    )
+    .projection_digest()
+}
+
+pub fn recovery_anchor(
+    catalog_digest: Digest,
+    committed: Freshness,
+    next: Freshness,
+    minimum_revision: u64,
+    expected_head: Digest,
+    projection: Digest,
+) -> RecoveryAnchor {
+    RecoveryAnchor::from_trusted_provider(
+        recovery_binding(catalog_digest, committed),
+        committed,
+        next,
+        minimum_revision,
+        expected_head,
+        projection,
+    )
+    .unwrap()
 }
 
 pub fn root(value: u64) -> RootId {

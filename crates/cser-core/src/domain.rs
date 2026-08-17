@@ -4,12 +4,13 @@ use alloc::{
     collections::{BTreeMap, BTreeSet},
     vec::Vec,
 };
+use core::hash::{Hash, Hasher};
 
 use sha2::{Digest as _, Sha256};
 
 use crate::{
     ClaimKindId, ComponentId, CompositeKindId, CreditClassId, Digest, DomainId, EvidenceKindId,
-    ObligationKindId, ReceiptSchemaId, VerifierId,
+    ObligationKindId, ReceiptSchemaId, VerifierGeneration, VerifierId,
 };
 
 /// Whether an explicitly rebound successor may adopt an unfinished effect.
@@ -79,6 +80,52 @@ pub enum ClaimScopePolicy {
     Logical,
     /// Every claim instance must name one exact device scope.
     Device,
+}
+
+/// Semantic role of a logical claim in a provider-backed composition.
+///
+/// The role is catalog data rather than an engine-dispatched workflow.  It
+/// gives a World/Harness profile a stable vocabulary for the kinds of logical
+/// custody it retains while keeping their lifecycle enforcement in the same
+/// claim and obligation algebra as every other CSER claim.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LogicalClaimRole {
+    /// An unclassified claim, including legacy and domain-specific classes.
+    Generic,
+    /// A durable slot for reconciling a remote operation by idempotency key.
+    RemoteIdempotencySlot,
+    /// A provider operation retained until its external outcome is known.
+    ProviderOperation,
+    /// A reply or result delivery retained until publication is acknowledged.
+    ReplyDelivery,
+    /// A queued job retained until the provider reports its disposition.
+    QueuedJob,
+    /// A recovery worker's logical custody of an unfinished operation.
+    RecoveryWorker,
+    /// A provider generation retained by an escaped effect.
+    RetainedProviderGeneration,
+    /// A closure of schema/verifier/provider artifacts retained for recovery.
+    ArtifactClosure,
+}
+
+impl LogicalClaimRole {
+    pub(crate) const fn tag(self) -> u8 {
+        match self {
+            Self::Generic => 1,
+            Self::RemoteIdempotencySlot => 2,
+            Self::ProviderOperation => 3,
+            Self::ReplyDelivery => 4,
+            Self::QueuedJob => 5,
+            Self::RecoveryWorker => 6,
+            Self::RetainedProviderGeneration => 7,
+            Self::ArtifactClosure => 8,
+        }
+    }
+
+    /// Returns whether this role is one of the explicit logical claim roles.
+    pub const fn is_logical(self) -> bool {
+        !matches!(self, Self::Generic)
+    }
 }
 
 impl ClaimScopePolicy {
@@ -179,6 +226,212 @@ impl ObligationPolicy {
 pub struct ReceiptBinding {
     verifier: VerifierId,
     receipt_schema: ReceiptSchemaId,
+}
+
+/// The verifier class and receipt schema required by a catalog rule.
+///
+/// This is intentionally only a semantic class/schema coordinate.  A live
+/// provider binding adds the verifier generation and implementation digest
+/// through [`VerifierBinding`].  Keeping the catalog requirement separate
+/// prevents a catalog from accidentally becoming an implementation registry.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct VerifierClassBinding {
+    verifier: VerifierId,
+    receipt_schema: ReceiptSchemaId,
+}
+
+impl VerifierClassBinding {
+    /// Declares one catalog-required verifier class and receipt schema.
+    pub const fn new(verifier: VerifierId, receipt_schema: ReceiptSchemaId) -> Self {
+        Self {
+            verifier,
+            receipt_schema,
+        }
+    }
+
+    /// Returns the configured verifier class.
+    pub const fn verifier(self) -> VerifierId {
+        self.verifier
+    }
+
+    /// Returns the canonical receipt schema.
+    pub const fn receipt_schema(self) -> ReceiptSchemaId {
+        self.receipt_schema
+    }
+}
+
+/// One exact generation of a verifier implementation bound to a receipt
+/// schema.
+///
+/// The implementation digest is an opaque identity supplied by the embedding;
+/// cryptographic verification, authentication, and transport remain outside
+/// the CSER core.  A zero digest is reserved and cannot represent a live
+/// implementation.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct VerifierBinding {
+    verifier: VerifierId,
+    generation: VerifierGeneration,
+    receipt_schema: ReceiptSchemaId,
+    implementation_digest: Digest,
+}
+
+impl Hash for VerifierBinding {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.verifier.hash(state);
+        self.generation.hash(state);
+        self.receipt_schema.hash(state);
+        self.implementation_digest.bytes().hash(state);
+    }
+}
+
+impl VerifierBinding {
+    /// Creates a validated verifier-generation binding.
+    pub const fn new(
+        verifier: VerifierId,
+        generation: VerifierGeneration,
+        receipt_schema: ReceiptSchemaId,
+        implementation_digest: Digest,
+    ) -> Result<Self, VerifierSetError> {
+        if implementation_digest.is_zero() {
+            return Err(VerifierSetError::ZeroImplementationDigest);
+        }
+        Ok(Self {
+            verifier,
+            generation,
+            receipt_schema,
+            implementation_digest,
+        })
+    }
+
+    /// Returns the verifier class.
+    pub const fn verifier(self) -> VerifierId {
+        self.verifier
+    }
+
+    /// Returns the verifier generation.
+    pub const fn generation(self) -> VerifierGeneration {
+        self.generation
+    }
+
+    /// Returns the receipt schema accepted by this verifier binding.
+    pub const fn receipt_schema(self) -> ReceiptSchemaId {
+        self.receipt_schema
+    }
+
+    /// Returns the opaque implementation identity digest.
+    pub const fn implementation_digest(self) -> Digest {
+        self.implementation_digest
+    }
+
+    const fn class(self) -> VerifierClassBinding {
+        VerifierClassBinding::new(self.verifier, self.receipt_schema)
+    }
+
+    /// Returns the catalog class/schema coordinate represented by this
+    /// generation binding.
+    pub const fn class_binding(self) -> VerifierClassBinding {
+        self.class()
+    }
+}
+
+/// Error returned while validating a canonical verifier set.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VerifierSetError {
+    /// A verifier binding cannot use the reserved zero implementation digest.
+    ZeroImplementationDigest,
+    /// At least one verifier binding is required.
+    Empty,
+    /// The same complete verifier binding occurs more than once.
+    DuplicateExactIdentity,
+    /// One verifier class/schema coordinate is bound to multiple generations
+    /// or implementation identities.
+    DuplicateClassSchema,
+    /// A catalog-required class/schema coordinate occurs more than once.
+    DuplicateRequiredClass,
+    /// A required catalog class/schema has no live verifier binding.
+    MissingRequiredClass,
+    /// A live verifier binding is not declared by the catalog requirement set.
+    UnexpectedClass,
+}
+
+/// Validates and hashes a verifier set in canonical order.
+///
+/// The returned digest is independent of input order.  Exact duplicate
+/// bindings and conflicting bindings for one class/schema are rejected before
+/// hashing.  This helper intentionally performs no cryptographic or network
+/// operation; it only commits the semantic identity of the binding set.
+pub fn canonical_verifier_set_digest(
+    bindings: &[VerifierBinding],
+) -> Result<Digest, VerifierSetError> {
+    let canonical = canonicalize_verifier_bindings(bindings)?;
+    Ok(hash_verifier_bindings(&canonical))
+}
+
+/// Validates a live verifier set against catalog-required class/schema
+/// coordinates and returns its canonical digest.
+pub fn validate_verifier_set(
+    bindings: &[VerifierBinding],
+    required: &[VerifierClassBinding],
+) -> Result<Digest, VerifierSetError> {
+    let canonical = canonicalize_verifier_bindings(bindings)?;
+    let mut required = required.to_vec();
+    required.sort_unstable();
+    for pair in required.windows(2) {
+        if pair[0] == pair[1] {
+            return Err(VerifierSetError::DuplicateRequiredClass);
+        }
+    }
+    for class in &required {
+        if !canonical.iter().any(|binding| binding.class() == *class) {
+            return Err(VerifierSetError::MissingRequiredClass);
+        }
+    }
+    for binding in &canonical {
+        if required.binary_search(&binding.class()).is_err() {
+            return Err(VerifierSetError::UnexpectedClass);
+        }
+    }
+    Ok(hash_verifier_bindings(&canonical))
+}
+
+fn canonicalize_verifier_bindings(
+    bindings: &[VerifierBinding],
+) -> Result<Vec<VerifierBinding>, VerifierSetError> {
+    if bindings.is_empty() {
+        return Err(VerifierSetError::Empty);
+    }
+    let mut canonical = bindings.to_vec();
+    // Class/schema is the primary key.  Sorting by the full binding alone
+    // would not necessarily place two equal class/schema coordinates next to
+    // one another because generation precedes schema in the public identity
+    // ordering.
+    canonical.sort_unstable_by(|left, right| {
+        left.class()
+            .cmp(&right.class())
+            .then_with(|| left.cmp(right))
+    });
+    for pair in canonical.windows(2) {
+        if pair[0] == pair[1] {
+            return Err(VerifierSetError::DuplicateExactIdentity);
+        }
+        if pair[0].class() == pair[1].class() {
+            return Err(VerifierSetError::DuplicateClassSchema);
+        }
+    }
+    Ok(canonical)
+}
+
+fn hash_verifier_bindings(bindings: &[VerifierBinding]) -> Digest {
+    let mut hasher = Sha256::new();
+    hasher.update(b"nexus.cser.verifier-set.v1");
+    hasher.update((bindings.len() as u64).to_le_bytes());
+    for binding in bindings {
+        hasher.update(binding.verifier().get().to_le_bytes());
+        hasher.update(binding.generation().get().to_le_bytes());
+        hasher.update(binding.receipt_schema().get().to_le_bytes());
+        hasher.update(binding.implementation_digest().bytes());
+    }
+    Digest::new(hasher.finalize().into())
 }
 
 impl ReceiptBinding {
@@ -335,12 +588,40 @@ impl ObligationSpec {
     }
 }
 
+/// Whether a composite component requires a recovery-artifact closure to be
+/// pinned before its effect may cross the external commit point.
+///
+/// The policy is catalog data only.  The artifact authority owns storage,
+/// pinning, and physical release; the engine later binds the corresponding
+/// lease to the exact effect and provider generation.  Keeping the default
+/// explicit and conservative for existing components lets profiles opt into
+/// recovery-root retention without making artifact storage part of the
+/// catalog builder itself.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecoveryArtifactPolicy {
+    /// This component's recovery does not require a retained artifact root.
+    NotRequired,
+    /// The embedding must pin the component's recovery-artifact closure before
+    /// the effect can be committed externally.
+    Required,
+}
+
+impl RecoveryArtifactPolicy {
+    pub(crate) const fn tag(self) -> u8 {
+        match self {
+            Self::NotRequired => 1,
+            Self::Required => 2,
+        }
+    }
+}
+
 /// One catalog-bound obligation component of a composite effect.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CompositeComponentSpec {
     component: ComponentId,
     domain: DomainId,
     obligation: ObligationKindId,
+    recovery_artifact_policy: RecoveryArtifactPolicy,
 }
 
 impl CompositeComponentSpec {
@@ -354,7 +635,44 @@ impl CompositeComponentSpec {
             component,
             domain,
             obligation,
+            recovery_artifact_policy: RecoveryArtifactPolicy::NotRequired,
         }
+    }
+
+    /// Binds one component slot and explicitly selects its recovery-artifact
+    /// retention policy.
+    ///
+    /// This is the profile-facing component builder.  It performs no storage
+    /// or lease operation, and both policy values are valid for any catalog
+    /// component; the embedding enforces `Required` at the external commit
+    /// boundary when the component is admitted.
+    pub const fn new_with_artifact_policy(
+        component: ComponentId,
+        domain: DomainId,
+        obligation: ObligationKindId,
+        recovery_artifact_policy: RecoveryArtifactPolicy,
+    ) -> Self {
+        Self::new(component, domain, obligation).with_artifact_policy(recovery_artifact_policy)
+    }
+
+    /// Selects the recovery-artifact retention policy for this component.
+    pub const fn with_artifact_policy(
+        self,
+        recovery_artifact_policy: RecoveryArtifactPolicy,
+    ) -> Self {
+        Self {
+            recovery_artifact_policy,
+            ..self
+        }
+    }
+
+    /// Alias for [`Self::with_artifact_policy`] whose name mirrors the policy
+    /// type when configuring a component in a domain profile.
+    pub const fn with_recovery_artifact_policy(
+        self,
+        recovery_artifact_policy: RecoveryArtifactPolicy,
+    ) -> Self {
+        self.with_artifact_policy(recovery_artifact_policy)
     }
 
     /// Returns the stable component slot.
@@ -370,6 +688,17 @@ impl CompositeComponentSpec {
     /// Returns the exact obligation class.
     pub const fn obligation(self) -> ObligationKindId {
         self.obligation
+    }
+
+    /// Returns whether this component requires a retained recovery-artifact
+    /// closure before external commit.
+    pub const fn artifact_policy(self) -> RecoveryArtifactPolicy {
+        self.recovery_artifact_policy
+    }
+
+    /// Alias for [`Self::artifact_policy`] using the full policy name.
+    pub const fn recovery_artifact_policy(self) -> RecoveryArtifactPolicy {
+        self.artifact_policy()
     }
 }
 
@@ -730,6 +1059,7 @@ pub struct ClaimRule {
     credit_class: CreditClassId,
     scope: ClaimScopePolicy,
     conflict: ConflictMode,
+    role: LogicalClaimRole,
     evidence: Vec<EvidenceRule>,
 }
 
@@ -757,6 +1087,11 @@ impl ClaimRule {
     /// Returns how concurrent claims on one resource coordinate interact.
     pub const fn conflict(&self) -> ConflictMode {
         self.conflict
+    }
+
+    /// Returns the catalog-declared logical role of this claim.
+    pub const fn role(&self) -> LogicalClaimRole {
+        self.role
     }
 
     /// Returns the complete evidence conjunction.
@@ -851,6 +1186,8 @@ pub enum DomainCatalogError {
     UnknownSingleHopHandoffComposite,
     /// A single-hop handoff endpoint is not a one-component product.
     NonSingletonSingleHopHandoff,
+    /// An explicit logical claim role cannot be attached to a device scope.
+    NonGenericClaimRoleOnDeviceScope,
 }
 
 /// Builder for a sealed, digest-bound domain catalog.
@@ -987,7 +1324,7 @@ impl DomainCatalogBuilder {
 
     /// Registers one claim class with an explicit admission algebra.
     pub fn claim_with_conflict(
-        mut self,
+        self,
         domain: DomainId,
         kind: ClaimKindId,
         credit_class: CreditClassId,
@@ -995,6 +1332,58 @@ impl DomainCatalogBuilder {
         conflict: ConflictMode,
         evidence: &[EvidenceRule],
     ) -> Result<Self, DomainCatalogError> {
+        self.claim_with_conflict_and_role(
+            domain,
+            kind,
+            credit_class,
+            scope,
+            conflict,
+            LogicalClaimRole::Generic,
+            evidence,
+        )
+    }
+
+    /// Registers one explicitly classified logical claim with exclusive
+    /// admission.  Non-generic roles are rejected for device-scoped claims;
+    /// physical custody remains represented by the existing device claim
+    /// algebra rather than by a logical label.
+    pub fn claim_with_role(
+        self,
+        domain: DomainId,
+        kind: ClaimKindId,
+        credit_class: CreditClassId,
+        scope: ClaimScopePolicy,
+        role: LogicalClaimRole,
+        evidence: &[EvidenceRule],
+    ) -> Result<Self, DomainCatalogError> {
+        self.claim_with_conflict_and_role(
+            domain,
+            kind,
+            credit_class,
+            scope,
+            ConflictMode::Exclusive,
+            role,
+            evidence,
+        )
+    }
+
+    /// Registers one claim with explicit admission algebra and logical role.
+    // Catalog construction deliberately spells out every semantic coordinate;
+    // an options bag would weaken reviewability of the sealed catalog tuple.
+    #[allow(clippy::too_many_arguments)]
+    pub fn claim_with_conflict_and_role(
+        mut self,
+        domain: DomainId,
+        kind: ClaimKindId,
+        credit_class: CreditClassId,
+        scope: ClaimScopePolicy,
+        conflict: ConflictMode,
+        role: LogicalClaimRole,
+        evidence: &[EvidenceRule],
+    ) -> Result<Self, DomainCatalogError> {
+        if scope == ClaimScopePolicy::Device && role.is_logical() {
+            return Err(DomainCatalogError::NonGenericClaimRoleOnDeviceScope);
+        }
         if evidence.is_empty() {
             return Err(DomainCatalogError::MissingEvidence);
         }
@@ -1102,6 +1491,7 @@ impl DomainCatalogBuilder {
                 credit_class,
                 scope,
                 conflict,
+                role,
                 evidence: evidence.to_vec(),
             },
         );
@@ -1257,6 +1647,52 @@ impl DomainCatalog {
         self.claims.get(&(domain, kind))
     }
 
+    /// Returns every claim rule in deterministic catalog order.
+    pub fn claim_rules(&self) -> impl Iterator<Item = &ClaimRule> {
+        self.claims.values()
+    }
+
+    /// Returns every verifier class/schema coordinate required by this
+    /// catalog in deterministic order.
+    ///
+    /// The set is the exact semantic input for provider registration: it
+    /// includes receipt classes declared by obligation commit/apply/settlement
+    /// stages and by every claim evidence rule.  It contains no implementation
+    /// generation or code identity; those are supplied by live
+    /// [`VerifierBinding`] values and checked separately.
+    pub fn verifier_class_bindings(&self) -> BTreeSet<VerifierClassBinding> {
+        let mut bindings = BTreeSet::new();
+        for claim in self.claims.values() {
+            for evidence in claim.evidence() {
+                bindings.insert(VerifierClassBinding::new(
+                    evidence.verifier(),
+                    evidence.receipt_schema(),
+                ));
+            }
+        }
+        for obligation in self.obligations.values() {
+            let receipts = obligation.receipts();
+            let commit = receipts.commit_outcome();
+            bindings.insert(VerifierClassBinding::new(
+                commit.verifier(),
+                commit.receipt_schema(),
+            ));
+            for receipt in [
+                receipts.apply_completed(),
+                receipts.settlement_acknowledged(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                bindings.insert(VerifierClassBinding::new(
+                    receipt.verifier(),
+                    receipt.receipt_schema(),
+                ));
+            }
+        }
+        bindings
+    }
+
     /// Returns one exact composite effect schema.
     pub fn composite_rule(&self, kind: CompositeKindId) -> Option<&CompositeRule> {
         self.composites.get(&kind)
@@ -1273,22 +1709,10 @@ impl DomainCatalog {
     }
 
     pub(crate) fn verifier_ids(&self) -> BTreeSet<VerifierId> {
-        let mut verifiers: BTreeSet<_> = self
-            .claims
-            .values()
-            .flat_map(|claim| claim.evidence().iter().map(|rule| rule.verifier()))
-            .collect();
-        for obligation in self.obligations.values() {
-            let receipts = obligation.receipts();
-            verifiers.insert(receipts.commit_outcome().verifier());
-            if let Some(binding) = receipts.apply_completed() {
-                verifiers.insert(binding.verifier());
-            }
-            if let Some(binding) = receipts.settlement_acknowledged() {
-                verifiers.insert(binding.verifier());
-            }
-        }
-        verifiers
+        self.verifier_class_bindings()
+            .into_iter()
+            .map(|binding| binding.verifier())
+            .collect()
     }
 }
 
@@ -1329,6 +1753,7 @@ fn catalog_digest(
         hasher.update(rule.credit_class().get().to_le_bytes());
         hasher.update([rule.scope().tag()]);
         hasher.update([rule.conflict().tag()]);
+        hasher.update([rule.role().tag()]);
         hasher.update((rule.evidence.len() as u64).to_le_bytes());
         for evidence in &rule.evidence {
             hasher.update(evidence.kind().get().to_le_bytes());
@@ -1358,6 +1783,7 @@ fn catalog_digest(
             hasher.update(component.component().get().to_le_bytes());
             hasher.update(component.domain().get().to_le_bytes());
             hasher.update(component.obligation().get().to_le_bytes());
+            hasher.update([component.artifact_policy().tag()]);
         }
     }
     hasher.update([0xfc]);

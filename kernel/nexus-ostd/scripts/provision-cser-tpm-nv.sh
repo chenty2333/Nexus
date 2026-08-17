@@ -35,9 +35,7 @@ catalog_hex=${2:-}
 tip_revision=${3:-0}
 tip_head_hex=${4:-}
 if [[ $mode == cser && -z $catalog_hex ]]; then
-    for _ in {1..32}; do
-        catalog_hex+=42
-    done
+    catalog_hex=0782c4858f2a997876a4bee9ba30ebf0cadf65d99d93dcc0dc77c6a1581ca8ee
 fi
 if [[ $mode == cser && ! $catalog_hex =~ ^[[:xdigit:]]{64}$ ]]; then
     echo "catalog digest must be exactly 64 hexadecimal characters" >&2
@@ -171,8 +169,8 @@ readonly TIP_SLOT_1=0x01800102
 readonly LEASE_COUNTER=0x01800103
 readonly LEASE_SLOT_0=0x01800104
 readonly LEASE_SLOT_1=0x01800105
-readonly TIP_SIZE=180
-readonly LEASE_SIZE=140
+readonly TIP_SIZE=228
+readonly LEASE_SIZE=156
 readonly COUNTER_ATTRIBUTES=0x42040414
 readonly SLOT_ATTRIBUTES=0x42041404
 readonly DELETE_POLICY_SHA256=47ce3032d8bad1f3089cb0c09088de43501491d460402b90cd1b7fc0b68ca92f
@@ -204,11 +202,14 @@ fi
 
 readonly one=0000000000000001
 readonly zero=0000000000000000
-readonly prefix_tip=4353455254504d31000101000000000000000001
-readonly prefix_lease=4353455254504d31000102000000000000000001
-readonly binding_hex="${catalog_hex}${one}${one}"
+readonly profile_hex=0005000900090002
+readonly world_hex=0000000000000001
+readonly genesis_projection_hex=77c5779d00604bc6a6f7e64a74c562143db5a18363f7ca727da9998f36a6ccf5
+readonly prefix_tip=4353455254504d32000201000000000000000001
+readonly prefix_lease=4353455254504d32000202000000000000000001
+readonly binding_hex="${profile_hex}${catalog_hex}${world_hex}${one}${one}"
 readonly freshness_hex="${one}${one}${one}${one}${one}"
-readonly tip_body_hex="${prefix_tip}${binding_hex}${freshness_hex}${tip_revision_hex}${tip_head_hex}"
+readonly tip_body_hex="${prefix_tip}${binding_hex}${freshness_hex}${tip_revision_hex}${tip_head_hex}${genesis_projection_hex}"
 readonly lease_body_hex="${prefix_lease}${binding_hex}${freshness_hex}"
 
 make_slot() {
@@ -248,7 +249,9 @@ else
     printf '%s' "$experiment_body_hex" | xxd -r -p >"$work_dir/experiment-body.bin"
     experiment_checksum=$(sha256sum "$work_dir/experiment-body.bin" | cut -d ' ' -f1)
     experiment_padding=
-    for _ in {1..84}; do experiment_padding+=00; done
+    for ((padding_byte = 96; padding_byte < TIP_SIZE; padding_byte++)); do
+        experiment_padding+=00
+    done
     printf '%s%s%s' "$experiment_body_hex" "$experiment_checksum" "$experiment_padding" \
         | xxd -r -p >"$work_dir/experiment-genesis.bin"
     if [[ $(stat -c %s "$work_dir/experiment-genesis.bin") != "$TIP_SIZE" ]]; then

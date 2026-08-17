@@ -11,7 +11,7 @@ use cser_core::{
     Engine, EvidenceKindId, ExternalOutcome, Freshness, REPLY_APPLY_RECEIPT_SCHEMA,
     REPLY_CLAIM_PUBLICATION_SLOT, REPLY_COMMIT_RECEIPT_SCHEMA, REPLY_EVIDENCE_PUBLICATION_ACK,
     REPLY_RECEIPT_SCHEMA, REPLY_SETTLEMENT_RECEIPT_SCHEMA, REPLY_VERIFIER, ReceiptBinding,
-    RecoveryAnchor, ResourceId, SettlementState, TransitionOutput, standard_catalog,
+    ResourceId, SettlementState, TransitionOutput, standard_catalog,
 };
 use cser_model::EffectId as OracleEffectId;
 use cser_model::composite_effect_oracle::{
@@ -22,8 +22,8 @@ use cser_model::composite_effect_oracle::{
 };
 use support::{
     ExactTestVerifier, Harness, TestReceipt, charge, claim, digest, effect, freshness, principal,
-    resource, resource_generation, snapshot, verified_apply_completion, verified_commit_outcome,
-    verified_settlement_ack,
+    recovery_anchor, resource, resource_generation, snapshot, verified_apply_completion,
+    verified_commit_outcome, verified_settlement_ack,
 };
 
 const ROOT: u64 = 0xce07;
@@ -665,16 +665,16 @@ fn recover_prefix(harness: &Harness, label: &str) -> Engine {
         committed.journal().get() + 1,
     );
     let anchor = || {
-        RecoveryAnchor::from_trusted_provider(
+        recovery_anchor(
             standard_catalog().digest(),
             committed,
             next,
             harness.engine.revision(),
             harness.engine.head(),
+            harness.engine.projection_digest(),
         )
-        .unwrap()
     };
-    let first = Engine::recover(
+    let first = Engine::recover_legacy_compatibility(
         standard_catalog(),
         CoreLimits::bounded_default(),
         anchor(),
@@ -688,7 +688,7 @@ fn recover_prefix(harness: &Harness, label: &str) -> Engine {
     );
     assert_eq!(first.acknowledged_head(), harness.engine.head(), "{label}");
     let first = first.into_engine();
-    let second = Engine::recover(
+    let second = Engine::recover_legacy_compatibility(
         standard_catalog(),
         CoreLimits::bounded_default(),
         anchor(),
@@ -794,7 +794,7 @@ fn profile2_core_and_independent_oracle_match_every_durable_prefix() {
     let origin = principal(ROOT, 1);
     let first_successor = principal(ROOT, 2);
     let second_successor = principal(ROOT, 3);
-    let mut harness = Harness::new_profile_two();
+    let mut harness = Harness::new();
     let mut oracle = CompositeEffectOracle::new(
         ORACLE_EFFECT,
         origin.generation(),

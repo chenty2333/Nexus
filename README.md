@@ -1,237 +1,126 @@
 # Nexus
 
-Nexus is a research operating-system prototype for **Causally Scoped Effect
-Revocation (CSER)**: kernel-enforced authority, effect custody, and causal
-closure for work delegated to restartable user-space OS services.
+Nexus is an experimental operating-system substrate for **Causally Scoped
+Effect Revocation (CSER)**: keeping escaped effects and their logical or
+physical claims under enforceable custody after the executor that created them
+exits or is replaced.
 
-> A service can die and immediately lose its future authority. That death is
-> not proof that its committed effects, reply obligations, queue slots, pinned
-> memory, or DMA ownership have disappeared.
+> Process death can revoke future authority. It is not evidence that an
+> already published reply, provider operation, queue entry, pinned page, DMA
+> mapping, or other external effect disappeared.
 
-[GitHub release](https://github.com/chenty2333/Nexus/releases/tag/v0.1.0) ·
-[Zenodo archive](https://zenodo.org/records/21343496) ·
-[DOI: 10.5281/zenodo.21343496](https://doi.org/10.5281/zenodo.21343496)
+CSER separates executor lifetime, durable effect lifetime, and resource-claim
+custody. Unknown outcomes require reconciliation. Missing physical quiescence
+evidence retains the affected claim and refuses reuse. The project is a bounded
+research prototype, not a production, exactly-once, rollback, or
+hardware-general claim.
 
-## The problem
+## Start here
 
-Revoking a handle prevents future use of that handle. It does not settle work
-already derived from it. A request may have crossed a restartable scheduler,
-pager, Linux personality, filesystem, or network service while still owning a
-reply, timer, queue entry, pinned page, device request, I/O translation, or an
-externally visible result.
+- [Terrain](maproom/terrain.md): research question, safety model, design
+  reasoning, evidence discipline, and claim limits.
+- [Basecamp](maproom/basecamp.md): the deliberately established current
+  position, evidence boundary, and paused work.
+- [Route](maproom/route.md): the user-selected high-level direction.
+- [Hazards](maproom/hazards.md): verified project-specific failure modes and
+  operational pitfalls.
+- [Contributing](CONTRIBUTING.md): supported local workflows.
 
-Ordinary process cleanup conflates two different facts:
+The maproom is the only current project-orientation source. Its terrain,
+basecamp, and route are user-directed documents, not progress files to update
+automatically. Historical
+architecture, vision, RFC, release-ledger, and vertical-slice documents remain
+available through Git history and immutable release tags rather than competing
+with current main.
 
-- the failed service incarnation must no longer initiate or commit new work;
-- already committed work must remain represented, and its concrete claims held,
-  until it completes, drains, resets, or is honestly recorded as indeterminate.
+## Current implementation
 
-CSER explores whether a small kernel can enforce that separation across
-multiple services and resource domains. It is a candidate compositional
-mechanism, not a novelty, firstness, exactly-once, or production-readiness
-claim. The short technical statement is [docs/CSER.md](docs/CSER.md).
+The portable authoritative state machine is `crates/cser-core`. It owns catalog
+admission, estates and composite effects, claims, exact custody, fencing,
+settlement, retirement evidence, journal records, checkpoints, recovery, and
+canonical invariants. `crates/cser-model` contains the independent normalized
+oracles used by current differential and Loom tests.
 
-## Working semantic contract
+`kernel/nexus-ostd` embeds that core in the OSTD kernel and contains the current
+ATA/TPM persistence, reply/DMA recovery, asynchronous Tool endpoint adapter,
+bounded CSER3 handoff, strongest independent handoff baseline, and experimental
+vNext journal paths.
 
-These requirements define the rebaselined portable core and its implemented,
-bounded `cser-production` profile. They are not broader production-readiness or
-hardware claims; the evidence boundary for current `main` is stated below.
+The trusted-local endpoint uses independently durable adapter and provider
+databases. POST persists Accepted work; leased workers persist Pending, query
+the provider by exact operation identity, and publish terminal evidence only
+after a verified provider result. Guest recovery performs an exact GET before
+any same-key retry, and exact 404 is the sole absence authority.
 
-- **Causal scopes and effects** record the authority that created work and the
-  descendants and resources derived from it.
-- **Authority epochs** fence a revoked scope generation. Independent
-  **binding epochs** fence crashed or replaced service incarnations.
-- A kernel-owned **commit gate** serializes `Commit` with `RevokeBegin`. If
-  revocation wins, old uncommitted work cannot first commit afterward.
-- **Typed credits and claims** account for queue capacity, memory, device, and
-  reply obligations without copying or silently releasing them. A complete
-  design must distinguish causal owner, charge owner, physical custodian, and
-  settlement claimant instead of hiding them in one `owner` field.
-- **Reverse-indexed closure** discovers the affected work without relying on a
-  global object scan.
-- Pre-commit work may abort. Post-commit work must complete, drain, reset, or
-  retain an explicit tombstone; CSER does not claim to undo external history.
-- Rebinding does not silently inherit stale work. `AdoptEffect` transfers
-  bounded authority to continue an eligible effect; `ClaimSettlement` only
-  authorizes reconciliation, publication, or retirement of an already
-  committed claim. Neither operation resurrects the dead incarnation.
-- Closure releases a physical claim only under domain-specific evidence. When
-  evidence is unavailable, quotas, scoped backpressure, reset, or
-  operator-visible reconciliation must make the safety/availability tradeoff
-  explicit.
+The bounded single-hop handoff verifies one canonical `ChildDescriptorV1` and
+permits child first observation only after the durable parent-release/child-
+intent pivot. It is not a general workflow graph or dynamic-component API.
 
-The released finite-state semantics are indexed in
-[specs/cser/README.md](specs/cser/README.md); their exact checked boundaries
-remain evidence rather than an implementation claim, and the working
-requirements above do not retroactively change them. The corresponding
-kernel, service, resource, and device map is
-[ARCHITECTURE.md](ARCHITECTURE.md).
+The legacy journal remains the default. The vNext same-segment append and
+checkpoint implementation is opt-in and experimental: it reduces controlled
+fill write amplification while increasing read, flush, and hashing work in the
+current measurements.
 
-## Status
+## Evidence
 
-| Track | Status | Meaning |
-| --- | --- | --- |
-| `v0.1.0` | Published, archived research artifact | Bounded CSER composition with reproducible models, implementation slices, and receipts |
-| Current development branch | Catalog-v6 clean-tree QEMU seal | RFC 0006's portable core and RFC 0008's evidence/conflict amendment are exercised by a four-boot QEMU seal at committed revision `1a8f75e`; it remains a bounded QEMU research result, not a hardware-general or product-release claim |
-| Production system | Not established | The `cser-production` profile is a bounded QEMU research path, not a hardware-general, SMP, availability, or production-readiness result |
-| Paper | None peer reviewed | `NARRATIVE.md` is a technical research account; the Zenodo object is software and reproducibility evidence |
+The current public development evidence is intentionally small:
 
-### What `v0.1.0` establishes
+- [Final asynchronous applicability and vNext evidence](docs/research/evidence/cser-async-vnext-final/README.md)
+  contains six sanitized real-QEMU rows, four portable state-profile rows, a
+  bounded journal-fill comparison, and a HMAC-pseudonymized applicability
+  projection.
+- [Matched logical handoff evidence](docs/research/evidence/cser-handoff-matched/README.md)
+  contains five crash cuts for CSER and the structurally independent baseline,
+  with two recovery boots and exact endpoint/provider ledgers per row.
 
-The release binds twelve PlusCal/TLA+ specification families, an independent
-safe-Rust reference model, an OSTD kernel prototype, retained Linux pressure
-workloads, and mediated VirtIO/reset/IOMMU component evidence.
+Both bundles state their source commits and limits. Raw identities, databases,
+logs, media, TPM state, paths, container identities, and HMAC keys are not
+published. QEMU/TCG observations are not physical-hardware evidence.
 
-| Evidence | Released result | Boundary |
-| --- | ---: | --- |
-| Concurrency | 14/14 Checked | Production transition source under a Loom-modeled outer mutex |
-| Fault injection | 20/20 Checked | Case-local ledgers; single-vCPU, single-thread-TCG QEMU |
-| Structural scale | 14/14 Checked | Finite tuples; no asymptotic or production `O(k)` claim |
-| Performance | 29/29 Observed | Guest-visible TSC samples; no threshold, baseline, or hardware-cycle claim |
-| Prior art | 16 sources | 14 full-text and 2 metadata-only in the release audit |
-| Contribution decision | `narrow` | Bounded compositional result, not novelty or firstness |
-
-The release does **not** establish whole-system proof, SMP or production-lock
-correctness, lock freedom, low overhead, Linux/VFS/TCP breadth, rollback of
-durable external effects, a shared production fault scope, or
-identity-preserving same-boot composition with the real-DMA receipt. The
-complete evidence and non-claim ledger is [NARRATIVE.md](NARRATIVE.md).
-
-### Current research line
-
-Post-release work follows [RFC 0006](docs/rfcs/0006-cser-core-semantic-rebaseline.md),
-as amended by [RFC 0008](docs/rfcs/0008-cser-catalog-v6-evidence-and-conflict-amendment.md).
-[RFC 0007](docs/rfcs/0007-cser-composite-effect-custody.md) is the historical
-catalog-v5 composite-custody baseline. The live kernel
-default is the single `cser-production` profile: one recovered portable-core
-owner is shared by the stateless `NXP3` portal, the `core-v1` supervisor, and
-the reply and DMA adapters. The old live Registry, portal glue, supervisor
-state, and kernel semantic mirrors have been removed from the production
-closure; the runtime does not dual-write old and new authority state.
-
-The portable core defines domain-classified obligations, claims, fencing,
-adoption, settlement, journal records, replay, and freshness coordinates. Its
-independent safe-Rust oracle, property tests, trace conformance, and Loom tests
-cover reply and DMA semantics, revoke/claim outcomes, stale generations, and
-repeated crash windows. The OSTD harness first runs real guest reply and DMA
-slices through the mutually exclusive, `--no-default-features`, test-only
-`cser-core-reply-recovery` and `cser-core-dma-recovery` OSDK schemes. It then
-boots `cser-production` four times over the same ATA PIO journal, secondary
-reply outbox, and swtpm state, with device quarantine established before
-replay. Those focused schemes provide domain evidence; they are not alternate
-production Registries and do not introduce live dual-write.
-
-The current catalog-v6 clean-tree seal is bound to committed revision
-`1a8f75e`. The locally generated, Git-ignored receipt at
-`kernel/nexus-ostd/artifacts/cser-production/combined-receipt.txt` records four
-fresh QEMU boots, exact generation `1 -> 2` reuse, stable repeated recovery,
-and zero retained claims at boot 4; its SHA-256 is
-`c94c66a2b272f8e3d0cc663e11a21127e23e92613f9e7fe6590fd39900e9ef8b`.
-This is a clean-tree execution seal for the bounded research path, not a
-hardware-general or product-release seal. Earlier C3 clean local and exact-C3
-CI receipts, including their swtpm and Docker/AppArmor negative records,
-remain historical evidence in the ledger.
-
-A separate tool-plus-DMA experiment now pairs a durable, idempotency-keyed host
-tool endpoint with the real guest VirtIO/IRQ/IOMMU path. The same seven semantic
-crash cutpoints run against CSER and a strongest workload-specific baseline of
-two independent durable finalizers. Both arms recover all seven rows to two
-evidence retirements and zero terminal retained claims. This bounded result does
-not show a safety advantage over that baseline; it establishes the adapter and
-comparison method. Elapsed reconciliation delay, contention-driven gate
-rejections, permanent retention, and administrative disposition remain
-unmeasured rather than being reported as zero. The endpoint capability census
-is [docs/research/cser-endpoint-evidence-census.md](docs/research/cser-endpoint-evidence-census.md),
-and the runner contract is
-[kernel/nexus-ostd/tools/cser-experiment/README.md](kernel/nexus-ostd/tools/cser-experiment/README.md).
-
-Every such receipt remains bounded to one-vCPU QEMU/TCG and swtpm. It does not
-establish physical TPM anti-rollback, physical power-loss behavior,
-hardware-general DMA quiescence, crash-persistent PFN/IOVA custody,
-authorization to reuse retained cross-reboot PFN/IOVA/quarantined queue
-resources, or SMP correctness. The focused same-boot DMA slice separately
-observes fresh-generation logical core-resource reuse, not physical-address
-reuse. Historical IRQ Phase A and `v0.1.0` evidence retain their original
-boundaries.
-
-## Use the repository
-
-The supported host boundary is Linux x86-64 with Docker, Git, Bash, and a
-normal Linux userland. Rust, Java, cargo-osdk, OVMF, QEMU, and guest toolchains
-are pinned or checked by the workflow.
-
-Start with the fast, non-QEMU path:
-
-```bash
-./x doctor
-./x test --quick
-```
-
-The public workflow is intentionally small:
-
-```bash
-./x build [all|model|kernel]
-./x test [--unit|--quick|--system|--full]
-./x run [kernel]
-./x verify
-./x clean [--all]
-```
-
-`--unit` stays on the host semantic graph and `--quick` adds the host
-tool-endpoint/matrix regressions plus the kernel static gate. `--system` runs
-the two focused guest evidence schemes followed by the
-four-boot production recovery path and writes an explicitly non-sealable proof.
-`--full` is the same clean-source seal gate as `verify`; it rejects tracked,
-staged, or nonignored untracked source changes before QEMU. Set
-`NEXUS_REBUILD=1` when an intentional cold image rebuild is required. The full
-path can take tens of minutes and substantial Docker/workspace storage. The
-immutable `v0.1.0` artifact workflow and its historical cold-fetch caveat
-remain documented in
-[ARTIFACT.md](ARTIFACT.md) and [CONTRIBUTING.md](CONTRIBUTING.md); those release
-instructions are not the current production-recovery front door.
+The historical `v0.1.0` artifact remains available from the immutable
+[GitHub release](https://github.com/chenty2333/Nexus/releases/tag/v0.1.0),
+[Zenodo record 21343496](https://zenodo.org/records/21343496), and
+[DOI 10.5281/zenodo.21343496](https://doi.org/10.5281/zenodo.21343496).
+Reproduce that historical release from its tag; current main does not carry a
+second mutable copy of its prose, models, and receipts.
 
 ## Repository map
 
 | Path | Role |
 | --- | --- |
-| `specs/cser/` | Released PlusCal/TLA+ families and checked boundaries |
-| `crates/cser-core/` | Portable authoritative `no_std + alloc` CSER state machine, journal, replay, and domain profiles |
-| `crates/cser-model/` | Independent safe-Rust oracles and Loom scenario drivers |
-| `crates/cser-trace-conformance/` | Frozen-trace replay and projection comparison |
-| `crates/nexus-effect-peer-wire/` | Retained frozen wire corpus boundary; not a live semantic owner |
-| `crates/nexus-ostd-virtio/` | Separate pinned VirtIO/PCI/IOMMU substrate used by the kernel adapter |
-| `kernel/nexus-ostd/` | Sole authoritative `cser-production` profile, two test-only guest evidence schemes, and four-boot recovery harness |
-| `docs/research/irq-spike-phase-a/` | Retained historical one-vCPU IRQ component evidence |
-| `evaluation/`, `status/` | Released evidence and moving exact-revision checkpoints |
-| `tools/xtask/` | Four-member workspace build, test, Loom, and static-cutover gates |
-| `./x` | Public workflow entry point |
+| `maproom/` | Conceptual terrain, established position, selected route, and verified hazards |
+| `crates/cser-core/` | Portable authoritative CSER state machine |
+| `crates/cser-model/` | Current independent differential oracles |
+| `crates/nexus-ostd-virtio/` | Pinned VirtIO/PCI/IOMMU substrate used by the kernel |
+| `kernel/nexus-ostd/` | OSTD production embedding and bounded experiment lanes |
+| `kernel/nexus-ostd/tools/cser-experiment/` | Trusted-local endpoint, provider, bridge, matrix, and evidence tools |
+| `docs/research/evidence/` | Current sanitized source-bound evidence bundles |
+| `tools/xtask/` | Small host workspace build/check/test runner |
+| `./x` | Public local workflow entry point |
 
-The root Cargo workspace contains exactly `crates/cser-core`,
-`crates/cser-model`, `crates/cser-trace-conformance`, and
-`crates/nexus-effect-peer-wire`; the OSTD kernel and VirtIO substrate retain
-their separate pinned build graphs. The independent oracle does not call
-production transition code to compute expected results.
+## Local workflows
 
-## Documentation
+The supported front door is `./x`:
 
-- [docs/CSER.md](docs/CSER.md): short committed mechanism and evidence statement
-- [VISION.md](VISION.md): committed research contract, non-goals, and
-  evidence vocabulary
-- [NARRATIVE.md](NARRATIVE.md): end-to-end research account and claim ledger
-- [ARCHITECTURE.md](ARCHITECTURE.md): committed kernel/service/resource map
-- [specs/cser/README.md](specs/cser/README.md): released protocol and evidence index
-- [ARTIFACT.md](ARTIFACT.md): reproduction and archive audit guide
-- [CONTRIBUTING.md](CONTRIBUTING.md): development workflow and claim discipline
-- [REWORK.md](REWORK.md): historical migration ledger, not the semantics source
+```text
+./x doctor
+./x build [all|model|kernel]
+./x test [--unit|--quick|--system|--full]
+./x check
+./x fmt
+./x verify
+./x clean [--all]
+```
+
+The root workflow uses a pinned Rust container. Kernel experiment-specific
+commands remain under `kernel/nexus-ostd/x` and are documented beside the
+experiment tools. See [CONTRIBUTING.md](CONTRIBUTING.md) before changing safety
+or evidence boundaries.
 
 ## Citation and license
 
 There is no peer-reviewed Nexus paper at this time. Cite the archived software
-release using [CITATION.cff](CITATION.cff) or:
-
-> Tianyi Chen. (2026). *Nexus: Causally Scoped Effect Revocation* (v0.1.0)
-> [Software]. Zenodo. https://doi.org/10.5281/zenodo.21343496
+release using `CITATION.cff` or the Zenodo DOI above.
 
 Nexus is released under the [Unlicense](LICENSE). Third-party and derived
-components retain their own license boundaries. See the notices beside the
-OSTD and VirtIO overlays before redistribution.
+components retain their own license boundaries and notices.

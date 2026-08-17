@@ -9,9 +9,11 @@ use cser_core::{
     ClaimProjection, ClaimScope, ComponentClaimProjection, ComponentId, DEVICE_CLAIM_IOVA,
     DEVICE_CLAIM_PINNED_PAGE, DEVICE_DOMAIN, DEVICE_EVIDENCE_IOTLB, DEVICE_EVIDENCE_IRQ_DRAINED,
     DEVICE_EVIDENCE_RESET, DEVICE_RECEIPT_SCHEMA, DEVICE_VERIFIER, DeviceGeneration, Digest,
-    EffectId, EvidenceChallenge, Freshness, ReceiptVerifier, ResourceGeneration, ResourceId,
-    VerificationError, VerifiedObservation, VerifierIdentity,
+    EffectId, EvidenceChallenge, Freshness, ReceiptSchemaId, ReceiptVerifier, ResourceGeneration,
+    ResourceId, VerificationError, VerifiedObservation, VerifierIdentity,
 };
+#[cfg(feature = "cser-production")]
+use cser_core::{VerifierBinding, VerifierGeneration};
 use nexus_ostd_virtio::{
     ActivatedBootDevice, BootClaimCoordinateError, BootClaimCoordinates,
     BootClaimQuarantineReceipts, BootDeviceScope, BootGlobalIotlbInvalidationReceipt,
@@ -21,6 +23,10 @@ use nexus_ostd_virtio::{
 };
 use sha2::{Digest as _, Sha256};
 
+#[cfg(feature = "cser-production")]
+use super::core_production_registry::{
+    DEVICE_RECEIPT_IMPLEMENTATION_DIGEST, PRODUCTION_WORLD, STANDARD_DMA_PROVIDER,
+};
 use super::core_reboot::{BootDeviceQuarantine, BootDeviceQuarantineGuard};
 
 /// One request to fence the fixed production device at a trusted generation.
@@ -233,6 +239,8 @@ impl OstdBootClaimVerifier {
             && challenge.domain() == DEVICE_DOMAIN
             && challenge.kind() == expected_kind
             && challenge.scope() == self.claim.scope
+            && challenge.expected_verifier() == DEVICE_VERIFIER
+            && challenge.expected_receipt_schema() == DEVICE_RECEIPT_SCHEMA
             && challenge.resource() == self.claim.resource
             && challenge.resource_generation() == self.claim.resource_generation
             && challenge.subject() == self.claim.enrolled_freshness
@@ -247,15 +255,63 @@ impl OstdBootClaimVerifier {
             && coordinates.units() == self.claim.units
             && coordinates.subject_device_generation()
                 == self.claim.enrolled_freshness.device().get()
+            && quarantine_scope_matches(challenge, DEVICE_RECEIPT_SCHEMA)
     }
+}
+
+#[cfg(feature = "cser-production")]
+fn quarantine_verifier_identity() -> VerifierIdentity {
+    let binding = VerifierBinding::new(
+        DEVICE_VERIFIER,
+        VerifierGeneration::new(1).expect("standard verifier generation is non-zero"),
+        DEVICE_RECEIPT_SCHEMA,
+        DEVICE_RECEIPT_IMPLEMENTATION_DIGEST,
+    )
+    .expect("standard device receipt verifier binding is valid");
+    VerifierIdentity::new_exact(binding)
+}
+
+#[cfg(not(feature = "cser-production"))]
+fn quarantine_verifier_identity() -> VerifierIdentity {
+    VerifierIdentity::new(DEVICE_VERIFIER, 1, DEVICE_RECEIPT_SCHEMA)
+        .expect("legacy device verifier identity is valid")
+}
+
+#[cfg(feature = "cser-production")]
+fn quarantine_scope_matches(challenge: &EvidenceChallenge, schema: ReceiptSchemaId) -> bool {
+    let Ok(binding) = VerifierBinding::new(
+        DEVICE_VERIFIER,
+        VerifierGeneration::new(1).expect("standard verifier generation is non-zero"),
+        schema,
+        DEVICE_RECEIPT_IMPLEMENTATION_DIGEST,
+    ) else {
+        return false;
+    };
+    match (
+        challenge.verification_scope(),
+        challenge.expected_verifier_binding(),
+    ) {
+        (None, None) => false,
+        (Some(scope), Some(expected)) => {
+            scope.world() == PRODUCTION_WORLD
+                && scope.provider() == STANDARD_DMA_PROVIDER
+                && scope.verifier_binding() == expected
+                && expected == binding
+        }
+        _ => false,
+    }
+}
+
+#[cfg(not(feature = "cser-production"))]
+fn quarantine_scope_matches(challenge: &EvidenceChallenge, _schema: ReceiptSchemaId) -> bool {
+    challenge.verification_scope().is_none() && challenge.expected_verifier_binding().is_none()
 }
 
 impl ReceiptVerifier for OstdBootClaimVerifier {
     type Receipt = BootVirtioStatusResetReceipt;
 
     fn identity(&self) -> VerifierIdentity {
-        VerifierIdentity::new(DEVICE_VERIFIER, 1, DEVICE_RECEIPT_SCHEMA)
-            .expect("standard device verifier identity is valid")
+        quarantine_verifier_identity()
     }
 
     fn verify(
@@ -307,8 +363,7 @@ impl ReceiptVerifier for OstdBootIrqVerifier {
     type Receipt = BootVirtioIsrEmptyReceipt;
 
     fn identity(&self) -> VerifierIdentity {
-        VerifierIdentity::new(DEVICE_VERIFIER, 1, DEVICE_RECEIPT_SCHEMA)
-            .expect("standard device verifier identity is valid")
+        quarantine_verifier_identity()
     }
 
     fn verify(
@@ -373,8 +428,7 @@ impl ReceiptVerifier for QemuArenaIotlbVerifier {
     type Receipt = BootGlobalIotlbInvalidationReceipt;
 
     fn identity(&self) -> VerifierIdentity {
-        VerifierIdentity::new(DEVICE_VERIFIER, 1, DEVICE_RECEIPT_SCHEMA)
-            .expect("standard device verifier identity is valid")
+        quarantine_verifier_identity()
     }
 
     fn verify(

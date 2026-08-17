@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: MPL-2.0
 
+use crate::domain::LogicalClaimRole;
 use crate::{
     AdoptionPolicy, ClaimCardinality, ClaimKindId, ClaimScopePolicy, ComponentId,
     CompositeComponentSpec, CompositeKindId, CreditClassId, DeviceGenerationEffect, DomainCatalog,
     DomainCatalogBuilder, DomainId, EvidenceKindId, EvidenceRule, FreshnessAxes, ObligationKindId,
     ObligationPolicy, ObligationReceipts, ObligationSpec, ReceiptBinding, ReceiptSchemaId,
-    VerifierId,
+    RecoveryArtifactPolicy, VerifierId,
 };
 
 /// Verifier for exact reply-publication acknowledgements.
@@ -380,12 +381,14 @@ pub fn standard_catalog() -> DomainCatalog {
                     AGENT_COMPONENT_REPLY,
                     REPLY_DOMAIN,
                     REPLY_OBLIGATION_PUBLICATION,
-                ),
+                )
+                .with_artifact_policy(RecoveryArtifactPolicy::NotRequired),
                 CompositeComponentSpec::new(
                     AGENT_COMPONENT_DMA,
                     DEVICE_DOMAIN,
                     DEVICE_OBLIGATION_DMA,
-                ),
+                )
+                .with_artifact_policy(RecoveryArtifactPolicy::NotRequired),
             ],
         )
         .expect("standard agent operation composite is valid")
@@ -395,7 +398,8 @@ pub fn standard_catalog() -> DomainCatalog {
                 AGENT_COMPONENT_DMA,
                 DEVICE_DOMAIN,
                 DEVICE_OBLIGATION_DMA,
-            )],
+            )
+            .with_artifact_policy(RecoveryArtifactPolicy::NotRequired)],
         )
         .expect("standard DMA arena reuse composite is valid")
         .build()
@@ -539,12 +543,14 @@ pub fn tool_dma_catalog() -> DomainCatalog {
                     TOOL_DMA_COMPONENT_TOOL,
                     TOOL_DOMAIN,
                     TOOL_OBLIGATION_INVOCATION,
-                ),
+                )
+                .with_artifact_policy(RecoveryArtifactPolicy::NotRequired),
                 CompositeComponentSpec::new(
                     TOOL_DMA_COMPONENT_DMA,
                     DEVICE_DOMAIN,
                     DEVICE_OBLIGATION_DMA,
-                ),
+                )
+                .with_artifact_policy(RecoveryArtifactPolicy::NotRequired),
             ],
         )
         .expect("tool DMA composite is valid")
@@ -554,7 +560,8 @@ pub fn tool_dma_catalog() -> DomainCatalog {
                 TOOL_HANDOFF_SOURCE_COMPONENT,
                 TOOL_DOMAIN,
                 TOOL_OBLIGATION_INVOCATION,
-            )],
+            )
+            .with_artifact_policy(RecoveryArtifactPolicy::NotRequired)],
         )
         .expect("tool handoff source composite is valid")
         .composite(
@@ -563,11 +570,457 @@ pub fn tool_dma_catalog() -> DomainCatalog {
                 TOOL_HANDOFF_COMPONENT,
                 TOOL_DOMAIN,
                 TOOL_OBLIGATION_INVOCATION,
-            )],
+            )
+            .with_artifact_policy(RecoveryArtifactPolicy::NotRequired)],
         )
         .expect("tool handoff child composite is valid")
         .single_hop_handoff(TOOL_HANDOFF_SOURCE_COMPOSITE, TOOL_HANDOFF_CHILD_COMPOSITE)
         .expect("tool handoff relation is valid")
         .build()
         .expect("tool DMA domain catalog is internally complete")
+}
+
+/// Verifier for the crash-recoverable Harness logical-operation receipts.
+pub const HARNESS_VERIFIER: VerifierId = match VerifierId::new(4) {
+    Ok(value) => value,
+    Err(_) => unreachable!(),
+};
+/// Canonical Harness logical-operation observation receipt schema.
+pub const HARNESS_RECEIPT_SCHEMA: ReceiptSchemaId = match ReceiptSchemaId::new(1) {
+    Ok(value) => value,
+    Err(_) => unreachable!(),
+};
+/// Canonical Harness logical-operation commit receipt schema.
+pub const HARNESS_COMMIT_RECEIPT_SCHEMA: ReceiptSchemaId = match ReceiptSchemaId::new(2) {
+    Ok(value) => value,
+    Err(_) => unreachable!(),
+};
+/// Canonical Harness logical-operation apply receipt schema.
+pub const HARNESS_APPLY_RECEIPT_SCHEMA: ReceiptSchemaId = match ReceiptSchemaId::new(3) {
+    Ok(value) => value,
+    Err(_) => unreachable!(),
+};
+/// Canonical Harness logical-operation settlement receipt schema.
+pub const HARNESS_SETTLEMENT_RECEIPT_SCHEMA: ReceiptSchemaId = match ReceiptSchemaId::new(4) {
+    Ok(value) => value,
+    Err(_) => unreachable!(),
+};
+
+/// Logical Harness/World profile domain.
+pub const HARNESS_DOMAIN: DomainId = match DomainId::new(4) {
+    Ok(value) => value,
+    Err(_) => unreachable!(),
+};
+
+/// Conserved remote idempotency-slot credits.
+pub const HARNESS_CREDIT_REMOTE_IDEMPOTENCY_SLOT: CreditClassId = match CreditClassId::new(6) {
+    Ok(value) => value,
+    Err(_) => unreachable!(),
+};
+/// Conserved provider-operation credits.
+pub const HARNESS_CREDIT_PROVIDER_OPERATION: CreditClassId = match CreditClassId::new(7) {
+    Ok(value) => value,
+    Err(_) => unreachable!(),
+};
+/// Conserved reply-delivery credits.
+pub const HARNESS_CREDIT_REPLY_DELIVERY: CreditClassId = match CreditClassId::new(8) {
+    Ok(value) => value,
+    Err(_) => unreachable!(),
+};
+/// Conserved queued-job credits.
+pub const HARNESS_CREDIT_QUEUED_JOB: CreditClassId = match CreditClassId::new(9) {
+    Ok(value) => value,
+    Err(_) => unreachable!(),
+};
+/// Conserved recovery-worker credits.
+pub const HARNESS_CREDIT_RECOVERY_WORKER: CreditClassId = match CreditClassId::new(10) {
+    Ok(value) => value,
+    Err(_) => unreachable!(),
+};
+/// Conserved retained-provider-generation credits.
+pub const HARNESS_CREDIT_RETAINED_PROVIDER_GENERATION: CreditClassId = match CreditClassId::new(11)
+{
+    Ok(value) => value,
+    Err(_) => unreachable!(),
+};
+/// Conserved artifact-closure credits.
+pub const HARNESS_CREDIT_ARTIFACT_CLOSURE: CreditClassId = match CreditClassId::new(12) {
+    Ok(value) => value,
+    Err(_) => unreachable!(),
+};
+
+/// Harness remote idempotency-slot obligation.
+pub const HARNESS_OBLIGATION_REMOTE_IDEMPOTENCY_SLOT: ObligationKindId =
+    match ObligationKindId::new(1) {
+        Ok(value) => value,
+        Err(_) => unreachable!(),
+    };
+/// Harness provider-operation obligation.
+pub const HARNESS_OBLIGATION_PROVIDER_OPERATION: ObligationKindId = match ObligationKindId::new(2) {
+    Ok(value) => value,
+    Err(_) => unreachable!(),
+};
+/// Harness reply-delivery obligation.
+pub const HARNESS_OBLIGATION_REPLY_DELIVERY: ObligationKindId = match ObligationKindId::new(3) {
+    Ok(value) => value,
+    Err(_) => unreachable!(),
+};
+/// Harness queued-job obligation.
+pub const HARNESS_OBLIGATION_QUEUED_JOB: ObligationKindId = match ObligationKindId::new(4) {
+    Ok(value) => value,
+    Err(_) => unreachable!(),
+};
+/// Harness recovery-worker obligation.
+pub const HARNESS_OBLIGATION_RECOVERY_WORKER: ObligationKindId = match ObligationKindId::new(5) {
+    Ok(value) => value,
+    Err(_) => unreachable!(),
+};
+/// Harness retained-provider-generation obligation.
+pub const HARNESS_OBLIGATION_RETAINED_PROVIDER_GENERATION: ObligationKindId =
+    match ObligationKindId::new(6) {
+        Ok(value) => value,
+        Err(_) => unreachable!(),
+    };
+/// Harness artifact-closure obligation.
+pub const HARNESS_OBLIGATION_ARTIFACT_CLOSURE: ObligationKindId = match ObligationKindId::new(7) {
+    Ok(value) => value,
+    Err(_) => unreachable!(),
+};
+
+/// Harness remote idempotency-slot claim.
+pub const HARNESS_CLAIM_REMOTE_IDEMPOTENCY_SLOT: ClaimKindId = match ClaimKindId::new(1) {
+    Ok(value) => value,
+    Err(_) => unreachable!(),
+};
+/// Harness provider-operation claim.
+pub const HARNESS_CLAIM_PROVIDER_OPERATION: ClaimKindId = match ClaimKindId::new(2) {
+    Ok(value) => value,
+    Err(_) => unreachable!(),
+};
+/// Harness reply-delivery claim.
+pub const HARNESS_CLAIM_REPLY_DELIVERY: ClaimKindId = match ClaimKindId::new(3) {
+    Ok(value) => value,
+    Err(_) => unreachable!(),
+};
+/// Harness queued-job claim.
+pub const HARNESS_CLAIM_QUEUED_JOB: ClaimKindId = match ClaimKindId::new(4) {
+    Ok(value) => value,
+    Err(_) => unreachable!(),
+};
+/// Harness recovery-worker claim.
+pub const HARNESS_CLAIM_RECOVERY_WORKER: ClaimKindId = match ClaimKindId::new(5) {
+    Ok(value) => value,
+    Err(_) => unreachable!(),
+};
+/// Harness retained-provider-generation claim.
+pub const HARNESS_CLAIM_RETAINED_PROVIDER_GENERATION: ClaimKindId = match ClaimKindId::new(6) {
+    Ok(value) => value,
+    Err(_) => unreachable!(),
+};
+/// Harness artifact-closure claim.
+pub const HARNESS_CLAIM_ARTIFACT_CLOSURE: ClaimKindId = match ClaimKindId::new(7) {
+    Ok(value) => value,
+    Err(_) => unreachable!(),
+};
+
+/// Bounded composite containing the seven logical Harness custody components.
+pub const HARNESS_OPERATION_COMPOSITE: CompositeKindId = match CompositeKindId::new(6) {
+    Ok(value) => value,
+    Err(_) => unreachable!(),
+};
+/// Remote idempotency component of [`HARNESS_OPERATION_COMPOSITE`].
+pub const HARNESS_COMPONENT_REMOTE_IDEMPOTENCY_SLOT: ComponentId = match ComponentId::new(1) {
+    Ok(value) => value,
+    Err(_) => unreachable!(),
+};
+/// Provider-operation component of [`HARNESS_OPERATION_COMPOSITE`].
+pub const HARNESS_COMPONENT_PROVIDER_OPERATION: ComponentId = match ComponentId::new(2) {
+    Ok(value) => value,
+    Err(_) => unreachable!(),
+};
+/// Reply-delivery component of [`HARNESS_OPERATION_COMPOSITE`].
+pub const HARNESS_COMPONENT_REPLY_DELIVERY: ComponentId = match ComponentId::new(3) {
+    Ok(value) => value,
+    Err(_) => unreachable!(),
+};
+/// Queued-job component of [`HARNESS_OPERATION_COMPOSITE`].
+pub const HARNESS_COMPONENT_QUEUED_JOB: ComponentId = match ComponentId::new(4) {
+    Ok(value) => value,
+    Err(_) => unreachable!(),
+};
+/// Recovery-worker component of [`HARNESS_OPERATION_COMPOSITE`].
+pub const HARNESS_COMPONENT_RECOVERY_WORKER: ComponentId = match ComponentId::new(5) {
+    Ok(value) => value,
+    Err(_) => unreachable!(),
+};
+/// Retained-provider-generation component of [`HARNESS_OPERATION_COMPOSITE`].
+pub const HARNESS_COMPONENT_RETAINED_PROVIDER_GENERATION: ComponentId = match ComponentId::new(6) {
+    Ok(value) => value,
+    Err(_) => unreachable!(),
+};
+/// Artifact-closure component of [`HARNESS_OPERATION_COMPOSITE`].
+pub const HARNESS_COMPONENT_ARTIFACT_CLOSURE: ComponentId = match ComponentId::new(7) {
+    Ok(value) => value,
+    Err(_) => unreachable!(),
+};
+
+const HARNESS_EVIDENCE_REMOTE_IDEMPOTENCY_SLOT: EvidenceKindId = match EvidenceKindId::new(1) {
+    Ok(value) => value,
+    Err(_) => unreachable!(),
+};
+const HARNESS_EVIDENCE_PROVIDER_OPERATION: EvidenceKindId = match EvidenceKindId::new(2) {
+    Ok(value) => value,
+    Err(_) => unreachable!(),
+};
+const HARNESS_EVIDENCE_REPLY_DELIVERY: EvidenceKindId = match EvidenceKindId::new(3) {
+    Ok(value) => value,
+    Err(_) => unreachable!(),
+};
+const HARNESS_EVIDENCE_QUEUED_JOB: EvidenceKindId = match EvidenceKindId::new(4) {
+    Ok(value) => value,
+    Err(_) => unreachable!(),
+};
+const HARNESS_EVIDENCE_RECOVERY_WORKER: EvidenceKindId = match EvidenceKindId::new(5) {
+    Ok(value) => value,
+    Err(_) => unreachable!(),
+};
+const HARNESS_EVIDENCE_RETAINED_PROVIDER_GENERATION: EvidenceKindId = match EvidenceKindId::new(6) {
+    Ok(value) => value,
+    Err(_) => unreachable!(),
+};
+const HARNESS_EVIDENCE_ARTIFACT_CLOSURE: EvidenceKindId = match EvidenceKindId::new(7) {
+    Ok(value) => value,
+    Err(_) => unreachable!(),
+};
+
+/// One bounded, sealed logical profile for a World/Harness integration.
+///
+/// The catalog names the seven logical custody classes needed to reconcile
+/// escaped provider work and its recovery closure.  It contains one fixed
+/// seven-component composite and no loader, resolver, dependency-injection,
+/// or general workflow surface.
+pub fn harness_catalog() -> DomainCatalog {
+    let freshness = FreshnessAxes::BOOT
+        .union(FreshnessAxes::REGISTRY)
+        .union(FreshnessAxes::BINDING)
+        .union(FreshnessAxes::JOURNAL);
+    let receipt = ReceiptBinding::new(HARNESS_VERIFIER, HARNESS_RECEIPT_SCHEMA);
+    let commit = ReceiptBinding::new(HARNESS_VERIFIER, HARNESS_COMMIT_RECEIPT_SCHEMA);
+    let apply = ReceiptBinding::new(HARNESS_VERIFIER, HARNESS_APPLY_RECEIPT_SCHEMA);
+    let settlement = ReceiptBinding::new(HARNESS_VERIFIER, HARNESS_SETTLEMENT_RECEIPT_SCHEMA);
+    let logical_obligation = |kind| {
+        ObligationSpec::new(
+            HARNESS_DOMAIN,
+            kind,
+            ObligationPolicy::SuccessorSettlement,
+            AdoptionPolicy::UncommittedOnly,
+            ObligationReceipts::successor_settlement(commit, apply, settlement),
+            1,
+        )
+    };
+
+    DomainCatalogBuilder::new()
+        .credit_class(HARNESS_CREDIT_REMOTE_IDEMPOTENCY_SLOT, 1024)
+        .expect("harness idempotency credits are unique")
+        .credit_class(HARNESS_CREDIT_PROVIDER_OPERATION, 1024)
+        .expect("harness provider-operation credits are unique")
+        .credit_class(HARNESS_CREDIT_REPLY_DELIVERY, 1024)
+        .expect("harness reply-delivery credits are unique")
+        .credit_class(HARNESS_CREDIT_QUEUED_JOB, 1024)
+        .expect("harness queued-job credits are unique")
+        .credit_class(HARNESS_CREDIT_RECOVERY_WORKER, 1024)
+        .expect("harness recovery-worker credits are unique")
+        .credit_class(HARNESS_CREDIT_RETAINED_PROVIDER_GENERATION, 1024)
+        .expect("harness retained-generation credits are unique")
+        .credit_class(HARNESS_CREDIT_ARTIFACT_CLOSURE, 1024)
+        .expect("harness artifact-closure credits are unique")
+        .obligation(
+            logical_obligation(HARNESS_OBLIGATION_REMOTE_IDEMPOTENCY_SLOT),
+            &[
+                ClaimCardinality::new(HARNESS_CLAIM_REMOTE_IDEMPOTENCY_SLOT, 1, 1)
+                    .expect("harness idempotency cardinality is valid"),
+            ],
+        )
+        .expect("harness idempotency obligation is unique")
+        .obligation(
+            logical_obligation(HARNESS_OBLIGATION_PROVIDER_OPERATION),
+            &[
+                ClaimCardinality::new(HARNESS_CLAIM_PROVIDER_OPERATION, 1, 1)
+                    .expect("harness provider-operation cardinality is valid"),
+            ],
+        )
+        .expect("harness provider-operation obligation is unique")
+        .obligation(
+            logical_obligation(HARNESS_OBLIGATION_REPLY_DELIVERY),
+            &[ClaimCardinality::new(HARNESS_CLAIM_REPLY_DELIVERY, 1, 1)
+                .expect("harness reply-delivery cardinality is valid")],
+        )
+        .expect("harness reply-delivery obligation is unique")
+        .obligation(
+            logical_obligation(HARNESS_OBLIGATION_QUEUED_JOB),
+            &[ClaimCardinality::new(HARNESS_CLAIM_QUEUED_JOB, 1, 1)
+                .expect("harness queued-job cardinality is valid")],
+        )
+        .expect("harness queued-job obligation is unique")
+        .obligation(
+            logical_obligation(HARNESS_OBLIGATION_RECOVERY_WORKER),
+            &[ClaimCardinality::new(HARNESS_CLAIM_RECOVERY_WORKER, 1, 1)
+                .expect("harness recovery-worker cardinality is valid")],
+        )
+        .expect("harness recovery-worker obligation is unique")
+        .obligation(
+            logical_obligation(HARNESS_OBLIGATION_RETAINED_PROVIDER_GENERATION),
+            &[
+                ClaimCardinality::new(HARNESS_CLAIM_RETAINED_PROVIDER_GENERATION, 1, 1)
+                    .expect("harness retained-generation cardinality is valid"),
+            ],
+        )
+        .expect("harness retained-generation obligation is unique")
+        .obligation(
+            logical_obligation(HARNESS_OBLIGATION_ARTIFACT_CLOSURE),
+            &[ClaimCardinality::new(HARNESS_CLAIM_ARTIFACT_CLOSURE, 1, 1)
+                .expect("harness artifact-closure cardinality is valid")],
+        )
+        .expect("harness artifact-closure obligation is unique")
+        .claim_with_role(
+            HARNESS_DOMAIN,
+            HARNESS_CLAIM_REMOTE_IDEMPOTENCY_SLOT,
+            HARNESS_CREDIT_REMOTE_IDEMPOTENCY_SLOT,
+            ClaimScopePolicy::Logical,
+            LogicalClaimRole::RemoteIdempotencySlot,
+            &[EvidenceRule::logical(
+                HARNESS_EVIDENCE_REMOTE_IDEMPOTENCY_SLOT,
+                receipt,
+                freshness,
+            )],
+        )
+        .expect("harness idempotency claim is valid")
+        .claim_with_role(
+            HARNESS_DOMAIN,
+            HARNESS_CLAIM_PROVIDER_OPERATION,
+            HARNESS_CREDIT_PROVIDER_OPERATION,
+            ClaimScopePolicy::Logical,
+            LogicalClaimRole::ProviderOperation,
+            &[EvidenceRule::logical(
+                HARNESS_EVIDENCE_PROVIDER_OPERATION,
+                receipt,
+                freshness,
+            )],
+        )
+        .expect("harness provider-operation claim is valid")
+        .claim_with_role(
+            HARNESS_DOMAIN,
+            HARNESS_CLAIM_REPLY_DELIVERY,
+            HARNESS_CREDIT_REPLY_DELIVERY,
+            ClaimScopePolicy::Logical,
+            LogicalClaimRole::ReplyDelivery,
+            &[EvidenceRule::logical(
+                HARNESS_EVIDENCE_REPLY_DELIVERY,
+                receipt,
+                freshness,
+            )],
+        )
+        .expect("harness reply-delivery claim is valid")
+        .claim_with_role(
+            HARNESS_DOMAIN,
+            HARNESS_CLAIM_QUEUED_JOB,
+            HARNESS_CREDIT_QUEUED_JOB,
+            ClaimScopePolicy::Logical,
+            LogicalClaimRole::QueuedJob,
+            &[EvidenceRule::logical(
+                HARNESS_EVIDENCE_QUEUED_JOB,
+                receipt,
+                freshness,
+            )],
+        )
+        .expect("harness queued-job claim is valid")
+        .claim_with_role(
+            HARNESS_DOMAIN,
+            HARNESS_CLAIM_RECOVERY_WORKER,
+            HARNESS_CREDIT_RECOVERY_WORKER,
+            ClaimScopePolicy::Logical,
+            LogicalClaimRole::RecoveryWorker,
+            &[EvidenceRule::logical(
+                HARNESS_EVIDENCE_RECOVERY_WORKER,
+                receipt,
+                freshness,
+            )],
+        )
+        .expect("harness recovery-worker claim is valid")
+        .claim_with_role(
+            HARNESS_DOMAIN,
+            HARNESS_CLAIM_RETAINED_PROVIDER_GENERATION,
+            HARNESS_CREDIT_RETAINED_PROVIDER_GENERATION,
+            ClaimScopePolicy::Logical,
+            LogicalClaimRole::RetainedProviderGeneration,
+            &[EvidenceRule::logical(
+                HARNESS_EVIDENCE_RETAINED_PROVIDER_GENERATION,
+                receipt,
+                freshness,
+            )],
+        )
+        .expect("harness retained-generation claim is valid")
+        .claim_with_role(
+            HARNESS_DOMAIN,
+            HARNESS_CLAIM_ARTIFACT_CLOSURE,
+            HARNESS_CREDIT_ARTIFACT_CLOSURE,
+            ClaimScopePolicy::Logical,
+            LogicalClaimRole::ArtifactClosure,
+            &[EvidenceRule::logical(
+                HARNESS_EVIDENCE_ARTIFACT_CLOSURE,
+                receipt,
+                freshness,
+            )],
+        )
+        .expect("harness artifact-closure claim is valid")
+        .composite(
+            HARNESS_OPERATION_COMPOSITE,
+            &[
+                CompositeComponentSpec::new(
+                    HARNESS_COMPONENT_REMOTE_IDEMPOTENCY_SLOT,
+                    HARNESS_DOMAIN,
+                    HARNESS_OBLIGATION_REMOTE_IDEMPOTENCY_SLOT,
+                )
+                .with_artifact_policy(RecoveryArtifactPolicy::NotRequired),
+                CompositeComponentSpec::new(
+                    HARNESS_COMPONENT_PROVIDER_OPERATION,
+                    HARNESS_DOMAIN,
+                    HARNESS_OBLIGATION_PROVIDER_OPERATION,
+                )
+                .with_artifact_policy(RecoveryArtifactPolicy::NotRequired),
+                CompositeComponentSpec::new(
+                    HARNESS_COMPONENT_REPLY_DELIVERY,
+                    HARNESS_DOMAIN,
+                    HARNESS_OBLIGATION_REPLY_DELIVERY,
+                )
+                .with_artifact_policy(RecoveryArtifactPolicy::NotRequired),
+                CompositeComponentSpec::new(
+                    HARNESS_COMPONENT_QUEUED_JOB,
+                    HARNESS_DOMAIN,
+                    HARNESS_OBLIGATION_QUEUED_JOB,
+                )
+                .with_artifact_policy(RecoveryArtifactPolicy::NotRequired),
+                CompositeComponentSpec::new(
+                    HARNESS_COMPONENT_RECOVERY_WORKER,
+                    HARNESS_DOMAIN,
+                    HARNESS_OBLIGATION_RECOVERY_WORKER,
+                )
+                .with_artifact_policy(RecoveryArtifactPolicy::NotRequired),
+                CompositeComponentSpec::new(
+                    HARNESS_COMPONENT_RETAINED_PROVIDER_GENERATION,
+                    HARNESS_DOMAIN,
+                    HARNESS_OBLIGATION_RETAINED_PROVIDER_GENERATION,
+                )
+                .with_artifact_policy(RecoveryArtifactPolicy::Required),
+                CompositeComponentSpec::new(
+                    HARNESS_COMPONENT_ARTIFACT_CLOSURE,
+                    HARNESS_DOMAIN,
+                    HARNESS_OBLIGATION_ARTIFACT_CLOSURE,
+                )
+                .with_artifact_policy(RecoveryArtifactPolicy::Required),
+            ],
+        )
+        .expect("harness bounded composite is valid")
+        .build()
+        .expect("harness domain catalog is internally complete")
 }

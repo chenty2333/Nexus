@@ -4,11 +4,12 @@ mod support;
 use cser_core::{
     CommandRequest as Command, CommitState, CoreError, CoreLimits, Digest, Engine, Freshness,
     JournalDecodeError, JournalRepair, OutcomeState, RecoveryAnchor, RecoveryAnchorError,
-    SettlementState, TransitionOutput, TxError, scan_journal, standard_catalog,
+    SettlementState, TransitionOutput, TxError, WorldId, scan_journal, standard_catalog,
 };
 use sha2::{Digest as _, Sha256};
 use support::{
-    Harness, charge, claim, digest, effect, freshness, principal, resource, resource_generation,
+    Harness, charge, claim, digest, effect, freshness, genesis_projection, principal,
+    recovery_anchor, recovery_binding, resource, resource_generation,
 };
 
 fn recover(
@@ -17,18 +18,19 @@ fn recover(
     target: Freshness,
     minimum_revision: u64,
     expected_head: Digest,
+    projection: Digest,
 ) -> Result<cser_core::RecoveryReport, CoreError> {
     Engine::recover_legacy_compatibility(
         standard_catalog(),
         CoreLimits::bounded_default(),
-        RecoveryAnchor::from_trusted_provider(
+        recovery_anchor(
             standard_catalog().digest(),
             committed,
             target,
             minimum_revision,
             expected_head,
-        )
-        .expect("test anchor must be structurally valid"),
+            projection,
+        ),
         bytes,
     )
 }
@@ -106,11 +108,12 @@ fn record_roundtrip_recovers_the_exact_acknowledged_chain_head() {
         standard_catalog(),
         CoreLimits::bounded_default(),
         RecoveryAnchor::from_trusted_provider(
-            standard_catalog().digest(),
+            recovery_binding(standard_catalog().digest(), freshness(1, 1, 1, 1, 1)),
             freshness(1, 1, 1, 1, 1),
             freshness(2, 1, 1, 1, 2),
             source.engine.revision(),
             source.engine.head(),
+            source.engine.projection_digest(),
         )
         .unwrap(),
         &source.journal,
@@ -141,7 +144,7 @@ fn current_recovery_rejects_a_schema_six_journal_bound_to_the_frozen_v5_catalog(
     source.tx(create_estate(20)).unwrap();
 
     let mut legacy_catalog_journal = source.journal.clone();
-    assert_eq!(&legacy_catalog_journal[..8], b"CSERJR8\0");
+    assert_eq!(&legacy_catalog_journal[..8], b"CSERJR9\0");
     legacy_catalog_journal[72..104].copy_from_slice(&v5_catalog.bytes());
     let checksum_start = legacy_catalog_journal.len() - 32;
     let checksum = Sha256::digest(&legacy_catalog_journal[..checksum_start]);
@@ -150,11 +153,12 @@ fn current_recovery_rejects_a_schema_six_journal_bound_to_the_frozen_v5_catalog(
     assert!(scan_journal(&legacy_catalog_journal).is_ok());
 
     let anchor = RecoveryAnchor::from_trusted_provider(
-        v5_catalog,
+        recovery_binding(v5_catalog, freshness(1, 1, 1, 1, 1)),
         freshness(1, 1, 1, 1, 1),
         freshness(2, 1, 1, 1, 2),
         1,
         old_head,
+        source.engine.projection_digest(),
     )
     .unwrap();
     assert_eq!(
@@ -198,6 +202,7 @@ fn incomplete_final_record_recovers_only_the_acknowledged_prefix_and_quarantines
         target,
         first.revision(),
         first.head(),
+        first.projection(),
     )
     .unwrap();
     assert_eq!(report.acknowledged_revision(), first.revision());
@@ -234,6 +239,7 @@ fn incomplete_final_record_recovers_only_the_acknowledged_prefix_and_quarantines
         target,
         first.revision(),
         first.head(),
+        first.projection(),
     )
     .unwrap();
     let mut engine = report.into_engine();
@@ -260,7 +266,8 @@ fn corruption_in_a_complete_record_is_never_downgraded_to_a_torn_tail() {
             freshness(1, 1, 1, 1, 1),
             freshness(2, 1, 1, 1, 2),
             1,
-            source.engine.head()
+            source.engine.head(),
+            source.engine.projection_digest(),
         ),
         Err(CoreError::Journal(JournalDecodeError::ChecksumMismatch {
             offset: 0
@@ -276,47 +283,79 @@ fn recovery_anchor_requires_exact_catalog_head_and_advancing_epochs() {
     let head = digest(1);
 
     assert_eq!(
-        RecoveryAnchor::from_trusted_provider(Digest::ZERO, committed, next, 1, head),
+        RecoveryAnchor::from_trusted_provider(
+            recovery_binding(catalog, committed),
+            committed,
+            next,
+            1,
+            head,
+            Digest::ZERO,
+        ),
         Err(RecoveryAnchorError::ZeroDigest)
     );
     assert_eq!(
-        RecoveryAnchor::from_trusted_provider(catalog, committed, next, 1, Digest::ZERO),
+        RecoveryAnchor::from_trusted_provider(
+            recovery_binding(catalog, committed),
+            committed,
+            next,
+            1,
+            Digest::ZERO,
+            genesis_projection(),
+        ),
         Err(RecoveryAnchorError::InconsistentGenesis)
-    );
-    assert_eq!(
-        RecoveryAnchor::from_trusted_provider(catalog, committed, next, 0, head),
-        Err(RecoveryAnchorError::InconsistentGenesis)
-    );
-    assert!(
-        RecoveryAnchor::from_trusted_provider(catalog, committed, next, 0, Digest::ZERO).is_ok()
     );
     assert_eq!(
         RecoveryAnchor::from_trusted_provider(
-            catalog,
+            recovery_binding(catalog, committed),
+            committed,
+            next,
+            0,
+            head,
+            genesis_projection(),
+        ),
+        Err(RecoveryAnchorError::InconsistentGenesis)
+    );
+    assert!(
+        RecoveryAnchor::from_trusted_provider(
+            recovery_binding(catalog, committed),
+            committed,
+            next,
+            0,
+            Digest::ZERO,
+            genesis_projection(),
+        )
+        .is_ok()
+    );
+    assert_eq!(
+        RecoveryAnchor::from_trusted_provider(
+            recovery_binding(catalog, committed),
             committed,
             freshness(2, 2, 1, 1, 2),
             1,
             head,
+            genesis_projection(),
         ),
         Err(RecoveryAnchorError::RegistryMismatch)
     );
     assert_eq!(
         RecoveryAnchor::from_trusted_provider(
-            catalog,
+            recovery_binding(catalog, committed),
             committed,
             freshness(2, 1, 2, 1, 2),
             1,
             head,
+            genesis_projection(),
         ),
-        Err(RecoveryAnchorError::BindingMismatch)
+        Err(RecoveryAnchorError::RegistryMismatch)
     );
     assert_eq!(
         RecoveryAnchor::from_trusted_provider(
-            catalog,
+            recovery_binding(catalog, committed),
             committed,
             freshness(1, 1, 1, 1, 2),
             1,
             head,
+            genesis_projection(),
         ),
         Err(RecoveryAnchorError::NonAdvancingEpoch)
     );
@@ -338,6 +377,7 @@ fn trusted_revision_head_and_freshness_anchors_reject_rollback() {
             freshness(2, 1, 1, 1, 2),
             second_revision,
             first.head(),
+            first.projection(),
         )
         .unwrap_err(),
         CoreError::RollbackDetected
@@ -349,40 +389,44 @@ fn trusted_revision_head_and_freshness_anchors_reject_rollback() {
             freshness(2, 1, 1, 1, 2),
             first.revision(),
             second_head,
+            source.engine.projection_digest(),
         )
         .unwrap_err(),
         CoreError::RollbackDetected
     );
     assert_eq!(
         RecoveryAnchor::from_trusted_provider(
-            standard_catalog().digest(),
+            recovery_binding(standard_catalog().digest(), freshness(1, 1, 1, 1, 1)),
             freshness(1, 1, 1, 1, 1),
             freshness(1, 1, 1, 1, 2),
             second_revision,
             second_head,
+            source.engine.projection_digest(),
         ),
         Err(RecoveryAnchorError::NonAdvancingEpoch)
     );
     assert_eq!(
         RecoveryAnchor::from_trusted_provider(
-            standard_catalog().digest(),
+            recovery_binding(standard_catalog().digest(), freshness(1, 1, 1, 1, 1)),
             freshness(1, 1, 1, 1, 1),
             freshness(2, 1, 1, 1, 1),
             second_revision,
             second_head,
+            source.engine.projection_digest(),
         ),
         Err(RecoveryAnchorError::NonAdvancingEpoch)
     );
     assert_eq!(
-        Engine::recover_legacy_compatibility(
+        Engine::recover(
             standard_catalog(),
             CoreLimits::bounded_default(),
             RecoveryAnchor::from_trusted_provider(
-                standard_catalog().digest(),
+                recovery_binding(standard_catalog().digest(), freshness(1, 2, 1, 1, 1)),
                 freshness(1, 2, 1, 1, 1),
                 freshness(2, 2, 1, 1, 2),
                 second_revision,
                 second_head,
+                source.engine.projection_digest(),
             )
             .unwrap(),
             &source.journal,
@@ -391,15 +435,16 @@ fn trusted_revision_head_and_freshness_anchors_reject_rollback() {
         CoreError::SchemaMismatch
     );
     assert_eq!(
-        Engine::recover_legacy_compatibility(
+        Engine::recover(
             standard_catalog(),
             CoreLimits::bounded_default(),
             RecoveryAnchor::from_trusted_provider(
-                digest(254),
+                recovery_binding(digest(254), freshness(1, 1, 1, 1, 1)),
                 freshness(1, 1, 1, 1, 1),
                 freshness(2, 1, 1, 1, 2),
                 second_revision,
                 second_head,
+                source.engine.projection_digest(),
             )
             .unwrap(),
             &source.journal,
@@ -414,6 +459,7 @@ fn trusted_revision_head_and_freshness_anchors_reject_rollback() {
             freshness(2, 1, 1, 2, 2),
             second_revision,
             second_head,
+            source.engine.projection_digest(),
         )
         .unwrap_err(),
         CoreError::FreshnessRollback
@@ -428,6 +474,7 @@ fn trusted_revision_head_and_freshness_anchors_reject_rollback() {
         first_recovery,
         device_source.engine.revision(),
         device_source.engine.head(),
+        device_source.engine.projection_digest(),
     )
     .unwrap();
     let mut recovered = report.into_engine();
@@ -435,11 +482,12 @@ fn trusted_revision_head_and_freshness_anchors_reject_rollback() {
     let target_with_older_device = freshness(3, 1, 1, 1, 3);
     assert_eq!(
         RecoveryAnchor::from_trusted_provider(
-            standard_catalog().digest(),
+            recovery_binding(standard_catalog().digest(), first_recovery),
             first_recovery,
             target_with_older_device,
             recovered.revision(),
             recovered.head(),
+            recovered.projection_digest(),
         ),
         Err(RecoveryAnchorError::NonAdvancingEpoch)
     );
@@ -464,6 +512,7 @@ fn trusted_head_recovers_before_complete_or_corrupt_unanchored_suffix() {
             freshness(2, 1, 1, 1, 2),
             first.revision(),
             first.head(),
+            first.projection(),
         )
         .unwrap();
         assert_eq!(report.acknowledged_revision(), first.revision());
@@ -510,6 +559,7 @@ fn trusted_head_recovers_before_complete_or_corrupt_unanchored_suffix() {
             freshness(2, 1, 1, 1, 2),
             first.revision(),
             first.head(),
+            first.projection(),
         ),
         Err(CoreError::Journal(JournalDecodeError::ChecksumMismatch {
             offset: 0
@@ -523,11 +573,12 @@ fn trusted_genesis_recovers_an_empty_prefix_and_rejects_unanchored_first_append(
     let target = freshness(2, 1, 1, 1, 2);
     let genesis_anchor = || {
         RecoveryAnchor::from_trusted_provider(
-            standard_catalog().digest(),
+            recovery_binding(standard_catalog().digest(), committed),
             committed,
             target,
             0,
             Digest::ZERO,
+            genesis_projection(),
         )
         .unwrap()
     };
@@ -587,11 +638,12 @@ fn trusted_genesis_rejects_profile_one_before_repair_without_reclassifying_resid
     let target = freshness(2, 1, 1, 1, 2);
     let genesis_anchor = || {
         RecoveryAnchor::from_trusted_provider(
-            standard_catalog().digest(),
+            recovery_binding(standard_catalog().digest(), committed),
             committed,
             target,
             0,
             Digest::ZERO,
+            genesis_projection(),
         )
         .unwrap()
     };
@@ -612,7 +664,7 @@ fn trusted_genesis_rejects_profile_one_before_repair_without_reclassifying_resid
         ));
     }
 
-    let report = Engine::recover(
+    let report = Engine::recover_legacy_compatibility(
         standard_catalog(),
         CoreLimits::bounded_default(),
         genesis_anchor(),
@@ -630,7 +682,8 @@ fn ambiguous_persistence_failure_latches_the_engine_until_journal_recovery() {
     #[derive(Debug, Eq, PartialEq)]
     struct DiskFull;
 
-    let mut engine = Engine::new_legacy_compatibility(
+    let mut engine = Engine::new_scoped_legacy_compatibility(
+        WorldId::new(1).unwrap(),
         standard_catalog(),
         CoreLimits::bounded_default(),
         freshness(1, 1, 1, 1, 1),
@@ -660,6 +713,8 @@ fn ambiguous_persistence_failure_latches_the_engine_until_journal_recovery() {
 
     let accepted = scan_journal(&rejected_record).unwrap();
     let candidate = accepted.records().last().unwrap();
+    let mut expected = Harness::new();
+    expected.tx(create_estate(24)).unwrap();
     let target = freshness(2, 1, 1, 1, 2);
     let recovered = recover(
         &rejected_record,
@@ -667,6 +722,7 @@ fn ambiguous_persistence_failure_latches_the_engine_until_journal_recovery() {
         target,
         candidate.revision(),
         candidate.digest(),
+        expected.engine.projection_digest(),
     )
     .unwrap();
     assert_eq!(recovered.acknowledged_revision(), 1);
@@ -708,6 +764,7 @@ fn crash_after_durable_commit_intent_recovers_as_indeterminate_without_reapply()
         target,
         source.engine.revision(),
         source.engine.head(),
+        source.engine.projection_digest(),
     )
     .unwrap();
     let mut recovered = report.into_engine();
@@ -732,6 +789,7 @@ fn crash_after_durable_commit_intent_recovers_as_indeterminate_without_reapply()
         target,
         recovered.revision(),
         recovered.head(),
+        recovered.projection_digest(),
     )
     .unwrap();
     let replayed = report.into_engine();
@@ -875,6 +933,7 @@ fn file_journal_requires_exact_recovery_coordinates_before_torn_tail_repair() {
         target,
         first.revision(),
         first.head(),
+        first.projection(),
     )
     .unwrap();
     let mut engine = report.into_engine();

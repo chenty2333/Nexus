@@ -9,10 +9,10 @@
 use core::fmt;
 
 use cser_core::{
-    ChargeAccountId, ClaimId, CoreLimits, EffectId, PrincipalId, PrincipalIncarnation,
-    RecoveryBinding, RegistryInstance, ResourceGeneration, ResourceId, RootId,
-    SingleHopHandoffProjection, TOOL_HANDOFF_COMPONENT, TOOL_HANDOFF_SOURCE_COMPONENT,
-    tool_dma_catalog,
+    AuthorityBindingGeneration, ChargeAccountId, ClaimId, CoreLimits, EffectId, PrincipalId,
+    PrincipalIncarnation, RecoveryBinding, RecoveryProfile, RegistryInstance, ResourceGeneration,
+    ResourceId, RootId, SingleHopHandoffProjection, TOOL_HANDOFF_COMPONENT,
+    TOOL_HANDOFF_SOURCE_COMPONENT, WorldId, tool_dma_catalog,
 };
 use ostd::{
     power::{ExitCode, poweroff},
@@ -60,9 +60,11 @@ pub(crate) fn run() {
     let identity = acquire_identity(catalog.digest());
     let run_id = identity.run_id().bytes();
     let binding = RecoveryBinding::new(
+        RecoveryProfile::current(),
+        WorldId::new(1).expect("handoff world is non-zero"),
         catalog.digest(),
         RegistryInstance::new(1).expect("handoff registry"),
-        1,
+        AuthorityBindingGeneration::new(1).expect("handoff binding is non-zero"),
     )
     .expect("handoff binding");
     let boot = PreparedQemuPersistentBoot::acquire()

@@ -10,8 +10,8 @@
 //! state.  Callers supply those at [`PreparedQemuPersistentBoot::recover`].
 
 use cser_core::{
-    CoordinatedPersistence, CoreLimits, DeviceGeneration, Digest, DomainCatalog, RecoveryBinding,
-    scan_journal,
+    CoordinatedPersistence, CoreError, CoreLimits, DeviceGeneration, Digest, DomainCatalog,
+    RecoveryBinding, scan_journal,
 };
 use nexus_ostd_virtio::{
     BootQuarantineGuard, BootQuarantineObservation, OwnerKind, PersistentDmaArenaLayout,
@@ -24,8 +24,8 @@ use super::{
     core_dma_arena_allocator::{persistent_dma_arena_base, persistent_dma_arena_ready},
     core_pio_journal::{AtaJournalFixture, AtaPioJournal, AtaPioJournalVNext},
     core_reboot::{
-        AlreadyQuarantined, BootDeviceQuarantine, OstdBootJournal, QuarantinedRecoveredBoot,
-        recover_quarantined_boot,
+        AlreadyQuarantined, BootDeviceQuarantine, BootRecoveryError, OstdBootJournal,
+        QuarantinedRecoveredBoot, recover_quarantined_boot,
     },
     core_tpm_anchor::{
         QemuTisTpm2, TpmNvAnchorCandidate, TpmNvIndexAuth, TpmNvLayout, TpmNvTrustedAnchor,
@@ -61,7 +61,7 @@ pub(crate) type PreparedQemuPersistentBoot = PreparedQemuPersistentBootFor<AtaPi
 /// to the legacy alias rather than a runtime format probe.
 pub(crate) type PreparedQemuPersistentBootVNext = PreparedQemuPersistentBootFor<AtaPioJournalVNext>;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum QemuPersistentBootError {
     ArenaNotWithheld,
     ArenaInstall,
@@ -76,6 +76,8 @@ pub(crate) enum QemuPersistentBootError {
     AtaJournalRead,
     CatalogBindingMismatch,
     AnchorBinding,
+    RecoveryCore(CoreError),
+    RecoveryCheckpoint,
     Recovery,
 }
 
@@ -209,17 +211,21 @@ where
             anchor,
             AlreadyQuarantined::new(self.guard),
         )
-        .map_err(|_| QemuPersistentBootError::Recovery)
+        .map_err(|error| match error {
+            BootRecoveryError::Core(error) => QemuPersistentBootError::RecoveryCore(error),
+            BootRecoveryError::Checkpoint(_) => QemuPersistentBootError::RecoveryCheckpoint,
+            _ => QemuPersistentBootError::Recovery,
+        })
     }
 }
 
-/// Returns whether the prepared journal is a legacy v5 stream.  Kept here so
+/// Returns whether the prepared journal is a legacy schema-8 stream.  Kept here so
 /// production can preserve its explicit migration diagnostic while experiments
 /// still share all acquisition/recovery machinery.
-pub(crate) fn is_legacy_schema5(bytes: &[u8]) -> bool {
+pub(crate) fn is_legacy_schema8(bytes: &[u8]) -> bool {
     matches!(
         scan_journal(bytes),
-        Err(cser_core::JournalDecodeError::UnsupportedVersion { version: 5 })
+        Err(cser_core::JournalDecodeError::UnsupportedVersion { version: 8 })
     )
 }
 

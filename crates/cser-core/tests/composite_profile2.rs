@@ -19,21 +19,32 @@ use cser_core::{
     REPLY_RECEIPT_SCHEMA, REPLY_SETTLEMENT_RECEIPT_SCHEMA, REPLY_VERIFIER, ReceiptBinding,
     ReceiptSchemaId, RecoveryAnchor, ResourceId, RetirementState, RootRecoveryState,
     SettlementState, TransitionDurability, TransitionEvent, TransitionOutput, TransitionResult,
-    TxError, VerifierId, scan_journal, standard_catalog,
+    TxError, VerifierId, WorldId, scan_journal, standard_catalog,
 };
 use proptest::prelude::*;
 use support::{
-    ExactTestVerifier, Harness, TestReceipt, charge, claim, digest, effect, freshness, principal,
-    resource, resource_generation, snapshot, verified_apply_completion, verified_commit_outcome,
-    verified_settlement_ack,
+    ExactTestVerifier, Harness, TestReceipt, charge, claim, digest, effect, freshness,
+    genesis_projection, principal, recovery_anchor, resource, resource_generation, snapshot,
+    verified_apply_completion, verified_commit_outcome, verified_settlement_ack,
 };
 
 const MAIN_ROOT: u64 = 0xc501;
 const SEED_ROOT: u64 = 0xd001;
 
+fn anchor(engine: &Engine, committed: Freshness, next: Freshness) -> RecoveryAnchor {
+    recovery_anchor(
+        standard_catalog().digest(),
+        committed,
+        next,
+        engine.revision(),
+        engine.head(),
+        engine.projection_digest(),
+    )
+}
+
 #[test]
 fn profile2_receipt_journal_and_snapshot_are_self_describing() {
-    let mut harness = Harness::new_profile_two();
+    let mut harness = Harness::new();
     let operation = effect(MAIN_ROOT, 1);
     let origin = principal(MAIN_ROOT, 1);
     let create = Command::CreateCompositeEffect {
@@ -43,9 +54,9 @@ fn profile2_receipt_journal_and_snapshot_are_self_describing() {
         kind: AGENT_OPERATION_COMPOSITE,
         charge_account: charge(MAIN_ROOT),
     };
-    assert!(create.is_profile_two_compatible());
+    assert!(!create.is_profile_two_compatible());
     let authorized: AuthorizedCommand = create.clone().into();
-    assert!(authorized.is_profile_two_compatible());
+    assert!(!authorized.is_profile_two_compatible());
 
     let receipt = harness.tx(create).unwrap();
     assert_eq!(receipt.core_api_profile(), JOURNAL_CORE_API_PROFILE);
@@ -109,7 +120,7 @@ fn profile2_receipt_journal_and_snapshot_are_self_describing() {
 
 #[test]
 fn profile2_recovery_snapshot_exposes_exact_partial_dma_claim_evidence() {
-    let mut harness = Harness::new_profile_two();
+    let mut harness = Harness::new();
     let operation = effect(0xc502, 1);
     let origin = principal(0xc502, 1);
     let reply_claim = claim(1);
@@ -247,7 +258,7 @@ fn profile2_recovery_snapshot_exposes_exact_partial_dma_claim_evidence() {
 
 #[test]
 fn recovery_checkpoint_preserves_an_already_durable_same_boot_fence() {
-    let mut harness = Harness::new_profile_two();
+    let mut harness = Harness::new();
     let operation = effect(0xc503, 1);
     let origin = principal(0xc503, 1);
     harness
@@ -269,15 +280,8 @@ fn recovery_checkpoint_preserves_an_already_durable_same_boot_fence() {
 
     let committed_freshness = harness.engine.freshness();
     let next_freshness = freshness(2, 1, 1, 1, 2);
-    let anchor = RecoveryAnchor::from_trusted_provider(
-        standard_catalog().digest(),
-        committed_freshness,
-        next_freshness,
-        harness.engine.revision(),
-        harness.engine.head(),
-    )
-    .unwrap();
-    let mut recovered = Engine::recover(
+    let anchor = anchor(&harness.engine, committed_freshness, next_freshness);
+    let mut recovered = Engine::recover_legacy_compatibility(
         standard_catalog(),
         CoreLimits::bounded_default(),
         anchor,
@@ -325,7 +329,7 @@ fn recovery_checkpoint_preserves_an_already_durable_same_boot_fence() {
 
 #[test]
 fn outstanding_component_commit_intents_track_acknowledgements_across_cold_recovery() {
-    let mut harness = Harness::new_profile_two();
+    let mut harness = Harness::new();
     let (operation, origin, _, _) = create_precommit_agent(&mut harness, 0xc504);
     let unknown = effect(0xc505, 1);
 
@@ -428,14 +432,11 @@ fn profile2_rejects_legacy_commands_before_transition_and_replay() {
 
     let mut legacy = Harness::new();
     legacy.tx(legacy_command).unwrap();
-    let anchor = RecoveryAnchor::from_trusted_provider(
-        standard_catalog().digest(),
+    let anchor = anchor(
+        &legacy.engine,
         freshness(1, 1, 1, 1, 1),
         freshness(2, 1, 1, 1, 2),
-        legacy.engine.revision(),
-        legacy.engine.head(),
-    )
-    .unwrap();
+    );
     assert!(matches!(
         Engine::recover(
             standard_catalog(),
@@ -499,7 +500,8 @@ fn composite_adoption_requires_every_component_catalog_policy() {
         .build()
         .unwrap();
     let mut harness = Harness {
-        engine: Engine::new(
+        engine: Engine::new_scoped_legacy_compatibility(
+            WorldId::new(1).unwrap(),
             catalog.clone(),
             CoreLimits::bounded_default(),
             freshness(1, 1, 1, 1, 1),
@@ -594,7 +596,8 @@ fn composite_adoption_requires_every_component_catalog_policy() {
     assert_eq!(projection.custodian, CustodyState::KernelEstate);
 
     let mut original_owner = Harness {
-        engine: Engine::new(
+        engine: Engine::new_scoped_legacy_compatibility(
+            WorldId::new(1).unwrap(),
             catalog,
             CoreLimits::bounded_default(),
             freshness(1, 1, 1, 1, 1),
@@ -647,7 +650,7 @@ fn composite_adoption_requires_every_component_catalog_policy() {
 
 #[test]
 fn profile_two_rejects_a_second_live_claim_for_one_resource_id() {
-    let mut harness = Harness::new_profile_two();
+    let mut harness = Harness::new();
     let operation = effect(0xcf03, 1);
     let owner = principal(0xcf03, 1);
     let shared_resource = resource(0xcf03);
@@ -1168,7 +1171,7 @@ fn pending_dma_quiescence_release(
 
 #[test]
 fn composite_prepare_is_atomic_across_heterogeneous_components() {
-    let mut harness = Harness::new_profile_two();
+    let mut harness = Harness::new();
     let effect = effect(0xca01, 1);
     let origin = principal(0xca01, 1);
     harness
@@ -1277,7 +1280,7 @@ fn composite_prepare_is_atomic_across_heterogeneous_components() {
 
 #[test]
 fn composite_profile2_reuses_one_resource_and_replays_the_complete_projection() {
-    let mut harness = Harness::new_profile_two();
+    let mut harness = Harness::new();
     let queue_resource = seed_retired_queue(&mut harness);
     let effect = effect(MAIN_ROOT, 1);
     let origin = principal(MAIN_ROOT, 1);
@@ -1805,16 +1808,16 @@ fn composite_profile2_reuses_one_resource_and_replays_the_complete_projection() 
     let revision = harness.engine.revision();
     let head = harness.engine.head();
     let recovery_anchor = || {
-        RecoveryAnchor::from_trusted_provider(
+        recovery_anchor(
             standard_catalog().digest(),
             freshness(1, 1, 1, 1, 1),
             freshness(2, 1, 1, 3, 2),
             revision,
             head,
+            pre_recovery_projection_digest,
         )
-        .unwrap()
     };
-    let report = Engine::recover(
+    let report = Engine::recover_legacy_compatibility(
         standard_catalog(),
         CoreLimits::bounded_default(),
         recovery_anchor(),
@@ -1825,11 +1828,11 @@ fn composite_profile2_reuses_one_resource_and_replays_the_complete_projection() 
     assert_eq!(report.acknowledged_head(), head);
     let recovered = report.into_engine();
     let recovered_projection_digest = recovered.projection_digest();
-    assert_ne!(
+    assert_eq!(
         recovered_projection_digest, pre_recovery_projection_digest,
-        "the pending fresh recovery target is part of projection v6"
+        "the transient recovery overlay retains the trusted base projection until checkpoint"
     );
-    let replayed_again = Engine::recover(
+    let replayed_again = Engine::recover_legacy_compatibility(
         standard_catalog(),
         CoreLimits::bounded_default(),
         recovery_anchor(),
@@ -1870,7 +1873,7 @@ fn composite_profile2_reuses_one_resource_and_replays_the_complete_projection() 
 
 #[test]
 fn dma_only_profile2_operation_reuses_a_retired_composite_resource() {
-    let mut harness = Harness::new_profile_two();
+    let mut harness = Harness::new();
     let origin = principal(MAIN_ROOT, 1);
     let original = effect(MAIN_ROOT, 1);
     let reuse = effect(MAIN_ROOT, 2);
@@ -2094,16 +2097,16 @@ fn replay_profile_two_prefix(harness: &Harness, label: &str) -> Engine {
     let revision = harness.engine.revision();
     let head = harness.engine.head();
     let anchor = || {
-        RecoveryAnchor::from_trusted_provider(
+        recovery_anchor(
             standard_catalog().digest(),
             freshness(1, 1, 1, 1, 1),
             freshness(2, 1, 1, 99, 2),
             revision,
             head,
+            harness.engine.projection_digest(),
         )
-        .unwrap()
     };
-    let recovered = Engine::recover(
+    let recovered = Engine::recover_legacy_compatibility(
         standard_catalog(),
         CoreLimits::bounded_default(),
         anchor(),
@@ -2114,7 +2117,7 @@ fn replay_profile_two_prefix(harness: &Harness, label: &str) -> Engine {
     assert_eq!(recovered.acknowledged_head(), head, "{label}");
     let recovered = recovered.into_engine();
     let recovered_projection_digest = recovered.projection_digest();
-    let replayed_again = Engine::recover(
+    let replayed_again = Engine::recover_legacy_compatibility(
         standard_catalog(),
         CoreLimits::bounded_default(),
         anchor(),
@@ -2130,7 +2133,7 @@ fn replay_profile_two_prefix(harness: &Harness, label: &str) -> Engine {
 }
 
 fn adopted_profile_two_fixture(root: u64) -> AdoptedProfileTwoFixture {
-    let mut harness = Harness::new_profile_two();
+    let mut harness = Harness::new();
     let reusable_queue = seed_retired_queue(&mut harness);
     let effect = effect(root, 1);
     let origin = principal(root, 1);
@@ -2413,6 +2416,30 @@ fn profile2_activation_persist_failure_replays_the_ambiguous_generation_plus_one
         TransitionOutput::ReusePermit(permit) => permit,
         other => panic!("expected reusable queue permit, got {other:?}"),
     };
+    let mut expected_fixture = adopted_profile_two_fixture(0xcb21);
+    let expected_permit = match expected_fixture
+        .harness
+        .output(Command::ReserveComponentReuse {
+            effect: expected_fixture.effect,
+            component: AGENT_COMPONENT_DMA,
+            actor: expected_fixture.successor,
+            binding_generation: 2,
+            claim: reuse_claim,
+            kind: DEVICE_CLAIM_QUEUE_SLOT,
+            scope: ClaimScope::Device(device_scope()),
+            resource: expected_fixture.reusable_queue,
+            expected_generation: resource_generation(1),
+            units: 1,
+            reuse_contract: digest(240),
+        }) {
+        TransitionOutput::ReusePermit(permit) => permit,
+        other => panic!("expected reusable queue permit, got {other:?}"),
+    };
+    expected_fixture
+        .harness
+        .tx(expected_permit.activate())
+        .unwrap();
+    let expected_projection = expected_fixture.harness.engine.projection_digest();
     let prefix_revision =
         replay_profile_two_prefix(&fixture.harness, "activation-persist-prefix").revision();
     let activation = permit.activate();
@@ -2428,15 +2455,15 @@ fn profile2_activation_persist_failure_replays_the_ambiguous_generation_plus_one
     fixture.harness.journal.extend_from_slice(&ambiguous_record);
     let activated_scan = scan_journal(&fixture.harness.journal).unwrap();
     let activated_record = activated_scan.records().last().unwrap();
-    let recovery_anchor = RecoveryAnchor::from_trusted_provider(
+    let recovery_anchor = recovery_anchor(
         standard_catalog().digest(),
         freshness(1, 1, 1, 1, 1),
         freshness(2, 1, 1, 99, 2),
         activated_record.revision(),
         activated_record.digest(),
-    )
-    .unwrap();
-    let recovered = Engine::recover(
+        expected_projection,
+    );
+    let recovered = Engine::recover_legacy_compatibility(
         standard_catalog(),
         CoreLimits::bounded_default(),
         recovery_anchor,
@@ -2520,15 +2547,12 @@ fn recover_checkpoint_and_adopt_precommit(
     successor: cser_core::PrincipalIncarnation,
     snapshot_value: u64,
 ) {
-    let anchor = RecoveryAnchor::from_trusted_provider(
-        standard_catalog().digest(),
+    let anchor = anchor(
+        &harness.engine,
         freshness(1, 1, 1, 1, 1),
         freshness(2, 1, 1, 2, 2),
-        harness.engine.revision(),
-        harness.engine.head(),
-    )
-    .unwrap();
-    harness.engine = Engine::recover(
+    );
+    harness.engine = Engine::recover_legacy_compatibility(
         standard_catalog(),
         CoreLimits::bounded_default(),
         anchor,
@@ -2599,7 +2623,7 @@ fn recover_checkpoint_and_adopt_precommit(
 
 #[test]
 fn adopted_precommit_claim_rebase_clears_quarantine_and_replays_schema_six() {
-    let mut harness = Harness::new_profile_two();
+    let mut harness = Harness::new();
     let (operation, origin, reply_claim, queue_claim) =
         create_precommit_agent(&mut harness, 0xcd01);
     let successor = principal(0xcd01, 2);
@@ -2723,17 +2747,14 @@ fn adopted_precommit_claim_rebase_clears_quarantine_and_replays_schema_six() {
         before_duplicate
     );
 
-    let replay = Engine::recover(
+    let replay = Engine::recover_legacy_compatibility(
         standard_catalog(),
         CoreLimits::bounded_default(),
-        RecoveryAnchor::from_trusted_provider(
-            standard_catalog().digest(),
+        anchor(
+            &harness.engine,
             freshness(2, 1, 1, 2, 2),
             freshness(3, 1, 1, 2, 3),
-            harness.engine.revision(),
-            harness.engine.head(),
-        )
-        .unwrap(),
+        ),
         &harness.journal,
     )
     .unwrap()
@@ -2760,7 +2781,7 @@ fn adopted_precommit_claim_rebase_clears_quarantine_and_replays_schema_six() {
 
 #[test]
 fn pending_generation_plus_one_survives_rebase_for_explicit_reclaim_only() {
-    let mut harness = Harness::new_profile_two();
+    let mut harness = Harness::new();
     let queue = seed_retired_queue(&mut harness);
     let operation = effect(0xcd11, 1);
     let origin = principal(0xcd11, 1);
@@ -2876,7 +2897,7 @@ fn pending_generation_plus_one_survives_rebase_for_explicit_reclaim_only() {
 
 #[test]
 fn activated_generation_plus_one_remains_retained_across_precommit_rebase() {
-    let mut harness = Harness::new_profile_two();
+    let mut harness = Harness::new();
     let queue = seed_retired_queue(&mut harness);
     let operation = effect(0xcd21, 1);
     let origin = principal(0xcd21, 1);
@@ -2960,7 +2981,7 @@ fn activated_generation_plus_one_remains_retained_across_precommit_rebase() {
 
 #[test]
 fn escaped_claim_in_shared_device_scope_keeps_rebase_fail_closed() {
-    let mut harness = Harness::new_profile_two();
+    let mut harness = Harness::new();
     let root_value = 0xcd31;
     let origin = principal(root_value, 1);
     let blocker = effect(root_value, 1);
@@ -3134,14 +3155,14 @@ fn nonempty_profile1_journal_fails_closed_without_pairing_heuristics() {
         scan_journal(&profile_one),
         Err(JournalDecodeError::UnsupportedVersion { version: 5 })
     ));
-    let genesis_anchor = RecoveryAnchor::from_trusted_provider(
+    let genesis_anchor = recovery_anchor(
         standard_catalog().digest(),
         freshness(1, 1, 1, 1, 1),
         freshness(2, 1, 1, 1, 2),
         0,
         cser_core::Digest::ZERO,
-    )
-    .unwrap();
+        genesis_projection(),
+    );
     assert!(matches!(
         Engine::recover(
             standard_catalog(),
@@ -3154,11 +3175,20 @@ fn nonempty_profile1_journal_fails_closed_without_pairing_heuristics() {
         }))
     ));
     let anchor = RecoveryAnchor::from_trusted_provider(
-        standard_catalog().digest(),
+        recovery_anchor(
+            standard_catalog().digest(),
+            freshness(1, 1, 1, 1, 1),
+            freshness(2, 1, 1, 1, 2),
+            0,
+            cser_core::Digest::ZERO,
+            genesis_projection(),
+        )
+        .binding(),
         freshness(1, 1, 1, 1, 1),
         freshness(2, 1, 1, 1, 2),
         1,
         digest(99),
+        genesis_projection(),
     )
     .unwrap();
     assert!(matches!(
@@ -3229,6 +3259,7 @@ impl TransitionDurability for TestDurability {
         &mut self,
         _: &cser_core::JournalRecord,
         _: Freshness,
+        _: cser_core::Digest,
     ) -> Result<(), Self::Error> {
         self.calls += 1;
         if self.fail { Err(DiskFull) } else { Ok(()) }
@@ -3239,7 +3270,7 @@ impl TransitionDurability for TestDurability {
 /// releases it reaches the durability boundary.
 #[test]
 fn custody_release_is_not_observable_before_its_evidence_is_durable() {
-    let mut harness = Harness::new_profile_two();
+    let mut harness = Harness::new();
     let (effect, origin, claim_id, queue, final_evidence) =
         pending_dma_quiescence_release(&mut harness);
     assert_eq!(
@@ -3359,7 +3390,7 @@ fn custody_release_is_not_observable_before_its_evidence_is_durable() {
 /// callback fails.
 #[test]
 fn closure_persistence_failure_keeps_final_quiescence_release_unobservable() {
-    let mut harness = Harness::new_profile_two();
+    let mut harness = Harness::new();
     let (effect, _, _, queue, final_evidence) = pending_dma_quiescence_release(&mut harness);
     let before_claims = harness.engine.retained_component_claims();
     let before_charge = harness.engine.charge(charge(MAIN_ROOT), CREDIT_QUEUE_SLOT);
@@ -3401,7 +3432,7 @@ fn closure_persistence_failure_keeps_final_quiescence_release_unobservable() {
 /// success.
 #[test]
 fn final_quiescence_evidence_releases_custody_after_durable_success() {
-    let mut harness = Harness::new_profile_two();
+    let mut harness = Harness::new();
     let (effect, _, claim_id, queue, final_evidence) = pending_dma_quiescence_release(&mut harness);
     let mut persistence = TestDurability {
         fail: false,
@@ -3458,7 +3489,7 @@ fn final_quiescence_evidence_releases_custody_after_durable_success() {
 #[test]
 fn a_saturated_component_does_not_backpressure_its_sibling() {
     let limits = CoreLimits::new(8, 8, 16, 16, 8, 3, 8).unwrap();
-    let mut harness = Harness::profile_two_with_limits(limits);
+    let mut harness = Harness::with_limits(limits);
     let operation = effect(0xc5b0, 1);
     let origin = principal(0xc5b0, 1);
     let scope = device_scope();
@@ -3585,8 +3616,7 @@ fn a_saturated_component_does_not_backpressure_its_sibling() {
     // Paired headroom control for the rejected second queue claim. This keeps
     // the effect, account, component, class, and claim shape fixed while only
     // increasing the unit ceiling.
-    let mut headroom =
-        Harness::profile_two_with_limits(CoreLimits::new(8, 8, 16, 16, 8, 4, 8).unwrap());
+    let mut headroom = Harness::with_limits(CoreLimits::new(8, 8, 16, 16, 8, 4, 8).unwrap());
     let operation = effect(0xc5b2, 1);
     let origin = principal(0xc5b2, 1);
     headroom

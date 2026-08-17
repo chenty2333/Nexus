@@ -9,13 +9,19 @@
 
 use alloc::{
     sync::{Arc, Weak},
+    vec,
     vec::Vec,
 };
 use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use cser_core::{
-    Command, CommandRequest, CommitIntent, CoreError, Engine, TransitionDurability,
-    TransitionOutput, TransitionReceipt, TxError,
+    Command, CommandRequest, CommitIntent, ComponentProviderBinding, CoreError,
+    DEVICE_COMMIT_RECEIPT_SCHEMA, DEVICE_RECEIPT_SCHEMA, DEVICE_VERIFIER, Digest, EffectId, Engine,
+    OperationId, PrincipalIncarnation, ProviderCoordinate, ProviderGeneration,
+    ProviderGenerationProjection, ProviderId, REPLY_APPLY_RECEIPT_SCHEMA,
+    REPLY_COMMIT_RECEIPT_SCHEMA, REPLY_RECEIPT_SCHEMA, REPLY_SETTLEMENT_RECEIPT_SCHEMA,
+    REPLY_VERIFIER, TransitionDurability, TransitionOutput, TransitionReceipt, TxError,
+    VerifierBinding, VerifierGeneration, WorldId,
 };
 use ostd::{sync::Mutex, task::Task};
 
@@ -31,6 +37,115 @@ const MAX_LINEAR_PORTAL_BEARERS: usize = 8;
 const INGRESS_CLOSED: u8 = 0;
 const INGRESS_INSTALLING: u8 = 1;
 const INGRESS_OPEN: u8 = 2;
+
+/// Semantic world used by the production persistent CSER owner.
+///
+/// This is deliberately an explicit world coordinate rather than an inferred
+/// or boot-local value.  Recovery bindings and every standard provider
+/// generation must agree on this exact world.
+pub(crate) const PRODUCTION_WORLD: WorldId = match WorldId::new(1) {
+    Ok(value) => value,
+    Err(_) => unreachable!(),
+};
+
+/// Stable provider identity for the standard reply adapter.
+pub(crate) const STANDARD_REPLY_PROVIDER_ID: ProviderId = match ProviderId::new(1) {
+    Ok(value) => value,
+    Err(_) => unreachable!(),
+};
+
+/// Stable provider identity for the standard DMA adapter.
+pub(crate) const STANDARD_DMA_PROVIDER_ID: ProviderId = match ProviderId::new(2) {
+    Ok(value) => value,
+    Err(_) => unreachable!(),
+};
+
+/// The first explicitly registered generation of the standard providers.
+pub(crate) const STANDARD_PROVIDER_GENERATION: ProviderGeneration = match ProviderGeneration::new(1)
+{
+    Ok(value) => value,
+    Err(_) => unreachable!(),
+};
+
+/// Exact world/provider/generation coordinate for reply publication.
+pub(crate) const STANDARD_REPLY_PROVIDER: ProviderCoordinate = ProviderCoordinate::new(
+    PRODUCTION_WORLD,
+    STANDARD_REPLY_PROVIDER_ID,
+    STANDARD_PROVIDER_GENERATION,
+);
+
+/// Exact world/provider/generation coordinate for DMA publication.
+pub(crate) const STANDARD_DMA_PROVIDER: ProviderCoordinate = ProviderCoordinate::new(
+    PRODUCTION_WORLD,
+    STANDARD_DMA_PROVIDER_ID,
+    STANDARD_PROVIDER_GENERATION,
+);
+
+// The current reply and DMA adapters expose verifier classes and receipt
+// schemas, but their VerifierIdentity values do not yet expose an executable
+// implementation digest.  These non-zero, stable local identities bind the
+// registered catalog classes to those exact adapters without pretending that
+// the digest is an automatically derived epoch or a cryptographic code hash.
+pub(crate) const REPLY_RECEIPT_IMPLEMENTATION_DIGEST: Digest = Digest::new([0x51; 32]);
+pub(crate) const REPLY_COMMIT_IMPLEMENTATION_DIGEST: Digest = Digest::new([0x52; 32]);
+pub(crate) const REPLY_APPLY_IMPLEMENTATION_DIGEST: Digest = Digest::new([0x53; 32]);
+pub(crate) const REPLY_SETTLEMENT_IMPLEMENTATION_DIGEST: Digest = Digest::new([0x54; 32]);
+pub(crate) const DEVICE_RECEIPT_IMPLEMENTATION_DIGEST: Digest = Digest::new([0x61; 32]);
+pub(crate) const DEVICE_COMMIT_IMPLEMENTATION_DIGEST: Digest = Digest::new([0x62; 32]);
+
+/// Builds the exact verifier set required by the standard catalog.
+///
+/// The class/schema coordinates mirror the receipt and evidence rules in the
+/// catalog.  Each implementation identity is a stable embedding-owned
+/// binding to the corresponding production adapter; it is intentionally
+/// explicit because the adapters do not currently publish code digests.
+pub(crate) fn standard_verifier_bindings() -> Vec<VerifierBinding> {
+    let generation = VerifierGeneration::new(1).expect("standard verifier generation is non-zero");
+    vec![
+        VerifierBinding::new(
+            REPLY_VERIFIER,
+            generation,
+            REPLY_RECEIPT_SCHEMA,
+            REPLY_RECEIPT_IMPLEMENTATION_DIGEST,
+        )
+        .expect("reply receipt verifier binding is valid"),
+        VerifierBinding::new(
+            REPLY_VERIFIER,
+            generation,
+            REPLY_COMMIT_RECEIPT_SCHEMA,
+            REPLY_COMMIT_IMPLEMENTATION_DIGEST,
+        )
+        .expect("reply commit verifier binding is valid"),
+        VerifierBinding::new(
+            REPLY_VERIFIER,
+            generation,
+            REPLY_APPLY_RECEIPT_SCHEMA,
+            REPLY_APPLY_IMPLEMENTATION_DIGEST,
+        )
+        .expect("reply apply verifier binding is valid"),
+        VerifierBinding::new(
+            REPLY_VERIFIER,
+            generation,
+            REPLY_SETTLEMENT_RECEIPT_SCHEMA,
+            REPLY_SETTLEMENT_IMPLEMENTATION_DIGEST,
+        )
+        .expect("reply settlement verifier binding is valid"),
+        VerifierBinding::new(
+            DEVICE_VERIFIER,
+            generation,
+            DEVICE_RECEIPT_SCHEMA,
+            DEVICE_RECEIPT_IMPLEMENTATION_DIGEST,
+        )
+        .expect("device receipt verifier binding is valid"),
+        VerifierBinding::new(
+            DEVICE_VERIFIER,
+            generation,
+            DEVICE_COMMIT_RECEIPT_SCHEMA,
+            DEVICE_COMMIT_IMPLEMENTATION_DIGEST,
+        )
+        .expect("device commit verifier binding is valid"),
+    ]
+}
 
 /// Exact task/root binding admitted through the production portal.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -434,9 +549,72 @@ impl<S: InstalledCore> ProductionCoreOwner<S> {
         self.installed.transact(command)
     }
 
+    /// Registers one exact provider generation through the trusted owner path.
+    ///
+    /// Ordinary portal ingress never reaches this method: provider lifecycle
+    /// is reserved for the recovered owner/supervisor authority.
+    pub(crate) fn register_provider_generation(
+        &self,
+        coordinate: ProviderCoordinate,
+        catalog_digest: Digest,
+        verifier_bindings: Vec<VerifierBinding>,
+    ) -> Result<TransitionReceipt, TxError<S::PersistenceError>> {
+        self.transact_trusted(CommandRequest::RegisterProviderGeneration {
+            coordinate,
+            catalog_digest,
+            verifier_bindings,
+        })
+    }
+
+    /// Atomically admits one composite with a closed component/provider set.
+    ///
+    /// The operation identity is a stable [`OperationId`], independent of any
+    /// external commit-operation digest used later by reply or DMA adapters.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn admit_scoped_composite_effect(
+        &self,
+        effect: EffectId,
+        operation: OperationId,
+        origin: PrincipalIncarnation,
+        binding_generation: u64,
+        kind: cser_core::CompositeKindId,
+        charge_account: cser_core::ChargeAccountId,
+        bindings: Vec<ComponentProviderBinding>,
+    ) -> Result<TransitionReceipt, TxError<S::PersistenceError>> {
+        self.transact_trusted(CommandRequest::AdmitScopedCompositeEffect {
+            effect,
+            operation,
+            origin,
+            binding_generation,
+            kind,
+            charge_account,
+            bindings,
+        })
+    }
+
     /// Runs a provider or verifier observation under the authoritative lock.
     pub(crate) fn observe_engine<R>(&self, operation: impl FnOnce(&Engine) -> R) -> R {
         self.installed.observe(operation)
+    }
+
+    /// Observes one durable provider-generation projection under the owner
+    /// lock without granting lifecycle authority.
+    pub(crate) fn observe_provider_generation(
+        &self,
+        coordinate: ProviderCoordinate,
+    ) -> Option<ProviderGenerationProjection> {
+        self.installed
+            .observe(|engine| engine.provider_generation_projection(coordinate))
+    }
+
+    /// Trusted owner/supervisor projection query for the same exact record.
+    /// This is intentionally read-only; registration and lifecycle transitions
+    /// remain separate trusted commands above.
+    pub(crate) fn trusted_provider_generation(
+        &self,
+        coordinate: ProviderCoordinate,
+    ) -> Option<ProviderGenerationProjection> {
+        self.observe_provider_generation(coordinate)
     }
 }
 
@@ -447,6 +625,15 @@ impl<S: InstalledCore + 'static> CoreRegistry for ProductionCoreOwner<S> {
         if !request.is_profile_two_compatible() {
             return Err(ProductionRegistryError::ProfileOneCommandForbidden);
         }
+        if !matches!(
+            &request,
+            CommandRequest::AddComponentClaim { .. }
+                | CommandRequest::PrepareCompositeEffect { .. }
+                | CommandRequest::RecordComponentCommitIntent { .. }
+                | CommandRequest::RecordCompositeCommitIntents { .. }
+        ) {
+            return Err(ProductionRegistryError::TrustedPathRequired);
+        }
         let identity = self
             .authorize_current_ingress()
             .map_err(ProductionRegistryError::Ingress)?;
@@ -456,16 +643,6 @@ impl<S: InstalledCore + 'static> CoreRegistry for ProductionCoreOwner<S> {
             ));
         }
         let expected_intent = command_commit_intent_identity(&request);
-        if !matches!(
-            &request,
-            CommandRequest::CreateCompositeEffect { .. }
-                | CommandRequest::AddComponentClaim { .. }
-                | CommandRequest::PrepareCompositeEffect { .. }
-                | CommandRequest::RecordComponentCommitIntent { .. }
-                | CommandRequest::RecordCompositeCommitIntents { .. }
-        ) {
-            return Err(ProductionRegistryError::TrustedPathRequired);
-        }
 
         let mut custody = self.linear_custody.lock();
         if custody.len() == MAX_LINEAR_PORTAL_BEARERS {
@@ -558,12 +735,6 @@ impl<S: InstalledCore + 'static> CoreRegistry for ProductionCoreOwner<S> {
 
 fn command_ingress_identity(request: &CommandRequest) -> Option<ProductionIngressIdentity> {
     let (root, incarnation, binding_generation) = match request {
-        CommandRequest::CreateCompositeEffect {
-            effect,
-            origin,
-            binding_generation,
-            ..
-        } => (effect.root(), *origin, *binding_generation),
         CommandRequest::AddComponentClaim {
             effect,
             actor,

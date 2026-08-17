@@ -46,9 +46,9 @@ use core::{
 };
 
 use cser_core::{
-    BootGeneration, DeviceGeneration, Digest, Freshness, JournalGeneration,
-    PersistenceProtocolError, RecoveryBinding, RecoveryLease, RegistryInstance,
-    TrustedAnchorBackend, TrustedAnchorSnapshot,
+    AuthorityBindingGeneration, BootGeneration, DeviceGeneration, Digest, Freshness,
+    JournalGeneration, PersistenceProtocolError, RecoveryBinding, RecoveryLease, RecoveryProfile,
+    RegistryInstance, TrustedAnchorBackend, TrustedAnchorSnapshot, WorldId,
 };
 use ostd::{
     io::IoMem,
@@ -134,15 +134,37 @@ const DEFAULT_POLL_BUDGET: u32 = 20_000_000;
 // algorithm's 32-byte digest size.
 const MAX_INDEX_AUTH: usize = 32;
 
-const SLOT_MAGIC: [u8; 8] = *b"CSERTPM1";
-const SLOT_VERSION: u16 = 1;
+// vNext deliberately has no decoder path for the predecessor CSERTPM1
+// payload.  The magic and version both change so a stale slot is rejected
+// before any field is interpreted.
+const SLOT_MAGIC: [u8; 8] = *b"CSERTPM2";
+const SLOT_VERSION: u16 = 2;
 const SLOT_KIND_TIP: u8 = 1;
 const SLOT_KIND_LEASE: u8 = 2;
 const SLOT_PREFIX_LEN: usize = 20;
-const TIP_BODY_LEN: usize = 148;
+// prefix + RecoveryBinding (profile 8 + catalog 32 + world 8 + Registry 8
+// + authority binding 8) + Freshness (5 * u64) + revision + head + projection
+const TIP_BODY_LEN: usize = 196;
 const TIP_SLOT_LEN: usize = TIP_BODY_LEN + 32;
-const LEASE_BODY_LEN: usize = 108;
+const LEASE_BODY_LEN: usize = 124;
 const LEASE_SLOT_LEN: usize = LEASE_BODY_LEN + 32;
+
+// The OSTD fixture has one stable semantic world and one stable recovery
+// authority binding.  Genesis projection is the digest of
+// Engine::new(WorldId(1), standard_catalog(), bounded_default(),
+// Freshness(1, 1, 1, 1, 1)); the shell provisioner carries this exact fixed
+// value because it cannot instantiate the scoped Core engine itself.
+const OSTD_WORLD_ID: u64 = 1;
+const OSTD_AUTHORITY_BINDING_GENERATION: u64 = 1;
+const OSTD_REGISTRY_INSTANCE: u64 = 1;
+const OSTD_STANDARD_CATALOG_DIGEST: Digest = Digest::new([
+    0x07, 0x82, 0xc4, 0x85, 0x8f, 0x2a, 0x99, 0x78, 0x76, 0xa4, 0xbe, 0xe9, 0xba, 0x30, 0xeb, 0xf0,
+    0xca, 0xdf, 0x65, 0xd9, 0x9d, 0x93, 0xdc, 0xcc, 0x0d, 0x77, 0xc6, 0xa1, 0x58, 0x1c, 0xa8, 0xee,
+]);
+const OSTD_GENESIS_PROJECTION: Digest = Digest::new([
+    0x77, 0xc5, 0x77, 0x9d, 0x00, 0x60, 0x4b, 0xc6, 0xa6, 0xf7, 0xe6, 0x4a, 0x74, 0xc5, 0x62, 0x14,
+    0x3d, 0xb5, 0xa1, 0x83, 0x63, 0xf7, 0xca, 0x72, 0x7d, 0xa9, 0x99, 0x8f, 0x36, 0xa6, 0xcc, 0xf5,
+]);
 
 // TPM2 ordinary NV has no compare-and-swap command. The double-slot selector
 // protocol is atomic only under one writer, so construction acquires a
@@ -1031,7 +1053,7 @@ where
         let next = Freshness::new(
             next_boot,
             binding.registry(),
-            binding.binding(),
+            binding.binding().get(),
             observed_device,
             next_journal,
         )
@@ -1180,7 +1202,7 @@ fn validate_inspected_state<E>(
 ) -> Result<(), TpmNvAnchorError<E>> {
     if committed.binding() != lease_binding
         || issued.registry() != lease_binding.registry()
-        || issued.binding() != lease_binding.binding()
+        || issued.binding() != lease_binding.binding().get()
     {
         return Err(PersistenceProtocolError::BindingMismatch.into());
     }
@@ -1296,6 +1318,7 @@ fn encode_tip_slot(sequence: u64, snapshot: TrustedAnchorSnapshot) -> [u8; TIP_S
     encode_freshness(&mut bytes, &mut cursor, snapshot.committed_freshness());
     put_u64(&mut bytes, &mut cursor, snapshot.revision());
     put_bytes(&mut bytes, &mut cursor, &snapshot.head().bytes());
+    put_bytes(&mut bytes, &mut cursor, &snapshot.projection().bytes());
     debug_assert_eq!(cursor, TIP_BODY_LEN);
     finish_checksum(&mut bytes, TIP_BODY_LEN);
     bytes
@@ -1313,10 +1336,11 @@ fn decode_tip_slot(
     let freshness = decode_freshness(bytes, &mut cursor)?;
     let revision = take_u64(bytes, &mut cursor)?;
     let head = Digest::new(take_array::<32>(bytes, &mut cursor)?);
+    let projection = Digest::new(take_array::<32>(bytes, &mut cursor)?);
     if cursor != TIP_BODY_LEN {
         return None;
     }
-    TrustedAnchorSnapshot::from_trusted_backend(binding, freshness, revision, head).ok()
+    TrustedAnchorSnapshot::from_trusted_backend(binding, freshness, revision, head, projection).ok()
 }
 
 fn encode_lease_slot(
@@ -1347,7 +1371,7 @@ fn decode_lease_slot(
     let freshness = decode_freshness(bytes, &mut cursor)?;
     if cursor != LEASE_BODY_LEN
         || freshness.registry().get() != binding.registry().get()
-        || freshness.binding() != binding.binding()
+        || freshness.binding() != binding.binding().get()
     {
         return None;
     }
@@ -1388,16 +1412,30 @@ fn finish_checksum(bytes: &mut [u8], body_len: usize) {
 }
 
 fn encode_binding(bytes: &mut [u8], cursor: &mut usize, binding: RecoveryBinding) {
+    let profile = binding.profile();
+    put_u16(bytes, cursor, profile.core_api());
+    put_u16(bytes, cursor, profile.journal_schema());
+    put_u16(bytes, cursor, profile.projection_schema());
+    put_u16(bytes, cursor, profile.checkpoint_schema());
     put_bytes(bytes, cursor, &binding.catalog_digest().bytes());
+    put_u64(bytes, cursor, binding.world().get());
     put_u64(bytes, cursor, binding.registry().get());
-    put_u64(bytes, cursor, binding.binding());
+    put_u64(bytes, cursor, binding.binding().get());
 }
 
 fn decode_binding(bytes: &[u8], cursor: &mut usize) -> Option<RecoveryBinding> {
+    let profile = RecoveryProfile::new(
+        take_u16(bytes, cursor)?,
+        take_u16(bytes, cursor)?,
+        take_u16(bytes, cursor)?,
+        take_u16(bytes, cursor)?,
+    )
+    .ok()?;
     let catalog = Digest::new(take_array::<32>(bytes, cursor)?);
+    let world = WorldId::new(take_u64(bytes, cursor)?).ok()?;
     let registry = RegistryInstance::new(take_u64(bytes, cursor)?).ok()?;
-    let binding = take_u64(bytes, cursor)?;
-    RecoveryBinding::new(catalog, registry, binding).ok()
+    let binding = AuthorityBindingGeneration::new(take_u64(bytes, cursor)?).ok()?;
+    RecoveryBinding::new(profile, world, catalog, registry, binding).ok()
 }
 
 fn encode_freshness(bytes: &mut [u8], cursor: &mut usize, freshness: Freshness) {
@@ -1421,6 +1459,10 @@ fn put_u64(bytes: &mut [u8], cursor: &mut usize, value: u64) {
     put_bytes(bytes, cursor, &value.to_be_bytes());
 }
 
+fn put_u16(bytes: &mut [u8], cursor: &mut usize, value: u16) {
+    put_bytes(bytes, cursor, &value.to_be_bytes());
+}
+
 fn put_bytes(bytes: &mut [u8], cursor: &mut usize, value: &[u8]) {
     let end = cursor
         .checked_add(value.len())
@@ -1431,6 +1473,10 @@ fn put_bytes(bytes: &mut [u8], cursor: &mut usize, value: &[u8]) {
 
 fn take_u64(bytes: &[u8], cursor: &mut usize) -> Option<u64> {
     Some(u64::from_be_bytes(take_array::<8>(bytes, cursor)?))
+}
+
+fn take_u16(bytes: &[u8], cursor: &mut usize) -> Option<u16> {
+    Some(u16::from_be_bytes(take_array::<2>(bytes, cursor)?))
 }
 
 fn take_array<const N: usize>(bytes: &[u8], cursor: &mut usize) -> Option<[u8; N]> {
@@ -1928,10 +1974,20 @@ fn take_u32_response(input: &[u8], cursor: &mut usize) -> Result<u32, TisTpmErro
 /// evidence: the host can roll back swtpm's state directory, and this profile
 /// does not own a physical device.
 pub(crate) fn launch() -> ! {
+    assert_eq!(
+        cser_core::standard_catalog().digest(),
+        OSTD_STANDARD_CATALOG_DIGEST,
+        "update the fixed shell genesis projection when the standard catalog changes",
+    );
+    let profile = RecoveryProfile::current();
     let binding = RecoveryBinding::new(
-        Digest::new([0x42; 32]),
-        RegistryInstance::new(1).expect("fixture Registry identity is nonzero"),
-        1,
+        profile,
+        WorldId::new(OSTD_WORLD_ID).expect("fixture World identity is nonzero"),
+        OSTD_STANDARD_CATALOG_DIGEST,
+        RegistryInstance::new(OSTD_REGISTRY_INSTANCE)
+            .expect("fixture Registry identity is nonzero"),
+        AuthorityBindingGeneration::new(OSTD_AUTHORITY_BINDING_GENERATION)
+            .expect("fixture authority binding is nonzero"),
     )
     .expect("fixture recovery binding is valid");
     let transport =
@@ -1942,6 +1998,13 @@ pub(crate) fn launch() -> ! {
             .expect("pre-provisioned TPM2 NV anchor must validate");
 
     let before = anchor.committed();
+    if before.revision() == 0 {
+        assert_eq!(
+            before.projection(),
+            OSTD_GENESIS_PROJECTION,
+            "vNext genesis must be the scoped empty Engine projection",
+        );
+    }
     let observed_device = anchor.issued.device();
     let lease = anchor
         .reserve_recovery_epoch(binding, observed_device)
@@ -1956,11 +2019,16 @@ pub(crate) fn launch() -> ! {
     digest_input[40..48].copy_from_slice(&lease.next_freshness().boot().get().to_be_bytes());
     digest_input[48..56].copy_from_slice(&lease.next_freshness().journal().get().to_be_bytes());
     let next_head = Digest::new(Sha256::digest(digest_input).into());
+    let mut projection_input = [0; 64];
+    projection_input[..32].copy_from_slice(&next_head.bytes());
+    projection_input[32..].copy_from_slice(&OSTD_GENESIS_PROJECTION.bytes());
+    let next_projection = Digest::new(Sha256::digest(projection_input).into());
     let replacement = TrustedAnchorSnapshot::from_trusted_backend(
         binding,
         lease.next_freshness(),
         next_revision,
         next_head,
+        next_projection,
     )
     .expect("fixture replacement trusted tip is valid");
     anchor
@@ -2056,9 +2124,14 @@ mod tests {
                 );
             }
 
-            let genesis =
-                TrustedAnchorSnapshot::from_trusted_backend(binding, freshness, 0, Digest::ZERO)
-                    .unwrap();
+            let genesis = TrustedAnchorSnapshot::from_trusted_backend(
+                binding,
+                freshness,
+                0,
+                Digest::ZERO,
+                digest(6),
+            )
+            .unwrap();
             let tip_index = slot_for_sequence(layout.tip_slots, sequence);
             let tip = &mut entries.get_mut(&tip_index).unwrap();
             tip.bytes
@@ -2188,7 +2261,14 @@ mod tests {
     }
 
     fn binding() -> RecoveryBinding {
-        RecoveryBinding::new(digest(7), RegistryInstance::new(9).unwrap(), 11).unwrap()
+        RecoveryBinding::new(
+            RecoveryProfile::current(),
+            WorldId::new(7).unwrap(),
+            digest(7),
+            RegistryInstance::new(9).unwrap(),
+            AuthorityBindingGeneration::new(11).unwrap(),
+        )
+        .unwrap()
     }
 
     fn freshness(boot: u64, device: u64, journal: u64) -> Freshness {
@@ -2217,6 +2297,8 @@ mod tests {
         assert_eq!(candidate.issued(), observed_freshness);
 
         let expected_binding = RecoveryBinding::new(
+            RecoveryProfile::current(),
+            observed_binding.world(),
             digest(8),
             observed_binding.registry(),
             observed_binding.binding(),
@@ -2262,6 +2344,7 @@ mod tests {
             lease.next_freshness(),
             1,
             digest(13),
+            digest(13),
         )
         .unwrap();
         anchor
@@ -2292,6 +2375,7 @@ mod tests {
             lease.next_freshness(),
             before.revision() + 1,
             digest(14),
+            digest(14),
         )
         .unwrap();
         anchor
@@ -2315,6 +2399,7 @@ mod tests {
             binding(),
             old.committed_freshness(),
             1,
+            digest(17),
             digest(17),
         )
         .unwrap();
@@ -2342,6 +2427,7 @@ mod tests {
             binding(),
             old.committed_freshness(),
             1,
+            digest(19),
             digest(19),
         )
         .unwrap();
@@ -2372,12 +2458,44 @@ mod tests {
     }
 
     #[ktest]
+    fn predecessor_magic_is_rejected_even_with_a_valid_checksum() {
+        let snapshot = TrustedAnchorSnapshot::from_trusted_backend(
+            binding(),
+            freshness(1, 1, 1),
+            0,
+            Digest::ZERO,
+            digest(6),
+        )
+        .unwrap();
+        let mut encoded = encode_tip_slot(1, snapshot);
+        encoded[..8].copy_from_slice(b"CSERTPM1");
+        finish_checksum(&mut encoded, TIP_BODY_LEN);
+        assert_eq!(decode_tip_slot(&encoded, 1), None);
+    }
+
+    #[ktest]
+    fn tip_roundtrip_preserves_profile_scope_and_projection() {
+        let snapshot = TrustedAnchorSnapshot::from_trusted_backend(
+            binding(),
+            freshness(1, 1, 1),
+            7,
+            digest(13),
+            digest(14),
+        )
+        .unwrap();
+        let encoded = encode_tip_slot(9, snapshot);
+        assert_eq!(decode_tip_slot(&encoded, 9), Some(snapshot));
+    }
+
+    #[ktest]
     fn lease_from_different_catalog_fails_binding_validation() {
         let layout = TpmNvLayout::qemu_fixture();
         let expected_binding = binding();
         let issued = freshness(1, 1, 1);
         let mut transport = MockNv::provision(layout, 1, expected_binding, issued);
         let foreign_binding = RecoveryBinding::new(
+            RecoveryProfile::current(),
+            expected_binding.world(),
             digest(8),
             expected_binding.registry(),
             expected_binding.binding(),

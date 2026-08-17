@@ -3,13 +3,13 @@ mod support;
 
 use cser_core::{
     AuthorityState, CommandRequest as Command, CoreError, CustodyState, DEVICE_CLAIM_IOVA,
-    DEVICE_EVIDENCE_IOTLB, DEVICE_OBLIGATION_DMA, Engine, ExternalOutcome, RecoveryAnchor,
-    RetirementState, SettlementState, TransitionOutput, standard_catalog,
+    DEVICE_EVIDENCE_IOTLB, DEVICE_OBLIGATION_DMA, Engine, ExternalOutcome, RetirementState,
+    SettlementState, TransitionOutput, WorldId, standard_catalog,
 };
 use support::{
     Harness, charge, claim, committed_reply, current_evidence_command, digest, effect,
-    fence_and_rebind, freshness, principal, resource, snapshot, verified_commit_outcome,
-    verified_evidence_command,
+    fence_and_rebind, freshness, principal, recovery_anchor, resource, snapshot,
+    verified_commit_outcome, verified_evidence_command,
 };
 
 #[test]
@@ -448,7 +448,8 @@ fn resource_reverse_index_rejects_a_second_live_owner_in_either_order() {
 
 #[test]
 fn journal_records_and_recovery_preserve_nondefault_binding_freshness() {
-    let mut engine = Engine::new_legacy_compatibility(
+    let mut engine = Engine::new_scoped_legacy_compatibility(
+        WorldId::new(1).unwrap(),
         standard_catalog(),
         cser_core::CoreLimits::bounded_default(),
         freshness(1, 1, 7, 1, 1),
@@ -475,14 +476,14 @@ fn journal_records_and_recovery_preserve_nondefault_binding_freshness() {
     let recovered = Engine::recover_legacy_compatibility(
         standard_catalog(),
         cser_core::CoreLimits::bounded_default(),
-        RecoveryAnchor::from_trusted_provider(
+        recovery_anchor(
             standard_catalog().digest(),
             freshness(1, 1, 7, 1, 1),
             freshness(2, 1, 7, 1, 2),
             1,
             engine.head(),
-        )
-        .unwrap(),
+            engine.projection_digest(),
+        ),
         &journal,
     )
     .unwrap();

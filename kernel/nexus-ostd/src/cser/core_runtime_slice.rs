@@ -17,6 +17,7 @@
 
 use alloc::{
     sync::{Arc, Weak},
+    vec,
     vec::Vec,
 };
 use core::{
@@ -25,14 +26,19 @@ use core::{
 };
 
 use cser_core::{
-    AuthorityState, BootGeneration, ChargeAccountId, ClaimId, ClaimScope, CommandRequest,
-    CoreError, CoreLimits, Digest, EffectFactChallenge, EffectFactKind, EffectId,
-    EffectReceiptVerifier, ExternalOutcome, Freshness, JournalGeneration, JournalRecord,
-    OutcomeState, PrincipalId, PrincipalIncarnation, REPLY_CLAIM_PUBLICATION_SLOT,
-    REPLY_COMMIT_RECEIPT_SCHEMA, REPLY_DOMAIN, REPLY_OBLIGATION_PUBLICATION, REPLY_VERIFIER,
-    ReceiptSchemaId, RegistryInstance, ResourceGeneration, ResourceId, RetirementState, RootId,
-    SettlementClaim, SettlementState, SnapshotId, TransitionDurability, TransitionOutput,
-    TransitionReceipt, TxError, VerificationError, VerifiedEffectObservation, VerifierIdentity,
+    AGENT_COMPONENT_DMA, AGENT_COMPONENT_REPLY, AGENT_OPERATION_COMPOSITE, AuthorityState,
+    BootGeneration, ChargeAccountId, ClaimId, ClaimScope, CommandRequest, CommitState,
+    ComponentCommitOperation, ComponentProviderBinding, CoreError, CoreLimits,
+    DEVICE_CLAIM_QUEUE_SLOT, DEVICE_COMMIT_RECEIPT_SCHEMA, DEVICE_EVIDENCE_IRQ_DRAINED,
+    DEVICE_EVIDENCE_RESET, DEVICE_RECEIPT_SCHEMA, DEVICE_VERIFIER, DeviceGeneration, DeviceScopeId,
+    Digest, EffectFactChallenge, EffectFactKind, EffectId, EffectReceiptVerifier,
+    EvidenceChallenge, ExternalOutcome, Freshness, JournalGeneration, JournalRecord, OperationId,
+    OutcomeState, PrincipalId, PrincipalIncarnation, ProviderCoordinate, ProviderGeneration,
+    ProviderId, REPLY_CLAIM_PUBLICATION_SLOT, REPLY_COMMIT_RECEIPT_SCHEMA, REPLY_VERIFIER,
+    ReceiptSchemaId, ReceiptVerifier, RegistryInstance, ResourceGeneration, ResourceId,
+    RetirementState, RootId, SettlementClaim, SettlementState, SnapshotId, TransitionDurability,
+    TransitionOutput, TransitionReceipt, TxError, VerificationError, VerifiedEffectObservation,
+    VerifiedObservation, VerifierBinding, VerifierGeneration, VerifierIdentity, WorldId,
     standard_catalog,
 };
 use ostd::{
@@ -71,6 +77,7 @@ impl TransitionDurability for VolatileReplyDurability {
         &mut self,
         record: &JournalRecord,
         resulting_freshness: Freshness,
+        _resulting_projection: Digest,
     ) -> Result<(), Self::Error> {
         assert!(!record.bytes().is_empty());
         assert_ne!(resulting_freshness.boot().get(), 0);
@@ -241,15 +248,54 @@ struct ProbeEffectReceipt {
 }
 
 struct ProbeEffectVerifier {
-    schema: ReceiptSchemaId,
+    binding: VerifierBinding,
+}
+
+#[derive(Clone, Copy)]
+struct ProbeEvidenceReceipt {
+    challenge: EvidenceChallenge,
+    observation: Freshness,
+    digest: Digest,
+}
+
+struct ProbeEvidenceVerifier {
+    binding: VerifierBinding,
+}
+
+impl ReceiptVerifier for ProbeEvidenceVerifier {
+    type Receipt = ProbeEvidenceReceipt;
+
+    fn identity(&self) -> VerifierIdentity {
+        VerifierIdentity::new_exact(self.binding)
+    }
+
+    fn verify(
+        &self,
+        challenge: &EvidenceChallenge,
+        receipt: &Self::Receipt,
+    ) -> Result<VerifiedObservation, VerificationError> {
+        if *challenge != receipt.challenge
+            || challenge.expected_verifier_binding() != Some(self.binding)
+            || challenge
+                .verification_scope()
+                .is_none_or(|scope| scope.verifier_binding() != self.binding)
+            || receipt.digest.is_zero()
+        {
+            return Err(VerificationError::Rejected);
+        }
+        Ok(VerifiedObservation::new(
+            challenge.subject(),
+            receipt.observation,
+            receipt.digest,
+        ))
+    }
 }
 
 impl EffectReceiptVerifier for ProbeEffectVerifier {
     type Receipt = ProbeEffectReceipt;
 
     fn identity(&self) -> VerifierIdentity {
-        VerifierIdentity::new(REPLY_VERIFIER, 1, self.schema)
-            .expect("probe verifier identity is valid")
+        VerifierIdentity::new_exact(self.binding)
     }
 
     fn verify(
@@ -258,8 +304,12 @@ impl EffectReceiptVerifier for ProbeEffectVerifier {
         receipt: &Self::Receipt,
     ) -> Result<VerifiedEffectObservation, VerificationError> {
         if *challenge != receipt.challenge
-            || challenge.expected_verifier() != REPLY_VERIFIER
-            || challenge.expected_receipt_schema() != self.schema
+            || challenge.expected_verifier() != self.binding.verifier()
+            || challenge.expected_receipt_schema() != self.binding.receipt_schema()
+            || challenge.expected_verifier_binding() != Some(self.binding)
+            || challenge
+                .verification_scope()
+                .is_none_or(|scope| scope.verifier_binding() != self.binding)
             || receipt.digest.is_zero()
         {
             return Err(VerificationError::Rejected);
@@ -323,8 +373,9 @@ fn run_task_recovery_slice() {
     let root = root(1);
     let effect = effect(root, 1);
     let origin = principal(1, 1);
-    let coordinate = ReplyCoordinate::new(
+    let coordinate = ReplyCoordinate::new_component(
         effect,
+        AGENT_COMPONENT_REPLY,
         claim_id(root.get()),
         resource(root.get()),
         ResourceGeneration::new(1).expect("reply resource generation is valid"),
@@ -460,7 +511,12 @@ fn run_task_recovery_slice() {
     fence_and_snapshot(&runtime, root, first_successor, 2, snapshot(2));
     println!("CSER_CORE_REPLY_TRACE manager=successor-v2-fenced-snapshotted");
     assert!(matches!(
-        runtime.observe(|engine| engine.estate(effect).unwrap().settlement),
+        runtime.observe(|engine| {
+            engine
+                .component(effect, AGENT_COMPONENT_REPLY)
+                .expect("reply component survives the second crash")
+                .settlement
+        }),
         SettlementState::ReconciliationRequired {
             generation: 2,
             applied: false,
@@ -520,11 +576,30 @@ fn run_task_recovery_slice() {
 
     exercise_revoke_adopt_orders(&runtime);
 
-    let estate = runtime.observe(|engine| engine.estate(effect).expect("reply estate exists"));
-    assert_eq!(estate.authority, AuthorityState::Fenced);
-    assert_eq!(estate.outcome, OutcomeState::KnownSuccess(digest(11)));
-    assert_eq!(estate.settlement, SettlementState::Settled);
-    assert_eq!(estate.retirement, RetirementState::Retired);
+    let composite = runtime.observe(|engine| {
+        engine
+            .composite_effect(effect)
+            .expect("reply composite effect exists")
+    });
+    let reply_component = runtime.observe(|engine| {
+        engine
+            .component(effect, AGENT_COMPONENT_REPLY)
+            .expect("reply component exists")
+    });
+    let dma_component = runtime.observe(|engine| {
+        engine
+            .component(effect, AGENT_COMPONENT_DMA)
+            .expect("DMA component exists")
+    });
+    assert_eq!(composite.authority, AuthorityState::Fenced);
+    assert_eq!(
+        reply_component.outcome,
+        OutcomeState::KnownSuccess(digest(11))
+    );
+    assert_eq!(reply_component.settlement, SettlementState::Settled);
+    assert_eq!(reply_component.retirement, RetirementState::Retired);
+    assert_eq!(dma_component.commit, CommitState::Committed);
+    assert_eq!(dma_component.retirement, RetirementState::Retired);
     assert!(!inbox.rejected.load(Ordering::Acquire));
     assert!(!custody_inbox.rejected.load(Ordering::Acquire));
     assert!(!settlement_inbox.rejected.load(Ordering::Acquire));
@@ -539,7 +614,8 @@ fn run_task_recovery_slice() {
          revoke_adopt_orders=2 legacy_runtime=false live_dual_write=false \
          rebind=task-bound-core production_rebind=false \
          receipt_provider=commit-probe+physical-reply real_reply=true \
-         historical_profile=1 production_profile=false \
+         api_profile=5 production_profile=false scoped_providers=true \
+         exact_verifier_binding=true \
          journal=same-boot-memory durability_boundary=transition-trait \
          reboot_persistence=false"
     );
@@ -547,6 +623,7 @@ fn run_task_recovery_slice() {
 }
 
 fn cser_engine() -> cser_core::Engine {
+    let world = WorldId::new(1).expect("probe world is non-zero");
     let freshness = Freshness::new(
         BootGeneration::new(1).expect("probe boot generation is valid"),
         RegistryInstance::new(1).expect("probe Registry instance is valid"),
@@ -555,11 +632,105 @@ fn cser_engine() -> cser_core::Engine {
         JournalGeneration::new(1).expect("probe journal generation is valid"),
     )
     .expect("probe freshness is complete");
-    cser_core::Engine::new_legacy_compatibility(
-        standard_catalog(),
+    let catalog = standard_catalog();
+    let mut engine = cser_core::Engine::new(
+        world,
+        catalog.clone(),
         CoreLimits::bounded_default(),
         freshness,
+    );
+    let verifier_bindings = probe_verifier_bindings();
+    for provider in [provider_coordinate(world, 1), provider_coordinate(world, 2)] {
+        engine
+            .transact(
+                CommandRequest::RegisterProviderGeneration {
+                    coordinate: provider,
+                    catalog_digest: catalog.digest(),
+                    verifier_bindings: verifier_bindings.clone(),
+                },
+                |_| Ok::<(), Infallible>(()),
+            )
+            .expect("probe provider generation is valid");
+    }
+    engine
+}
+
+fn provider_coordinate(world: WorldId, provider: u64) -> ProviderCoordinate {
+    ProviderCoordinate::new(
+        world,
+        ProviderId::new(provider).expect("probe provider id is non-zero"),
+        ProviderGeneration::new(1).expect("probe provider generation is non-zero"),
     )
+}
+
+fn probe_verifier_bindings() -> Vec<VerifierBinding> {
+    let generation = VerifierGeneration::new(1).expect("probe verifier generation is non-zero");
+    vec![
+        VerifierBinding::new(
+            REPLY_VERIFIER,
+            generation,
+            cser_core::REPLY_RECEIPT_SCHEMA,
+            Digest::new([0x51; 32]),
+        )
+        .expect("probe reply receipt binding is valid"),
+        VerifierBinding::new(
+            REPLY_VERIFIER,
+            generation,
+            REPLY_COMMIT_RECEIPT_SCHEMA,
+            Digest::new([0x52; 32]),
+        )
+        .expect("probe reply commit binding is valid"),
+        VerifierBinding::new(
+            REPLY_VERIFIER,
+            generation,
+            cser_core::REPLY_APPLY_RECEIPT_SCHEMA,
+            Digest::new([0x53; 32]),
+        )
+        .expect("probe reply apply binding is valid"),
+        VerifierBinding::new(
+            REPLY_VERIFIER,
+            generation,
+            cser_core::REPLY_SETTLEMENT_RECEIPT_SCHEMA,
+            Digest::new([0x54; 32]),
+        )
+        .expect("probe reply settlement binding is valid"),
+        VerifierBinding::new(
+            DEVICE_VERIFIER,
+            generation,
+            DEVICE_RECEIPT_SCHEMA,
+            Digest::new([0x61; 32]),
+        )
+        .expect("probe device receipt binding is valid"),
+        VerifierBinding::new(
+            DEVICE_VERIFIER,
+            generation,
+            DEVICE_COMMIT_RECEIPT_SCHEMA,
+            Digest::new([0x62; 32]),
+        )
+        .expect("probe device commit binding is valid"),
+    ]
+}
+
+fn probe_verifier_binding(
+    verifier: cser_core::VerifierId,
+    schema: ReceiptSchemaId,
+) -> VerifierBinding {
+    let digest = match (verifier, schema) {
+        (REPLY_VERIFIER, cser_core::REPLY_RECEIPT_SCHEMA) => Digest::new([0x51; 32]),
+        (REPLY_VERIFIER, REPLY_COMMIT_RECEIPT_SCHEMA) => Digest::new([0x52; 32]),
+        (REPLY_VERIFIER, cser_core::REPLY_APPLY_RECEIPT_SCHEMA) => Digest::new([0x53; 32]),
+        (REPLY_VERIFIER, cser_core::REPLY_SETTLEMENT_RECEIPT_SCHEMA) => Digest::new([0x54; 32]),
+        (DEVICE_VERIFIER, DEVICE_RECEIPT_SCHEMA) => Digest::new([0x61; 32]),
+        (DEVICE_VERIFIER, DEVICE_COMMIT_RECEIPT_SCHEMA) => Digest::new([0x62; 32]),
+        _ => panic!("probe verifier binding is outside the standard catalog"),
+    };
+    VerifierBinding::new(
+        verifier,
+        VerifierGeneration::new(1).expect("probe verifier generation is non-zero"),
+        schema,
+        digest,
+    )
+    .expect("probe verifier binding is valid")
 }
 
 fn wait_for_reap(inbox: &ReapInbox) -> ReapObservation {
@@ -623,24 +794,35 @@ fn create_committed_reply(
 ) {
     tx(
         runtime,
-        CommandRequest::CreateEstate {
+        CommandRequest::AdmitScopedCompositeEffect {
             effect,
+            operation: OperationId::new(effect.root().get())
+                .expect("reply operation identity is valid"),
             origin,
             binding_generation,
-            domain: REPLY_DOMAIN,
-            obligation: REPLY_OBLIGATION_PUBLICATION,
+            kind: AGENT_OPERATION_COMPOSITE,
             charge_account: ChargeAccountId::new(effect.root().get())
                 .expect("reply charge account is valid"),
+            bindings: vec![
+                ComponentProviderBinding::new(
+                    AGENT_COMPONENT_REPLY,
+                    provider_coordinate(WorldId::new(1).expect("probe world is valid"), 1),
+                ),
+                ComponentProviderBinding::new(
+                    AGENT_COMPONENT_DMA,
+                    provider_coordinate(WorldId::new(1).expect("probe world is valid"), 2),
+                ),
+            ],
         },
     );
     tx(
         runtime,
-        CommandRequest::AddClaim {
+        CommandRequest::AddComponentClaim {
             effect,
+            component: AGENT_COMPONENT_REPLY,
             actor: origin,
             binding_generation,
             claim: claim_id(effect.root().get()),
-            domain: REPLY_DOMAIN,
             kind: REPLY_CLAIM_PUBLICATION_SLOT,
             scope: ClaimScope::Logical,
             resource: resource(effect.root().get()),
@@ -649,50 +831,170 @@ fn create_committed_reply(
             units: 1,
         },
     );
+    let dma_claim = claim_id(
+        effect
+            .root()
+            .get()
+            .checked_add(1_000)
+            .expect("probe DMA claim identity is bounded"),
+    );
     tx(
         runtime,
-        CommandRequest::PrepareEffect {
+        CommandRequest::AddComponentClaim {
+            effect,
+            component: AGENT_COMPONENT_DMA,
+            actor: origin,
+            binding_generation,
+            claim: dma_claim,
+            kind: DEVICE_CLAIM_QUEUE_SLOT,
+            scope: ClaimScope::Device(
+                DeviceScopeId::new(1).expect("probe DMA device scope is valid"),
+            ),
+            resource: resource(
+                effect
+                    .root()
+                    .get()
+                    .checked_add(2_000)
+                    .expect("probe DMA resource identity is bounded"),
+            ),
+            resource_generation: ResourceGeneration::new(1)
+                .expect("probe DMA resource generation is valid"),
+            units: 1,
+        },
+    );
+    tx(
+        runtime,
+        CommandRequest::PrepareCompositeEffect {
             effect,
             actor: origin,
             binding_generation,
         },
     );
-    let intent = output(
+    let output = output(
         runtime,
-        CommandRequest::RecordCommitIntent {
+        CommandRequest::RecordCompositeCommitIntents {
             effect,
             actor: origin,
             binding_generation,
-            operation: digest(10),
+            operations: vec![
+                ComponentCommitOperation::new(AGENT_COMPONENT_REPLY, digest(10)),
+                ComponentCommitOperation::new(AGENT_COMPONENT_DMA, digest(12)),
+            ],
         },
     );
-    let TransitionOutput::CommitIntent(intent) = intent else {
-        panic!("reply commit intent transition returned the wrong authority");
+    let TransitionOutput::CompositeCommitIntents(intents) = output else {
+        panic!("reply composite commit intents returned the wrong authority");
     };
-    let challenge = runtime.observe(|engine| {
+    assert_eq!(intents.len(), 2);
+    for intent in intents {
+        let (binding, receipt_digest) = match intent.component() {
+            Some(component) if component == AGENT_COMPONENT_REPLY => (
+                probe_verifier_binding(REPLY_VERIFIER, REPLY_COMMIT_RECEIPT_SCHEMA),
+                digest(11),
+            ),
+            Some(component) if component == AGENT_COMPONENT_DMA => (
+                probe_verifier_binding(DEVICE_VERIFIER, DEVICE_COMMIT_RECEIPT_SCHEMA),
+                digest(13),
+            ),
+            _ => panic!("reply composite commit intent has an unknown component"),
+        };
+        let challenge = runtime.observe(|engine| {
+            engine
+                .commit_outcome_challenge(&intent)
+                .expect("component commit outcome challenge is available")
+        });
+        let verifier = ProbeEffectVerifier { binding };
+        let receipt = ProbeEffectReceipt {
+            challenge,
+            digest: receipt_digest,
+            outcome: Some(ExternalOutcome::Success),
+        };
+        let outcome = runtime.observe(|engine| {
+            engine
+                .verify_commit_outcome(&intent, &verifier, &receipt)
+                .expect("scoped component commit receipt verifies")
+        });
+        tx(
+            runtime,
+            intent
+                .acknowledge(outcome)
+                .expect("verified component commit outcome matches the intent"),
+        );
+    }
+    retire_probe_dma_claim(runtime, effect, dma_claim);
+}
+
+fn retire_probe_dma_claim(runtime: &SpikeRuntime, effect: EffectId, claim: ClaimId) {
+    let binding = probe_verifier_binding(DEVICE_VERIFIER, DEVICE_RECEIPT_SCHEMA);
+    let verifier = ProbeEvidenceVerifier { binding };
+    let reset_challenge = runtime.observe(|engine| {
         engine
-            .commit_outcome_challenge(&intent)
-            .expect("commit outcome challenge is available")
+            .component_evidence_challenge(effect, AGENT_COMPONENT_DMA, claim, DEVICE_EVIDENCE_RESET)
+            .expect("probe DMA reset challenge is available")
     });
-    let verifier = ProbeEffectVerifier {
-        schema: REPLY_COMMIT_RECEIPT_SCHEMA,
+    let current = reset_challenge.current_observation();
+    let reset_observation = Freshness::new(
+        current.boot(),
+        current.registry(),
+        current.binding(),
+        DeviceGeneration::new(
+            current
+                .device()
+                .get()
+                .checked_add(1)
+                .expect("probe device generation is bounded"),
+        )
+        .expect("probe device generation advances"),
+        current.journal(),
+    )
+    .expect("probe reset observation is complete");
+    let reset_receipt = ProbeEvidenceReceipt {
+        challenge: reset_challenge,
+        observation: reset_observation,
+        digest: digest(14),
     };
-    let receipt = ProbeEffectReceipt {
-        challenge,
-        digest: digest(11),
-        outcome: Some(ExternalOutcome::Success),
-    };
-    let outcome = runtime.observe(|engine| {
+    let reset = runtime.observe(|engine| {
         engine
-            .verify_commit_outcome(&intent, &verifier, &receipt)
-            .expect("commit receipt verifies")
+            .verify_component_retirement_evidence(
+                effect,
+                AGENT_COMPONENT_DMA,
+                claim,
+                DEVICE_EVIDENCE_RESET,
+                &verifier,
+                &reset_receipt,
+            )
+            .expect("probe DMA reset evidence verifies")
     });
-    tx(
-        runtime,
-        intent
-            .acknowledge(outcome)
-            .expect("verified commit outcome matches the intent"),
-    );
+    tx(runtime, reset.submit());
+
+    let irq_challenge = runtime.observe(|engine| {
+        engine
+            .component_evidence_challenge(
+                effect,
+                AGENT_COMPONENT_DMA,
+                claim,
+                DEVICE_EVIDENCE_IRQ_DRAINED,
+            )
+            .expect("probe DMA IRQ-drain challenge is available")
+    });
+    let irq_receipt = ProbeEvidenceReceipt {
+        challenge: irq_challenge,
+        observation: irq_challenge.current_observation(),
+        digest: digest(15),
+    };
+    let irq = runtime.observe(|engine| {
+        engine
+            .verify_component_retirement_evidence(
+                effect,
+                AGENT_COMPONENT_DMA,
+                claim,
+                DEVICE_EVIDENCE_IRQ_DRAINED,
+                &verifier,
+                &irq_receipt,
+            )
+            .expect("probe DMA IRQ-drain evidence verifies")
+    });
+    tx(runtime, irq.submit());
 }
 
 fn record_settlement_intent(
@@ -704,8 +1006,9 @@ fn record_settlement_intent(
     let settlement = settlement_claim(
         output(
             runtime,
-            CommandRequest::ClaimSettlement {
+            CommandRequest::ClaimComponentSettlement {
                 effect,
+                component: AGENT_COMPONENT_REPLY,
                 claimant: successor,
             },
         ),
@@ -730,8 +1033,9 @@ fn claim_reconciliation(
     let settlement = settlement_claim(
         output(
             runtime,
-            CommandRequest::ClaimSettlement {
+            CommandRequest::ClaimComponentSettlement {
                 effect,
+                component: AGENT_COMPONENT_REPLY,
                 claimant: successor,
             },
         ),
@@ -816,8 +1120,8 @@ fn exercise_revoke_adopt_orders(runtime: &SpikeRuntime) {
     );
     let revoke_epoch = runtime.observe(|engine| {
         engine
-            .estate(revoke_effect)
-            .expect("revoke-race estate exists")
+            .composite_effect(revoke_effect)
+            .expect("revoke-race composite exists")
             .authority_epoch
     });
     tx(
@@ -851,8 +1155,8 @@ fn exercise_revoke_adopt_orders(runtime: &SpikeRuntime) {
     );
     let stale_epoch = runtime.observe(|engine| {
         engine
-            .estate(adopt_effect)
-            .expect("adopt-race estate exists")
+            .composite_effect(adopt_effect)
+            .expect("adopt-race composite exists")
             .authority_epoch
     });
     tx(
@@ -877,14 +1181,25 @@ fn exercise_revoke_adopt_orders(runtime: &SpikeRuntime) {
 fn create_registered_reply(runtime: &SpikeRuntime, effect: EffectId, origin: PrincipalIncarnation) {
     tx(
         runtime,
-        CommandRequest::CreateEstate {
+        CommandRequest::AdmitScopedCompositeEffect {
             effect,
+            operation: OperationId::new(effect.root().get())
+                .expect("race operation identity is valid"),
             origin,
             binding_generation: 1,
-            domain: REPLY_DOMAIN,
-            obligation: REPLY_OBLIGATION_PUBLICATION,
+            kind: AGENT_OPERATION_COMPOSITE,
             charge_account: ChargeAccountId::new(effect.root().get())
                 .expect("race charge account is valid"),
+            bindings: vec![
+                ComponentProviderBinding::new(
+                    AGENT_COMPONENT_REPLY,
+                    provider_coordinate(WorldId::new(1).expect("probe world is valid"), 1),
+                ),
+                ComponentProviderBinding::new(
+                    AGENT_COMPONENT_DMA,
+                    provider_coordinate(WorldId::new(1).expect("probe world is valid"), 2),
+                ),
+            ],
         },
     );
 }

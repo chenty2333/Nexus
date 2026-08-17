@@ -429,14 +429,27 @@ mod tests {
     }
 
     fn record(base_revision: u64, predecessor: Digest) -> JournalRecord {
-        JournalRecord::build(
-            base_revision,
+        let freshness = crate::Freshness::new(
             BootGeneration::new(1).unwrap(),
             RegistryInstance::new(1).unwrap(),
             1,
-            JournalGeneration::new(1).unwrap(),
             DeviceGeneration::new(1).unwrap(),
+            JournalGeneration::new(1).unwrap(),
+        )
+        .unwrap();
+        let binding = crate::RecoveryBinding::new(
+            crate::RecoveryProfile::current(),
+            crate::WorldId::new(1).unwrap(),
             digest(9),
+            RegistryInstance::new(1).unwrap(),
+            crate::AuthorityBindingGeneration::new(1).unwrap(),
+        )
+        .unwrap();
+        JournalRecord::build(
+            base_revision,
+            freshness,
+            binding,
+            digest(7),
             predecessor,
             CommandKind::CheckpointRecovery {
                 boot: BootGeneration::new(2).unwrap(),

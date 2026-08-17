@@ -13,17 +13,17 @@ use std::{
 };
 
 use cser_core::{
-    ClaimScope, CommandRequest as Command, CoordinatedPersistence, CoreError, CoreLimits,
-    DEVICE_CLAIM_IOVA, DEVICE_DOMAIN, DEVICE_EVIDENCE_IOTLB, DEVICE_EVIDENCE_RESET,
-    DEVICE_OBLIGATION_DMA, DEVICE_RECEIPT_SCHEMA, DEVICE_VERIFIER, DeviceGeneration,
-    DurableJournalBackend, Engine, Freshness, JournalRepair, ReceiptBinding, RecoveryBinding,
-    RecoveryLease, TransitionOutput, TrustedAnchorBackend, TrustedAnchorSnapshot, TxError,
-    standard_catalog,
+    AuthorityBindingGeneration, ClaimScope, CommandRequest as Command, CoordinatedPersistence,
+    CoreError, CoreLimits, DEVICE_CLAIM_IOVA, DEVICE_DOMAIN, DEVICE_EVIDENCE_IOTLB,
+    DEVICE_EVIDENCE_RESET, DEVICE_OBLIGATION_DMA, DEVICE_RECEIPT_SCHEMA, DEVICE_VERIFIER,
+    DeviceGeneration, DurableJournalBackend, Engine, Freshness, JournalRepair, ReceiptBinding,
+    RecoveryBinding, RecoveryLease, RecoveryProfile, TransitionOutput, TrustedAnchorBackend,
+    TrustedAnchorSnapshot, TxError, WorldId, standard_catalog,
     std_support::{FileJournal, HostAnchorFailpoint, HostFileTrustedAnchor},
 };
 use support::{
-    ExactTestVerifier, TestReceipt, charge, claim, digest, effect, freshness, principal, resource,
-    resource_generation,
+    ExactTestVerifier, TestReceipt, charge, claim, digest, effect, freshness, genesis_projection,
+    principal, recovery_binding, resource, resource_generation,
 };
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(1);
@@ -61,16 +61,17 @@ impl Drop for TempStore {
 }
 
 fn binding() -> RecoveryBinding {
-    RecoveryBinding::new(
-        standard_catalog().digest(),
-        freshness(1, 1, 1, 1, 1).registry(),
-        1,
-    )
-    .unwrap()
+    recovery_binding(standard_catalog().digest(), freshness(1, 1, 1, 1, 1))
 }
 
 fn open_anchor(path: &Path) -> HostFileTrustedAnchor {
-    HostFileTrustedAnchor::open_or_initialize(path, binding(), freshness(1, 1, 1, 1, 1)).unwrap()
+    HostFileTrustedAnchor::open_or_initialize(
+        path,
+        binding(),
+        freshness(1, 1, 1, 1, 1),
+        genesis_projection(),
+    )
+    .unwrap()
 }
 
 /// A test-only controller injects a storage failure without borrowing the
@@ -451,9 +452,11 @@ fn binding_device_and_journal_rollback_fail_closed() {
             .is_err()
     );
     let wrong_binding = RecoveryBinding::new(
+        RecoveryProfile::current(),
+        WorldId::new(1).unwrap(),
         standard_catalog().digest(),
         freshness(1, 1, 1, 1, 1).registry(),
-        2,
+        AuthorityBindingGeneration::new(2).unwrap(),
     )
     .unwrap();
     assert!(
@@ -461,8 +464,14 @@ fn binding_device_and_journal_rollback_fail_closed() {
             .reserve_recovery_epoch(wrong_binding, DeviceGeneration::new(2).unwrap())
             .is_err()
     );
-    let wrong_catalog =
-        RecoveryBinding::new(digest(201), freshness(1, 1, 1, 1, 1).registry(), 1).unwrap();
+    let wrong_catalog = RecoveryBinding::new(
+        RecoveryProfile::current(),
+        WorldId::new(1).unwrap(),
+        digest(201),
+        freshness(1, 1, 1, 1, 1).registry(),
+        AuthorityBindingGeneration::new(1).unwrap(),
+    )
+    .unwrap();
     assert!(
         anchor
             .reserve_recovery_epoch(wrong_catalog, DeviceGeneration::new(2).unwrap())
@@ -473,6 +482,7 @@ fn binding_device_and_journal_rollback_fail_closed() {
         freshness(1, 1, 1, 1, 1),
         0,
         cser_core::Digest::ZERO,
+        genesis_projection(),
     )
     .unwrap();
     assert!(RecoveryLease::from_trusted_backend(snapshot, freshness(1, 1, 1, 1, 1)).is_err());

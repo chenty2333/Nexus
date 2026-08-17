@@ -23,10 +23,14 @@ use cser_core::{
     DEVICE_EVIDENCE_IRQ_DRAINED, DEVICE_EVIDENCE_RESET, DEVICE_OBLIGATION_DMA,
     DEVICE_RECEIPT_SCHEMA, DEVICE_VERIFIER, DeviceGeneration, DeviceScopeId, Digest,
     EffectFactChallenge, EffectFactKind, EffectReceiptVerifier, Engine, EvidenceChallenge,
-    EvidenceKindId, ExternalOutcome, PrincipalIncarnation, ReceiptVerifier, ResourceGeneration,
-    ResourceId, VerificationError, VerifiedEffectObservation, VerifiedObservation,
-    VerifierIdentity,
+    EvidenceKindId, ExternalOutcome, PrincipalIncarnation, ReceiptSchemaId, ReceiptVerifier,
+    ResourceGeneration, ResourceId, VerificationError, VerifiedEffectObservation,
+    VerifiedObservation, VerifierIdentity,
 };
+#[cfg(feature = "cser-core-dma-recovery")]
+use cser_core::{ProviderCoordinate, ProviderGeneration, ProviderId, WorldId};
+#[cfg(any(feature = "cser-production", feature = "cser-core-dma-recovery"))]
+use cser_core::{VerifierBinding, VerifierGeneration};
 use nexus_ostd_virtio::{
     BootQuarantineGuard, DeviceBdf, DeviceSessionIdentity, InterruptCause,
     InterruptCompletionProgress, InterruptReceipt, NotificationDisposition,
@@ -35,6 +39,47 @@ use nexus_ostd_virtio::{
     ReceiptedPreparedRequest,
 };
 use sha2::{Digest as _, Sha256};
+
+#[cfg(feature = "cser-production")]
+use super::core_production_registry::{
+    DEVICE_COMMIT_IMPLEMENTATION_DIGEST, DEVICE_RECEIPT_IMPLEMENTATION_DIGEST,
+    STANDARD_DMA_PROVIDER,
+};
+
+#[cfg(not(feature = "cser-production"))]
+const DEVICE_RECEIPT_IMPLEMENTATION_DIGEST: Digest = Digest::new([0x61; 32]);
+#[cfg(not(feature = "cser-production"))]
+const DEVICE_COMMIT_IMPLEMENTATION_DIGEST: Digest = Digest::new([0x62; 32]);
+
+/// Exact provider coordinate used by the isolated profile-5 DMA recovery
+/// scheme. It deliberately matches the production DMA provider coordinate,
+/// while remaining available when the mutually-exclusive production module
+/// is not compiled.
+#[cfg(feature = "cser-core-dma-recovery")]
+pub(crate) const DMA_RECOVERY_PROVIDER: ProviderCoordinate = ProviderCoordinate::new(
+    match WorldId::new(1) {
+        Ok(value) => value,
+        Err(_) => unreachable!(),
+    },
+    match ProviderId::new(2) {
+        Ok(value) => value,
+        Err(_) => unreachable!(),
+    },
+    match ProviderGeneration::new(1) {
+        Ok(value) => value,
+        Err(_) => unreachable!(),
+    },
+);
+
+#[cfg(feature = "cser-production")]
+const fn dma_provider_coordinate() -> cser_core::ProviderCoordinate {
+    STANDARD_DMA_PROVIDER
+}
+
+#[cfg(feature = "cser-core-dma-recovery")]
+const fn dma_provider_coordinate() -> ProviderCoordinate {
+    DMA_RECOVERY_PROVIDER
+}
 
 /// One experiment-owned device resource coordinate.
 ///
@@ -585,6 +630,7 @@ impl QueueCommitBinding {
             || challenge.expected_receipt_schema() != DEVICE_COMMIT_RECEIPT_SCHEMA
             || challenge.current_observation().binding() != cohort.binding_generation
             || challenge.current_observation().device().get() != cohort.hardware.device_generation()
+            || !dma_effect_scope_matches(challenge, DEVICE_COMMIT_RECEIPT_SCHEMA)
         {
             return Err(CoreError::VerificationFailed);
         }
@@ -612,6 +658,7 @@ impl QueueCommitBinding {
             && challenge.current_observation().binding() == self.cohort.binding_generation
             && challenge.current_observation().device().get()
                 == self.cohort.hardware.device_generation()
+            && dma_effect_scope_matches(challenge, DEVICE_COMMIT_RECEIPT_SCHEMA)
     }
 }
 
@@ -679,8 +726,10 @@ impl EffectReceiptVerifier for CoreQueueCommitVerifier {
     type Receipt = QueueCommitObservation;
 
     fn identity(&self) -> VerifierIdentity {
-        VerifierIdentity::new(DEVICE_VERIFIER, 1, DEVICE_COMMIT_RECEIPT_SCHEMA)
-            .expect("standard device verifier identity is valid")
+        dma_verifier_identity(
+            DEVICE_COMMIT_RECEIPT_SCHEMA,
+            DEVICE_COMMIT_IMPLEMENTATION_DIGEST,
+        )
     }
 
     fn verify(
@@ -696,6 +745,7 @@ impl EffectReceiptVerifier for CoreQueueCommitVerifier {
             || receipt.notification == NotificationDisposition::AlreadyResolved
             || receipt.digest.is_zero()
             || receipt.digest != queue_commit_digest(receipt)
+            || !dma_effect_scope_matches(challenge, DEVICE_COMMIT_RECEIPT_SCHEMA)
         {
             return Err(VerificationError::Rejected);
         }
@@ -716,8 +766,7 @@ impl ReceiptVerifier for CoreRetirementVerifier {
     type Receipt = RetirementObservation;
 
     fn identity(&self) -> VerifierIdentity {
-        VerifierIdentity::new(DEVICE_VERIFIER, 1, DEVICE_RECEIPT_SCHEMA)
-            .expect("standard device verifier identity is valid")
+        dma_verifier_identity(DEVICE_RECEIPT_SCHEMA, DEVICE_RECEIPT_IMPLEMENTATION_DIGEST)
     }
 
     fn verify(
@@ -765,6 +814,7 @@ impl ReceiptVerifier for CoreRetirementVerifier {
             || receipt.attempt_sequence == 0
             || receipt.digest.is_zero()
             || receipt.digest != retirement_digest(receipt)
+            || !dma_evidence_scope_matches(challenge, DEVICE_RECEIPT_SCHEMA)
         {
             return Err(VerificationError::Rejected);
         }
@@ -776,6 +826,90 @@ impl ReceiptVerifier for CoreRetirementVerifier {
             receipt.digest,
         ))
     }
+}
+
+#[cfg(any(feature = "cser-production", feature = "cser-core-dma-recovery"))]
+fn dma_verifier_identity(
+    schema: ReceiptSchemaId,
+    implementation_digest: Digest,
+) -> VerifierIdentity {
+    let binding = VerifierBinding::new(
+        DEVICE_VERIFIER,
+        VerifierGeneration::new(1).expect("standard verifier generation is non-zero"),
+        schema,
+        implementation_digest,
+    )
+    .expect("standard device verifier binding is valid");
+    VerifierIdentity::new_exact(binding)
+}
+
+#[cfg(not(any(feature = "cser-production", feature = "cser-core-dma-recovery")))]
+fn dma_verifier_identity(
+    schema: ReceiptSchemaId,
+    _implementation_digest: Digest,
+) -> VerifierIdentity {
+    VerifierIdentity::new(DEVICE_VERIFIER, 1, schema)
+        .expect("legacy device verifier identity is valid")
+}
+
+#[cfg(any(feature = "cser-production", feature = "cser-core-dma-recovery"))]
+fn dma_binding(schema: ReceiptSchemaId) -> Option<VerifierBinding> {
+    let implementation_digest = match schema {
+        DEVICE_RECEIPT_SCHEMA => DEVICE_RECEIPT_IMPLEMENTATION_DIGEST,
+        DEVICE_COMMIT_RECEIPT_SCHEMA => DEVICE_COMMIT_IMPLEMENTATION_DIGEST,
+        _ => return None,
+    };
+    VerifierBinding::new(
+        DEVICE_VERIFIER,
+        VerifierGeneration::new(1).ok()?,
+        schema,
+        implementation_digest,
+    )
+    .ok()
+}
+
+#[cfg(any(feature = "cser-production", feature = "cser-core-dma-recovery"))]
+fn dma_effect_scope_matches(challenge: &EffectFactChallenge, schema: ReceiptSchemaId) -> bool {
+    match (
+        challenge.verification_scope(),
+        challenge.expected_verifier_binding(),
+    ) {
+        (None, None) => false,
+        (Some(scope), Some(binding)) => {
+            scope.world() == dma_provider_coordinate().world()
+                && scope.provider() == dma_provider_coordinate()
+                && scope.verifier_binding() == binding
+                && Some(binding) == dma_binding(schema)
+        }
+        _ => false,
+    }
+}
+
+#[cfg(not(any(feature = "cser-production", feature = "cser-core-dma-recovery")))]
+fn dma_effect_scope_matches(challenge: &EffectFactChallenge, _schema: ReceiptSchemaId) -> bool {
+    challenge.verification_scope().is_none() && challenge.expected_verifier_binding().is_none()
+}
+
+#[cfg(any(feature = "cser-production", feature = "cser-core-dma-recovery"))]
+fn dma_evidence_scope_matches(challenge: &EvidenceChallenge, schema: ReceiptSchemaId) -> bool {
+    match (
+        challenge.verification_scope(),
+        challenge.expected_verifier_binding(),
+    ) {
+        (None, None) => false,
+        (Some(scope), Some(binding)) => {
+            scope.world() == dma_provider_coordinate().world()
+                && scope.provider() == dma_provider_coordinate()
+                && scope.verifier_binding() == binding
+                && Some(binding) == dma_binding(schema)
+        }
+        _ => false,
+    }
+}
+
+#[cfg(not(any(feature = "cser-production", feature = "cser-core-dma-recovery")))]
+fn dma_evidence_scope_matches(challenge: &EvidenceChallenge, _schema: ReceiptSchemaId) -> bool {
+    challenge.verification_scope().is_none() && challenge.expected_verifier_binding().is_none()
 }
 
 /// Linear durable intent and exact core/DMA binding fixed before publication.
@@ -1375,7 +1509,7 @@ mod tests {
         AGENT_COMPONENT_DMA, AGENT_COMPONENT_REPLY, AGENT_OPERATION_COMPOSITE, BootGeneration,
         ComponentCommitOperation, CoreLimits, DMA_ARENA_REUSE_COMPOSITE, Freshness,
         JournalGeneration, PrincipalId, REPLY_CLAIM_PUBLICATION_SLOT, RegistryInstance, RootId,
-        SnapshotId, TransitionOutput, TransitionReceipt, TxError, standard_catalog,
+        SnapshotId, TransitionOutput, TransitionReceipt, TxError, WorldId, standard_catalog,
     };
     use ostd::prelude::ktest;
 
@@ -1387,7 +1521,8 @@ mod tests {
     impl Harness {
         fn new() -> Self {
             Self {
-                engine: Engine::new(
+                engine: Engine::new_scoped_legacy_compatibility(
+                    WorldId::new(1).unwrap(),
                     standard_catalog(),
                     CoreLimits::bounded_default(),
                     freshness(1),

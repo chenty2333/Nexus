@@ -14,32 +14,111 @@
 //! instance until it is dropped and recovered from the trusted anchor.
 
 use crate::{
-    Digest, Freshness, JournalRecord, RecoveryAnchor, RecoveryAnchorError, RegistryInstance,
+    AuthorityBindingGeneration, Digest, Freshness, JournalRecord, RecoveryAnchor,
+    RecoveryAnchorError, RegistryInstance, WorldId,
 };
+
+/// Immutable schema coordinates which govern one recovery domain.
+///
+/// The tuple is deliberately kept separate from the mutable projection. A
+/// recovery binding identifies the code and catalog which interpret a journal;
+/// provider generations, verifier epochs, and artifact leases are state and
+/// are authenticated by the projection instead.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RecoveryProfile {
+    core_api: u16,
+    journal_schema: u16,
+    projection_schema: u16,
+    checkpoint_schema: u16,
+}
+
+impl RecoveryProfile {
+    /// Creates an exact immutable schema tuple.
+    pub const fn new(
+        core_api: u16,
+        journal_schema: u16,
+        projection_schema: u16,
+        checkpoint_schema: u16,
+    ) -> Result<Self, PersistenceProtocolError> {
+        if core_api == 0 || journal_schema == 0 || projection_schema == 0 || checkpoint_schema == 0
+        {
+            return Err(PersistenceProtocolError::InvalidAnchor);
+        }
+        Ok(Self {
+            core_api,
+            journal_schema,
+            projection_schema,
+            checkpoint_schema,
+        })
+    }
+
+    /// Returns the current CSER Core schema tuple.
+    pub const fn current() -> Self {
+        Self {
+            core_api: crate::CSER_CORE_API_PROFILE_VERSION,
+            journal_schema: crate::JOURNAL_SCHEMA_VERSION,
+            projection_schema: crate::PROJECTION_VERSION,
+            checkpoint_schema: crate::JOURNAL_CHECKPOINT_VERSION,
+        }
+    }
+
+    /// Returns the semantic core API coordinate.
+    pub const fn core_api(self) -> u16 {
+        self.core_api
+    }
+    /// Returns the journal wire schema coordinate.
+    pub const fn journal_schema(self) -> u16 {
+        self.journal_schema
+    }
+    /// Returns the authenticated projection schema coordinate.
+    pub const fn projection_schema(self) -> u16 {
+        self.projection_schema
+    }
+    /// Returns the checkpoint envelope schema coordinate.
+    pub const fn checkpoint_schema(self) -> u16 {
+        self.checkpoint_schema
+    }
+}
 
 /// Stable schema and principal-binding coordinates expected at boot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RecoveryBinding {
+    profile: RecoveryProfile,
+    world: WorldId,
     catalog_digest: Digest,
     registry: RegistryInstance,
-    binding: u64,
+    authority_binding: AuthorityBindingGeneration,
 }
 
 impl RecoveryBinding {
     /// Creates an exact recovery binding.
     pub const fn new(
+        profile: RecoveryProfile,
+        world: WorldId,
         catalog_digest: Digest,
         registry: RegistryInstance,
-        binding: u64,
+        authority_binding: AuthorityBindingGeneration,
     ) -> Result<Self, PersistenceProtocolError> {
-        if catalog_digest.is_zero() || binding == 0 {
+        if catalog_digest.is_zero() {
             return Err(PersistenceProtocolError::InvalidAnchor);
         }
         Ok(Self {
+            profile,
+            world,
             catalog_digest,
             registry,
-            binding,
+            authority_binding,
         })
+    }
+
+    /// Returns the immutable schema tuple.
+    pub const fn profile(self) -> RecoveryProfile {
+        self.profile
+    }
+
+    /// Returns the semantic world allocated by the embedding.
+    pub const fn world(self) -> WorldId {
+        self.world
     }
 
     /// Returns the expected domain-catalog digest.
@@ -53,8 +132,13 @@ impl RecoveryBinding {
     }
 
     /// Returns the expected principal-binding generation.
-    pub const fn binding(self) -> u64 {
-        self.binding
+    pub const fn binding(self) -> AuthorityBindingGeneration {
+        self.authority_binding
+    }
+
+    /// Returns the global recovery-authority generation.
+    pub const fn authority_binding(self) -> AuthorityBindingGeneration {
+        self.authority_binding
     }
 }
 
@@ -65,6 +149,7 @@ pub struct TrustedAnchorSnapshot {
     committed_freshness: Freshness,
     revision: u64,
     head: Digest,
+    projection: Digest,
 }
 
 impl TrustedAnchorSnapshot {
@@ -77,13 +162,14 @@ impl TrustedAnchorSnapshot {
         committed_freshness: Freshness,
         revision: u64,
         head: Digest,
+        projection: Digest,
     ) -> Result<Self, PersistenceProtocolError> {
         if committed_freshness.registry().get() != binding.registry().get()
-            || committed_freshness.binding() != binding.binding()
+            || committed_freshness.binding() != binding.binding().get()
         {
             return Err(PersistenceProtocolError::BindingMismatch);
         }
-        if (revision == 0) != head.is_zero() {
+        if projection.is_zero() || (revision == 0) != head.is_zero() {
             return Err(PersistenceProtocolError::InvalidAnchor);
         }
         Ok(Self {
@@ -91,6 +177,7 @@ impl TrustedAnchorSnapshot {
             committed_freshness,
             revision,
             head,
+            projection,
         })
     }
 
@@ -113,6 +200,11 @@ impl TrustedAnchorSnapshot {
     pub const fn head(self) -> Digest {
         self.head
     }
+
+    /// Returns the exact final state projection at the acknowledged tip.
+    pub const fn projection(self) -> Digest {
+        self.projection
+    }
 }
 
 /// Single boot's atomically reserved recovery epoch.
@@ -133,11 +225,12 @@ impl RecoveryLease {
         next_freshness: Freshness,
     ) -> Result<Self, PersistenceProtocolError> {
         RecoveryAnchor::from_trusted_provider(
-            committed.binding().catalog_digest(),
+            committed.binding(),
             committed.committed_freshness(),
             next_freshness,
             committed.revision(),
             committed.head(),
+            committed.projection(),
         )
         .map_err(PersistenceProtocolError::RecoveryAnchor)?;
         Ok(Self {
@@ -159,11 +252,12 @@ impl RecoveryLease {
     /// Consumes the lease into the core's single-use recovery anchor.
     pub fn into_recovery_anchor(self) -> Result<RecoveryAnchor, RecoveryAnchorError> {
         RecoveryAnchor::from_trusted_provider(
-            self.committed.binding().catalog_digest(),
+            self.committed.binding(),
             self.committed.committed_freshness(),
             self.next_freshness,
             self.committed.revision(),
             self.committed.head(),
+            self.committed.projection(),
         )
     }
 }
@@ -171,9 +265,9 @@ impl RecoveryLease {
 /// Portable protocol violation detected before a backend operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PersistenceProtocolError {
-    /// A zero digest, zero binding, or inconsistent genesis coordinates were supplied.
+    /// A zero digest or inconsistent genesis coordinates were supplied.
     InvalidAnchor,
-    /// Catalog, Registry, or principal-binding coordinates do not match.
+    /// Catalog, Registry, schema, world, or authority-binding coordinates do not match.
     BindingMismatch,
     /// A record does not extend the exact trusted journal tip.
     StaleJournalHead,
@@ -263,6 +357,7 @@ pub trait TransitionDurability {
         &mut self,
         record: &JournalRecord,
         resulting_freshness: Freshness,
+        resulting_projection: Digest,
     ) -> Result<(), Self::Error>;
 }
 
@@ -375,6 +470,11 @@ where
         if checkpoint.revision() != self.committed.revision()
             || checkpoint.digest() != self.committed.head()
             || !checkpoint.is_whole_state_checkpoint()
+            || !matches!(
+                checkpoint.command(),
+                crate::engine::CommandKind::WholeStateCheckpointV1 { projection, .. }
+                    if *projection == checkpoint.base_projection()
+            )
         {
             return Err(CoordinatedPersistenceError::Protocol(
                 PersistenceProtocolError::StaleJournalHead,
@@ -402,6 +502,7 @@ where
         &mut self,
         record: &JournalRecord,
         resulting_freshness: Freshness,
+        resulting_projection: Digest,
     ) -> Result<(), Self::Error> {
         if self.recovery_required {
             return Err(CoordinatedPersistenceError::Protocol(
@@ -411,9 +512,8 @@ where
         let expected_freshness = self.committed.committed_freshness();
         if record.base_revision() != self.committed.revision()
             || record.predecessor() != self.committed.head()
-            || record.catalog_digest() != self.committed.binding().catalog_digest()
-            || record.registry().get() != self.committed.binding().registry().get()
-            || record.binding() != self.committed.binding().binding()
+            || record.base_projection() != self.committed.projection()
+            || record.recovery_binding() != self.committed.binding()
             || record.boot() != expected_freshness.boot()
             || record.journal() != expected_freshness.journal()
             || record.device() != expected_freshness.device()
@@ -434,6 +534,7 @@ where
             resulting_freshness,
             record.revision(),
             record.digest(),
+            resulting_projection,
         )
         .map_err(CoordinatedPersistenceError::Protocol)?;
 
@@ -551,11 +652,28 @@ mod tests {
         fail_replacement: bool,
     ) -> (Engine, CoordinatedPersistence<TestJournal, TestAnchor>) {
         let catalog = standard_catalog();
-        let binding =
-            RecoveryBinding::new(catalog.digest(), RegistryInstance::new(1).unwrap(), 1).unwrap();
-        let committed =
-            TrustedAnchorSnapshot::from_trusted_backend(binding, freshness(1), 0, Digest::ZERO)
-                .unwrap();
+        let engine = Engine::new(
+            crate::WorldId::new(1).unwrap(),
+            catalog.clone(),
+            CoreLimits::bounded_default(),
+            freshness(1),
+        );
+        let binding = RecoveryBinding::new(
+            RecoveryProfile::current(),
+            crate::WorldId::new(1).unwrap(),
+            catalog.digest(),
+            RegistryInstance::new(1).unwrap(),
+            crate::AuthorityBindingGeneration::new(1).unwrap(),
+        )
+        .unwrap();
+        let committed = TrustedAnchorSnapshot::from_trusted_backend(
+            binding,
+            freshness(1),
+            0,
+            Digest::ZERO,
+            engine.projection_digest(),
+        )
+        .unwrap();
         let lease = RecoveryLease::from_trusted_backend(committed, freshness(2)).unwrap();
         let persistence = CoordinatedPersistence::from_recovery_lease(
             TestJournal {
@@ -567,10 +685,7 @@ mod tests {
             TestAnchor { committed },
             &lease,
         );
-        (
-            Engine::new(catalog, CoreLimits::bounded_default(), freshness(1)),
-            persistence,
-        )
+        (engine, persistence)
     }
 
     #[test]
@@ -610,6 +725,7 @@ mod tests {
             persistence.committed.committed_freshness(),
             persistence.committed.revision() + 1,
             Digest::new([7; 32]),
+            persistence.committed.projection(),
         )
         .unwrap();
 
@@ -669,11 +785,12 @@ mod tests {
             standard_catalog(),
             CoreLimits::bounded_default(),
             RecoveryAnchor::from_trusted_provider(
-                anchor.committed.binding().catalog_digest(),
+                anchor.committed.binding(),
                 anchor.committed.committed_freshness(),
                 freshness(2),
                 anchor.committed.revision(),
                 anchor.committed.head(),
+                anchor.committed.projection(),
             )
             .unwrap(),
             &bytes,

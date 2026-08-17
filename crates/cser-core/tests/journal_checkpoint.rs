@@ -4,15 +4,16 @@ mod support;
 use cser_core::{
     AGENT_COMPONENT_DMA, AGENT_OPERATION_COMPOSITE, ClaimScope, CommandRequest as Command,
     CoreError, CoreLimits, DEVICE_CLAIM_QUEUE_SLOT, DeviceScopeId, Engine, JournalCheckpoint,
-    RecoveryAnchor, RootRecoveryState, standard_catalog,
+    RootRecoveryState, standard_catalog,
 };
 use support::{
-    Harness, charge, claim, effect, freshness, principal, resource, resource_generation,
+    Harness, charge, claim, effect, freshness, principal, recovery_anchor, resource,
+    resource_generation,
 };
 
 #[test]
 fn exact_replay_checkpoint_requires_advancing_anchor_and_fences_the_root() {
-    let mut harness = Harness::new_profile_two();
+    let mut harness = Harness::new();
     let operation = effect(0xce01, 1);
     let origin = principal(0xce01, 1);
     harness
@@ -37,21 +38,21 @@ fn exact_replay_checkpoint_requires_advancing_anchor_and_fences_the_root() {
 
     let encoded = checkpoint.encode();
     let decoded = JournalCheckpoint::decode(&encoded).unwrap();
-    let mut recovered = decoded
-        .recover(
-            standard_catalog(),
-            CoreLimits::bounded_default(),
-            RecoveryAnchor::from_trusted_provider(
-                standard_catalog().digest(),
-                freshness(1, 1, 1, 1, 1),
-                freshness(2, 1, 1, 1, 2),
-                harness.engine.revision(),
-                harness.engine.head(),
-            )
-            .unwrap(),
-        )
-        .unwrap()
-        .into_engine();
+    let mut recovered = Engine::recover_legacy_compatibility(
+        standard_catalog(),
+        CoreLimits::bounded_default(),
+        recovery_anchor(
+            standard_catalog().digest(),
+            freshness(1, 1, 1, 1, 1),
+            freshness(2, 1, 1, 1, 2),
+            harness.engine.revision(),
+            harness.engine.head(),
+            harness.engine.projection_digest(),
+        ),
+        decoded.image(),
+    )
+    .unwrap()
+    .into_engine();
     assert_eq!(recovered.revision(), harness.engine.revision());
     assert_eq!(recovered.head(), harness.engine.head());
     assert!(matches!(
@@ -88,7 +89,7 @@ fn exact_replay_checkpoint_requires_advancing_anchor_and_fences_the_root() {
 
 #[test]
 fn checkpoint_recovery_quarantines_retained_device_claims() {
-    let mut harness = Harness::new_profile_two();
+    let mut harness = Harness::new();
     let operation = effect(0xce03, 1);
     let origin = principal(0xce03, 1);
     harness
@@ -115,21 +116,21 @@ fn checkpoint_recovery_quarantines_retained_device_claims() {
         })
         .unwrap();
     let checkpoint = harness.checkpoint();
-    let mut recovered = checkpoint
-        .recover(
-            standard_catalog(),
-            CoreLimits::bounded_default(),
-            RecoveryAnchor::from_trusted_provider(
-                standard_catalog().digest(),
-                freshness(1, 1, 1, 1, 1),
-                freshness(2, 1, 1, 1, 2),
-                harness.engine.revision(),
-                harness.engine.head(),
-            )
-            .unwrap(),
-        )
-        .unwrap()
-        .into_engine();
+    let mut recovered = Engine::recover_legacy_compatibility(
+        standard_catalog(),
+        CoreLimits::bounded_default(),
+        recovery_anchor(
+            standard_catalog().digest(),
+            freshness(1, 1, 1, 1, 1),
+            freshness(2, 1, 1, 1, 2),
+            harness.engine.revision(),
+            harness.engine.head(),
+            harness.engine.projection_digest(),
+        ),
+        checkpoint.image(),
+    )
+    .unwrap()
+    .into_engine();
     assert!(recovered.pressure().quarantined);
     recovered
         .transact(
@@ -149,7 +150,7 @@ fn checkpoint_recovery_quarantines_retained_device_claims() {
 
 #[test]
 fn checkpoint_refuses_the_uncheckpointed_recovery_epoch() {
-    let mut harness = Harness::new_profile_two();
+    let mut harness = Harness::new();
     let operation = effect(0xce02, 1);
     harness
         .tx(Command::CreateCompositeEffect {
@@ -161,17 +162,17 @@ fn checkpoint_refuses_the_uncheckpointed_recovery_epoch() {
         })
         .unwrap();
 
-    let recovered = Engine::recover(
+    let recovered = Engine::recover_legacy_compatibility(
         standard_catalog(),
         CoreLimits::bounded_default(),
-        RecoveryAnchor::from_trusted_provider(
+        recovery_anchor(
             standard_catalog().digest(),
             freshness(1, 1, 1, 1, 1),
             freshness(2, 1, 1, 1, 2),
             harness.engine.revision(),
             harness.engine.head(),
-        )
-        .unwrap(),
+            harness.engine.projection_digest(),
+        ),
         &harness.journal,
     )
     .unwrap()

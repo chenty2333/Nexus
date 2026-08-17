@@ -3,13 +3,14 @@
 use std::{env, path::Path, process};
 
 use cser_core::{
-    BootGeneration, ChargeAccountId, ClaimId, Command as AuthorizedCommand,
-    CommandRequest as Command, CoreError, CoreLimits, DeviceGeneration, Digest, EffectFactKind,
-    EffectId, EffectReceiptVerifier, Engine, ExternalOutcome, Freshness, JournalGeneration,
-    PrincipalId, PrincipalIncarnation, ReceiptVerifier, RecoveryAnchor, RegistryInstance,
+    AuthorityBindingGeneration, BootGeneration, ChargeAccountId, ClaimId,
+    Command as AuthorizedCommand, CommandRequest as Command, CoreError, CoreLimits,
+    DeviceGeneration, Digest, EffectFactKind, EffectId, EffectReceiptVerifier, Engine,
+    ExternalOutcome, Freshness, JournalGeneration, PrincipalId, PrincipalIncarnation,
+    ReceiptVerifier, RecoveryAnchor, RecoveryBinding, RecoveryProfile, RegistryInstance,
     ResourceGeneration, ResourceId, RetirementState, RootId, SettlementState, SnapshotId,
     TransitionOutput, TxError, VerificationError, VerifiedEffectObservation, VerifiedObservation,
-    VerifierIdentity, standard_catalog,
+    VerifierIdentity, WorldId, standard_catalog,
     std_support::{FileJournal, read_all},
 };
 
@@ -174,7 +175,8 @@ fn origin(path: &Path) -> Result<(), String> {
         return Err("origin requires a new journal".to_owned());
     }
     let mut file = FileJournal::open(path).map_err(io_error)?;
-    let mut engine = Engine::new_legacy_compatibility(
+    let mut engine = Engine::new_scoped_legacy_compatibility(
+        WorldId::new(1).unwrap(),
         standard_catalog(),
         CoreLimits::bounded_default(),
         freshness(1, 1),
@@ -251,7 +253,7 @@ fn origin(path: &Path) -> Result<(), String> {
             .acknowledge(outcome)
             .map_err(|error| core_error(error.error().clone()))?,
     )?;
-    publish_anchor(&engine);
+    publish_anchor(path, &engine)?;
     Ok(())
 }
 
@@ -260,11 +262,12 @@ fn adopt(path: &Path, minimum_revision: u64, expected_head: Digest) -> Result<()
     let target = freshness(2, 2);
     let catalog = standard_catalog();
     let anchor = RecoveryAnchor::from_trusted_provider(
-        catalog.digest(),
+        recovery_binding(catalog.digest(), freshness(1, 1)),
         freshness(1, 1),
         target,
         minimum_revision,
         expected_head,
+        read_projection(path)?,
     )
     .map_err(|error| format!("invalid recovery anchor: {error:?}"))?;
     let report = Engine::recover_legacy_compatibility(
@@ -298,7 +301,7 @@ fn adopt(path: &Path, minimum_revision: u64, expected_head: Digest) -> Result<()
             .record_apply_intent(digest(20))
             .map_err(claim_error)?,
     )?;
-    publish_anchor(&engine);
+    publish_anchor(path, &engine)?;
     Ok(())
 }
 
@@ -307,11 +310,12 @@ fn reconcile(path: &Path, minimum_revision: u64, expected_head: Digest) -> Resul
     let target = freshness(3, 3);
     let catalog = standard_catalog();
     let anchor = RecoveryAnchor::from_trusted_provider(
-        catalog.digest(),
+        recovery_binding(catalog.digest(), freshness(2, 2)),
         freshness(2, 2),
         target,
         minimum_revision,
         expected_head,
+        read_projection(path)?,
     )
     .map_err(|error| format!("invalid recovery anchor: {error:?}"))?;
     let report = Engine::recover_legacy_compatibility(
@@ -425,7 +429,7 @@ fn reconcile(path: &Path, minimum_revision: u64, expected_head: Digest) -> Resul
     {
         return Err(format!("unexpected final projection: {estate:?}"));
     }
-    publish_anchor(&engine);
+    publish_anchor(path, &engine)?;
     Ok(())
 }
 
@@ -556,8 +560,34 @@ fn digest(value: u8) -> Digest {
     Digest::new(bytes)
 }
 
-fn publish_anchor(engine: &Engine) {
+fn publish_anchor(path: &Path, engine: &Engine) -> Result<(), String> {
+    std::fs::write(
+        projection_path(path),
+        encode_digest(engine.projection_digest()),
+    )
+    .map_err(io_error)?;
     println!("{} {}", engine.revision(), encode_digest(engine.head()));
+    Ok(())
+}
+
+fn recovery_binding(catalog_digest: Digest, freshness: Freshness) -> RecoveryBinding {
+    RecoveryBinding::new(
+        RecoveryProfile::current(),
+        WorldId::new(1).unwrap(),
+        catalog_digest,
+        freshness.registry(),
+        AuthorityBindingGeneration::new(freshness.binding()).unwrap(),
+    )
+    .expect("fixture recovery binding must be valid")
+}
+
+fn projection_path(path: &Path) -> std::path::PathBuf {
+    path.with_extension("projection")
+}
+
+fn read_projection(path: &Path) -> Result<Digest, String> {
+    let encoded = std::fs::read_to_string(projection_path(path)).map_err(io_error)?;
+    parse_digest(encoded.trim())
 }
 
 fn encode_digest(digest: Digest) -> String {

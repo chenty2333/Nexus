@@ -100,20 +100,21 @@ done
 [[ -d $cser_source_root && ! -L $cser_source_root ]] \
     || fail "CSER source root is not a directory: $cser_source_root"
 
-grep -Fxq 'pub const CSER_CORE_API_PROFILE_VERSION: u16 = 4;' "$core_lib" \
-    || fail 'portable core API profile 4 is not frozen at the cutover'
-grep -Fxq 'pub const STANDARD_CATALOG_VERSION: u16 = 7;' "$core_lib" \
-    || fail 'portable standard catalog v7 is not frozen at the cutover'
-grep -Fxq 'pub const PROJECTION_VERSION: u16 = 8;' "$core_lib" \
-    || fail 'portable projection v8 is not frozen at the cutover'
-grep -Fxq 'pub const RECOVERY_SNAPSHOT_VERSION: u16 = 4;' "$core_lib" \
-    || fail 'portable recovery snapshot v4 is not frozen at the cutover'
-grep -Fxq 'pub const JOURNAL_MAGIC: [u8; 8] = *b"CSERJR8\0";' "$core_journal" \
-    || fail 'portable core journal magic is not bound to schema 8'
-grep -Fxq 'pub const JOURNAL_SCHEMA_VERSION: u16 = 8;' "$core_journal" \
-    || fail 'portable core journal schema 8 is not frozen at the cutover'
+grep -Fxq 'pub const CSER_CORE_API_PROFILE_VERSION: u16 = 5;' "$core_lib" \
+    || fail 'portable core API profile 5 is not frozen at the cutover'
+grep -Fxq 'pub const STANDARD_CATALOG_VERSION: u16 = 8;' "$core_lib" \
+    || fail 'portable standard catalog v8 is not frozen at the cutover'
+grep -Fxq 'pub const PROJECTION_VERSION: u16 = 9;' "$core_lib" \
+    || fail 'portable projection v9 is not frozen at the cutover'
+grep -Fxq 'pub const RECOVERY_SNAPSHOT_VERSION: u16 = 5;' "$core_lib" \
+    || fail 'portable recovery snapshot v5 is not frozen at the cutover'
+grep -Fxq 'pub const JOURNAL_MAGIC: [u8; 8] = *b"CSERJR9\0";' "$core_journal" \
+    || fail 'portable core journal magic is not bound to schema 9'
+grep -Fxq 'pub const JOURNAL_SCHEMA_VERSION: u16 = 9;' "$core_journal" \
+    || fail 'portable core journal schema 9 is not frozen at the cutover'
 for profile2_engine_guard in \
-    'Self::new_with_mode(catalog, limits, freshness, EngineApiMode::ProfileTwo)' \
+    'world: WorldId,' \
+    'Some(world),' \
     'if self.api_mode == EngineApiMode::ProfileTwo && !command.is_profile_two_compatible() {' \
     '&& !record.command().is_profile_two_compatible()'; do
     grep -Fq "$profile2_engine_guard" "$core_engine" \
@@ -388,13 +389,19 @@ require_ordered_tokens "$client_transact" 'client-facing production Registry tra
     '.installed' \
     '.transact(request.into())'
 for component_command in \
-    'CommandRequest::CreateCompositeEffect { .. }' \
     'CommandRequest::AddComponentClaim { .. }' \
     'CommandRequest::PrepareCompositeEffect { .. }' \
     'CommandRequest::RecordComponentCommitIntent { .. }' \
     'CommandRequest::RecordCompositeCommitIntents { .. }'; do
     grep -Fq "$component_command" <<<"$client_transact" \
         || fail "client-facing production Registry rejects profile 2 command: $component_command"
+done
+for trusted_admission in \
+    'CommandRequest::CreateCompositeEffect { .. }' \
+    'CommandRequest::AdmitScopedCompositeEffect { .. }'; do
+    if grep -Fq "$trusted_admission" <<<"$client_transact"; then
+        fail "client-facing production Registry exposes trusted admission: $trusted_admission"
+    fi
 done
 
 component_intent_take=$(extract_rust_item \
@@ -460,9 +467,11 @@ portal_policy=$(extract_rust_item \
 require_ordered_tokens "$portal_policy" 'profile-2 portal policy' \
     'if !request.is_profile_two_compatible() {' \
     'return Err(PortalPolicyError::ProfileOneCommandForbidden);' \
-    'CommandRequest::CreateCompositeEffect { .. }' \
+    'CommandRequest::AddComponentClaim { .. }' \
     '| CommandRequest::RecordComponentCommitIntent { .. }' \
-    '| CommandRequest::RecordCompositeCommitIntents { .. } => return Ok(())'
+    '| CommandRequest::RecordCompositeCommitIntents { .. } => return Ok(())' \
+    '| CommandRequest::CreateCompositeEffect { .. }' \
+    'CommandRequest::AdmitScopedCompositeEffect { .. } => TrustedTransition::ScopedAdmission'
 
 if grep -Fq 'pub(crate) fn take_commit_intent(' "$production_registry"; then
     fail 'production Registry still exposes a profile-1 commit-intent transfer'
@@ -537,16 +546,14 @@ composite_prepare=$(extract_rust_item \
     'fn ensure_composite_prepared<S>(' \
     "$persistent_runtime") \
     || fail 'cannot isolate production composite preparation'
-create_composite_count=$(grep -Fc 'CommandRequest::CreateCompositeEffect {' \
+legacy_create_composite_count=$(grep -Fc 'CommandRequest::CreateCompositeEffect {' \
     <<<"$composite_prepare" || true)
 prepare_composite_count=$(grep -Fc 'CommandRequest::PrepareCompositeEffect {' \
     <<<"$composite_prepare" || true)
-(( create_composite_count == 1 && prepare_composite_count == 1 )) \
-    || fail 'production composite preparation must create and prepare one shared effect'
+(( legacy_create_composite_count == 0 && prepare_composite_count == 1 )) \
+    || fail 'production composite preparation must only prepare an already scoped effect'
 require_ordered_tokens "$composite_prepare" 'production composite preparation' \
     'let effect = operation_effect();' \
-    'CommandRequest::CreateCompositeEffect {' \
-    'kind: AGENT_OPERATION_COMPOSITE,' \
     'engine.component(effect, AGENT_COMPONENT_REPLY)' \
     'engine.component(effect, AGENT_COMPONENT_DMA)' \
     'CommandRequest::AddComponentClaim {' \
@@ -554,6 +561,25 @@ require_ordered_tokens "$composite_prepare" 'production composite preparation' \
     'engine.component_claims(effect, AGENT_COMPONENT_DMA)' \
     'dma.enroll_claims()' \
     'CommandRequest::PrepareCompositeEffect {'
+
+scoped_admission=$(extract_rust_item \
+    'fn ensure_standard_scoped_composite<S>(' \
+    "$persistent_runtime") \
+    || fail 'cannot isolate production scoped admission'
+require_ordered_tokens "$scoped_admission" 'production scoped admission' \
+    'if bindings.iter().any(|binding| binding.artifact().is_some()) {' \
+    'if let Some(composite) = composite {' \
+    'if composite.operation != Some(operation) || composite.provider_bindings != bindings {' \
+    '.admit_scoped_composite_effect(' \
+    'operation_charge_account(),' \
+    'bindings.clone(),'
+if grep -Fq 'CommandRequest::CreateCompositeEffect {' <<<"$scoped_admission"; then
+    fail 'production scoped admission falls back to predecessor composite creation'
+fi
+scoped_admission_call_count=$(grep -Fc 'ensure_standard_scoped_composite(' \
+    "$persistent_runtime" || true)
+(( scoped_admission_call_count == 2 )) \
+    || fail "production runtime must admit exactly the operation and reuse scoped composites; found $scoped_admission_call_count"
 
 reply_commit=$(extract_rust_item \
     'fn ensure_reply_component_committed<S>(' \
@@ -713,9 +739,6 @@ reuse_publication=$(extract_rust_item \
 require_ordered_tokens "$reuse_publication" 'generation+1 DMA reuse publication' \
     'engine.component_claims(operation_effect(), AGENT_COMPONENT_DMA)' \
     'claims.iter().any(|claim| !claim.retired)' \
-    'CommandRequest::CreateCompositeEffect {' \
-    'effect: reuse_effect(),' \
-    'kind: DMA_ARENA_REUSE_COMPOSITE,' \
     'ensure_uncommitted_composite_actor(' \
     'if let Some(projection) = projections' \
     'engine.reclaim_component_resource_reuse(' \
@@ -730,6 +753,9 @@ require_ordered_tokens "$reuse_publication" 'generation+1 DMA reuse publication'
     'cohort.record_commit_intent(persistent_dma_arena_digest(arena))' \
     'publish_real_queue(' \
     'published.verify_commit(engine)'
+if grep -Fq 'CommandRequest::CreateCompositeEffect {' <<<"$reuse_publication"; then
+    fail 'generation+1 DMA reuse falls back to predecessor composite creation'
+fi
 reuse_permit_count=$(grep -Fc 'CommandRequest::ReserveComponentReuse {' \
     <<<"$reuse_publication" || true)
 (( reuse_permit_count == 1 )) \
@@ -948,8 +974,6 @@ workspace_members=$(awk '
 expected_members=(
     crates/cser-core
     crates/cser-model
-    crates/cser-trace-conformance
-    crates/nexus-effect-peer-wire
 )
 member_count=$(grep -Ec '^[[:space:]]*"[^"]+",?[[:space:]]*$' <<<"$workspace_members" || true)
 (( member_count == ${#expected_members[@]} )) \
@@ -958,16 +982,6 @@ for member in "${expected_members[@]}"; do
     count=$(grep -Fxc "    \"$member\"," <<<"$workspace_members" || true)
     (( count == 1 )) || fail "root production workspace lacks exact member: $member"
 done
-for retired in \
-    crates/cser-transition-gates \
-    crates/nexus-effect-peer \
-    crates/nexus-portal-abi \
-    crates/nexus-supervisor; do
-    if grep -Fq "\"$retired\"" <<<"$workspace_members"; then
-        fail "retired live crate remains a production workspace member: $retired"
-    fi
-done
-
 root_verify=$(awk '
     /^verify_all\(\)[[:space:]]*\{/ { in_function = 1 }
     in_function { print }
@@ -1149,19 +1163,20 @@ require_ordered_tokens "$runtime_recovery" 'production trusted-state recovery or
     'let mut prepared = match PreparedQemuPersistentBoot::acquire() {' \
     'let selected_tip = prepared.candidate().committed();' \
     'let selected_bytes = match prepared.journal_bytes() {' \
-    'if is_legacy_schema5(&selected_bytes) {' \
+    'if is_legacy_schema8(&selected_bytes) {' \
     'let boot = match prepared.recover(catalog, CoreLimits::bounded_default(), binding) {'
-for schema5_fail_closed_token in \
-    'if is_legacy_schema5(&selected_bytes)' \
+for schema8_fail_closed_token in \
+    'if is_legacy_schema8(&selected_bytes)' \
     'selected_tip.revision() == 0 || selected_tip.head().is_zero()' \
     'trusted_tpm_candidate_selected=true' \
-    'profile2_binding_authorized=false' \
+    'profile5_binding_authorized=false' \
+    'journal_schema=8' \
     'typed_error=migration-required' \
     'semantic_replay=false inferred_pairing=false pre_replay_quarantine=true' \
     'device_guard_retained=true production_registry=false device_activation=false' \
-    'fail_closed("schema5-migration-required", prepared)'; do
-    grep -Fq "$schema5_fail_closed_token" <<<"$runtime_recovery" \
-        || fail "production schema-5 rejection lacks retained authority token: $schema5_fail_closed_token"
+    'fail_closed("schema8-migration-required", prepared)'; do
+    grep -Fq "$schema8_fail_closed_token" <<<"$runtime_recovery" \
+        || fail "production schema-8 rejection lacks retained authority token: $schema8_fail_closed_token"
 done
 for anchor_candidate_token in \
     'pub(crate) struct TpmNvAnchorCandidate<T> {' \
@@ -1259,12 +1274,12 @@ persistent_capture=$(awk '
     in_function && /^\)[[:space:]]*$/ { found_end = 1; exit }
     END { if (!in_function || !found_end) exit 1 }
 ' "$kernel_workflow") || fail 'cannot isolate persistent production capture wrapper'
-schema5_negative=$(awk '
-    /^capture_core_schema5_negative_boot\(\)[[:space:]]*\{/ { in_function = 1 }
+schema8_negative=$(awk '
+    /^capture_core_schema8_negative_boot\(\)[[:space:]]*\{/ { in_function = 1 }
     in_function { print }
     in_function && /^\}[[:space:]]*$/ { found_end = 1; exit }
     END { if (!in_function || !found_end) exit 1 }
-' "$kernel_workflow") || fail 'cannot isolate schema-5 negative boot cell'
+' "$kernel_workflow") || fail 'cannot isolate schema-8 negative boot cell'
 swtpm_start=$(awk '
     /^start_core_persistent_swtpm\(\)[[:space:]]*\{/ { in_function = 1 }
     in_function { print }
@@ -1293,21 +1308,21 @@ if grep -Fq -- '--daemon' <<<"$swtpm_start"; then
     fail 'persistent swtpm escaped the runner-owned background process'
 fi
 grep -Fxq \
-    'core_schema5_fixture_catalog=f58ad9f2c973e65532b10d6392f0528838bf95c09668f30395743816a58ddf25' \
+    'core_schema8_fixture_catalog=c510695985b0de4592242dcfca36fb52eafc0e0c53fbd214e9dd46799464424b' \
     "$kernel_workflow" \
-    || fail 'schema-5 negative boot lacks the frozen profile-1 catalog digest'
-require_ordered_tokens "$schema5_negative" 'authentic schema-5 negative boot' \
-    'build_core_schema5_selected_fixture' \
+    || fail 'schema-8 negative boot lacks the frozen profile-4 catalog digest'
+require_ordered_tokens "$schema8_negative" 'authentic schema-8 negative boot' \
+    'build_core_schema8_selected_fixture' \
     'bash "$root/scripts/provision-cser-tpm-nv.sh"' \
-    '"$core_schema5_fixture_catalog"' \
+    '"$core_schema8_fixture_catalog"' \
     'capture_core_persistent_boot' \
-    'cmp "$core_schema5_journal" "$core_persistent_journal"' \
-    "'CSER_CORE_SCHEMA5_MIGRATION_REQUIRED PASS'" \
+    'cmp "$core_schema8_journal" "$core_persistent_journal"' \
+    "'CSER_CORE_SCHEMA8_MIGRATION_REQUIRED PASS'" \
     "'anchor_binding_match=false'" \
     "'device_guard_retained=true'" \
-    'assert_core_schema5_post_quarantine_trace'
-if grep -Fq '"$catalog_digest" \' <<<"$schema5_negative"; then
-    fail 'schema-5 negative boot provisions TPM authority with the profile-2 catalog'
+    'assert_core_schema8_post_quarantine_trace'
+if grep -Fq '"$catalog_digest" \' <<<"$schema8_negative"; then
+    fail 'schema-8 negative boot provisions TPM authority with the profile-5 catalog'
 fi
 [[ $(grep -Fc 'NEXUS_CONTAINER_HOST_UNIX_SOCKET' <<<"$container_function") == 1 ]] \
     || fail 'container runner must declare the host Unix socket policy once'
@@ -1331,4 +1346,4 @@ for forbidden_container_option in --privileged --cap-add --device; do
     fi
 done
 
-echo "CSER_CORE_PRODUCTION_CUTOVER PASS manifest_sources=${#closure_sources[@]} portable_core=nonoptional api_profile=4 catalog_version=7 projection_version=8 snapshot_version=4 journal_schema=8 default=cser-production registry=single operation_effect=shared component_custody=reply+dma production_service_tasks=1 legacy_runtime_estates=false task_bound_ingress=true post_exit_fence=true production_rebind=true vnext_portal=true vnext_supervisor=true volatile_transitions=false evidence_schemes=reply+dma boots=4 shared_media=true tpm_fixture_policy=scoped"
+echo "CSER_CORE_PRODUCTION_CUTOVER PASS manifest_sources=${#closure_sources[@]} portable_core=nonoptional api_profile=5 catalog_version=8 projection_version=9 snapshot_version=5 journal_schema=9 default=cser-production registry=single operation_effect=shared provider_scope=closed component_custody=reply+dma production_service_tasks=1 legacy_runtime_estates=false task_bound_ingress=true post_exit_fence=true production_rebind=true vnext_portal=true vnext_supervisor=true volatile_transitions=false evidence_schemes=reply+dma boots=4 shared_media=true tpm_fixture_policy=scoped"

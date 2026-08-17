@@ -24,11 +24,11 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Verify formatting, portable core, oracle, and Loom
+      - name: Verify current portable core, oracle, and host checks
         run: ./x test --quick
 
   verify:
-    name: CSER Core rebaseline verification
+    name: CSER production recovery verification
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
@@ -46,18 +46,18 @@ jobs:
         env:
           NEXUS_REBUILD: "1"
         run: ./x verify
-      - name: Upload combined CSER Core recovery evidence
+      - name: Upload combined CSER production recovery evidence
         if: success()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: nexus-cser-core-rebaseline-${{ github.run_attempt }}
+          name: nexus-cser-production-${{ github.run_attempt }}
           if-no-files-found: error
           path: kernel/nexus-ostd/artifacts/cser-production
       - name: Upload failure evidence
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: nexus-cser-core-rebaseline-failure-${{ github.run_attempt }}
+          name: nexus-cser-production-failure-${{ github.run_attempt }}
           if-no-files-found: ignore
           include-hidden-files: true
           path: |

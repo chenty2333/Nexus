@@ -12,8 +12,3 @@ std = []
 [dev-dependencies]
 loom = "=0.7.2"
 proptest = "=1.11.0"
-
-[[bin]]
-name = "cser-model"
-path = "src/bin/cser-model.rs"
-required-features = ["std"]

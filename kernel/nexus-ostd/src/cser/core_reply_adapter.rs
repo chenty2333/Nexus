@@ -15,13 +15,30 @@ use cser_core::{
     ClaimId, ClaimScope, ComponentId, CoreError, Digest, EffectFactChallenge, EffectFactKind,
     EffectReceiptVerifier, Engine, EvidenceChallenge, REPLY_APPLY_RECEIPT_SCHEMA, REPLY_DOMAIN,
     REPLY_EVIDENCE_PUBLICATION_ACK, REPLY_OBLIGATION_PUBLICATION, REPLY_RECEIPT_SCHEMA,
-    REPLY_SETTLEMENT_RECEIPT_SCHEMA, REPLY_VERIFIER, ReceiptVerifier, ResourceGeneration,
-    ResourceId, SettlementClaim, VerificationError, VerifiedApplyReceipt,
+    REPLY_SETTLEMENT_RECEIPT_SCHEMA, REPLY_VERIFIER, ReceiptSchemaId, ReceiptVerifier,
+    ResourceGeneration, ResourceId, SettlementClaim, VerificationError, VerifiedApplyReceipt,
     VerifiedEffectObservation, VerifiedObservation, VerifiedRetirementEvidence,
     VerifiedSettlementAck, VerifierIdentity,
 };
+#[cfg(feature = "cser-core-reply-recovery")]
+use cser_core::{ProviderCoordinate, ProviderGeneration, ProviderId, WorldId};
+#[cfg(any(feature = "cser-production", feature = "cser-core-reply-recovery"))]
+use cser_core::{VerifierBinding, VerifierGeneration};
 use ostd::sync::{SpinLock, Waiter, Waker};
 use sha2::{Digest as _, Sha256};
+
+#[cfg(feature = "cser-production")]
+use super::core_production_registry::{
+    REPLY_APPLY_IMPLEMENTATION_DIGEST, REPLY_RECEIPT_IMPLEMENTATION_DIGEST,
+    REPLY_SETTLEMENT_IMPLEMENTATION_DIGEST, STANDARD_REPLY_PROVIDER,
+};
+
+#[cfg(feature = "cser-core-reply-recovery")]
+const REPLY_RECEIPT_IMPLEMENTATION_DIGEST: Digest = Digest::new([0x51; 32]);
+#[cfg(feature = "cser-core-reply-recovery")]
+const REPLY_APPLY_IMPLEMENTATION_DIGEST: Digest = Digest::new([0x53; 32]);
+#[cfg(feature = "cser-core-reply-recovery")]
+const REPLY_SETTLEMENT_IMPLEMENTATION_DIGEST: Digest = Digest::new([0x54; 32]);
 
 const REPLY_ARMED: u8 = 0;
 const REPLY_APPLYING: u8 = 1;
@@ -489,8 +506,18 @@ impl EffectReceiptVerifier for ReplyEffectVerifier<'_> {
     type Receipt = ReplyApplyObservation;
 
     fn identity(&self) -> VerifierIdentity {
-        VerifierIdentity::new(REPLY_VERIFIER, 1, REPLY_APPLY_RECEIPT_SCHEMA)
-            .expect("standard reply verifier identity is valid")
+        #[cfg(any(feature = "cser-production", feature = "cser-core-reply-recovery"))]
+        {
+            reply_verifier_identity(
+                REPLY_APPLY_RECEIPT_SCHEMA,
+                REPLY_APPLY_IMPLEMENTATION_DIGEST,
+            )
+        }
+        #[cfg(not(any(feature = "cser-production", feature = "cser-core-reply-recovery")))]
+        {
+            VerifierIdentity::new(REPLY_VERIFIER, 1, REPLY_APPLY_RECEIPT_SCHEMA)
+                .expect("legacy reply verifier identity is valid")
+        }
     }
 
     fn verify(
@@ -505,6 +532,7 @@ impl EffectReceiptVerifier for ReplyEffectVerifier<'_> {
             || challenge.domain() != REPLY_DOMAIN
             || challenge.obligation() != REPLY_OBLIGATION_PUBLICATION
             || challenge.operation() != receipt.plan.intent_digest
+            || !reply_challenge_scope_matches(challenge, REPLY_APPLY_RECEIPT_SCHEMA)
             || receipt.plan.coordinate != self.custody.coordinate
             || receipt.digest != apply_digest(receipt.plan)
             || !matches!(phase, REPLY_PUBLISHED | REPLY_ACKNOWLEDGED)
@@ -523,8 +551,18 @@ impl EffectReceiptVerifier for ReplyAckVerifier<'_> {
     type Receipt = ReplyAckObservation;
 
     fn identity(&self) -> VerifierIdentity {
-        VerifierIdentity::new(REPLY_VERIFIER, 1, REPLY_SETTLEMENT_RECEIPT_SCHEMA)
-            .expect("standard reply acknowledgement verifier identity is valid")
+        #[cfg(any(feature = "cser-production", feature = "cser-core-reply-recovery"))]
+        {
+            reply_verifier_identity(
+                REPLY_SETTLEMENT_RECEIPT_SCHEMA,
+                REPLY_SETTLEMENT_IMPLEMENTATION_DIGEST,
+            )
+        }
+        #[cfg(not(any(feature = "cser-production", feature = "cser-core-reply-recovery")))]
+        {
+            VerifierIdentity::new(REPLY_VERIFIER, 1, REPLY_SETTLEMENT_RECEIPT_SCHEMA)
+                .expect("legacy reply acknowledgement verifier identity is valid")
+        }
     }
 
     fn verify(
@@ -538,6 +576,7 @@ impl EffectReceiptVerifier for ReplyAckVerifier<'_> {
             || challenge.domain() != REPLY_DOMAIN
             || challenge.obligation() != REPLY_OBLIGATION_PUBLICATION
             || challenge.operation() != receipt.plan.intent_digest
+            || !reply_challenge_scope_matches(challenge, REPLY_SETTLEMENT_RECEIPT_SCHEMA)
             || challenge.predecessor() != Some(apply_digest(receipt.plan))
             || receipt.plan.coordinate != self.custody.coordinate
             || receipt.digest != ack_digest(receipt.plan)
@@ -565,8 +604,15 @@ impl ReceiptVerifier for ReplyRetirementVerifier<'_> {
     type Receipt = ReplyAckObservation;
 
     fn identity(&self) -> VerifierIdentity {
-        VerifierIdentity::new(REPLY_VERIFIER, 1, REPLY_RECEIPT_SCHEMA)
-            .expect("standard reply retirement verifier identity is valid")
+        #[cfg(any(feature = "cser-production", feature = "cser-core-reply-recovery"))]
+        {
+            reply_verifier_identity(REPLY_RECEIPT_SCHEMA, REPLY_RECEIPT_IMPLEMENTATION_DIGEST)
+        }
+        #[cfg(not(any(feature = "cser-production", feature = "cser-core-reply-recovery")))]
+        {
+            VerifierIdentity::new(REPLY_VERIFIER, 1, REPLY_RECEIPT_SCHEMA)
+                .expect("legacy reply retirement verifier identity is valid")
+        }
     }
 
     fn verify(
@@ -582,6 +628,7 @@ impl ReceiptVerifier for ReplyRetirementVerifier<'_> {
             || challenge.scope() != ClaimScope::Logical
             || challenge.resource() != self.custody.coordinate.resource
             || challenge.resource_generation() != self.custody.coordinate.resource_generation
+            || !reply_evidence_scope_matches(challenge, REPLY_RECEIPT_SCHEMA)
             || receipt.plan.coordinate != self.custody.coordinate
             || receipt.digest != ack_digest(receipt.plan)
             || self.custody.state.phase.load(Ordering::Acquire) != REPLY_ACKNOWLEDGED
@@ -595,6 +642,100 @@ impl ReceiptVerifier for ReplyRetirementVerifier<'_> {
             retirement_digest(receipt.plan),
         ))
     }
+}
+
+/// Builds the exact production identity registered for one reply receipt
+/// schema.  `VerifierIdentity::new` remains reserved for the unscoped legacy
+/// task probe; a scoped challenge must carry this implementation binding.
+#[cfg(any(feature = "cser-production", feature = "cser-core-reply-recovery"))]
+fn reply_verifier_identity(
+    schema: ReceiptSchemaId,
+    implementation_digest: Digest,
+) -> VerifierIdentity {
+    let generation = VerifierGeneration::new(1).expect("standard verifier generation is non-zero");
+    let binding = VerifierBinding::new(REPLY_VERIFIER, generation, schema, implementation_digest)
+        .expect("standard reply verifier binding is valid");
+    VerifierIdentity::new_exact(binding)
+}
+
+#[cfg(any(feature = "cser-production", feature = "cser-core-reply-recovery"))]
+fn reply_binding(schema: ReceiptSchemaId) -> Option<VerifierBinding> {
+    let implementation_digest = match schema {
+        REPLY_RECEIPT_SCHEMA => REPLY_RECEIPT_IMPLEMENTATION_DIGEST,
+        REPLY_APPLY_RECEIPT_SCHEMA => REPLY_APPLY_IMPLEMENTATION_DIGEST,
+        REPLY_SETTLEMENT_RECEIPT_SCHEMA => REPLY_SETTLEMENT_IMPLEMENTATION_DIGEST,
+        _ => return None,
+    };
+    VerifierBinding::new(
+        REPLY_VERIFIER,
+        VerifierGeneration::new(1).ok()?,
+        schema,
+        implementation_digest,
+    )
+    .ok()
+}
+
+#[cfg(feature = "cser-production")]
+fn reply_provider_coordinate() -> cser_core::ProviderCoordinate {
+    STANDARD_REPLY_PROVIDER
+}
+
+#[cfg(feature = "cser-core-reply-recovery")]
+fn reply_provider_coordinate() -> ProviderCoordinate {
+    ProviderCoordinate::new(
+        WorldId::new(1).expect("reply probe world is non-zero"),
+        ProviderId::new(1).expect("reply probe provider is non-zero"),
+        ProviderGeneration::new(1).expect("reply probe provider generation is non-zero"),
+    )
+}
+
+#[cfg(any(feature = "cser-production", feature = "cser-core-reply-recovery"))]
+fn reply_challenge_scope_matches(challenge: &EffectFactChallenge, schema: ReceiptSchemaId) -> bool {
+    match (
+        challenge.verification_scope(),
+        challenge.expected_verifier_binding(),
+    ) {
+        (None, None) => false,
+        (Some(scope), Some(binding)) => {
+            let provider = reply_provider_coordinate();
+            scope.world() == provider.world()
+                && scope.provider() == provider
+                && scope.verifier_binding() == binding
+                && Some(binding) == reply_binding(schema)
+        }
+        _ => false,
+    }
+}
+
+#[cfg(not(any(feature = "cser-production", feature = "cser-core-reply-recovery")))]
+fn reply_challenge_scope_matches(
+    challenge: &EffectFactChallenge,
+    _schema: ReceiptSchemaId,
+) -> bool {
+    challenge.verification_scope().is_none() && challenge.expected_verifier_binding().is_none()
+}
+
+#[cfg(any(feature = "cser-production", feature = "cser-core-reply-recovery"))]
+fn reply_evidence_scope_matches(challenge: &EvidenceChallenge, schema: ReceiptSchemaId) -> bool {
+    match (
+        challenge.verification_scope(),
+        challenge.expected_verifier_binding(),
+    ) {
+        (None, None) => false,
+        (Some(scope), Some(binding)) => {
+            let provider = reply_provider_coordinate();
+            scope.world() == provider.world()
+                && scope.provider() == provider
+                && scope.verifier_binding() == binding
+                && Some(binding) == reply_binding(schema)
+        }
+        _ => false,
+    }
+}
+
+#[cfg(not(any(feature = "cser-production", feature = "cser-core-reply-recovery")))]
+fn reply_evidence_scope_matches(challenge: &EvidenceChallenge, _schema: ReceiptSchemaId) -> bool {
+    challenge.verification_scope().is_none() && challenge.expected_verifier_binding().is_none()
 }
 
 fn apply_observation(plan: ReplyPlan) -> ReplyApplyObservation {

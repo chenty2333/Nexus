@@ -26,19 +26,21 @@ use core::{
 };
 
 use cser_core::{
-    AGENT_COMPONENT_DMA, AGENT_COMPONENT_REPLY, AGENT_OPERATION_COMPOSITE, AuthorityState,
-    CSER_CORE_API_PROFILE_VERSION, ChargeAccountId, ClaimId, ClaimScope, Command, CommandRequest,
-    CommitIntent, CommitState, ComponentClaimProjection, ComponentCommitOperation, ComponentId,
-    ComponentProjection, CompositeEffectProjection, CoordinatedPersistence, CoreError, CoreLimits,
-    CustodyState, DEVICE_CLAIM_IOVA, DEVICE_CLAIM_PINNED_PAGE, DEVICE_CLAIM_QUEUE_SLOT,
+    AGENT_COMPONENT_DMA, AGENT_COMPONENT_REPLY, AGENT_OPERATION_COMPOSITE,
+    AuthorityBindingGeneration, AuthorityState, CSER_CORE_API_PROFILE_VERSION, ChargeAccountId,
+    ClaimId, ClaimScope, Command, CommandRequest, CommitIntent, CommitState,
+    ComponentClaimProjection, ComponentCommitOperation, ComponentId, ComponentProjection,
+    ComponentProviderBinding, CompositeEffectProjection, CoordinatedPersistence, CoreError,
+    CoreLimits, CustodyState, DEVICE_CLAIM_IOVA, DEVICE_CLAIM_PINNED_PAGE, DEVICE_CLAIM_QUEUE_SLOT,
     DEVICE_DOMAIN, DEVICE_EVIDENCE_IOTLB, DEVICE_EVIDENCE_IRQ_DRAINED, DEVICE_EVIDENCE_RESET,
     DEVICE_OBLIGATION_DMA, DMA_ARENA_REUSE_COMPOSITE, Digest, EffectEscapeState, EffectId, Engine,
-    JOURNAL_SCHEMA_VERSION, OutcomeState, PROJECTION_VERSION, PrincipalId, PrincipalIncarnation,
-    RECOVERY_SNAPSHOT_VERSION, REPLY_CLAIM_PUBLICATION_SLOT, REPLY_DOMAIN,
-    REPLY_EVIDENCE_PUBLICATION_ACK, REPLY_OBLIGATION_PUBLICATION, RecoveryBinding,
-    RegistryInstance, ResourceGeneration, ResourceId, RetirementState, ReusePermit, RootId,
-    RootRecoveryState, STANDARD_CATALOG_VERSION, SettlementClaim, SettlementState, SnapshotId,
-    TransitionDurability, TransitionOutput, TransitionReceipt, TxError, standard_catalog,
+    JOURNAL_SCHEMA_VERSION, OperationId, OutcomeState, PROJECTION_VERSION, PrincipalId,
+    PrincipalIncarnation, ProviderEffectState, RECOVERY_SNAPSHOT_VERSION,
+    REPLY_CLAIM_PUBLICATION_SLOT, REPLY_DOMAIN, REPLY_EVIDENCE_PUBLICATION_ACK,
+    REPLY_OBLIGATION_PUBLICATION, RecoveryBinding, RecoveryProfile, RegistryInstance,
+    ResourceGeneration, ResourceId, RetirementState, ReusePermit, RootId, RootRecoveryState,
+    STANDARD_CATALOG_VERSION, SettlementClaim, SettlementState, SnapshotId, TransitionDurability,
+    TransitionOutput, TransitionReceipt, TxError, standard_catalog,
 };
 use nexus_ostd_virtio::{
     BootQuarantineGuard, MaskedIntx, OwnerKind, PersistentDmaArenaLayout, ProductionDevice,
@@ -69,12 +71,14 @@ use super::{
         PortalResponseBody,
     },
     core_production_registry::{
-        InstalledCore, ProductionCoreOwner, ProductionIngressError, ProductionIngressExitObserver,
-        ProductionIngressIdentity, ProductionIngressTaskData, ProductionRegistryError,
+        InstalledCore, PRODUCTION_WORLD, ProductionCoreOwner, ProductionIngressError,
+        ProductionIngressExitObserver, ProductionIngressIdentity, ProductionIngressTaskData,
+        ProductionRegistryError, STANDARD_DMA_PROVIDER, STANDARD_REPLY_PROVIDER,
+        standard_verifier_bindings,
     },
     core_qemu_persistent_boot::{
         PreparedQemuPersistentBoot, QemuPersistentAnchor, QemuPersistentBootError,
-        is_legacy_schema5, persistent_dma_arena_digest,
+        is_legacy_schema8, persistent_dma_arena_digest,
     },
     core_reboot::{BootActivationBlock, BootActivationFailure, QuarantinedRecoveredBoot},
     core_reply_adapter::{
@@ -904,9 +908,11 @@ pub(crate) fn launch() -> ! {
 fn run_persistent_recovery() {
     let catalog = standard_catalog();
     let binding = RecoveryBinding::new(
+        RecoveryProfile::current(),
+        PRODUCTION_WORLD,
         catalog.digest(),
         RegistryInstance::new(1).expect("persistent Registry identity is non-zero"),
-        1,
+        AuthorityBindingGeneration::new(1).expect("persistent binding is non-zero"),
     )
     .expect("persistent recovery binding is valid");
     let mut prepared = match PreparedQemuPersistentBoot::acquire() {
@@ -918,16 +924,16 @@ fn run_persistent_recovery() {
         Ok(bytes) => bytes,
         Err(error) => fail_closed(qemu_boot_failure_reason(error), prepared),
     };
-    if is_legacy_schema5(&selected_bytes) {
+    if is_legacy_schema8(&selected_bytes) {
         if selected_tip.revision() == 0 || selected_tip.head().is_zero() {
-            fail_closed("unanchored-schema5-journal", prepared);
+            fail_closed("unanchored-schema8-journal", prepared);
         }
         let quarantine = prepared.quarantine_observation();
         println!(
-            "CSER_CORE_SCHEMA5_MIGRATION_REQUIRED PASS trusted_tpm_candidate_selected=true \
-             profile2_binding_authorized=false \
+            "CSER_CORE_SCHEMA8_MIGRATION_REQUIRED PASS trusted_tpm_candidate_selected=true \
+             profile5_binding_authorized=false \
              selected_revision={} selected_head={} selected_catalog={} expected_catalog={} \
-             anchor_binding_match={} journal_schema=5 typed_error=migration-required \
+             anchor_binding_match={} journal_schema=8 typed_error=migration-required \
              semantic_replay=false inferred_pairing=false pre_replay_quarantine=true \
              bus_master_disabled={} intx_masked={} reset_status_zero={} \
              observed_isr_bits={} isr_reads={} consecutive_empty_isr_reads={} \
@@ -949,11 +955,19 @@ fn run_persistent_recovery() {
             quarantine.iotlb_used_remapped_iova(),
             quarantine.iotlb_completed_trigger_pages(),
         );
-        fail_closed("schema5-migration-required", prepared)
+        fail_closed("schema8-migration-required", prepared)
     }
     let boot = match prepared.recover(catalog, CoreLimits::bounded_default(), binding) {
         Ok(boot) => boot,
-        Err(error) => fail_closed(qemu_boot_failure_reason(error), ()),
+        Err(error) => {
+            if let QemuPersistentBootError::RecoveryCore(core) = &error {
+                println!(
+                    "CSER_CORE_PERSISTENT_RECOVERY_DIAGNOSTIC stage=core error={:?}",
+                    core
+                );
+            }
+            fail_closed(qemu_boot_failure_reason(error), ())
+        }
     };
 
     if boot.observe(|engine| engine.profile_one_estate_count() != 0) {
@@ -991,8 +1005,102 @@ const fn qemu_boot_failure_reason(error: QemuPersistentBootError) -> &'static st
         QemuPersistentBootError::AtaJournalRead => "ata-journal-read",
         QemuPersistentBootError::CatalogBindingMismatch => "recovery-catalog-binding",
         QemuPersistentBootError::AnchorBinding => "tpm2-anchor-binding",
+        QemuPersistentBootError::RecoveryCore(_) => "anchored-core-replay",
+        QemuPersistentBootError::RecoveryCheckpoint => "recovery-checkpoint",
         QemuPersistentBootError::Recovery => "anchored-replay",
     }
+}
+
+/// Ensures that the trusted owner has registered the exact standard adapter
+/// generations before any scoped effect admission is attempted.
+///
+/// Registration is deliberately explicit and idempotent only for an already
+/// matching durable projection. A mismatched or partially registered record is
+/// a fail-closed startup condition; it is never repaired by silently choosing a
+/// new epoch or verifier set.
+fn ensure_standard_provider_generations<S>(
+    owner: &ProductionCoreOwner<S>,
+) -> Result<(), &'static str>
+where
+    S: InstalledCore,
+{
+    let catalog_digest = owner.observe_engine(|engine| engine.catalog_digest());
+    let expected = standard_verifier_bindings();
+    for coordinate in [STANDARD_REPLY_PROVIDER, STANDARD_DMA_PROVIDER] {
+        match owner.trusted_provider_generation(coordinate) {
+            Some(projection)
+                if projection.coordinate == coordinate
+                    && projection.catalog_digest == catalog_digest
+                    && projection.verifier_bindings == expected
+                    && projection.state == ProviderEffectState::Active => {}
+            Some(_) => return Err("provider-generation-projection-mismatch"),
+            None => {
+                owner
+                    .register_provider_generation(
+                        coordinate,
+                        catalog_digest,
+                        standard_verifier_bindings(),
+                    )
+                    .map_err(|_| "provider-generation-register")?;
+                let registered = owner
+                    .trusted_provider_generation(coordinate)
+                    .ok_or("provider-generation-register-projection")?;
+                if registered.coordinate != coordinate
+                    || registered.catalog_digest != catalog_digest
+                    || registered.verifier_bindings != expected
+                    || registered.state != ProviderEffectState::Active
+                {
+                    return Err("provider-generation-register-mismatch");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Admits one standard operation through one closed component/provider set.
+/// Existing records must already carry the same scoped identity; an old
+/// unscoped composite is not upgraded in place.
+fn ensure_standard_scoped_composite<S>(
+    owner: &ProductionCoreOwner<S>,
+    effect: EffectId,
+    operation: OperationId,
+    origin: PrincipalIncarnation,
+    binding_generation: u64,
+    kind: cser_core::CompositeKindId,
+    bindings: Vec<ComponentProviderBinding>,
+) -> Result<(), &'static str>
+where
+    S: InstalledCore,
+{
+    if bindings.iter().any(|binding| binding.artifact().is_some()) {
+        return Err("standard-component-artifact-not-required");
+    }
+    let composite = owner.observe_engine(|engine| engine.composite_effect(effect));
+    if let Some(composite) = composite {
+        if composite.operation != Some(operation) || composite.provider_bindings != bindings {
+            return Err("scoped-admission-projection-mismatch");
+        }
+        return Ok(());
+    }
+    owner
+        .admit_scoped_composite_effect(
+            effect,
+            operation,
+            origin,
+            binding_generation,
+            kind,
+            operation_charge_account(),
+            bindings.clone(),
+        )
+        .map_err(|_| "scoped-admission")?;
+    let admitted = owner
+        .observe_engine(|engine| engine.composite_effect(effect))
+        .ok_or("scoped-admission-projection")?;
+    if admitted.operation != Some(operation) || admitted.provider_bindings != bindings {
+        return Err("scoped-admission-projection-mismatch");
+    }
+    Ok(())
 }
 
 fn run_activation_boot(boot: PersistentBoot) -> ! {
@@ -1015,6 +1123,9 @@ fn run_activation_boot(boot: PersistentBoot) -> ! {
     let supervisor = CoreSupervisorVNext::new(supervisor_owner);
     if supervisor.protocol() != CORE_SUPERVISOR_PROTOCOL {
         fail_closed("supervisor-protocol", (owner, supervisor, devices));
+    }
+    if let Err(reason) = ensure_standard_provider_generations(&owner) {
+        fail_closed(reason, (owner, supervisor, devices));
     }
 
     let outbox = match AtaPioReplyOutbox::acquire_secondary_master() {
@@ -1046,6 +1157,18 @@ fn run_activation_boot(boot: PersistentBoot) -> ! {
         if ingress.identity.snapshot.is_some() {
             ingress.ready_and_wait_for_rebind()?;
         }
+        ensure_standard_scoped_composite(
+            &ingress.owner,
+            operation_effect(),
+            operation_id(),
+            ingress.identity.ingress.incarnation(),
+            ingress.identity.ingress.binding_generation(),
+            AGENT_OPERATION_COMPOSITE,
+            vec![
+                ComponentProviderBinding::new(AGENT_COMPONENT_REPLY, STANDARD_REPLY_PROVIDER),
+                ComponentProviderBinding::new(AGENT_COMPONENT_DMA, STANDARD_DMA_PROVIDER),
+            ],
+        )?;
         let portal = CorePortalVNext::new(Arc::clone(&ingress.owner));
         let task_supervisor = CoreSupervisorVNext::new(Arc::clone(&ingress.owner));
         let output = publish_first_boot_operation(
@@ -1387,6 +1510,18 @@ fn run_reuse_activation_boot(
     let task_output = Arc::clone(&output);
     let run = match build_production_service(&owner, identity, move |ingress| {
         ingress.ready_and_wait_for_rebind()?;
+        ensure_standard_scoped_composite(
+            &ingress.owner,
+            reuse_effect(),
+            reuse_operation_id(),
+            ingress.identity.ingress.incarnation(),
+            ingress.identity.ingress.binding_generation(),
+            DMA_ARENA_REUSE_COMPOSITE,
+            vec![ComponentProviderBinding::new(
+                AGENT_COMPONENT_DMA,
+                STANDARD_DMA_PROVIDER,
+            )],
+        )?;
         let mut outbox = outbox;
         let endpoint = endpoint
             .as_ref()
@@ -1633,20 +1768,17 @@ fn publish_reused_dma(
         return Err("old-dma-scope-mismatch");
     }
     let arena = persistent_dma_arena_layout().ok_or("dma-arena-layout-absent")?;
-    let mut composite = ingress.observe(|engine| engine.composite_effect(reuse_effect()))?;
-    if composite.is_none() {
-        expect_no_output_checked(ingress.transact(CommandRequest::CreateCompositeEffect {
-            effect: reuse_effect(),
-            origin: actor,
-            binding_generation,
-            kind: DMA_ARENA_REUSE_COMPOSITE,
-            charge_account: operation_charge_account(),
-        })?)?;
-        composite = ingress.observe(|engine| engine.composite_effect(reuse_effect()))?;
-    }
-    let composite = composite.ok_or("dma-reuse-effect-disappeared")?;
+    let composite = ingress
+        .observe(|engine| engine.composite_effect(reuse_effect()))?
+        .ok_or("scoped-admission-missing")?;
     if composite.effect != reuse_effect()
         || composite.kind != DMA_ARENA_REUSE_COMPOSITE
+        || composite.operation != Some(reuse_operation_id())
+        || composite.provider_bindings
+            != vec![ComponentProviderBinding::new(
+                AGENT_COMPONENT_DMA,
+                STANDARD_DMA_PROVIDER,
+            )]
         || composite.causal_owner.principal() != actor.principal()
         || composite.charge_owner != operation_charge_account()
         || composite.component_count != 1
@@ -1809,25 +1941,15 @@ where
     S: InstalledCore + 'static,
 {
     let effect = operation_effect();
-    let mut resumed_prefix = true;
-    let mut composite = owner.observe_engine(|engine| engine.composite_effect(effect));
+    let resumed_prefix = owner.observe_engine(|engine| {
+        engine.composite_effect(effect).is_some()
+            && engine
+                .component_claims(effect, AGENT_COMPONENT_REPLY)
+                .is_ok_and(|claims| !claims.is_empty())
+    });
+    let composite = owner.observe_engine(|engine| engine.composite_effect(effect));
     if composite.is_none() {
-        if actor != operation_origin() || binding_generation != 1 {
-            return Err("composite-create-after-root-recovery");
-        }
-        resumed_prefix = false;
-        portal_tx_checked(
-            portal,
-            0xc501_0001,
-            CommandRequest::CreateCompositeEffect {
-                effect,
-                origin: operation_origin(),
-                binding_generation,
-                kind: AGENT_OPERATION_COMPOSITE,
-                charge_account: operation_charge_account(),
-            },
-        )?;
-        composite = owner.observe_engine(|engine| engine.composite_effect(effect));
+        return Err("scoped-admission-missing");
     }
 
     let projection = composite.ok_or("composite-effect-disappeared")?;
@@ -2124,6 +2246,9 @@ fn rebase_prearm_and_activate(boot: PersistentBoot) -> ! {
         Ok(owner) => Arc::new(owner),
         Err(error) => fail_closed("prearm-profile2-install", error),
     };
+    if let Err(reason) = ensure_standard_provider_generations(&owner) {
+        fail_closed(reason, owner);
+    }
     let supervisor = CoreSupervisorVNext::new(Arc::clone(&owner));
     let identity = match prepare_production_service(
         &owner,
@@ -2252,6 +2377,9 @@ fn run_quarantined_boot(boot: PersistentBoot) -> ! {
         Ok(owner) => Arc::new(owner),
         Err(error) => fail_closed("profile2-quarantined-install", error),
     };
+    if let Err(reason) = ensure_standard_provider_generations(&owner) {
+        fail_closed(reason, owner);
+    }
     let supervisor_owner = Arc::clone(&owner);
     let reply_owner = Arc::clone(&owner);
     let dma_owner = Arc::clone(&owner);
@@ -3168,6 +3296,12 @@ fn inspect_reply_delivery(
 fn validate_composite_projection(composite: &CompositeEffectProjection) -> bool {
     composite.effect == operation_effect()
         && composite.kind == AGENT_OPERATION_COMPOSITE
+        && composite.operation == Some(operation_id())
+        && composite.provider_bindings
+            == vec![
+                ComponentProviderBinding::new(AGENT_COMPONENT_REPLY, STANDARD_REPLY_PROVIDER),
+                ComponentProviderBinding::new(AGENT_COMPONENT_DMA, STANDARD_DMA_PROVIDER),
+            ]
         && composite.causal_owner == operation_origin()
         && composite.charge_owner == operation_charge_account()
         && composite.component_count == 2
@@ -3278,6 +3412,12 @@ fn validate_reuse_precommit(engine: &Engine) -> bool {
     };
     composite.effect == reuse_effect()
         && composite.kind == DMA_ARENA_REUSE_COMPOSITE
+        && composite.operation == Some(reuse_operation_id())
+        && composite.provider_bindings
+            == vec![ComponentProviderBinding::new(
+                AGENT_COMPONENT_DMA,
+                STANDARD_DMA_PROVIDER,
+            )]
         && composite.charge_owner == operation_charge_account()
         && composite.component_count == 1
         && composite.authority == AuthorityState::Active
@@ -3805,9 +3945,19 @@ fn operation_effect() -> EffectId {
     EffectId::new(operation_root(), 1).expect("agent operation effect is non-zero")
 }
 
+/// Stable semantic operation identity for the standard reply+DMA operation.
+fn operation_id() -> OperationId {
+    OperationId::new(1).expect("agent operation identity is non-zero")
+}
+
 fn reuse_effect() -> EffectId {
     EffectId::new(operation_root(), REUSE_EFFECT_SEQUENCE)
         .expect("DMA reuse effect identity is non-zero")
+}
+
+/// Stable semantic operation identity for the DMA-only reuse operation.
+fn reuse_operation_id() -> OperationId {
+    OperationId::new(2).expect("DMA reuse operation identity is non-zero")
 }
 
 fn operation_origin() -> PrincipalIncarnation {

@@ -12,11 +12,6 @@
 # OSDK/QEMU outputs
 kernel/nexus-ostd/artifacts/
 kernel/nexus-ostd/guest/*.bin
-experiments/ostd-virtio-cser-spike/artifacts/
-specs/cser/states/
-specs/cser/*_TTrace_*.bin
-specs/cser/*_TTrace_*.tla
-specs/cser/*.old
 
 # Local agent/editor control files
 /AGENTS.md

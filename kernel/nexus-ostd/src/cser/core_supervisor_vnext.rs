@@ -288,8 +288,9 @@ impl<A: RecoveredCoreAuthority> CoreSupervisorVNext<A> {
 mod tests {
     use cser_core::{
         AGENT_COMPONENT_REPLY, AGENT_OPERATION_COMPOSITE, BootGeneration, ChargeAccountId,
-        CoreLimits, DeviceGeneration, Engine, Freshness, JournalGeneration, JournalRecord,
-        PrincipalId, RegistryInstance, TransitionEvent, TransitionOutput, standard_catalog,
+        CoreLimits, DeviceGeneration, Digest, Engine, Freshness, JournalGeneration, JournalRecord,
+        PrincipalId, RegistryInstance, TransitionEvent, TransitionOutput, WorldId,
+        standard_catalog,
     };
 
     use super::*;
@@ -306,6 +307,7 @@ mod tests {
             &mut self,
             record: &JournalRecord,
             resulting_freshness: Freshness,
+            _resulting_projection: Digest,
         ) -> Result<(), Self::Error> {
             assert!(!record.bytes().is_empty());
             assert_eq!(resulting_freshness, freshness());
@@ -348,6 +350,7 @@ mod tests {
     fn runtime(fail_at: Option<usize>) -> Arc<OstdCserRuntime<TestDurability>> {
         Arc::new(OstdCserRuntime::from_engine(
             Engine::new(
+                WorldId::new(1).unwrap(),
                 standard_catalog(),
                 CoreLimits::bounded_default(),
                 freshness(),

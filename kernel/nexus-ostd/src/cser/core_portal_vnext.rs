@@ -340,6 +340,12 @@ impl CoreObservation {
 /// Trusted transition family which cannot enter the client portal.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TrustedTransition {
+    /// Provider registration, fencing, drain, and retirement are owner-owned.
+    ProviderLifecycle,
+    /// Closed component/provider admission is owner-owned.
+    ScopedAdmission,
+    /// Recovery-artifact verifier binding and release are owner-owned.
+    ArtifactLifecycle,
     /// Immediate incarnation fencing is supervisor-owned.
     Fence,
     /// Snapshot readiness and binding installation are supervisor-owned.
@@ -471,17 +477,25 @@ fn require_client_command(request: &CommandRequest) -> Result<(), PortalPolicyEr
         return Err(PortalPolicyError::ProfileOneCommandForbidden);
     }
     let trusted = match request {
-        CommandRequest::CreateCompositeEffect { .. }
-        | CommandRequest::AddComponentClaim { .. }
+        CommandRequest::AddComponentClaim { .. }
         | CommandRequest::PrepareCompositeEffect { .. }
         | CommandRequest::RecordComponentCommitIntent { .. }
         | CommandRequest::RecordCompositeCommitIntents { .. } => return Ok(()),
         CommandRequest::CreateEstate { .. }
+        | CommandRequest::CreateCompositeEffect { .. }
         | CommandRequest::AddClaim { .. }
         | CommandRequest::PrepareEffect { .. }
         | CommandRequest::RecordCommitIntent { .. } => {
             return Err(PortalPolicyError::ProfileOneCommandForbidden);
         }
+        CommandRequest::RegisterProviderGeneration { .. }
+        | CommandRequest::FenceProviderEffects { .. }
+        | CommandRequest::EnterProviderSettlementOnly { .. }
+        | CommandRequest::RetireProviderEffects { .. } => TrustedTransition::ProviderLifecycle,
+        CommandRequest::AdmitScopedCompositeEffect { .. } => TrustedTransition::ScopedAdmission,
+        CommandRequest::BindArtifactReceiptVerifiers { .. }
+        | CommandRequest::AuthorizeArtifactRelease { .. } => TrustedTransition::ArtifactLifecycle,
+        CommandRequest::AbortUnescapedEffect { .. } => TrustedTransition::Retirement,
         CommandRequest::FenceIncarnation { .. } => TrustedTransition::Fence,
         CommandRequest::Ready { .. } | CommandRequest::Rebind { .. } => TrustedTransition::Recovery,
         CommandRequest::AdoptEffect { .. }
@@ -706,11 +720,12 @@ mod tests {
     }
 
     #[test]
-    fn profile_one_client_prefix_is_rejected_before_the_shared_owner() {
+    fn predecessor_client_prefix_is_rejected_before_the_shared_owner() {
         let owner = Arc::new(FakeRegistry::new());
         let portal = CorePortalVNext::new(Arc::clone(&owner));
         let commands = [
             create(),
+            create_composite(),
             add_claim(),
             CommandRequest::PrepareEffect {
                 effect: effect(),
@@ -739,11 +754,10 @@ mod tests {
     }
 
     #[test]
-    fn composite_creation_prefix_reaches_the_shared_owner() {
+    fn scoped_composite_mutation_prefix_reaches_the_shared_owner() {
         let owner = Arc::new(FakeRegistry::new());
         let portal = CorePortalVNext::new(Arc::clone(&owner));
         let commands = [
-            create_composite(),
             add_component_claim(),
             CommandRequest::PrepareCompositeEffect {
                 effect: effect(),
@@ -773,7 +787,7 @@ mod tests {
             assert_eq!(response.request_id(), request_id);
             assert!(matches!(response.body(), PortalResponseBody::Transition(_)));
         }
-        assert_eq!(owner.transacts.load(Ordering::Acquire), 5);
+        assert_eq!(owner.transacts.load(Ordering::Acquire), 4);
     }
 
     #[test]

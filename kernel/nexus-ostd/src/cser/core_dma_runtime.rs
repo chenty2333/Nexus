@@ -25,11 +25,16 @@ use core::{
 };
 
 use cser_core::{
-    BootGeneration, ChargeAccountId, ClaimId, Command, CommandRequest, CoreError, CoreLimits,
-    DeviceGeneration, Digest, EffectId, Engine, Freshness, JournalGeneration, JournalRecord,
-    PrincipalId, PrincipalIncarnation, RegistryInstance, ResourceGeneration, ResourceId, RootId,
-    SnapshotId, TransitionDurability, TransitionOutput, TransitionReceipt, TxError,
-    standard_catalog,
+    AGENT_COMPONENT_DMA, BootGeneration, CSER_CORE_API_PROFILE_VERSION, ChargeAccountId, ClaimId,
+    ClaimScope, Command, CommandRequest, ComponentProviderBinding, CoreError, CoreLimits,
+    DEVICE_CLAIM_IOVA, DEVICE_CLAIM_PINNED_PAGE, DEVICE_CLAIM_QUEUE_SLOT,
+    DEVICE_COMMIT_RECEIPT_SCHEMA, DEVICE_RECEIPT_SCHEMA, DEVICE_VERIFIER,
+    DMA_ARENA_REUSE_COMPOSITE, DeviceGeneration, DeviceScopeId, Digest, EffectId, Engine,
+    Freshness, JournalGeneration, JournalRecord, OperationId, PrincipalId, PrincipalIncarnation,
+    REPLY_APPLY_RECEIPT_SCHEMA, REPLY_COMMIT_RECEIPT_SCHEMA, REPLY_RECEIPT_SCHEMA,
+    REPLY_SETTLEMENT_RECEIPT_SCHEMA, REPLY_VERIFIER, RegistryInstance, ResourceGeneration,
+    ResourceId, RootId, SnapshotId, TransitionDurability, TransitionOutput, TransitionReceipt,
+    TxError, VerifierBinding, VerifierGeneration, standard_catalog,
 };
 use nexus_ostd_virtio::{
     CompletedRequest, CompletionMode, InterruptCompletionProgress, InterruptNotReadyReason,
@@ -47,8 +52,8 @@ use ostd::{
 
 use super::core_dma_adapter::{
     ClaimRole, CoreDmaClaim, CoreDmaClaims, CoreDmaCohort, CoreReuseReservation,
-    acknowledge_real_irq, apply_real_iotlb_closure, apply_real_reset_generation, bind_queue_commit,
-    complete_real_irq, publish_real_queue,
+    DMA_RECOVERY_PROVIDER, acknowledge_real_irq, apply_real_iotlb_closure,
+    apply_real_reset_generation, bind_queue_commit, complete_real_irq, publish_real_queue,
 };
 use super::core_runtime::OstdCserRuntime;
 
@@ -84,6 +89,7 @@ impl TransitionDurability for VolatileDmaDurability {
         &mut self,
         record: &JournalRecord,
         resulting_freshness: Freshness,
+        _resulting_projection: Digest,
     ) -> Result<(), Self::Error> {
         assert!(!record.bytes().is_empty());
         assert_ne!(resulting_freshness.boot().get(), 0);
@@ -95,21 +101,78 @@ impl TransitionDurability for VolatileDmaDurability {
 type DmaRuntime = OstdCserRuntime<VolatileDmaDurability>;
 
 fn new_dma_runtime() -> DmaRuntime {
-    OstdCserRuntime::from_engine(
-        Engine::new_legacy_compatibility(
-            standard_catalog(),
-            CoreLimits::bounded_default(),
-            Freshness::new(
-                nz::<BootGeneration>(1),
-                nz::<RegistryInstance>(1),
-                1,
-                nz::<DeviceGeneration>(1),
-                nz::<JournalGeneration>(1),
-            )
-            .expect("DMA runtime freshness is complete"),
+    let world = DMA_RECOVERY_PROVIDER.world();
+    let catalog = standard_catalog();
+    let mut engine = Engine::new(
+        world,
+        catalog.clone(),
+        CoreLimits::bounded_default(),
+        Freshness::new(
+            nz::<BootGeneration>(1),
+            nz::<RegistryInstance>(1),
+            1,
+            nz::<DeviceGeneration>(1),
+            nz::<JournalGeneration>(1),
+        )
+        .expect("DMA runtime freshness is complete"),
+    );
+    // The DMA slice runs against the current profile-5 command grammar.  Both
+    // DMA provider is registered before any effect can bind a component, so
+    // every later receipt/evidence challenge has an exact
+    // world/provider/generation and verifier binding to check.
+    engine
+        .transact(
+            CommandRequest::RegisterProviderGeneration {
+                coordinate: DMA_RECOVERY_PROVIDER,
+                catalog_digest: catalog.digest(),
+                verifier_bindings: dma_recovery_verifier_bindings(),
+            },
+            |_| Ok::<(), Infallible>(()),
+        )
+        .expect("DMA runtime provider generation registration is valid");
+    OstdCserRuntime::from_engine(engine, VolatileDmaDurability::new())
+}
+
+fn dma_recovery_verifier_bindings() -> Vec<VerifierBinding> {
+    let generation = VerifierGeneration::new(1).expect("DMA verifier generation is non-zero");
+    [
+        (
+            REPLY_VERIFIER,
+            REPLY_RECEIPT_SCHEMA,
+            Digest::new([0x51; 32]),
         ),
-        VolatileDmaDurability::new(),
-    )
+        (
+            REPLY_VERIFIER,
+            REPLY_COMMIT_RECEIPT_SCHEMA,
+            Digest::new([0x52; 32]),
+        ),
+        (
+            REPLY_VERIFIER,
+            REPLY_APPLY_RECEIPT_SCHEMA,
+            Digest::new([0x53; 32]),
+        ),
+        (
+            REPLY_VERIFIER,
+            REPLY_SETTLEMENT_RECEIPT_SCHEMA,
+            Digest::new([0x54; 32]),
+        ),
+        (
+            DEVICE_VERIFIER,
+            DEVICE_RECEIPT_SCHEMA,
+            Digest::new([0x61; 32]),
+        ),
+        (
+            DEVICE_VERIFIER,
+            DEVICE_COMMIT_RECEIPT_SCHEMA,
+            Digest::new([0x62; 32]),
+        ),
+    ]
+    .into_iter()
+    .map(|(verifier, schema, implementation)| {
+        VerifierBinding::new(verifier, generation, schema, implementation)
+            .expect("DMA recovery verifier binding is valid")
+    })
+    .collect()
 }
 
 struct ServiceControl {
@@ -258,8 +321,9 @@ fn run_dma_recovery_slice() {
     let first_identity = receipted.identity();
     let first_addresses = dma_addresses(first_identity.device_generation());
     let claims1 = dma_claims(0x100, 1);
-    let cohort1 = CoreDmaCohort::bind(
+    let cohort1 = CoreDmaCohort::bind_component(
         effect1,
+        AGENT_COMPONENT_DMA,
         origin,
         1,
         nz::<ChargeAccountId>(0xd001),
@@ -268,7 +332,14 @@ fn run_dma_recovery_slice() {
     )
     .expect("first real request binds to the portable core");
 
-    enroll_new_effect(&core, cohort1);
+    enroll_new_effect(
+        &core,
+        cohort1,
+        OperationId::new(1).expect("first DMA operation is valid"),
+        origin,
+        1,
+        nz::<ChargeAccountId>(0xd001),
+    );
     let intent1 = commit_intent(&core, cohort1, digest(0x11));
     let authority1 = core
         .observe(move |engine| bind_queue_commit(engine, intent1, cohort1))
@@ -306,7 +377,13 @@ fn run_dma_recovery_slice() {
     let snapshot1 = core
         .observe(|engine| engine.snapshot_root(root_id, nz::<SnapshotId>(1)))
         .expect("first DMA post-mortem snapshot is available");
-    assert_eq!(snapshot1.items().len(), 1);
+    assert_eq!(snapshot1.items().len(), 0);
+    assert_eq!(snapshot1.composites().len(), 1);
+    assert_eq!(snapshot1.composites()[0].components.len(), 1);
+    assert_eq!(
+        snapshot1.composites()[0].components[0].component,
+        AGENT_COMPONENT_DMA
+    );
     tx(&core, snapshot1.record());
     tx(
         &core,
@@ -343,7 +420,13 @@ fn run_dma_recovery_slice() {
     let snapshot2 = core
         .observe(|engine| engine.snapshot_root(root_id, nz::<SnapshotId>(2)))
         .expect("second-crash DMA snapshot is available");
-    assert_eq!(snapshot2.items().len(), 1);
+    assert_eq!(snapshot2.items().len(), 0);
+    assert_eq!(snapshot2.composites().len(), 1);
+    assert_eq!(snapshot2.composites()[0].components.len(), 1);
+    assert_eq!(
+        snapshot2.composites()[0].components[0].component,
+        AGENT_COMPONENT_DMA
+    );
     tx(&core, snapshot2.record());
     tx(
         &core,
@@ -379,18 +462,18 @@ fn run_dma_recovery_slice() {
     assert_reusable(&core, cohort1);
 
     let effect2 = EffectId::new(root_id, 2).expect("second DMA effect is valid");
-    tx(
-        &core,
-        CommandRequest::CreateEstate {
-            effect: effect2,
-            origin: successor2,
-            binding_generation: 3,
-            domain: cser_core::DEVICE_DOMAIN,
-            obligation: cser_core::DEVICE_OBLIGATION_DMA,
-            charge_account: nz::<ChargeAccountId>(0xd001),
-        },
-    );
     let claims2 = dma_claims(0x200, 2);
+    admit_dma_effect(
+        &core,
+        effect2,
+        OperationId::new(2).expect("second DMA operation is valid"),
+        successor2,
+        3,
+        nz::<ChargeAccountId>(0xd001),
+        cohort1.scope(),
+        claims2,
+        false,
+    );
     for (role, claim) in [
         (ClaimRole::Queue, claims2_for(claims2, ClaimRole::Queue)),
         (
@@ -428,8 +511,9 @@ fn run_dma_recovery_slice() {
     let second_identity = receipted2.identity();
     assert_eq!(second_identity.device_generation(), 2);
     let second_addresses = dma_addresses(second_identity.device_generation());
-    let cohort2 = CoreDmaCohort::bind(
+    let cohort2 = CoreDmaCohort::bind_component(
         effect2,
+        AGENT_COMPONENT_DMA,
         successor2,
         3,
         nz::<ChargeAccountId>(0xd001),
@@ -526,8 +610,10 @@ fn run_dma_recovery_slice() {
         "CSER_CORE_DMA_OSTD_QEMU PASS death=real-task-reap fence=immediate-manager \
          second_crash=true post_mortem_owner=kernel-manager reply_registry=false \
          legacy_registry=false portal_glue=false live_dual_write=false \
-         historical_profile=1 production_profile=false \
-         journal=volatile-dev-only durable_provider=separate-suite qemu=true physical_hardware=false"
+         api_profile={} scoped_providers=true exact_verifier_binding=true \
+         production_profile=false \
+         journal=volatile-dev-only durable_provider=separate-suite qemu=true physical_hardware=false",
+        CSER_CORE_API_PROFILE_VERSION,
     );
     poweroff(ExitCode::Success);
 }
@@ -546,12 +632,93 @@ fn output<C: Into<Command>>(core: &DmaRuntime, command: C) -> TransitionOutput {
     tx(core, command).into_output()
 }
 
-fn enroll_new_effect(core: &DmaRuntime, cohort: CoreDmaCohort) {
-    tx(core, cohort.create_estate());
-    for claim in cohort.enroll_claims() {
-        tx(core, claim);
+fn enroll_new_effect(
+    core: &DmaRuntime,
+    cohort: CoreDmaCohort,
+    operation: OperationId,
+    origin: PrincipalIncarnation,
+    binding_generation: u64,
+    charge_account: ChargeAccountId,
+) {
+    admit_dma_effect(
+        core,
+        cohort.effect(),
+        operation,
+        origin,
+        binding_generation,
+        charge_account,
+        cohort.scope(),
+        CoreDmaClaims::new(
+            cohort.claim(ClaimRole::Queue),
+            cohort.claim(ClaimRole::PinnedPages),
+            cohort.claim(ClaimRole::Iova),
+        ),
+        true,
+    );
+}
+
+/// Enters the profile-5 composite grammar and, for a fresh allocation, enrolls
+/// its device claims before preparation. The reuse path admits only the empty
+/// component first: exact reuse permits create the replacement claims before
+/// the composite crosses the prepared boundary.
+fn admit_dma_effect(
+    core: &DmaRuntime,
+    effect: EffectId,
+    operation: OperationId,
+    origin: PrincipalIncarnation,
+    binding_generation: u64,
+    charge_account: ChargeAccountId,
+    scope: DeviceScopeId,
+    claims: CoreDmaClaims,
+    prepare: bool,
+) {
+    tx(
+        core,
+        CommandRequest::AdmitScopedCompositeEffect {
+            effect,
+            operation,
+            origin,
+            binding_generation,
+            kind: DMA_ARENA_REUSE_COMPOSITE,
+            charge_account,
+            bindings: alloc::vec![ComponentProviderBinding::new(
+                AGENT_COMPONENT_DMA,
+                DMA_RECOVERY_PROVIDER,
+            )],
+        },
+    );
+    if prepare {
+        for (role, kind) in [
+            (ClaimRole::Queue, DEVICE_CLAIM_QUEUE_SLOT),
+            (ClaimRole::PinnedPages, DEVICE_CLAIM_PINNED_PAGE),
+            (ClaimRole::Iova, DEVICE_CLAIM_IOVA),
+        ] {
+            let claim = claims.claim(role);
+            tx(
+                core,
+                CommandRequest::AddComponentClaim {
+                    effect,
+                    component: AGENT_COMPONENT_DMA,
+                    actor: origin,
+                    binding_generation,
+                    claim: claim.claim(),
+                    kind,
+                    scope: ClaimScope::Device(scope),
+                    resource: claim.resource(),
+                    resource_generation: claim.generation(),
+                    units: claim.units(),
+                },
+            );
+        }
+        tx(
+            core,
+            CommandRequest::PrepareCompositeEffect {
+                effect,
+                actor: origin,
+                binding_generation,
+            },
+        );
     }
-    tx(core, cohort.prepare());
 }
 
 fn commit_intent(
@@ -750,10 +917,15 @@ fn close_real_generation(
 
 fn assert_retained(core: &DmaRuntime, cohort: CoreDmaCohort) {
     core.observe(|engine| {
-        let estate = engine
-            .estate(cohort.effect())
-            .expect("DMA estate remains present");
-        assert_eq!(estate.retained_claims, 3);
+        let component = engine
+            .component(
+                cohort.effect(),
+                cohort
+                    .component()
+                    .expect("scoped DMA cohort has a component identity"),
+            )
+            .expect("DMA component remains present");
+        assert_eq!(component.retained_claims, 3);
         for role in [ClaimRole::Queue, ClaimRole::PinnedPages, ClaimRole::Iova] {
             let claim = cohort.claim(role);
             assert_eq!(
@@ -766,10 +938,15 @@ fn assert_retained(core: &DmaRuntime, cohort: CoreDmaCohort) {
 
 fn assert_reusable(core: &DmaRuntime, cohort: CoreDmaCohort) {
     core.observe(|engine| {
-        let estate = engine
-            .estate(cohort.effect())
-            .expect("retired DMA estate remains inspectable");
-        assert_eq!(estate.retained_claims, 0);
+        let component = engine
+            .component(
+                cohort.effect(),
+                cohort
+                    .component()
+                    .expect("scoped DMA cohort has a component identity"),
+            )
+            .expect("retired DMA component remains inspectable");
+        assert_eq!(component.retained_claims, 0);
         for role in [ClaimRole::Queue, ClaimRole::PinnedPages, ClaimRole::Iova] {
             let claim = cohort.claim(role);
             assert_eq!(

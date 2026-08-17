@@ -10,9 +10,13 @@ publish = false
 # The workspace's model and integration tests use explicit in-memory and
 # predecessor-profile fixtures. Production embeddings must opt out, as the
 # Nexus kernel does with `default-features = false`.
-default = ["test-support"]
+default = ["test-support", "full-invariant-oracle"]
 std = []
 test-support = []
+# Runs the authoritative whole-state invariant oracle after every prepared
+# transition. Production embeddings may enable `test-support` fixtures without
+# paying this diagnostic O(total state) cost.
+full-invariant-oracle = []
 
 [dependencies]
 sha2 = { version = "=0.10.9", default-features = false, features = ["force-soft"] }
@@ -31,3 +35,8 @@ required-features = ["std", "test-support"]
 name = "cser-catalog-digest"
 path = "src/bin/cser-catalog-digest.rs"
 required-features = ["std"]
+
+[[test]]
+name = "persistent_provider"
+path = "tests/persistent_provider.rs"
+required-features = ["std", "test-support"]

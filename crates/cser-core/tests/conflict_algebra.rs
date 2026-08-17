@@ -16,7 +16,7 @@ use cser_core::{
     CoreError, CoreLimits, CreditClassId, DeviceGeneration, DeviceGenerationEffect, DeviceScopeId,
     DomainCatalog, DomainCatalogBuilder, DomainId, Engine, EvidenceKindId, EvidenceRule,
     ExternalOutcome, Freshness, FreshnessAxes, ObligationKindId, ObligationPolicy,
-    ObligationReceipts, ReceiptBinding, ReceiptSchemaId, TransitionOutput, VerifierId,
+    ObligationReceipts, ReceiptBinding, ReceiptSchemaId, TransitionOutput, VerifierId, WorldId,
 };
 use support::{
     ExactTestVerifier, Harness, TestReceipt, charge, claim, current_evidence_command, digest,
@@ -271,7 +271,8 @@ fn conflict_mode_participates_in_the_catalog_digest() {
 /// each admission test differs only in the claim class it enrolls.
 fn two_mode_harness() -> Harness {
     let mut harness = Harness {
-        engine: Engine::new_legacy_compatibility(
+        engine: Engine::new_scoped_legacy_compatibility(
+            WorldId::new(1).unwrap(),
             two_mode_catalog(),
             CoreLimits::bounded_default(),
             freshness(1, 1, 1, 1, 1),
@@ -713,7 +714,8 @@ fn shared_newcomer_cannot_bypass_an_exclusive_generation_advancer() {
         .build()
         .unwrap();
     let mut harness = Harness {
-        engine: Engine::new_legacy_compatibility(
+        engine: Engine::new_scoped_legacy_compatibility(
+            WorldId::new(1).unwrap(),
             catalog,
             CoreLimits::bounded_default(),
             freshness(1, 1, 1, 1, 1),

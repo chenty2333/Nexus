@@ -12,7 +12,7 @@ pub enum IdentityError {
 macro_rules! nonzero_id {
     ($name:ident, $inner:ty, $doc:literal) => {
         #[doc = $doc]
-        #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+        #[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
         pub struct $name($inner);
 
         impl $name {
@@ -66,6 +66,11 @@ nonzero_id!(
     JournalGeneration,
     u64,
     "Monotonic journal generation supplied by the persistence provider."
+);
+nonzero_id!(
+    AuthorityBindingGeneration,
+    u64,
+    "Monotonic generation of the global recovery authority binding."
 );
 nonzero_id!(
     DeviceGeneration,
@@ -131,6 +136,70 @@ nonzero_id!(
     u32,
     "Stable domain-defined retirement-evidence class identity."
 );
+nonzero_id!(
+    WorldId,
+    u64,
+    "Stable identity of one authoritative semantic world."
+);
+nonzero_id!(
+    ProviderId,
+    u64,
+    "Stable logical identity of one semantic provider."
+);
+nonzero_id!(
+    ProviderGeneration,
+    u64,
+    "Monotonic generation of one semantic provider."
+);
+nonzero_id!(
+    OperationId,
+    u64,
+    "Stable identity of one general causal operation allocated by the embedding."
+);
+nonzero_id!(
+    RecoveryArtifactId,
+    u64,
+    "Stable identity of one recovery-artifact retention lease."
+);
+nonzero_id!(
+    VerifierGeneration,
+    u64,
+    "Monotonic generation of one receipt verifier."
+);
+
+/// Exact world/provider generation coordinate bound to an effect or receipt.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ProviderCoordinate {
+    world: WorldId,
+    provider: ProviderId,
+    generation: ProviderGeneration,
+}
+
+impl ProviderCoordinate {
+    /// Creates a provider coordinate from its non-zero identity components.
+    pub const fn new(world: WorldId, provider: ProviderId, generation: ProviderGeneration) -> Self {
+        Self {
+            world,
+            provider,
+            generation,
+        }
+    }
+
+    /// Returns the authoritative world identity.
+    pub const fn world(self) -> WorldId {
+        self.world
+    }
+
+    /// Returns the logical provider identity.
+    pub const fn provider(self) -> ProviderId {
+        self.provider
+    }
+
+    /// Returns the provider generation.
+    pub const fn generation(self) -> ProviderGeneration {
+        self.generation
+    }
+}
 
 /// Stable identity of one effect below a causal root.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -314,5 +383,36 @@ impl Freshness {
 
     pub(crate) fn set_device(&mut self, device: DeviceGeneration) {
         self.device = device;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        AuthorityBindingGeneration, IdentityError, OperationId, ProviderCoordinate,
+        ProviderGeneration, ProviderId, RecoveryArtifactId, VerifierGeneration, WorldId,
+    };
+
+    #[test]
+    fn next_profile_identities_reject_zero() {
+        assert_eq!(WorldId::new(0), Err(IdentityError::Zero));
+        assert_eq!(ProviderId::new(0), Err(IdentityError::Zero));
+        assert_eq!(ProviderGeneration::new(0), Err(IdentityError::Zero));
+        assert_eq!(OperationId::new(0), Err(IdentityError::Zero));
+        assert_eq!(RecoveryArtifactId::new(0), Err(IdentityError::Zero));
+        assert_eq!(VerifierGeneration::new(0), Err(IdentityError::Zero));
+        assert_eq!(AuthorityBindingGeneration::new(0), Err(IdentityError::Zero));
+    }
+
+    #[test]
+    fn provider_coordinate_exposes_exact_components() {
+        let world = WorldId::new(11).unwrap();
+        let provider = ProviderId::new(22).unwrap();
+        let generation = ProviderGeneration::new(33).unwrap();
+        let coordinate = ProviderCoordinate::new(world, provider, generation);
+
+        assert_eq!(coordinate.world(), world);
+        assert_eq!(coordinate.provider(), provider);
+        assert_eq!(coordinate.generation(), generation);
     }
 }

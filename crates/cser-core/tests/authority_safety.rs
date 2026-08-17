@@ -3,11 +3,12 @@ mod support;
 
 use cser_core::{
     AuthorityState, CommandRequest as Command, CommitState, CoreError, CoreLimits, CustodyState,
-    Engine, RecoveryAnchor, RootRecoveryState, SettlementState, TransitionOutput, standard_catalog,
+    Engine, RootRecoveryState, SettlementState, TransitionOutput, standard_catalog,
 };
 use support::{
     ExactEffectVerifier, Harness, charge, claim, committed_reply, digest, effect, fence_and_rebind,
-    freshness, principal, resource, resource_generation, snapshot, test_effect_receipt,
+    freshness, principal, recovery_anchor, resource, resource_generation, snapshot,
+    test_effect_receipt,
 };
 
 fn one_crash_limits() -> CoreLimits {
@@ -115,14 +116,14 @@ fn crash_quota_exhaustion_fences_first_and_blocks_automatic_recovery() {
     let replayed = Engine::recover_legacy_compatibility(
         standard_catalog(),
         limits,
-        RecoveryAnchor::from_trusted_provider(
+        recovery_anchor(
             standard_catalog().digest(),
             freshness(1, 1, 1, 1, 1),
             freshness(2, 1, 1, 1, 2),
             harness.engine.revision(),
             harness.engine.head(),
-        )
-        .unwrap(),
+            harness.engine.projection_digest(),
+        ),
         &harness.journal,
     )
     .unwrap()
@@ -157,14 +158,14 @@ fn boot_checkpoint_also_persists_exhausted_fencing() {
     let report = Engine::recover_legacy_compatibility(
         standard_catalog(),
         limits,
-        RecoveryAnchor::from_trusted_provider(
+        recovery_anchor(
             standard_catalog().digest(),
             freshness(1, 1, 1, 1, 1),
             freshness(2, 1, 1, 1, 2),
             minimum_revision,
             expected_head,
-        )
-        .unwrap(),
+            harness.engine.projection_digest(),
+        ),
         &harness.journal,
     )
     .unwrap();

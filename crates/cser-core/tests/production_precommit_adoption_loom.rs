@@ -10,9 +10,8 @@ use cser_core::{
     DEVICE_RECEIPT_SCHEMA, DEVICE_VERIFIER, DMA_ARENA_REUSE_COMPOSITE, EffectId, Engine,
     EvidenceKindId, ExternalOutcome, Freshness, OutcomeState, PrincipalIncarnation,
     REPLY_APPLY_RECEIPT_SCHEMA, REPLY_CLAIM_PUBLICATION_SLOT, REPLY_COMMIT_RECEIPT_SCHEMA,
-    REPLY_SETTLEMENT_RECEIPT_SCHEMA, REPLY_VERIFIER, ReceiptBinding, RecoveryAnchor,
-    ResourceGeneration, SettlementClaim, SettlementState, TransitionOutput, VerifierId,
-    standard_catalog,
+    REPLY_SETTLEMENT_RECEIPT_SCHEMA, REPLY_VERIFIER, ReceiptBinding, ResourceGeneration,
+    SettlementClaim, SettlementState, TransitionOutput, VerifierId, standard_catalog,
 };
 use loom::{
     model,
@@ -22,7 +21,7 @@ use loom::{
 use std::sync::Arc as StdArc;
 use support::{
     ExactTestVerifier, Harness, TestReceipt, charge, claim, digest, effect, fence_and_rebind,
-    freshness, principal, resource, resource_generation, snapshot,
+    freshness, principal, recovery_anchor, resource, resource_generation, snapshot,
     verified_apply_completion_for_engine, verified_commit_outcome_for_engine,
     verified_settlement_ack_for_engine,
 };
@@ -53,7 +52,7 @@ where
 
 fn composite_commit_fence_scenario(root_value: u64) {
     model_transition(move || {
-        let mut harness = Harness::new_profile_two();
+        let mut harness = Harness::new();
         let effect = effect(root_value, 1);
         let origin = principal(root_value, 1);
         harness
@@ -417,7 +416,7 @@ fn loom_reply_and_dma_commit_intents_share_the_parent_fence_gate() {
 #[test]
 fn loom_component_second_crash_before_or_after_durable_intent() {
     model_transition(|| {
-        let mut harness = Harness::new_profile_two();
+        let mut harness = Harness::new();
         let (effect, successor) = committed_rebound_composite(&mut harness, 94);
         let claim = claim_component_reply(&mut harness, effect, successor);
         let intent = claim.record_apply_intent(digest(111)).unwrap();
@@ -480,7 +479,7 @@ fn loom_component_second_crash_before_or_after_durable_intent() {
 #[test]
 fn loom_component_second_crash_before_or_after_external_apply() {
     model_transition(|| {
-        let mut harness = Harness::new_profile_two();
+        let mut harness = Harness::new();
         let (effect, successor) = committed_rebound_composite(&mut harness, 95);
         let claim = claim_component_reply(&mut harness, effect, successor);
         let claim = match harness.output(claim.record_apply_intent(digest(112)).unwrap()) {
@@ -557,7 +556,7 @@ fn loom_component_second_crash_before_or_after_external_apply() {
 #[test]
 fn loom_component_ack_and_second_crash_settle_once() {
     model_transition(|| {
-        let mut harness = Harness::new_profile_two();
+        let mut harness = Harness::new();
         let (effect, successor) = committed_rebound_composite(&mut harness, 96);
         let claim = claim_component_reply(&mut harness, effect, successor);
         let claim = match harness.output(claim.record_apply_intent(digest(114)).unwrap()) {
@@ -642,7 +641,7 @@ fn loom_component_ack_and_second_crash_settle_once() {
 #[test]
 fn loom_reply_ack_and_dma_retirement_evidence_discharge_independently() {
     model_transition(|| {
-        let mut harness = Harness::new_profile_two();
+        let mut harness = Harness::new();
         let root_value = 97;
         let (effect, successor) = committed_rebound_composite(&mut harness, root_value);
         let queue_claim = claim(root_value + 1);
@@ -740,7 +739,7 @@ fn component_discharge_crash_scenario(
     terminal_evidence: EvidenceKindId,
 ) {
     model_transition(move || {
-        let mut harness = Harness::new_profile_two();
+        let mut harness = Harness::new();
         let (effect, successor) = committed_rebound_composite(&mut harness, root_value);
         let target = claim(root_value + claim_offset);
         let reset = reset_component_command(&harness.engine, effect, target, 120);
@@ -810,7 +809,7 @@ fn loom_second_crash_after_each_queue_pfn_and_iova_discharge_preserves_custody()
 fn loom_final_irq_evidence_and_component_reuse_reservation_linearize_once() {
     model_transition(|| {
         let root_value = 100;
-        let mut harness = Harness::new_profile_two();
+        let mut harness = Harness::new();
         let (original, successor) = committed_rebound_composite(&mut harness, root_value);
         let queue_claim = claim(root_value + 1);
         let queue_resource = resource(root_value + 1);
@@ -889,7 +888,7 @@ fn loom_final_irq_evidence_and_component_reuse_reservation_linearize_once() {
 fn loom_conflicting_component_reuse_reservations_have_one_owner() {
     model_transition(|| {
         let root_value = 101;
-        let mut harness = Harness::new_profile_two();
+        let mut harness = Harness::new();
         let (original, successor) = committed_rebound_composite(&mut harness, root_value);
         let queue_claim = claim(root_value + 1);
         let queue_resource = resource(root_value + 1);
@@ -984,7 +983,7 @@ fn loom_conflicting_component_reuse_reservations_have_one_owner() {
 fn loom_late_old_irq_cannot_mutate_generation_plus_one_activation() {
     model_transition(|| {
         let root_value = 102;
-        let mut harness = Harness::new_profile_two();
+        let mut harness = Harness::new();
         let (original, successor) = committed_rebound_composite(&mut harness, root_value);
         let queue_claim = claim(root_value + 1);
         let queue_resource = resource(root_value + 1);
@@ -1067,7 +1066,7 @@ fn loom_late_old_irq_cannot_mutate_generation_plus_one_activation() {
 #[test]
 fn loom_precommit_adoption_wins_and_evidence_rejection_survives_two_recoveries() {
     model_transition(|| {
-        let mut harness = Harness::new_profile_two();
+        let mut harness = Harness::new();
         let root_value = 90;
         let effect = effect(root_value, 1);
         let origin = principal(root_value, 1);
@@ -1167,16 +1166,16 @@ fn loom_precommit_adoption_wins_and_evidence_rejection_survives_two_recoveries()
         let revision = harness.engine.revision();
         let head = harness.engine.head();
         let recovery_anchor = || {
-            RecoveryAnchor::from_trusted_provider(
+            recovery_anchor(
                 standard_catalog().digest(),
                 freshness(1, 1, 1, 1, 1),
                 freshness(2, 1, 1, 1, 2),
                 revision,
                 head,
+                harness.engine.projection_digest(),
             )
-            .unwrap()
         };
-        let recovered = Engine::recover(
+        let recovered = Engine::recover_legacy_compatibility(
             standard_catalog(),
             CoreLimits::bounded_default(),
             recovery_anchor(),
@@ -1184,7 +1183,7 @@ fn loom_precommit_adoption_wins_and_evidence_rejection_survives_two_recoveries()
         )
         .unwrap()
         .into_engine();
-        let mut recovered_again = Engine::recover(
+        let mut recovered_again = Engine::recover_legacy_compatibility(
             standard_catalog(),
             CoreLimits::bounded_default(),
             recovery_anchor(),
@@ -1269,7 +1268,7 @@ fn loom_precommit_adoption_wins_and_evidence_rejection_survives_two_recoveries()
 #[test]
 fn loom_precommit_adopt_and_begin_revoke_drive_the_production_command_gate() {
     model_transition(|| {
-        let mut harness = Harness::new_profile_two();
+        let mut harness = Harness::new();
         let effect = effect(91, 1);
         let origin = principal(91, 1);
         harness

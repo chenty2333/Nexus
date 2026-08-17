@@ -23,7 +23,7 @@ use cser_core::{
     EffectId, Freshness, PrincipalIncarnation, ResourceGeneration, ResourceId, RetirementState,
     SettlementState, TOOL_CLAIM_OUTCOME_SLOT, TOOL_DMA_COMPONENT_DMA, TOOL_DMA_COMPONENT_TOOL,
     TOOL_DMA_OPERATION_COMPOSITE, TransitionDurability, TransitionOutput, TransitionReceipt,
-    TrustedAnchorBackend, TxError, tool_dma_catalog,
+    TrustedAnchorBackend, TxError, WorldId, tool_dma_catalog,
 };
 
 use super::{
@@ -315,7 +315,12 @@ impl ToolDmaCoordinates {
 /// authenticated its journal prefix.
 pub(crate) fn new_tool_dma_runtime<P>(persistence: P, freshness: Freshness) -> OstdCserRuntime<P> {
     OstdCserRuntime::from_engine(
-        cser_core::Engine::new(tool_dma_catalog(), CoreLimits::bounded_default(), freshness),
+        cser_core::Engine::new(
+            WorldId::new(1).expect("tool DMA runtime world is non-zero"),
+            tool_dma_catalog(),
+            CoreLimits::bounded_default(),
+            freshness,
+        ),
         persistence,
     )
 }
@@ -847,6 +852,7 @@ mod tests {
             &mut self,
             record: &JournalRecord,
             resulting_freshness: Freshness,
+            _resulting_projection: Digest,
         ) -> Result<(), Self::Error> {
             assert!(!record.bytes().is_empty());
             assert_ne!(resulting_freshness.boot().get(), 0);

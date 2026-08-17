@@ -9,7 +9,7 @@ use cser_core::{
     Freshness, JournalGeneration, PrincipalId, PrincipalIncarnation, ReceiptVerifier,
     RegistryInstance, ResourceGeneration, ResourceId, SettlementClaim, SettlementState, SnapshotId,
     TransitionOutput, TransitionReceipt, TxError, VerificationError, VerifiedObservation,
-    VerifierIdentity, standard_catalog,
+    VerifierIdentity, WorldId, standard_catalog,
 };
 use loom::{
     model,
@@ -81,7 +81,8 @@ struct Harness {
 impl Harness {
     fn new() -> Self {
         Self {
-            engine: Engine::new_legacy_compatibility(
+            engine: Engine::new_scoped_legacy_compatibility(
+                WorldId::new(1).unwrap(),
                 standard_catalog(),
                 CoreLimits::bounded_default(),
                 freshness(1, 1, 1, 1, 1),

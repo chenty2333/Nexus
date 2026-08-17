@@ -246,6 +246,16 @@ impl<P> OstdCserRuntime<P> {
         operation(&state.engine)
     }
 
+    /// Returns one provider-generation projection under the authoritative
+    /// writer lock. This is a read-only query; lifecycle transitions continue
+    /// to require the trusted production owner path.
+    pub(crate) fn provider_generation_projection(
+        &self,
+        coordinate: cser_core::ProviderCoordinate,
+    ) -> Option<cser_core::ProviderGenerationProjection> {
+        self.observe(|engine| engine.provider_generation_projection(coordinate))
+    }
+
     /// Runs a read-only durability-provider observation under the same owner
     /// lock as the engine.
     ///
@@ -375,11 +385,11 @@ mod tests {
     use core::sync::atomic::{AtomicU64, Ordering};
 
     use cser_core::{
-        AGENT_OPERATION_COMPOSITE, BootGeneration, ChargeAccountId, CommandRequest,
-        CompactingJournalBackend, CoordinatedPersistence, DeviceGeneration, EffectId, Freshness,
-        JournalGeneration, JournalRecord, PrincipalId, PrincipalIncarnation, RecoveryBinding,
-        RecoveryLease, RegistryInstance, RootId, TrustedAnchorBackend, TrustedAnchorSnapshot,
-        standard_catalog,
+        AGENT_OPERATION_COMPOSITE, AuthorityBindingGeneration, BootGeneration, ChargeAccountId,
+        CommandRequest, CompactingJournalBackend, CoordinatedPersistence, DeviceGeneration,
+        EffectId, Freshness, JournalGeneration, JournalRecord, PrincipalId, PrincipalIncarnation,
+        RecoveryBinding, RecoveryLease, RecoveryProfile, RegistryInstance, RootId,
+        TrustedAnchorBackend, TrustedAnchorSnapshot, WorldId, standard_catalog,
     };
     #[cfg(ktest)]
     use ostd::prelude::ktest;
@@ -396,6 +406,7 @@ mod tests {
             &mut self,
             record: &JournalRecord,
             _resulting_freshness: Freshness,
+            _resulting_projection: Digest,
         ) -> Result<(), Self::Error> {
             assert!(!record.bytes().is_empty());
             Ok(())
@@ -471,7 +482,12 @@ mod tests {
         )
         .unwrap();
         OstdCserRuntime::from_engine(
-            Engine::new(standard_catalog(), CoreLimits::bounded_default(), freshness),
+            Engine::new(
+                WorldId::new(1).unwrap(),
+                standard_catalog(),
+                CoreLimits::bounded_default(),
+                freshness,
+            ),
             TestDurability,
         )
     }
@@ -541,13 +557,26 @@ mod tests {
             JournalGeneration::new(2).unwrap(),
         )
         .unwrap();
-        let binding =
-            RecoveryBinding::new(catalog.digest(), RegistryInstance::new(1).unwrap(), 1).unwrap();
+        let binding = RecoveryBinding::new(
+            RecoveryProfile::current(),
+            WorldId::new(1).unwrap(),
+            catalog.digest(),
+            RegistryInstance::new(1).unwrap(),
+            AuthorityBindingGeneration::new(1).unwrap(),
+        )
+        .unwrap();
+        let engine = Engine::new(
+            WorldId::new(1).unwrap(),
+            catalog.clone(),
+            CoreLimits::bounded_default(),
+            freshness,
+        );
         let committed = TrustedAnchorSnapshot::from_trusted_backend(
             binding,
             freshness,
             0,
             cser_core::Digest::ZERO,
+            engine.projection_digest(),
         )
         .unwrap();
         let lease = RecoveryLease::from_trusted_backend(committed, next).unwrap();
@@ -559,10 +588,7 @@ mod tests {
             CompactingTestAnchor { committed },
             &lease,
         );
-        let runtime = OstdCserRuntime::from_engine(
-            Engine::new(catalog, CoreLimits::bounded_default(), freshness),
-            persistence,
-        );
+        let runtime = OstdCserRuntime::from_engine(engine, persistence);
 
         let receipt = runtime.compact_checkpoint().expect("runtime checkpoint");
         assert_eq!(replacements.load(Ordering::Relaxed), 1);

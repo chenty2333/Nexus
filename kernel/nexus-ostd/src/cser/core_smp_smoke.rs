@@ -7,12 +7,16 @@
 //! write probe: interrupt context never takes the runtime mutex or runs a
 //! sleepable transaction.
 
+use alloc::vec;
+use core::convert::Infallible;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use cser_core::{
-    AGENT_OPERATION_COMPOSITE, BootGeneration, ChargeAccountId, CommandRequest, CoreLimits,
-    EffectId, Freshness, JournalGeneration, JournalRecord, PrincipalId, PrincipalIncarnation,
-    RegistryInstance, RootId, TransitionDurability, TxError, standard_catalog,
+    AGENT_COMPONENT_DMA, AGENT_COMPONENT_REPLY, AGENT_OPERATION_COMPOSITE, BootGeneration,
+    ChargeAccountId, CommandRequest, ComponentProviderBinding, CoreLimits, Digest, EffectId,
+    Freshness, JournalGeneration, JournalRecord, OperationId, PrincipalId, PrincipalIncarnation,
+    ProviderCoordinate, ProviderGeneration, ProviderId, RegistryInstance, RootId,
+    TransitionDurability, TxError, VerifierBinding, VerifierGeneration, WorldId, standard_catalog,
 };
 use ostd::{
     cpu::{CpuId, CpuSet, num_cpus},
@@ -42,6 +46,7 @@ impl TransitionDurability for UnavailableJournal {
         &mut self,
         record: &JournalRecord,
         resulting_freshness: Freshness,
+        _resulting_projection: Digest,
     ) -> Result<(), Self::Error> {
         assert!(!record.bytes().is_empty());
         assert_ne!(resulting_freshness.boot().get(), 0);
@@ -101,6 +106,7 @@ pub(crate) fn launch() -> ! {
 }
 
 fn run_bsp_fail_closed_persistence_smoke() -> super::core_runtime::RuntimeSerializationMetrics {
+    let world = WorldId::new(1).expect("smoke world is non-zero");
     let root = RootId::new(1).expect("smoke root is non-zero");
     let principal = PrincipalId::new(1).expect("smoke principal is non-zero");
     let origin = PrincipalIncarnation::new(principal, 1).expect("smoke incarnation is non-zero");
@@ -112,24 +118,65 @@ fn run_bsp_fail_closed_persistence_smoke() -> super::core_runtime::RuntimeSerial
         JournalGeneration::new(1).expect("smoke journal is non-zero"),
     )
     .expect("smoke freshness is complete");
-    let runtime = OstdCserRuntime::from_engine(
-        cser_core::Engine::new(standard_catalog(), CoreLimits::bounded_default(), freshness),
-        UnavailableJournal,
+    let catalog = standard_catalog();
+    let provider = ProviderCoordinate::new(
+        world,
+        ProviderId::new(1).expect("smoke provider is non-zero"),
+        ProviderGeneration::new(1).expect("smoke provider generation is non-zero"),
     );
+    let verifier_generation =
+        VerifierGeneration::new(1).expect("smoke verifier generation is non-zero");
+    let verifier_bindings = catalog
+        .verifier_class_bindings()
+        .into_iter()
+        .enumerate()
+        .map(|(index, class)| {
+            VerifierBinding::new(
+                class.verifier(),
+                verifier_generation,
+                class.receipt_schema(),
+                Digest::new([0x40u8.wrapping_add(index as u8); 32]),
+            )
+            .expect("smoke verifier binding is valid")
+        })
+        .collect();
+    let mut engine = cser_core::Engine::new(
+        world,
+        catalog.clone(),
+        CoreLimits::bounded_default(),
+        freshness,
+    );
+    engine
+        .transact(
+            CommandRequest::RegisterProviderGeneration {
+                coordinate: provider,
+                catalog_digest: catalog.digest(),
+                verifier_bindings,
+            },
+            |_| Ok::<(), Infallible>(()),
+        )
+        .expect("smoke provider setup is valid");
+    let base_revision = engine.revision();
+    let runtime = OstdCserRuntime::from_engine(engine, UnavailableJournal);
     let effect = EffectId::new(root, 1).expect("smoke effect is non-zero");
     runtime.set_serialization_timing(true);
     assert!(matches!(
-        runtime.transact(CommandRequest::CreateCompositeEffect {
+        runtime.transact(CommandRequest::AdmitScopedCompositeEffect {
             effect,
+            operation: OperationId::new(1).expect("smoke operation is non-zero"),
             origin,
             binding_generation: 1,
             kind: AGENT_OPERATION_COMPOSITE,
             charge_account: ChargeAccountId::new(1).expect("smoke account is non-zero"),
+            bindings: vec![
+                ComponentProviderBinding::new(AGENT_COMPONENT_REPLY, provider),
+                ComponentProviderBinding::new(AGENT_COMPONENT_DMA, provider),
+            ],
         }),
         Err(TxError::Persist(UnavailableJournalError::NoDurableProvider))
     ));
     runtime.observe(|engine| {
-        assert_eq!(engine.revision(), 0);
+        assert_eq!(engine.revision(), base_revision);
         assert!(engine.composite_effect(effect).is_none());
         assert!(engine.pressure().persistence_recovery_required);
     });

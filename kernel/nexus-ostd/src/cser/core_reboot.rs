@@ -269,6 +269,7 @@ where
         if self.engine.revision() != committed.revision()
             || self.engine.head() != committed.head()
             || self.engine.freshness() != committed.committed_freshness()
+            || self.engine.projection_digest() != committed.projection()
         {
             return Some(BootActivationBlock::TrustedTipMismatch);
         }
@@ -437,10 +438,11 @@ mod tests {
     use super::*;
     use alloc::vec;
     use cser_core::{
-        BootGeneration, ChargeAccountId, ClaimId, ClaimScope, DEVICE_CLAIM_QUEUE_SLOT,
-        DMA_ARENA_REUSE_COMPOSITE, DeviceScopeId, Digest, EffectId, Freshness, JournalGeneration,
-        PrincipalId, PrincipalIncarnation, RegistryInstance, ResourceGeneration, ResourceId,
-        RootId, TrustedAnchorSnapshot, standard_catalog,
+        AuthorityBindingGeneration, BootGeneration, ChargeAccountId, ClaimId, ClaimScope,
+        DEVICE_CLAIM_QUEUE_SLOT, DMA_ARENA_REUSE_COMPOSITE, DeviceScopeId, Digest, EffectId,
+        Freshness, JournalGeneration, PrincipalId, PrincipalIncarnation, RecoveryProfile,
+        RegistryInstance, ResourceGeneration, ResourceId, RootId, TrustedAnchorSnapshot, WorldId,
+        standard_catalog,
     };
     use ostd::prelude::ktest;
 
@@ -615,21 +617,31 @@ mod tests {
 
     fn binding() -> RecoveryBinding {
         RecoveryBinding::new(
+            RecoveryProfile::current(),
+            WorldId::new(1).unwrap(),
             standard_catalog().digest(),
             RegistryInstance::new(17).unwrap(),
-            23,
+            AuthorityBindingGeneration::new(23).unwrap(),
         )
         .unwrap()
     }
 
     fn genesis_anchor() -> MemoryAnchor {
         let freshness = initial_freshness(1);
+        let projection = Engine::new(
+            WorldId::new(1).unwrap(),
+            standard_catalog(),
+            CoreLimits::bounded_default(),
+            freshness,
+        )
+        .projection_digest();
         MemoryAnchor {
             committed: TrustedAnchorSnapshot::from_trusted_backend(
                 binding(),
                 freshness,
                 0,
                 Digest::ZERO,
+                projection,
             )
             .unwrap(),
             issued: freshness,
@@ -639,6 +651,7 @@ mod tests {
 
     fn quarantined_device_fixture() -> (MemoryJournal, MemoryAnchor) {
         let mut engine = Engine::new(
+            WorldId::new(1).unwrap(),
             standard_catalog(),
             CoreLimits::bounded_default(),
             initial_freshness(1),
@@ -680,6 +693,7 @@ mod tests {
             engine.freshness(),
             engine.revision(),
             engine.head(),
+            engine.projection_digest(),
         )
         .unwrap();
         (

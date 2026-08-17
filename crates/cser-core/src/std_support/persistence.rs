@@ -20,9 +20,9 @@ use crate::{
     TrustedAnchorSnapshot,
 };
 
-const MAGIC: [u8; 8] = *b"CSERAN1\0";
-const VERSION: u16 = 1;
-const BODY_LEN: usize = 146;
+const MAGIC: [u8; 8] = *b"CSERAN2\0";
+const VERSION: u16 = 2;
+const BODY_LEN: usize = 194;
 const ENCODED_LEN: usize = BODY_LEN + 32;
 
 /// One-shot crash point in the host reference anchor.
@@ -87,6 +87,7 @@ impl HostFileTrustedAnchor {
         path: impl AsRef<Path>,
         binding: RecoveryBinding,
         initial_freshness: Freshness,
+        initial_projection: Digest,
     ) -> Result<Self, HostAnchorError> {
         let path = path.as_ref().to_path_buf();
         let lock_path = path.with_extension("lock");
@@ -112,6 +113,7 @@ impl HostFileTrustedAnchor {
                 initial_freshness,
                 0,
                 Digest::ZERO,
+                initial_projection,
             )?;
             let state = HostAnchorState {
                 committed,
@@ -187,7 +189,7 @@ impl TrustedAnchorBackend for HostFileTrustedAnchor {
         let next = Freshness::new(
             next_boot,
             binding.registry(),
-            binding.binding(),
+            binding.binding().get(),
             observed_device,
             next_journal,
         )
@@ -257,6 +259,28 @@ fn encode_state(state: HostAnchorState) -> [u8; ENCODED_LEN] {
     let mut cursor = 0;
     put(&mut bytes, &mut cursor, &MAGIC);
     put(&mut bytes, &mut cursor, &VERSION.to_le_bytes());
+    let profile = state.committed.binding().profile();
+    put(&mut bytes, &mut cursor, &profile.core_api().to_le_bytes());
+    put(
+        &mut bytes,
+        &mut cursor,
+        &profile.journal_schema().to_le_bytes(),
+    );
+    put(
+        &mut bytes,
+        &mut cursor,
+        &profile.projection_schema().to_le_bytes(),
+    );
+    put(
+        &mut bytes,
+        &mut cursor,
+        &profile.checkpoint_schema().to_le_bytes(),
+    );
+    put(
+        &mut bytes,
+        &mut cursor,
+        &state.committed.binding().world().get().to_le_bytes(),
+    );
     put(
         &mut bytes,
         &mut cursor,
@@ -270,7 +294,7 @@ fn encode_state(state: HostAnchorState) -> [u8; ENCODED_LEN] {
     put(
         &mut bytes,
         &mut cursor,
-        &state.committed.binding().binding().to_le_bytes(),
+        &state.committed.binding().binding().get().to_le_bytes(),
     );
     put(
         &mut bytes,
@@ -311,6 +335,11 @@ fn encode_state(state: HostAnchorState) -> [u8; ENCODED_LEN] {
     put(
         &mut bytes,
         &mut cursor,
+        &state.committed.projection().bytes(),
+    );
+    put(
+        &mut bytes,
+        &mut cursor,
         &state.issued.boot().get().to_le_bytes(),
     );
     put(
@@ -338,11 +367,26 @@ fn decode_state(bytes: &[u8]) -> Result<HostAnchorState, HostAnchorError> {
         return Err(HostAnchorError::Corrupt);
     }
     let mut cursor = 10;
+    let profile = crate::RecoveryProfile::new(
+        take_u16(bytes, &mut cursor)?,
+        take_u16(bytes, &mut cursor)?,
+        take_u16(bytes, &mut cursor)?,
+        take_u16(bytes, &mut cursor)?,
+    )
+    .map_err(|_| HostAnchorError::Corrupt)?;
+    if profile != crate::RecoveryProfile::current() {
+        return Err(HostAnchorError::Corrupt);
+    }
+    let world =
+        crate::WorldId::new(take_u64(bytes, &mut cursor)?).map_err(|_| HostAnchorError::Corrupt)?;
     let catalog = Digest::new(take_array(bytes, &mut cursor)?);
     let registry = crate::RegistryInstance::new(take_u64(bytes, &mut cursor)?)
         .map_err(|_| HostAnchorError::Corrupt)?;
     let binding_value = take_u64(bytes, &mut cursor)?;
-    let binding = RecoveryBinding::new(catalog, registry, binding_value)?;
+    let authority_binding = crate::AuthorityBindingGeneration::new(binding_value)
+        .map_err(|_| HostAnchorError::Corrupt)?;
+    let binding = RecoveryBinding::new(profile, world, catalog, registry, authority_binding)
+        .map_err(|_| HostAnchorError::Corrupt)?;
     let committed = Freshness::new(
         BootGeneration::new(take_u64(bytes, &mut cursor)?).map_err(|_| HostAnchorError::Corrupt)?,
         registry,
@@ -355,6 +399,7 @@ fn decode_state(bytes: &[u8]) -> Result<HostAnchorState, HostAnchorError> {
     .map_err(|_| HostAnchorError::Corrupt)?;
     let revision = take_u64(bytes, &mut cursor)?;
     let head = Digest::new(take_array(bytes, &mut cursor)?);
+    let projection = Digest::new(take_array(bytes, &mut cursor)?);
     let issued = Freshness::new(
         BootGeneration::new(take_u64(bytes, &mut cursor)?).map_err(|_| HostAnchorError::Corrupt)?,
         registry,
@@ -372,8 +417,9 @@ fn decode_state(bytes: &[u8]) -> Result<HostAnchorState, HostAnchorError> {
     {
         return Err(HostAnchorError::Corrupt);
     }
-    let committed =
-        TrustedAnchorSnapshot::from_trusted_backend(binding, committed, revision, head)?;
+    let committed = TrustedAnchorSnapshot::from_trusted_backend(
+        binding, committed, revision, head, projection,
+    )?;
     Ok(HostAnchorState { committed, issued })
 }
 
@@ -384,6 +430,10 @@ fn put<const N: usize>(bytes: &mut [u8], cursor: &mut usize, value: &[u8; N]) {
 
 fn take_u64(bytes: &[u8], cursor: &mut usize) -> Result<u64, HostAnchorError> {
     Ok(u64::from_le_bytes(take_array(bytes, cursor)?))
+}
+
+fn take_u16(bytes: &[u8], cursor: &mut usize) -> Result<u16, HostAnchorError> {
+    Ok(u16::from_le_bytes(take_array(bytes, cursor)?))
 }
 
 fn take_array<const N: usize>(

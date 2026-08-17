@@ -26,16 +26,21 @@
 use cser_core::{
     ClaimId, ClaimScope, ComponentId, Digest, EffectFactChallenge, EffectFactKind, EffectId,
     EffectReceiptVerifier, EvidenceChallenge, ExternalOutcome, PrincipalIncarnation,
-    REPLY_APPLY_RECEIPT_SCHEMA, REPLY_COMMIT_RECEIPT_SCHEMA, REPLY_DOMAIN,
-    REPLY_EVIDENCE_PUBLICATION_ACK, REPLY_OBLIGATION_PUBLICATION, REPLY_RECEIPT_SCHEMA,
-    REPLY_SETTLEMENT_RECEIPT_SCHEMA, REPLY_VERIFIER, ReceiptVerifier, ResourceGeneration,
-    ResourceId, VerificationError, VerifiedEffectObservation, VerifiedObservation,
-    VerifierIdentity,
+    ProviderVerificationScope, REPLY_APPLY_RECEIPT_SCHEMA, REPLY_COMMIT_RECEIPT_SCHEMA,
+    REPLY_DOMAIN, REPLY_EVIDENCE_PUBLICATION_ACK, REPLY_OBLIGATION_PUBLICATION,
+    REPLY_RECEIPT_SCHEMA, REPLY_SETTLEMENT_RECEIPT_SCHEMA, REPLY_VERIFIER, ReceiptSchemaId,
+    ReceiptVerifier, ResourceGeneration, ResourceId, VerificationError, VerifiedEffectObservation,
+    VerifiedObservation, VerifierBinding, VerifierGeneration, VerifierIdentity,
 };
 use sha2::{Digest as _, Sha256};
 
 use super::core_pio_journal::{
     AtaJournalFixture, AtaPioDisk, AtaPioError, SECTOR_BYTES, SectorBackend,
+};
+use super::core_production_registry::{
+    PRODUCTION_WORLD, REPLY_APPLY_IMPLEMENTATION_DIGEST, REPLY_COMMIT_IMPLEMENTATION_DIGEST,
+    REPLY_RECEIPT_IMPLEMENTATION_DIGEST, REPLY_SETTLEMENT_IMPLEMENTATION_DIGEST,
+    STANDARD_REPLY_PROVIDER,
 };
 use super::core_reply_adapter::ReplyPlan;
 
@@ -1342,8 +1347,11 @@ impl EffectReceiptVerifier for ReplyDurableApplyVerifier {
     type Receipt = ReplyApplyRecord;
 
     fn identity(&self) -> VerifierIdentity {
-        VerifierIdentity::new(REPLY_VERIFIER, 1, REPLY_APPLY_RECEIPT_SCHEMA)
-            .expect("standard durable reply apply verifier identity is valid")
+        reply_outbox_verifier_identity(
+            1,
+            REPLY_APPLY_RECEIPT_SCHEMA,
+            REPLY_APPLY_IMPLEMENTATION_DIGEST,
+        )
     }
 
     fn verify(
@@ -1361,6 +1369,7 @@ impl EffectReceiptVerifier for ReplyDurableApplyVerifier {
             || challenge.predecessor().is_some()
             || challenge.expected_verifier() != REPLY_VERIFIER
             || challenge.expected_receipt_schema() != REPLY_APPLY_RECEIPT_SCHEMA
+            || !reply_outbox_effect_scope_matches(challenge, REPLY_APPLY_RECEIPT_SCHEMA, 1)
             || !receipt.matches_plan(self.plan)
         {
             return Err(VerificationError::Rejected);
@@ -1389,8 +1398,11 @@ impl EffectReceiptVerifier for ReplyDurableAckVerifier {
     type Receipt = ReplyAckRecord;
 
     fn identity(&self) -> VerifierIdentity {
-        VerifierIdentity::new(REPLY_VERIFIER, 1, REPLY_SETTLEMENT_RECEIPT_SCHEMA)
-            .expect("standard durable reply acknowledgement verifier identity is valid")
+        reply_outbox_verifier_identity(
+            1,
+            REPLY_SETTLEMENT_RECEIPT_SCHEMA,
+            REPLY_SETTLEMENT_IMPLEMENTATION_DIGEST,
+        )
     }
 
     fn verify(
@@ -1408,6 +1420,7 @@ impl EffectReceiptVerifier for ReplyDurableAckVerifier {
             || challenge.predecessor() != Some(self.apply.semantic_digest())
             || challenge.expected_verifier() != REPLY_VERIFIER
             || challenge.expected_receipt_schema() != REPLY_SETTLEMENT_RECEIPT_SCHEMA
+            || !reply_outbox_effect_scope_matches(challenge, REPLY_SETTLEMENT_RECEIPT_SCHEMA, 1)
             || !self.apply.matches_plan(self.plan)
             || !receipt.matches_plan(self.plan, self.apply)
         {
@@ -1438,8 +1451,7 @@ impl ReceiptVerifier for ReplyDurableRetirementVerifier {
     type Receipt = ReplyAckRecord;
 
     fn identity(&self) -> VerifierIdentity {
-        VerifierIdentity::new(REPLY_VERIFIER, 1, REPLY_RECEIPT_SCHEMA)
-            .expect("standard durable reply retirement verifier identity is valid")
+        reply_outbox_verifier_identity(1, REPLY_RECEIPT_SCHEMA, REPLY_RECEIPT_IMPLEMENTATION_DIGEST)
     }
 
     fn verify(
@@ -1456,6 +1468,7 @@ impl ReceiptVerifier for ReplyDurableRetirementVerifier {
             || challenge.scope() != ClaimScope::Logical
             || challenge.resource() != coordinate.resource()
             || challenge.resource_generation() != coordinate.resource_generation()
+            || !reply_outbox_evidence_scope_matches(challenge, REPLY_RECEIPT_SCHEMA, 1)
             || !self.apply.matches_plan(self.plan)
             || !receipt.matches_plan(self.plan, self.apply)
         {
@@ -1489,8 +1502,11 @@ impl EffectReceiptVerifier for ReplyOutboxCommitVerifier {
     type Receipt = ReplyCommitReceipt;
 
     fn identity(&self) -> VerifierIdentity {
-        VerifierIdentity::new(REPLY_VERIFIER, self.epoch, REPLY_COMMIT_RECEIPT_SCHEMA)
-            .expect("non-zero outbox verifier epoch is valid")
+        reply_outbox_verifier_identity(
+            self.epoch,
+            REPLY_COMMIT_RECEIPT_SCHEMA,
+            REPLY_COMMIT_IMPLEMENTATION_DIGEST,
+        )
     }
 
     fn verify(
@@ -1504,6 +1520,11 @@ impl EffectReceiptVerifier for ReplyOutboxCommitVerifier {
             || challenge.predecessor().is_some()
             || challenge.expected_verifier() != REPLY_VERIFIER
             || challenge.expected_receipt_schema() != REPLY_COMMIT_RECEIPT_SCHEMA
+            || !reply_outbox_effect_scope_matches(
+                challenge,
+                REPLY_COMMIT_RECEIPT_SCHEMA,
+                self.epoch,
+            )
             || challenge.effect() != receipt.reply().effect()
             || challenge.component() != Some(receipt.component())
             || challenge.actor() != receipt.actor()
@@ -1519,6 +1540,82 @@ impl EffectReceiptVerifier for ReplyOutboxCommitVerifier {
             ExternalOutcome::Success,
             receipt.record_checksum(),
         ))
+    }
+}
+
+/// Exact production identity for a reply outbox verifier.  The generation is
+/// deliberately supplied by the outbox verifier so a stale or speculative
+/// epoch cannot satisfy a scoped challenge registered for another generation.
+fn reply_outbox_verifier_identity(
+    generation: u64,
+    schema: ReceiptSchemaId,
+    implementation_digest: Digest,
+) -> VerifierIdentity {
+    let generation =
+        VerifierGeneration::new(generation).expect("reply outbox verifier generation is non-zero");
+    let binding = VerifierBinding::new(REPLY_VERIFIER, generation, schema, implementation_digest)
+        .expect("standard reply outbox verifier binding is valid");
+    VerifierIdentity::new_exact(binding)
+}
+
+fn reply_outbox_binding(generation: u64, schema: ReceiptSchemaId) -> Option<VerifierBinding> {
+    let implementation_digest = match schema {
+        REPLY_RECEIPT_SCHEMA => REPLY_RECEIPT_IMPLEMENTATION_DIGEST,
+        REPLY_COMMIT_RECEIPT_SCHEMA => REPLY_COMMIT_IMPLEMENTATION_DIGEST,
+        REPLY_APPLY_RECEIPT_SCHEMA => REPLY_APPLY_IMPLEMENTATION_DIGEST,
+        REPLY_SETTLEMENT_RECEIPT_SCHEMA => REPLY_SETTLEMENT_IMPLEMENTATION_DIGEST,
+        _ => return None,
+    };
+    VerifierBinding::new(
+        REPLY_VERIFIER,
+        VerifierGeneration::new(generation).ok()?,
+        schema,
+        implementation_digest,
+    )
+    .ok()
+}
+
+fn reply_outbox_effect_scope_matches(
+    challenge: &EffectFactChallenge,
+    schema: ReceiptSchemaId,
+    generation: u64,
+) -> bool {
+    reply_outbox_scope_matches(
+        challenge.verification_scope(),
+        challenge.expected_verifier_binding(),
+        schema,
+        generation,
+    )
+}
+
+fn reply_outbox_evidence_scope_matches(
+    challenge: &EvidenceChallenge,
+    schema: ReceiptSchemaId,
+    generation: u64,
+) -> bool {
+    reply_outbox_scope_matches(
+        challenge.verification_scope(),
+        challenge.expected_verifier_binding(),
+        schema,
+        generation,
+    )
+}
+
+fn reply_outbox_scope_matches(
+    scope: Option<ProviderVerificationScope>,
+    binding: Option<VerifierBinding>,
+    schema: ReceiptSchemaId,
+    generation: u64,
+) -> bool {
+    match (scope, binding) {
+        (None, None) => false,
+        (Some(scope), Some(binding)) => {
+            scope.world() == PRODUCTION_WORLD
+                && scope.provider() == STANDARD_REPLY_PROVIDER
+                && scope.verifier_binding() == binding
+                && Some(binding) == reply_outbox_binding(generation, schema)
+        }
+        _ => false,
     }
 }
 
@@ -1579,9 +1676,10 @@ mod tests {
     use cser_core::{
         AGENT_COMPONENT_DMA, AGENT_COMPONENT_REPLY, AGENT_OPERATION_COMPOSITE, BootGeneration,
         ChargeAccountId, ClaimId, ClaimScope, CommandRequest, ComponentCommitOperation, CoreError,
-        CoreLimits, DEVICE_CLAIM_QUEUE_SLOT, DeviceGeneration, DeviceScopeId, Engine, Freshness,
-        JournalGeneration, JournalRecord, PrincipalId, RegistryInstance, ResourceGeneration,
-        ResourceId, RootId, TransitionDurability, TransitionOutput, standard_catalog,
+        CoreLimits, DEVICE_CLAIM_QUEUE_SLOT, DeviceGeneration, DeviceScopeId, Digest, Engine,
+        Freshness, JournalGeneration, JournalRecord, PrincipalId, RegistryInstance,
+        ResourceGeneration, ResourceId, RootId, TransitionDurability, TransitionOutput, WorldId,
+        standard_catalog,
     };
     use ostd::prelude::ktest;
 
@@ -1603,6 +1701,7 @@ mod tests {
             &mut self,
             record: &JournalRecord,
             _resulting_freshness: Freshness,
+            _resulting_projection: Digest,
         ) -> Result<(), Self::Error> {
             assert!(!record.bytes().is_empty());
             Ok(())
@@ -1715,7 +1814,12 @@ mod tests {
             JournalGeneration::new(1).unwrap(),
         )
         .unwrap();
-        let mut engine = Engine::new(standard_catalog(), CoreLimits::bounded_default(), freshness);
+        let mut engine = Engine::new(
+            WorldId::new(1).unwrap(),
+            standard_catalog(),
+            CoreLimits::bounded_default(),
+            freshness,
+        );
         let mut durability = MemoryDurability;
         let effect = EffectId::new(RootId::new(root_value).unwrap(), 1).unwrap();
         let actor = PrincipalIncarnation::new(PrincipalId::new(root_value).unwrap(), 1).unwrap();
@@ -1923,10 +2027,22 @@ mod tests {
             .commit_exact(key, digest(0x62))
             .expect("source record commits and reads back");
         let verifier = ReplyOutboxCommitVerifier::new(1).unwrap();
+        assert_eq!(
+            verifier.identity().implementation_digest(),
+            Some(REPLY_COMMIT_IMPLEMENTATION_DIGEST),
+            "the production verifier must expose the registered implementation"
+        );
 
         let _verified = engine
             .verify_commit_outcome(&intent, &verifier, &receipt)
             .expect("exact disk receipt verifies as a known success");
+
+        let wrong_generation = ReplyOutboxCommitVerifier::new(2).unwrap();
+        assert_eq!(
+            engine.verify_commit_outcome(&intent, &wrong_generation, &receipt),
+            Err(CoreError::StaleVerifierEpoch),
+            "a verifier generation outside the registered binding fails closed"
+        );
 
         let mut forged = receipt;
         forged.key.intent_nonce = forged.key.intent_nonce.checked_add(1).unwrap();

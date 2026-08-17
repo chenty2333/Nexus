@@ -7,9 +7,5 @@ target
 **/fuzz/artifacts
 kernel/nexus-ostd/guest/*.bin
 kernel/nexus-ostd/guest/*.elf
-specs/cser/*_TTrace_*.bin
-specs/cser/*_TTrace_*.tla
-specs/cser/*.old
-specs/cser/states/
 .claude
 AGENTS.md

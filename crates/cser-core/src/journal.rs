@@ -6,15 +6,15 @@ use sha2::{Digest as _, Sha256};
 
 use crate::{
     BootGeneration, CSER_CORE_API_PROFILE_VERSION, DeviceGeneration, Digest, JournalGeneration,
-    RegistryInstance,
+    RecoveryBinding, RecoveryProfile, RegistryInstance, WorldId,
     engine::{CommandDecodeError, CommandKind},
 };
 
 /// Magic prefix of every CSER journal record.
-pub const JOURNAL_MAGIC: [u8; 8] = *b"CSERJR8\0";
-/// Frozen journal schema for CSER core semantic API profile 4.
-pub const JOURNAL_SCHEMA_VERSION: u16 = 8;
-/// Semantic core API profile explicitly bound in every schema-8 envelope.
+pub const JOURNAL_MAGIC: [u8; 8] = *b"CSERJR9\0";
+/// Frozen journal schema for CSER core semantic API profile 5.
+pub const JOURNAL_SCHEMA_VERSION: u16 = 9;
+/// Semantic core API profile explicitly bound in every schema-9 envelope.
 pub const JOURNAL_CORE_API_PROFILE: u16 = CSER_CORE_API_PROFILE_VERSION;
 
 /// Magic prefix of a portable exact-replay checkpoint envelope.
@@ -22,21 +22,27 @@ pub const JOURNAL_CORE_API_PROFILE: u16 = CSER_CORE_API_PROFILE_VERSION;
 /// This is deliberately distinct from a journal record. A checkpoint carries
 /// a canonical *image* of the exact journal prefix it replaces; it is not a
 /// lossy serialization of the private engine state.
-pub const JOURNAL_CHECKPOINT_MAGIC: [u8; 8] = *b"CSERCP1\0";
+pub const JOURNAL_CHECKPOINT_MAGIC: [u8; 8] = *b"CSERCP2\0";
 /// Version of [`JournalCheckpoint`] envelopes.
-pub const JOURNAL_CHECKPOINT_VERSION: u16 = 1;
+pub const JOURNAL_CHECKPOINT_VERSION: u16 = 2;
+const PREVIOUS_CHECKPOINT_MAGIC: [u8; 8] = *b"CSERCP1\0";
 
 const PRE_HANDOFF_RESOLUTION_JOURNAL_MAGIC: [u8; 8] = *b"CSERJR7\0";
 const PRE_HANDOFF_RESOLUTION_JOURNAL_SCHEMA_VERSION: u16 = 7;
+const PREVIOUS_JOURNAL_MAGIC: [u8; 8] = *b"CSERJR8\0";
+const PREVIOUS_JOURNAL_SCHEMA_VERSION: u16 = 8;
 const PROFILE_ONE_JOURNAL_MAGIC: [u8; 8] = *b"CSERJR5\0";
 const PROFILE_ONE_JOURNAL_SCHEMA_VERSION: u16 = 5;
 const LEGACY_JOURNAL_MAGIC: [u8; 8] = *b"CSERJR4\0";
 const LEGACY_JOURNAL_SCHEMA_VERSION: u16 = 4;
 
-const FIXED_WITHOUT_DIGEST: usize = 140;
+// prefix + revisions + profile + world + catalog + registry + authority +
+// freshness axes + base projection + predecessor + payload length.
+const FIXED_WITHOUT_DIGEST: usize = 188;
 const DIGEST_LEN: usize = 32;
 const MIN_RECORD_LEN: usize = FIXED_WITHOUT_DIGEST + DIGEST_LEN;
-const CHECKPOINT_FIXED_WITHOUT_DIGEST: usize = 8 + 2 + 2 + 4 + 32 + 8 + 32 + 32 + 40 + 4;
+const CHECKPOINT_FIXED_WITHOUT_DIGEST: usize =
+    8 + 2 + 2 + 4 + 8 + 8 + 32 + 8 + 8 + 8 + 32 + 32 + 40 + 4;
 const CHECKPOINT_MIN_LEN: usize = CHECKPOINT_FIXED_WITHOUT_DIGEST + DIGEST_LEN;
 /// Largest exact journal image accepted by the portable checkpoint envelope.
 ///
@@ -52,6 +58,7 @@ pub const MAX_JOURNAL_CHECKPOINT_IMAGE_BYTES: usize = 16 * 1024 * 1024;
 /// checkpoint can be accepted.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct JournalCheckpointAnchor {
+    binding: RecoveryBinding,
     catalog_digest: Digest,
     freshness: crate::Freshness,
     revision: u64,
@@ -61,6 +68,10 @@ pub struct JournalCheckpointAnchor {
 }
 
 impl JournalCheckpointAnchor {
+    /// Returns the complete immutable recovery binding.
+    pub const fn binding(self) -> RecoveryBinding {
+        self.binding
+    }
     /// Returns the catalog which interprets the replay image.
     pub const fn catalog_digest(self) -> Digest {
         self.catalog_digest
@@ -97,6 +108,7 @@ impl JournalCheckpointAnchor {
 /// needs a separately specified canonical state codec.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct JournalCheckpoint {
+    binding: RecoveryBinding,
     catalog_digest: Digest,
     freshness: crate::Freshness,
     revision: u64,
@@ -107,15 +119,24 @@ pub struct JournalCheckpoint {
 }
 
 impl JournalCheckpoint {
+    /// Returns the complete immutable binding encoded in this checkpoint.
+    pub const fn binding(&self) -> RecoveryBinding {
+        self.binding
+    }
+
     pub(crate) fn build(
-        catalog_digest: Digest,
+        binding: RecoveryBinding,
         freshness: crate::Freshness,
         revision: u64,
         head: Digest,
         projection: Digest,
         image: &[u8],
     ) -> Result<Self, JournalCheckpointDecodeError> {
-        if catalog_digest.is_zero() || (revision == 0) != head.is_zero() {
+        if (revision == 0) != head.is_zero()
+            || projection.is_zero()
+            || freshness.registry() != binding.registry()
+            || freshness.binding() != binding.authority_binding().get()
+        {
             return Err(JournalCheckpointDecodeError::InvalidCoordinates);
         }
         if image.len() > MAX_JOURNAL_CHECKPOINT_IMAGE_BYTES {
@@ -134,7 +155,11 @@ impl JournalCheckpoint {
         bytes.extend_from_slice(&JOURNAL_CHECKPOINT_VERSION.to_le_bytes());
         bytes.extend_from_slice(&JOURNAL_CORE_API_PROFILE.to_le_bytes());
         bytes.extend_from_slice(&total_u32.to_le_bytes());
-        bytes.extend_from_slice(&catalog_digest.bytes());
+        put_profile(&mut bytes, binding.profile());
+        bytes.extend_from_slice(&binding.world().get().to_le_bytes());
+        bytes.extend_from_slice(&binding.catalog_digest().bytes());
+        bytes.extend_from_slice(&binding.registry().get().to_le_bytes());
+        bytes.extend_from_slice(&binding.authority_binding().get().to_le_bytes());
         bytes.extend_from_slice(&revision.to_le_bytes());
         bytes.extend_from_slice(&head.bytes());
         bytes.extend_from_slice(&projection.bytes());
@@ -143,7 +168,8 @@ impl JournalCheckpoint {
         bytes.extend_from_slice(image);
         let envelope = Digest::new(Sha256::digest(&bytes).into());
         Ok(Self {
-            catalog_digest,
+            binding,
+            catalog_digest: binding.catalog_digest(),
             freshness,
             revision,
             head,
@@ -158,6 +184,10 @@ impl JournalCheckpoint {
     /// Call [`Self::recover`] with a trusted advancing anchor before trusting the contained projection or
     /// replacing a journal: structural decoding does not interpret commands.
     pub fn decode(bytes: &[u8]) -> Result<Self, JournalCheckpointDecodeError> {
+        if bytes.len() >= PREVIOUS_CHECKPOINT_MAGIC.len() && bytes[..8] == PREVIOUS_CHECKPOINT_MAGIC
+        {
+            return Err(JournalCheckpointDecodeError::UnsupportedVersion { version: 1 });
+        }
         if bytes.len() < CHECKPOINT_MIN_LEN {
             return Err(JournalCheckpointDecodeError::InvalidLength);
         }
@@ -168,9 +198,11 @@ impl JournalCheckpoint {
         if version != JOURNAL_CHECKPOINT_VERSION {
             return Err(JournalCheckpointDecodeError::UnsupportedVersion { version });
         }
-        let profile = checkpoint_read_u16(bytes, 10)?;
-        if profile != JOURNAL_CORE_API_PROFILE {
-            return Err(JournalCheckpointDecodeError::UnsupportedApiProfile { profile });
+        let envelope_profile = checkpoint_read_u16(bytes, 10)?;
+        if envelope_profile != JOURNAL_CORE_API_PROFILE {
+            return Err(JournalCheckpointDecodeError::UnsupportedApiProfile {
+                profile: envelope_profile,
+            });
         }
         let total = usize::try_from(checkpoint_read_u32(bytes, 12)?)
             .map_err(|_| JournalCheckpointDecodeError::InvalidLength)?;
@@ -183,12 +215,12 @@ impl JournalCheckpoint {
         // Reject oversized or structurally inconsistent images before hashing
         // attacker-controlled input. This is the recovery-input admission
         // bound, not merely an allocation bound.
-        let image_len = usize::try_from(checkpoint_read_u32(bytes, 160)?)
+        let image_len = usize::try_from(checkpoint_read_u32(bytes, 192)?)
             .map_err(|_| JournalCheckpointDecodeError::InvalidLength)?;
         if image_len > MAX_JOURNAL_CHECKPOINT_IMAGE_BYTES {
             return Err(JournalCheckpointDecodeError::ImageTooLarge);
         }
-        let image_end = 164usize
+        let image_end = 196usize
             .checked_add(image_len)
             .ok_or(JournalCheckpointDecodeError::InvalidLength)?;
         if image_end != digest_offset {
@@ -203,33 +235,54 @@ impl JournalCheckpoint {
         if expected != actual {
             return Err(JournalCheckpointDecodeError::ChecksumMismatch);
         }
+        let profile = read_profile(bytes, 16)?;
+        let world = WorldId::new(read_u64(bytes, 24))
+            .map_err(|_| JournalCheckpointDecodeError::ZeroIdentity)?;
         let catalog_digest = Digest::new(
-            bytes[16..48]
+            bytes[32..64]
                 .try_into()
                 .map_err(|_| JournalCheckpointDecodeError::InvalidLength)?,
         );
-        let revision = checkpoint_read_u64(bytes, 48)?;
+        let registry = RegistryInstance::new(checkpoint_read_u64(bytes, 64)?)
+            .map_err(|_| JournalCheckpointDecodeError::ZeroIdentity)?;
+        let authority_binding =
+            crate::AuthorityBindingGeneration::new(checkpoint_read_u64(bytes, 72)?)
+                .map_err(|_| JournalCheckpointDecodeError::ZeroIdentity)?;
+        let revision = checkpoint_read_u64(bytes, 80)?;
         let head = Digest::new(
-            bytes[56..88]
-                .try_into()
-                .map_err(|_| JournalCheckpointDecodeError::InvalidLength)?,
-        );
-        let projection = Digest::new(
             bytes[88..120]
                 .try_into()
                 .map_err(|_| JournalCheckpointDecodeError::InvalidLength)?,
         );
-        let freshness = checkpoint_read_freshness(bytes, 120)?;
-        if catalog_digest.is_zero() || (revision == 0) != head.is_zero() {
+        let projection = Digest::new(
+            bytes[120..152]
+                .try_into()
+                .map_err(|_| JournalCheckpointDecodeError::InvalidLength)?,
+        );
+        let freshness = checkpoint_read_freshness(bytes, 152)?;
+        let binding =
+            RecoveryBinding::new(profile, world, catalog_digest, registry, authority_binding)
+                .map_err(|_| JournalCheckpointDecodeError::InvalidCoordinates)?;
+        if profile != RecoveryProfile::current() {
+            return Err(JournalCheckpointDecodeError::UnsupportedApiProfile {
+                profile: profile.core_api(),
+            });
+        }
+        if (revision == 0) != head.is_zero()
+            || projection.is_zero()
+            || freshness.registry() != binding.registry()
+            || freshness.binding() != binding.authority_binding().get()
+        {
             return Err(JournalCheckpointDecodeError::InvalidCoordinates);
         }
         Ok(Self {
+            binding,
             catalog_digest,
             freshness,
             revision,
             head,
             projection,
-            image: bytes[164..image_end].to_vec(),
+            image: bytes[196..image_end].to_vec(),
             envelope: expected,
         })
     }
@@ -246,10 +299,12 @@ impl JournalCheckpoint {
         anchor: crate::RecoveryAnchor,
     ) -> Result<crate::RecoveryReport, crate::CoreError> {
         let expected = self.anchor();
-        if anchor.catalog_digest() != expected.catalog_digest()
+        if anchor.binding() != expected.binding()
+            || anchor.catalog_digest() != expected.catalog_digest()
             || anchor.committed_freshness() != expected.freshness()
             || anchor.minimum_revision() != expected.revision()
             || anchor.expected_head() != expected.head()
+            || anchor.projection() != expected.projection()
         {
             return Err(crate::CoreError::RollbackDetected);
         }
@@ -264,6 +319,7 @@ impl JournalCheckpoint {
     /// Returns the trusted coordinates which must be anchored with this image.
     pub const fn anchor(&self) -> JournalCheckpointAnchor {
         JournalCheckpointAnchor {
+            binding: self.binding,
             catalog_digest: self.catalog_digest,
             freshness: self.freshness,
             revision: self.revision,
@@ -287,7 +343,11 @@ impl JournalCheckpoint {
         bytes.extend_from_slice(
             &(u32::try_from(total).expect("checkpoint envelope was bounded")).to_le_bytes(),
         );
-        bytes.extend_from_slice(&self.catalog_digest.bytes());
+        put_profile(&mut bytes, self.binding.profile());
+        bytes.extend_from_slice(&self.binding.world().get().to_le_bytes());
+        bytes.extend_from_slice(&self.binding.catalog_digest().bytes());
+        bytes.extend_from_slice(&self.binding.registry().get().to_le_bytes());
+        bytes.extend_from_slice(&self.binding.authority_binding().get().to_le_bytes());
         bytes.extend_from_slice(&self.revision.to_le_bytes());
         bytes.extend_from_slice(&self.head.bytes());
         bytes.extend_from_slice(&self.projection.bytes());
@@ -335,6 +395,26 @@ fn put_freshness(bytes: &mut Vec<u8>, freshness: crate::Freshness) {
     bytes.extend_from_slice(&freshness.binding().to_le_bytes());
     bytes.extend_from_slice(&freshness.device().get().to_le_bytes());
     bytes.extend_from_slice(&freshness.journal().get().to_le_bytes());
+}
+
+fn put_profile(bytes: &mut Vec<u8>, profile: RecoveryProfile) {
+    bytes.extend_from_slice(&profile.core_api().to_le_bytes());
+    bytes.extend_from_slice(&profile.journal_schema().to_le_bytes());
+    bytes.extend_from_slice(&profile.projection_schema().to_le_bytes());
+    bytes.extend_from_slice(&profile.checkpoint_schema().to_le_bytes());
+}
+
+fn read_profile(
+    bytes: &[u8],
+    offset: usize,
+) -> Result<RecoveryProfile, JournalCheckpointDecodeError> {
+    RecoveryProfile::new(
+        checkpoint_read_u16(bytes, offset)?,
+        checkpoint_read_u16(bytes, offset + 2)?,
+        checkpoint_read_u16(bytes, offset + 4)?,
+        checkpoint_read_u16(bytes, offset + 6)?,
+    )
+    .map_err(|_| JournalCheckpointDecodeError::InvalidCoordinates)
 }
 
 fn checkpoint_read_u16(bytes: &[u8], offset: usize) -> Result<u16, JournalCheckpointDecodeError> {
@@ -391,7 +471,11 @@ pub struct JournalRecord {
     binding: u64,
     journal: JournalGeneration,
     device: DeviceGeneration,
+    profile: RecoveryProfile,
+    world: WorldId,
     catalog_digest: Digest,
+    authority_binding: crate::AuthorityBindingGeneration,
+    base_projection: Digest,
     predecessor: Digest,
     command: CommandKind,
     digest: Digest,
@@ -402,18 +486,21 @@ impl JournalRecord {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn build(
         base_revision: u64,
-        boot: BootGeneration,
-        registry: RegistryInstance,
-        binding: u64,
-        journal: JournalGeneration,
-        device: DeviceGeneration,
-        catalog_digest: Digest,
+        freshness: crate::Freshness,
+        binding: RecoveryBinding,
+        base_projection: Digest,
         predecessor: Digest,
         command: CommandKind,
     ) -> Result<Self, JournalDecodeError> {
         let revision = base_revision
             .checked_add(1)
             .ok_or(JournalDecodeError::RevisionOverflow)?;
+        if base_projection.is_zero()
+            || freshness.registry() != binding.registry()
+            || freshness.binding() != binding.authority_binding().get()
+        {
+            return Err(JournalDecodeError::InvalidBinding);
+        }
         let payload = command.encode_payload();
         let total_len = MIN_RECORD_LEN
             .checked_add(payload.len())
@@ -430,12 +517,15 @@ impl JournalRecord {
         bytes.extend_from_slice(&total_len_u32.to_le_bytes());
         bytes.extend_from_slice(&base_revision.to_le_bytes());
         bytes.extend_from_slice(&revision.to_le_bytes());
-        bytes.extend_from_slice(&boot.get().to_le_bytes());
-        bytes.extend_from_slice(&registry.get().to_le_bytes());
-        bytes.extend_from_slice(&binding.to_le_bytes());
-        bytes.extend_from_slice(&journal.get().to_le_bytes());
-        bytes.extend_from_slice(&device.get().to_le_bytes());
-        bytes.extend_from_slice(&catalog_digest.bytes());
+        put_profile(&mut bytes, binding.profile());
+        bytes.extend_from_slice(&binding.world().get().to_le_bytes());
+        bytes.extend_from_slice(&binding.catalog_digest().bytes());
+        bytes.extend_from_slice(&binding.registry().get().to_le_bytes());
+        bytes.extend_from_slice(&binding.authority_binding().get().to_le_bytes());
+        bytes.extend_from_slice(&freshness.boot().get().to_le_bytes());
+        bytes.extend_from_slice(&freshness.journal().get().to_le_bytes());
+        bytes.extend_from_slice(&freshness.device().get().to_le_bytes());
+        bytes.extend_from_slice(&base_projection.bytes());
         bytes.extend_from_slice(&predecessor.bytes());
         bytes.extend_from_slice(&payload_len.to_le_bytes());
         bytes.extend_from_slice(&payload);
@@ -447,12 +537,16 @@ impl JournalRecord {
         Ok(Self {
             base_revision,
             revision,
-            boot,
-            registry,
-            binding,
-            journal,
-            device,
-            catalog_digest,
+            boot: freshness.boot(),
+            registry: freshness.registry(),
+            binding: binding.authority_binding().get(),
+            journal: freshness.journal(),
+            device: freshness.device(),
+            profile: binding.profile(),
+            world: binding.world(),
+            catalog_digest: binding.catalog_digest(),
+            authority_binding: binding.authority_binding(),
+            base_projection,
             predecessor,
             command,
             digest,
@@ -498,6 +592,33 @@ impl JournalRecord {
     /// Returns the bound domain-catalog digest.
     pub const fn catalog_digest(&self) -> Digest {
         self.catalog_digest
+    }
+
+    /// Returns the immutable schema tuple.
+    pub const fn profile(&self) -> RecoveryProfile {
+        self.profile
+    }
+
+    /// Returns the semantic world bound by this record.
+    pub const fn world(&self) -> WorldId {
+        self.world
+    }
+
+    /// Returns the complete immutable binding encoded by this record.
+    pub fn recovery_binding(&self) -> RecoveryBinding {
+        RecoveryBinding::new(
+            self.profile,
+            self.world,
+            self.catalog_digest,
+            self.registry,
+            self.authority_binding,
+        )
+        .expect("journal record stores validated binding")
+    }
+
+    /// Returns the projection digest immediately before this transition.
+    pub const fn base_projection(&self) -> Digest {
+        self.base_projection
     }
 
     /// Returns the predecessor record digest.
@@ -552,6 +673,8 @@ pub enum JournalDecodeError {
     RevisionOverflow,
     /// A non-zero stable identity decoded as zero.
     ZeroIdentity,
+    /// The immutable record binding disagrees with its freshness coordinates.
+    InvalidBinding,
     /// The payload does not encode a known command.
     Command(CommandDecodeError),
     /// The trailing digest does not match the record bytes.
@@ -666,6 +789,11 @@ fn scan_journal_inner(
                 version: PRE_HANDOFF_RESOLUTION_JOURNAL_SCHEMA_VERSION,
             });
         }
+        if remaining[..8] == PREVIOUS_JOURNAL_MAGIC {
+            return Err(JournalDecodeError::UnsupportedVersion {
+                version: PREVIOUS_JOURNAL_SCHEMA_VERSION,
+            });
+        }
         if remaining[..8] == PROFILE_ONE_JOURNAL_MAGIC {
             return Err(JournalDecodeError::UnsupportedVersion {
                 version: PROFILE_ONE_JOURNAL_SCHEMA_VERSION,
@@ -712,7 +840,7 @@ fn scan_journal_inner(
             ));
         }
         let record_bytes = &remaining[..total_len];
-        let payload_len = read_u32(record_bytes, 136) as usize;
+        let payload_len = read_u32(record_bytes, 184) as usize;
         if FIXED_WITHOUT_DIGEST
             .checked_add(payload_len)
             .and_then(|value| value.checked_add(DIGEST_LEN))
@@ -730,25 +858,42 @@ fn scan_journal_inner(
             return Err(JournalDecodeError::ChecksumMismatch { offset });
         }
 
-        let boot = BootGeneration::new(read_u64(record_bytes, 32))
-            .map_err(|_| JournalDecodeError::ZeroIdentity)?;
-        let registry = RegistryInstance::new(read_u64(record_bytes, 40))
-            .map_err(|_| JournalDecodeError::ZeroIdentity)?;
-        let binding = read_u64(record_bytes, 48);
-        if binding == 0 {
-            return Err(JournalDecodeError::ZeroIdentity);
+        let profile =
+            read_profile(record_bytes, 32).map_err(|_| JournalDecodeError::InvalidLength)?;
+        if profile != RecoveryProfile::current() {
+            return Err(JournalDecodeError::UnsupportedApiProfile {
+                profile: profile.core_api(),
+            });
         }
-        let journal = JournalGeneration::new(read_u64(record_bytes, 56))
-            .map_err(|_| JournalDecodeError::ZeroIdentity)?;
-        let device = DeviceGeneration::new(read_u64(record_bytes, 64))
+        let world = WorldId::new(read_u64(record_bytes, 40))
             .map_err(|_| JournalDecodeError::ZeroIdentity)?;
         let catalog_digest = Digest::new(
-            record_bytes[72..104]
+            record_bytes[48..80]
                 .try_into()
                 .map_err(|_| JournalDecodeError::InvalidLength)?,
         );
+        let registry = RegistryInstance::new(read_u64(record_bytes, 80))
+            .map_err(|_| JournalDecodeError::ZeroIdentity)?;
+        let authority_binding = crate::AuthorityBindingGeneration::new(read_u64(record_bytes, 88))
+            .map_err(|_| JournalDecodeError::ZeroIdentity)?;
+        let boot = BootGeneration::new(read_u64(record_bytes, 96))
+            .map_err(|_| JournalDecodeError::ZeroIdentity)?;
+        let journal = JournalGeneration::new(read_u64(record_bytes, 104))
+            .map_err(|_| JournalDecodeError::ZeroIdentity)?;
+        let device = DeviceGeneration::new(read_u64(record_bytes, 112))
+            .map_err(|_| JournalDecodeError::ZeroIdentity)?;
+        let base_projection = Digest::new(
+            record_bytes[120..152]
+                .try_into()
+                .map_err(|_| JournalDecodeError::InvalidLength)?,
+        );
+        if base_projection.is_zero() {
+            return Err(JournalDecodeError::InvalidBinding);
+        }
+        RecoveryBinding::new(profile, world, catalog_digest, registry, authority_binding)
+            .map_err(|_| JournalDecodeError::InvalidBinding)?;
         let predecessor = Digest::new(
-            record_bytes[104..136]
+            record_bytes[152..184]
                 .try_into()
                 .map_err(|_| JournalDecodeError::InvalidLength)?,
         );
@@ -760,10 +905,14 @@ fn scan_journal_inner(
             revision: read_u64(record_bytes, 24),
             boot,
             registry,
-            binding,
+            binding: authority_binding.get(),
             journal,
             device,
+            profile,
+            world,
             catalog_digest,
+            authority_binding,
+            base_projection,
             predecessor,
             command,
             digest: expected,
@@ -821,6 +970,17 @@ mod checkpoint_tests {
     use super::*;
     use crate::{CoreError, CoreLimits, Engine, RecoveryAnchor, standard_catalog};
 
+    fn binding(catalog: &crate::DomainCatalog) -> crate::RecoveryBinding {
+        crate::RecoveryBinding::new(
+            crate::RecoveryProfile::current(),
+            crate::WorldId::new(1).unwrap(),
+            catalog.digest(),
+            crate::RegistryInstance::new(1).unwrap(),
+            crate::AuthorityBindingGeneration::new(1).unwrap(),
+        )
+        .unwrap()
+    }
+
     fn freshness(boot: u64, journal: u64) -> crate::Freshness {
         crate::Freshness::new(
             crate::BootGeneration::new(boot).unwrap(),
@@ -836,12 +996,13 @@ mod checkpoint_tests {
     fn recovery_rejects_a_checksum_valid_checkpoint_with_wrong_projection() {
         let catalog = standard_catalog();
         let engine = Engine::new(
+            crate::WorldId::new(1).unwrap(),
             catalog.clone(),
             CoreLimits::bounded_default(),
             freshness(1, 1),
         );
         let checkpoint = JournalCheckpoint::build(
-            catalog.digest(),
+            binding(&catalog),
             freshness(1, 1),
             0,
             Digest::ZERO,
@@ -854,11 +1015,12 @@ mod checkpoint_tests {
                 catalog.clone(),
                 CoreLimits::bounded_default(),
                 RecoveryAnchor::from_trusted_provider(
-                    catalog.digest(),
+                    binding(&catalog),
                     freshness(1, 1),
                     freshness(2, 2),
                     0,
                     Digest::ZERO,
+                    engine.projection_digest(),
                 )
                 .unwrap(),
             ),
@@ -875,12 +1037,22 @@ mod checkpoint_tests {
         bytes[8..10].copy_from_slice(&JOURNAL_CHECKPOINT_VERSION.to_le_bytes());
         bytes[10..12].copy_from_slice(&JOURNAL_CORE_API_PROFILE.to_le_bytes());
         bytes[12..16].copy_from_slice(&(u32::try_from(total).unwrap()).to_le_bytes());
-        bytes[160..164].copy_from_slice(
+        bytes[192..196].copy_from_slice(
             &(u32::try_from(MAX_JOURNAL_CHECKPOINT_IMAGE_BYTES + 1).unwrap()).to_le_bytes(),
         );
         assert_eq!(
             JournalCheckpoint::decode(&bytes),
             Err(JournalCheckpointDecodeError::ImageTooLarge)
+        );
+    }
+
+    #[test]
+    fn decode_identifies_the_predecessor_checkpoint_before_vnext_length_checks() {
+        let mut bytes = vec![0u8; 196];
+        bytes[..8].copy_from_slice(&PREVIOUS_CHECKPOINT_MAGIC);
+        assert_eq!(
+            JournalCheckpoint::decode(&bytes),
+            Err(JournalCheckpointDecodeError::UnsupportedVersion { version: 1 })
         );
     }
 }

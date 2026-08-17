@@ -24,8 +24,8 @@ Public commands:
 Focused commands:
   fmt                     format Rust workspaces
   check                   run schema and Rust static checks
-  quick                   run all non-TLA+, non-QEMU verification
-  model                   alias for the complete host semantic gate
+  quick                   run current non-QEMU verification
+  model                   alias for the current host semantic gate
 EOF
 }
 
@@ -69,18 +69,12 @@ compute_image_identity() {
     image_key=$(sha256sum \
         "$root/Dockerfile" \
         "$root/.dockerignore" \
-        "$root/third_party/tlaplus/1.8.0-227f61b/tla2tools-227f61b.jar" \
-        "$root/third_party/tlaplus/1.8.0-227f61b/SHA256SUMS" \
-        "$root/third_party/tlaplus/1.8.0-227f61b/PROVENANCE.json" \
-        "$root/third_party/tlaplus/1.8.0-227f61b/LICENSE.upstream" \
         "$root/rust-toolchain.toml" \
         "$root/.cargo/config.toml" \
         "$root/Cargo.toml" \
         "$root/Cargo.lock" \
         "$root/crates/cser-core/Cargo.toml" \
         "$root/crates/cser-model/Cargo.toml" \
-        "$root/crates/cser-trace-conformance/Cargo.toml" \
-        "$root/crates/nexus-effect-peer-wire/Cargo.toml" \
         "$root/tools/xtask/Cargo.toml" \
         "$root/tools/xtask/Cargo.lock" | cut -d ' ' -f1 | sha256sum | cut -c1-16)
     image="nexus/cser-dev:$image_key"
@@ -259,15 +253,10 @@ clean_cache() {
         "$root/crates/nexus-ostd-virtio/target" \
         "$root/kernel/nexus-ostd/target" \
         "$root/kernel/nexus-ostd/userspace/personality/target" \
-        "$root/experiments/ostd-virtio-cser-spike/target" \
-        "$root/experiments/ostd-virtio-cser-spike/patch-work" \
-        "$root/specs/cser/states"
+        "$root/crates/nexus-ostd-virtio/target"
     rm -f \
         "$root"/kernel/nexus-ostd/guest/*.bin \
-        "$root"/kernel/nexus-ostd/guest/*.elf \
-        "$root"/specs/cser/*_TTrace_*.bin \
-        "$root"/specs/cser/*_TTrace_*.tla \
-        "$root"/specs/cser/*.old
+        "$root"/kernel/nexus-ostd/guest/*.elf
     echo 'CLEAN CACHE PASS evidence=preserved release=preserved docker_images=preserved'
 }
 
@@ -276,8 +265,7 @@ clean_evidence() {
         "$root/target/scenario-artifacts" \
         "$root/target/verification" \
         "$root/target/research" \
-        "$root/kernel/nexus-ostd/artifacts" \
-        "$root/experiments/ostd-virtio-cser-spike/artifacts"
+        "$root/kernel/nexus-ostd/artifacts"
     echo 'CLEAN EVIDENCE PASS release=preserved docker_images=preserved'
 }
 

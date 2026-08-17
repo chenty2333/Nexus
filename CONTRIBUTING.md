@@ -1,135 +1,90 @@
 # Contributing to Nexus
 
-Nexus is a research artifact: implementation changes, semantic claims, and
-reproducibility evidence must remain reviewable as separate facts. This guide
-documents the supported development workflow. The public project overview is
-in [README.md](README.md), and release reproduction is in
-[ARTIFACT.md](ARTIFACT.md).
+Nexus is a research codebase with no external compatibility users. Breaking
+changes are acceptable when they simplify the authoritative model, strengthen a
+safety boundary, or remove obsolete research machinery.
 
-## Supported environment
+Read these before substantive work:
 
-Use a Linux x86-64 host with:
+- [maproom/terrain.md](maproom/terrain.md)
+- [maproom/basecamp.md](maproom/basecamp.md)
+- [maproom/route.md](maproom/route.md)
+- [maproom/hazards.md](maproom/hazards.md)
 
-- Docker and a working daemon;
-- Bash and Git;
-- `awk`, coreutils, `grep`, and `sed`;
-- `flock` from util-linux.
+Do not introduce another current roadmap, architecture ledger, evidence claim
+ledger, or status file outside `maproom/`.
 
-The supported workflow does not depend on host Rust, Java, TLA+, cargo-osdk,
-OVMF, QEMU, Nix, direnv, or Just installations. Project toolchains are pinned
-inside Docker images, and verification containers run without network access
-after those images have been built.
+## Supported workflow
 
-Start every change with:
+Use the root `./x` entry point:
 
-```bash
-./x doctor
-./x test --quick
-```
-
-## Command contract
-
-`./x` is the only public workflow front door. Backend entry points are retained
-for isolation and maintenance, not as a second user-facing contract.
-
-| Command | Contract |
+| Command | Purpose |
 | --- | --- |
-| `./x doctor` | Validate the host boundary, repository layout, catalogs, pinned tools, and backend entry points. |
-| `./x build [all\|model\|kernel\|virtio]` | Build the selected reference-model or OSTD artifact graph without running QEMU. |
-| `./x test --unit` | Run Rust and neutral-runner unit/scenario tests; this is the default `test` tier. |
-| `./x test --quick` | Run non-TLA+, non-QEMU formatting, schema, check, Clippy, test, and canonical-trace gates. |
-| `./x test --system` | Run both QEMU receipts and the predecessor plus Linux-I/O composition oracles. |
-| `./x test --full` | Traverse the complete development graph; release sealing uses the canonical `./x verify`. |
-| `./x run kernel` | Run the bounded Nexus OSTD kernel receipt. |
-| `./x run virtio` | Run the mediated VirtIO/reset/IOMMU receipt. |
-| `./x run composition` | Regenerate both QEMU receipts and cross-check the predecessor and additive Linux-I/O successor; this is the default `run` target. |
-| `./x verify` | Run the canonical local, release, and CI full-acceptance gate. |
-| `./x verify-bundle [DIRECTORY]` | Verify a canonical cold bundle against the matching clean checkout without rebuilding evidence or running QEMU. |
-| `./x clean` | Remove root, xtask, OSDK, guest, and TLC build caches without Docker while preserving evidence and release outputs. |
-| `./x clean --all` | Also remove verification, scenario, QEMU, and research evidence; published release and audit outputs remain preserved. |
-| `./x research handoff-admission` | Run the prospective RFC-0002 local TLA+/Rust/fault-matrix gate and emit its unified research receipt. |
+| `./x doctor` | Validate Docker, repository layout, and pinned toolchain |
+| `./x build` | Build the host workspace and OSTD kernel |
+| `./x test --unit` | Run current host unit and differential tests |
+| `./x test --quick` | Run host checks plus the kernel static gate |
+| `./x test --system` | Run the current persistent recovery system path |
+| `./x test --full` | Run the complete supported local verification path |
+| `./x check` | Run schema, Rust, host experiment, and kernel checks |
+| `./x fmt` | Format the current Rust workspaces |
+| `./x verify` | Seal the current clean-source production recovery gate |
+| `./x clean --all` | Remove generated caches and local run evidence |
 
-Focused `fmt`, `check`, `quick`, `model`, `spec`, and `system` commands exist
-for diagnostics. There is intentionally no `fuzz` command until Nexus owns a
-real fuzz target and corpus contract.
+The root container is intentionally independent of host Rust. The OSTD kernel
+has a separate pinned build graph under `kernel/nexus-ostd`.
 
 ## Change discipline
 
-- Change formal semantics, the independent reference model, and the OSTD
-  implementation in separate reviewable steps.
-- Keep effect IDs, authority and binding epochs, commit points, tickets,
-  receipts, budget transfers, and failure boundaries visible in tests and
-  traces.
-- Preserve the independence of the safe-Rust oracle and OSTD implementation;
-  neither may call the other's transition implementation.
-- Do not delete TLA+ configurations, negative oracles, OSDK runner snapshots,
-  retained Linux inputs, or hardware traces merely because they are not
-  runtime product code. They are part of the reproducibility boundary.
-- Keep mechanical source moves separate from semantic changes, and prove the
-  existing receipts before introducing new behavior.
-- Treat `Checked`, `Observed`, and unestablished claims distinctly. Preserve
-  the exact concurrency boundary `production transition source under a
-  Loom-modeled outer mutex` unless stronger evidence has actually replaced it.
-- Do not rename released stage, receipt, schema, or evidence paths for cosmetic
-  reasons. They are part of the `v0.1.0` artifact contract.
-- Never move, recreate, or retroactively rewrite a published release tag.
+- Keep one authoritative semantic path. Do not dual-write a historical state
+  machine and the current core.
+- Add a core transition only when a smaller adapter/runtime policy cannot
+  enforce the required invariant.
+- Preserve exact claim coordinates, fencing generations, journal-before-anchor
+  ordering, and evidence-specific retirement.
+- Do not translate timeout, unavailable transport, missing telemetry, or
+  nonterminal endpoint state into business failure.
+- Keep the independent current oracles independent: do not call production
+  transition helpers to compute their expected result.
+- Prefer focused tests for the changed invariant. Historical gate shapes and
+  frozen receipt populations are not compatibility obligations on current
+  main.
 
-When changing a claimed property, update the relevant normative specification,
-implementation-independent oracle, implementation trace, and claim ledger. A
-new result must not enlarge what an older frozen receipt establishes.
+## Evidence changes
 
-The active post-`v0.1.0` research contract is
-[RFC 0001](docs/rfcs/0001-production-identity.md). Its production-identity,
-same-boot device, IRQ, and SMP requirements remain prospective until every
-named evidence gate closes.
+Every checked or observed claim must identify its code revision, environment,
+workload, and source. A newer implementation does not inherit an older
+source-bound bundle automatically.
 
-Current main uses `nexus.verification.v6` for the post-release evidence
-successor. The formal-verifier descriptor, four vendored TLA+ files,
-`target/verification/.formal-verifier.json`, model/spec prerequisite, and
-bundle population are one contract: change them together and add a negative
-mutation test that remains failing even after the downstream receipt chain and
-outer checksum index are resealed. These static tool inputs are not fresh
-research artifacts and must stay associated with the existing
-`formal-specifications` stage.
+Do not edit a committed evidence bundle to make it describe newer code. Capture
+a new bundle when the new claim needs execution evidence, or state that the old
+bundle applies only to its recorded source commit.
 
-## Verification evidence
+Public evidence must exclude raw operation/effect/resource identities,
+databases, logs, media, TPM state, absolute paths, container identifiers, and
+HMAC keys. Missing evidence remains unknown or right-censored.
 
-Successful and failed runs retain ignored evidence under:
+## Documentation changes
 
-```text
-target/verification/
-kernel/nexus-ostd/artifacts/
-experiments/ostd-virtio-cser-spike/artifacts/
-```
+Maproom maintenance is user-directed. Do not update terrain, basecamp, or route
+merely because work progressed or seems worth recording. When the user asks
+for an update, change only the relevant document:
 
-A complete `./x verify` records the invocation, Git revision, nonignored source
-fingerprint, dirty state, cold-rebuild request, run nonce, research boundaries,
-and SHA-256 of every required artifact. Ordered start, model/spec, completion,
-and manifest records bind one run so focused commands cannot splice evidence
-after a failed full gate. Repository and backend locks prevent concurrent
-public workflows from mutating that evidence set while it is sealed.
+- conceptual or semantic reasoning: `maproom/terrain.md`;
+- deliberately established current position: `maproom/basecamp.md`;
+- user-selected high-level direction: `maproom/route.md`;
+- verified project-specific failure modes: `maproom/hazards.md`.
 
-The same run publishes `target/verification/artifact-bundle/`. Verify it with:
+General development conventions belong in this contributing guide, not in the
+hazards file. Status feeds, session logs, result ledgers, and detailed execution
+plans do not belong in the maproom.
 
-```bash
-./x verify-bundle target/verification/artifact-bundle
-```
+README should remain a concise entry point. Historical states belong to Git
+history, tags, and release archives rather than duplicated archive trees on
+current main.
 
-The verifier checks the exact file population and receipt/hash chain and binds
-the bundle to the current clean checkout. See [ARTIFACT.md](ARTIFACT.md) for the
-published `v0.1.0` populations, resource envelope, exact release audit, and
-future sealing procedure.
+## Publication boundary
 
-## Acceptance boundary
-
-Before a release or other acceptance claim:
-
-1. Commit every implementation, documentation, and tooling change.
-2. Run a clean, cold `NEXUS_REBUILD=1 ./x verify`.
-3. Verify the generated bundle against that checkout.
-4. Push the exact commit and require the remote quick and full jobs to pass at
-   that SHA.
-5. Audit the downloaded CI bundle before publishing a protected tag or release.
-
-Focused local success is diagnostic evidence, not release acceptance. CI
-success at a different revision is not evidence for the proposed change.
+Do not configure, synchronize, push, publish, or submit the sibling
+`nexus-hotos` paper repository without explicit user authorization. Local code
+or documentation cleanup in Nexus does not grant that authorization.

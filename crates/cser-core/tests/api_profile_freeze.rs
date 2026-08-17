@@ -6,25 +6,28 @@ use cser_core::{
     ConflictMode, DEVICE_CLAIM_IOVA, DEVICE_CLAIM_PINNED_PAGE, DEVICE_CLAIM_QUEUE_SLOT,
     DEVICE_DOMAIN, DEVICE_EVIDENCE_IOTLB, DEVICE_RECEIPT_SCHEMA, DEVICE_VERIFIER,
     DMA_ARENA_REUSE_COMPOSITE, DeviceGenerationEffect, DomainCatalogBuilder, DomainCatalogError,
-    EvidenceCapability, EvidenceRecovery, EvidenceRule, FreshnessAxes, JOURNAL_CORE_API_PROFILE,
-    JOURNAL_MAGIC, JOURNAL_SCHEMA_VERSION, NORMALIZED_TRACE_VERSION, ObligationPolicy,
-    ObligationReceipts, ObligationSpec, PROJECTION_VERSION, RECOVERY_SNAPSHOT_VERSION,
-    REPLY_APPLY_RECEIPT_SCHEMA, REPLY_CLAIM_PUBLICATION_SLOT, REPLY_COMMIT_RECEIPT_SCHEMA,
-    REPLY_DOMAIN, REPLY_EVIDENCE_PUBLICATION_ACK, REPLY_OBLIGATION_PUBLICATION,
-    REPLY_RECEIPT_SCHEMA, REPLY_SETTLEMENT_RECEIPT_SCHEMA, REPLY_VERIFIER, ReceiptBinding,
-    STANDARD_CATALOG_VERSION, standard_catalog,
+    EvidenceCapability, EvidenceRecovery, EvidenceRule, FreshnessAxes, JOURNAL_CHECKPOINT_MAGIC,
+    JOURNAL_CHECKPOINT_VERSION, JOURNAL_CORE_API_PROFILE, JOURNAL_MAGIC, JOURNAL_SCHEMA_VERSION,
+    NORMALIZED_TRACE_VERSION, ObligationPolicy, ObligationReceipts, ObligationSpec,
+    PROJECTION_VERSION, RECOVERY_SNAPSHOT_VERSION, REPLY_APPLY_RECEIPT_SCHEMA,
+    REPLY_CLAIM_PUBLICATION_SLOT, REPLY_COMMIT_RECEIPT_SCHEMA, REPLY_DOMAIN,
+    REPLY_EVIDENCE_PUBLICATION_ACK, REPLY_OBLIGATION_PUBLICATION, REPLY_RECEIPT_SCHEMA,
+    REPLY_SETTLEMENT_RECEIPT_SCHEMA, REPLY_VERIFIER, ReceiptBinding, STANDARD_CATALOG_VERSION,
+    standard_catalog,
 };
 
 #[test]
-fn semantic_api_profile_four_freezes_journal_and_domain_catalog() {
-    assert_eq!(CSER_CORE_API_PROFILE_VERSION, 4);
-    assert_eq!(JOURNAL_MAGIC, *b"CSERJR8\0");
-    assert_eq!(JOURNAL_SCHEMA_VERSION, 8);
-    assert_eq!(JOURNAL_CORE_API_PROFILE, 4);
-    assert_eq!(STANDARD_CATALOG_VERSION, 7);
-    assert_eq!(PROJECTION_VERSION, 8);
-    assert_eq!(RECOVERY_SNAPSHOT_VERSION, 4);
-    assert_eq!(NORMALIZED_TRACE_VERSION, 2);
+fn semantic_api_profile_five_freezes_journal_and_domain_catalog() {
+    assert_eq!(CSER_CORE_API_PROFILE_VERSION, 5);
+    assert_eq!(JOURNAL_MAGIC, *b"CSERJR9\0");
+    assert_eq!(JOURNAL_SCHEMA_VERSION, 9);
+    assert_eq!(JOURNAL_CORE_API_PROFILE, 5);
+    assert_eq!(STANDARD_CATALOG_VERSION, 8);
+    assert_eq!(PROJECTION_VERSION, 9);
+    assert_eq!(RECOVERY_SNAPSHOT_VERSION, 5);
+    assert_eq!(NORMALIZED_TRACE_VERSION, 3);
+    assert_eq!(JOURNAL_CHECKPOINT_MAGIC, *b"CSERCP2\0");
+    assert_eq!(JOURNAL_CHECKPOINT_VERSION, 2);
     let catalog = standard_catalog();
     let agent_operation = catalog
         .composite_rule(AGENT_OPERATION_COMPOSITE)
@@ -46,9 +49,9 @@ fn semantic_api_profile_four_freezes_journal_and_domain_catalog() {
     assert_eq!(
         catalog.digest().bytes(),
         [
-            0xc5, 0x10, 0x69, 0x59, 0x85, 0xb0, 0xde, 0x45, 0x92, 0x24, 0x2d, 0xcf, 0xca, 0x36,
-            0xfb, 0x52, 0xea, 0xfc, 0x0e, 0x0c, 0x53, 0xfb, 0xd2, 0x14, 0xe9, 0xdd, 0x46, 0x79,
-            0x94, 0x64, 0x42, 0x4b,
+            0x07, 0x82, 0xc4, 0x85, 0x8f, 0x2a, 0x99, 0x78, 0x76, 0xa4, 0xbe, 0xe9, 0xba, 0x30,
+            0xeb, 0xf0, 0xca, 0xdf, 0x65, 0xd9, 0x9d, 0x93, 0xdc, 0xc0, 0xdc, 0x77, 0xc6, 0xa1,
+            0x58, 0x1c, 0xa8, 0xee,
         ]
     );
 }

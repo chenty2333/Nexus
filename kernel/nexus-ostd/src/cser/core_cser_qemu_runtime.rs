@@ -13,11 +13,12 @@
 use alloc::sync::Arc;
 use core::fmt;
 use cser_core::{
-    ChargeAccountId, ClaimId, CommandRequest, CoordinatedPersistence, CoreLimits, DEVICE_DOMAIN,
-    DEVICE_EVIDENCE_IOTLB, DEVICE_EVIDENCE_IRQ_DRAINED, DEVICE_EVIDENCE_RESET, DeviceScopeId,
-    Digest, EffectId, PrincipalId, PrincipalIncarnation, RecoveryBinding, RegistryInstance,
-    ResourceGeneration, ResourceId, RootId, TOOL_DMA_COMPONENT_DMA, TOOL_DMA_COMPONENT_TOOL,
-    TransitionDurability, TransitionOutput, tool_dma_catalog,
+    AuthorityBindingGeneration, ChargeAccountId, ClaimId, CommandRequest, CoordinatedPersistence,
+    CoreLimits, DEVICE_DOMAIN, DEVICE_EVIDENCE_IOTLB, DEVICE_EVIDENCE_IRQ_DRAINED,
+    DEVICE_EVIDENCE_RESET, DeviceScopeId, Digest, EffectId, PrincipalId, PrincipalIncarnation,
+    RecoveryBinding, RecoveryProfile, RegistryInstance, ResourceGeneration, ResourceId, RootId,
+    TOOL_DMA_COMPONENT_DMA, TOOL_DMA_COMPONENT_TOOL, TransitionDurability, TransitionOutput,
+    WorldId, tool_dma_catalog,
 };
 use nexus_ostd_virtio::{
     CompletedRequest, InterruptCompletionProgress, InterruptReceipt, MaskedIntx,
@@ -267,9 +268,11 @@ pub(crate) fn run() {
     let experiment_identity = acquire_experiment_identity(catalog.digest());
     let run_id = experiment_identity.run_id().bytes();
     let binding = RecoveryBinding::new(
+        RecoveryProfile::current(),
+        WorldId::new(1).expect("experiment world is non-zero"),
         catalog.digest(),
         RegistryInstance::new(1).expect("non-zero experiment registry"),
-        1,
+        AuthorityBindingGeneration::new(1).expect("experiment binding is non-zero"),
     )
     .expect("valid experiment binding");
     let mut prepared = ExperimentPreparedBoot::acquire()

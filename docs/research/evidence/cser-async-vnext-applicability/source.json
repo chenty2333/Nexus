@@ -1,8 +1,0 @@
-{
-  "commit": "59dee4031ead7736275e5314c22a871bcf053aba",
-  "dirty": false,
-  "exporter": "qemu_applicability_export_v1",
-  "repository": "Nexus",
-  "source_diff_sha256": "4e59bf27372b1304bc0b137d1be9d566ad58b154b6a6b5778af7f414b1d4b84c",
-  "source_tree_sha256": "a1b7f28c9df194885560ba778cc05640ffd1e2869d554cb227b8104f05c43adf"
-}

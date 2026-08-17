@@ -8,11 +8,12 @@ type Result<T> = std::result::Result<T, Box<dyn Error>>;
 const REQUIRED_PATHS: &[&str] = &[
     "Cargo.toml",
     "Cargo.lock",
-    "docs/rfcs/0006-cser-core-semantic-rebaseline.md",
+    "maproom/terrain.md",
+    "maproom/basecamp.md",
+    "maproom/route.md",
+    "maproom/hazards.md",
     "crates/cser-core/Cargo.toml",
     "crates/cser-model/Cargo.toml",
-    "crates/cser-trace-conformance/Cargo.toml",
-    "crates/nexus-effect-peer-wire/Cargo.toml",
     "kernel/nexus-ostd/Cargo.toml",
     "kernel/nexus-ostd/cser-production-sources.txt",
     "kernel/nexus-ostd/scripts/assert-cser-core-production-cutover.sh",
@@ -66,11 +67,11 @@ fn print_usage() {
 }
 
 fn doctor(root: &Path) -> Result<()> {
-    section("validate CSER core rebaseline layout");
+    section("validate current CSER layout");
     for relative in REQUIRED_PATHS {
         let path = root.join(relative);
         if !path.is_file() {
-            return Err(format!("required rebaseline path is missing: {}", path.display()).into());
+            return Err(format!("required current path is missing: {}", path.display()).into());
         }
     }
     run(root, "rustc", &["--version"])?;
@@ -85,7 +86,7 @@ fn doctor(root: &Path) -> Result<()> {
 }
 
 fn build(root: &Path) -> Result<()> {
-    section("build the rebaselined host workspace");
+    section("build the current host workspace");
     cargo(
         root,
         &[
@@ -166,8 +167,6 @@ fn check(root: &Path) -> Result<()> {
         ],
     )?;
     cargo_package(root, "check", "cser-model", true)?;
-    cargo_package(root, "check", "cser-trace-conformance", false)?;
-    cargo_package(root, "check", "nexus-effect-peer-wire", false)?;
     section("check the production workflow runner");
     cargo(
         root,
@@ -184,8 +183,6 @@ fn check(root: &Path) -> Result<()> {
 fn clippy(root: &Path) -> Result<()> {
     clippy_package(root, "cser-core", true)?;
     clippy_package(root, "cser-model", true)?;
-    clippy_package(root, "cser-trace-conformance", false)?;
-    clippy_package(root, "nexus-effect-peer-wire", false)?;
     section("clippy the production workflow runner");
     cargo(
         root,
@@ -205,8 +202,6 @@ fn clippy(root: &Path) -> Result<()> {
 fn test(root: &Path) -> Result<()> {
     test_package(root, "cser-core", true)?;
     test_package(root, "cser-model", true)?;
-    test_package(root, "cser-trace-conformance", false)?;
-    test_package(root, "nexus-effect-peer-wire", false)?;
     section("test the production workflow runner");
     cargo(
         root,
@@ -225,7 +220,7 @@ fn verify(root: &Path) -> Result<()> {
     clippy(root)?;
     test(root)?;
     println!(
-        "CSER CORE VERIFY PASS portable_core=true independent_oracle=true loom=true journal_recovery=true frozen_wire=archive-only"
+        "CSER CORE VERIFY PASS portable_core=true independent_oracle=true loom=true journal_recovery=true"
     );
     Ok(())
 }
