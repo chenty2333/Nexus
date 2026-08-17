@@ -150,6 +150,45 @@ fn two_mode_catalog() -> DomainCatalog {
         .unwrap()
 }
 
+/// Builds two otherwise identical catalog materializations which deliberately
+/// disagree about the same `(domain, claim-kind)` coordinate.  This is the
+/// smallest public-path witness that admission must resolve each incumbent by
+/// its owning catalog instead of interpreting every claim with the incoming
+/// catalog.
+fn same_coordinate_catalog(mode: ConflictMode, credit_limit: u64) -> DomainCatalog {
+    DomainCatalogBuilder::new()
+        .credit_class(CREDIT, credit_limit)
+        .unwrap()
+        .obligation(
+            cser_core::ObligationSpec::new(
+                DOMAIN,
+                OBLIGATION,
+                ObligationPolicy::RetirementEvidence,
+                AdoptionPolicy::Forbidden,
+                ObligationReceipts::retirement_only(ReceiptBinding::new(VERIFIER, SCHEMA)),
+                1,
+            ),
+            &[ClaimCardinality::new(SHARED_KIND, 0, 8).unwrap()],
+        )
+        .unwrap()
+        .claim_with_conflict(
+            DOMAIN,
+            SHARED_KIND,
+            CREDIT,
+            ClaimScopePolicy::Device,
+            mode,
+            &[device_retirement_evidence(DeviceGenerationEffect::None)],
+        )
+        .unwrap()
+        .composite(
+            COMPOSITE,
+            &[CompositeComponentSpec::new(COMPONENT, DOMAIN, OBLIGATION)],
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+}
+
 fn freshness() -> Freshness {
     Freshness::new(
         cser_core::BootGeneration::new(1).unwrap(),
@@ -377,6 +416,158 @@ fn a_shared_class_admits_a_second_component_custodian() {
     let second = admit(&mut harness, 2);
     add_claim(&mut harness, first, SHARED_KIND, 1, 500).unwrap();
     add_claim(&mut harness, second, SHARED_KIND, 2, 500).unwrap();
+}
+
+#[test]
+fn mixed_catalog_admission_is_symmetric_and_charge_cache_is_global() {
+    let shared = same_coordinate_catalog(ConflictMode::Shared, 64);
+    let exclusive = same_coordinate_catalog(ConflictMode::Exclusive, 64);
+    assert_ne!(shared.digest(), exclusive.digest());
+    let mut engine = Engine::new(
+        WORLD,
+        CatalogSet::new(&[shared.clone(), exclusive.clone()]).unwrap(),
+        CoreLimits::new(64, 1024, 4096, 4096, 32, 3, 1024).unwrap(),
+        freshness(),
+    );
+    let shared_provider = ProviderCoordinate::new(
+        WORLD,
+        ProviderId::new(11).unwrap(),
+        ProviderGeneration::new(1).unwrap(),
+    );
+    let exclusive_provider = ProviderCoordinate::new(
+        WORLD,
+        ProviderId::new(12).unwrap(),
+        ProviderGeneration::new(1).unwrap(),
+    );
+    for (provider, catalog) in [(shared_provider, &shared), (exclusive_provider, &exclusive)] {
+        tx(
+            &mut engine,
+            CommandRequest::RegisterProviderGeneration {
+                coordinate: provider,
+                catalog_digest: catalog.digest(),
+                verifier_bindings: verifier_bindings(catalog),
+            },
+        )
+        .unwrap();
+    }
+    let shared_effect = effect(101);
+    let exclusive_effect = effect(102);
+    let account = cser_core::ChargeAccountId::new(77).unwrap();
+    for (effect, provider, catalog) in [
+        (shared_effect, shared_provider, &shared),
+        (exclusive_effect, exclusive_provider, &exclusive),
+    ] {
+        tx(
+            &mut engine,
+            CommandRequest::AdmitScopedCompositeEffect {
+                effect,
+                origin: actor(effect.operation().get()),
+                kind: COMPOSITE,
+                charge_account: account,
+                bindings: vec![ComponentProviderBinding::new(COMPONENT, provider)],
+            },
+        )
+        .unwrap();
+        assert_eq!(engine.catalog_set().get(catalog.digest()), Some(catalog));
+    }
+
+    let claim = |engine: &mut Engine, effect, claim, resource| {
+        tx(
+            engine,
+            CommandRequest::AddComponentClaim {
+                effect,
+                component: COMPONENT,
+                actor: actor(effect.operation().get()),
+                claim: cser_core::ClaimId::new(claim).unwrap(),
+                kind: SHARED_KIND,
+                scope: ClaimScope::Device(DEVICE_SCOPE),
+                resource: ResourceId::new(resource).unwrap(),
+                resource_generation: ResourceGeneration::new(1).unwrap(),
+                units: 1,
+            },
+        )
+    };
+
+    // Candidate Exclusive must reject an incumbent Shared claim: the
+    // candidate declaration is not allowed to reinterpret the incumbent.
+    claim(&mut engine, shared_effect, 1, 700).unwrap();
+    assert_eq!(
+        claim(&mut engine, exclusive_effect, 2, 700),
+        Err(CoreError::ResourceRetained)
+    );
+    // The reverse direction is rejected as well.  A Shared candidate cannot
+    // join an incumbent whose owning catalog declares Exclusive.
+    claim(&mut engine, exclusive_effect, 3, 701).unwrap();
+    assert_eq!(
+        claim(&mut engine, shared_effect, 4, 701),
+        Err(CoreError::ResourceRetained)
+    );
+
+    // The two catalogs share the account/class identifier but their local
+    // limits are independent.  The public aggregate must retain both units,
+    // rather than being overwritten by the second catalog's local subtotal.
+    claim(&mut engine, exclusive_effect, 5, 702).unwrap();
+    assert_eq!(
+        engine.charge(account, CREDIT).retained_units,
+        3,
+        "cross-catalog enrollment must preserve the global aggregate"
+    );
+    assert_eq!(
+        claim(&mut engine, shared_effect, 6, 703),
+        Err(CoreError::Backpressure),
+        "the Core-wide account ceiling applies across catalog digests"
+    );
+    for provider in [shared_provider, exclusive_provider] {
+        tx(
+            &mut engine,
+            CommandRequest::FenceProviderEffects {
+                coordinate: provider,
+                expected_epoch: 1,
+            },
+        )
+        .unwrap();
+    }
+    tx(
+        &mut engine,
+        CommandRequest::AbortUnescapedEffect {
+            effect: shared_effect,
+        },
+    )
+    .unwrap();
+    assert_eq!(engine.charge(account, CREDIT).retained_units, 2);
+    tx(
+        &mut engine,
+        CommandRequest::AbortUnescapedEffect {
+            effect: exclusive_effect,
+        },
+    )
+    .unwrap();
+    assert_eq!(engine.charge(account, CREDIT).retained_units, 0);
+}
+
+#[test]
+fn one_component_cannot_cross_device_scopes() {
+    let mut harness = two_mode_harness();
+    let first = admit(&mut harness, 201);
+    add_claim(&mut harness, first, SHARED_KIND, 1, 710).unwrap();
+    let second_scope = DeviceScopeId::new(2).unwrap();
+    let result = tx(
+        &mut harness.engine,
+        CommandRequest::AddComponentClaim {
+            effect: first,
+            component: COMPONENT,
+            actor: actor(201),
+            claim: cser_core::ClaimId::new(2).unwrap(),
+            kind: SHARED_KIND,
+            scope: ClaimScope::Device(second_scope),
+            resource: ResourceId::new(711).unwrap(),
+            resource_generation: ResourceGeneration::new(1).unwrap(),
+            units: 1,
+        },
+    );
+    assert_eq!(result, Err(CoreError::WrongClaimScope));
+    assert_eq!(harness.engine.device_generation(second_scope), None);
+    assert_eq!(harness.engine.pressure().retained_claims, 1);
 }
 
 #[test]

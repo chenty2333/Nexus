@@ -306,8 +306,9 @@ impl JournalCheckpoint {
 
     /// Recovers the checkpoint image through the normal trusted-anchor path.
     ///
-    /// The anchor is consumed by [`crate::Engine::recover`], which reserves a
-    /// newer freshness epoch, fences operations, and quarantines device claims.
+    /// The anchor is consumed by the engine's validated recovery path, which
+    /// reserves a newer freshness epoch, fences operations, and quarantines
+    /// device claims.
     /// This API deliberately cannot return an old-epoch writable engine.
     pub fn recover(
         &self,
@@ -325,12 +326,10 @@ impl JournalCheckpoint {
         {
             return Err(crate::CoreError::RollbackDetected);
         }
-        // Rebuild the pre-recovery image before advancing freshness. This
-        // binds the stored projection to actual replayed state; the following
-        // normal recovery deliberately changes that projection by installing
-        // a recovery target and device quarantine.
-        crate::Engine::validate_journal_checkpoint(catalog.clone(), limits, self)?;
-        crate::Engine::recover(catalog, limits, anchor, self.image())
+        // Replay and validate the image once, then install the transient
+        // recovery overlay on that validated engine without replaying it a
+        // second time.
+        crate::Engine::recover_validated_journal_checkpoint(catalog, limits, self, anchor)
     }
 
     /// Returns the trusted coordinates which must be anchored with this image.
@@ -1140,6 +1139,101 @@ mod checkpoint_tests {
             Err(CoreError::RollbackDetected)
         ));
         assert_ne!(engine.projection_digest(), Digest::new([7; 32]));
+    }
+
+    #[test]
+    fn recovery_validates_checkpoint_once_then_keeps_trusted_projection_overlay() {
+        let catalog = standard_catalog();
+        let catalogs = CatalogSet::new(core::slice::from_ref(&catalog)).unwrap();
+        let committed = freshness(1, 1);
+        let next = freshness(2, 2);
+        let checkpoint_binding = crate::RecoveryBinding::new(
+            crate::RecoveryProfile::current(),
+            crate::WorldId::new(1).unwrap(),
+            catalogs.digest(),
+            crate::RegistryInstance::new(1).unwrap(),
+        )
+        .unwrap();
+        let engine = Engine::new(
+            crate::WorldId::new(1).unwrap(),
+            catalogs.clone(),
+            CoreLimits::bounded_default(),
+            committed,
+        );
+        let checkpoint = JournalCheckpoint::build(
+            checkpoint_binding,
+            committed,
+            0,
+            Digest::ZERO,
+            engine.projection_digest(),
+            &[],
+        )
+        .unwrap();
+        let anchor = RecoveryAnchor::from_trusted_provider(
+            checkpoint_binding,
+            committed,
+            next,
+            0,
+            Digest::ZERO,
+            engine.projection_digest(),
+        )
+        .unwrap();
+
+        let report = checkpoint
+            .recover(catalogs, CoreLimits::bounded_default(), anchor)
+            .unwrap();
+        assert_eq!(report.acknowledged_revision(), 0);
+        assert_eq!(report.acknowledged_head(), Digest::ZERO);
+        let recovered = report.into_engine();
+        assert_eq!(recovered.projection_digest(), engine.projection_digest());
+        assert_eq!(recovered.freshness(), committed);
+        assert_eq!(
+            recovered.journal_checkpoint(&[]),
+            Err(crate::CoreError::RecoveryPending)
+        );
+    }
+
+    #[test]
+    fn recovery_rejects_a_valid_envelope_with_a_malicious_image() {
+        let catalog = standard_catalog();
+        let catalogs = CatalogSet::new(core::slice::from_ref(&catalog)).unwrap();
+        let committed = freshness(1, 1);
+        let engine = Engine::new(
+            crate::WorldId::new(1).unwrap(),
+            catalogs.clone(),
+            CoreLimits::bounded_default(),
+            committed,
+        );
+        let checkpoint_binding = crate::RecoveryBinding::new(
+            crate::RecoveryProfile::current(),
+            crate::WorldId::new(1).unwrap(),
+            catalogs.digest(),
+            crate::RegistryInstance::new(1).unwrap(),
+        )
+        .unwrap();
+        let checkpoint = JournalCheckpoint::build(
+            checkpoint_binding,
+            committed,
+            0,
+            Digest::ZERO,
+            engine.projection_digest(),
+            b"malicious-image",
+        )
+        .unwrap();
+        let anchor = RecoveryAnchor::from_trusted_provider(
+            checkpoint_binding,
+            committed,
+            freshness(2, 2),
+            0,
+            Digest::ZERO,
+            engine.projection_digest(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            checkpoint.recover(catalogs, CoreLimits::bounded_default(), anchor),
+            Err(crate::CoreError::RollbackDetected)
+        ));
     }
 
     #[test]

@@ -6,13 +6,13 @@ use cser_core::{
     ExecutorCoordinate, ExecutorGeneration, ExecutorId, ExternalOutcome, Freshness,
     JournalGeneration, OperationId, ProviderCoordinate, ProviderEffectState, ProviderGeneration,
     ProviderId, ReceiptVerifier, RecoveryAnchor, RecoveryBinding, RecoveryProfile,
-    RegistryInstance, ResourceGeneration, ResourceId, TOOL_APPLY_RECEIPT_SCHEMA,
-    TOOL_CLAIM_OUTCOME_SLOT, TOOL_COMMIT_RECEIPT_SCHEMA, TOOL_EVIDENCE_OUTCOME_ACK,
-    TOOL_HANDOFF_CHILD_COMPOSITE, TOOL_HANDOFF_COMPONENT, TOOL_HANDOFF_SOURCE_COMPONENT,
-    TOOL_HANDOFF_SOURCE_COMPOSITE, TOOL_RECEIPT_SCHEMA, TOOL_SETTLEMENT_RECEIPT_SCHEMA,
-    TOOL_VERIFIER, TransitionOutput, VerifiedEffectObservation, VerifiedObservation,
-    VerifierBinding, VerifierGeneration, VerifierIdentity, WorldId, standard_catalog,
-    tool_dma_catalog,
+    RegistryInstance, ResourceGeneration, ResourceId, SingleHopHandoffProjection,
+    TOOL_APPLY_RECEIPT_SCHEMA, TOOL_CLAIM_OUTCOME_SLOT, TOOL_COMMIT_RECEIPT_SCHEMA,
+    TOOL_EVIDENCE_OUTCOME_ACK, TOOL_HANDOFF_CHILD_COMPOSITE, TOOL_HANDOFF_COMPONENT,
+    TOOL_HANDOFF_SOURCE_COMPONENT, TOOL_HANDOFF_SOURCE_COMPOSITE, TOOL_RECEIPT_SCHEMA,
+    TOOL_SETTLEMENT_RECEIPT_SCHEMA, TOOL_VERIFIER, TransitionEvent, TransitionOutput,
+    VerifiedEffectObservation, VerifiedObservation, VerifierBinding, VerifierGeneration,
+    VerifierIdentity, WorldId, standard_catalog, tool_dma_catalog,
 };
 
 struct AcceptDescriptor;
@@ -622,6 +622,247 @@ fn handoff_source_release_removes_scoped_binding_at_the_pivot() {
         },
     )
     .unwrap();
+}
+
+#[test]
+fn fenced_prepared_handoff_child_aborts_and_recovers_as_released() {
+    let world = WorldId::new(741).unwrap();
+    let catalog = tool_dma_catalog();
+    let mut engine = Engine::new(
+        world,
+        CatalogSet::new(std::slice::from_ref(&catalog)).unwrap(),
+        CoreLimits::bounded_default(),
+        freshness(),
+    );
+    let mut journal = Vec::new();
+    macro_rules! durable {
+        ($request:expr $(,)?) => {
+            engine
+                .transact($request, |record| {
+                    journal.extend_from_slice(record.bytes());
+                    Ok::<(), ()>(())
+                })
+                .unwrap()
+        };
+    }
+    let provider = coordinate(741, 742, 1);
+    let target_provider = coordinate(741, 743, 1);
+    let digest = catalog.digest();
+    durable!(CommandRequest::RegisterProviderGeneration {
+        coordinate: provider,
+        catalog_digest: digest,
+        verifier_bindings: verifiers_for(&catalog, 0x74),
+    });
+    durable!(CommandRequest::RegisterProviderGeneration {
+        coordinate: target_provider,
+        catalog_digest: digest,
+        verifier_bindings: verifiers_for(&catalog, 0x75),
+    });
+
+    let parent = EffectId::new(OperationId::new(7411).unwrap(), 1).unwrap();
+    let actor = ExecutorCoordinate::new(
+        ExecutorId::new(7411).unwrap(),
+        ExecutorGeneration::new(1).unwrap(),
+    );
+    durable!(CommandRequest::AdmitScopedCompositeEffect {
+        effect: parent,
+        origin: actor,
+        kind: TOOL_HANDOFF_SOURCE_COMPOSITE,
+        charge_account: cser_core::ChargeAccountId::new(7411).unwrap(),
+        bindings: vec![ComponentProviderBinding::new(
+            TOOL_HANDOFF_SOURCE_COMPONENT,
+            provider,
+        )],
+    });
+    durable!(CommandRequest::AddComponentClaim {
+        effect: parent,
+        component: TOOL_HANDOFF_SOURCE_COMPONENT,
+        actor,
+        claim: ClaimId::new(7411).unwrap(),
+        kind: TOOL_CLAIM_OUTCOME_SLOT,
+        scope: ClaimScope::Logical,
+        resource: ResourceId::new(7411).unwrap(),
+        resource_generation: ResourceGeneration::new(1).unwrap(),
+        units: 1,
+    });
+    durable!(CommandRequest::PrepareCompositeEffect {
+        effect: parent,
+        actor,
+    });
+    let receipt = durable!(CommandRequest::RecordComponentCommitIntent {
+        effect: parent,
+        component: TOOL_HANDOFF_SOURCE_COMPONENT,
+        actor,
+        operation: Digest::new([0x93; 32]),
+    });
+    let TransitionOutput::CommitIntent(intent) = receipt.into_output() else {
+        panic!("expected source commit intent");
+    };
+    let descriptor = ChildDescriptorV1 {
+        schema: 1,
+        sequence: 1,
+        parent,
+        parent_component: TOOL_HANDOFF_SOURCE_COMPONENT,
+        route_digest: Digest::new([0x94; 32]),
+        child_kind: TOOL_HANDOFF_CHILD_COMPOSITE,
+        child_component: TOOL_HANDOFF_COMPONENT,
+        claim: ClaimId::new(7411).unwrap(),
+        claim_kind: TOOL_CLAIM_OUTCOME_SLOT,
+        scope: ClaimScope::Logical,
+        resource: ResourceId::new(7411).unwrap(),
+        resource_generation: ResourceGeneration::new(1).unwrap(),
+        units: 1,
+        input_digest: Digest::new([0x95; 32]),
+        catalog_digest: digest,
+    };
+    let verified_descriptor = engine
+        .verify_child_descriptor(descriptor, &AcceptDescriptor, &())
+        .unwrap();
+    let verified_outcome = engine
+        .verify_commit_outcome(&intent, &AcceptEffect, &())
+        .unwrap();
+    durable!(
+        intent
+            .acknowledge_handoff_parent_success(verified_outcome, verified_descriptor)
+            .unwrap()
+    );
+    let verified = engine
+        .verify_child_descriptor(descriptor, &AcceptDescriptor, &())
+        .unwrap();
+    let child = descriptor.child_effect().unwrap();
+    durable!(verified.install(
+        actor,
+        cser_core::ChargeAccountId::new(7411).unwrap(),
+        ComponentProviderBinding::new(TOOL_HANDOFF_COMPONENT, target_provider),
+    ));
+
+    durable!(CommandRequest::FenceProviderEffects {
+        coordinate: target_provider,
+        expected_epoch: 1,
+    });
+    assert_eq!(
+        tx(
+            &mut engine,
+            CommandRequest::EnterProviderSettlementOnly {
+                coordinate: target_provider,
+                expected_epoch: 2,
+            },
+        ),
+        Err(CoreError::ProviderEffectsLive)
+    );
+
+    let receipt = durable!(CommandRequest::AbortUnescapedEffect { effect: child });
+    assert_eq!(receipt.event(), TransitionEvent::CompositeEffectReleased);
+    assert_eq!(
+        engine.composite_effect(parent).unwrap().handoff,
+        SingleHopHandoffProjection::None
+    );
+    assert_eq!(
+        engine.composite_effect(child).unwrap().handoff,
+        SingleHopHandoffProjection::None
+    );
+    assert_eq!(
+        engine
+            .component(child, TOOL_HANDOFF_COMPONENT)
+            .unwrap()
+            .claim_count,
+        0
+    );
+    assert_eq!(
+        engine
+            .component(child, TOOL_HANDOFF_COMPONENT)
+            .unwrap()
+            .retirement,
+        cser_core::RetirementState::Released
+    );
+    assert_eq!(
+        engine
+            .provider_generation_projection(target_provider)
+            .unwrap()
+            .live_component_bindings,
+        0
+    );
+    durable!(CommandRequest::EnterProviderSettlementOnly {
+        coordinate: target_provider,
+        expected_epoch: 2,
+    });
+    durable!(CommandRequest::RetireProviderEffects {
+        coordinate: target_provider,
+        expected_epoch: 3,
+    });
+
+    let next_freshness = Freshness::new(
+        BootGeneration::new(2).unwrap(),
+        RegistryInstance::new(1).unwrap(),
+        DeviceGeneration::new(1).unwrap(),
+        JournalGeneration::new(2).unwrap(),
+    );
+    let recovered = Engine::recover(
+        CatalogSet::new(std::slice::from_ref(&catalog)).unwrap(),
+        CoreLimits::bounded_default(),
+        RecoveryAnchor::from_trusted_provider(
+            recovery_binding(world, &catalog, freshness()),
+            freshness(),
+            next_freshness,
+            engine.revision(),
+            engine.head(),
+            engine.projection_digest(),
+        )
+        .unwrap(),
+        &journal,
+    )
+    .unwrap()
+    .into_engine();
+    assert_eq!(
+        recovered.composite_effect(parent).unwrap().handoff,
+        SingleHopHandoffProjection::None
+    );
+    assert_eq!(
+        recovered
+            .component(child, TOOL_HANDOFF_COMPONENT)
+            .unwrap()
+            .claim_count,
+        0
+    );
+    assert!(matches!(
+        recovered
+            .provider_generation_projection(target_provider)
+            .unwrap()
+            .state,
+        ProviderEffectState::Retired { .. }
+    ));
+
+    let checkpoint = engine.journal_checkpoint(&journal).unwrap();
+    let checkpoint_recovered = Engine::recover(
+        CatalogSet::new(std::slice::from_ref(&catalog)).unwrap(),
+        CoreLimits::bounded_default(),
+        RecoveryAnchor::from_trusted_provider(
+            recovery_binding(world, &catalog, freshness()),
+            freshness(),
+            next_freshness,
+            checkpoint.anchor().revision(),
+            checkpoint.anchor().head(),
+            checkpoint.anchor().projection(),
+        )
+        .unwrap(),
+        checkpoint.image(),
+    )
+    .unwrap()
+    .into_engine();
+    assert_eq!(
+        checkpoint_recovered
+            .composite_effect(parent)
+            .unwrap()
+            .handoff,
+        SingleHopHandoffProjection::None
+    );
+    assert_eq!(
+        checkpoint_recovered
+            .component(child, TOOL_HANDOFF_COMPONENT)
+            .unwrap()
+            .claim_count,
+        0
+    );
 }
 
 #[test]

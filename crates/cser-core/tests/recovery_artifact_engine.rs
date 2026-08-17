@@ -1599,7 +1599,10 @@ fn abort_unescaped_then_release_reissues_the_same_permit_and_confirms_once() {
         },
     )
     .unwrap();
-    tx(&mut engine, CommandRequest::AbortUnescapedEffect { effect }).unwrap();
+    let abort = engine
+        .transact_volatile(CommandRequest::AbortUnescapedEffect { effect })
+        .unwrap();
+    assert_eq!(abort.event(), TransitionEvent::Revoked);
     let component = engine
         .component(effect, id(COMPONENT, ComponentId::new))
         .unwrap();
@@ -1619,6 +1622,21 @@ fn abort_unescaped_then_release_reissues_the_same_permit_and_confirms_once() {
             .live_component_bindings,
         1
     );
+    tx(
+        &mut engine,
+        CommandRequest::EnterProviderSettlementOnly {
+            coordinate: provider,
+            expected_epoch: 2,
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        engine
+            .provider_generation_projection(provider)
+            .unwrap()
+            .state,
+        ProviderEffectState::SettlementOnly { .. }
+    ));
 
     let permit = match tx(
         &mut engine,

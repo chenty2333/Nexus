@@ -4833,6 +4833,42 @@ struct PreparedTransition {
     receipt: TransitionReceipt,
 }
 
+#[allow(clippy::large_enum_variant)]
+enum TransitionInput {
+    Command(Command),
+    ValidatedCheckpoint(ValidatedCheckpointImage),
+}
+
+/// Private proof that a compact checkpoint image was encoded from a fully
+/// validated live state.  There is deliberately no public constructor: only
+/// the local compact-checkpoint path may use this image without decoding it.
+struct ValidatedCheckpointImage {
+    image: Arc<[u8]>,
+    projection: Digest,
+}
+
+impl ValidatedCheckpointImage {
+    fn from_live_state(
+        state: &State,
+        catalog: &CatalogSet,
+        limits: CoreLimits,
+    ) -> Result<Self, CoreError> {
+        check_invariants_for_catalog_set(catalog, limits, state)?;
+        let rebuilt_projection = build_projection_cache(state, catalog.digest());
+        if state.projection_cache() != &rebuilt_projection {
+            return Err(CoreError::InvariantViolation);
+        }
+        let image = encode_whole_state_checkpoint(state);
+        if image.len() > MAX_JOURNAL_CHECKPOINT_IMAGE_BYTES {
+            return Err(CoreError::CheckpointImageTooLarge);
+        }
+        Ok(Self {
+            image: Arc::from(image.into_boxed_slice()),
+            projection: rebuilt_projection.digest,
+        })
+    }
+}
+
 #[derive(Debug, Eq, PartialEq)]
 enum PrepareError {
     Core(CoreError),
@@ -6187,15 +6223,14 @@ impl Engine {
         if !state_within_limits(&self.state, self.limits) {
             return Err(TxError::Core(CoreError::CapacityExceeded));
         }
-        let state = encode_whole_state_checkpoint(&self.state);
-        if state.len() > MAX_JOURNAL_CHECKPOINT_IMAGE_BYTES {
-            return Err(TxError::Core(CoreError::CheckpointImageTooLarge));
-        }
-        let command = CommandKind::WholeStateCheckpointV1 {
-            state: Arc::from(state.into_boxed_slice()),
-            projection: self.projection_digest(),
-        };
-        self.transact_with_freshness(Command(command), |record, freshness, projection| {
+        // The image was produced from this immutable live state and is
+        // validated against the full invariant/projection oracles before it
+        // enters the durable boundary.  Keep that proof private so a caller
+        // cannot use it to bypass decoding an arbitrary checkpoint image.
+        let checkpoint =
+            ValidatedCheckpointImage::from_live_state(&self.state, &self.catalog, self.limits)
+                .map_err(TxError::Core)?;
+        self.transact_with_validated_checkpoint(checkpoint, |record, freshness, projection| {
             persistence.persist_transition(record, freshness, projection)
         })
     }
@@ -6209,12 +6244,32 @@ impl Engine {
         C: Into<Command>,
         P: FnOnce(&JournalRecord, Freshness, Digest) -> Result<(), E>,
     {
-        let prepared = self
-            .prepare_transition(command)
-            .map_err(|error| match error {
-                PrepareError::Core(error) => TxError::Core(error),
-                PrepareError::Journal(error) => TxError::Journal(error),
-            })?;
+        self.transact_with_input(TransitionInput::Command(command.into()), persist)
+    }
+
+    fn transact_with_validated_checkpoint<E, P>(
+        &mut self,
+        checkpoint: ValidatedCheckpointImage,
+        persist: P,
+    ) -> Result<TransitionReceipt, TxError<E>>
+    where
+        P: FnOnce(&JournalRecord, Freshness, Digest) -> Result<(), E>,
+    {
+        self.transact_with_input(TransitionInput::ValidatedCheckpoint(checkpoint), persist)
+    }
+
+    fn transact_with_input<E, P>(
+        &mut self,
+        input: TransitionInput,
+        persist: P,
+    ) -> Result<TransitionReceipt, TxError<E>>
+    where
+        P: FnOnce(&JournalRecord, Freshness, Digest) -> Result<(), E>,
+    {
+        let prepared = self.prepare_input(input).map_err(|error| match error {
+            PrepareError::Core(error) => TxError::Core(error),
+            PrepareError::Journal(error) => TxError::Journal(error),
+        })?;
         // Arm before entering user-controlled persistence.  A provider can
         // panic before writing anything, after appending bytes, or after its
         // barrier; all three cases are ambiguous to the core.  The latch is
@@ -6247,6 +6302,15 @@ impl Engine {
         Ok(receipt)
     }
 
+    fn prepare_input(&self, input: TransitionInput) -> Result<PreparedTransition, PrepareError> {
+        match input {
+            TransitionInput::Command(command) => self.prepare_transition(command),
+            TransitionInput::ValidatedCheckpoint(checkpoint) => {
+                self.prepare_validated_checkpoint(checkpoint)
+            }
+        }
+    }
+
     /// Executes all fallible semantic work for one transition.
     ///
     /// This includes applying and validating the prepared delta, constructing
@@ -6259,6 +6323,27 @@ impl Engine {
         C: Into<Command>,
     {
         let Command(command) = command.into();
+        self.prepare_transition_inner(command, false)
+    }
+
+    fn prepare_validated_checkpoint(
+        &self,
+        checkpoint: ValidatedCheckpointImage,
+    ) -> Result<PreparedTransition, PrepareError> {
+        self.prepare_transition_inner(
+            CommandKind::WholeStateCheckpointV1 {
+                state: checkpoint.image,
+                projection: checkpoint.projection,
+            },
+            true,
+        )
+    }
+
+    fn prepare_transition_inner(
+        &self,
+        command: CommandKind,
+        validated_checkpoint: bool,
+    ) -> Result<PreparedTransition, PrepareError> {
         let coordinates = command.coordinates_for_state(&self.state);
         if self.journal_repair_required.is_some() {
             return Err(PrepareError::Core(CoreError::JournalRepairRequired));
@@ -6276,14 +6361,23 @@ impl Engine {
             .map_err(|_| PrepareError::Core(CoreError::CapacityExceeded))?;
         let command_catalog = self.command_catalog(&command).map_err(PrepareError::Core)?;
         let mut delta = DeltaBuilder::new(&self.state);
-        let output = apply_command(
-            &self.catalog,
-            command_catalog,
-            self.limits,
-            &mut delta,
-            &command,
-        )
-        .map_err(PrepareError::Core)?;
+        let output = if validated_checkpoint {
+            // `ValidatedCheckpointImage` can only be constructed from this
+            // live state immediately above, after full invariant and
+            // projection checks.  Its private path therefore skips decoding
+            // the image it just encoded; all ordinary/replayed checkpoint
+            // commands still go through the decoder below.
+            AppliedOutput::none(TransitionEvent::RecoveryCheckpointed)
+        } else {
+            apply_command(
+                &self.catalog,
+                command_catalog,
+                self.limits,
+                &mut delta,
+                &command,
+            )
+            .map_err(PrepareError::Core)?
+        };
         // The mutation hooks on `DeltaBuilder` are the sole production source
         // of projection addresses.  In particular, an idempotent write is
         // still a touch: recovery overlays may intentionally write a value
@@ -6432,46 +6526,20 @@ impl Engine {
                 engine,
             });
         }
-        let (scan, accepted_count, journal_repair) = match scan_journal(bytes) {
-            Ok(scan) => {
-                let accepted_index = scan
-                    .records()
-                    .iter()
-                    .position(|record| record.digest() == anchor.expected_head())
-                    .ok_or(CoreError::RollbackDetected)?;
-                let accepted_count = accepted_index + 1;
-                let accepted_len = scan.records()[..accepted_count]
-                    .iter()
-                    .map(|record| record.bytes().len())
-                    .sum();
-                let repair = if accepted_count < scan.records().len() {
-                    Some(JournalRepair::UnanchoredSuffix {
-                        offset: accepted_len,
-                    })
-                } else {
-                    scan.torn_tail()
-                        .map(|offset| JournalRepair::TornTail { offset })
-                };
-                (scan, accepted_count, repair)
-            }
-            Err(full_error) => {
-                let scan = scan_journal_to_head(bytes, anchor.expected_head())
-                    .map_err(CoreError::Journal)?
-                    .ok_or(CoreError::Journal(full_error))?;
-                let accepted_count = scan.records().len();
-                let offset = scan.unanchored_suffix().unwrap_or_else(|| {
-                    scan.records()
-                        .iter()
-                        .map(|record| record.bytes().len())
-                        .sum()
-                });
-                (
-                    scan,
-                    accepted_count,
-                    Some(JournalRepair::UnanchoredSuffix { offset }),
-                )
-            }
-        };
+        // Stop decoding as soon as the trusted head is found.  A complete
+        // checksum-valid suffix is not authoritative and must not be
+        // materialized merely to discover that it follows the anchor.
+        let scan = scan_journal_to_head(bytes, anchor.expected_head())
+            .map_err(CoreError::Journal)?
+            .ok_or(CoreError::RollbackDetected)?;
+        let accepted_count = scan.records().len();
+        let journal_repair = scan
+            .torn_tail()
+            .map(|offset| JournalRepair::TornTail { offset })
+            .or_else(|| {
+                scan.unanchored_suffix()
+                    .map(|offset| JournalRepair::UnanchoredSuffix { offset })
+            });
         let records = &scan.records()[..accepted_count];
         let first = records.first().ok_or(CoreError::RollbackDetected)?;
         if first.catalog_digest() != catalog.digest()
@@ -6487,106 +6555,7 @@ impl Engine {
         );
         let mut engine = Self::new(expected_world, catalog, limits, initial);
 
-        for (index, record) in records.iter().enumerate() {
-            let replay_catalog = if matches!(
-                record.command(),
-                CommandKind::CheckpointRecovery { .. }
-                    | CommandKind::WholeStateCheckpointV1 { .. }
-                    | CommandKind::Snapshot { .. }
-                    | CommandKind::FenceExecutor { .. }
-                    | CommandKind::Ready { .. }
-                    | CommandKind::Rebind { .. }
-            ) {
-                None
-            } else {
-                let digest = engine.command_catalog_digest(record.command())?;
-                Some(
-                    engine
-                        .catalog
-                        .get(digest)
-                        .ok_or(CoreError::SchemaMismatch)?,
-                )
-            };
-            if record.recovery_binding() != anchor.binding() {
-                return Err(CoreError::RollbackDetected);
-            }
-            if index == 0
-                && let CommandKind::WholeStateCheckpointV1 { state, projection } = record.command()
-            {
-                let rebuilt = decode_whole_state_checkpoint(state, &engine.catalog, engine.limits)?;
-                if rebuilt.recovery_target.is_some()
-                    || rebuilt.revision != record.base_revision()
-                    || rebuilt.head != record.predecessor()
-                    || rebuilt.freshness.boot() != record.boot()
-                    || rebuilt.freshness.registry() != record.registry()
-                    || rebuilt.freshness.journal() != record.journal()
-                    || rebuilt.freshness.device() != record.device()
-                    || rebuilt.projection_cache.digest != *projection
-                {
-                    return Err(CoreError::RollbackDetected);
-                }
-                if rebuilt.world != expected_world {
-                    return Err(CoreError::WorldMismatch);
-                }
-                engine.state = rebuilt;
-            }
-            if record.base_revision() != engine.state.revision()
-                || record.revision()
-                    != engine
-                        .state
-                        .revision
-                        .checked_add(1)
-                        .ok_or(CoreError::GenerationExhausted)?
-            {
-                return Err(CoreError::RevisionConflict);
-            }
-            if record.predecessor() != engine.state.head() {
-                return Err(CoreError::PredecessorMismatch);
-            }
-            if record.catalog_digest() != engine.catalog.digest()
-                || record.registry() != engine.state.freshness().registry()
-                || record.boot() != engine.state.freshness().boot()
-                || record.journal() != engine.state.freshness().journal()
-                || record.device() != engine.state.freshness().device()
-            {
-                return Err(CoreError::SchemaMismatch);
-            }
-            if record.base_projection() != engine.projection_digest() {
-                return Err(CoreError::RollbackDetected);
-            }
-            restore_checkpoint_recovery_prelude(
-                &mut engine.state,
-                record.command(),
-                engine.catalog.digest(),
-            )?;
-            let previous = engine.state.clone();
-            apply_command(
-                &engine.catalog,
-                replay_catalog,
-                engine.limits,
-                &mut engine.state,
-                record.command(),
-            )?;
-            let mut touches = ProjectionTouches::default();
-            touch_all_projection_records(&previous, &mut touches);
-            touch_all_projection_records(&engine.state, &mut touches);
-            engine.state.total_claims = count_state_claims(&engine.state)?;
-            check_transition_local_invariants(
-                replay_catalog,
-                engine.limits,
-                &previous,
-                &engine.state,
-                &touches,
-            )?;
-            engine.state.revision = record.revision();
-            engine.state.head = record.digest();
-            refresh_projection_cache(
-                &previous,
-                &mut engine.state,
-                &touches,
-                engine.catalog.digest(),
-            );
-        }
+        replay_records(&mut engine, records, anchor.binding(), expected_world)?;
 
         check_invariants_for_catalog_set(&engine.catalog, engine.limits, &engine.state)?;
         let rebuilt_projection = build_projection_cache(&engine.state, engine.catalog.digest());
@@ -6897,7 +6866,7 @@ impl Engine {
                 ..
             }) => {
                 if !resource_allows_additional_custodian(
-                    self.effect_catalog(effect)?,
+                    self.catalog_set(),
                     &self.state,
                     resource,
                     expected_generation,
@@ -7021,17 +6990,61 @@ impl Engine {
         Ok(checkpoint)
     }
 
-    pub(crate) fn validate_journal_checkpoint(
+    /// Recovers a journal checkpoint after one full replay/validation pass.
+    ///
+    /// This is crate-private so callers cannot supply an unvalidated state or
+    /// bypass the checkpoint envelope and exact trusted-anchor coordinates.
+    /// The checkpoint image is replayed by
+    /// [`Self::validate_journal_checkpoint_for_world`], then this method only
+    /// installs the post-replay recovery overlay while retaining the trusted
+    /// projection cache as the recovery base.
+    pub(crate) fn recover_validated_journal_checkpoint(
         catalog: CatalogSet,
         limits: CoreLimits,
         checkpoint: &JournalCheckpoint,
-    ) -> Result<Self, CoreError> {
-        Self::validate_journal_checkpoint_for_world(
+        anchor: RecoveryAnchor,
+    ) -> Result<RecoveryReport, CoreError> {
+        let expected = checkpoint.anchor();
+        if anchor.binding() != expected.binding()
+            || anchor.catalog_digest() != expected.catalog_digest()
+            || anchor.committed_freshness() != expected.freshness()
+            || anchor.minimum_revision() != expected.revision()
+            || anchor.expected_head() != expected.head()
+            || anchor.projection() != expected.projection()
+        {
+            return Err(CoreError::RollbackDetected);
+        }
+
+        let expected_world = anchor.world();
+        let mut engine = Self::validate_journal_checkpoint_for_world(
             catalog,
             limits,
             checkpoint,
-            checkpoint.binding().world(),
-        )
+            expected_world,
+        )?;
+        let target = anchor.next_freshness();
+        let current = engine.state.freshness();
+        if target.registry() != current.registry()
+            || target.boot().get() <= current.boot().get()
+            || target.journal().get() <= current.journal().get()
+            || target.device().get() < current.device().get()
+        {
+            return Err(CoreError::FreshnessRollback);
+        }
+
+        // Keep the validated trusted projection cache unchanged. The target
+        // and quarantine are a transient primary-state overlay; the durable
+        // CheckpointRecovery transition will later rebuild and publish its
+        // post-checkpoint projection.
+        engine.state.recovery_target = Some(target);
+        quarantine_live_device_claims(&mut engine.state);
+
+        Ok(RecoveryReport {
+            acknowledged_revision: engine.state.revision(),
+            acknowledged_head: engine.state.head(),
+            journal_repair: None,
+            engine,
+        })
     }
 
     fn validate_journal_checkpoint_for_world(
@@ -7073,106 +7086,12 @@ impl Engine {
             first.journal(),
         );
         let mut engine = Self::new(expected_world, catalog, limits, initial);
-        for (index, record) in scan.records().iter().enumerate() {
-            let replay_catalog = if matches!(
-                record.command(),
-                CommandKind::CheckpointRecovery { .. }
-                    | CommandKind::WholeStateCheckpointV1 { .. }
-                    | CommandKind::Snapshot { .. }
-                    | CommandKind::FenceExecutor { .. }
-                    | CommandKind::Ready { .. }
-                    | CommandKind::Rebind { .. }
-            ) {
-                None
-            } else {
-                let digest = engine.command_catalog_digest(record.command())?;
-                Some(
-                    engine
-                        .catalog
-                        .get(digest)
-                        .ok_or(CoreError::SchemaMismatch)?,
-                )
-            };
-            if record.recovery_binding() != anchor.binding() {
-                return Err(CoreError::RollbackDetected);
-            }
-            if index == 0
-                && let CommandKind::WholeStateCheckpointV1 { state, projection } = record.command()
-            {
-                let rebuilt = decode_whole_state_checkpoint(state, &engine.catalog, engine.limits)?;
-                if rebuilt.recovery_target.is_some()
-                    || rebuilt.revision != record.base_revision()
-                    || rebuilt.head != record.predecessor()
-                    || rebuilt.freshness.boot() != record.boot()
-                    || rebuilt.freshness.registry() != record.registry()
-                    || rebuilt.freshness.journal() != record.journal()
-                    || rebuilt.freshness.device() != record.device()
-                    || rebuilt.projection_cache.digest != *projection
-                {
-                    return Err(CoreError::RollbackDetected);
-                }
-                if rebuilt.world != expected_world {
-                    return Err(CoreError::WorldMismatch);
-                }
-                engine.state = rebuilt;
-            }
-            if record.base_revision() != engine.state.revision()
-                || record.revision()
-                    != engine
-                        .state
-                        .revision
-                        .checked_add(1)
-                        .ok_or(CoreError::GenerationExhausted)?
-            {
-                return Err(CoreError::RevisionConflict);
-            }
-            if record.predecessor() != engine.state.head() {
-                return Err(CoreError::PredecessorMismatch);
-            }
-            if record.catalog_digest() != engine.catalog.digest()
-                || record.registry() != engine.state.freshness().registry()
-                || record.boot() != engine.state.freshness().boot()
-                || record.journal() != engine.state.freshness().journal()
-                || record.device() != engine.state.freshness().device()
-            {
-                return Err(CoreError::SchemaMismatch);
-            }
-            if record.base_projection() != engine.projection_digest() {
-                return Err(CoreError::RollbackDetected);
-            }
-            restore_checkpoint_recovery_prelude(
-                &mut engine.state,
-                record.command(),
-                engine.catalog.digest(),
-            )?;
-            let previous = engine.state.clone();
-            apply_command(
-                &engine.catalog,
-                replay_catalog,
-                engine.limits,
-                &mut engine.state,
-                record.command(),
-            )?;
-            let mut touches = ProjectionTouches::default();
-            touch_all_projection_records(&previous, &mut touches);
-            touch_all_projection_records(&engine.state, &mut touches);
-            engine.state.total_claims = count_state_claims(&engine.state)?;
-            check_transition_local_invariants(
-                replay_catalog,
-                engine.limits,
-                &previous,
-                &engine.state,
-                &touches,
-            )?;
-            engine.state.revision = record.revision();
-            engine.state.head = record.digest();
-            refresh_projection_cache(
-                &previous,
-                &mut engine.state,
-                &touches,
-                engine.catalog.digest(),
-            );
-        }
+        replay_records(
+            &mut engine,
+            scan.records(),
+            anchor.binding(),
+            expected_world,
+        )?;
         check_invariants_for_catalog_set(&engine.catalog, engine.limits, &engine.state)?;
         let rebuilt_projection = build_projection_cache(&engine.state, engine.catalog.digest());
         if rebuilt_projection.digest != engine.projection_digest() {
@@ -7756,6 +7675,16 @@ fn apply_command_internal<S: StateAccessMut>(
                                             | CommitState::Prepared
                                             | CommitState::CommitIntentDurable
                                     ) && scoped.bindings.get(&component.id) == Some(&coordinate)
+                                        // A revoked pre-commit effect has no
+                                        // remaining execution bearer. Its
+                                        // binding may still be retained solely
+                                        // by a pinned recovery artifact, which
+                                        // settlement-only authority must be
+                                        // able to drain.
+                                        && !(composite.authority == AuthorityState::Revoked
+                                            && component.settlement
+                                                == SettlementState::Revoked
+                                            && component.claims.is_empty())
                                 })
                         })
             }) {
@@ -7825,6 +7754,14 @@ fn apply_command_internal<S: StateAccessMut>(
             }) {
                 return Err(CoreError::ProviderLifecycleViolation);
             }
+            // An installed handoff child owns a prepared reservation which is
+            // deliberately absent from the live resource index and charge
+            // aggregate.  It cannot pass through the ordinary pre-commit
+            // revocation loop: doing so would subtract a second time and turn
+            // a valid provider-fence cancellation into InvariantViolation.
+            if let Some(descriptor) = prepared_handoff_target_for_abort(state, effect)? {
+                return abort_prepared_handoff_target(state, descriptor);
+            }
             let (causal_owner, authority_epoch) = {
                 let composite = state
                     .composite_effects()
@@ -7857,7 +7794,11 @@ fn apply_command_internal<S: StateAccessMut>(
                 release_scoped_provider_bindings(state, effect)?;
             }
             Ok(AppliedOutput::none(
-                TransitionEvent::CompositeEffectReleased,
+                if artifacts_released_for_effect(state, effect) {
+                    TransitionEvent::CompositeEffectReleased
+                } else {
+                    TransitionEvent::Revoked
+                },
             ))
         }
         CommandKind::AdmitScopedCompositeEffect {
@@ -8284,6 +8225,7 @@ fn apply_command_internal<S: StateAccessMut>(
                 },
             );
             enroll_component_claim(
+                catalogs,
                 catalog,
                 limits,
                 state,
@@ -8413,7 +8355,6 @@ fn apply_command_internal<S: StateAccessMut>(
                 .handoff = target_role;
             release_handoff_source_claim(state, descriptor)?;
             activate_prepared_handoff_target(catalog, limits, state, child, descriptor)?;
-            let source_was_scoped = state.scoped_composites().contains_key(&descriptor.parent);
             state.touch_composite(descriptor.parent);
             let source = state
                 .composite_effects_mut()
@@ -8424,16 +8365,6 @@ fn apply_command_internal<S: StateAccessMut>(
             for component in source.components.values_mut() {
                 component.settlement = SettlementState::Revoked;
                 component.retirement = RetirementState::Released;
-                if source_was_scoped {
-                    // The pivot drops the source's live provider binding. Its
-                    // verifier-bound facts cannot outlive that relationship:
-                    // the Source role already retains the terminal and
-                    // descriptor receipt digests needed to validate the
-                    // bounded handoff after source release.
-                    component.commit_fact = None;
-                    component.applied_fact = None;
-                    component.settlement_fact = None;
-                }
             }
             release_scoped_provider_bindings(state, descriptor.parent)?;
             Ok(intent)
@@ -8449,6 +8380,7 @@ fn apply_command_internal<S: StateAccessMut>(
             resource_generation,
             units,
         } => enroll_component_claim(
+            catalogs,
             catalog,
             limits,
             state,
@@ -9001,6 +8933,7 @@ fn apply_command_internal<S: StateAccessMut>(
                 },
             );
             enroll_component_claim(
+                catalogs,
                 catalog,
                 limits,
                 state,
@@ -9719,50 +9652,10 @@ fn handoff_recovery_fact_matches(
         .is_ok()
 }
 
-/// Summarizes the modes of every live custodian at one exact resource
-/// generation. The resource record stores the coordinate state, while the
-/// reverse index identifies its composite custodians.
-fn live_resource_conflict_summary(
-    catalog: &DomainCatalog,
-    state: &impl StateAccess,
-    resource: ResourceId,
-    generation: ResourceGeneration,
-    candidate: ConflictMode,
-) -> Result<(usize, bool), CoreError> {
-    let mut custodians = 0usize;
-    let mut compatible = true;
-    let mut inspect = |claim: &ClaimRecord| -> Result<(), CoreError> {
-        if claim.retired || claim.resource != resource || claim.resource_generation != generation {
-            return Err(CoreError::InvariantViolation);
-        }
-        let rule = catalog
-            .claim_rule(claim.domain, claim.kind)
-            .ok_or(CoreError::InvariantViolation)?;
-        custodians = custodians
-            .checked_add(1)
-            .ok_or(CoreError::InvariantViolation)?;
-        compatible &= candidate.compatible_with(rule.conflict());
-        Ok(())
-    };
-
-    if let Some(entries) = state.composite_resource_index().get(&resource) {
-        for (effect, component, claim_id) in entries {
-            let claim = state
-                .composite_effects()
-                .get(effect)
-                .and_then(|composite| composite.components.get(component))
-                .and_then(|component| component.claims.get(claim_id))
-                .ok_or(CoreError::InvariantViolation)?;
-            inspect(claim)?;
-        }
-    }
-    Ok((custodians, compatible))
-}
-
-/// Mixed-catalog invariant counterpart of [`live_resource_conflict_summary`].
-/// Each indexed claim is interpreted by the immutable catalog recorded on its
-/// owning composite; no catalog-set iteration order participates in the
-/// result.
+/// Summarizes every live custodian at one exact resource generation. Each
+/// incumbent claim is interpreted by the immutable catalog recorded on its
+/// owning composite; no incoming catalog or catalog-set iteration order may
+/// change the result.
 fn live_resource_conflict_summary_for_set(
     catalogs: &CatalogSet,
     state: &impl StateAccess,
@@ -9806,14 +9699,14 @@ fn live_resource_conflict_summary_for_set(
 /// is symmetric: every incumbent and the incoming claim must explicitly opt
 /// into shared custody.
 fn resource_allows_additional_custodian(
-    catalog: &DomainCatalog,
+    catalogs: &CatalogSet,
     state: &impl StateAccess,
     resource: ResourceId,
     generation: ResourceGeneration,
     incoming: ConflictMode,
 ) -> Result<bool, CoreError> {
     let (custodians, compatible) =
-        live_resource_conflict_summary(catalog, state, resource, generation, incoming)?;
+        live_resource_conflict_summary_for_set(catalogs, state, resource, generation, incoming)?;
     if custodians == 0 {
         return Err(CoreError::InvariantViolation);
     }
@@ -9870,6 +9763,160 @@ fn handoff_target_reservation_matches(
             Some(source) if matches!(&source.handoff, SingleHopRole::Source { descriptor: saved, .. } if **saved == descriptor)
                 && handoff_source_claim_matches(source, descriptor)
         )
+}
+
+/// Returns the descriptor for an installed child which is still only a
+/// prepared, non-executable reservation. Such a child is the one handoff
+/// state that cannot use the ordinary pre-commit abort path: its claim has
+/// already been removed from the live resource index and charge aggregate by
+/// [`deactivate_prepared_handoff_target`].
+fn prepared_handoff_target_for_abort(
+    state: &impl StateAccess,
+    child: EffectId,
+) -> Result<Option<ChildDescriptorV1>, CoreError> {
+    let Some(target) = state.composite_effects().get(&child) else {
+        return Err(CoreError::UnknownEffect);
+    };
+    let SingleHopRole::Target {
+        parent,
+        descriptor_digest,
+        recovery_fact,
+    } = target.handoff
+    else {
+        return Ok(None);
+    };
+    if recovery_fact.is_some() {
+        return Err(CoreError::WrongCommitState);
+    }
+    let source = state
+        .composite_effects()
+        .get(&parent)
+        .ok_or(CoreError::HandoffGuardRequired)?;
+    let SingleHopRole::Source { descriptor, .. } = &source.handoff else {
+        return Err(CoreError::HandoffGuardRequired);
+    };
+    let descriptor = **descriptor;
+    if descriptor.child_effect() != Ok(child)
+        || descriptor_digest != handoff_descriptor_digest(descriptor)
+        || !handoff_source_claim_matches(source, descriptor)
+    {
+        return Err(CoreError::HandoffGuardRequired);
+    }
+    if !matches!(
+        (target.authority, target.custodian),
+        (AuthorityState::Active, CustodyState::Executor(_))
+            | (AuthorityState::Fenced, CustodyState::CoreOwned)
+    ) {
+        return Err(CoreError::WrongCommitState);
+    }
+    let component = target
+        .components
+        .get(&descriptor.child_component)
+        .ok_or(CoreError::UnknownObligationClass)?;
+    if component.commit != CommitState::Prepared
+        || component.commit_nonce.is_some()
+        || component.commit_operation.is_some()
+        || component.commit_fact.is_some()
+        || component.outcome != OutcomeState::Pending
+        || component.settlement != SettlementState::Unavailable
+        || component.settlement_nonce.is_some()
+        || component.claim_stage.is_some()
+        || component.settlement_intent.is_some()
+        || component.applied_fact.is_some()
+        || component.settlement_fact.is_some()
+        || component.claims.len() != 1
+        || !component_is_prepared_handoff_target(state, target, component)
+    {
+        return Err(CoreError::WrongCommitState);
+    }
+    Ok(Some(descriptor))
+}
+
+/// Cancels the installed child reservation after its provider generation has
+/// been fenced. The source claim remains the live custodian of the exact
+/// resource coordinate; only the inactive child claim and its provider
+/// binding are cleaned up. Both handoff roles are cleared because this branch
+/// abandoned the child before its commit gate and has no outcome to resolve.
+fn abort_prepared_handoff_target(
+    state: &mut impl StateAccessMut,
+    descriptor: ChildDescriptorV1,
+) -> Result<AppliedOutput, CoreError> {
+    let child = descriptor.child_effect()?;
+    let (causal_owner, authority_epoch) = {
+        let target = state
+            .composite_effects()
+            .get(&child)
+            .ok_or(CoreError::UnknownEffect)?;
+        let component = target
+            .components
+            .get(&descriptor.child_component)
+            .ok_or(CoreError::UnknownObligationClass)?;
+        if !component_is_prepared_handoff_target(state, target, component) {
+            return Err(CoreError::HandoffGuardRequired);
+        }
+        (target.causal_owner, target.authority_epoch)
+    };
+
+    // The reservation was deliberately omitted from both derived live
+    // structures at install time. Removing its primary claim is therefore
+    // the complete claim/resource cleanup; no charge or index decrement is
+    // permitted here.
+    state.touch_composite(child);
+    state
+        .composite_effects_mut()
+        .get_mut(&child)
+        .ok_or(CoreError::UnknownEffect)?
+        .components
+        .get_mut(&descriptor.child_component)
+        .ok_or(CoreError::UnknownObligationClass)?
+        .claims
+        .clear();
+    revoke_composite_effect(state, child, causal_owner, authority_epoch)?;
+
+    state.touch_composite(descriptor.parent);
+    state
+        .composite_effects_mut()
+        .get_mut(&descriptor.parent)
+        .ok_or(CoreError::UnknownEffect)?
+        .handoff = SingleHopRole::None;
+    state.touch_composite(child);
+    state
+        .composite_effects_mut()
+        .get_mut(&child)
+        .ok_or(CoreError::UnknownEffect)?
+        .handoff = SingleHopRole::None;
+
+    revoke_unpinned_artifact_placeholders(state, child)?;
+    let released = artifacts_released_for_effect(state, child);
+    if released {
+        state.touch_composite(child);
+        let target = state
+            .composite_effects_mut()
+            .get_mut(&child)
+            .ok_or(CoreError::UnknownEffect)?;
+        target.custodian = CustodyState::Released;
+        target.authority = AuthorityState::Revoked;
+        for component in target.components.values_mut() {
+            component.retirement = RetirementState::Released;
+        }
+        release_scoped_provider_bindings(state, child)?;
+    }
+    Ok(AppliedOutput::none(if released {
+        TransitionEvent::CompositeEffectReleased
+    } else {
+        TransitionEvent::Revoked
+    }))
+}
+
+fn component_is_prepared_handoff_target(
+    state: &impl StateAccess,
+    composite: &CompositeEffectRecord,
+    component: &ComponentRecord,
+) -> bool {
+    component
+        .claims
+        .values()
+        .any(|claim| prepared_handoff_target_claim(state, composite, component, claim))
 }
 
 fn deactivate_prepared_handoff_target(
@@ -10027,18 +10074,31 @@ fn activate_prepared_handoff_target(
         .ok_or(CoreError::InvariantViolation)?
         .max_units_per_account()
         .min(limits.max_units_per_account);
-    let charged = charged_for_catalog(state, catalog.digest(), charge_owner, credit_class)?;
+    let charged_catalog = charged_for_catalog(state, catalog.digest(), charge_owner, credit_class)?;
     // The source claim has already been released and the target reservation
-    // is now live, so the catalog-local scan already includes exactly the
-    // target units. Re-adding `descriptor.units` would double-charge the
-    // handoff pivot and leave the aggregate cache inconsistent with the
-    // authoritative claim set.
-    if charged > limit {
+    // is still excluded from the catalog-local scan while it is prepared.
+    // Check the catalog-local limit with the target's units, then add exactly
+    // those units to the cross-catalog aggregate cache. Never replace the
+    // aggregate with the local catalog subtotal.
+    let next_catalog = charged_catalog
+        .checked_add(descriptor.units)
+        .ok_or(CoreError::Backpressure)?;
+    if next_catalog > limit {
+        return Err(CoreError::Backpressure);
+    }
+    let next_global = state
+        .charges()
+        .get(&(charge_owner, credit_class))
+        .copied()
+        .unwrap_or(0)
+        .checked_add(descriptor.units)
+        .ok_or(CoreError::Backpressure)?;
+    if next_global > limits.max_units_per_account {
         return Err(CoreError::Backpressure);
     }
     *state
         .charges_mut()
-        .get_or_insert_with_mut((charge_owner, credit_class), || 0) = charged;
+        .get_or_insert_with_mut((charge_owner, credit_class), || 0) = next_global;
     state.touch_resource(descriptor.resource);
     let resource_record = state
         .resources_mut()
@@ -10086,7 +10146,21 @@ fn prepared_handoff_target_claim(
     let SingleHopRole::Source { descriptor, .. } = &source.handoff else {
         return false;
     };
-    component.commit == CommitState::Prepared
+    matches!(
+        component.commit,
+        CommitState::Prepared | CommitState::CommitIntentDurable
+    )
+        // A target remains charge/index-deactivated until the pivot restores
+        // its live custody.  Checking the derived index makes this helper
+        // valid across the target's Prepared -> CommitIntentDurable step; it
+        // becomes false immediately after activation adds the exact index
+        // entry back.
+        && !state
+            .composite_resource_index()
+            .get(&claim.resource)
+            .is_some_and(|entries| {
+                entries.contains(&(composite.effect, component.id, claim.id))
+            })
         && handoff_source_claim_matches(source, **descriptor)
         && handoff_descriptor_digest(**descriptor) == descriptor_digest
         && descriptor.child_effect() == Ok(composite.effect)
@@ -10139,6 +10213,7 @@ fn charged_for_catalog(
 
 #[allow(clippy::too_many_arguments)]
 fn enroll_component_claim(
+    catalogs: &CatalogSet,
     catalog: &DomainCatalog,
     limits: CoreLimits,
     state: &mut impl StateAccessMut,
@@ -10177,6 +10252,28 @@ fn enroll_component_claim(
     };
     if authority != AuthorityState::Active || commit != CommitState::Registered {
         return Err(CoreError::WrongCommitState);
+    }
+    // `component_freshness` is intentionally a scalar coordinate today. A
+    // component may therefore carry logical claims or claims for one device
+    // scope, but admitting a second distinct device scope would create a
+    // state that cannot be given one exact freshness for commit/settlement.
+    if let ClaimScope::Device(incoming_scope) = scope {
+        let existing_scope = state
+            .composite_effects()
+            .get(&effect)
+            .and_then(|composite| composite.components.get(&component))
+            .and_then(|component| {
+                component
+                    .claims
+                    .values()
+                    .find_map(|claim| match claim.scope {
+                        ClaimScope::Device(scope) => Some(scope),
+                        ClaimScope::Logical => None,
+                    })
+            });
+        if existing_scope.is_some_and(|existing| existing != incoming_scope) {
+            return Err(CoreError::WrongClaimScope);
+        }
     }
     let rule = catalog
         .claim_rule(domain, kind)
@@ -10281,7 +10378,7 @@ fn enroll_component_claim(
             None,
         ) => {
             if !resource_allows_additional_custodian(
-                catalog,
+                catalogs,
                 state,
                 resource,
                 resource_generation,
@@ -10312,8 +10409,18 @@ fn enroll_component_claim(
         return Err(CoreError::CapacityExceeded);
     }
     let charged = charged_for_catalog(state, catalog.digest(), charge_owner, credit_class)?;
-    let next = charged.checked_add(units).ok_or(CoreError::Backpressure)?;
-    if next > credit_limit {
+    let next_catalog = charged.checked_add(units).ok_or(CoreError::Backpressure)?;
+    if next_catalog > credit_limit {
+        return Err(CoreError::Backpressure);
+    }
+    let next_global = state
+        .charges()
+        .get(&(charge_owner, credit_class))
+        .copied()
+        .unwrap_or(0)
+        .checked_add(units)
+        .ok_or(CoreError::Backpressure)?;
+    if next_global > limits.max_units_per_account {
         return Err(CoreError::Backpressure);
     }
     state.touch_composite(effect);
@@ -10376,7 +10483,7 @@ fn enroll_component_claim(
     );
     *state
         .charges_mut()
-        .get_or_insert_with_mut((charge_owner, credit_class), || 0) = next;
+        .get_or_insert_with_mut((charge_owner, credit_class), || 0) = next_global;
     let entries = state
         .composite_resource_index_mut()
         .get_or_insert_with_mut(resource, Vec::new);
@@ -10422,6 +10529,16 @@ fn validate_component_claims(
     catalog: &DomainCatalog,
     component: &ComponentRecord,
 ) -> Result<(), CoreError> {
+    let mut device_scope = None;
+    for claim in component.claims.values() {
+        if let ClaimScope::Device(scope) = claim.scope
+            && device_scope
+                .replace(scope)
+                .is_some_and(|existing| existing != scope)
+        {
+            return Err(CoreError::WrongClaimScope);
+        }
+    }
     let rule = catalog
         .obligation_rule(component.domain, component.obligation)
         .ok_or(CoreError::InvariantViolation)?;
@@ -10721,17 +10838,147 @@ fn quarantine_live_device_claims(state: &mut impl StateAccessMut) {
     }
 }
 
-fn install_recovery_target(state: &mut impl StateAccessMut, target: Freshness, catalog: Digest) {
-    state.set_recovery_target(Some(target));
-    quarantine_live_device_claims(state);
-    let projection = build_projection_cache(&*state, catalog);
-    state.set_projection_cache(projection);
+/// Replays a trusted record slice through one delta per record.  The helper is
+/// shared by anchored recovery and journal-checkpoint validation so both paths
+/// retain the same command, projection, and checkpoint semantics.
+fn replay_records(
+    engine: &mut Engine,
+    records: &[JournalRecord],
+    binding: RecoveryBinding,
+    expected_world: WorldId,
+) -> Result<(), CoreError> {
+    for (index, record) in records.iter().enumerate() {
+        let replay_catalog = if matches!(
+            record.command(),
+            CommandKind::CheckpointRecovery { .. }
+                | CommandKind::WholeStateCheckpointV1 { .. }
+                | CommandKind::Snapshot { .. }
+                | CommandKind::FenceExecutor { .. }
+                | CommandKind::Ready { .. }
+                | CommandKind::Rebind { .. }
+        ) {
+            None
+        } else {
+            let digest = engine.command_catalog_digest(record.command())?;
+            Some(
+                engine
+                    .catalog
+                    .get(digest)
+                    .ok_or(CoreError::SchemaMismatch)?,
+            )
+        };
+        if record.recovery_binding() != binding {
+            return Err(CoreError::RollbackDetected);
+        }
+
+        // A leading whole-state checkpoint is a validated base for replay,
+        // not a command which needs to decode the same image again.  Every
+        // later checkpoint is decoded exactly once here and compared as a
+        // no-op against the delta candidate.
+        let mut decoded_checkpoint = None;
+        let mut validated_checkpoint_base = false;
+        if let CommandKind::WholeStateCheckpointV1 {
+            state: image,
+            projection,
+        } = record.command()
+        {
+            let rebuilt = decode_whole_state_checkpoint(image, &engine.catalog, engine.limits)?;
+            if rebuilt.recovery_target.is_some() || rebuilt.projection_cache.digest != *projection {
+                return Err(CoreError::RollbackDetected);
+            }
+            if index == 0 {
+                if rebuilt.revision != record.base_revision()
+                    || rebuilt.head != record.predecessor()
+                    || rebuilt.freshness.boot() != record.boot()
+                    || rebuilt.freshness.registry() != record.registry()
+                    || rebuilt.freshness.journal() != record.journal()
+                    || rebuilt.freshness.device() != record.device()
+                {
+                    return Err(CoreError::RollbackDetected);
+                }
+                if rebuilt.world != expected_world {
+                    return Err(CoreError::WorldMismatch);
+                }
+                engine.state = rebuilt;
+                validated_checkpoint_base = true;
+            } else {
+                decoded_checkpoint = Some(rebuilt);
+            }
+        }
+
+        if record.base_revision() != engine.state.revision()
+            || record.revision()
+                != engine
+                    .state
+                    .revision
+                    .checked_add(1)
+                    .ok_or(CoreError::GenerationExhausted)?
+        {
+            return Err(CoreError::RevisionConflict);
+        }
+        if record.predecessor() != engine.state.head() {
+            return Err(CoreError::PredecessorMismatch);
+        }
+        if record.catalog_digest() != engine.catalog.digest()
+            || record.registry() != engine.state.freshness().registry()
+            || record.boot() != engine.state.freshness().boot()
+            || record.journal() != engine.state.freshness().journal()
+            || record.device() != engine.state.freshness().device()
+        {
+            return Err(CoreError::SchemaMismatch);
+        }
+
+        // The record was prepared while cold recovery retained the trusted
+        // anchor's projection cache, even though the primary overlay was
+        // staged for the pending checkpoint. Keep that ordering: validate the
+        // record against the old cache before staging its prelude in this
+        // replay delta.
+        if record.base_projection() != engine.projection_digest() {
+            return Err(CoreError::RollbackDetected);
+        }
+
+        let mut delta = DeltaBuilder::new(&engine.state);
+        restore_checkpoint_recovery_prelude(&mut delta, record.command())?;
+        let prelude_touches = delta.take_projection_touches();
+
+        if validated_checkpoint_base {
+            // The leading checkpoint was decoded and installed above; it is
+            // the validated replay base and therefore a no-op record.
+        } else if let Some(rebuilt) = decoded_checkpoint.as_ref() {
+            if !checkpoint_state_matches(&delta, rebuilt) {
+                return Err(CoreError::InvariantViolation);
+            }
+        } else {
+            apply_command(
+                &engine.catalog,
+                replay_catalog,
+                engine.limits,
+                &mut delta,
+                record.command(),
+            )?;
+        }
+
+        let mut touches = delta.take_projection_touches();
+        touches.merge(prelude_touches);
+        delta.set_total_claims(transition_total_claims(&engine.state, &delta, &touches)?);
+        check_transition_local_invariants(
+            replay_catalog,
+            engine.limits,
+            &engine.state,
+            &delta,
+            &touches,
+        )?;
+        delta.set_revision(record.revision());
+        delta.set_head(record.digest());
+        refresh_projection_cache(&engine.state, &mut delta, &touches, engine.catalog.digest());
+        delta.finish().apply(&mut engine.state);
+    }
+    Ok(())
 }
 
 fn restore_checkpoint_recovery_prelude(
     state: &mut impl StateAccessMut,
     command: &CommandKind,
-    catalog: Digest,
 ) -> Result<(), CoreError> {
     let CommandKind::CheckpointRecovery {
         boot,
@@ -10748,7 +10995,12 @@ fn restore_checkpoint_recovery_prelude(
         return Err(CoreError::FreshnessRollback);
     }
     let target = Freshness::new(*boot, state.freshness().registry(), *device, *journal);
-    install_recovery_target(state, target, catalog);
+    // Replay may need this overlay to validate the record's base projection,
+    // but must keep it in the same delta as the command itself.  In
+    // particular, do not rebuild the complete projection before the command
+    // has been applied.
+    state.set_recovery_target(Some(target));
+    quarantine_live_device_claims(state);
     Ok(())
 }
 
@@ -12690,6 +12942,16 @@ fn check_invariants(
         }
         let mut claim_ids = BTreeSet::new();
         for component in composite.components.values() {
+            let mut component_device_scope = None;
+            for claim in component.claims.values() {
+                if let ClaimScope::Device(scope) = claim.scope
+                    && component_device_scope
+                        .replace(scope)
+                        .is_some_and(|existing| existing != scope)
+                {
+                    return Err(CoreError::InvariantViolation);
+                }
+            }
             let obligation_rule = catalog
                 .obligation_rule(component.domain, component.obligation)
                 .ok_or(CoreError::InvariantViolation)?;
@@ -13010,7 +13272,7 @@ fn check_invariants(
     for key in state.charges().keys().chain(expected_charges.keys()) {
         let actual = state.charges().get(key).copied().unwrap_or(0);
         let expected = expected_charges.get(key).copied().unwrap_or(0);
-        if actual != expected {
+        if actual != expected || actual > limits.max_units_per_account {
             return Err(CoreError::InvariantViolation);
         }
     }
@@ -13931,32 +14193,17 @@ struct ProjectionTouches {
     devices: BTreeSet<DeviceScopeId>,
 }
 
-fn touch_all_projection_records(state: &impl StateAccess, touches: &mut ProjectionTouches) {
-    touches
-        .provider_high_water
-        .extend(state.provider_high_water().keys().copied());
-    touches
-        .provider_generations
-        .extend(state.provider_generations().keys().copied());
-    touches
-        .scoped_composites
-        .extend(state.scoped_composites().keys().copied());
-    touches
-        .artifact_leases
-        .extend(state.artifact_leases().keys().copied());
-    touches
-        .operations
-        .extend(state.recovery_operations().keys().copied());
-    touches
-        .composites
-        .extend(state.composite_effects().keys().copied());
-    touches.resources.extend(state.resources().keys().copied());
-    touches
-        .devices
-        .extend(state.device_generations().keys().copied());
-    touches
-        .devices
-        .extend(state.device_quarantine().iter().copied());
+impl ProjectionTouches {
+    fn merge(&mut self, other: Self) {
+        self.provider_high_water.extend(other.provider_high_water);
+        self.provider_generations.extend(other.provider_generations);
+        self.scoped_composites.extend(other.scoped_composites);
+        self.artifact_leases.extend(other.artifact_leases);
+        self.operations.extend(other.operations);
+        self.composites.extend(other.composites);
+        self.resources.extend(other.resources);
+        self.devices.extend(other.devices);
+    }
 }
 
 fn transition_total_claims(
