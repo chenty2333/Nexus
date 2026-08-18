@@ -9,7 +9,34 @@ extern crate alloc;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cmp::Ordering;
+use core::convert::Infallible;
 use core::iter::FromIterator;
+
+/// The validation failure returned by a sorted, exact-length collection
+/// builder.
+///
+/// The builders consume at most one item beyond the requested length.  This
+/// is enough to reject a trailing item while keeping the recovery path
+/// streaming and bounded.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SortedExactError<E = Infallible> {
+    /// The iterator ended before the requested number of entries was read.
+    TooFew {
+        /// Number of entries requested by the caller.
+        expected: usize,
+        /// Number of entries observed before the iterator ended.
+        actual: usize,
+    },
+    /// The input contained at least one item after the requested length.
+    TooMany {
+        /// Number of entries requested by the caller.
+        expected: usize,
+    },
+    /// Keys were not strictly increasing (including a duplicate key).
+    NotStrictlyIncreasing,
+    /// The source failed while producing an entry.
+    Source(E),
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Node<K, V> {
@@ -22,8 +49,16 @@ struct Node<K, V> {
     left: Option<Arc<Node<K, V>>>,
     right: Option<Arc<Node<K, V>>>,
     height: u32,
-    size: usize,
 }
+
+// Let N(h) be the minimum number of nodes in an AVL tree of height h, where
+// N(0) = 0, N(1) = 1, and N(h) = 1 + N(h - 1) + N(h - 2).  Induction gives
+// N(h) >= 2^floor((h + 1) / 2) - 1.  For b = usize::BITS, a StateMap has at
+// most usize::MAX = 2^b - 1 nodes, so a height of 2b + 1 would require more
+// than usize::MAX nodes; every representable AVL tree therefore has height
+// at most 2b.  The in-order traversal stack is never deeper than the tree's
+// height, so this fixed capacity is sufficient without truncation.
+const MAX_AVL_ITER_STACK: usize = 2 * usize::BITS as usize;
 
 /// An immutable ordered map with logarithmic path-copying updates.
 ///
@@ -95,6 +130,25 @@ impl<K> StateSet<K> {
     #[cfg(test)]
     pub(crate) fn ptr_eq(&self, other: &Self) -> bool {
         self.map.ptr_eq(&other.map)
+    }
+}
+
+impl<K: Ord> StateSet<K> {
+    /// Builds a set from an exactly sized, strictly increasing fallible
+    /// source.  The source is consumed in canonical order and any source
+    /// error is returned without being hidden behind a collection failure.
+    pub(crate) fn try_from_sorted_exact_fallible<I, E>(
+        entries: I,
+        expected_len: usize,
+    ) -> Result<Self, SortedExactError<E>>
+    where
+        I: IntoIterator<Item = Result<K, E>>,
+    {
+        StateMap::try_from_sorted_exact_fallible(
+            entries.into_iter().map(|key| key.map(|key| (key, ()))),
+            expected_len,
+        )
+        .map(|map| Self { map })
     }
 }
 
@@ -256,6 +310,67 @@ impl<K, V> StateMap<K, V> {
 }
 
 impl<K: Ord, V> StateMap<K, V> {
+    /// Builds a map from exactly `expected_len` strictly increasing entries.
+    ///
+    /// The input must be in canonical key order.  The builder consumes every
+    /// key and value exactly once, constructs every final AVL node exactly
+    /// once, and uses `O(log n)` call-stack space.  In particular, unlike the
+    /// path-copying update API, it does not require `K: Clone` or `V: Clone`.
+    /// An iterator ending before the requested count, containing a duplicate
+    /// or descending key, or containing a trailing item is rejected.
+    pub fn try_from_sorted_exact<I>(
+        entries: I,
+        expected_len: usize,
+    ) -> Result<Self, SortedExactError>
+    where
+        I: IntoIterator<Item = (K, V)>,
+    {
+        StateMap::try_from_sorted_exact_fallible(
+            entries.into_iter().map(Ok::<_, Infallible>),
+            expected_len,
+        )
+    }
+
+    /// Builds a map from an exactly sized, strictly increasing fallible
+    /// source.  Source failures and structural failures are kept distinct so
+    /// recovery callers cannot accidentally turn a cursor error into a
+    /// successful decode.
+    pub fn try_from_sorted_exact_fallible<I, E>(
+        entries: I,
+        expected_len: usize,
+    ) -> Result<Self, SortedExactError<E>>
+    where
+        I: IntoIterator<Item = Result<(K, V), E>>,
+    {
+        let mut entries = entries.into_iter();
+        let mut consumed = 0;
+        let (root, _) = build_sorted_nodes(
+            &mut entries,
+            expected_len,
+            None,
+            None,
+            expected_len,
+            &mut consumed,
+        )?;
+
+        match entries.next() {
+            Some(Ok(_)) => {
+                return Err(SortedExactError::TooMany {
+                    expected: expected_len,
+                });
+            }
+            Some(Err(error)) => return Err(SortedExactError::Source(error)),
+            None => {}
+        }
+
+        Ok(Self {
+            root,
+            len: expected_len,
+        })
+    }
+}
+
+impl<K: Ord, V> StateMap<K, V> {
     /// Returns the value for `key`, if present.
     #[must_use]
     pub fn get(&self, key: &K) -> Option<&V> {
@@ -279,7 +394,11 @@ impl<K: Ord, V> StateMap<K, V> {
     /// Iterates over entries in ascending key order.
     #[must_use]
     pub fn iter(&self) -> Iter<'_, K, V> {
-        let mut iter = Iter { stack: Vec::new() };
+        let mut iter = Iter {
+            stack: [None; MAX_AVL_ITER_STACK],
+            stack_len: 0,
+            remaining: self.len,
+        };
         iter.push_left(self.root.as_deref());
         iter
     }
@@ -421,15 +540,33 @@ impl<K: Ord + Clone, V: Clone> StateMap<K, V> {
 
 /// The in-order iterator returned by [`StateMap::iter`].
 pub struct Iter<'a, K, V> {
-    stack: Vec<&'a Node<K, V>>,
+    stack: [Option<&'a Node<K, V>>; MAX_AVL_ITER_STACK],
+    stack_len: usize,
+    remaining: usize,
 }
 
 impl<'a, K, V> Iter<'a, K, V> {
+    fn push(&mut self, node: &'a Node<K, V>) {
+        let index = self.stack_len;
+        assert!(
+            index < MAX_AVL_ITER_STACK,
+            "AVL iterator stack capacity exceeded"
+        );
+        self.stack[index] = Some(node);
+        self.stack_len = index + 1;
+    }
+
     fn push_left(&mut self, mut node: Option<&'a Node<K, V>>) {
         while let Some(current) = node {
-            self.stack.push(current);
+            self.push(current);
             node = current.left.as_deref();
         }
+    }
+
+    fn pop(&mut self) -> Option<&'a Node<K, V>> {
+        let index = self.stack_len.checked_sub(1)?;
+        self.stack_len = index;
+        self.stack[index].take()
     }
 }
 
@@ -437,13 +574,14 @@ impl<'a, K: 'a, V: 'a> Iterator for Iter<'a, K, V> {
     type Item = (&'a K, &'a V);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let node = self.stack.pop()?;
+        let node = self.pop()?;
         self.push_left(node.right.as_deref());
+        self.remaining -= 1;
         Some((&node.key, &node.value))
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        (0, None)
+        (self.remaining, Some(self.remaining))
     }
 }
 
@@ -459,19 +597,74 @@ fn make_node<K, V>(
 ) -> Arc<Node<K, V>> {
     let left_height = height(left.as_ref());
     let right_height = height(right.as_ref());
-    let size = 1 + size_of(left.as_ref()) + size_of(right.as_ref());
     Arc::new(Node {
         key,
         value,
         left,
         right,
         height: 1 + left_height.max(right_height),
-        size,
     })
 }
 
-fn size_of<K, V>(node: Option<&Arc<Node<K, V>>>) -> usize {
-    node.map_or(0, |node| node.size)
+type SortedBuildResult<K, V, E> =
+    Result<(Option<Arc<Node<K, V>>>, Option<Arc<Node<K, V>>>), SortedExactError<E>>;
+
+/// Builds a balanced AVL tree from an in-order stream.
+///
+/// The second returned handle is an `Arc` to the rightmost node.  Keeping
+/// that handle lets the caller validate the left subtree's upper boundary in
+/// `O(1)` time without cloning or moving its key out of the final node.  Arc
+/// handle clones are bounded by the recursion depth and do not construct
+/// additional tree nodes.
+fn build_sorted_nodes<K: Ord, V, I, E>(
+    entries: &mut I,
+    count: usize,
+    lower: Option<&K>,
+    upper: Option<&K>,
+    expected_len: usize,
+    consumed: &mut usize,
+) -> SortedBuildResult<K, V, E>
+where
+    I: Iterator<Item = Result<(K, V), E>>,
+{
+    if count == 0 {
+        return Ok((None, None));
+    }
+
+    let left_count = count / 2;
+    let right_count = count - left_count - 1;
+    let (left, left_max) =
+        build_sorted_nodes(entries, left_count, lower, upper, expected_len, consumed)?;
+
+    let Some(entry) = entries.next() else {
+        return Err(SortedExactError::TooFew {
+            expected: expected_len,
+            actual: *consumed,
+        });
+    };
+    let (key, value) = entry.map_err(SortedExactError::Source)?;
+    *consumed += 1;
+
+    if lower.is_some_and(|lower| key <= *lower)
+        || upper.is_some_and(|upper| key >= *upper)
+        || left_max
+            .as_ref()
+            .is_some_and(|left_max| left_max.key >= key)
+    {
+        return Err(SortedExactError::NotStrictlyIncreasing);
+    }
+
+    let (right, right_max) = build_sorted_nodes(
+        entries,
+        right_count,
+        Some(&key),
+        upper,
+        expected_len,
+        consumed,
+    )?;
+    let node = make_node(key, Arc::new(value), left, right);
+    let max = right_max.unwrap_or_else(|| node.clone());
+    Ok((Some(node), Some(max)))
 }
 
 fn balance_factor<K, V>(node: &Node<K, V>) -> i32 {
@@ -681,7 +874,7 @@ fn remove_min<K: Clone, V>(node: &Arc<Node<K, V>>) -> RemoveMinResult<K, V> {
 
 #[cfg(test)]
 mod tests {
-    use super::{StateMap, StateSet};
+    use super::{SortedExactError, StateMap, StateSet};
     use alloc::{
         collections::{BTreeMap, BTreeSet},
         vec,
@@ -716,12 +909,11 @@ mod tests {
             if let Some(max) = max {
                 assert!(&node.key < max);
             }
-            let (left_height, left_size) = visit(node.left.as_deref(), min, Some(&node.key));
-            let (right_height, right_size) = visit(node.right.as_deref(), Some(&node.key), max);
+            let (left_height, left_count) = visit(node.left.as_deref(), min, Some(&node.key));
+            let (right_height, right_count) = visit(node.right.as_deref(), Some(&node.key), max);
             assert!((left_height as i32 - right_height as i32).abs() <= 1);
             assert_eq!(node.height, 1 + left_height.max(right_height));
-            assert_eq!(node.size, 1 + left_size + right_size);
-            (node.height, node.size)
+            (node.height, 1 + left_count + right_count)
         }
 
         let result = visit(map.root.as_deref(), None, None);
@@ -843,6 +1035,72 @@ mod tests {
     }
 
     #[test]
+    fn iterator_empty_and_single_node_use_fixed_stack_and_exact_hints() {
+        let empty = StateMap::<u32, u32>::new();
+        let mut empty_iter = empty.iter();
+        assert_eq!(empty_iter.stack.len(), super::MAX_AVL_ITER_STACK);
+        assert_eq!(empty_iter.stack_len, 0);
+        assert_eq!(empty_iter.size_hint(), (0, Some(0)));
+        assert!(empty_iter.next().is_none());
+
+        let (single, old) = empty.insert(7, 70);
+        assert_eq!(old, None);
+        let mut single_iter = single.iter();
+        assert_eq!(single_iter.stack.len(), super::MAX_AVL_ITER_STACK);
+        assert_eq!(single_iter.stack_len, 1);
+        assert_eq!(single_iter.size_hint(), (1, Some(1)));
+        let (key, value) = single_iter.next().expect("single node should iterate");
+        assert_eq!((*key, *value), (7, 70));
+        assert_eq!(single_iter.size_hint(), (0, Some(0)));
+        assert!(single_iter.next().is_none());
+    }
+
+    #[test]
+    fn iterator_handles_large_ascending_and_descending_insertions() {
+        const COUNT: u32 = 8_192;
+
+        let mut ascending = StateMap::new();
+        for key in 0..COUNT {
+            assert_eq!(ascending.insert_mut(key, key * 3), None);
+        }
+        assert_valid(&ascending);
+        let mut ascending_iter = ascending.iter();
+        for expected in 0..COUNT {
+            assert_eq!(
+                ascending_iter.size_hint(),
+                (
+                    (COUNT - expected) as usize,
+                    Some((COUNT - expected) as usize)
+                )
+            );
+            let (key, value) = ascending_iter.next().expect("ascending key missing");
+            assert_eq!((*key, *value), (expected, expected * 3));
+        }
+        assert_eq!(ascending_iter.size_hint(), (0, Some(0)));
+        assert!(ascending_iter.next().is_none());
+
+        let mut descending = StateMap::new();
+        for key in (0..COUNT).rev() {
+            assert_eq!(descending.insert_mut(key, key * 5), None);
+        }
+        assert_valid(&descending);
+        let mut descending_iter = descending.iter();
+        for expected in 0..COUNT {
+            assert_eq!(
+                descending_iter.size_hint(),
+                (
+                    (COUNT - expected) as usize,
+                    Some((COUNT - expected) as usize)
+                )
+            );
+            let (key, value) = descending_iter.next().expect("descending key missing");
+            assert_eq!((*key, *value), (expected, expected * 5));
+        }
+        assert_eq!(descending_iter.size_hint(), (0, Some(0)));
+        assert!(descending_iter.next().is_none());
+    }
+
+    #[test]
     fn path_copy_clones_only_the_target_value() {
         let mut map = StateMap::new();
         for key in 0..128 {
@@ -908,6 +1166,69 @@ mod tests {
         assert_eq!(original.len(), 4);
         assert_valid(&map);
         assert_valid(&original);
+    }
+
+    #[test]
+    fn sorted_builder_is_linear_and_does_not_require_clone() {
+        #[derive(Debug, Eq, PartialEq)]
+        struct NoClone(u32);
+
+        let map = StateMap::try_from_sorted_exact(
+            [(1_u32, NoClone(10)), (2, NoClone(20)), (3, NoClone(30))],
+            3,
+        )
+        .expect("strictly sorted entries should build");
+        assert_eq!(map.len(), 3);
+        assert_eq!(map.get(&1), Some(&NoClone(10)));
+        assert_eq!(map.get(&2), Some(&NoClone(20)));
+        assert_eq!(map.get(&3), Some(&NoClone(30)));
+        assert_valid(&map);
+    }
+
+    #[test]
+    fn sorted_builder_rejects_early_trailing_and_non_increasing_input() {
+        assert_eq!(
+            StateMap::try_from_sorted_exact([(1, 10), (2, 20)], 3),
+            Err(SortedExactError::TooFew {
+                expected: 3,
+                actual: 2
+            })
+        );
+        assert_eq!(
+            StateMap::try_from_sorted_exact([(1, 10), (2, 20)], 1),
+            Err(SortedExactError::TooMany { expected: 1 })
+        );
+        assert_eq!(
+            StateMap::try_from_sorted_exact([(1, 10), (1, 20)], 2),
+            Err(SortedExactError::NotStrictlyIncreasing)
+        );
+        assert_eq!(
+            StateMap::try_from_sorted_exact([(2, 20), (1, 10)], 2),
+            Err(SortedExactError::NotStrictlyIncreasing)
+        );
+    }
+
+    #[test]
+    fn fallible_sorted_builder_preserves_source_errors() {
+        let early =
+            StateMap::<u32, u32>::try_from_sorted_exact_fallible([Ok((1, 10)), Err(7_u8)], 2);
+        assert_eq!(early, Err(SortedExactError::Source(7)));
+
+        let trailing =
+            StateMap::<u32, u32>::try_from_sorted_exact_fallible([Ok((1, 10)), Err(9_u8)], 1);
+        assert_eq!(trailing, Err(SortedExactError::Source(9)));
+    }
+
+    #[test]
+    fn sorted_set_builder_preserves_canonical_order() {
+        let set = StateSet::try_from_sorted_exact_fallible(
+            [1, 2, 3, 4].map(Ok::<_, core::convert::Infallible>),
+            4,
+        )
+        .expect("strictly sorted keys should build");
+        assert_eq!(set.iter().copied().collect::<Vec<_>>(), vec![1, 2, 3, 4]);
+        assert_eq!(set.len(), 4);
+        assert_valid(&set.map);
     }
 
     #[test]

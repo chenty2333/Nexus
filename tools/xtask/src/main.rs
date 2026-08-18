@@ -16,6 +16,21 @@ const CSER_MODEL_NO_STD_CHECK_ARGS: &[&str] = &[
     "--target",
     BARE_METAL_TARGET,
 ];
+// `cser-core --all-features` includes the software-only SHA-2 comparator.
+// Keep that coverage in the broad host test below, but exercise the normal
+// host runtime-dispatch profile explicitly as a separate CI gate.
+const CSER_HASH_BACKEND_RUNTIME_DISPATCH_TEST_ARGS: &[&str] = &[
+    "test",
+    "--locked",
+    "-p",
+    "cser-core",
+    "--no-default-features",
+    "--features",
+    "std",
+    "--test",
+    "hash_backend",
+    "--no-fail-fast",
+];
 
 const REQUIRED_PATHS: &[&str] = &[
     "Cargo.toml",
@@ -220,6 +235,7 @@ fn test_with_model_no_std(root: &Path, include_model_no_std: bool) -> Result<()>
     if include_model_no_std {
         check_cser_model_no_std(root)?;
     }
+    test_hash_backend_runtime_dispatch(root)?;
     test_package(root, "cser-core", true)?;
     test_package(root, "cser-model", true)?;
     section("test the production workflow runner");
@@ -240,7 +256,7 @@ fn verify(root: &Path) -> Result<()> {
     clippy(root)?;
     test_with_model_no_std(root, false)?;
     println!(
-        "CSER CORE VERIFY PASS portable_core=true independent_oracle=true loom=true journal_recovery=true"
+        "CSER CORE VERIFY PASS portable_core=true independent_oracle=true loom=true journal_recovery=true hash_backend_runtime_dispatch=true"
     );
     Ok(())
 }
@@ -248,6 +264,11 @@ fn verify(root: &Path) -> Result<()> {
 fn check_cser_model_no_std(root: &Path) -> Result<()> {
     section("check independent oracle for bare metal without std");
     cargo(root, CSER_MODEL_NO_STD_CHECK_ARGS)
+}
+
+fn test_hash_backend_runtime_dispatch(root: &Path) -> Result<()> {
+    section("test cser-core host runtime-dispatch hash backend");
+    cargo(root, CSER_HASH_BACKEND_RUNTIME_DISPATCH_TEST_ARGS)
 }
 
 fn cargo_package(root: &Path, verb: &str, package: &str, all_features: bool) -> Result<()> {
@@ -309,7 +330,10 @@ fn section(title: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{BARE_METAL_TARGET, CSER_MODEL_NO_STD_CHECK_ARGS};
+    use super::{
+        BARE_METAL_TARGET, CSER_HASH_BACKEND_RUNTIME_DISPATCH_TEST_ARGS,
+        CSER_MODEL_NO_STD_CHECK_ARGS,
+    };
 
     #[test]
     fn model_no_std_check_plan_is_locked_and_targeted() {
@@ -326,5 +350,26 @@ mod tests {
                 BARE_METAL_TARGET,
             ]
         );
+    }
+
+    #[test]
+    fn host_hash_backend_gate_uses_runtime_dispatch_profile() {
+        assert_eq!(
+            CSER_HASH_BACKEND_RUNTIME_DISPATCH_TEST_ARGS,
+            [
+                "test",
+                "--locked",
+                "-p",
+                "cser-core",
+                "--no-default-features",
+                "--features",
+                "std",
+                "--test",
+                "hash_backend",
+                "--no-fail-fast",
+            ]
+        );
+        assert!(!CSER_HASH_BACKEND_RUNTIME_DISPATCH_TEST_ARGS.contains(&"--all-features"));
+        assert!(!CSER_HASH_BACKEND_RUNTIME_DISPATCH_TEST_ARGS.contains(&"sha2-software-baseline"));
     }
 }

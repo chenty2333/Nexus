@@ -214,6 +214,255 @@ fn tx<C: Into<cser_core::Command>>(engine: &mut Engine, request: C) -> Result<()
     engine.transact_volatile(request).map(|_| ())
 }
 
+fn durable_output<C: Into<cser_core::Command>>(
+    engine: &mut Engine,
+    journal: &mut Vec<u8>,
+    request: C,
+) -> TransitionOutput {
+    engine
+        .transact(request, |record| {
+            journal.extend_from_slice(record.bytes());
+            Ok::<(), ()>(())
+        })
+        .unwrap()
+        .into_output()
+}
+
+struct TerminalHandoffFixture {
+    engine: Engine,
+    catalog: DomainCatalog,
+    journal: Vec<u8>,
+    world: WorldId,
+    provider: ProviderCoordinate,
+    target_provider: ProviderCoordinate,
+    parent: EffectId,
+    actor: ExecutorCoordinate,
+    descriptor: ChildDescriptorV1,
+}
+
+fn terminal_handoff_fixture(
+    world_number: u64,
+    operation_number: u64,
+    provider_number: u64,
+    target_provider_number: u64,
+) -> TerminalHandoffFixture {
+    let world = WorldId::new(world_number).unwrap();
+    let catalog = tool_dma_catalog();
+    let mut engine = Engine::new(
+        world,
+        CatalogSet::new(std::slice::from_ref(&catalog)).unwrap(),
+        CoreLimits::new(64, 1024, 4096, 4096, 32, 1, 1024).unwrap(),
+        freshness(),
+    );
+    let mut journal = Vec::new();
+    let provider = coordinate(world_number, provider_number, 1);
+    let target_provider = coordinate(world_number, target_provider_number, 1);
+    let digest = catalog.digest();
+    durable_output(
+        &mut engine,
+        &mut journal,
+        CommandRequest::RegisterProviderGeneration {
+            coordinate: provider,
+            catalog_digest: digest,
+            verifier_bindings: verifiers_for(&catalog, 0x74),
+        },
+    );
+    durable_output(
+        &mut engine,
+        &mut journal,
+        CommandRequest::RegisterProviderGeneration {
+            coordinate: target_provider,
+            catalog_digest: digest,
+            verifier_bindings: verifiers_for(&catalog, 0x75),
+        },
+    );
+    let parent = EffectId::new(OperationId::new(operation_number).unwrap(), 1).unwrap();
+    let actor = ExecutorCoordinate::new(
+        ExecutorId::new(operation_number).unwrap(),
+        ExecutorGeneration::new(1).unwrap(),
+    );
+    let claim = ClaimId::new(operation_number).unwrap();
+    let resource = ResourceId::new(operation_number).unwrap();
+    durable_output(
+        &mut engine,
+        &mut journal,
+        CommandRequest::AdmitScopedCompositeEffect {
+            effect: parent,
+            origin: actor,
+            kind: TOOL_HANDOFF_SOURCE_COMPOSITE,
+            charge_account: cser_core::ChargeAccountId::new(operation_number).unwrap(),
+            bindings: vec![ComponentProviderBinding::new(
+                TOOL_HANDOFF_SOURCE_COMPONENT,
+                provider,
+            )],
+        },
+    );
+    durable_output(
+        &mut engine,
+        &mut journal,
+        CommandRequest::AddComponentClaim {
+            effect: parent,
+            component: TOOL_HANDOFF_SOURCE_COMPONENT,
+            actor,
+            claim,
+            kind: TOOL_CLAIM_OUTCOME_SLOT,
+            scope: ClaimScope::Logical,
+            resource,
+            resource_generation: ResourceGeneration::new(1).unwrap(),
+            units: 1,
+        },
+    );
+    durable_output(
+        &mut engine,
+        &mut journal,
+        CommandRequest::PrepareCompositeEffect {
+            effect: parent,
+            actor,
+        },
+    );
+    let intent = match durable_output(
+        &mut engine,
+        &mut journal,
+        CommandRequest::RecordComponentCommitIntent {
+            effect: parent,
+            component: TOOL_HANDOFF_SOURCE_COMPONENT,
+            actor,
+            operation: Digest::new([0x75; 32]),
+        },
+    ) {
+        TransitionOutput::CommitIntent(intent) => intent,
+        other => panic!("expected source commit intent, got {other:?}"),
+    };
+    let descriptor = ChildDescriptorV1 {
+        schema: 1,
+        sequence: 1,
+        parent,
+        parent_component: TOOL_HANDOFF_SOURCE_COMPONENT,
+        route_digest: Digest::new([0x76; 32]),
+        child_kind: TOOL_HANDOFF_CHILD_COMPOSITE,
+        child_component: TOOL_HANDOFF_COMPONENT,
+        claim,
+        claim_kind: TOOL_CLAIM_OUTCOME_SLOT,
+        scope: ClaimScope::Logical,
+        resource,
+        resource_generation: ResourceGeneration::new(1).unwrap(),
+        units: 1,
+        input_digest: Digest::new([0x77; 32]),
+        catalog_digest: digest,
+    };
+    let verified_descriptor = engine
+        .verify_child_descriptor(descriptor, &AcceptDescriptor, &())
+        .unwrap();
+    let verified_outcome = engine
+        .verify_commit_outcome(&intent, &AcceptEffect, &())
+        .unwrap();
+    durable_output(
+        &mut engine,
+        &mut journal,
+        intent
+            .acknowledge_handoff_parent_success(verified_outcome, verified_descriptor)
+            .unwrap(),
+    );
+    TerminalHandoffFixture {
+        engine,
+        catalog,
+        journal,
+        world,
+        provider,
+        target_provider,
+        parent,
+        actor,
+        descriptor,
+    }
+}
+
+fn settle_terminal_handoff_source(fixture: &mut TerminalHandoffFixture) {
+    let settlement = match durable_output(
+        &mut fixture.engine,
+        &mut fixture.journal,
+        CommandRequest::ClaimComponentSettlement {
+            effect: fixture.parent,
+            component: TOOL_HANDOFF_SOURCE_COMPONENT,
+            claimant: fixture.actor,
+        },
+    ) {
+        TransitionOutput::SettlementClaim(claim) => claim,
+        other => panic!("expected source settlement claim, got {other:?}"),
+    };
+    let settlement = match durable_output(
+        &mut fixture.engine,
+        &mut fixture.journal,
+        settlement
+            .record_apply_intent(Digest::new([0x79; 32]))
+            .unwrap(),
+    ) {
+        TransitionOutput::SettlementClaim(claim) => claim,
+        other => panic!("expected source apply-intent claim, got {other:?}"),
+    };
+    let applied = fixture
+        .engine
+        .verify_apply_completion(
+            &settlement,
+            &ScopedEffectVerifier {
+                identity: scoped_identity(
+                    &fixture.catalog,
+                    TOOL_VERIFIER,
+                    TOOL_APPLY_RECEIPT_SCHEMA,
+                    0x74,
+                ),
+            },
+            &(),
+        )
+        .unwrap();
+    let settlement = match durable_output(
+        &mut fixture.engine,
+        &mut fixture.journal,
+        settlement.record_applied(applied).unwrap(),
+    ) {
+        TransitionOutput::SettlementClaim(claim) => claim,
+        other => panic!("expected source applied claim, got {other:?}"),
+    };
+    let acknowledgement = fixture
+        .engine
+        .verify_settlement_ack(
+            &settlement,
+            &ScopedEffectVerifier {
+                identity: scoped_identity(
+                    &fixture.catalog,
+                    TOOL_VERIFIER,
+                    TOOL_SETTLEMENT_RECEIPT_SCHEMA,
+                    0x74,
+                ),
+            },
+            &(),
+        )
+        .unwrap();
+    durable_output(
+        &mut fixture.engine,
+        &mut fixture.journal,
+        settlement.settle(acknowledgement).unwrap(),
+    );
+    let evidence = fixture
+        .engine
+        .verify_component_retirement_evidence(
+            fixture.parent,
+            TOOL_HANDOFF_SOURCE_COMPONENT,
+            fixture.descriptor.claim,
+            TOOL_EVIDENCE_OUTCOME_ACK,
+            &ScopedEvidenceVerifier {
+                identity: scoped_identity(
+                    &fixture.catalog,
+                    TOOL_VERIFIER,
+                    TOOL_RECEIPT_SCHEMA,
+                    0x74,
+                ),
+            },
+            &(),
+        )
+        .unwrap();
+    durable_output(&mut fixture.engine, &mut fixture.journal, evidence.submit());
+}
+
 #[test]
 fn provider_generation_high_water_is_monotonic_and_scoped() {
     let world = WorldId::new(7).unwrap();
@@ -530,6 +779,167 @@ fn handoff_source_release_removes_scoped_binding_at_the_pivot() {
         cser_core::ChargeAccountId::new(7401).unwrap(),
         ComponentProviderBinding::new(TOOL_HANDOFF_COMPONENT, target_provider),
     ));
+
+    // A prepared child never turns a still-open source into a legal pivot.
+    let verified = engine
+        .verify_child_descriptor(descriptor, &AcceptDescriptor, &())
+        .unwrap();
+    assert_eq!(
+        engine.transact_volatile(
+            verified.release_source_and_record_target_intent(actor, Digest::new([0x78; 32]))
+        ),
+        Err(CoreError::HandoffGuardRequired)
+    );
+
+    // Match the OSTD lifecycle: ordinary successor settlement and typed
+    // retirement release the source accounting before the custody pivot.
+    let settlement = match durable!(CommandRequest::ClaimComponentSettlement {
+        effect: parent,
+        component: TOOL_HANDOFF_SOURCE_COMPONENT,
+        claimant: actor,
+    })
+    .into_output()
+    {
+        TransitionOutput::SettlementClaim(claim) => claim,
+        other => panic!("expected source settlement claim, got {other:?}"),
+    };
+    let settlement = match durable!(
+        settlement
+            .record_apply_intent(Digest::new([0x79; 32]))
+            .unwrap()
+    )
+    .into_output()
+    {
+        TransitionOutput::SettlementClaim(claim) => claim,
+        other => panic!("expected source apply-intent claim, got {other:?}"),
+    };
+    let applied = engine
+        .verify_apply_completion(
+            &settlement,
+            &ScopedEffectVerifier {
+                identity: scoped_identity(&catalog, TOOL_VERIFIER, TOOL_APPLY_RECEIPT_SCHEMA, 0x74),
+            },
+            &(),
+        )
+        .unwrap();
+    let settlement = match durable!(settlement.record_applied(applied).unwrap()).into_output() {
+        TransitionOutput::SettlementClaim(claim) => claim,
+        other => panic!("expected source applied claim, got {other:?}"),
+    };
+    let acknowledgement = engine
+        .verify_settlement_ack(
+            &settlement,
+            &ScopedEffectVerifier {
+                identity: scoped_identity(
+                    &catalog,
+                    TOOL_VERIFIER,
+                    TOOL_SETTLEMENT_RECEIPT_SCHEMA,
+                    0x74,
+                ),
+            },
+            &(),
+        )
+        .unwrap();
+    durable!(settlement.settle(acknowledgement).unwrap());
+
+    // Settlement alone is insufficient while the source claim still awaits
+    // typed retirement evidence.
+    let verified = engine
+        .verify_child_descriptor(descriptor, &AcceptDescriptor, &())
+        .unwrap();
+    assert_eq!(
+        engine.transact_volatile(
+            verified.release_source_and_record_target_intent(actor, Digest::new([0x7a; 32]))
+        ),
+        Err(CoreError::HandoffGuardRequired)
+    );
+
+    let evidence = engine
+        .verify_component_retirement_evidence(
+            parent,
+            TOOL_HANDOFF_SOURCE_COMPONENT,
+            ClaimId::new(7401).unwrap(),
+            TOOL_EVIDENCE_OUTCOME_ACK,
+            &ScopedEvidenceVerifier {
+                identity: scoped_identity(&catalog, TOOL_VERIFIER, TOOL_RECEIPT_SCHEMA, 0x74),
+            },
+            &(),
+        )
+        .unwrap();
+    durable!(evidence.submit());
+    assert_eq!(
+        engine
+            .component(parent, TOOL_HANDOFF_SOURCE_COMPONENT)
+            .unwrap()
+            .retirement,
+        cser_core::RetirementState::Retired
+    );
+
+    // Ordinary source retirement leaves this exact generation absent from the
+    // live index and charge aggregate, but the accepted source descriptor
+    // still reserves it until the child pivot or an explicit abort.  Both the
+    // read-only reusable check and the durable reuse command must observe that
+    // reservation instead of advancing the generation behind the descriptor.
+    let child = descriptor.child_effect().unwrap();
+    assert_eq!(
+        engine.check_reusable(descriptor.resource, descriptor.resource_generation,),
+        Err(CoreError::ResourceRetained)
+    );
+    assert_eq!(
+        tx(
+            &mut engine,
+            CommandRequest::ReserveComponentReuse {
+                effect: child,
+                component: TOOL_HANDOFF_COMPONENT,
+                actor,
+                claim: ClaimId::new(7402).unwrap(),
+                kind: TOOL_CLAIM_OUTCOME_SLOT,
+                scope: ClaimScope::Logical,
+                resource: descriptor.resource,
+                expected_generation: descriptor.resource_generation,
+                units: descriptor.units,
+                reuse_contract: Digest::new([0x7b; 32]),
+            },
+        ),
+        Err(CoreError::ResourceRetained)
+    );
+
+    // The reservation is derived from the durable source role, so a cold
+    // replay followed by checkpoint recovery must retain the same exclusion.
+    let recovery_freshness = Freshness::new(
+        BootGeneration::new(2).unwrap(),
+        RegistryInstance::new(1).unwrap(),
+        DeviceGeneration::new(1).unwrap(),
+        JournalGeneration::new(2).unwrap(),
+    );
+    let mut recovered_before_pivot = Engine::recover(
+        CatalogSet::new(std::slice::from_ref(&catalog)).unwrap(),
+        CoreLimits::bounded_default(),
+        RecoveryAnchor::from_trusted_provider(
+            recovery_binding(world, &catalog, freshness()),
+            freshness(),
+            recovery_freshness,
+            engine.revision(),
+            engine.head(),
+            engine.projection_digest(),
+        )
+        .unwrap(),
+        &journal,
+    )
+    .unwrap()
+    .into_engine();
+    recovered_before_pivot
+        .transact_volatile(CommandRequest::CheckpointRecovery {
+            boot: recovery_freshness.boot(),
+            journal: recovery_freshness.journal(),
+            device: recovery_freshness.device(),
+        })
+        .unwrap();
+    assert_eq!(
+        recovered_before_pivot.check_reusable(descriptor.resource, descriptor.resource_generation,),
+        Err(CoreError::ResourceRetained)
+    );
+
     let verified = engine
         .verify_child_descriptor(descriptor, &AcceptDescriptor, &())
         .unwrap();
@@ -599,7 +1009,6 @@ fn handoff_source_release_removes_scoped_binding_at_the_pivot() {
         )
         .unwrap();
     recovered.transact_volatile(resolution.resolve()).unwrap();
-    let child = descriptor.child_effect().unwrap();
     assert_eq!(
         recovered
             .component(child, TOOL_HANDOFF_COMPONENT)
@@ -624,6 +1033,191 @@ fn handoff_source_release_removes_scoped_binding_at_the_pivot() {
         },
     )
     .unwrap();
+}
+
+#[test]
+fn terminal_retired_handoff_reservation_survives_recovery_before_child_install() {
+    let mut fixture = terminal_handoff_fixture(742, 7421, 7422, 7423);
+    settle_terminal_handoff_source(&mut fixture);
+    let descriptor = fixture.descriptor;
+    let child = descriptor.child_effect().unwrap();
+
+    assert_eq!(
+        fixture
+            .engine
+            .check_reusable(descriptor.resource, descriptor.resource_generation),
+        Err(CoreError::ResourceRetained)
+    );
+    assert_eq!(
+        tx(
+            &mut fixture.engine,
+            CommandRequest::ReserveComponentReuse {
+                effect: fixture.parent,
+                component: TOOL_HANDOFF_SOURCE_COMPONENT,
+                actor: fixture.actor,
+                claim: ClaimId::new(7422).unwrap(),
+                kind: TOOL_CLAIM_OUTCOME_SLOT,
+                scope: ClaimScope::Logical,
+                resource: descriptor.resource,
+                expected_generation: descriptor.resource_generation,
+                units: descriptor.units,
+                reuse_contract: Digest::new([0x7b; 32]),
+            },
+        ),
+        Err(CoreError::ResourceRetained)
+    );
+
+    let next_freshness = Freshness::new(
+        BootGeneration::new(2).unwrap(),
+        RegistryInstance::new(1).unwrap(),
+        DeviceGeneration::new(1).unwrap(),
+        JournalGeneration::new(2).unwrap(),
+    );
+    let mut recovered = Engine::recover(
+        CatalogSet::new(std::slice::from_ref(&fixture.catalog)).unwrap(),
+        CoreLimits::bounded_default(),
+        RecoveryAnchor::from_trusted_provider(
+            recovery_binding(fixture.world, &fixture.catalog, freshness()),
+            freshness(),
+            next_freshness,
+            fixture.engine.revision(),
+            fixture.engine.head(),
+            fixture.engine.projection_digest(),
+        )
+        .unwrap(),
+        &fixture.journal,
+    )
+    .unwrap()
+    .into_engine();
+    recovered
+        .transact_volatile(CommandRequest::CheckpointRecovery {
+            boot: next_freshness.boot(),
+            journal: next_freshness.journal(),
+            device: next_freshness.device(),
+        })
+        .unwrap();
+    assert_eq!(
+        recovered.check_reusable(descriptor.resource, descriptor.resource_generation),
+        Err(CoreError::ResourceRetained)
+    );
+
+    let verified = fixture
+        .engine
+        .verify_child_descriptor(descriptor, &AcceptDescriptor, &())
+        .unwrap();
+    durable_output(
+        &mut fixture.engine,
+        &mut fixture.journal,
+        verified.install(
+            fixture.actor,
+            cser_core::ChargeAccountId::new(7421).unwrap(),
+            ComponentProviderBinding::new(TOOL_HANDOFF_COMPONENT, fixture.target_provider),
+        ),
+    );
+    assert_eq!(
+        fixture
+            .engine
+            .component(child, TOOL_HANDOFF_COMPONENT)
+            .unwrap()
+            .claim_count,
+        1
+    );
+
+    let verified = fixture
+        .engine
+        .verify_child_descriptor(descriptor, &AcceptDescriptor, &())
+        .unwrap();
+    durable_output(
+        &mut fixture.engine,
+        &mut fixture.journal,
+        verified.release_source_and_record_target_intent(fixture.actor, Digest::new([0x7c; 32])),
+    );
+    assert_eq!(
+        fixture
+            .engine
+            .provider_generation_projection(fixture.provider)
+            .unwrap()
+            .live_component_bindings,
+        0
+    );
+    assert_eq!(
+        fixture
+            .engine
+            .provider_generation_projection(fixture.target_provider)
+            .unwrap()
+            .live_component_bindings,
+        1
+    );
+    assert_eq!(
+        fixture
+            .engine
+            .component(child, TOOL_HANDOFF_COMPONENT)
+            .unwrap()
+            .claim_count,
+        1
+    );
+}
+
+#[test]
+fn terminal_retired_handoff_abort_releases_resource_reservation() {
+    let mut fixture = terminal_handoff_fixture(743, 7431, 7432, 7433);
+    settle_terminal_handoff_source(&mut fixture);
+    let descriptor = fixture.descriptor;
+    let child = descriptor.child_effect().unwrap();
+    let verified = fixture
+        .engine
+        .verify_child_descriptor(descriptor, &AcceptDescriptor, &())
+        .unwrap();
+    durable_output(
+        &mut fixture.engine,
+        &mut fixture.journal,
+        verified.install(
+            fixture.actor,
+            cser_core::ChargeAccountId::new(7431).unwrap(),
+            ComponentProviderBinding::new(TOOL_HANDOFF_COMPONENT, fixture.target_provider),
+        ),
+    );
+    assert_eq!(
+        fixture
+            .engine
+            .check_reusable(descriptor.resource, descriptor.resource_generation),
+        Err(CoreError::ResourceRetained)
+    );
+    durable_output(
+        &mut fixture.engine,
+        &mut fixture.journal,
+        CommandRequest::FenceProviderEffects {
+            coordinate: fixture.target_provider,
+            expected_epoch: 1,
+        },
+    );
+    durable_output(
+        &mut fixture.engine,
+        &mut fixture.journal,
+        CommandRequest::AbortUnescapedEffect { effect: child },
+    );
+    assert_eq!(
+        fixture
+            .engine
+            .composite_effect(fixture.parent)
+            .unwrap()
+            .handoff,
+        SingleHopHandoffProjection::None
+    );
+    assert_eq!(
+        fixture
+            .engine
+            .check_reusable(descriptor.resource, descriptor.resource_generation),
+        Ok(())
+    );
+    assert_eq!(
+        fixture
+            .engine
+            .component(child, TOOL_HANDOFF_COMPONENT)
+            .unwrap()
+            .claim_count,
+        0
+    );
 }
 
 #[test]
@@ -1177,5 +1771,204 @@ fn profile6_scoped_commit_settle_retire_release_keeps_provenance() {
             .unwrap()
             .state,
         ProviderEffectState::Retired { .. }
+    ));
+}
+
+#[test]
+fn provider_rotation_rejects_active_predecessor_without_split_brain_authority() {
+    let world = WorldId::new(901).unwrap();
+    let catalog = tool_dma_catalog();
+    let digest = catalog.digest();
+    let mut engine = Engine::new(
+        world,
+        CatalogSet::new(std::slice::from_ref(&catalog)).unwrap(),
+        CoreLimits::bounded_default(),
+        freshness(),
+    );
+    let predecessor = coordinate(901, 902, 1);
+    let successor = coordinate(901, 902, 2);
+    tx(
+        &mut engine,
+        CommandRequest::RegisterProviderGeneration {
+            coordinate: predecessor,
+            catalog_digest: digest,
+            verifier_bindings: verifiers_for(&catalog, 0x90),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        tx(
+            &mut engine,
+            CommandRequest::RegisterProviderGeneration {
+                coordinate: successor,
+                catalog_digest: digest,
+                verifier_bindings: verifiers_for(&catalog, 0x91),
+            },
+        ),
+        Err(CoreError::ProviderLifecycleViolation)
+    );
+
+    // A failed rotation leaves the predecessor as the sole high-water
+    // authority, so an old-generation admission and commit-intent path still
+    // use one coherent coordinate rather than a split-brain pair.
+    let effect = EffectId::new(OperationId::new(9011).unwrap(), 1).unwrap();
+    let actor = ExecutorCoordinate::new(
+        ExecutorId::new(9011).unwrap(),
+        ExecutorGeneration::new(1).unwrap(),
+    );
+    tx(
+        &mut engine,
+        CommandRequest::AdmitScopedCompositeEffect {
+            effect,
+            origin: actor,
+            kind: TOOL_HANDOFF_SOURCE_COMPOSITE,
+            charge_account: cser_core::ChargeAccountId::new(9011).unwrap(),
+            bindings: vec![ComponentProviderBinding::new(
+                TOOL_HANDOFF_SOURCE_COMPONENT,
+                predecessor,
+            )],
+        },
+    )
+    .unwrap();
+    tx(
+        &mut engine,
+        CommandRequest::AddComponentClaim {
+            effect,
+            component: TOOL_HANDOFF_SOURCE_COMPONENT,
+            actor,
+            claim: ClaimId::new(9012).unwrap(),
+            kind: TOOL_CLAIM_OUTCOME_SLOT,
+            scope: ClaimScope::Logical,
+            resource: ResourceId::new(9013).unwrap(),
+            resource_generation: ResourceGeneration::new(1).unwrap(),
+            units: 1,
+        },
+    )
+    .unwrap();
+    tx(
+        &mut engine,
+        CommandRequest::PrepareCompositeEffect { effect, actor },
+    )
+    .unwrap();
+    assert!(
+        tx(
+            &mut engine,
+            CommandRequest::RecordComponentCommitIntent {
+                effect,
+                component: TOOL_HANDOFF_SOURCE_COMPONENT,
+                actor,
+                operation: Digest::new([0x92; 32]),
+            },
+        )
+        .is_ok()
+    );
+    assert!(engine.provider_generation_projection(successor).is_none());
+}
+
+#[test]
+fn provider_rotation_accepts_only_effect_retired_predecessor_and_fences_old_admission() {
+    let world = WorldId::new(911).unwrap();
+    let catalog = tool_dma_catalog();
+    let digest = catalog.digest();
+    let mut engine = Engine::new(
+        world,
+        CatalogSet::new(std::slice::from_ref(&catalog)).unwrap(),
+        CoreLimits::bounded_default(),
+        freshness(),
+    );
+    let predecessor = coordinate(911, 912, 1);
+    let successor = coordinate(911, 912, 2);
+    tx(
+        &mut engine,
+        CommandRequest::RegisterProviderGeneration {
+            coordinate: predecessor,
+            catalog_digest: digest,
+            verifier_bindings: verifiers_for(&catalog, 0x93),
+        },
+    )
+    .unwrap();
+    tx(
+        &mut engine,
+        CommandRequest::FenceProviderEffects {
+            coordinate: predecessor,
+            expected_epoch: 1,
+        },
+    )
+    .unwrap();
+    tx(
+        &mut engine,
+        CommandRequest::EnterProviderSettlementOnly {
+            coordinate: predecessor,
+            expected_epoch: 2,
+        },
+    )
+    .unwrap();
+    tx(
+        &mut engine,
+        CommandRequest::RetireProviderEffects {
+            coordinate: predecessor,
+            expected_epoch: 3,
+        },
+    )
+    .unwrap();
+    tx(
+        &mut engine,
+        CommandRequest::RegisterProviderGeneration {
+            coordinate: successor,
+            catalog_digest: digest,
+            verifier_bindings: verifiers_for(&catalog, 0x94),
+        },
+    )
+    .unwrap();
+
+    let actor = ExecutorCoordinate::new(
+        ExecutorId::new(9111).unwrap(),
+        ExecutorGeneration::new(1).unwrap(),
+    );
+    let old_effect = EffectId::new(OperationId::new(9111).unwrap(), 1).unwrap();
+    assert_eq!(
+        tx(
+            &mut engine,
+            CommandRequest::AdmitScopedCompositeEffect {
+                effect: old_effect,
+                origin: actor,
+                kind: TOOL_HANDOFF_SOURCE_COMPOSITE,
+                charge_account: cser_core::ChargeAccountId::new(9111).unwrap(),
+                bindings: vec![ComponentProviderBinding::new(
+                    TOOL_HANDOFF_SOURCE_COMPONENT,
+                    predecessor,
+                )],
+            },
+        ),
+        Err(CoreError::ProviderLifecycleViolation)
+    );
+    let current_effect = EffectId::new(OperationId::new(9112).unwrap(), 1).unwrap();
+    tx(
+        &mut engine,
+        CommandRequest::AdmitScopedCompositeEffect {
+            effect: current_effect,
+            origin: actor,
+            kind: TOOL_HANDOFF_SOURCE_COMPOSITE,
+            charge_account: cser_core::ChargeAccountId::new(9112).unwrap(),
+            bindings: vec![ComponentProviderBinding::new(
+                TOOL_HANDOFF_SOURCE_COMPONENT,
+                successor,
+            )],
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        engine
+            .provider_generation_projection(predecessor)
+            .unwrap()
+            .state,
+        ProviderEffectState::Retired { .. }
+    ));
+    assert!(matches!(
+        engine
+            .provider_generation_projection(successor)
+            .unwrap()
+            .state,
+        ProviderEffectState::Active
     ));
 }

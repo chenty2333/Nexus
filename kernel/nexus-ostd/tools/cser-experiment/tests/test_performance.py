@@ -30,10 +30,13 @@ class PerformanceLaneTests(unittest.TestCase):
         fields = {
             "version": 2, "run_id": run_id, "phase": phase, "clock": "guest_tsc", "calibrated": False, "journal_format": journal,
             "journal_phase_scope": "last-complete-publication", "runtime_transactions": transactions, "mutex_wait_cycles": 2, "mutex_max_wait_cycles": 3,
-            "mutex_hold_cycles": 4, "mutex_max_hold_cycles": 5, "journal_sectors_read": 6,
-            "journal_sectors_written": 7, "journal_flushes": 8, "journal_hash_bytes": 9,
-            "journal_image_bytes": 10, "journal_capacity_bytes": 11, "tpm_lease_advances": 12,
-            "tpm_tip_advances": 13, "tpm_lease_cycles": 14, "tpm_tip_cycles": 15,
+            "mutex_hold_cycles": 4, "mutex_max_hold_cycles": 5, "checkpoints": 16,
+            "commit_gate_wait_cycles": 17, "max_commit_gate_wait_cycles": 18,
+            "checkpoint_lock_wait_cycles": 19, "max_checkpoint_lock_wait_cycles": 20,
+            "checkpoint_lock_hold_cycles": 21, "max_checkpoint_lock_hold_cycles": 22,
+            "journal_sectors_read": 6, "journal_sectors_written": 7, "journal_flushes": 8,
+            "journal_hash_bytes": 9, "journal_image_bytes": 10, "journal_capacity_bytes": 11,
+            "tpm_lease_advances": 12, "tpm_tip_advances": 13, "tpm_lease_cycles": 14, "tpm_tip_cycles": 15,
             "journal_payload_written_tsc": phases[0], "journal_payload_flushed_tsc": phases[1],
             "journal_header_written_tsc": phases[2], "journal_header_flushed_tsc": phases[3],
             "journal_readback_validated_tsc": phases[4], "journal_cache_updated_tsc": phases[5],
@@ -105,6 +108,12 @@ class PerformanceLaneTests(unittest.TestCase):
         group = result["groups"][0]
         self.assertEqual((group["n"], group["unit"], group["p50"], group["p95"], group["p95_resolution"]), (3, "ms", 2.0, 3.0, "low"))
 
+    def test_summary_rejects_bool_and_nonfinite_measurements(self) -> None:
+        for value in (True, False, float("nan"), float("inf"), float("-inf")):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    summarize([{"point": "control", "measurements": {"metric": {"value": value, "unit": "ms"}}}])
+
     def test_trial_rows_produce_n_equal_to_requested_trials(self) -> None:
         result = summarize([
             {"point": "control", "trial": 1, "measurements": {"accepted_to_pending": {"value": 1, "unit": "ms"}, "max_inflight": {"value": 1, "unit": "count"}}},
@@ -151,6 +160,13 @@ class PerformanceLaneTests(unittest.TestCase):
             trial = Path(temporary); self._write_perf_logs(trial)
             values = _runtime_measurements(trial, "legacy", RUN)
             self.assertEqual(values["recovery_journal_hash_bytes"], {"value": 9, "unit": "bytes"})
+            self.assertEqual(values["recovery_checkpoints"], {"value": 16, "unit": "count"})
+            self.assertEqual(values["recovery_commit_gate_wait_cycles"], {"value": 17, "unit": "cycles"})
+            self.assertEqual(values["recovery_max_commit_gate_wait_cycles"], {"value": 18, "unit": "cycles"})
+            self.assertEqual(values["recovery_checkpoint_lock_wait_cycles"], {"value": 19, "unit": "cycles"})
+            self.assertEqual(values["recovery_max_checkpoint_lock_wait_cycles"], {"value": 20, "unit": "cycles"})
+            self.assertEqual(values["recovery_checkpoint_lock_hold_cycles"], {"value": 21, "unit": "cycles"})
+            self.assertEqual(values["recovery_max_checkpoint_lock_hold_cycles"], {"value": 22, "unit": "cycles"})
             self.assertEqual(values["initial_journal_payload_write_to_flush_cycles"], {"value": 1, "unit": "cycles"})
             log = trial / "recovery.stdout.log"
             for contents in ("", self._perf_line() + self._perf_line(), "TOOL_DMA_PERF_V1 {bad}\n", self._perf_line(phase="terminal-initial"), self._perf_line(run_id="f" * 32)):

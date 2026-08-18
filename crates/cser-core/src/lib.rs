@@ -47,6 +47,8 @@ mod journal;
 mod persistence;
 mod persistent_map;
 mod profiles;
+#[path = "recovery_source.rs"]
+pub mod recovery_source;
 
 #[cfg(feature = "std")]
 pub mod std_support;
@@ -66,22 +68,23 @@ pub use domain::{
     VerifierClassBinding, VerifierSetError, canonical_verifier_set_digest, validate_verifier_set,
 };
 pub use engine::{
-    ArtifactAdmission, ArtifactRecoveryItem, AuthorityState, ChargeProjection,
-    ChildDescriptorDecodeError, ChildDescriptorV1, ChildDescriptorVerifier, ClaimCustodian,
-    ClaimProjection, ClaimScope, ClaimUseError, Command, CommandDecodeError, CommandRequest,
-    CommitIntent, CommitState, CommitUseError, ComponentClaimProjection,
-    ComponentClaimRecoveryItem, ComponentCommitOperation, ComponentProjection,
-    ComponentProviderBinding, ComponentRecoveryItem, CompositeEffectProjection,
-    CompositeRecoveryItem, CoreError, CoreLimits, CustodyState, EffectEscapeState,
-    EffectFactChallenge, EffectFactKind, EffectReceiptVerifier, Engine, EvidenceChallenge,
-    ExternalOutcome, HandoffChildResolutionVerifier, HandoffResolutionChallenge,
-    HandoffResolutionVerifier, HistoryLimits, JournalFailure, OperationRecoveryState, OutcomeState,
+    ArtifactAdmission, ArtifactRecoveryItem, AuthorityState, ChargeProjection, CheckpointAnchor,
+    CheckpointRecordPlan, CheckpointSnapshot, CheckpointWrite, ChildDescriptorDecodeError,
+    ChildDescriptorV1, ChildDescriptorVerifier, ClaimCustodian, ClaimProjection, ClaimScope,
+    ClaimUseError, Command, CommandDecodeError, CommandRequest, CommitIntent, CommitState,
+    CommitUseError, ComponentClaimProjection, ComponentClaimRecoveryItem, ComponentCommitOperation,
+    ComponentProjection, ComponentProviderBinding, ComponentRecoveryItem,
+    CompositeEffectProjection, CompositeRecoveryItem, CoreError, CoreLimits, CustodyState,
+    DurablePreparedCheckpoint, EffectEscapeState, EffectFactChallenge, EffectFactKind,
+    EffectReceiptVerifier, Engine, EvidenceChallenge, ExternalOutcome,
+    HandoffChildResolutionVerifier, HandoffResolutionChallenge, HandoffResolutionVerifier,
+    HistoryLimits, JournalFailure, OperationRecoveryState, OutcomeState, PreparedCheckpoint,
     PressureProjection, ProviderEffectState, ProviderGenerationProjection, ProviderObligation,
     ProviderVerificationScope, ReceiptVerifier, RecoveryAnchor, RecoveryAnchorError,
-    RecoveryEvidenceItem, RecoveryReport, RecoverySnapshot, RetirementState, ReusePermit,
-    SettlementClaim, SettlementState, SingleHopHandoffProjection, TransitionCoordinates,
-    TransitionEvent, TransitionOutput, TransitionReceipt, TransitionResult, TxError,
-    VerificationError, VerifiedApplyReceipt, VerifiedArtifactPin, VerifiedArtifactRelease,
+    RecoveryEvidenceItem, RecoveryFromSourceError, RecoveryReport, RecoverySnapshot,
+    RetirementState, ReusePermit, SettlementClaim, SettlementState, SingleHopHandoffProjection,
+    TransitionCoordinates, TransitionEvent, TransitionOutput, TransitionReceipt, TransitionResult,
+    TxError, VerificationError, VerifiedApplyReceipt, VerifiedArtifactPin, VerifiedArtifactRelease,
     VerifiedChildDescriptor, VerifiedCommitOutcome, VerifiedEffectObservation,
     VerifiedHandoffChildResolution, VerifiedHandoffResolution, VerifiedObservation,
     VerifiedRetirementEvidence, VerifiedSettlementAck, VerifierIdentity, VerifierStamp,
@@ -104,9 +107,10 @@ pub use journal::{
     MAX_JOURNAL_CHECKPOINT_IMAGE_BYTES, scan_journal, scan_journal_to_head,
 };
 pub use persistence::{
-    CompactingJournalBackend, CoordinatedPersistence, CoordinatedPersistenceError,
-    DurableJournalBackend, PersistenceProtocolError, RecoveryBinding, RecoveryLease,
-    RecoveryProfile, TransitionDurability, TrustedAnchorBackend, TrustedAnchorSnapshot,
+    CheckpointDurability, CompactingJournalBackend, CoordinatedPersistence,
+    CoordinatedPersistenceError, DurableJournalBackend, PersistenceProtocolError, RecoveryBinding,
+    RecoveryLease, RecoveryProfile, StreamingJournalBackend, TransitionDurability,
+    TrustedAnchorBackend, TrustedAnchorSnapshot,
 };
 pub use profiles::{
     AGENT_COMPONENT_DMA, AGENT_COMPONENT_REPLY, AGENT_OPERATION_COMPOSITE, CREDIT_IOVA,
@@ -140,3 +144,4 @@ pub use profiles::{
     TOOL_RECEIPT_SCHEMA, TOOL_SETTLEMENT_RECEIPT_SCHEMA, TOOL_VERIFIER, harness_catalog,
     standard_catalog, tool_dma_catalog,
 };
+pub use recovery_source::{JournalRecoverySource, RecoverySourceSnapshot};

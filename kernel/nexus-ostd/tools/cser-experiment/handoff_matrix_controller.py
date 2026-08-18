@@ -11,18 +11,19 @@ from __future__ import annotations
 import argparse
 from contextlib import closing
 import json
+import hashlib
+import math
 import os
 import re
-import signal
 import socket
 import sqlite3
 import subprocess
 import sys
-import time
 from pathlib import Path
 from typing import Any, Iterable
 
-from matrix_controller import _connect_qemu_server, _read_one_frame, _run_recovery_launcher
+from matrix_controller import (_connect_qemu_server, _kill_process_group, _read_one_frame,
+                               _run_recovery_launcher)
 from matrix_protocol import BarrierProtocolError, UART_WRITE_INTER_CHUNK_SECONDS, barrier_ack, config_response, paced_sendall, parse_barrier, parse_config_hello
 from handoff_identity import (ParentDescriptorContext, child_transport_effect_id,
                               expected_child_request, expected_source_request,
@@ -43,9 +44,23 @@ _HEX32 = re.compile(r"^[0-9a-f]{32}$")
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _CID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$")
 _TRIAL_TOKEN = re.compile(r"^[0-9a-f]{64}$")
+_CONTAINER_KILL_ATTEMPTS = 3
+_CONTAINER_KILL_TIMEOUT_SECONDS = 5
+_MEDIA_HASH_CHUNK_BYTES = 1024 * 1024
 _HANDOFF_CONTAINER_LABELS = {
     "nexus.cser-experiment": "handoff",
 }
+
+
+def _validate_timeout(value: object, label: str) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value <= 0
+    ):
+        raise ValueError(f"{label} must be finite and positive")
+    return float(value)
 
 
 def observe_handoff_barriers(client: socket.socket, run_id: str, target: int, *, catalog_digest: str,
@@ -211,8 +226,94 @@ def compare_recoveries(first: dict[str, Any], second: dict[str, Any]) -> None:
 
 
 def _kill(process: subprocess.Popen[bytes]) -> None:
-    try: os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError: pass
+    _kill_process_group(process, stage="handoff initial", force=True)
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(_MEDIA_HASH_CHUNK_BYTES):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _source_snapshot(path: Path) -> tuple[int, int, int, int, int]:
+    stat = path.lstat()
+    if not path.is_file() or path.is_symlink():
+        raise ValueError(f"base media is not a regular non-symlink file: {path}")
+    return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_mode
+
+
+def _media_fingerprint(path: Path) -> tuple[int, int, int, int, int, str]:
+    """Capture one stable staged-file identity and content digest."""
+    before = _source_snapshot(path)
+    digest = _sha256_file(path)
+    after = _source_snapshot(path)
+    if before != after:
+        raise ValueError(f"staged media changed while being verified: {path}")
+    return (*after, digest)
+
+
+def _verify_staged_media(expected: dict[Path, tuple[int, int, int, int, int, str]]) -> None:
+    """Revalidate every staged path immediately before launching the guest."""
+    for path, fingerprint in expected.items():
+        try:
+            current = _media_fingerprint(path)
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"staged media is not stable at execution boundary: {path}") from exc
+        if current != fingerprint:
+            raise ValueError(f"staged media was replaced or modified before execution: {path}")
+
+
+def _stage_media(trial_dir: Path, sources: Iterable[str | Path]) -> list[Path]:
+    """Copy stable, non-aliased media into a trial-owned directory.
+
+    Handoff rows are independent evidence artifacts.  A symlink or a silent
+    basename overwrite would let two rows claim the same bytes while the
+    controller records only the last destination.  Hashing both sides before
+    and after the copy also makes a concurrent source mutation fail closed.
+    """
+    media_dir = trial_dir / "media"
+    media_dir.mkdir()
+    resolved_sources: list[Path] = []
+    basenames: set[str] = set()
+    for source in sources:
+        original = Path(source)
+        component = original
+        has_symlink_component = False
+        while component != component.parent:
+            if component.is_symlink():
+                has_symlink_component = True
+                break
+            component = component.parent
+        if has_symlink_component:
+            raise ValueError(f"base media must not be a symlink: {original}")
+        resolved = original.resolve()
+        if not resolved.is_file() or resolved.is_symlink():
+            raise ValueError(f"base media is not a regular non-symlink file: {original}")
+        if resolved.name in basenames:
+            raise ValueError(f"base media basename conflict: {resolved.name}")
+        basenames.add(resolved.name)
+        resolved_sources.append(resolved)
+
+    media: list[Path] = []
+    for source in resolved_sources:
+        destination = media_dir / source.name
+        source_before = _source_snapshot(source)
+        before = _sha256_file(source)
+        subprocess.run(
+            ["cp", "--reflink=auto", "--preserve=mode,timestamps", str(source), str(destination)],
+            check=True,
+        )
+        copied = _sha256_file(destination)
+        source_after = _source_snapshot(source)
+        after = _sha256_file(source)
+        if source_before != source_after or before != after or copied != before:
+            raise ValueError(
+                f"base media changed or copy digest mismatched: source={source} destination={destination}"
+            )
+        media.append(destination)
+    return media
 
 
 def _container_labels(container_id: str) -> dict[str, str]:
@@ -241,7 +342,10 @@ def _matching_handoff_container(run_id: str, trial_token: str, *, allow_absent: 
     )
     if completed.returncode != 0:
         raise RuntimeError(f"handoff container discovery failed ({completed.returncode}): {completed.stderr.strip()}")
-    candidates = [value for value in completed.stdout.splitlines() if _CID.fullmatch(value)]
+    raw_candidates = [value for value in completed.stdout.splitlines() if value]
+    if any(not _CID.fullmatch(value) for value in raw_candidates):
+        raise RuntimeError("handoff container discovery returned an invalid container id")
+    candidates = raw_candidates
     if not candidates and allow_absent:
         return None
     if len(candidates) != 1:
@@ -269,24 +373,32 @@ def _kill_container(cid_path: Path, *, run_id: str, trial_token: str, allow_abse
     labels = _container_labels(cid)
     if any(labels.get(key) != value for key, value in expected_labels.items()):
         raise RuntimeError("container identity is uncertain: handoff labels do not match")
-    completed = subprocess.run(["/usr/bin/docker", "kill", cid], check=False,
-                               capture_output=True, text=True, timeout=15)
-    if completed.returncode != 0:
-        raise RuntimeError(f"container kill failed ({completed.returncode}): {completed.stderr.strip()}")
-    return cid
+    failures: list[str] = []
+    for attempt in range(1, _CONTAINER_KILL_ATTEMPTS + 1):
+        try:
+            completed = subprocess.run(["/usr/bin/docker", "kill", cid], check=False,
+                                       capture_output=True, text=True,
+                                       timeout=_CONTAINER_KILL_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            failures.append(f"attempt {attempt}: timeout after {_CONTAINER_KILL_TIMEOUT_SECONDS}s")
+            continue
+        if completed.returncode == 0:
+            return cid
+        failures.append(f"attempt {attempt}: exit {completed.returncode}: {completed.stderr.strip()}")
+    raise RuntimeError(
+        f"container kill failed after {_CONTAINER_KILL_ATTEMPTS} bounded attempts for {cid}: "
+        + "; ".join(failures)
+    )
 
 
 def run_trial(args: argparse.Namespace) -> dict[str, Any]:
+    args.timeout_seconds = _validate_timeout(args.timeout_seconds, "QEMU timeout")
+    args.recovery_timeout_seconds = _validate_timeout(args.recovery_timeout_seconds, "recovery timeout")
     trial_dir = args.trial_dir.resolve(); trial_dir.mkdir(parents=True, exist_ok=False)
     cid_path = trial_dir / "container.cid"
     trial_token = __import__("hashlib").sha256(str(trial_dir).encode("utf-8")).hexdigest()
-    media_dir = trial_dir / "media"; media_dir.mkdir()
-    media: list[Path] = []
-    for source in args.media:
-        src = Path(source).resolve()
-        if not src.is_file(): raise ValueError(f"base media is not a regular file: {src}")
-        dest = media_dir / src.name; subprocess.run(["cp", "--reflink=auto", "--preserve=mode,timestamps", str(src), str(dest)], check=True)
-        media.append(dest)
+    media = _stage_media(trial_dir, args.media)
+    staged_media = {path: _media_fingerprint(path) for path in media}
     env = os.environ.copy(); env.update({"CSER_EXPERIMENT_LANE": "handoff", "CSER_EXPERIMENT_VARIANT": args.variant,
         "CSER_EXPERIMENT_RUN_ID": args.run_id, "CSER_EXPERIMENT_TRIAL_DIR": str(trial_dir),
         "CSER_EXPERIMENT_CATALOG_DIGEST": args.catalog_digest, "CSER_EXPERIMENT_NAMESPACE_ID": args.namespace_id,
@@ -295,33 +407,51 @@ def run_trial(args: argparse.Namespace) -> dict[str, Any]:
         "CSER_EXPERIMENT_CID_FILE": str(cid_path),
         "CSER_EXPERIMENT_TRIAL_TOKEN": trial_token})
     initial_out, initial_err = (trial_dir / "initial.stdout.log").open("wb"), (trial_dir / "initial.stderr.log").open("wb")
-    process = subprocess.Popen(args.guest, env=env, start_new_session=True, stdout=initial_out, stderr=initial_err)
+    try:
+        # The staged destination is mutable until this point (and is later
+        # updated by recovery).  Recheck inode, mode, size, and digest at the
+        # execution boundary so a symlink or replacement cannot be silently
+        # consumed by the initial QEMU launcher.
+        _verify_staged_media(staged_media)
+        process = subprocess.Popen(args.guest, env=env, start_new_session=True, stdout=initial_out, stderr=initial_err)
+    except BaseException:
+        initial_out.close(); initial_err.close()
+        raise
     container_id: str | None = None
     container_terminated = False
     try:
-        try:
-            with _connect_qemu_server(args.barrier_socket, args.timeout_seconds) as client:
-                observe_handoff_barriers(client, args.run_id, args.cutpoint_id, catalog_digest=args.catalog_digest,
-                    namespace_id=args.namespace_id, authority_id=args.authority_id, effect_id=args.effect_id,
-                    uart_pace_seconds=UART_WRITE_INTER_CHUNK_SECONDS if args.real_qemu else 0.0)
-        except BaseException:
-            if args.real_qemu:
-                container_terminated = _kill_container(
-                    cid_path, run_id=args.run_id, trial_token=trial_token, allow_absent=True,
-                ) is not None
-            raise
+        with _connect_qemu_server(args.barrier_socket, args.timeout_seconds) as client:
+            observe_handoff_barriers(client, args.run_id, args.cutpoint_id, catalog_digest=args.catalog_digest,
+                namespace_id=args.namespace_id, authority_id=args.authority_id, effect_id=args.effect_id,
+                uart_pace_seconds=UART_WRITE_INTER_CHUNK_SECONDS if args.real_qemu else 0.0)
         if args.real_qemu:
             container_id = _kill_container(cid_path, run_id=args.run_id, trial_token=trial_token)
             container_terminated = True
     finally:
+        cleanup_errors: list[BaseException] = []
+        # Do not rely on the launcher process group: Docker containers are
+        # outside it.  A second attempt is intentional after any failure
+        # before the normal cut kill, and remains label-bound.
+        if args.real_qemu and not container_terminated:
+            try:
+                found = _kill_container(cid_path, run_id=args.run_id, trial_token=trial_token, allow_absent=True)
+                if found is not None:
+                    container_id = found
+            except BaseException as exc:
+                cleanup_errors.append(exc)
         try:
-            # Do not rely on the launcher process group: Docker containers are
-            # outside it.  A second attempt is intentional after any failure
-            # before the normal cut kill, and remains label-bound.
-            if args.real_qemu and not container_terminated:
-                _kill_container(cid_path, run_id=args.run_id, trial_token=trial_token, allow_absent=True)
+            _kill(process)
+        except BaseException as exc:
+            cleanup_errors.append(exc)
+        try:
+            process.wait(timeout=10)
+        except BaseException as exc:
+            cleanup_errors.append(exc)
         finally:
-            _kill(process); process.wait(timeout=10); initial_out.close(); initial_err.close()
+            initial_out.close(); initial_err.close()
+        if cleanup_errors:
+            details = "; ".join(str(error) for error in cleanup_errors)
+            raise RuntimeError(f"handoff cleanup failed explicitly: {details}") from cleanup_errors[0]
     receipts = []
     for index in (1, 2):
         recovery_env = env | {"CSER_EXPERIMENT_PHASE": "recovery", "CSER_HANDOFF_RECOVERY_INDEX": str(index)}
@@ -355,7 +485,11 @@ def main() -> None:
     args.guest = args.guest[1:]
     if args.cutpoint_id != CUTPOINTS[args.cutpoint]: parser.error("cutpoint name/id mismatch")
     if not (_HEX32.fullmatch(args.run_id) and _HEX64.fullmatch(args.catalog_digest) and _HEX32.fullmatch(args.authority_id) and _HEX32.fullmatch(args.effect_id)): parser.error("invalid experiment identity")
-    if args.timeout_seconds <= 0 or args.recovery_timeout_seconds <= 0: parser.error("timeouts must be positive")
+    try:
+        _validate_timeout(args.timeout_seconds, "--timeout-seconds")
+        _validate_timeout(args.recovery_timeout_seconds, "--recovery-timeout-seconds")
+    except ValueError as exc:
+        parser.error(str(exc))
     if args.real_qemu and (Path(args.guest[0]).resolve() != Path(__file__).with_name("qemu_boot.sh").resolve() or args.recovery_guest.resolve() != Path(__file__).with_name("qemu_boot.sh").resolve()): parser.error("real handoff trials require qemu_boot.sh")
     if args.real_qemu and args.recovery_timeout_seconds <= 130:
         parser.error("real handoff trials require recovery timeout greater than the internal 130s launcher timeout")

@@ -27,7 +27,11 @@ _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _RUN_ID = re.compile(r"^[0-9a-f]{32}$")
 _PERF_NUMERIC_UNITS = {
     "runtime_transactions": "count", "mutex_wait_cycles": "cycles", "mutex_max_wait_cycles": "cycles",
-    "mutex_hold_cycles": "cycles", "mutex_max_hold_cycles": "cycles", "journal_sectors_read": "count",
+    "mutex_hold_cycles": "cycles", "mutex_max_hold_cycles": "cycles", "checkpoints": "count",
+    "commit_gate_wait_cycles": "cycles", "max_commit_gate_wait_cycles": "cycles",
+    "checkpoint_lock_wait_cycles": "cycles", "max_checkpoint_lock_wait_cycles": "cycles",
+    "checkpoint_lock_hold_cycles": "cycles", "max_checkpoint_lock_hold_cycles": "cycles",
+    "journal_sectors_read": "count",
     "journal_sectors_written": "count", "journal_flushes": "count", "journal_hash_bytes": "bytes",
     "journal_image_bytes": "bytes", "journal_capacity_bytes": "bytes", "tpm_lease_advances": "count",
     "tpm_tip_advances": "count", "tpm_lease_cycles": "cycles", "tpm_tip_cycles": "cycles",

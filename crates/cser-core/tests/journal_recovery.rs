@@ -142,7 +142,7 @@ fn record_roundtrip_recovers_the_exact_acknowledged_chain_head() {
 }
 
 #[test]
-fn current_recovery_rejects_a_recognized_old_journal_prefix() {
+fn genesis_anchor_does_not_interpret_an_unanchored_old_journal_prefix() {
     let committed = freshness(1, 1, 1, 1);
     let target = freshness(2, 1, 1, 2);
     let anchor = recovery_anchor(
@@ -155,17 +155,49 @@ fn current_recovery_rejects_a_recognized_old_journal_prefix() {
     );
     let mut old = Vec::from(*b"CSERJR5\0");
     old.extend_from_slice(b"old journal payload");
-    assert!(matches!(
-        Engine::recover(
-            CatalogSet::new(&[tool_dma_catalog()]).unwrap(),
-            CoreLimits::bounded_default(),
-            anchor,
-            &old
-        ),
-        Err(CoreError::Journal(JournalDecodeError::UnsupportedVersion {
-            version: 5
-        }))
-    ));
+    let report = Engine::recover(
+        CatalogSet::new(&[tool_dma_catalog()]).unwrap(),
+        CoreLimits::bounded_default(),
+        anchor,
+        &old,
+    )
+    .unwrap();
+    assert_eq!(report.acknowledged_revision(), 0);
+    assert_eq!(report.acknowledged_head(), Digest::ZERO);
+    assert_eq!(
+        report.journal_repair(),
+        Some(JournalRepair::UnanchoredSuffix { offset: 0 })
+    );
+}
+
+#[test]
+fn genesis_anchor_repairs_a_complete_current_record_candidate_to_empty() {
+    let mut source = Harness::new();
+    source.tx(admit_command(effect(210, 1), 210)).unwrap();
+    let committed = freshness(1, 1, 1, 1);
+    let target = freshness(2, 1, 1, 2);
+    let anchor = recovery_anchor(
+        CatalogSet::new(&[tool_dma_catalog()]).unwrap().digest(),
+        committed,
+        target,
+        0,
+        Digest::ZERO,
+        tool_genesis_projection(),
+    );
+
+    let report = Engine::recover(
+        CatalogSet::new(&[tool_dma_catalog()]).unwrap(),
+        CoreLimits::bounded_default(),
+        anchor,
+        &source.journal,
+    )
+    .unwrap();
+    assert_eq!(report.acknowledged_revision(), 0);
+    assert_eq!(report.acknowledged_head(), Digest::ZERO);
+    assert_eq!(
+        report.journal_repair(),
+        Some(JournalRepair::UnanchoredSuffix { offset: 0 })
+    );
 }
 
 #[test]

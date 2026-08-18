@@ -9,9 +9,13 @@
 extern crate alloc;
 
 use alloc::sync::Arc;
+#[cfg(test)]
+use alloc::vec::Vec;
 use sha2::{Digest as Sha2Digest, Sha256};
 
 use crate::Digest;
+#[cfg(test)]
+use crate::persistent_map::SortedExactError;
 
 /// Number of bits in an authenticated-map key.
 pub const TREE_DEPTH: u16 = 256;
@@ -73,6 +77,89 @@ pub struct AuthenticatedMap {
     empty_digest: Digest,
 }
 
+/// Error returned while building an authenticated map without path copying.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AuthenticatedMapBuilderError {
+    /// The input attempted to insert an already occupied key.
+    DuplicateKey([u8; 32]),
+    /// The builder could not obtain unique ownership of one of its nodes.
+    ///
+    /// This is an internal ownership violation: callers cannot create an
+    /// alias to a builder's private root, but returning an error keeps the
+    /// builder fail-closed if that invariant ever changes.
+    SharedNode,
+    /// The number of leaves would overflow the builder's length counter.
+    CapacityOverflow,
+}
+
+/// A one-pass mutable builder for unsorted authenticated-map leaves.
+///
+/// The builder owns the resident `Arc` tree exclusively.  Inserting a leaf
+/// mutates existing branch nodes in place; only the new leaf and the branch
+/// introduced at a previously absent divergence are allocated. Hashes remain
+/// unset until [`Self::finish`], which computes them in one post-order pass.
+/// No input collection or sorting buffer is retained.
+#[derive(Debug)]
+pub(crate) struct AuthenticatedMapBuilder {
+    root: Option<Arc<Node>>,
+    len: usize,
+}
+
+impl AuthenticatedMapBuilder {
+    /// Creates an empty builder.
+    pub(crate) const fn new() -> Self {
+        Self { root: None, len: 0 }
+    }
+
+    /// Returns the number of leaves accepted so far.
+    #[cfg(test)]
+    pub(crate) const fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Returns whether no leaves have been accepted.
+    #[cfg(test)]
+    pub(crate) const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Adds one unsorted leaf.
+    ///
+    /// A duplicate leaves the builder unchanged and returns its exact key.
+    /// A zero digest is an ordinary value and is therefore accepted.
+    pub(crate) fn insert(
+        &mut self,
+        key: [u8; 32],
+        value: Digest,
+    ) -> Result<(), AuthenticatedMapBuilderError> {
+        if self.len == usize::MAX {
+            return Err(AuthenticatedMapBuilderError::CapacityOverflow);
+        }
+        if let Some(root) = self.root.as_mut() {
+            insert_builder_node(root, 0, key, value)?;
+        } else {
+            self.root = Some(make_unhashed_leaf(key, value));
+        }
+        self.len += 1;
+        Ok(())
+    }
+
+    /// Finishes the map and computes every resident node hash once.
+    pub(crate) fn finish(mut self) -> Result<AuthenticatedMap, AuthenticatedMapBuilderError> {
+        let empty_digest = hash_empty();
+        let root_digest = match self.root.as_mut() {
+            Some(root) => finalize_builder_hash(root)?,
+            None => empty_digest,
+        };
+        Ok(AuthenticatedMap {
+            root: self.root,
+            len: self.len,
+            root_digest,
+            empty_digest,
+        })
+    }
+}
+
 impl PartialEq for AuthenticatedMap {
     fn eq(&self, other: &Self) -> bool {
         self.len == other.len && self.root_digest == other.root_digest
@@ -98,6 +185,103 @@ impl AuthenticatedMap {
             empty_digest,
             len: 0,
         }
+    }
+
+    /// Builds a canonical authenticated map from exactly `expected_len`
+    /// strictly increasing leaves.
+    ///
+    /// Leaves are consumed once in lexicographic key order.  The builder
+    /// maintains only the compressed right frontier (at most one frame per
+    /// key bit), constructs each final leaf or branch once, and computes the
+    /// same root commitment as inserting the leaves one at a time in any
+    /// order.  A zero digest remains a valid leaf value; only a duplicate or
+    /// non-increasing key is rejected.
+    #[cfg(test)]
+    pub fn try_from_sorted_exact<I>(
+        leaves: I,
+        expected_len: usize,
+    ) -> Result<Self, SortedExactError>
+    where
+        I: IntoIterator<Item = ([u8; 32], Digest)>,
+    {
+        let mut leaves = leaves.into_iter();
+        let mut previous_key = None;
+        let mut root = None;
+        let mut frontier = Vec::new();
+
+        for (index, _) in (0..expected_len).enumerate() {
+            let Some((key, value)) = leaves.next() else {
+                return Err(SortedExactError::TooFew {
+                    expected: expected_len,
+                    actual: index,
+                });
+            };
+
+            if let Some(previous_key) = previous_key {
+                if key <= previous_key {
+                    return Err(SortedExactError::NotStrictlyIncreasing);
+                }
+                let Some(divergence) = (0..TREE_DEPTH)
+                    .find(|depth| key_bit(&previous_key, *depth) != key_bit(&key, *depth))
+                else {
+                    return Err(SortedExactError::NotStrictlyIncreasing);
+                };
+                while frontier
+                    .last()
+                    .is_some_and(|frame: &BuildFrame| frame.depth >= divergence)
+                {
+                    if !finish_frontier_frame(&mut frontier, &mut root) {
+                        // The sorted-key checks above make this unreachable
+                        // for a valid stream.  Keep the fallible builder
+                        // fail-closed if its internal frontier is ever
+                        // malformed instead of exposing an `expect` panic to
+                        // recovery input.
+                        return Err(SortedExactError::NotStrictlyIncreasing);
+                    }
+                }
+
+                let left = if let Some(parent) = frontier.last_mut() {
+                    let Some(left) = parent.right.take() else {
+                        return Err(SortedExactError::NotStrictlyIncreasing);
+                    };
+                    left
+                } else {
+                    let Some(left) = root.take() else {
+                        return Err(SortedExactError::NotStrictlyIncreasing);
+                    };
+                    left
+                };
+                frontier.push(BuildFrame {
+                    depth: divergence,
+                    left,
+                    right: Some(make_leaf(key, value)),
+                });
+            } else {
+                root = Some(make_leaf(key, value));
+            }
+            previous_key = Some(key);
+        }
+
+        if leaves.next().is_some() {
+            return Err(SortedExactError::TooMany {
+                expected: expected_len,
+            });
+        }
+
+        while !frontier.is_empty() {
+            if !finish_frontier_frame(&mut frontier, &mut root) {
+                return Err(SortedExactError::NotStrictlyIncreasing);
+            }
+        }
+
+        let empty_digest = hash_empty();
+        let root_digest = root.as_ref().map_or(empty_digest, |root| root.hash());
+        Ok(Self {
+            root,
+            len: expected_len,
+            root_digest,
+            empty_digest,
+        })
     }
 
     /// Returns the number of occupied leaves.
@@ -249,6 +433,39 @@ fn make_leaf(key: [u8; 32], value: Digest) -> Arc<Node> {
     })
 }
 
+fn make_unhashed_leaf(key: [u8; 32], value: Digest) -> Arc<Node> {
+    Arc::new(Node::Leaf {
+        key,
+        value,
+        hash: Digest::ZERO,
+    })
+}
+
+#[cfg(test)]
+struct BuildFrame {
+    depth: u16,
+    left: Arc<Node>,
+    right: Option<Arc<Node>>,
+}
+
+#[cfg(test)]
+fn finish_frontier_frame(frontier: &mut Vec<BuildFrame>, root: &mut Option<Arc<Node>>) -> bool {
+    let Some(frame) = frontier.pop() else {
+        return false;
+    };
+    let Some(right) = frame.right else {
+        return false;
+    };
+    let branch = make_branch(frame.depth, frame.left, right);
+    if let Some(parent) = frontier.last_mut() {
+        debug_assert!(parent.right.is_none());
+        parent.right = Some(branch);
+    } else {
+        *root = Some(branch);
+    }
+    true
+}
+
 fn make_branch(depth: u16, left: Arc<Node>, right: Arc<Node>) -> Arc<Node> {
     debug_assert!(depth < TREE_DEPTH);
     debug_assert!(key_bit(left.key(), depth) != key_bit(right.key(), depth));
@@ -264,14 +481,171 @@ fn make_branch(depth: u16, left: Arc<Node>, right: Arc<Node>) -> Arc<Node> {
     })
 }
 
-fn first_difference(left: &[u8; 32], right: &[u8; 32], start: u16) -> u16 {
-    let mut depth = start;
-    while depth < TREE_DEPTH {
-        if key_bit(left, depth) != key_bit(right, depth) {
-            return depth;
+fn make_unhashed_branch(depth: u16, left: Arc<Node>, right: Arc<Node>) -> Arc<Node> {
+    debug_assert!(depth < TREE_DEPTH);
+    debug_assert!(key_bit(left.key(), depth) != key_bit(right.key(), depth));
+    debug_assert!(left.key() < right.key());
+    let key = *left.key();
+    Arc::new(Node::Branch {
+        depth,
+        key,
+        left,
+        right,
+        hash: Digest::ZERO,
+    })
+}
+
+fn insert_builder_node(
+    node: &mut Arc<Node>,
+    expected_depth: u16,
+    key: [u8; 32],
+    value: Digest,
+) -> Result<(), AuthenticatedMapBuilderError> {
+    match node.as_ref() {
+        Node::Leaf {
+            key: stored_key, ..
+        } => {
+            if stored_key == &key {
+                return Err(AuthenticatedMapBuilderError::DuplicateKey(key));
+            }
+            let depth = first_difference(stored_key, &key, expected_depth);
+            let old_leaf = node.clone();
+            let new_leaf = make_unhashed_leaf(key, value);
+            *node = if key_bit(&key, depth) {
+                make_unhashed_branch(depth, old_leaf, new_leaf)
+            } else {
+                make_unhashed_branch(depth, new_leaf, old_leaf)
+            };
+            Ok(())
         }
-        depth += 1;
+        Node::Branch {
+            depth,
+            key: representative,
+            ..
+        } => {
+            let branch_depth = *depth;
+            let prefix_diff = (expected_depth..branch_depth)
+                .find(|bit| key_bit(representative, *bit) != key_bit(&key, *bit));
+            if let Some(depth) = prefix_diff {
+                let old_branch = node.clone();
+                let new_leaf = make_unhashed_leaf(key, value);
+                *node = if key_bit(&key, depth) {
+                    make_unhashed_branch(depth, old_branch, new_leaf)
+                } else {
+                    make_unhashed_branch(depth, new_leaf, old_branch)
+                };
+                return Ok(());
+            }
+
+            let Some(current) = Arc::get_mut(node) else {
+                return Err(AuthenticatedMapBuilderError::SharedNode);
+            };
+            let Node::Branch {
+                depth: current_depth,
+                key: current_representative,
+                left,
+                right,
+                ..
+            } = current
+            else {
+                return Err(AuthenticatedMapBuilderError::SharedNode);
+            };
+            let result = if key_bit(&key, *current_depth) {
+                insert_builder_node(right, *current_depth + 1, key, value)
+            } else {
+                insert_builder_node(left, *current_depth + 1, key, value)
+            };
+            if result.is_ok() {
+                *current_representative = *left.key();
+            }
+            result
+        }
     }
+}
+
+fn finalize_builder_hash(node: &mut Arc<Node>) -> Result<Digest, AuthenticatedMapBuilderError> {
+    let Some(current) = Arc::get_mut(node) else {
+        return Err(AuthenticatedMapBuilderError::SharedNode);
+    };
+    match current {
+        Node::Leaf { key, value, hash } => {
+            let digest = hash_leaf(key, *value);
+            *hash = digest;
+            Ok(digest)
+        }
+        Node::Branch {
+            depth,
+            key,
+            left,
+            right,
+            hash,
+        } => {
+            let left_hash = finalize_builder_hash(left)?;
+            let right_hash = finalize_builder_hash(right)?;
+            let representative = *left.key();
+            let digest = hash_branch(*depth, &representative, left_hash, right_hash);
+            *key = representative;
+            *hash = digest;
+            Ok(digest)
+        }
+    }
+}
+
+#[inline]
+fn first_difference(left: &[u8; 32], right: &[u8; 32], start: u16) -> u16 {
+    debug_assert!(start < TREE_DEPTH);
+
+    // The first byte may begin in the middle of a byte.  Masking the prefix
+    // keeps the MSB-first path semantics while allowing the remaining bytes
+    // to be compared in native word-sized chunks.  `from_be_bytes` makes the
+    // leading-zero count independent of host endianness, and explicit byte
+    // loads remain valid even when the input arrays are not word-aligned.
+    let mut byte_index = (start / 8) as usize;
+    let bit_offset = start % 8;
+    if bit_offset != 0 {
+        let difference = (left[byte_index] ^ right[byte_index]) & (0xff >> bit_offset);
+        if difference != 0 {
+            return (byte_index * 8 + difference.leading_zeros() as usize) as u16;
+        }
+        byte_index += 1;
+    }
+
+    while byte_index + 8 <= left.len() {
+        let left_word = u64::from_be_bytes([
+            left[byte_index],
+            left[byte_index + 1],
+            left[byte_index + 2],
+            left[byte_index + 3],
+            left[byte_index + 4],
+            left[byte_index + 5],
+            left[byte_index + 6],
+            left[byte_index + 7],
+        ]);
+        let right_word = u64::from_be_bytes([
+            right[byte_index],
+            right[byte_index + 1],
+            right[byte_index + 2],
+            right[byte_index + 3],
+            right[byte_index + 4],
+            right[byte_index + 5],
+            right[byte_index + 6],
+            right[byte_index + 7],
+        ]);
+        let difference = left_word ^ right_word;
+        if difference != 0 {
+            return (byte_index * 8 + difference.leading_zeros() as usize) as u16;
+        }
+        byte_index += 8;
+    }
+
+    while byte_index < left.len() {
+        let difference = left[byte_index] ^ right[byte_index];
+        if difference != 0 {
+            return (byte_index * 8 + difference.leading_zeros() as usize) as u16;
+        }
+        byte_index += 1;
+    }
+
     unreachable!("different authenticated-map keys must diverge")
 }
 
@@ -435,13 +809,23 @@ fn count_nodes(node: &Node) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{AuthenticatedMap, Node, TREE_DEPTH};
+    use super::{
+        AuthenticatedMap, AuthenticatedMapBuilder, AuthenticatedMapBuilderError, Node,
+        SortedExactError, TREE_DEPTH,
+    };
     use crate::Digest;
     use alloc::sync::Arc;
+    use alloc::vec::Vec;
     use sha2::{Digest as Sha2Digest, Sha256};
 
     fn key(value: u8) -> [u8; 32] {
         [value; 32]
+    }
+
+    fn key_prefix(prefix: [u8; 4]) -> [u8; 32] {
+        let mut key = [0; 32];
+        key[..4].copy_from_slice(&prefix);
+        key
     }
 
     fn digest(value: u8) -> Digest {
@@ -477,6 +861,229 @@ mod tests {
         }
         assert_eq!(forward.root_digest(), reverse.root_digest());
         assert_eq!(forward.len(), entries.len());
+    }
+
+    fn reference_first_difference(left: &[u8; 32], right: &[u8; 32], start: u16) -> u16 {
+        (start..TREE_DEPTH)
+            .find(|depth| super::key_bit(left, *depth) != super::key_bit(right, *depth))
+            .expect("test keys must differ at or after the requested depth")
+    }
+
+    #[test]
+    fn first_difference_matches_msb_reference_at_every_bit_boundary() {
+        for difference_depth in 0..TREE_DEPTH {
+            let left = [0; 32];
+            let mut right = [0; 32];
+            right[(difference_depth / 8) as usize] = 0x80 >> (difference_depth % 8);
+
+            for start in 0..=difference_depth {
+                assert_eq!(
+                    super::first_difference(&left, &right, start),
+                    reference_first_difference(&left, &right, start),
+                    "difference depth {difference_depth}, start {start}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn first_difference_matches_msb_reference_for_property_cases() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        for round in 0..256 {
+            let mut left = [0; 32];
+            let mut right = [0; 32];
+            for byte in &mut left {
+                seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                *byte = (seed >> 24) as u8;
+            }
+            for byte in &mut right {
+                seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                *byte = (seed >> 32) as u8;
+            }
+            if left == right {
+                right[round % right.len()] ^= 1;
+            }
+
+            let first = reference_first_difference(&left, &right, 0);
+            for start in 0..=first {
+                assert_eq!(
+                    super::first_difference(&left, &right, start),
+                    reference_first_difference(&left, &right, start),
+                    "round {round}, start {start}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mutable_builder_handles_empty_zero_and_duplicate_leaves() {
+        let empty = AuthenticatedMapBuilder::new()
+            .finish()
+            .expect("an empty builder has no ownership failure");
+        assert_eq!(empty, AuthenticatedMap::new());
+        assert!(empty.is_empty());
+
+        let duplicate_key = key(0x2a);
+        let second_key = key(0x2b);
+        let mut builder = AuthenticatedMapBuilder::new();
+        assert!(builder.is_empty());
+        assert_eq!(builder.insert(duplicate_key, Digest::ZERO), Ok(()));
+        assert_eq!(builder.insert(second_key, digest(8)), Ok(()));
+        assert_eq!(builder.len(), 2);
+        assert_eq!(
+            builder.insert(duplicate_key, digest(7)),
+            Err(AuthenticatedMapBuilderError::DuplicateKey(duplicate_key))
+        );
+        let built = builder
+            .finish()
+            .expect("duplicate rejection leaves the builder valid");
+        assert_eq!(built.get(&duplicate_key), Some(Digest::ZERO));
+        assert_eq!(built.get(&second_key), Some(digest(8)));
+        assert_eq!(built.node_count(), 3);
+    }
+
+    #[test]
+    fn sorted_builder_matches_inserted_map_and_lookup() {
+        let entries = [
+            (key(0), Digest::ZERO),
+            (key(1), digest(2)),
+            (key(7), digest(3)),
+            (key(64), digest(4)),
+            (key(128), digest(5)),
+            (key(255), digest(6)),
+        ];
+        let built = AuthenticatedMap::try_from_sorted_exact(entries, entries.len())
+            .expect("strictly sorted leaves should build");
+        let mut inserted = AuthenticatedMap::new();
+        for (entry_key, entry_value) in entries {
+            assert_eq!(inserted.insert_mut(entry_key, entry_value), None);
+        }
+
+        assert_eq!(built.root_digest(), inserted.root_digest());
+        assert_eq!(
+            built.root_digest(),
+            Digest::new([
+                0x73, 0x7d, 0x2b, 0xf1, 0xdc, 0xf3, 0x16, 0xa8, 0x0a, 0xb0, 0x74, 0x68, 0xf9, 0x4f,
+                0xb4, 0xd1, 0xab, 0xbd, 0x86, 0x0c, 0x4c, 0x17, 0x10, 0x43, 0xd5, 0x54, 0xc6, 0xa3,
+                0x2a, 0x82, 0xe6, 0xb9,
+            ])
+        );
+        assert_eq!(built.len(), inserted.len());
+        for (entry_key, entry_value) in entries {
+            assert_eq!(built.get(&entry_key), Some(entry_value));
+        }
+
+        let mut mutable_builder = AuthenticatedMapBuilder::new();
+        for (entry_key, entry_value) in entries {
+            mutable_builder
+                .insert(entry_key, entry_value)
+                .expect("fixture keys are unique");
+        }
+        let mutable = mutable_builder
+            .finish()
+            .expect("the builder owns every resident node");
+        assert_eq!(mutable.root_digest(), built.root_digest());
+        assert_eq!(mutable.len(), entries.len());
+        assert_eq!(mutable.node_count(), 2 * entries.len() - 1);
+    }
+
+    #[test]
+    fn sorted_builder_rejects_bad_lengths_and_duplicate_keys() {
+        assert_eq!(
+            AuthenticatedMap::try_from_sorted_exact([(key(1), digest(1))], 2),
+            Err(SortedExactError::TooFew {
+                expected: 2,
+                actual: 1
+            })
+        );
+        assert_eq!(
+            AuthenticatedMap::try_from_sorted_exact([(key(1), digest(1))], 0),
+            Err(SortedExactError::TooMany { expected: 0 })
+        );
+        assert_eq!(
+            AuthenticatedMap::try_from_sorted_exact([(key(1), digest(1)), (key(1), digest(2))], 2),
+            Err(SortedExactError::NotStrictlyIncreasing)
+        );
+        assert_eq!(
+            AuthenticatedMap::try_from_sorted_exact([(key(2), digest(2)), (key(1), digest(1))], 2),
+            Err(SortedExactError::NotStrictlyIncreasing)
+        );
+    }
+
+    #[test]
+    fn mutable_builder_matches_every_permutation_and_sorted_builder() {
+        let entries = [
+            (key(0), Digest::ZERO),
+            (key(1), digest(2)),
+            (key(7), digest(3)),
+            (key(64), digest(4)),
+            (key(128), digest(5)),
+            (key(255), digest(6)),
+            (key_prefix([0x12, 0x34, 0x56, 0x78]), digest(8)),
+            (key_prefix([0xa5, 0x5a, 0x01, 0xfe]), digest(9)),
+        ];
+        let mut sorted = entries;
+        sorted.sort_unstable_by_key(|entry| entry.0);
+        let sorted_len = sorted.len();
+        let expected = AuthenticatedMap::try_from_sorted_exact(sorted, sorted_len)
+            .expect("the sorted fixture should build");
+        let mut order: Vec<usize> = (0..entries.len()).collect();
+        let mut seed = 0x243f_6a88_85a3_08d3_u64;
+
+        for round in 0..64 {
+            for index in (1..order.len()).rev() {
+                seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                let swap = (seed as usize) % (index + 1);
+                order.swap(index, swap);
+            }
+
+            let mut builder = AuthenticatedMapBuilder::new();
+            let mut inserted = AuthenticatedMap::new();
+            for &index in &order {
+                let (entry_key, entry_value) = entries[index];
+                builder
+                    .insert(entry_key, entry_value)
+                    .expect("the permutation contains unique keys");
+                assert_eq!(inserted.insert_mut(entry_key, entry_value), None);
+            }
+            let built = builder.finish().expect("the builder owns its tree");
+            assert_eq!(built.root_digest(), expected.root_digest(), "round {round}");
+            assert_eq!(built.root_digest(), inserted.root_digest(), "round {round}");
+            assert_eq!(built.len(), entries.len());
+            assert_eq!(built.node_count(), 2 * entries.len() - 1);
+        }
+    }
+
+    #[test]
+    fn mutable_builder_handles_prefix_and_depth_boundaries() {
+        let depths = [0, 1, 7, 8, 63, 64, 127, 128, 191, 192, 255];
+        let entries: Vec<_> = depths
+            .into_iter()
+            .enumerate()
+            .map(|(index, depth)| {
+                let mut key = [0; 32];
+                key[(depth / 8) as usize] = 0x80 >> (depth % 8);
+                (key, digest((index + 1) as u8))
+            })
+            .collect();
+        let mut sorted = entries.clone();
+        sorted.sort_unstable_by_key(|entry| entry.0);
+        let sorted_len = sorted.len();
+        let expected = AuthenticatedMap::try_from_sorted_exact(sorted, sorted_len)
+            .expect("boundary keys are unique");
+
+        let mut builder = AuthenticatedMapBuilder::new();
+        for (entry_key, entry_value) in entries.iter().copied().rev() {
+            builder
+                .insert(entry_key, entry_value)
+                .expect("boundary keys are unique");
+        }
+        let built = builder.finish().expect("the builder owns its tree");
+        assert_eq!(built.root_digest(), expected.root_digest());
+        assert_eq!(built.node_count(), 2 * entries.len() - 1);
+        for (entry_key, entry_value) in entries {
+            assert_eq!(built.get(&entry_key), Some(entry_value));
+        }
     }
 
     #[test]
@@ -664,7 +1271,11 @@ mod tests {
             for (entry_key, entry_value) in selected.iter().copied() {
                 let _ = map.insert_mut(entry_key, entry_value);
             }
+            let built =
+                AuthenticatedMap::try_from_sorted_exact(selected.iter().copied(), selected.len())
+                    .expect("the selected fixture keys are strictly sorted");
             assert_eq!(map.root_digest(), oracle(&selected, 0));
+            assert_eq!(built.root_digest(), map.root_digest());
             assert_eq!(map.len(), selected.len());
             for (entry_key, entry_value) in selected.iter().copied() {
                 assert_eq!(map.get(&entry_key), Some(entry_value));

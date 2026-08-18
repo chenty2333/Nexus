@@ -1132,19 +1132,25 @@ if grep -Fq '!= *" $field "*' "$kernel_workflow"; then
 fi
 grep -Fq '"$root/crates/cser-core/src/lib.rs"' "$root_workflow" \
     || fail 'root image cache identity does not include cser-core/src/lib.rs'
-grep -Fq '"$root/src/lib.rs"' "$kernel_workflow" \
-    || fail 'kernel image cache identity does not include src/lib.rs'
+grep -Fq 'nexus_source_proof_add_file "$kernel_source/src/lib.rs"' "$kernel_workflow" \
+    || fail 'kernel image source closure does not include src/lib.rs'
+grep -Fq 'nexus_source_proof_digest "$repo_root" "$root"' "$kernel_workflow" \
+    || fail 'kernel image cache identity does not use the canonical source closure'
+grep -Fq 'verified_image_source_proof() {' "$kernel_workflow" \
+    || fail 'kernel workflow lacks a common image source-proof verifier'
+grep -Fq 'verified_image_source_proof >/dev/null' "$kernel_workflow" \
+    || fail 'kernel image reuse does not verify the canonical source closure'
 kernel_workflow_source=$(<"$kernel_workflow")
 require_ordered_tokens "$kernel_workflow_source" 'CSER image source proof validation' \
     'current_cser_source_proof' \
-    'image_source_proof=$(container cat /nexus-cser-verified)' \
+    'image_source_proof=$(read_image_source_proof)' \
     'current_source_proof=$(current_cser_source_proof)' \
-    'pinned image CSER source proof does not match the current production closure'
+    'pinned image CSER source proof does not match the current canonical source closure'
 require_ordered_tokens "$(<"$kernel_dockerfile")" \
     'CSER Docker source proof closure' \
-    '/candidate-root/kernel/nexus-ostd/cser-production-sources.txt;' \
-    '/candidate-root/kernel/nexus-ostd/src/lib.rs;' \
-    '/candidate-root/kernel/nexus-ostd/src/cser/$relative"'
+    '--mount=type=bind,from=build,source=/,target=/candidate-root,readonly' \
+    'NEXUS_SOURCE_PROOF_MODE=verify' \
+    '/usr/bin/bash -p /candidate-root/work/x > /verified;'
 
 kernel_command_definition_count=$(grep -Ec \
     '^[[:space:]]*(function[[:space:]]+)?run_production_recovery([[:space:]]*\(\))?[[:space:]]*\{' \
@@ -1318,11 +1324,11 @@ require_ordered_tokens "$runtime_recovery" 'production trusted-state recovery or
     'let catalogs = CatalogSet::new(' \
     'let mut prepared = match PreparedQemuPersistentBoot::acquire() {' \
     'let selected_tip = prepared.candidate().committed();' \
-    'let selected_bytes = match prepared.journal_bytes() {' \
-    'if is_legacy_schema8(&selected_bytes) {' \
+    'let schema8 = match prepared.journal_is_unambiguously_schema8() {' \
+    'if schema8 {' \
     'let boot = match prepared.recover(catalogs, CoreLimits::bounded_default(), binding) {'
 for schema8_fail_closed_token in \
-    'if is_legacy_schema8(&selected_bytes)' \
+    'if schema8' \
     'selected_tip.revision() == 0 || selected_tip.head().is_zero()' \
     'trusted_tpm_candidate_selected=true' \
     'current_binding_authorized=false' \

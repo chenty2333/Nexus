@@ -5,13 +5,14 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from applicability_trace import StudyPseudonymizer, aggregate, aggregate_raw_trace, load_raw_trace, load_trace
-from qemu_applicability_export import export_trial
+from qemu_applicability_export import _operation_hint, _row_value, export_trial
 
 
 class QemuApplicabilityExportTests(unittest.TestCase):
@@ -25,6 +26,16 @@ class QemuApplicabilityExportTests(unittest.TestCase):
         }
         receipt.update(extra)
         return "TOOL_DMA_RECOVERY_METRICS " + json.dumps(receipt) + "\n"
+
+    def test_export_input_rows_require_terminal_state_key_grammar_and_sha256_digest(self) -> None:
+        with self.assertRaisesRegex(ValueError, "operation key"):
+            _operation_hint({}, "bad/key")
+        with self.assertRaisesRegex(ValueError, "operation key"):
+            _row_value(("bad/key", "b" * 64, "succeeded"), True)
+        with self.assertRaisesRegex(ValueError, "terminal"):
+            _row_value(("primary", "b" * 64, "pending"), True)
+        with self.assertRaisesRegex(ValueError, "input digest"):
+            _row_value(("primary", "not-a-digest", "succeeded"), True)
 
     def test_exports_only_receipt_backed_terminal_and_sanitized_bundle(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -149,6 +160,59 @@ class QemuApplicabilityExportTests(unittest.TestCase):
             events = load_trace([result.trace])
             device = [event for event in events if event.get("source_id") == "device" and event["event_type"] == "effect_observation"]
             self.assertEqual((device[0]["event_kind"], device[0]["quiescence_observation"], device[0]["right_censored"]), ("observation_ended", "unknown", True))
+
+    def test_selects_one_primary_key_and_cross_checks_modern_ledgers(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            trial = Path(temporary) / "trial"; trial.mkdir()
+            identity = {"namespace_id": "ns", "authority_id": "authority", "effect_id": "effect",
+                        "catalog_digest": "a" * 64, "run_id": "r" * 32}
+            (trial / "experiment-identity.json").write_text(json.dumps(identity))
+            input_digest = "b" * 64
+            endpoint = trial / "tool-endpoint.sqlite"
+            provider = trial / "tool-endpoint.provider.sqlite"
+            with closing(sqlite3.connect(endpoint)) as db:
+                db.execute("CREATE TABLE operations(namespace_id,authority_id,effect_id,catalog_digest,run_id,operation_key,input_digest,state)")
+                db.executemany("INSERT INTO operations VALUES(?,?,?,?,?,?,?,?)", [
+                    (*identity.values(), "primary", input_digest, "succeeded"),
+                    (*identity.values(), "perf-bg-0", input_digest, "succeeded"),
+                ])
+                db.commit()
+            with closing(sqlite3.connect(provider)) as db:
+                db.execute("CREATE TABLE provider_operations(namespace_id,authority_id,effect_id,catalog_digest,run_id,operation_key,input_digest,state)")
+                db.executemany("INSERT INTO provider_operations VALUES(?,?,?,?,?,?,?,?)", [
+                    (*identity.values(), "primary", input_digest, "succeeded"),
+                    (*identity.values(), "perf-bg-0", input_digest, "succeeded"),
+                ])
+                db.commit()
+            result = export_trial(trial, Path(temporary) / "out", study_id="qemu_test_v1", key=b"x" * 32)
+            events = [event for event in load_trace([result.trace]) if event["event_type"] == "effect_observation"]
+            self.assertEqual({event["source_id"] for event in events}, {"endpoint", "worker_provider"})
+
+            with closing(sqlite3.connect(provider)) as db:
+                db.execute("UPDATE provider_operations SET input_digest='c' WHERE operation_key='primary'")
+                db.commit()
+            with self.assertRaisesRegex(ValueError, "invalid input digest"):
+                export_trial(trial, Path(temporary) / "out-mismatch", study_id="qemu_test_v1", key=b"x" * 32)
+
+    def test_rejects_ambiguous_or_background_only_operation_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            trial = Path(temporary) / "trial"; trial.mkdir()
+            identity = {"namespace_id": "ns", "authority_id": "authority", "effect_id": "effect",
+                        "catalog_digest": "a" * 64, "run_id": "r" * 32}
+            (trial / "experiment-identity.json").write_text(json.dumps(identity))
+            database = trial / "tool-endpoint.sqlite"
+            with closing(sqlite3.connect(database)) as db:
+                db.execute("CREATE TABLE operations(namespace_id,authority_id,effect_id,catalog_digest,run_id,operation_key,input_digest,state)")
+                db.execute("INSERT INTO operations VALUES(?,?,?,?,?,?,?,?)", (*identity.values(), "perf-bg-0", "b" * 64, "succeeded"))
+                db.commit()
+            with self.assertRaisesRegex(ValueError, "background"):
+                export_trial(trial, Path(temporary) / "out-background", study_id="qemu_test_v1", key=b"x" * 32)
+            with closing(sqlite3.connect(database)) as db:
+                db.execute("INSERT INTO operations VALUES(?,?,?,?,?,?,?,?)", (*identity.values(), "primary-1", "b" * 64, "succeeded"))
+                db.execute("INSERT INTO operations VALUES(?,?,?,?,?,?,?,?)", (*identity.values(), "primary-2", "b" * 64, "succeeded"))
+                db.commit()
+            with self.assertRaisesRegex(ValueError, "exactly one"):
+                export_trial(trial, Path(temporary) / "out-ambiguous", study_id="qemu_test_v1", key=b"x" * 32)
 
 
 if __name__ == "__main__":

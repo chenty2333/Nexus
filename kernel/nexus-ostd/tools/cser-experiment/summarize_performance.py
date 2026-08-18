@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from collections import defaultdict
 from pathlib import Path
 
@@ -17,6 +18,16 @@ def percentile(values: list[float], fraction: float) -> float:
     return ordered[min(len(ordered) - 1, max(0, int((len(ordered) * fraction + 0.999999999) - 1)))]
 
 
+def _finite_number(value: object) -> bool:
+    """Accept real JSON numbers, excluding bool and non-finite float values."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (OverflowError, ValueError):
+        return False
+
+
 def summarize(rows: list[dict[str, object]]) -> dict[str, object]:
     groups: dict[tuple[str, str, str], list[float]] = defaultdict(list)
     for row in rows:
@@ -26,7 +37,7 @@ def summarize(rows: list[dict[str, object]]) -> dict[str, object]:
         for metric, observation in measurements.items():
             if (not isinstance(metric, str) or not isinstance(observation, dict)
                     or set(observation) != {"value", "unit"}
-                    or not isinstance(observation["value"], (int, float))
+                    or not _finite_number(observation["value"])
                     or observation["unit"] not in ("ms", "count", "cycles", "bytes")):
                 raise ValueError("performance measurements must contain numeric value and explicit unit")
             groups[(point, metric, observation["unit"])].append(float(observation["value"]))

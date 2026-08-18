@@ -15,15 +15,18 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
+import ipaddress
 import json
+import math
 import secrets
 import sqlite3
+import socket
 import threading
 import time
 from dataclasses import dataclass
 from enum import Enum
 from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +52,9 @@ _DEFAULT_CATALOG_DIGEST = hashlib.sha256(b"nexus-cser-local-evidence-unbound-v2"
 _DEFAULT_NAMESPACE = "trusted-local"
 _ASYNC_QUEUE_SCHEMA_VERSION = 1
 _PERFORMANCE_TIMING_SCHEMA_VERSION = 1
+_MAX_SQLITE_INTEGER = (1 << 63) - 1
+_LEASE_TOKEN_RE = r"[0-9a-f]{32}"
+_SHUTDOWN_TIMEOUT_SECONDS = 5.0
 
 
 def _valid_id(value: object) -> bool:
@@ -61,6 +67,74 @@ def _valid_digest(value: object) -> bool:
     import re
 
     return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+
+
+def _valid_timestamp(value: object, *, allow_zero: bool = True) -> bool:
+    """Return whether ``value`` is a representable non-negative SQLite ns."""
+    return (
+        isinstance(value, int) and not isinstance(value, bool)
+        and value >= 0 and (allow_zero or value > 0) and value <= _MAX_SQLITE_INTEGER
+    )
+
+
+def _valid_lease_token(value: object) -> bool:
+    import re
+
+    return isinstance(value, str) and re.fullmatch(_LEASE_TOKEN_RE, value) is not None
+
+
+def _resolve_bind_host(host: object, *, allow_nonlocal: bool) -> str:
+    """Resolve ``host`` once and return the exact numeric bind address.
+
+    ``HTTPServer`` resolves a hostname again while binding.  A hostname that
+    was loopback at validation time could therefore be rebound to a nonlocal
+    address between the two lookups.  Returning a numeric address makes the
+    later bind independent of DNS state.  The endpoint is IPv4 by default,
+    so resolution uses the same family as ``HTTPServer``.
+    """
+    if not isinstance(host, str) or not host.strip():
+        raise ValueError("endpoint host is invalid")
+    candidate = host.strip()
+    if candidate.startswith("[") and candidate.endswith("]"):
+        candidate = candidate[1:-1]
+    try:
+        address = ipaddress.ip_address(candidate)
+    except ValueError:
+        try:
+            infos = socket.getaddrinfo(
+                candidate, None, family=socket.AF_INET, type=socket.SOCK_STREAM,
+            )
+        except OSError as exc:
+            raise ValueError("endpoint host is not resolvable") from exc
+        addresses: list[ipaddress._BaseAddress] = []
+        for info in infos:
+            if not info[4]:
+                continue
+            try:
+                parsed = ipaddress.ip_address(info[4][0])
+            except ValueError:
+                continue
+            if parsed not in addresses:
+                addresses.append(parsed)
+        if not addresses:
+            raise ValueError("endpoint host has no numeric address")
+        if not allow_nonlocal and any(not item.is_loopback for item in addresses):
+            raise ValueError("non-loopback endpoint bind is disabled")
+        # The returned numeric address is one of the addresses validated
+        # above; HTTPServer will not perform another DNS lookup for it.
+        return str(addresses[0])
+    if not allow_nonlocal and not address.is_loopback:
+        raise ValueError("non-loopback endpoint bind is disabled")
+    return str(address)
+
+
+def _host_is_loopback(host: object) -> bool:
+    """Compatibility predicate for callers that only need loopback status."""
+    try:
+        _resolve_bind_host(host, allow_nonlocal=False)
+    except (OSError, ValueError):
+        return False
+    return True
 
 
 class OperationState(str, Enum):
@@ -83,6 +157,7 @@ class EndpointRecord:
     run_id: str
     operation_key: str
     input_digest: str
+    payload: bytes
     catalog_digest: str
     state: OperationState
     result: str
@@ -223,16 +298,22 @@ class Store:
         if authority_id is not None:
             try:
                 validate_run_id(authority_id)
-            except ProtocolError as exc:
+            except (ProtocolError, TypeError) as exc:
                 raise ValueError("invalid authority id") from exc
         if effect_id is not None:
             try:
                 validate_run_id(effect_id)
-            except ProtocolError as exc:
+            except (ProtocolError, TypeError) as exc:
                 raise ValueError("invalid effect id") from exc
-        if retention_seconds <= 0:
+        if (
+            isinstance(retention_seconds, bool)
+            or not isinstance(retention_seconds, int)
+            or retention_seconds <= 0
+            or retention_seconds > _MAX_SQLITE_INTEGER // 1_000_000_000
+        ):
             raise ValueError("retention seconds must be positive")
         self._lock = threading.Lock()
+        self._closed = False
         self._connection = sqlite3.connect(str(database), check_same_thread=False, isolation_level=None)
         try:
             self._connection.execute("PRAGMA journal_mode=DELETE")
@@ -312,9 +393,11 @@ class Store:
                     self._connection.execute("DROP TABLE operations_v1_unbound")
                 elif not columns:
                     self._create_operations_table()
+                self._validate_operations_schema()
                 self._connection.execute(
                     "CREATE TABLE IF NOT EXISTS adapter_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
                 )
+                self._validate_adapter_metadata_schema()
                 queue_columns = self._connection.execute("PRAGMA table_info(operation_queue)").fetchall()
                 if not queue_columns:
                     self._create_operation_queue_table()
@@ -380,10 +463,16 @@ class Store:
                     raise ValueError("endpoint database configuration differs from its durable evidence contract")
                 try:
                     self._max_inflight = int(metadata["max_inflight"])
-                    if self._max_inflight < 0:
+                    if self._max_inflight < 0 or self._max_inflight > _MAX_SQLITE_INTEGER:
                         raise ValueError
                 except (KeyError, ValueError) as exc:
                     raise ValueError("endpoint database has invalid durable max inflight") from exc
+                try:
+                    created_at_ns = int(metadata["created_at_ns"])
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise ValueError("endpoint database has invalid metadata timestamp") from exc
+                if not _valid_timestamp(created_at_ns, allow_zero=False):
+                    raise ValueError("endpoint database has invalid metadata timestamp")
                 authority = metadata.get("authority_id")
                 effect = metadata.get("effect_id")
                 try:
@@ -404,6 +493,7 @@ class Store:
                 self._effect_id = effect
                 if self._configured_effect_id is not None and effect != self._configured_effect_id:
                     raise ValueError("endpoint database effect differs from launcher configuration")
+                self._validate_durable_state_locked()
                 self._connection.execute(f"PRAGMA user_version={ENDPOINT_RECORD_SCHEMA_VERSION}")
                 self._connection.execute("COMMIT")
             except BaseException:
@@ -436,6 +526,38 @@ class Store:
                    PRIMARY KEY(namespace_id, run_id, operation_key)
                )"""
         )
+
+    def _validate_operations_schema(self) -> None:
+        expected = {
+            "namespace_id": ("TEXT", 1, 1), "authority_id": ("TEXT", 1, 0),
+            "effect_id": ("TEXT", 1, 0), "run_id": ("TEXT", 1, 2),
+            "operation_key": ("TEXT", 1, 3), "input_digest": ("TEXT", 1, 0),
+            "payload": ("BLOB", 1, 0), "state": ("TEXT", 1, 0),
+            "result": ("TEXT", 1, 0), "catalog_digest": ("TEXT", 1, 0),
+            "output_kind": ("TEXT", 1, 0), "output": ("BLOB", 1, 0),
+            "record_schema_version": ("INTEGER", 1, 0), "created_at_ns": ("INTEGER", 1, 0),
+            "updated_at_ns": ("INTEGER", 1, 0), "expires_at_ns": ("INTEGER", 1, 0),
+            "accepted_at_ns": ("INTEGER", 1, 0), "pending_at_ns": ("INTEGER", 1, 0),
+            "provider_applied_at_ns": ("INTEGER", 1, 0), "terminal_at_ns": ("INTEGER", 1, 0),
+        }
+        actual = {
+            row[1]: (str(row[2]).upper(), row[3], row[5])
+            for row in self._connection.execute("PRAGMA table_info(operations)").fetchall()
+        }
+        if actual != expected:
+            raise ValueError("endpoint database has an unknown or unmigratable operations schema")
+
+    def _validate_adapter_metadata_schema(self) -> None:
+        expected = {
+            "key": ("TEXT", 0, None, 1),
+            "value": ("TEXT", 1, None, 0),
+        }
+        actual = {
+            row[1]: (str(row[2]).upper(), row[3], row[4], row[5])
+            for row in self._connection.execute("PRAGMA table_info(adapter_metadata)").fetchall()
+        }
+        if actual != expected:
+            raise ValueError("endpoint database has an unknown or unmigratable adapter_metadata schema")
 
     def _create_operation_queue_table(self) -> None:
         self._connection.execute(
@@ -476,6 +598,197 @@ class Store:
         if orphan is not None:
             raise ValueError("operation_queue contains orphaned or terminal work")
 
+    @staticmethod
+    def _validate_request_values(
+        run_id: object, operation_key: object, input_digest: object, payload: object,
+    ) -> tuple[str, str, str, bytes]:
+        try:
+            checked_run_id = validate_run_id(run_id)  # type: ignore[arg-type]
+        except (ProtocolError, TypeError) as exc:
+            raise ValueError("invalid run id") from exc
+        if not _valid_id(operation_key):
+            raise ValueError("invalid operation key")
+        if not _valid_digest(input_digest):
+            raise ValueError("invalid input digest")
+        if not isinstance(payload, bytes):
+            raise ValueError("payload must be bytes")
+        if len(payload) > MAX_PAYLOAD_BYTES:
+            raise ValueError("payload too large")
+        if digest(payload) != input_digest:
+            raise ValueError("payload digest mismatch")
+        return checked_run_id, operation_key, input_digest, payload
+
+    def _validate_record(self, record: EndpointRecord, *, allow_expiry_reconciliation: bool = False) -> None:
+        """Validate one durable operation, including state-dependent fields."""
+        try:
+            state = record.state if isinstance(record.state, OperationState) else OperationState(record.state)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("endpoint database has invalid operation state") from exc
+        legacy_tombstone = (
+            record.record_schema_version == 1
+            and record.namespace_id == "legacy"
+            and record.authority_id == "0" * 32
+            and record.effect_id == "0" * 32
+            and record.catalog_digest == _DEFAULT_CATALOG_DIGEST
+            and state == OperationState.EXPIRED
+        )
+        if not _valid_id(record.namespace_id):
+            raise ValueError("endpoint database has invalid operation namespace")
+        for name, value in (("authority", record.authority_id), ("effect", record.effect_id), ("run", record.run_id)):
+            try:
+                validate_run_id(value)
+            except (ProtocolError, TypeError) as exc:
+                raise ValueError(f"endpoint database has invalid operation {name} id") from exc
+        if not _valid_id(record.operation_key):
+            raise ValueError("endpoint database has invalid operation key")
+        if not _valid_digest(record.input_digest) or not _valid_digest(record.catalog_digest):
+            raise ValueError("endpoint database has invalid operation digest")
+        if not isinstance(record.payload, bytes) or len(record.payload) > MAX_PAYLOAD_BYTES:
+            raise ValueError("endpoint database has invalid operation payload")
+        if digest(record.payload) != record.input_digest:
+            raise ValueError("endpoint database operation payload digest mismatch")
+        if not isinstance(record.result, str) or not _valid_id(record.result):
+            raise ValueError("endpoint database has invalid operation result")
+        if record.record_schema_version not in (1, LEGACY_V2_RECORD_SCHEMA_VERSION, ENDPOINT_RECORD_SCHEMA_VERSION):
+            raise ValueError("endpoint database has invalid operation record schema")
+        if record.record_schema_version == 1 and not legacy_tombstone:
+            raise ValueError("endpoint database has an unbound operation record")
+        if record.record_schema_version == LEGACY_V2_RECORD_SCHEMA_VERSION and record.output_kind != "none":
+            raise ValueError("v2 operation has unsupported terminal output")
+        if not legacy_tombstone and (
+            record.namespace_id != self._namespace_id
+            or record.authority_id != self._authority_id
+            or record.effect_id != self._effect_id
+            or record.catalog_digest != self._catalog_digest
+        ):
+            raise ValueError("endpoint database operation identity differs from its durable contract")
+        if legacy_tombstone and record.result == "":
+            raise ValueError("endpoint database has an invalid legacy tombstone result")
+
+        if record.output_kind not in ("none", "child_descriptor_v1"):
+            raise ValueError("endpoint database has invalid operation output kind")
+        if not isinstance(record.output, bytes) or len(record.output) > MAX_TERMINAL_OUTPUT_BYTES:
+            raise ValueError("endpoint database has invalid operation output")
+        if record.output_kind == "none" and record.output:
+            raise ValueError("endpoint database operation output does not match its kind")
+        if record.output_kind == "child_descriptor_v1" and not record.output:
+            raise ValueError("endpoint database descriptor output is empty")
+        if state == OperationState.FAILED and record.output_kind != "none":
+            raise ValueError("endpoint database failed operation has output")
+        if state != OperationState.SUCCEEDED and record.output_kind == "child_descriptor_v1":
+            raise ValueError("endpoint database non-success operation has descriptor output")
+        if state == OperationState.EXPIRED and record.output_kind != "none" and not legacy_tombstone:
+            raise ValueError("endpoint database expired operation has output")
+
+        timestamp_values = (
+            ("created", record.created_at_ns), ("updated", record.updated_at_ns),
+            ("expires", record.expires_at_ns), ("accepted", record.accepted_at_ns),
+            ("pending", record.pending_at_ns), ("provider", record.provider_applied_at_ns),
+            ("terminal", record.terminal_at_ns),
+        )
+        for name, value in timestamp_values:
+            if not _valid_timestamp(value):
+                raise ValueError(f"endpoint database has invalid {name} timestamp")
+        if not _valid_timestamp(record.created_at_ns, allow_zero=False):
+            raise ValueError("endpoint database has invalid created timestamp")
+        if record.updated_at_ns < record.created_at_ns:
+            raise ValueError("endpoint database timestamps move backwards")
+        if record.expires_at_ns and record.expires_at_ns < record.created_at_ns:
+            raise ValueError("endpoint database retention deadline precedes creation")
+        previous = record.created_at_ns
+        for name, value in timestamp_values[3:]:
+            if value and value < previous:
+                raise ValueError(f"endpoint database {name} timestamp moves backwards")
+            if value:
+                previous = value
+        for name, value in timestamp_values[3:]:
+            if value and value > record.updated_at_ns:
+                raise ValueError(f"endpoint database {name} timestamp exceeds updated time")
+
+        # Historical v2/v3 rows may have zero timing fields because those
+        # boundaries were not recorded.  Once a row carries the new accepted
+        # boundary, however, its state must carry the corresponding fields.
+        timing_known = record.accepted_at_ns != 0
+        if state == OperationState.ACCEPTED:
+            if record.pending_at_ns or record.provider_applied_at_ns or record.terminal_at_ns:
+                raise ValueError("accepted operation has terminal timing fields")
+            if record.expires_at_ns != 0:
+                raise ValueError("accepted operation has a retention deadline")
+        elif state == OperationState.PENDING:
+            if record.provider_applied_at_ns or record.terminal_at_ns:
+                raise ValueError("pending operation has terminal timing fields")
+            if timing_known and record.pending_at_ns == 0:
+                raise ValueError("pending operation is missing pending timestamp")
+            if record.expires_at_ns != 0:
+                raise ValueError("pending operation has a retention deadline")
+        elif state in (OperationState.SUCCEEDED, OperationState.FAILED):
+            if record.expires_at_ns == 0 and not allow_expiry_reconciliation:
+                raise ValueError("terminal operation is missing retention deadline")
+            if timing_known and record.terminal_at_ns == 0:
+                raise ValueError("terminal operation is missing terminal timestamp")
+        elif state == OperationState.EXPIRED:
+            if not legacy_tombstone and record.result != "retention_expired":
+                raise ValueError("expired operation has an invalid result")
+            if not legacy_tombstone and timing_known and record.terminal_at_ns == 0:
+                raise ValueError("expired operation is missing terminal timestamp")
+        if legacy_tombstone and record.output_kind != "none":
+            raise ValueError("legacy tombstone has output")
+
+    def _validate_durable_state_locked(self, *, allow_expiry_reconciliation: bool = False) -> None:
+        """Scan every durable row before exposing this Store to callers."""
+        operations: dict[tuple[str, str, str], EndpointRecord] = {}
+        rows = self._connection.execute(
+            """SELECT namespace_id, authority_id, effect_id, run_id, operation_key, input_digest, payload,
+                      state, result, catalog_digest, output_kind, output, record_schema_version,
+                      created_at_ns, updated_at_ns, expires_at_ns, accepted_at_ns, pending_at_ns,
+                      provider_applied_at_ns, terminal_at_ns FROM operations"""
+        ).fetchall()
+        for row in rows:
+            try:
+                record = self._from_row(row)
+            except (TypeError, ValueError, IndexError) as exc:
+                raise ValueError("endpoint database has an unreadable operation row") from exc
+            self._validate_record(record, allow_expiry_reconciliation=allow_expiry_reconciliation)
+            key = (record.namespace_id, record.run_id, record.operation_key)
+            if key in operations:
+                raise ValueError("endpoint database has duplicate operation identity")
+            operations[key] = record
+
+        leased = 0
+        queue_rows = self._connection.execute(
+            "SELECT namespace_id, run_id, operation_key, lease_token, lease_until_ns, attempts FROM operation_queue"
+        ).fetchall()
+        for namespace_id, run_id, operation_key, lease_token, lease_until_ns, attempts in queue_rows:
+            try:
+                validate_run_id(run_id)
+            except (ProtocolError, TypeError) as exc:
+                raise ValueError("endpoint database queue has invalid run id") from exc
+            if namespace_id != self._namespace_id or not _valid_id(operation_key):
+                raise ValueError("endpoint database queue has invalid identity")
+            record = operations.get((namespace_id, run_id, operation_key))
+            if record is None:
+                raise ValueError("endpoint database queue contains an orphan")
+            if record.state not in (OperationState.ACCEPTED, OperationState.PENDING):
+                raise ValueError("endpoint database queue references terminal work")
+            if not isinstance(attempts, int) or isinstance(attempts, bool) or attempts < 0 or attempts > _MAX_SQLITE_INTEGER:
+                raise ValueError("endpoint database queue has invalid attempts")
+            token_present = lease_token is not None
+            deadline_present = lease_until_ns is not None
+            if token_present != deadline_present:
+                raise ValueError("endpoint database queue lease token/deadline are not paired")
+            if token_present:
+                if not _valid_lease_token(lease_token):
+                    raise ValueError("endpoint database queue has invalid lease token")
+                if not _valid_timestamp(lease_until_ns, allow_zero=False):
+                    raise ValueError("endpoint database queue has invalid lease deadline")
+                if attempts < 1:
+                    raise ValueError("leased queue entry has no attempt")
+                leased += 1
+                if record.state == OperationState.ACCEPTED:
+                    raise ValueError("accepted queue entry cannot hold a lease")
+        if leased > self._max_inflight:
+            raise ValueError("endpoint database queue exceeds durable inflight bound")
+
     @property
     def authority_id(self) -> str:
         return self._authority_id
@@ -499,19 +812,19 @@ class Store:
     def _from_row(self, row: tuple[Any, ...]) -> EndpointRecord:
         return EndpointRecord(
             namespace_id=row[0], authority_id=row[1], effect_id=row[2], run_id=row[3],
-            operation_key=row[4], input_digest=row[5], state=OperationState(row[6]), result=row[7],
-            catalog_digest=row[8], output_kind=row[9], output=row[10], record_schema_version=row[11],
-            created_at_ns=row[12], updated_at_ns=row[13], expires_at_ns=row[14],
-            accepted_at_ns=row[15], pending_at_ns=row[16], provider_applied_at_ns=row[17], terminal_at_ns=row[18],
+            operation_key=row[4], input_digest=row[5], payload=row[6], state=OperationState(row[7]), result=row[8],
+            catalog_digest=row[9], output_kind=row[10], output=row[11], record_schema_version=row[12],
+            created_at_ns=row[13], updated_at_ns=row[14], expires_at_ns=row[15],
+            accepted_at_ns=row[16], pending_at_ns=row[17], provider_applied_at_ns=row[18], terminal_at_ns=row[19],
         )
 
     @staticmethod
     def _now() -> int:
         return time.time_ns()
 
-    def _select(self, run_id: str, operation_key: str) -> EndpointRecord | None:
+    def _select(self, run_id: str, operation_key: str, *, allow_expiry_reconciliation: bool = False) -> EndpointRecord | None:
         row = self._connection.execute(
-            """SELECT namespace_id, authority_id, effect_id, run_id, operation_key, input_digest,
+            """SELECT namespace_id, authority_id, effect_id, run_id, operation_key, input_digest, payload,
                       state, result, catalog_digest, output_kind, output, record_schema_version, created_at_ns, updated_at_ns,
                       expires_at_ns, accepted_at_ns, pending_at_ns, provider_applied_at_ns, terminal_at_ns FROM operations WHERE namespace_id=? AND run_id=? AND operation_key=?""",
             (self._namespace_id, run_id, operation_key),
@@ -522,12 +835,19 @@ class Store:
         # second live tenant.
         if row is None:
             row = self._connection.execute(
-                """SELECT namespace_id, authority_id, effect_id, run_id, operation_key, input_digest,
+                """SELECT namespace_id, authority_id, effect_id, run_id, operation_key, input_digest, payload,
                           state, result, catalog_digest, output_kind, output, record_schema_version, created_at_ns, updated_at_ns,
                           expires_at_ns, accepted_at_ns, pending_at_ns, provider_applied_at_ns, terminal_at_ns FROM operations WHERE run_id=? AND operation_key=?""",
                 (run_id, operation_key),
             ).fetchone()
-        return None if row is None else self._from_row(row)
+        if row is None:
+            return None
+        try:
+            record = self._from_row(row)
+        except (TypeError, ValueError, IndexError) as exc:
+            raise ValueError("endpoint database has an unreadable operation row") from exc
+        self._validate_record(record, allow_expiry_reconciliation=allow_expiry_reconciliation)
+        return record
 
     def _expire_if_needed(self, record: EndpointRecord, now: int) -> EndpointRecord:
         # Retention begins only after immutable terminal evidence exists.
@@ -535,7 +855,7 @@ class Store:
         if not record.state.terminal or record.state == OperationState.EXPIRED or now < record.expires_at_ns:
             return record
         self._connection.execute(
-            "UPDATE operations SET state='expired', result='retention_expired', updated_at_ns=? "
+            "UPDATE operations SET state='expired', result='retention_expired', output_kind='none', output=X'', updated_at_ns=? "
             "WHERE namespace_id=? AND run_id=? AND operation_key=?",
             (now, record.namespace_id, record.run_id, record.operation_key),
         )
@@ -552,13 +872,22 @@ class Store:
         initial_state: OperationState = OperationState.SUCCEEDED,
         result: str = "success",
     ) -> tuple[int, dict[str, str]]:
-        if initial_state == OperationState.EXPIRED or not _valid_id(result):
+        run_id, operation_key, input_digest, payload = self._validate_request_values(
+            run_id, operation_key, input_digest, payload
+        )
+        if not isinstance(initial_state, OperationState) or initial_state == OperationState.EXPIRED or not _valid_id(result):
             raise ValueError("invalid initial operation state")
         now = self._now()
+        if not _valid_timestamp(now, allow_zero=False):
+            raise ValueError("invalid endpoint clock")
+        expires = 0 if initial_state in (OperationState.ACCEPTED, OperationState.PENDING) else now + self._retention_ns
+        if not _valid_timestamp(expires):
+            raise ValueError("endpoint retention deadline exceeds SQLite bounds")
         with self._lock:
+            self._validate_durable_state_locked(allow_expiry_reconciliation=True)
             self._connection.execute("BEGIN IMMEDIATE")
             try:
-                existing = self._select(run_id, operation_key)
+                existing = self._select(run_id, operation_key, allow_expiry_reconciliation=True)
                 if existing is not None:
                     existing = self._expire_if_needed(existing, now)
                     if existing.state == OperationState.EXPIRED:
@@ -571,17 +900,18 @@ class Store:
                     self._counters["replay"] += 1
                     self._connection.execute("COMMIT")
                     return self._status_for(existing, replayed=True), existing.document(replayed=True)
-                expires = now + self._retention_ns
                 self._connection.execute(
                     """INSERT INTO operations(namespace_id, authority_id, effect_id, run_id, operation_key,
                        input_digest, payload, state, result, catalog_digest, output_kind, output, record_schema_version,
                        created_at_ns, updated_at_ns, expires_at_ns, accepted_at_ns, pending_at_ns, provider_applied_at_ns, terminal_at_ns)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'none', X'', ?, ?, ?, ?, ?, 0, 0, ?)""",
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'none', X'', ?, ?, ?, ?, ?, ?, 0, ?)""",
                     (self._namespace_id, self._authority_id, self._effect_id, run_id, operation_key,
                      input_digest, payload, initial_state.value, result, self._catalog_digest,
-                     ENDPOINT_RECORD_SCHEMA_VERSION, now, now, expires, now, now),
+                     ENDPOINT_RECORD_SCHEMA_VERSION, now, now, expires, now,
+                     now if initial_state == OperationState.PENDING else 0,
+                     now if initial_state.terminal else 0),
                 )
-                record = self._select(run_id, operation_key)
+                record = self._select(run_id, operation_key, allow_expiry_reconciliation=True)
                 assert record is not None
                 if self._fault_before_commit_once:
                     self._fault_before_commit_once = False
@@ -604,11 +934,20 @@ class Store:
         return HTTPStatus.GONE
 
     def get(self, run_id: str, operation_key: str) -> dict[str, str] | None:
+        try:
+            run_id = validate_run_id(run_id)
+        except (ProtocolError, TypeError) as exc:
+            raise ValueError("invalid run id") from exc
+        if not _valid_id(operation_key):
+            raise ValueError("invalid operation key")
         now = self._now()
+        if not _valid_timestamp(now, allow_zero=False):
+            raise ValueError("invalid endpoint clock")
         with self._lock:
+            self._validate_durable_state_locked(allow_expiry_reconciliation=True)
             self._connection.execute("BEGIN IMMEDIATE")
             try:
-                record = self._select(run_id, operation_key)
+                record = self._select(run_id, operation_key, allow_expiry_reconciliation=True)
                 if record is None:
                     self._connection.execute("COMMIT")
                     return None
@@ -621,11 +960,17 @@ class Store:
 
     def enqueue(self, run_id: str, operation_key: str, input_digest: str, payload: bytes) -> tuple[int, dict[str, str]]:
         """Durably accept a v2 operation and its work item before returning 202."""
+        run_id, operation_key, input_digest, payload = self._validate_request_values(
+            run_id, operation_key, input_digest, payload
+        )
         now = self._now()
+        if not _valid_timestamp(now, allow_zero=False):
+            raise ValueError("invalid endpoint clock")
         with self._lock:
+            self._validate_durable_state_locked(allow_expiry_reconciliation=True)
             self._connection.execute("BEGIN IMMEDIATE")
             try:
-                existing = self._select(run_id, operation_key)
+                existing = self._select(run_id, operation_key, allow_expiry_reconciliation=True)
                 if existing is not None:
                     existing = self._expire_if_needed(existing, now)
                     if existing.state == OperationState.EXPIRED:
@@ -650,7 +995,7 @@ class Store:
                     "INSERT INTO operation_queue(namespace_id, run_id, operation_key) VALUES (?, ?, ?)",
                     (self._namespace_id, run_id, operation_key),
                 )
-                record = self._select(run_id, operation_key)
+                record = self._select(run_id, operation_key, allow_expiry_reconciliation=True)
                 assert record is not None
                 if self._fault_before_commit_once:
                     self._fault_before_commit_once = False
@@ -662,11 +1007,30 @@ class Store:
                 self._connection.execute("ROLLBACK")
                 raise
 
+    def _validate_work_item(self, item: WorkItem) -> None:
+        if not isinstance(item, WorkItem):
+            raise ValueError("invalid work item")
+        if (
+            item.namespace_id != self._namespace_id
+            or item.authority_id != self._authority_id
+            or item.effect_id != self._effect_id
+            or item.catalog_digest != self._catalog_digest
+        ):
+            raise ValueError("work item identity differs from durable endpoint contract")
+        self._validate_request_values(item.run_id, item.operation_key, item.input_digest, item.payload)
+        if not _valid_lease_token(item.lease_token):
+            raise ValueError("invalid lease token")
+
     def claim_next(self, worker_id: str, lease_seconds: float) -> WorkItem | None:
-        if not _valid_id(worker_id) or lease_seconds <= 0:
+        if not _valid_id(worker_id) or not isinstance(lease_seconds, (int, float)) or isinstance(lease_seconds, bool) \
+                or not math.isfinite(lease_seconds) or lease_seconds <= 0 \
+                or lease_seconds > _MAX_SQLITE_INTEGER / 1_000_000_000:
             raise ValueError("invalid worker lease")
         now = self._now()
+        if not _valid_timestamp(now, allow_zero=False):
+            raise ValueError("invalid endpoint clock")
         with self._lock:
+            self._validate_durable_state_locked(allow_expiry_reconciliation=True)
             self._connection.execute("BEGIN IMMEDIATE")
             try:
                 row = self._connection.execute(
@@ -685,6 +1049,8 @@ class Store:
                     return None
                 token = secrets.token_hex(16)
                 until = now + int(lease_seconds * 1_000_000_000)
+                if not _valid_timestamp(until, allow_zero=False) or not _valid_lease_token(token):
+                    raise ValueError("invalid worker lease deadline")
                 changed = self._connection.execute(
                     """UPDATE operation_queue SET lease_token=?, lease_until_ns=?, attempts=attempts+1
                        WHERE namespace_id=? AND run_id=? AND operation_key=?
@@ -715,16 +1081,27 @@ class Store:
                 raise
 
     def complete_lease(self, item: WorkItem, state: str, result: str, output_kind: str = "none", output: bytes = b"", provider_applied_at_ns: int = 0) -> bool:
+        self._validate_work_item(item)
         if (state not in ("succeeded", "failed") or not _valid_id(result)
                 or output_kind not in ("none", "child_descriptor_v1")
                 or (state == "failed" and output_kind != "none")
+                or not isinstance(output, bytes)
                 or len(output) > MAX_TERMINAL_OUTPUT_BYTES
-                or (output_kind == "none") != (not output) or provider_applied_at_ns < 0):
+                or (output_kind == "none") != (not output)
+                or not _valid_timestamp(provider_applied_at_ns)):
             raise ValueError("invalid provider outcome")
         now = self._now()
+        if not _valid_timestamp(now, allow_zero=False):
+            raise ValueError("invalid endpoint clock")
         if provider_applied_at_ns == 0:
             provider_applied_at_ns = now
+        if not _valid_timestamp(provider_applied_at_ns, allow_zero=False):
+            raise ValueError("invalid provider application timestamp")
+        terminal_expires = now + self._retention_ns
+        if not _valid_timestamp(terminal_expires, allow_zero=False):
+            raise ValueError("endpoint retention deadline exceeds SQLite bounds")
         with self._lock:
+            self._validate_durable_state_locked(allow_expiry_reconciliation=True)
             self._connection.execute("BEGIN IMMEDIATE")
             try:
                 changed = self._connection.execute(
@@ -733,10 +1110,30 @@ class Store:
                          AND EXISTS (SELECT 1 FROM operation_queue q WHERE q.namespace_id=operations.namespace_id
                            AND q.run_id=operations.run_id AND q.operation_key=operations.operation_key
                            AND q.lease_token=?)""",
-                    (state, result, output_kind, output, now, now + self._retention_ns, provider_applied_at_ns, now, item.namespace_id, item.run_id,
+                    (state, result, output_kind, output, now, terminal_expires, provider_applied_at_ns, now, item.namespace_id, item.run_id,
                      item.operation_key, item.lease_token),
                 ).rowcount
                 if changed:
+                    # Validate the newly terminal row while the transaction is
+                    # still open.  Provider application is evidence only when
+                    # it lies between the durable pending boundary and this
+                    # terminal publication; checking the caller's argument
+                    # before UPDATE would not protect against a malformed
+                    # pending row or another transactional mutation.
+                    updated = self._select(
+                        item.run_id, item.operation_key,
+                        allow_expiry_reconciliation=True,
+                    )
+                    if updated is None:
+                        raise ValueError("provider completion removed its operation row")
+                    if not (
+                        updated.pending_at_ns <= updated.provider_applied_at_ns
+                        <= updated.terminal_at_ns
+                    ):
+                        raise ValueError(
+                            "provider application timestamp must lie between pending and terminal times"
+                        )
+                    self._validate_record(updated, allow_expiry_reconciliation=True)
                     self._connection.execute(
                         "DELETE FROM operation_queue WHERE namespace_id=? AND run_id=? AND operation_key=? AND lease_token=?",
                         (item.namespace_id, item.run_id, item.operation_key, item.lease_token),
@@ -749,7 +1146,9 @@ class Store:
                 raise
 
     def release_lease(self, item: WorkItem) -> None:
+        self._validate_work_item(item)
         with self._lock:
+            self._validate_durable_state_locked(allow_expiry_reconciliation=True)
             self._connection.execute(
                 """UPDATE operation_queue SET lease_token=NULL, lease_until_ns=NULL
                    WHERE namespace_id=? AND run_id=? AND operation_key=? AND lease_token=?""",
@@ -766,13 +1165,21 @@ class Store:
 
     def transition(self, run_id: str, operation_key: str, state: OperationState, result: str) -> dict[str, str] | None:
         """Advance a nonterminal local job; terminal/expired facts are immutable."""
-        if not _valid_id(result) or state == OperationState.EXPIRED:
+        try:
+            run_id = validate_run_id(run_id)
+        except (ProtocolError, TypeError) as exc:
+            raise ValueError("invalid run id") from exc
+        if not _valid_id(operation_key) or not isinstance(state, OperationState) \
+                or not _valid_id(result) or state == OperationState.EXPIRED:
             raise ValueError("invalid transition")
         now = self._now()
+        if not _valid_timestamp(now, allow_zero=False):
+            raise ValueError("invalid endpoint clock")
         with self._lock:
+            self._validate_durable_state_locked(allow_expiry_reconciliation=True)
             self._connection.execute("BEGIN IMMEDIATE")
             try:
-                record = self._select(run_id, operation_key)
+                record = self._select(run_id, operation_key, allow_expiry_reconciliation=True)
                 if record is None:
                     self._connection.execute("COMMIT")
                     return None
@@ -788,6 +1195,8 @@ class Store:
                     self._connection.execute("COMMIT")
                     return record.document(replayed=True)
                 expires = now + self._retention_ns if state.terminal else record.expires_at_ns
+                if not _valid_timestamp(expires):
+                    raise ValueError("endpoint retention deadline exceeds SQLite bounds")
                 self._connection.execute(
                     "UPDATE operations SET state=?, result=?, updated_at_ns=?, expires_at_ns=?, pending_at_ns=CASE WHEN ?='pending' THEN ? ELSE pending_at_ns END, terminal_at_ns=CASE WHEN ? IN ('succeeded','failed') THEN ? ELSE terminal_at_ns END WHERE namespace_id=? AND run_id=? AND operation_key=?",
                     (state.value, result, now, expires, state.value, now, state.value, now, self._namespace_id, run_id, operation_key),
@@ -810,6 +1219,7 @@ class Store:
 
     def metrics(self) -> dict[str, str]:
         with self._lock:
+            self._validate_durable_state_locked()
             counts = dict(self._connection.execute("SELECT state, COUNT(*) FROM operations GROUP BY state").fetchall())
             queue = self._connection.execute(
                 "SELECT COUNT(*), COALESCE(SUM(attempts), 0), COALESCE(SUM(lease_token IS NOT NULL), 0) FROM operation_queue"
@@ -838,30 +1248,133 @@ class Store:
             }
 
     def close(self) -> None:
-        self._connection.close()
+        with self._lock:
+            if self._closed:
+                return
+            self._connection.close()
+            self._closed = True
 
 
 class Endpoint(ThreadingHTTPServer):
     def __init__(self, address: tuple[str, int], store: Store, fault_after_response_commit_once: bool,
                  *, provider_database: Path | None = None, start_worker: bool = False,
-                 provider_fault_after_apply_once: bool = False, provider_delay_ms: int = 0, worker_count: int = 1) -> None:
-        if worker_count < 1:
-            raise ValueError("worker count must be positive")
-        super().__init__(address, Handler)
+                 provider_fault_after_apply_once: bool = False, provider_delay_ms: int = 0, worker_count: int = 1,
+                 allow_nonlocal_bind: bool = False,
+                 shutdown_timeout_seconds: float = _SHUTDOWN_TIMEOUT_SECONDS) -> None:
+        # Set every field consulted by cleanup before HTTPServer validates and
+        # binds the socket.  A bind failure must preserve its original OSError
+        # while still closing the Store supplied by the failed construction.
         self.store = store
+        self._handler_condition = threading.Condition()
+        self._active_handlers = 0
+        self._closing = False
+        self._socket_closed = False
+        self._async_closed = False
+        self.provider: ProviderStore | None = None
+        self.workers: list[AsyncWorker] = []
+        self.worker: AsyncWorker | None = None
+        self._shutdown_timeout_seconds = _SHUTDOWN_TIMEOUT_SECONDS
         self.fault_after_response_commit_once = fault_after_response_commit_once
         self._fault_lock = threading.Lock()
-        self.provider = ProviderStore(
-            provider_database or store.database.with_suffix(".provider.sqlite"),
-            fault_after_apply_once=provider_fault_after_apply_once,
-            delay_ms=provider_delay_ms,
+        bound = False
+        try:
+            if worker_count < 1:
+                raise ValueError("worker count must be positive")
+            if (
+                not isinstance(shutdown_timeout_seconds, (int, float))
+                or isinstance(shutdown_timeout_seconds, bool)
+                or not math.isfinite(shutdown_timeout_seconds)
+                or shutdown_timeout_seconds <= 0
+            ):
+                raise ValueError("shutdown timeout must be finite and positive")
+            self._shutdown_timeout_seconds = float(shutdown_timeout_seconds)
+            bind_host = _resolve_bind_host(address[0], allow_nonlocal=allow_nonlocal_bind)
+            super().__init__((bind_host, address[1]), Handler)
+            bound = True
+            self.provider = ProviderStore(
+                provider_database or store.database.with_suffix(".provider.sqlite"),
+                fault_after_apply_once=provider_fault_after_apply_once,
+                delay_ms=provider_delay_ms,
+            )
+            self.workers = [
+                AsyncWorker(store, self.provider, worker_id=f"endpoint-worker-{index}")
+                for index in range(worker_count)
+            ]
+            self.worker = self.workers[0]  # focused callers retain the singular test hook
+            if start_worker:
+                for worker in self.workers:
+                    worker.start()
+        except BaseException:
+            if bound:
+                try:
+                    HTTPServer.server_close(self)
+                except BaseException:
+                    pass
+            else:
+                # ``HTTPServer.__init__`` creates its socket before bind and
+                # may raise the original OSError from ``server_bind``.  The
+                # failed object is never returned to a caller, so close that
+                # partially initialized socket directly without replacing the
+                # bind exception with cleanup noise.
+                failed_socket = getattr(self, "socket", None)
+                if failed_socket is not None:
+                    try:
+                        failed_socket.close()
+                    except BaseException:
+                        pass
+            if self.provider is not None:
+                try:
+                    self.provider.close()
+                except BaseException:
+                    pass
+            try:
+                store.close()
+            except BaseException:
+                pass
+            raise
+
+    def process_request(self, request: Any, client_address: Any) -> None:
+        """Track handlers so durable dependencies outlive every request."""
+        with self._handler_condition:
+            if self._closing:
+                self.shutdown_request(request)
+                return
+            self._active_handlers += 1
+        thread = threading.Thread(
+            target=self._run_handler,
+            args=(request, client_address),
+            name=f"cser-endpoint-handler-{client_address!s}",
+            daemon=False,
         )
-        self.workers = [AsyncWorker(store, self.provider, worker_id=f"endpoint-worker-{index}") for index in range(worker_count)]
-        self.worker = self.workers[0]  # focused callers retain the singular test hook
-        self._async_closed = False
-        if start_worker:
-            for worker in self.workers:
-                worker.start()
+        try:
+            thread.start()
+        except BaseException:
+            with self._handler_condition:
+                self._active_handlers -= 1
+                self._handler_condition.notify_all()
+            self.shutdown_request(request)
+            raise
+
+    def _run_handler(self, request: Any, client_address: Any) -> None:
+        try:
+            self.process_request_thread(request, client_address)
+        finally:
+            with self._handler_condition:
+                self._active_handlers -= 1
+                self._handler_condition.notify_all()
+
+    def _wait_for_handlers(self) -> None:
+        deadline = time.monotonic() + self._shutdown_timeout_seconds
+        with self._handler_condition:
+            while self._active_handlers:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError("HTTP handler did not stop before shutdown timeout; refusing dependency close")
+                self._handler_condition.wait(remaining)
+
+    def _mark_closing(self) -> None:
+        with self._handler_condition:
+            self._closing = True
 
     def take_lost_response_fault(self) -> bool:
         with self._fault_lock:
@@ -873,14 +1386,40 @@ class Endpoint(ThreadingHTTPServer):
     def close_async(self) -> None:
         if self._async_closed:
             return
-        if not all(worker.stop() for worker in self.workers):
+        self._mark_closing()
+        self._wait_for_handlers()
+        stopped: list[bool] = []
+        for worker in self.workers:
+            try:
+                stopped.append(worker.stop())
+            except BaseException:
+                stopped.append(False)
+        if not all(stopped):
             raise RuntimeError("async worker did not stop before provider close")
+        # ``HTTPServer.__init__`` calls the virtual ``server_close`` when
+        # binding fails, before Endpoint has constructed its provider or
+        # workers.  Mark that partially initialized object closed so the base
+        # class can re-raise the exact bind OSError.
+        if self.provider is None:
+            self._async_closed = True
+            return
         self.provider.close()
         self._async_closed = True
 
-    def server_close(self) -> None:
+    def shutdown(self) -> None:
+        self._mark_closing()
+        super().shutdown()
         self.close_async()
-        super().server_close()
+
+    def server_close(self) -> None:
+        self._mark_closing()
+        if not self._socket_closed:
+            # Call HTTPServer directly: ThreadingMixIn.server_close() joins
+            # handlers without a timeout, which would prevent fail-closed
+            # shutdown if a client keeps a handler blocked indefinitely.
+            HTTPServer.server_close(self)
+            self._socket_closed = True
+        self.close_async()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1074,6 +1613,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--database", required=True, type=Path)
     parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument(
+        "--allow-nonlocal-bind", "--unsafe-allow-nonlocal-bind",
+        dest="allow_nonlocal_bind", action="store_true",
+        help="DANGEROUS: permit a non-loopback bind; the default is trusted-local only",
+    )
     parser.add_argument("--port", required=True, type=int)
     parser.add_argument("--port-file", type=Path)
     parser.add_argument("--namespace", default=_DEFAULT_NAMESPACE)
@@ -1089,12 +1633,24 @@ def main() -> None:
     parser.add_argument("--provider-delay-ms", default=0, type=int)
     parser.add_argument("--worker-count", default=1, type=int)
     args = parser.parse_args()
+    try:
+        # Resolve once here and pass the numeric result to Endpoint.  The
+        # socket bind therefore cannot perform a second DNS lookup after this
+        # trusted-local policy check.
+        bind_host = _resolve_bind_host(args.host, allow_nonlocal=args.allow_nonlocal_bind)
+    except (OSError, ValueError) as exc:
+        parser.error(str(exc))
+    store = Store(
+        args.database, namespace_id=args.namespace, catalog_digest=args.catalog_digest,
+        authority_id=args.authority_id, effect_id=args.effect_id,
+        retention_seconds=args.retention_seconds,
+    )
     endpoint = Endpoint(
-        (args.host, args.port),
-        Store(args.database, namespace_id=args.namespace, catalog_digest=args.catalog_digest, authority_id=args.authority_id, effect_id=args.effect_id, retention_seconds=args.retention_seconds),
-        args.fault_after_response_commit_once, provider_database=args.provider_database, start_worker=True,
+        (bind_host, args.port), store, args.fault_after_response_commit_once,
+        provider_database=args.provider_database, start_worker=True,
         provider_fault_after_apply_once=args.provider_fault_after_apply_once,
         provider_delay_ms=args.provider_delay_ms, worker_count=args.worker_count,
+        allow_nonlocal_bind=args.allow_nonlocal_bind,
     )
     if args.port_file is not None:
         args.port_file.write_text(f"{endpoint.server_port}\n", encoding="ascii")

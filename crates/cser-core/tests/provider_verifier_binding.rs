@@ -215,7 +215,7 @@ fn scoped_verifier_generation_and_implementation_mismatch_fail_without_mutation(
 }
 
 #[test]
-fn verifier_rotation_does_not_rebind_an_existing_effect_challenge() {
+fn verifier_rotation_waits_for_effect_retirement_without_rebinding_challenge() {
     let world = WorldId::new(903).unwrap();
     let catalog = standard_catalog();
     let provider = coordinate(903, 904, 1);
@@ -242,13 +242,14 @@ fn verifier_rotation_does_not_rebind_an_existing_effect_challenge() {
         )
         .unwrap();
     let next = coordinate(903, 904, 2);
-    engine
-        .transact_volatile(CommandRequest::RegisterProviderGeneration {
+    assert_eq!(
+        engine.transact_volatile(CommandRequest::RegisterProviderGeneration {
             coordinate: next,
             catalog_digest: catalog.digest(),
             verifier_bindings: bindings(&catalog, 2, 0x60),
-        })
-        .unwrap();
+        }),
+        Err(CoreError::ProviderLifecycleViolation)
+    );
     let after = engine
         .component_evidence_challenge(
             effect,

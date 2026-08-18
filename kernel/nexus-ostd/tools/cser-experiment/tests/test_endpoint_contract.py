@@ -5,6 +5,8 @@ import http.client
 import json
 import gc
 import sqlite3
+import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -12,6 +14,7 @@ import unittest
 import warnings
 from base64 import b64encode
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -245,6 +248,203 @@ class EndpointContractTests(unittest.TestCase):
             connection.request("POST", "/v2/operations", json.dumps(legacy_body), {"Content-Type": "application/json"})
             self.assertEqual(connection.getresponse().status, 400)
             connection.close(); server.shutdown(); server.server_close(); store.close(); thread.join(timeout=5)
+
+    def test_store_direct_calls_validate_identity_digest_and_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            store = Store(Path(temp) / "direct.sqlite", catalog_digest=CATALOG)
+            payload = b"direct-validation"
+            payload_digest = hashlib.sha256(payload).hexdigest()
+            with self.assertRaisesRegex(ValueError, "run id"):
+                store.submit("not-a-run", "op", payload_digest, payload)
+            with self.assertRaisesRegex(ValueError, "operation key"):
+                store.enqueue(RUN, "", payload_digest, payload)
+            with self.assertRaisesRegex(ValueError, "input digest"):
+                store.submit(RUN, "bad-digest", "f" * 63, payload)
+            with self.assertRaisesRegex(ValueError, "payload digest"):
+                store.enqueue(RUN, "mismatch", "0" * 64, payload)
+            with self.assertRaisesRegex(ValueError, "invalid transition"):
+                store.transition(RUN, "missing", "pending", "working")  # type: ignore[arg-type]
+            store.close()
+
+    def test_store_rejects_corrupt_rows_and_queue_lease_pairs_at_startup(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            payload = b"durable-corruption"
+            payload_digest = hashlib.sha256(payload).hexdigest()
+
+            database = root / "payload.sqlite"
+            store = Store(database, catalog_digest=CATALOG)
+            store.enqueue(RUN, "payload-row", payload_digest, payload)
+            store.close()
+            connection = sqlite3.connect(database)
+            connection.execute("UPDATE operations SET payload=? WHERE operation_key='payload-row'", (b"tampered",))
+            connection.commit(); connection.close()
+            with self.assertRaisesRegex(ValueError, "payload digest"):
+                Store(database, catalog_digest=CATALOG)
+
+            database = root / "queue.sqlite"
+            store = Store(database, catalog_digest=CATALOG)
+            store.enqueue(RUN, "queue-row", payload_digest, payload)
+            store.close()
+            connection = sqlite3.connect(database)
+            connection.execute(
+                "UPDATE operation_queue SET lease_token=? WHERE operation_key='queue-row'",
+                ("a" * 32,),
+            )
+            connection.commit(); connection.close()
+            with self.assertRaisesRegex(ValueError, "lease token/deadline"):
+                Store(database, catalog_digest=CATALOG)
+
+            database = root / "timestamps.sqlite"
+            store = Store(database, catalog_digest=CATALOG)
+            self.submit(store, key="timestamp-row")
+            store.close()
+            connection = sqlite3.connect(database)
+            connection.execute("UPDATE operations SET updated_at_ns=-1 WHERE operation_key='timestamp-row'")
+            connection.commit(); connection.close()
+            with self.assertRaisesRegex(ValueError, "updated timestamp"):
+                Store(database, catalog_digest=CATALOG)
+
+            database = root / "metadata.sqlite"
+            store = Store(database, catalog_digest=CATALOG)
+            store.close()
+            connection = sqlite3.connect(database)
+            connection.execute("ALTER TABLE adapter_metadata ADD COLUMN unexpected TEXT")
+            connection.commit(); connection.close()
+            with self.assertRaisesRegex(ValueError, "adapter_metadata schema"):
+                Store(database, catalog_digest=CATALOG)
+
+    def test_complete_lease_requires_provider_time_between_pending_and_terminal(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            store = Store(Path(temp) / "timestamps.sqlite", catalog_digest=CATALOG)
+            payload = b"provider-time"
+            digest = hashlib.sha256(payload).hexdigest()
+            store.enqueue(RUN, "provider-time", digest, payload)
+            item = store.claim_next("worker", 60.0)
+            assert item is not None
+            pending = int(store.get(RUN, "provider-time")["pending_at_ns"])  # type: ignore[index]
+            with self.assertRaisesRegex(ValueError, "provider timestamp"):
+                store.complete_lease(item, "succeeded", "success", provider_applied_at_ns=pending - 1)
+            with self.assertRaisesRegex(ValueError, "timestamp"):
+                store.complete_lease(item, "succeeded", "success", provider_applied_at_ns=(1 << 63) - 1)
+            current = store.get(RUN, "provider-time")
+            assert current is not None
+            self.assertEqual(current["state"], "pending")
+            self.assertTrue(store.complete_lease(item, "succeeded", "success"))
+            store.close()
+
+    def test_hostname_is_resolved_once_to_the_validated_numeric_loopback_address(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            store = Store(Path(temp) / "dns.sqlite", catalog_digest=CATALOG)
+            info = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 0))]
+            with mock.patch("tool_endpoint.socket.getaddrinfo", return_value=info) as resolve:
+                endpoint = Endpoint(("loopback.test", 0), store, False)
+            self.assertEqual(endpoint.server_address[0], "127.0.0.1")
+            self.assertEqual(resolve.call_count, 1)
+            endpoint.server_close(); store.close()
+
+    def test_bind_failure_preserves_oserror_and_closes_owned_store(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            store = Store(Path(temp) / "bind-error.sqlite", catalog_digest=CATALOG)
+            bind_error = OSError("exact bind failure")
+            with mock.patch("tool_endpoint.HTTPServer.server_bind", side_effect=bind_error):
+                with self.assertRaises(OSError) as raised:
+                    Endpoint(("127.0.0.1", 0), store, False)
+            self.assertIs(raised.exception, bind_error)
+            self.assertTrue(store._closed)
+
+    def test_nonlocal_bind_requires_explicit_cli_danger_switch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            database = Path(temp) / "bind.sqlite"
+            result = subprocess.run(
+                [
+                    sys.executable, str(ROOT / "tool_endpoint.py"),
+                    "--database", str(database), "--host", "0.0.0.0", "--port", "0",
+                ], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("non-loopback", result.stderr)
+            self.assertFalse(database.exists())
+
+            store = Store(database, catalog_digest=CATALOG)
+            with self.assertRaisesRegex(ValueError, "non-loopback"):
+                Endpoint(("0.0.0.0", 0), store, False)
+            store.close()
+
+    def test_shutdown_timeout_keeps_provider_open_until_inflight_handler_finishes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            database = Path(temp) / "shutdown.sqlite"
+            store = Store(database, catalog_digest=CATALOG)
+            endpoint = Endpoint(
+                ("127.0.0.1", 0), store, False,
+                provider_database=Path(temp) / "provider.sqlite",
+                start_worker=False, shutdown_timeout_seconds=0.05,
+            )
+            serving = threading.Thread(target=endpoint.serve_forever, daemon=True)
+            serving.start()
+            entered = threading.Event()
+            release = threading.Event()
+            original_submit = store.submit
+
+            def blocking_submit(*args: object, **kwargs: object) -> tuple[int, dict[str, str]]:
+                entered.set()
+                release.wait(2)
+                return original_submit(*args, **kwargs)
+
+            store.submit = blocking_submit  # type: ignore[method-assign]
+            response: list[int] = []
+
+            def post() -> None:
+                connection = http.client.HTTPConnection("127.0.0.1", endpoint.server_port, timeout=5)
+                try:
+                    payload = b"shutdown-inflight"
+                    body = json.dumps({
+                        "run_id": RUN,
+                        "operation_key": "shutdown",
+                        "payload_digest": hashlib.sha256(payload).hexdigest(),
+                        "payload_b64": b64encode(payload).decode("ascii"),
+                    })
+                    connection.request("POST", "/v1/operations", body, {"Content-Type": "application/json"})
+                    reply = connection.getresponse()
+                    response.append(reply.status)
+                    reply.read()
+                finally:
+                    connection.close()
+
+            request_thread = threading.Thread(target=post, daemon=True)
+            request_thread.start()
+            self.assertTrue(entered.wait(2))
+            with self.assertRaisesRegex(RuntimeError, "handler did not stop"):
+                endpoint.shutdown()
+            self.assertFalse(endpoint._async_closed)
+            # A failed stop must not close the provider while a handler can
+            # still reach the Store/provider dependency graph.
+            self.assertIn("provider_query", endpoint.provider.metrics())
+            release.set()
+            request_thread.join(timeout=5)
+            self.assertEqual(response, [201])
+            endpoint.server_close()
+            serving.join(timeout=5)
+            store.close()
+
+    def test_worker_stop_timeout_fails_closed_before_provider_close(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            store = Store(Path(temp) / "worker-shutdown.sqlite", catalog_digest=CATALOG)
+            endpoint = Endpoint(
+                ("127.0.0.1", 0), store, False,
+                provider_database=Path(temp) / "provider.sqlite", start_worker=False,
+            )
+            serving = threading.Thread(target=endpoint.serve_forever, daemon=True)
+            serving.start()
+            endpoint.worker.stop = lambda: False  # type: ignore[method-assign]
+            with self.assertRaisesRegex(RuntimeError, "worker did not stop"):
+                endpoint.shutdown()
+            self.assertFalse(endpoint._async_closed)
+            self.assertIn("provider_query", endpoint.provider.metrics())
+            endpoint.worker.stop = lambda: True  # type: ignore[method-assign]
+            endpoint.server_close()
+            serving.join(timeout=5)
+            store.close()
 
 
 if __name__ == "__main__":

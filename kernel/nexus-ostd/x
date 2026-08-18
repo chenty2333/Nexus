@@ -5,6 +5,308 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 readonly PATH
 root=$(cd "$(/usr/bin/dirname "$0")" && pwd)
 repo_root=$(cd "$root/../.." && pwd)
+
+# The build-stage verifier and the runtime use this same source-closure
+# enumerator.  Each record is a logical image path plus the source file and
+# mode that must populate it.  Keeping the logical path in the digest prevents
+# two different files with the same bytes from silently exchanging places.
+declare -a nexus_source_proof_records=()
+
+nexus_source_proof_context_ignored() {
+    local relative=$1
+    # Keep this narrow mirror of the root .dockerignore in sync with the
+    # context that Docker sends to the build.  The proof only enumerates
+    # production inputs below, so ignored worktrees and generated artifacts
+    # must not affect the host digest or become new production inputs.
+    case "$relative" in
+        .git|.git/*|*/.git|*/.git/* \
+            |.claude|.claude/*|*/.claude|*/.claude/* \
+            |AGENTS.md|*/AGENTS.md \
+            |target|target/*|*/target|*/target/* \
+            |artifacts|artifacts/*|*/artifacts|*/artifacts/* \
+            |mutants.out*|*/mutants.out* \
+            |fuzz/corpus|fuzz/corpus/*|*/fuzz/corpus|*/fuzz/corpus/* \
+            |fuzz/artifacts|fuzz/artifacts/*|*/fuzz/artifacts|*/fuzz/artifacts/* \
+            |kernel/nexus-ostd/guest/*.bin|kernel/nexus-ostd/guest/*.elf)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+nexus_source_proof_add_file() {
+    local source=$1
+    local logical=$2
+    if [[ $logical != /* || $logical == *$'\t'* || $logical == *$'\n'* ]]; then
+        echo "invalid source-proof logical path: $logical" >&2
+        return 1
+    fi
+    if [[ ! -f $source || -L $source ]] \
+        || [[ $(/usr/bin/realpath -e -- "$source") != "$source" ]]; then
+        echo "source-proof input must be a non-symlink regular file: $source" >&2
+        return 1
+    fi
+    nexus_source_proof_records+=("$logical"$'\t'"$source")
+}
+
+nexus_source_proof_add_tree() {
+    local source_dir=$1
+    local logical_dir=$2
+    local context_root=${3-}
+    local context_prefix=${4-}
+    if [[ ! -d $source_dir || -L $source_dir ]] \
+        || [[ $(/usr/bin/realpath -e -- "$source_dir") != "$source_dir" ]]; then
+        echo "source-proof input tree must be a non-symlink directory: $source_dir" >&2
+        return 1
+    fi
+    local symlink_records file_records sorted_records
+    symlink_records=$(mktemp)
+    file_records=$(mktemp)
+    sorted_records=$(mktemp)
+    if ! find "$source_dir" \
+        \( -type d \( -name target -o -name artifacts -o -name .git -o -name .claude \
+            -o -path '*/fuzz/corpus' -o -path '*/fuzz/artifacts' \) -prune \) -o \
+        -type l -print0 >"$symlink_records"; then
+        rm -f -- "$symlink_records" "$file_records" "$sorted_records"
+        echo "source-proof input tree traversal failed while checking symlinks: $source_dir" >&2
+        return 1
+    fi
+    local symlink source relative context_relative
+    while IFS= read -r -d '' symlink; do
+        if [[ -n $context_root ]]; then
+            if [[ -n $context_prefix ]]; then
+                context_relative="$context_prefix/${symlink#"$source_dir"/}"
+            else
+                context_relative=${symlink#"$context_root"/}
+            fi
+            if nexus_source_proof_context_ignored "$context_relative"; then
+                continue
+            fi
+        fi
+        rm -f -- "$symlink_records" "$file_records" "$sorted_records"
+        echo "source-proof input tree contains a symlink: $source_dir" >&2
+        return 1
+    done <"$symlink_records"
+    if ! find "$source_dir" \
+        \( -type d \( -name target -o -name artifacts -o -name .git -o -name .claude \
+            -o -path '*/fuzz/corpus' -o -path '*/fuzz/artifacts' \) -prune \) -o \
+        -type f -print0 >"$file_records"; then
+        rm -f -- "$symlink_records" "$file_records" "$sorted_records"
+        echo "source-proof input tree traversal failed while enumerating files: $source_dir" >&2
+        return 1
+    fi
+    if ! LC_ALL=C sort -z "$file_records" >"$sorted_records"; then
+        rm -f -- "$symlink_records" "$file_records" "$sorted_records"
+        echo "source-proof input tree sort failed: $source_dir" >&2
+        return 1
+    fi
+    while IFS= read -r -d '' source; do
+        relative=${source#"$source_dir"/}
+        if [[ -n $context_root ]]; then
+            if [[ -n $context_prefix ]]; then
+                context_relative="$context_prefix/$relative"
+            else
+                context_relative=${source#"$context_root"/}
+            fi
+            if nexus_source_proof_context_ignored "$context_relative"; then
+                continue
+            fi
+        fi
+        if ! nexus_source_proof_add_file "$source" "$logical_dir/$relative"; then
+            rm -f -- "$symlink_records" "$file_records" "$sorted_records"
+            return 1
+        fi
+    done <"$sorted_records"
+    rm -f -- "$symlink_records" "$file_records" "$sorted_records"
+}
+
+nexus_source_proof_validate_manifest() {
+    local manifest=$1
+    if [[ ! -f $manifest || -L $manifest ]] \
+        || [[ $(/usr/bin/realpath -e -- "$manifest") != "$manifest" ]]; then
+        echo "source-proof production manifest must be a non-symlink regular file: $manifest" >&2
+        return 1
+    fi
+    local relative previous=
+    local count=0
+    while IFS= read -r relative; do
+        if [[ ! $relative =~ ^[a-z0-9_./-]+\.rs$ ]] \
+            || [[ $relative == /* || $relative == ./* || $relative == *"/./"* ]] \
+            || [[ $relative == *".."* || $relative == *"//"* ]]; then
+            echo "invalid CSER production source path: $relative" >&2
+            return 1
+        fi
+        if [[ -n $previous && ! $previous < $relative ]]; then
+            echo "CSER production source manifest is not strictly sorted: $relative" >&2
+            return 1
+        fi
+        previous=$relative
+        ((count += 1))
+    done <"$manifest"
+    if ((count == 0)); then
+        echo "CSER production source manifest is empty: $manifest" >&2
+        return 1
+    fi
+}
+
+nexus_source_proof_collect() {
+    local repo_source=$1
+    local kernel_source=$2
+    nexus_source_proof_records=()
+
+    nexus_source_proof_add_tree "$repo_source/crates/cser-core" \
+        /crates/cser-core "$repo_source"
+    nexus_source_proof_add_tree "$repo_source/crates/cser-model" \
+        /crates/cser-model "$repo_source"
+    nexus_source_proof_add_tree "$repo_source/crates/nexus-ostd-virtio" \
+        /crates/nexus-ostd-virtio "$repo_source"
+    nexus_source_proof_add_tree "$kernel_source/src" /work/src "$repo_source" \
+        kernel/nexus-ostd/src
+    # The patch-tree closure includes the committed osdk-test-kernel-fetch.lock
+    # and virtio-drivers-0.13.0.lock fixture graphs used by the build stage.
+    nexus_source_proof_add_tree "$kernel_source/patches" /work/patches "$repo_source" \
+        kernel/nexus-ostd/patches
+    nexus_source_proof_add_tree "$kernel_source/scripts" /work/scripts "$repo_source" \
+        kernel/nexus-ostd/scripts
+    nexus_source_proof_add_tree "$kernel_source/osdk-runner-base" \
+        /work/osdk-runner-base "$repo_source" kernel/nexus-ostd/osdk-runner-base
+
+    local relative
+    for relative in \
+        Cargo.toml Cargo.lock OSDK.toml rust-toolchain.toml Dockerfile \
+        .dockerignore cser-production-sources.txt x; do
+        nexus_source_proof_add_file "$kernel_source/$relative" \
+            "/work/$relative"
+    done
+    nexus_source_proof_validate_manifest \
+        "$kernel_source/cser-production-sources.txt"
+    nexus_source_proof_add_file "$kernel_source/src/lib.rs" \
+        /kernel/nexus-ostd/src/lib.rs
+    nexus_source_proof_add_file "$kernel_source/cser-production-sources.txt" \
+        /kernel/nexus-ostd/cser-production-sources.txt
+    while IFS= read -r relative; do
+        nexus_source_proof_add_file "$kernel_source/src/cser/$relative" \
+            "/kernel/nexus-ostd/src/cser/$relative"
+    done <"$kernel_source/cser-production-sources.txt"
+
+    nexus_source_proof_add_file "$repo_source/Cargo.toml" \
+        /nexus-source-inputs/Cargo.toml
+    nexus_source_proof_add_file "$repo_source/Cargo.lock" \
+        /nexus-source-inputs/Cargo.lock
+    nexus_source_proof_add_file "$repo_source/.dockerignore" \
+        /nexus-source-inputs/repo.dockerignore
+    nexus_source_proof_add_file \
+        "$repo_source/tests/guest/linux/sources/linux-runtime-fs-smoke/runtime_fs_smoke.S" \
+        /nexus-source-inputs/runtime_fs_smoke.S
+
+    nexus_source_proof_add_file "$repo_source/patches/ostd-0.18.0-cser.patch" \
+        /tmp/nexus-patches/ostd-0.18.0-cser.patch
+    nexus_source_proof_add_file \
+        "$kernel_source/patches/ostd-0.18.0-cser-arena.patch" \
+        /tmp/nexus-patches/ostd-0.18.0-cser-arena.patch
+    nexus_source_proof_add_file \
+        "$repo_source/patches/virtio-drivers-0.13.0-cser.patch" \
+        /tmp/nexus-patches/virtio-drivers-0.13.0-cser.patch
+    nexus_source_proof_add_file \
+        "$repo_source/patches/virtio-drivers-0.13.0-LICENSE-MIT" \
+        /tmp/nexus-patches/virtio-drivers-0.13.0-LICENSE-MIT
+    nexus_source_proof_add_file "$kernel_source/patches/assert-ostd-cser-arena-patch.sh" \
+        /usr/local/bin/assert-ostd-cser-arena-patch
+    nexus_source_proof_add_file "$repo_source/patches/cser-cargo-config.toml" \
+        /root/.cargo/config.toml
+    nexus_source_proof_add_file "$repo_source/tools/ostd/assert-cser-patch.sh" \
+        /usr/local/bin/assert-ostd-cser-patch
+    nexus_source_proof_add_file "$repo_source/tools/virtio/assert-cser-patch.sh" \
+        /usr/local/bin/assert-virtio-cser-patch
+    nexus_source_proof_add_file \
+        "$repo_source/tools/virtio/assert-production-substrate.sh" \
+        /usr/local/bin/assert-production-virtio-substrate
+}
+
+nexus_source_proof_sorted_records() {
+    printf '%s\n' "${nexus_source_proof_records[@]}" \
+        | LC_ALL=C sort -t $'\t' -k1,1 -k2,2
+}
+
+nexus_source_proof_digest() {
+    local repo_source=$1
+    local kernel_source=$2
+    local candidate_root=${3-}
+    local records_input proof_input logical source previous=
+    local candidate digest count=0
+    records_input=$(mktemp)
+    proof_input=$(mktemp)
+    trap 'rm -f -- "$records_input" "$proof_input"' RETURN
+    nexus_source_proof_collect "$repo_source" "$kernel_source"
+    nexus_source_proof_sorted_records >"$records_input"
+    printf '%s\n' nexus.cser.image-source-proof.v3 >"$proof_input"
+    local source_mode candidate_mode
+    while IFS=$'\t' read -r logical source; do
+        [[ -n $logical ]] || continue
+        if [[ -n $previous && $previous == "$logical" ]]; then
+            echo "duplicate source-proof logical path: $logical" >&2
+            return 1
+        fi
+        previous=$logical
+        ((count += 1))
+        if [[ -n $candidate_root ]]; then
+            if [[ $candidate_root == / ]]; then
+                candidate=$logical
+            else
+                candidate="$candidate_root$logical"
+            fi
+            if [[ ! -f $candidate || -L $candidate ]] \
+                || [[ $(/usr/bin/realpath -e -- "$candidate") != "$candidate" ]]; then
+                echo "candidate source-proof input is missing or unsafe: $candidate" >&2
+                return 1
+            fi
+            if ! /usr/bin/cmp -- "$source" "$candidate"; then
+                echo "candidate source-proof input content mismatch: $candidate" >&2
+                return 1
+            fi
+            source_mode=$(/usr/bin/stat -c '%04a' -- "$source")
+            candidate_mode=$(/usr/bin/stat -c '%04a' -- "$candidate")
+            if [[ $source_mode != "$candidate_mode" ]]; then
+                echo "candidate source-proof input mode mismatch: $candidate" >&2
+                return 1
+            fi
+            digest=$(/usr/bin/sha256sum -- "$candidate" | /usr/bin/cut -d ' ' -f1)
+        else
+            source_mode=$(/usr/bin/stat -c '%04a' -- "$source")
+            digest=$(/usr/bin/sha256sum -- "$source" | /usr/bin/cut -d ' ' -f1)
+        fi
+        printf '%s\0%s\0%s\0' "$logical" "$source_mode" "$digest" >>"$proof_input"
+    done <"$records_input"
+    if ((count == 0)); then
+        echo 'source-proof input set is empty' >&2
+        return 1
+    fi
+    digest=$(/usr/bin/sha256sum -- "$proof_input" | /usr/bin/cut -d ' ' -f1)
+    printf 'nexus.cser.image-source-proof.v3\n%s\n' "$digest"
+}
+
+# Docker's verifier invokes this script from the read-only source mount.  This
+# keeps the verifier and runtime proof on one enumerator and one path-bound
+# digest format rather than maintaining a second manifest in the Dockerfile.
+if [[ ${NEXUS_SOURCE_PROOF_MODE:-} == verify ]]; then
+    : "${NEXUS_SOURCE_PROOF_REPO_ROOT:?missing NEXUS_SOURCE_PROOF_REPO_ROOT}"
+    : "${NEXUS_SOURCE_PROOF_KERNEL_ROOT:?missing NEXUS_SOURCE_PROOF_KERNEL_ROOT}"
+    : "${NEXUS_SOURCE_PROOF_CANDIDATE_ROOT:?missing NEXUS_SOURCE_PROOF_CANDIDATE_ROOT}"
+    nexus_source_proof_digest \
+        "$NEXUS_SOURCE_PROOF_REPO_ROOT" \
+        "$NEXUS_SOURCE_PROOF_KERNEL_ROOT" \
+        "$NEXUS_SOURCE_PROOF_CANDIDATE_ROOT"
+    exit 0
+fi
+if [[ ${NEXUS_SOURCE_PROOF_MODE:-} == digest ]]; then
+    : "${NEXUS_SOURCE_PROOF_REPO_ROOT:?missing NEXUS_SOURCE_PROOF_REPO_ROOT}"
+    : "${NEXUS_SOURCE_PROOF_KERNEL_ROOT:?missing NEXUS_SOURCE_PROOF_KERNEL_ROOT}"
+    nexus_source_proof_digest \
+        "$NEXUS_SOURCE_PROOF_REPO_ROOT" \
+        "$NEXUS_SOURCE_PROOF_KERNEL_ROOT"
+    exit 0
+fi
+
 docker_bin=/usr/bin/docker
 if [[ ! -f $docker_bin || ! -x $docker_bin || -L $docker_bin ]] \
     || [[ $(/usr/bin/realpath -e -- "$docker_bin") != "$docker_bin" ]]; then
@@ -13,7 +315,7 @@ if [[ ! -f $docker_bin || ! -x $docker_bin || -L $docker_bin ]] \
 fi
 readonly docker_bin
 capture_helper="$root/scripts/qemu-stream-capture.sh"
-capture_helper_sha256=b05544fb66e5d124fb141696accb1933742de561469f1c9e4a12eef3c6c5e7b7
+capture_helper_sha256=1ad0736dffb798c2ce77410ca8dedb2ab89f121e33783a7ab2267030d5c7e70c
 if [[ ! -f $capture_helper || -L $capture_helper ]] \
     || [[ $(/usr/bin/realpath -e -- "$capture_helper") != "$capture_helper" ]]; then
     echo "QEMU capture helper must be a non-symlink regular file: $capture_helper" >&2
@@ -71,94 +373,82 @@ if ((${#cser_production_sources[@]} == 0)); then
 fi
 readonly production_source_manifest
 readonly -a cser_production_sources cser_source_hash_inputs cser_source_mount_args
-mapfile -d '' -t cser_model_image_inputs < <(
-    find "$repo_root/crates/cser-model" -type f -print0 | sort -z
+# Hash the complete canonical source closure consumed by the pinned image.
+# Runtime serial oracles execute from mounted worktrees and therefore do not
+# add their unrelated inputs to this cache key.
+mapfile -t image_source_proof_lines < <(
+    nexus_source_proof_digest "$repo_root" "$root"
 )
-if ((${#cser_model_image_inputs[@]} == 0)) \
-    || find "$repo_root/crates/cser-model" -type l -print -quit | grep -q .; then
-    echo "cser-model image inputs must be non-empty regular files without symlinks" >&2
+if ((${#image_source_proof_lines[@]} != 2)) \
+    || [[ ${image_source_proof_lines[0]} != nexus.cser.image-source-proof.v3 ]] \
+    || [[ ! ${image_source_proof_lines[1]} =~ ^[0-9a-f]{64}$ ]]; then
+    echo 'canonical image source closure returned an invalid digest' >&2
     exit 1
 fi
-readonly -a cser_model_image_inputs
-# Hash only inputs consumed while building the pinned image. Runtime serial
-# oracles execute from the mounted worktree and must not force an image rebuild.
-image_key=$(sha256sum \
-    "$repo_root/Cargo.toml" \
-    "$repo_root/Cargo.lock" \
-    "$root/Dockerfile" \
-    "$root/.dockerignore" \
-    "$repo_root/.dockerignore" \
-    "$repo_root/tests/guest/linux/sources/linux-runtime-fs-smoke/runtime_fs_smoke.S" \
-    "$root/Cargo.toml" \
-    "$root/Cargo.lock" \
-    "$root/OSDK.toml" \
-    "$root/rust-toolchain.toml" \
-    "$root/osdk-runner-base/Cargo.toml" \
-    "$root/osdk-runner-base/Cargo.lock" \
-    "$root/osdk-runner-base/src/main.rs" \
-    "$root/osdk-runner-base/x86_64.ld" \
-    "$root/osdk-runner-base/riscv64.ld" \
-    "$root/osdk-runner-base/loongarch64.ld" \
-    "$root/scripts/build-runtime-fs.sh" \
-    "$root/scripts/assert-runtime-fs-artifacts.sh" \
-    "$root/scripts/build-runtime-fs-block-image.sh" \
-    "$root/scripts/assert-runtime-fs-block-image.sh" \
-    "$root/src/lib.rs" \
-    "$repo_root/crates/cser-core/Cargo.toml" \
-    "$repo_root/crates/cser-core/src/domain.rs" \
-    "$repo_root/crates/cser-core/src/engine.rs" \
-    "$repo_root/crates/cser-core/src/identity.rs" \
-    "$repo_root/crates/cser-core/src/journal.rs" \
-    "$repo_root/crates/cser-core/src/lib.rs" \
-    "$repo_root/crates/cser-core/src/persistence.rs" \
-    "$repo_root/crates/cser-core/src/profiles.rs" \
-    "$repo_root/crates/cser-core/src/bin/cser-catalog-digest.rs" \
-    "${cser_model_image_inputs[@]}" \
-    "$repo_root/crates/nexus-ostd-virtio/Cargo.toml" \
-    "$repo_root/crates/nexus-ostd-virtio/Cargo.lock" \
-    "$repo_root/crates/nexus-ostd-virtio/README.md" \
-    "$repo_root/crates/nexus-ostd-virtio/src/boot_quarantine.rs" \
-    "$repo_root/crates/nexus-ostd-virtio/src/lib.rs" \
-    "$repo_root/crates/nexus-ostd-virtio/src/dma.rs" \
-    "$repo_root/crates/nexus-ostd-virtio/src/pci.rs" \
-    "$repo_root/crates/nexus-ostd-virtio/src/production.rs" \
-    "$repo_root/patches/ostd-0.18.0-cser.patch" \
-    "$root/patches/ostd-0.18.0-cser-arena.patch" \
-    "$root/patches/assert-ostd-cser-arena-patch.sh" \
-    "$repo_root/patches/virtio-drivers-0.13.0-cser.patch" \
-    "$repo_root/patches/virtio-drivers-0.13.0-LICENSE-MIT" \
-    "$repo_root/patches/cser-cargo-config.toml" \
-    "$repo_root/tools/ostd/assert-cser-patch.sh" \
-    "$repo_root/tools/virtio/assert-cser-patch.sh" \
-    "$repo_root/tools/virtio/assert-production-substrate.sh" \
-    "$production_source_manifest" \
-    "${cser_source_hash_inputs[@]}" | cut -d ' ' -f1 | sha256sum | cut -c1-16)
+image_key=${image_source_proof_lines[1]:0:16}
 image="nexus/nexus-ostd:$image_key"
 runner_base="$root/osdk-runner-base"
 runner_target="$root/target/osdk/nexus-kernel-run-base"
 
 current_cser_source_proof() (
     set -euo pipefail
-    local proof_input relative digest
-    proof_input=$(mktemp)
-    trap 'rm -f -- "$proof_input"' EXIT
-    printf '%s\n' nexus.cser.image-source-proof.v1 >"$proof_input"
-    digest=$(sha256sum -- "$production_source_manifest" | cut -d ' ' -f1)
-    printf '%s  %s\n' "$digest" \
-        /candidate-root/kernel/nexus-ostd/cser-production-sources.txt \
-        >>"$proof_input"
-    digest=$(sha256sum -- "$root/src/lib.rs" | cut -d ' ' -f1)
-    printf '%s  %s\n' "$digest" \
-        /candidate-root/kernel/nexus-ostd/src/lib.rs \
-        >>"$proof_input"
-    while IFS= read -r relative; do
-        digest=$(sha256sum -- "$root/src/cser/$relative" | cut -d ' ' -f1)
-        printf '%s  %s\n' "$digest" \
-            "/candidate-root/kernel/nexus-ostd/src/cser/$relative" \
-            >>"$proof_input"
-    done <"$production_source_manifest"
-    sha256sum -- "$proof_input" | cut -d ' ' -f1
+    local -a proof_lines
+    mapfile -t proof_lines < <(nexus_source_proof_digest "$repo_root" "$root")
+    if ((${#proof_lines[@]} != 2)) \
+        || [[ ${proof_lines[0]} != nexus.cser.image-source-proof.v3 ]] \
+        || [[ ! ${proof_lines[1]} =~ ^[0-9a-f]{64}$ ]]; then
+        echo 'canonical runtime source closure returned an invalid digest' >&2
+        return 1
+    fi
+    printf '%s\n' "${proof_lines[1]}"
 )
+
+read_image_source_proof() (
+    set -euo pipefail
+    local container_id=
+    local proof_dir
+    proof_dir=$(mktemp -d)
+    cleanup_image_proof() {
+        if [[ -n $container_id ]]; then
+            command "$docker_bin" rm "$container_id" >/dev/null 2>&1 || true
+        fi
+        rm -rf -- "$proof_dir"
+    }
+    trap cleanup_image_proof EXIT
+
+    # Inspect the marker without executing any program from a cached or
+    # manually retagged image and without exposing repository mounts to it.
+    container_id=$(command "$docker_bin" create --platform linux/amd64 "$image")
+    command "$docker_bin" cp \
+        "$container_id:/nexus-cser-verified" \
+        "$proof_dir/nexus-cser-verified"
+    if [[ ! -f $proof_dir/nexus-cser-verified \
+        || -L $proof_dir/nexus-cser-verified ]]; then
+        echo 'pinned image lacks a regular CSER source-proof marker' >&2
+        return 1
+    fi
+    command cat -- "$proof_dir/nexus-cser-verified"
+)
+
+verified_image_source_proof() {
+    local image_source_proof current_source_proof
+    local -a proof_lines
+
+    image_source_proof=$(read_image_source_proof) || return 1
+    mapfile -t proof_lines <<<"$image_source_proof"
+    if ((${#proof_lines[@]} != 2)) \
+        || [[ ${proof_lines[0]} != nexus.cser.image-source-proof.v3 ]] \
+        || [[ ! ${proof_lines[1]} =~ ^[0-9a-f]{64}$ ]]; then
+        echo 'pinned image returned an invalid CSER source proof' >&2
+        return 1
+    fi
+    current_source_proof=$(current_cser_source_proof) || return 1
+    if [[ ${proof_lines[1]} != "$current_source_proof" ]]; then
+        echo 'pinned image CSER source proof does not match the current canonical source closure' >&2
+        return 1
+    fi
+    printf '%s\n' "${proof_lines[@]}"
+}
 
 build_image() {
     local -a rebuild_args=()
@@ -256,6 +546,7 @@ ensure_image() {
         || ! command "$docker_bin" image inspect "$image" >/dev/null 2>&1; then
         build_image
     fi
+    verified_image_source_proof >/dev/null
 }
 
 check_ostd_patch() {
@@ -1870,8 +2161,8 @@ capture_cser_smp_smoke() {
         'persistence=fail-closed' \
         'transactions=1' \
         'tcg=multi'
-    smp_marker_line=$(tr -d '\r' <"$artifact_dir/serial.log" \
-        | grep -F 'CSER_SMP_IPI PASS' | tail -n 1)
+    smp_marker_line=$(core_persistent_marker_line \
+        "$artifact_dir/serial.log" 'CSER_SMP_IPI PASS') || return 1
     for metric in lock_wait_cycles lock_hold_cycles; do
         if [[ ! $smp_marker_line =~ (^|[[:space:]])${metric}=[0-9]+($|[[:space:]]) ]]; then
             echo "CSER SMP marker lacks numeric $metric: $smp_marker_line" >&2
@@ -2063,9 +2354,9 @@ capture_core_schema8_negative_boot() {
         echo 'schema-8 negative boot published or duplicated a production result' >&2
         return 1
     fi
-    migration_marker=$(tr -d '\r' \
-        <"$core_persistent_artifact_dir/schema8-negative-serial.log" \
-        | grep -F 'CSER_CORE_SCHEMA8_MIGRATION_REQUIRED PASS' | tail -n 1)
+    migration_marker=$(core_persistent_marker_line \
+        "$core_persistent_artifact_dir/schema8-negative-serial.log" \
+        'CSER_CORE_SCHEMA8_MIGRATION_REQUIRED PASS') || return 1
     assert_core_schema8_post_quarantine_trace \
         "$core_persistent_artifact_dir/schema8-negative-qemu-debug.log" \
         "$migration_marker"
@@ -2086,13 +2377,16 @@ capture_core_schema8_negative_boot() {
     echo "CSER_CORE_SCHEMA8_QEMU_NEGATIVE PASS selected_revision=$core_schema8_fixture_revision_number selected_head=$core_schema8_fixture_head selected_catalog=$core_schema8_fixture_catalog expected_catalog=$catalog_digest trusted_tpm_candidate_selected=true current_binding_authorized=false typed_error=migration-required registry_publication=false post_quarantine_activation=false device_quarantined=true device_guard_retained=true arena_withheld=true pci_bus_master_fence_readback=true isr_drain=two-empty-reads iotlb_completion=true tpm_selected_nv_unchanged=true tpm_selected_coordinate_digest=$tpm_coordinate_digest tpm_tip_counter_hex=$tip_counter tpm_tip_selected_slot=$tip_slot tpm_lease_counter_hex=$lease_counter tpm_lease_selected_slot=$lease_slot"
 }
 
-require_core_persistent_marker() {
+core_persistent_marker_line() {
     local serial=$1
     local marker=$2
-    shift 2
-    local line field
-    if ! line=$(tr -d '\r' <"$serial" | awk -v marker="$marker" '
-        function marker_matches(line,    expected_count, line_count, i, j) {
+    local fail_marker=
+    if [[ $marker == *' PASS' ]]; then
+        fail_marker="${marker% PASS} FAIL"
+    fi
+    tr -d '\r' <"$serial" | awk -v pass_marker="$marker" \
+        -v fail_marker="$fail_marker" '
+        function marker_matches(line, marker,    expected_count, line_count, i, j) {
             expected_count = split(marker, expected, /[[:space:]]+/)
             line_count = split(line, tokens, /[[:space:]]+/)
             for (i = 1; i <= line_count - expected_count + 1; i++) {
@@ -2105,14 +2399,28 @@ require_core_persistent_marker() {
             }
             return 0
         }
-        marker_matches($0) { found = $0 }
-        END {
-            if (found == "")
-                exit 1
-            print found
+        marker_matches($0, pass_marker) {
+            pass_count++
+            pass_line = $0
         }
-    '); then
-        echo "missing persistent recovery marker '$marker' in $serial" >&2
+        fail_marker != "" && marker_matches($0, fail_marker) {
+            fail_count++
+        }
+        END {
+            if (pass_count != 1 || fail_count != 0)
+                exit 1
+            print pass_line
+        }
+    '
+}
+
+require_core_persistent_marker() {
+    local serial=$1
+    local marker=$2
+    shift 2
+    local line field
+    if ! line=$(core_persistent_marker_line "$serial" "$marker"); then
+        echo "persistent recovery marker '$marker' is not exactly one PASS with no FAIL in $serial" >&2
         return 1
     fi
     for field in "$@"; do
@@ -2251,7 +2559,7 @@ core_persistent_marker_bounded_decimal() {
 
 selftest_core_persistent_marker_parser() (
     set -euo pipefail
-    local valid invalid tmp serial
+    local valid invalid contradictory tmp serial
     valid='CSER_CORE_PERSISTENT_BOOT1 PASS executor_generation=1 service_executor_generation=1'
     invalid='CSER_CORE_PERSISTENT_BOOT1 PASS executor_generation=1x service_executor_generation=1'
     if [[ ! $(core_persistent_marker_value "$valid" executor_generation) == 1 ]]; then
@@ -2281,7 +2589,20 @@ selftest_core_persistent_marker_parser() (
         echo 'persistent marker parser accepted a non-exact key=value token' >&2
         return 1
     fi
-    echo 'persistent marker parser self-test: PASS exact_key_value=true suffix_rejected=true'
+    printf '%s\n%s\n' "$valid" "$valid" >"$serial"
+    if core_persistent_marker_line \
+        "$serial" 'CSER_CORE_PERSISTENT_BOOT1 PASS' >/dev/null 2>&1; then
+        echo 'persistent marker parser accepted duplicate PASS results' >&2
+        return 1
+    fi
+    contradictory=${valid/PASS/FAIL}
+    printf '%s\n%s\n' "$valid" "$contradictory" >"$serial"
+    if core_persistent_marker_line \
+        "$serial" 'CSER_CORE_PERSISTENT_BOOT1 PASS' >/dev/null 2>&1; then
+        echo 'persistent marker parser accepted contradictory PASS and FAIL results' >&2
+        return 1
+    fi
+    echo 'persistent marker parser self-test: PASS exact_key_value=true suffix_rejected=true duplicate_pass_rejected=true contradictory_status_rejected=true'
 )
 
 core_persistent_trace_has_exact_dma_mapping() {
@@ -2578,20 +2899,8 @@ capture_core_persistent_run() {
         echo "unfrozen CSER coordinates: api=$core_api_profile catalog=$catalog_version projection=$projection_version snapshot=$snapshot_version journal=$journal_schema" >&2
         return 1
     fi
-    image_source_proof=$(container cat /nexus-cser-verified)
+    image_source_proof=$(verified_image_source_proof) || return 1
     mapfile -t image_source_proof_lines <<<"$image_source_proof"
-    if ((${#image_source_proof_lines[@]} != 2)) \
-        || [[ ${image_source_proof_lines[0]} != nexus.cser.image-source-proof.v1 ]] \
-        || [[ ! ${image_source_proof_lines[1]} =~ ^[0-9a-f]{64}$ ]]; then
-        echo 'pinned image returned an invalid CSER source proof' >&2
-        return 1
-    fi
-    local current_source_proof
-    current_source_proof=$(current_cser_source_proof)
-    if [[ ${image_source_proof_lines[1]} != "$current_source_proof" ]]; then
-        echo 'pinned image CSER source proof does not match the current production closure' >&2
-        return 1
-    fi
     capture_core_schema8_negative_boot "$catalog_digest"
     ram_backing_size=$(stat -c %s -- "$core_persistent_ram")
     ram_backing_identity=$(stat -c '%d:%i' -- "$core_persistent_ram")
@@ -2856,21 +3165,21 @@ capture_core_persistent_run() {
     local schema8_tpm_state_sha256 schema8_tpm_coordinate_digest
     local schema8_tpm_tip_counter schema8_tpm_lease_counter
     local schema8_tpm_tip_slot schema8_tpm_lease_slot
-    schema8_negative_marker=$(tr -d '\r' \
-        <"$core_persistent_artifact_dir/schema8-negative-serial.log" \
-        | grep -F 'CSER_CORE_SCHEMA8_MIGRATION_REQUIRED PASS' | tail -n 1)
-    boot1_marker=$(tr -d '\r' \
-        <"$core_persistent_artifact_dir/boot1-serial.log" \
-        | grep -F 'CSER_CORE_PERSISTENT_BOOT1 PASS' | tail -n 1)
-    boot2_marker=$(tr -d '\r' \
-        <"$core_persistent_artifact_dir/boot2-serial.log" \
-        | grep -F 'CSER_CORE_PERSISTENT_BOOT2 PASS' | tail -n 1)
-    boot3_marker=$(tr -d '\r' \
-        <"$core_persistent_artifact_dir/boot3-serial.log" \
-        | grep -F 'CSER_CORE_PERSISTENT_BOOT3 PASS' | tail -n 1)
-    boot4_marker=$(tr -d '\r' \
-        <"$core_persistent_artifact_dir/boot4-serial.log" \
-        | grep -F 'CSER_CORE_PERSISTENT_BOOT4 PASS' | tail -n 1)
+    schema8_negative_marker=$(core_persistent_marker_line \
+        "$core_persistent_artifact_dir/schema8-negative-serial.log" \
+        'CSER_CORE_SCHEMA8_MIGRATION_REQUIRED PASS') || return 1
+    boot1_marker=$(core_persistent_marker_line \
+        "$core_persistent_artifact_dir/boot1-serial.log" \
+        'CSER_CORE_PERSISTENT_BOOT1 PASS') || return 1
+    boot2_marker=$(core_persistent_marker_line \
+        "$core_persistent_artifact_dir/boot2-serial.log" \
+        'CSER_CORE_PERSISTENT_BOOT2 PASS') || return 1
+    boot3_marker=$(core_persistent_marker_line \
+        "$core_persistent_artifact_dir/boot3-serial.log" \
+        'CSER_CORE_PERSISTENT_BOOT3 PASS') || return 1
+    boot4_marker=$(core_persistent_marker_line \
+        "$core_persistent_artifact_dir/boot4-serial.log" \
+        'CSER_CORE_PERSISTENT_BOOT4 PASS') || return 1
     printf '%s\n' "$boot1_marker" \
         >"$core_persistent_artifact_dir/boot1-marker.txt"
     printf '%s\n' "$boot2_marker" \
@@ -2898,15 +3207,15 @@ capture_core_persistent_run() {
         echo 'persistent RAM backend was replaced or resized across the four boots' >&2
         return 1
     fi
-    reply_evidence_marker=$(tr -d '\r' \
-        <"$core_persistent_artifact_dir/reply-evidence-serial.log" \
-        | grep -F 'CSER_CORE_OSTD_TASK_RECOVERY PASS' | tail -n 1)
-    dma_hardware_marker=$(tr -d '\r' \
-        <"$core_persistent_artifact_dir/dma-evidence-serial.log" \
-        | grep -F 'CSER_CORE_DMA HardwareClosure PASS' | tail -n 1)
-    dma_runtime_marker=$(tr -d '\r' \
-        <"$core_persistent_artifact_dir/dma-evidence-serial.log" \
-        | grep -F 'CSER_CORE_DMA_OSTD_QEMU PASS' | tail -n 1)
+    reply_evidence_marker=$(core_persistent_marker_line \
+        "$core_persistent_artifact_dir/reply-evidence-serial.log" \
+        'CSER_CORE_OSTD_TASK_RECOVERY PASS') || return 1
+    dma_hardware_marker=$(core_persistent_marker_line \
+        "$core_persistent_artifact_dir/dma-evidence-serial.log" \
+        'CSER_CORE_DMA HardwareClosure PASS') || return 1
+    dma_runtime_marker=$(core_persistent_marker_line \
+        "$core_persistent_artifact_dir/dma-evidence-serial.log" \
+        'CSER_CORE_DMA_OSTD_QEMU PASS') || return 1
 
     docker_image_id=$("$docker_bin" image inspect --format '{{.Id}}' "$image")
     git_revision=$(git -C "$repo_root" rev-parse --verify HEAD)

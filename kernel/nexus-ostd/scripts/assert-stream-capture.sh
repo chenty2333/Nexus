@@ -199,4 +199,38 @@ if [[ "$long_failure_status" -ne 24 ]] ||
     exit 1
 fi
 
+# A signal to the capture shell must also terminate a target process group.
+# Keep TERM ignored in the fixture so this exercises the bounded KILL fallback,
+# then verify the target wrapper was reaped rather than left behind by EXIT
+# cleanup.
+signal_target_pid_file="$work/signal-target.pid"
+signal_fixture() {
+    printf 'signal-ready\n'
+    printf '%s\n' "$BASHPID" >"$signal_target_pid_file"
+    trap ':' TERM
+    while :; do sleep 1; done
+}
+set +e
+capture_qemu_streams \
+    "$work/signal-serial.log" "$work/signal-debug.log" \
+    signal_fixture >"$work/signal-report.log" 2>&1 &
+capture_pid=$!
+for _ in {1..100}; do
+    [[ -s $signal_target_pid_file ]] && break
+    sleep .02
+done
+signal_target_pid=$(<"$signal_target_pid_file")
+# Bash creates a small job wrapper when a function is backgrounded. Signal the
+# actual capture subshell (the target's parent), as a supervisor would signal
+# the capture process in the production foreground path.
+capture_process_pid=$(ps -o ppid= -p "$signal_target_pid" | tr -d ' ')
+kill -TERM "$capture_process_pid" 2>/dev/null || true
+wait "$capture_pid"
+signal_capture_status=$?
+set -e
+if [[ "$signal_capture_status" -eq 0 ]] || kill -0 "$signal_target_pid" 2>/dev/null; then
+    echo 'split capture signal cleanup left the target process group alive' >&2
+    exit 1
+fi
+
 echo 'QEMU split-stream capture assertions: PASS legacy_byte_interleave=reproduced raw_inputs_isolated=true live_replay=false failure_tail_bytes=65536 errexit=preserved partial=preserved setup_failure_cleanup=true setup_failure_target=false long_record=preserved caller_backpressure=isolated'

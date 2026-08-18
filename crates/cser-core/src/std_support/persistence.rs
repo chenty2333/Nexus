@@ -9,6 +9,7 @@
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, Write},
+    panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
 };
 
@@ -34,6 +35,9 @@ pub enum HostAnchorFailpoint {
     BeforeAtomicReplace,
     /// Atomically install and sync the replacement, then lose its acknowledgement.
     AfterAtomicReplaceBeforeReturn,
+    /// Atomically install and sync the replacement, then panic before the
+    /// caller receives an acknowledgement.
+    PanicAfterAtomicReplaceBeforeReturn,
 }
 
 /// Failure from [`HostFileTrustedAnchor`].
@@ -47,6 +51,12 @@ pub enum HostAnchorError {
     Protocol(PersistenceProtocolError),
     /// A configured crash point fired.
     Injected(HostAnchorFailpoint),
+    /// The atomic replacement panicked after entering the filesystem
+    /// operation. The handle is permanently poisoned and must be reopened.
+    AtomicWritePanicked,
+    /// This handle observed an ambiguous filesystem mutation. Drop and
+    /// reopen it before reserving, advancing, or observing its state.
+    RecoveryRequired,
 }
 
 impl From<io::Error> for HostAnchorError {
@@ -79,6 +89,7 @@ pub struct HostFileTrustedAnchor {
     lock: File,
     state: HostAnchorState,
     failpoint: HostAnchorFailpoint,
+    recovery_required: bool,
 }
 
 impl HostFileTrustedAnchor {
@@ -127,6 +138,7 @@ impl HostFileTrustedAnchor {
             lock,
             state,
             failpoint: HostAnchorFailpoint::None,
+            recovery_required: false,
         })
     }
 
@@ -135,16 +147,54 @@ impl HostFileTrustedAnchor {
         self.failpoint = failpoint;
     }
 
-    /// Returns the currently decoded host-file state.
-    pub const fn committed(&self) -> TrustedAnchorSnapshot {
-        self.state.committed
+    /// Returns the currently decoded host-file state while this handle is
+    /// still authoritative.
+    ///
+    /// After an ambiguous filesystem error the in-memory state may no longer
+    /// describe the durable file (for example, an atomic rename may have
+    /// succeeded before its acknowledgement was lost). Such observations are
+    /// therefore rejected until this object is dropped and reopened.
+    pub fn committed(&self) -> Result<TrustedAnchorSnapshot, HostAnchorError> {
+        self.ensure_usable()?;
+        Ok(self.state.committed)
+    }
+
+    /// Returns whether this handle has observed an ambiguous filesystem
+    /// mutation and must be dropped and reopened.
+    pub const fn recovery_required(&self) -> bool {
+        self.recovery_required
+    }
+
+    fn ensure_usable(&self) -> Result<(), HostAnchorError> {
+        if self.recovery_required {
+            Err(HostAnchorError::RecoveryRequired)
+        } else {
+            Ok(())
+        }
     }
 
     fn replace(&mut self, state: HostAnchorState) -> Result<(), HostAnchorError> {
+        self.ensure_usable()?;
         let failpoint = core::mem::replace(&mut self.failpoint, HostAnchorFailpoint::None);
-        write_atomic(&self.path, state, failpoint)?;
-        self.state = state;
-        Ok(())
+        match catch_unwind(AssertUnwindSafe(|| {
+            write_atomic(&self.path, state, failpoint)
+        })) {
+            Ok(Ok(())) => {
+                // The file and its parent directory are durable before this
+                // in-memory authority moves. This assignment must remain the
+                // final fallible-operation boundary.
+                self.state = state;
+                Ok(())
+            }
+            Ok(Err(error)) => {
+                self.recovery_required = true;
+                Err(error)
+            }
+            Err(_) => {
+                self.recovery_required = true;
+                Err(HostAnchorError::AtomicWritePanicked)
+            }
+        }
     }
 }
 
@@ -162,6 +212,7 @@ impl TrustedAnchorBackend for HostFileTrustedAnchor {
         binding: RecoveryBinding,
         observed_device: DeviceGeneration,
     ) -> Result<RecoveryLease, Self::Error> {
+        self.ensure_usable()?;
         if binding != self.state.committed.binding() {
             return Err(PersistenceProtocolError::BindingMismatch.into());
         }
@@ -200,6 +251,7 @@ impl TrustedAnchorBackend for HostFileTrustedAnchor {
         expected: TrustedAnchorSnapshot,
         replacement: TrustedAnchorSnapshot,
     ) -> Result<(), Self::Error> {
+        self.ensure_usable()?;
         if expected != self.state.committed {
             return Err(PersistenceProtocolError::StaleJournalHead.into());
         }
@@ -243,6 +295,9 @@ fn write_atomic(
     sync_parent_directory(path)?;
     if failpoint == HostAnchorFailpoint::AfterAtomicReplaceBeforeReturn {
         return Err(HostAnchorError::Injected(failpoint));
+    }
+    if failpoint == HostAnchorFailpoint::PanicAfterAtomicReplaceBeforeReturn {
+        panic!("injected host trusted-anchor panic after atomic replacement");
     }
     Ok(())
 }
@@ -433,4 +488,169 @@ fn take_array<const N: usize>(
 
 fn sync_parent_directory(path: &Path) -> io::Result<()> {
     File::open(path.parent().unwrap_or_else(|| Path::new(".")))?.sync_all()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
+    use super::*;
+    use crate::{CatalogSet, RecoveryProfile, RegistryInstance, WorldId, standard_catalog};
+
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(1);
+
+    struct TempAnchor {
+        directory: PathBuf,
+        path: PathBuf,
+    }
+
+    impl TempAnchor {
+        fn new(label: &str) -> Self {
+            let sequence = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+            let directory = std::env::temp_dir().join(format!(
+                "nexus-cser-host-anchor-{label}-{}-{sequence}",
+                std::process::id()
+            ));
+            fs::create_dir(&directory).expect("create isolated anchor test directory");
+            let path = directory.join("anchor.bin");
+            Self { directory, path }
+        }
+    }
+
+    impl Drop for TempAnchor {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.directory);
+        }
+    }
+
+    fn binding() -> RecoveryBinding {
+        RecoveryBinding::new(
+            RecoveryProfile::current(),
+            WorldId::new(7).expect("test world is nonzero"),
+            CatalogSet::new(&[standard_catalog()])
+                .expect("test catalog is valid")
+                .digest(),
+            RegistryInstance::new(3).expect("test registry is nonzero"),
+        )
+        .expect("test recovery binding is valid")
+    }
+
+    fn freshness(boot: u64, device: u64, journal: u64) -> Freshness {
+        Freshness::new(
+            BootGeneration::new(boot).expect("test boot is nonzero"),
+            binding().registry(),
+            DeviceGeneration::new(device).expect("test device is nonzero"),
+            JournalGeneration::new(journal).expect("test journal is nonzero"),
+        )
+    }
+
+    fn open(temp: &TempAnchor) -> HostFileTrustedAnchor {
+        HostFileTrustedAnchor::open_or_initialize(
+            &temp.path,
+            binding(),
+            freshness(1, 1, 1),
+            Digest::new([0xabu8; 32]),
+        )
+        .expect("open host anchor")
+    }
+
+    #[test]
+    fn ambiguous_before_rename_poison_rejects_reuse_and_reopens_old_truth() {
+        let temp = TempAnchor::new("before-rename");
+        let mut anchor = open(&temp);
+        let old = anchor.committed().expect("unpoisoned observation");
+
+        anchor.set_failpoint(HostAnchorFailpoint::BeforeAtomicReplace);
+        let error = anchor
+            .reserve_recovery_epoch(binding(), DeviceGeneration::new(2).unwrap())
+            .expect_err("injected pre-rename failure");
+        assert!(matches!(
+            error,
+            HostAnchorError::Injected(HostAnchorFailpoint::BeforeAtomicReplace)
+        ));
+        assert!(anchor.recovery_required());
+        assert!(matches!(
+            anchor.committed(),
+            Err(HostAnchorError::RecoveryRequired)
+        ));
+
+        let replacement = TrustedAnchorSnapshot::from_trusted_backend(
+            binding(),
+            old.committed_freshness(),
+            1,
+            Digest::new([0x11; 32]),
+            Digest::new([0x22; 32]),
+        )
+        .expect("test replacement is valid");
+        assert!(matches!(
+            anchor.compare_and_advance(old, replacement),
+            Err(HostAnchorError::RecoveryRequired)
+        ));
+
+        drop(anchor);
+        let mut reopened = open(&temp);
+        assert_eq!(reopened.committed().expect("reopened observation"), old);
+        let lease = reopened
+            .reserve_recovery_epoch(binding(), DeviceGeneration::new(2).unwrap())
+            .expect("reopened old durable state remains usable");
+        assert_eq!(lease.next_freshness(), freshness(2, 2, 2));
+    }
+
+    #[test]
+    fn ambiguous_after_rename_poison_reopens_at_durable_replacement() {
+        let temp = TempAnchor::new("after-rename");
+        let mut anchor = open(&temp);
+        let old = anchor.committed().expect("unpoisoned observation");
+
+        anchor.set_failpoint(HostAnchorFailpoint::AfterAtomicReplaceBeforeReturn);
+        let error = anchor
+            .reserve_recovery_epoch(binding(), DeviceGeneration::new(2).unwrap())
+            .expect_err("injected lost acknowledgement");
+        assert!(matches!(
+            error,
+            HostAnchorError::Injected(HostAnchorFailpoint::AfterAtomicReplaceBeforeReturn)
+        ));
+        assert!(anchor.recovery_required());
+        drop(anchor);
+
+        let mut reopened = open(&temp);
+        assert_eq!(reopened.committed().expect("reopened observation"), old);
+        // The failed reserve installed the new issued epoch before losing its
+        // acknowledgement. Reopening must use that durable truth rather than
+        // the stale in-memory state from the dropped handle.
+        let lease = reopened
+            .reserve_recovery_epoch(binding(), DeviceGeneration::new(2).unwrap())
+            .expect("reopened durable state remains usable");
+        assert_eq!(lease.next_freshness(), freshness(3, 2, 3));
+    }
+
+    #[test]
+    fn precondition_errors_do_not_poison_the_handle() {
+        let temp = TempAnchor::new("precondition");
+        let mut anchor = open(&temp);
+        let old = anchor.committed().expect("unpoisoned observation");
+        let wrong_binding = RecoveryBinding::new(
+            RecoveryProfile::current(),
+            old.binding().world(),
+            Digest::new([0x33; 32]),
+            old.binding().registry(),
+        )
+        .expect("wrong binding is structurally valid");
+
+        assert!(matches!(
+            anchor.reserve_recovery_epoch(wrong_binding, DeviceGeneration::new(2).unwrap()),
+            Err(HostAnchorError::Protocol(
+                PersistenceProtocolError::BindingMismatch
+            ))
+        ));
+        assert!(!anchor.recovery_required());
+        assert_eq!(
+            anchor.committed().expect("precondition keeps state usable"),
+            old
+        );
+    }
 }

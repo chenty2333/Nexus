@@ -30,26 +30,129 @@
 use alloc::{boxed::Box, vec::Vec};
 use core::convert::Infallible;
 
+#[cfg(ktest)]
+use cser_core::scan_journal_to_head;
 use cser_core::{
     CatalogSet, Command, CommandRequest, CoordinatedPersistence, CoordinatedPersistenceError,
-    CoreError, CoreLimits, DeviceGeneration, DurableJournalBackend, Engine, JournalRepair,
-    RecoveryBinding, TransitionReceipt, TrustedAnchorBackend, TxError,
+    CoreError, CoreLimits, DeviceGeneration, Digest, DurableJournalBackend, Engine,
+    JournalRecoverySource, JournalRepair, RecoveryAnchor, RecoveryBinding, RecoveryFromSourceError,
+    RecoverySourceSnapshot, TransitionReceipt, TrustedAnchorBackend, TrustedAnchorSnapshot,
+    TxError,
 };
+#[cfg(ktest)]
+use sha2::{Digest as _, Sha256};
+
+/// Fixed scratch used by the portable positioned recovery adapter.  Its size
+/// is independent of the candidate's logical journal length.
+const RECOVERY_SCRATCH_BYTES: usize = 4096;
+
+/// One physically validated recovery image retained by a journal provider.
+///
+/// `generation` and `storage_digest` describe the provider's copy-on-write
+/// metadata only.  They are deliberately never compared with a CSER record
+/// revision or head: physical segment chains and logical journal chains are
+/// different authorities.  The source retains the provider-specific payload
+/// behind `slot`, while boot asks for bounded logical reads through
+/// [`OstdBootJournal::read_recovery_at`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RecoveryCandidate {
+    slot: u32,
+    generation: u64,
+    logical_len: usize,
+    storage_digest: Digest,
+}
+
+impl RecoveryCandidate {
+    /// Creates a provider-owned candidate descriptor.
+    pub(crate) const fn new(
+        slot: u32,
+        generation: u64,
+        logical_len: usize,
+        storage_digest: Digest,
+    ) -> Self {
+        Self {
+            slot,
+            generation,
+            logical_len,
+            storage_digest,
+        }
+    }
+
+    /// Provider-local candidate slot.
+    pub(crate) const fn slot(self) -> u32 {
+        self.slot
+    }
+
+    /// Physical copy-on-write generation, never a CSER authority coordinate.
+    pub(crate) const fn generation(self) -> u64 {
+        self.generation
+    }
+
+    /// Number of logical CSER journal bytes exposed by this candidate.
+    pub(crate) const fn logical_len(self) -> usize {
+        self.logical_len
+    }
+
+    /// Digest of the provider's validated physical image metadata.
+    pub(crate) const fn storage_digest(self) -> Digest {
+        self.storage_digest
+    }
+}
 
 /// Journal operations required before ordinary durable appends can resume.
 pub(crate) trait OstdBootJournal: DurableJournalBackend {
     /// Error from boot-time reads or exact suffix repair.
     type RecoveryError;
 
-    /// Reads the complete durable journal image.
-    fn read_all(&mut self) -> Result<Vec<u8>, Self::RecoveryError>;
+    /// Enumerates every physically validated bank/manifest candidate.  The
+    /// provider must retain all returned candidates until one is selected
+    /// against the trusted CSER snapshot; it may not return only its newest
+    /// physical generation.
+    fn recovery_candidates(&mut self) -> Result<Vec<RecoveryCandidate>, Self::RecoveryError>;
+
+    /// Installs the provider candidate chosen by the trusted logical anchor
+    /// into the compatibility append cache.  Callers must invoke this only
+    /// after the candidate has passed `Engine::recover`; before then the
+    /// source remains read-at only. `None` denotes a validated blank medium
+    /// at CSER genesis.
+    fn select_recovery_candidate(
+        &mut self,
+        candidate: Option<RecoveryCandidate>,
+    ) -> Result<(), Self::RecoveryError>;
+
+    /// Reads a bounded logical range from one retained candidate.
+    ///
+    /// The source must not cache the complete logical image on behalf of this
+    /// API or cache every candidate during enumeration.  A provider may keep
+    /// a separately selected compatibility append cache, but it may read
+    /// physical sectors into bounded scratch storage and translate
+    /// framed/segmented layouts into the requested logical range.
+    fn read_recovery_at(
+        &mut self,
+        candidate: RecoveryCandidate,
+        offset: usize,
+        output: &mut [u8],
+    ) -> Result<(), Self::RecoveryError>;
+
+    /// Revalidates the candidate snapshot immediately before a bounded read
+    /// sequence.  Providers must recheck the exact header/manifest and its
+    /// payload digest so a candidate enumerated before a media change cannot
+    /// be stitched together from a newer image.
+    fn revalidate_recovery_candidate(
+        &mut self,
+        candidate: RecoveryCandidate,
+    ) -> Result<(), Self::RecoveryError>;
 
     /// Removes exactly the suffix named by anchored recovery and synchronizes
     /// the repaired durable image before returning.
     ///
     /// Returning an error is fail-closed.  The caller will not append or
     /// activate this journal instance.
-    fn repair_and_sync(&mut self, repair: JournalRepair) -> Result<(), Self::RecoveryError>;
+    fn repair_and_sync(
+        &mut self,
+        repair: JournalRepair,
+        candidate: Option<RecoveryCandidate>,
+    ) -> Result<(), Self::RecoveryError>;
 }
 
 /// Linear owner of the boot-time hardware quarantine.
@@ -127,6 +230,19 @@ pub(crate) enum BootProviderContractError {
     DeviceGenerationMismatch,
 }
 
+/// Fail-closed result of matching physical candidates to one trusted CSER
+/// tip.  A malformed logical stream is simply not a match; if no validated
+/// candidate remains, recovery stops rather than guessing from generation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BootJournalSelectionError {
+    /// No candidate contains the exact trusted logical revision/head chain.
+    NoMatchingCandidate,
+    /// The portable source adapter observed an impossible token/range
+    /// violation.  This is a provider contract failure, not a candidate
+    /// mismatch, and must stop boot rather than trying another copy.
+    SourceContractViolation,
+}
+
 /// Failure while constructing one quarantined recovered boot.
 #[derive(Debug)]
 pub(crate) enum BootRecoveryError<JournalRecovery, JournalWrite, Anchor, Quarantine> {
@@ -134,6 +250,8 @@ pub(crate) enum BootRecoveryError<JournalRecovery, JournalWrite, Anchor, Quarant
     Quarantine(Quarantine),
     /// Durable journal bytes could not be read.
     JournalRead(JournalRecovery),
+    /// No unique logical candidate could be selected against the trusted tip.
+    JournalSelection(BootJournalSelectionError),
     /// The exact ignored suffix could not be durably removed.
     JournalRepair(JournalRecovery),
     /// The trusted provider could not reserve a fresh recovery epoch.
@@ -348,6 +466,269 @@ where
     }
 }
 
+/// Errors which can be returned by the OSTD-to-core positioned adapter.
+///
+/// The provider error remains opaque and is mapped back to the boot journal
+/// error.  The other variants are local contract failures: they cannot be
+/// repaired by trying a different physical candidate.
+#[derive(Debug)]
+enum RecoverySourceError<E> {
+    Provider(E),
+    SnapshotMismatch,
+    Range,
+}
+
+/// A stable, candidate-bound positioned source for the portable core.
+///
+/// The source owns no journal bytes. Its only state is the provider borrow
+/// and the exact candidate token returned by `recovery_candidates`; every
+/// read is therefore tied to the same provider snapshot and is bounded by
+/// core's fixed scratch buffer.
+struct CandidateRecoverySource<'a, J: OstdBootJournal> {
+    journal: &'a mut J,
+    candidate: RecoveryCandidate,
+}
+
+impl<J: OstdBootJournal> JournalRecoverySource for CandidateRecoverySource<'_, J> {
+    type Error = RecoverySourceError<J::RecoveryError>;
+    type Snapshot = RecoveryCandidate;
+
+    fn begin_snapshot(&mut self) -> Result<RecoverySourceSnapshot<Self::Snapshot>, Self::Error> {
+        self.journal
+            .revalidate_recovery_candidate(self.candidate)
+            .map_err(RecoverySourceError::Provider)?;
+        let logical_len =
+            u64::try_from(self.candidate.logical_len()).map_err(|_| RecoverySourceError::Range)?;
+        Ok(RecoverySourceSnapshot::new(self.candidate, logical_len))
+    }
+
+    fn read_exact_at(
+        &mut self,
+        snapshot: Self::Snapshot,
+        offset: u64,
+        output: &mut [u8],
+    ) -> Result<(), Self::Error> {
+        if snapshot != self.candidate {
+            return Err(RecoverySourceError::SnapshotMismatch);
+        }
+        let offset = usize::try_from(offset).map_err(|_| RecoverySourceError::Range)?;
+        self.journal
+            .read_recovery_at(snapshot, offset, output)
+            .map_err(RecoverySourceError::Provider)
+    }
+
+    fn validate_snapshot(&mut self, snapshot: Self::Snapshot) -> Result<(), Self::Error> {
+        if snapshot != self.candidate {
+            return Err(RecoverySourceError::SnapshotMismatch);
+        }
+        self.journal
+            .revalidate_recovery_candidate(snapshot)
+            .map_err(RecoverySourceError::Provider)
+    }
+}
+
+/// Stable empty source used when the trusted genesis anchor has no physical
+/// candidate. It avoids manufacturing even an empty journal image Vec in
+/// the production recovery path.
+struct EmptyRecoverySource;
+
+impl JournalRecoverySource for EmptyRecoverySource {
+    type Error = RecoverySourceError<Infallible>;
+    type Snapshot = ();
+
+    fn begin_snapshot(&mut self) -> Result<RecoverySourceSnapshot<Self::Snapshot>, Self::Error> {
+        Ok(RecoverySourceSnapshot::new((), 0))
+    }
+
+    fn read_exact_at(
+        &mut self,
+        _snapshot: Self::Snapshot,
+        _offset: u64,
+        output: &mut [u8],
+    ) -> Result<(), Self::Error> {
+        if output.is_empty() {
+            Ok(())
+        } else {
+            Err(RecoverySourceError::Range)
+        }
+    }
+
+    fn validate_snapshot(&mut self, _snapshot: Self::Snapshot) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+enum CandidateReadError<E> {
+    Source(E),
+    Selection(BootJournalSelectionError),
+}
+
+fn map_candidate_recovery_error<E>(
+    error: RecoveryFromSourceError<RecoverySourceError<E>>,
+) -> CandidateReadError<E> {
+    match error {
+        RecoveryFromSourceError::Source(RecoverySourceError::Provider(error)) => {
+            CandidateReadError::Source(error)
+        }
+        RecoveryFromSourceError::Source(
+            RecoverySourceError::SnapshotMismatch | RecoverySourceError::Range,
+        )
+        | RecoveryFromSourceError::EmptyScratch => {
+            CandidateReadError::Selection(BootJournalSelectionError::SourceContractViolation)
+        }
+        RecoveryFromSourceError::Core(_) => {
+            CandidateReadError::Selection(BootJournalSelectionError::NoMatchingCandidate)
+        }
+    }
+}
+
+/// Runs the authoritative source recovery once as candidate admission. A
+/// core error means this physical candidate does not contain the trusted
+/// logical head; provider/source errors remain fatal. The recovered engine
+/// is dropped immediately, so no complete journal or checkpoint image is
+/// retained between candidates.
+fn candidate_matches<J>(
+    journal: &mut J,
+    candidate: RecoveryCandidate,
+    catalogs: CatalogSet,
+    limits: CoreLimits,
+    committed: TrustedAnchorSnapshot,
+    next_freshness: cser_core::Freshness,
+    scratch: &mut [u8],
+) -> Result<bool, CandidateReadError<J::RecoveryError>>
+where
+    J: OstdBootJournal,
+{
+    let anchor = RecoveryAnchor::from_trusted_provider(
+        committed.binding(),
+        committed.committed_freshness(),
+        next_freshness,
+        committed.revision(),
+        committed.head(),
+        committed.projection(),
+    )
+    .map_err(|_| {
+        CandidateReadError::Selection(BootJournalSelectionError::SourceContractViolation)
+    })?;
+    let mut source = CandidateRecoverySource { journal, candidate };
+    match Engine::recover_from_source(catalogs, limits, anchor, &mut source, scratch) {
+        Ok(report) => Ok(report.acknowledged_revision() == committed.revision()
+            && report.acknowledged_head() == committed.head()),
+        Err(error) => match map_candidate_recovery_error(error) {
+            CandidateReadError::Selection(BootJournalSelectionError::NoMatchingCandidate) => {
+                Ok(false)
+            }
+            other => Err(other),
+        },
+    }
+}
+
+/// Selects a candidate only after the trusted backend has supplied the
+/// committed CSER snapshot. Each trial uses the portable Core source path;
+/// no candidate image is materialized. A successful trial proves the exact
+/// authenticated prefix, so an equal-length second success has no distinct
+/// logical authority to compare. A shorter success is preferred because any
+/// bytes after its anchored prefix are repaired rather than trusted.
+fn select_logical_candidate<J>(
+    journal: &mut J,
+    catalogs: &CatalogSet,
+    limits: CoreLimits,
+    committed: TrustedAnchorSnapshot,
+    next_freshness: cser_core::Freshness,
+    candidates: &[RecoveryCandidate],
+    scratch: &mut [u8],
+) -> Result<Option<RecoveryCandidate>, CandidateReadError<J::RecoveryError>>
+where
+    J: OstdBootJournal,
+{
+    if candidates.is_empty() {
+        if committed.revision() == 0 {
+            return Ok(None);
+        }
+        return Err(CandidateReadError::Selection(
+            BootJournalSelectionError::NoMatchingCandidate,
+        ));
+    }
+
+    let mut selected = None;
+    for &candidate in candidates {
+        if !candidate_matches(
+            journal,
+            candidate,
+            catalogs.clone(),
+            limits,
+            committed,
+            next_freshness,
+            scratch,
+        )? {
+            continue;
+        }
+        let Some(current) = selected else {
+            selected = Some(candidate);
+            continue;
+        };
+        if candidate.logical_len() < current.logical_len() {
+            selected = Some(candidate);
+        }
+    }
+    selected
+        .ok_or(CandidateReadError::Selection(
+            BootJournalSelectionError::NoMatchingCandidate,
+        ))
+        .map(Some)
+}
+
+/// Test-only contiguous oracle retained for the candidate-selection unit
+/// tests. Production recovery uses `CandidateRecoverySource` above and never
+/// constructs this image.
+#[cfg(ktest)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LogicalCandidateMatch {
+    candidate: RecoveryCandidate,
+    accepted_prefix_digest: Digest,
+    full_image_digest: Digest,
+}
+
+#[cfg(ktest)]
+fn logical_match(
+    committed: TrustedAnchorSnapshot,
+    candidate: RecoveryCandidate,
+    image: &[u8],
+) -> Option<LogicalCandidateMatch> {
+    let accepted_len = if committed.revision() == 0 {
+        0
+    } else {
+        let scan = match scan_journal_to_head(image, committed.head()) {
+            Ok(Some(scan)) => scan,
+            Ok(None) | Err(_) => return None,
+        };
+        let records = scan.records();
+        let last = records.last()?;
+        if last.revision() != committed.revision()
+            || last.digest() != committed.head()
+            || last.recovery_binding() != committed.binding()
+            || last.boot() != committed.committed_freshness().boot()
+            || last.registry() != committed.committed_freshness().registry()
+            || last.journal() != committed.committed_freshness().journal()
+            || last.device() != committed.committed_freshness().device()
+            || records
+                .iter()
+                .any(|record| record.recovery_binding() != committed.binding())
+        {
+            return None;
+        }
+        scan.unanchored_suffix()
+            .or(scan.torn_tail())
+            .unwrap_or(image.len())
+    };
+    Some(LogicalCandidateMatch {
+        candidate,
+        accepted_prefix_digest: Digest::new(Sha256::digest(&image[..accepted_len]).into()),
+        full_image_digest: Digest::new(Sha256::digest(image).into()),
+    })
+}
+
 /// Recovers one boot while retaining every physical device owner.
 ///
 /// One anchored suffix repair is permitted.  Because a [`RecoveryLease`] is
@@ -373,7 +754,6 @@ where
     let mut repaired_once = false;
 
     loop {
-        let bytes = journal.read_all().map_err(BootRecoveryError::JournalRead)?;
         let lease = anchor
             .reserve_recovery_epoch(binding, observed_generation)
             .map_err(BootRecoveryError::Anchor)?;
@@ -388,17 +768,83 @@ where
             ));
         }
 
+        // Do not inspect or choose a physical bank/manifest until the trusted
+        // backend has supplied the committed CSER tip.  A newer valid copy is
+        // only an unanchored suffix until this logical comparison accepts it.
+        let candidates = journal
+            .recovery_candidates()
+            .map_err(BootRecoveryError::JournalRead)?;
         let next_freshness = lease.next_freshness();
-        let mut persistence = CoordinatedPersistence::from_recovery_lease(journal, anchor, &lease);
-        let report = Engine::recover(
-            catalogs.clone(),
+        let mut scratch = [0u8; RECOVERY_SCRATCH_BYTES];
+        let selected = select_logical_candidate(
+            &mut journal,
+            &catalogs,
             limits,
-            lease
-                .into_recovery_anchor()
-                .map_err(BootRecoveryError::RecoveryAnchor)?,
-            &bytes,
+            lease.committed(),
+            next_freshness,
+            &candidates,
+            &mut scratch,
         )
-        .map_err(BootRecoveryError::Core)?;
+        .map_err(|error| match error {
+            CandidateReadError::Source(error) => BootRecoveryError::JournalRead(error),
+            CandidateReadError::Selection(error) => BootRecoveryError::JournalSelection(error),
+        })?;
+        let recovery_anchor = RecoveryAnchor::from_trusted_provider(
+            lease.committed().binding(),
+            lease.committed().committed_freshness(),
+            next_freshness,
+            lease.committed().revision(),
+            lease.committed().head(),
+            lease.committed().projection(),
+        )
+        .map_err(BootRecoveryError::RecoveryAnchor)?;
+        let report = if let Some(candidate) = selected {
+            let mut source = CandidateRecoverySource {
+                journal: &mut journal,
+                candidate,
+            };
+            Engine::recover_from_source(
+                catalogs.clone(),
+                limits,
+                recovery_anchor,
+                &mut source,
+                &mut scratch,
+            )
+            .map_err(|error| match error {
+                RecoveryFromSourceError::Source(RecoverySourceError::Provider(error)) => {
+                    BootRecoveryError::JournalRead(error)
+                }
+                RecoveryFromSourceError::Source(
+                    RecoverySourceError::SnapshotMismatch | RecoverySourceError::Range,
+                )
+                | RecoveryFromSourceError::EmptyScratch => {
+                    BootRecoveryError::Core(CoreError::InvariantViolation)
+                }
+                RecoveryFromSourceError::Core(error) => BootRecoveryError::Core(error),
+            })?
+        } else {
+            let mut source = EmptyRecoverySource;
+            Engine::recover_from_source(
+                catalogs.clone(),
+                limits,
+                recovery_anchor,
+                &mut source,
+                &mut scratch,
+            )
+            .map_err(|error| match error {
+                RecoveryFromSourceError::Source(RecoverySourceError::Provider(never)) => {
+                    match never {}
+                }
+                RecoveryFromSourceError::Source(
+                    RecoverySourceError::SnapshotMismatch | RecoverySourceError::Range,
+                )
+                | RecoveryFromSourceError::EmptyScratch => {
+                    BootRecoveryError::Core(CoreError::InvariantViolation)
+                }
+                RecoveryFromSourceError::Core(error) => BootRecoveryError::Core(error),
+            })?
+        };
+        let mut persistence = CoordinatedPersistence::from_recovery_lease(journal, anchor, &lease);
 
         if let Some(repair) = report.journal_repair() {
             if repaired_once {
@@ -406,13 +852,21 @@ where
             }
             let (mut recovered_journal, recovered_anchor) = persistence.into_backends();
             recovered_journal
-                .repair_and_sync(repair)
+                .repair_and_sync(repair, selected)
                 .map_err(BootRecoveryError::JournalRepair)?;
             journal = recovered_journal;
             anchor = recovered_anchor;
             repaired_once = true;
             continue;
         }
+
+        // Only a successful, already-validated logical recovery may install
+        // the provider's compatibility append cache. Before this point all
+        // candidate reads were source read-at operations against the trusted
+        // lease; physical generation has not become authority.
+        persistence
+            .inspect_journal(|journal| journal.select_recovery_candidate(selected))
+            .map_err(BootRecoveryError::JournalRead)?;
 
         let mut engine = report.into_engine();
         engine
@@ -475,11 +929,55 @@ mod tests {
     impl OstdBootJournal for MemoryJournal {
         type RecoveryError = MockError;
 
-        fn read_all(&mut self) -> Result<Vec<u8>, Self::RecoveryError> {
-            Ok(self.bytes.clone())
+        fn recovery_candidates(&mut self) -> Result<Vec<RecoveryCandidate>, Self::RecoveryError> {
+            if self.bytes.is_empty() {
+                Ok(Vec::new())
+            } else {
+                Ok(vec![RecoveryCandidate::new(
+                    0,
+                    1,
+                    self.bytes.len(),
+                    Digest::ZERO,
+                )])
+            }
         }
 
-        fn repair_and_sync(&mut self, repair: JournalRepair) -> Result<(), Self::RecoveryError> {
+        fn select_recovery_candidate(
+            &mut self,
+            _candidate: Option<RecoveryCandidate>,
+        ) -> Result<(), Self::RecoveryError> {
+            Ok(())
+        }
+
+        fn read_recovery_at(
+            &mut self,
+            _candidate: RecoveryCandidate,
+            offset: usize,
+            output: &mut [u8],
+        ) -> Result<(), Self::RecoveryError> {
+            let end = offset.checked_add(output.len()).ok_or(MockError::Repair)?;
+            if end > self.bytes.len() {
+                return Err(MockError::Repair);
+            }
+            output.copy_from_slice(&self.bytes[offset..end]);
+            Ok(())
+        }
+
+        fn revalidate_recovery_candidate(
+            &mut self,
+            candidate: RecoveryCandidate,
+        ) -> Result<(), Self::RecoveryError> {
+            if candidate.logical_len() != self.bytes.len() {
+                return Err(MockError::Repair);
+            }
+            Ok(())
+        }
+
+        fn repair_and_sync(
+            &mut self,
+            repair: JournalRepair,
+            _candidate: Option<RecoveryCandidate>,
+        ) -> Result<(), Self::RecoveryError> {
             let offset = match repair {
                 JournalRepair::TornTail { offset } | JournalRepair::UnanchoredSuffix { offset } => {
                     offset
@@ -865,5 +1363,74 @@ mod tests {
         };
         assert_eq!(error, MockError::Stale);
         assert_eq!(boot.activation_block(), None);
+    }
+
+    #[ktest]
+    fn logical_candidate_matching_ignores_physical_generation_and_suffix() {
+        let (journal, anchor) = quarantined_device_fixture();
+        let committed = anchor.committed;
+        let exact = RecoveryCandidate::new(0, 7, journal.bytes.len(), Digest::new([0x11; 32]));
+        let exact_match = logical_match(committed, exact, &journal.bytes)
+            .expect("trusted logical head matches the exact candidate");
+
+        let mut suffix = journal.bytes.clone();
+        suffix.extend_from_slice(b"unanchored-newer-copy");
+        let newer = RecoveryCandidate::new(1, 900, suffix.len(), Digest::new([0x22; 32]));
+        let newer_match = logical_match(committed, newer, &suffix)
+            .expect("trusted prefix matches despite an unanchored suffix");
+        assert_eq!(
+            exact_match.accepted_prefix_digest,
+            newer_match.accepted_prefix_digest
+        );
+        assert!(newer.logical_len() > exact.logical_len());
+        assert_ne!(exact.generation(), newer.generation());
+    }
+
+    #[ktest]
+    fn logical_candidate_matching_rejects_a_different_trusted_head() {
+        let (journal, anchor) = quarantined_device_fixture();
+        let committed = anchor.committed;
+        let wrong = TrustedAnchorSnapshot::from_trusted_backend(
+            committed.binding(),
+            committed.committed_freshness(),
+            committed.revision(),
+            Digest::new([0x77; 32]),
+            committed.projection(),
+        )
+        .expect("wrong digest still has structurally valid anchor coordinates");
+        let candidate = RecoveryCandidate::new(0, 1, journal.bytes.len(), Digest::new([0x33; 32]));
+        assert!(logical_match(wrong, candidate, &journal.bytes).is_none());
+    }
+
+    #[ktest]
+    fn recovery_fails_closed_when_no_candidate_matches_the_committed_head() {
+        let (journal, mut anchor) = quarantined_device_fixture();
+        let committed = anchor.committed;
+        anchor.committed = TrustedAnchorSnapshot::from_trusted_backend(
+            committed.binding(),
+            committed.committed_freshness(),
+            committed.revision(),
+            Digest::new([0x78; 32]),
+            committed.projection(),
+        )
+        .expect("wrong digest still has structurally valid anchor coordinates");
+        let result = recover_quarantined_boot(
+            catalog_set(),
+            CoreLimits::bounded_default(),
+            binding(),
+            journal,
+            anchor,
+            MockQuarantine {
+                observed: DeviceGeneration::new(2).unwrap(),
+                reject_activation: false,
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(BootRecoveryError::JournalSelection(
+                BootJournalSelectionError::NoMatchingCandidate
+            ))
+        ));
     }
 }

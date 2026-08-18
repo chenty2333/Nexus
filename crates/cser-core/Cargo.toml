@@ -11,7 +11,20 @@ publish = false
 # predecessor-profile fixtures. Production embeddings must opt out, as the
 # Nexus kernel does with `default-features = false`.
 default = ["test-support", "full-invariant-oracle"]
+# Host builds retain `sha2`'s normal runtime dispatch. On x86/x86_64 this
+# selects SHA-NI when the runtime CPU check succeeds and otherwise falls back
+# to RustCrypto's software compressor. The Core `std` marker intentionally
+# stays independent of sha2's optional `std` trait conveniences; bare-metal
+# users keep this feature off while still compiling the same hash contract.
 std = []
+# Explicit software comparator for host A/B profiles. This feature must be
+# selected from a `--no-default-features` command so the runtime-dispatch and
+# software measurements have the same Core/profile feature set. The kernel
+# does not use this feature: its direct `sha2/force-soft` dependency edge
+# continues to unify the shared sha2 package to the software backend. Cargo
+# features are additive and cannot encode a mutual-exclusion check here; the
+# documented no-default profile is therefore the minimal reliable A/B split.
+sha2-software-baseline = ["sha2/force-soft"]
 test-support = []
 # Runs the authoritative whole-state invariant oracle after every prepared
 # transition. Production embeddings may enable `test-support` fixtures without
@@ -19,7 +32,10 @@ test-support = []
 full-invariant-oracle = []
 
 [dependencies]
-sha2 = { version = "=0.10.9", default-features = false, features = ["force-soft"] }
+# Do not put `force-soft` on this edge. Normal host/std builds need sha2's
+# runtime SHA-NI dispatch, while kernel/nexus-ostd's direct force-soft edge
+# keeps its no_std graph software-only until a proven SIMD/FPU guard exists.
+sha2 = { version = "=0.10.9", default-features = false }
 
 [dev-dependencies]
 cser-model = { path = "../cser-model", default-features = false }
@@ -31,7 +47,17 @@ name = "cser-catalog-digest"
 path = "src/bin/cser-catalog-digest.rs"
 required-features = ["std"]
 
+[[example]]
+name = "cser_hash_profile"
+path = "examples/cser_hash_profile.rs"
+required-features = ["std"]
+
 [[test]]
 name = "persistent_provider"
 path = "tests/persistent_provider.rs"
 required-features = ["std", "test-support"]
+
+[[test]]
+name = "hash_backend"
+path = "tests/hash_backend.rs"
+required-features = ["std"]

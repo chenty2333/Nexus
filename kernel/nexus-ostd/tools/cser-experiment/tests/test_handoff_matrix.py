@@ -8,7 +8,11 @@ TOOLS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(TOOLS))
 from handoff_identity import ParentDescriptorContext, child_transport_effect_id, expected_child_request, expected_source_request  # noqa: E402
 from tool_provider import _child_descriptor_v1  # noqa: E402
-from handoff_matrix_controller import _kill_container, _one_terminal, compare_recoveries, observe_handoff_barriers, validate_receipt, verify_endpoint_ledgers  # noqa: E402
+from handoff_matrix_controller import (_kill_container, _one_terminal, _stage_media,
+                                       _media_fingerprint, _validate_timeout,
+                                       _verify_staged_media, compare_recoveries,
+                                       observe_handoff_barriers, validate_receipt,
+                                       verify_endpoint_ledgers)  # noqa: E402
 from matrix_protocol import barrier, parse_config_hello  # noqa: E402
 from summarize_handoff_metrics import summarize  # noqa: E402
 
@@ -89,12 +93,76 @@ class HandoffMatrixTests(unittest.TestCase):
                     _kill_container(cid_path, run_id=RUN, trial_token="b" * 64)
             self.assertEqual(run.call_count, 1)
 
+    def test_container_discovery_rejects_malformed_ids_in_label_result(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            cid_path = Path(directory) / "missing.cid"
+            malformed = mock.Mock(returncode=0, stderr="", stdout=("c" * 64 + "\ninvalid/id\n"))
+            with mock.patch("handoff_matrix_controller.subprocess.run", return_value=malformed):
+                with self.assertRaisesRegex(RuntimeError, "invalid container id"):
+                    _kill_container(cid_path, run_id=RUN, trial_token="b" * 64)
+
     def test_cleanup_allows_an_absent_labelled_container_but_not_ambiguity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             cid_path = Path(directory) / "missing.cid"
             absent = mock.Mock(returncode=0, stderr="", stdout="")
             with mock.patch("handoff_matrix_controller.subprocess.run", return_value=absent):
                 self.assertIsNone(_kill_container(cid_path, run_id=RUN, trial_token="b" * 64, allow_absent=True))
+
+    def test_container_kill_retries_are_bounded_and_label_checked(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            cid_path = Path(directory) / "container.cid"
+            cid_path.write_text("a" * 64 + "\n", encoding="ascii")
+            inspected = mock.Mock(returncode=0, stderr="", stdout=json.dumps({"nexus.cser-experiment": "handoff", "nexus.cser-run-id": RUN, "nexus.cser-trial-token": "b" * 64}))
+            failed = mock.Mock(returncode=1, stderr="busy")
+            killed = mock.Mock(returncode=0, stderr="")
+            with mock.patch("handoff_matrix_controller.subprocess.run", side_effect=[inspected, failed, failed, killed]) as run:
+                self.assertEqual(_kill_container(cid_path, run_id=RUN, trial_token="b" * 64), "a" * 64)
+            self.assertEqual(run.call_count, 4)
+
+    def test_handoff_media_rejects_symlinks_and_basename_conflicts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); trial = root / "trial"; trial.mkdir()
+            real = root / "real.raw"; real.write_bytes(b"stable")
+            alias = root / "alias.raw"; alias.symlink_to(real)
+            with self.assertRaisesRegex(ValueError, "symlink"):
+                _stage_media(trial, [alias])
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); trial = root / "trial"; trial.mkdir()
+            first = root / "one"; second = root / "two"; first.mkdir(); second.mkdir()
+            (first / "same.raw").write_bytes(b"one")
+            (second / "same.raw").write_bytes(b"two")
+            with self.assertRaisesRegex(ValueError, "basename conflict"):
+                _stage_media(trial, [first / "same.raw", second / "same.raw"])
+
+    def test_handoff_media_requires_stable_source_and_matching_copy_digest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); trial = root / "trial"; trial.mkdir(); source = root / "medium.raw"
+            source.write_bytes(b"stable")
+            staged = _stage_media(trial, [source])
+            self.assertEqual(staged[0].read_bytes(), b"stable")
+
+            trial2 = root / "trial2"; trial2.mkdir()
+            with mock.patch("handoff_matrix_controller._sha256_file", side_effect=["a", "a", "b"]):
+                with self.assertRaisesRegex(ValueError, "changed or copy digest"):
+                    _stage_media(trial2, [source])
+
+    def test_handoff_media_is_rechecked_before_guest_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); trial = root / "trial"; trial.mkdir(); source = root / "medium.raw"
+            source.write_bytes(b"stable")
+            staged = _stage_media(trial, [source])
+            expected = {staged[0]: _media_fingerprint(staged[0])}
+            staged[0].unlink()
+            staged[0].symlink_to(source)
+            with self.assertRaisesRegex(ValueError, "execution boundary"):
+                _verify_staged_media(expected)
+
+    def test_handoff_controller_rejects_nonfinite_timeouts(self) -> None:
+        for value in (float("nan"), float("inf"), float("-inf"), 0.0, -1.0):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    _validate_timeout(value, "test timeout")
 
     def test_real_qemu_controller_rejects_recovery_budget_at_inner_launcher_limit(self) -> None:
         controller = TOOLS / "handoff_matrix_controller.py"

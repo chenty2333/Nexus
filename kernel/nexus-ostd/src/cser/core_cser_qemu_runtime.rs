@@ -121,7 +121,7 @@ fn emit_perf(runtime: &ExperimentRuntime, phase: &'static str, run_id: [u8; 16])
         )
     });
     println!(
-        "TOOL_DMA_PERF_V2 {{\"version\":2,\"run_id\":\"{}\",\"phase\":\"{}\",\"clock\":\"guest_tsc\",\"calibrated\":false,\"journal_format\":\"{}\",\"journal_phase_scope\":\"last-complete-publication\",\"runtime_transactions\":{},\"mutex_wait_cycles\":{},\"mutex_max_wait_cycles\":{},\"mutex_hold_cycles\":{},\"mutex_max_hold_cycles\":{},\"journal_sectors_read\":{},\"journal_sectors_written\":{},\"journal_flushes\":{},\"journal_hash_bytes\":{},\"journal_image_bytes\":{},\"journal_capacity_bytes\":{},\"journal_payload_written_tsc\":{},\"journal_payload_flushed_tsc\":{},\"journal_header_written_tsc\":{},\"journal_header_flushed_tsc\":{},\"journal_readback_validated_tsc\":{},\"journal_cache_updated_tsc\":{},\"tpm_lease_advances\":{},\"tpm_tip_advances\":{},\"tpm_lease_cycles\":{},\"tpm_tip_cycles\":{}}}",
+        "TOOL_DMA_PERF_V2 {{\"version\":2,\"run_id\":\"{}\",\"phase\":\"{}\",\"clock\":\"guest_tsc\",\"calibrated\":false,\"journal_format\":\"{}\",\"journal_phase_scope\":\"last-complete-publication\",\"runtime_transactions\":{},\"mutex_wait_cycles\":{},\"mutex_max_wait_cycles\":{},\"mutex_hold_cycles\":{},\"mutex_max_hold_cycles\":{},\"checkpoints\":{},\"commit_gate_wait_cycles\":{},\"max_commit_gate_wait_cycles\":{},\"checkpoint_lock_wait_cycles\":{},\"max_checkpoint_lock_wait_cycles\":{},\"checkpoint_lock_hold_cycles\":{},\"max_checkpoint_lock_hold_cycles\":{},\"journal_sectors_read\":{},\"journal_sectors_written\":{},\"journal_flushes\":{},\"journal_hash_bytes\":{},\"journal_image_bytes\":{},\"journal_capacity_bytes\":{},\"journal_payload_written_tsc\":{},\"journal_payload_flushed_tsc\":{},\"journal_header_written_tsc\":{},\"journal_header_flushed_tsc\":{},\"journal_readback_validated_tsc\":{},\"journal_cache_updated_tsc\":{},\"tpm_lease_advances\":{},\"tpm_tip_advances\":{},\"tpm_lease_cycles\":{},\"tpm_tip_cycles\":{}}}",
         HexRun(run_id),
         phase,
         EXPERIMENT_JOURNAL_FORMAT,
@@ -130,6 +130,13 @@ fn emit_perf(runtime: &ExperimentRuntime, phase: &'static str, run_id: [u8; 16])
         serialization.max_lock_wait_cycles,
         serialization.lock_hold_cycles,
         serialization.max_lock_hold_cycles,
+        serialization.checkpoints,
+        serialization.commit_gate_wait_cycles,
+        serialization.max_commit_gate_wait_cycles,
+        serialization.checkpoint_lock_wait_cycles,
+        serialization.max_checkpoint_lock_wait_cycles,
+        serialization.checkpoint_lock_hold_cycles,
+        serialization.max_checkpoint_lock_hold_cycles,
         journal.counters.sectors_read,
         journal.counters.sectors_written,
         journal.counters.flushes,
@@ -157,28 +164,12 @@ fn emit_perf(runtime: &ExperimentRuntime, phase: &'static str, run_id: [u8; 16])
 fn compact_vnext_terminal(runtime: &VNextRuntime, phase: &'static str, run_id: [u8; 16]) {
     let (revision_before, head_before) =
         runtime.observe(|engine| (engine.revision(), engine.head()));
-    let mut before_replacement = true;
     let (checkpoint, (logical_before, io_before), (logical_after, io_after)) = runtime
         .compact_checkpoint_observed(|journal| {
-            // The preimage must be read before its sample; the postimage must
-            // be read after its sample.  This makes the published deltas cover
-            // exactly checkpoint append + physical replacement, rather than
-            // the diagnostic post-read itself.
-            let (bytes, telemetry) = if before_replacement {
-                before_replacement = false;
-                let bytes = journal.read_all()?;
-                let telemetry = journal
-                    .telemetry()
-                    .expect("TOOL_DMA_FAIL stage=vnext-compaction-telemetry");
-                (bytes, telemetry)
-            } else {
-                let telemetry = journal
-                    .telemetry()
-                    .expect("TOOL_DMA_FAIL stage=vnext-compaction-telemetry");
-                let bytes = journal.read_all()?;
-                (bytes, telemetry)
-            };
-            Ok((bytes.len(), telemetry))
+            let telemetry = journal
+                .telemetry()
+                .expect("TOOL_DMA_FAIL stage=vnext-compaction-telemetry");
+            (telemetry.image_bytes as usize, telemetry)
         })
         .unwrap_or_else(|error| panic!("TOOL_DMA_FAIL stage=vnext-compaction error={:?}", error));
     let (revision_after, head_after) = runtime.observe(|engine| (engine.revision(), engine.head()));

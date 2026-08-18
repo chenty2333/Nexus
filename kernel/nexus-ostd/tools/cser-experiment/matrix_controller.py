@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import signal
@@ -25,6 +26,10 @@ _RECOVERY_METRICS_PREFIX = "TOOL_DMA_RECOVERY_METRICS "
 _RECOVERY_DEFERRED_PREFIX = "TOOL_DMA_DEFERRED "
 _MAX_RECOVERY_SERIAL_LINE_BYTES = 64 * 1024
 _RECOVERY_STDERR_TAIL_BYTES = 4096
+_PROCESS_KILL_ATTEMPTS = 3
+_PROCESS_KILL_WAIT_SECONDS = 0.2
+_CONTAINER_KILL_ATTEMPTS = 3
+_CONTAINER_KILL_TIMEOUT_SECONDS = 5
 # Legacy fake-guest compatibility only. Real QEMU rows always receive a fresh
 # host-generated identity through the explicit COM3 configuration handshake.
 _CURRENT_GUEST_RUN_ID = "42" * 16
@@ -111,6 +116,7 @@ def _read_one_frame(client: socket.socket) -> bytes:
 
 def _connect_qemu_server(socket_path: Path, timeout_seconds: float) -> socket.socket:
     """Connect to QEMU's sole COM3 Unix-socket server, retrying its startup."""
+    _validate_timeout(timeout_seconds, "QEMU connection timeout")
     deadline = __import__("time").monotonic() + timeout_seconds
     last_error: OSError | None = None
     while __import__("time").monotonic() < deadline:
@@ -123,6 +129,17 @@ def _connect_qemu_server(socket_path: Path, timeout_seconds: float) -> socket.so
             client.close(); last_error = exc
             __import__("time").sleep(0.05)
     raise RuntimeError(f"QEMU COM3 server unavailable at {socket_path}: {last_error}")
+
+
+def _validate_timeout(value: object, label: str) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value <= 0
+    ):
+        raise ValueError(f"{label} must be finite and positive")
+    return float(value)
 
 
 def observe_barriers(
@@ -311,11 +328,98 @@ def _validate_real_qemu_launcher(args: argparse.Namespace) -> None:
         )
 
 
-def _kill_process_group(process: subprocess.Popen[bytes]) -> None:
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        return
+def _kill_process_group(process: subprocess.Popen[bytes], *, stage: str = "launcher", force: bool = False) -> None:
+    """Kill and reap a launcher process group with a bounded retry budget.
+
+    A launcher can outlive its direct child (QEMU, ``timeout``, and swtpm are
+    all present in the real path), so a single ``killpg`` call is not enough
+    evidence that the stage is gone.  Retry transient races, then fail
+    explicitly rather than allowing cleanup to silently leak a process.
+    """
+    def has_live_group_member() -> bool:
+        """Return whether this PGID contains a non-zombie process.
+
+        ``killpg(pgid, 0)`` considers zombie entries live.  The launcher can
+        reap its own leader while a same-PGID helper remains, so the leader's
+        ``poll()`` state is not sufficient evidence for cleanup.
+        """
+        proc_root = Path("/proc")
+        try:
+            entries = list(proc_root.iterdir())
+        except OSError:
+            entries = []
+        found_procfs_member = False
+        for entry in entries:
+            if not entry.name.isdigit():
+                continue
+            try:
+                fields = entry.joinpath("stat").read_text(encoding="ascii").rpartition(")")[2].split()
+                # The fields after the final comm delimiter start at stat's
+                # state (field 3); process group is the third value there.
+                state, group = fields[0], fields[2]
+            except (OSError, UnicodeError, IndexError):
+                continue
+            if group != str(process.pid):
+                continue
+            found_procfs_member = True
+            if state != "Z":
+                return True
+        if found_procfs_member:
+            return False
+        # Keep a portable fallback for hosts without procfs.  On Linux the
+        # procfs branch above is what filters zombie-only residue.
+        try:
+            os.killpg(process.pid, 0)
+        except ProcessLookupError:
+            return False
+        except OSError:
+            return True
+        return process.poll() is None
+
+    failures: list[str] = []
+    for attempt in range(1, _PROCESS_KILL_ATTEMPTS + 1):
+        if not has_live_group_member() and process.poll() is not None:
+            return
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            # The group leader may have exited while its child is being
+            # reaped.  A bounded wait distinguishes that race from a live
+            # process whose group could not be signalled.
+            try:
+                process.wait(timeout=_PROCESS_KILL_WAIT_SECONDS)
+                if not has_live_group_member():
+                    return
+                failures.append("process group remained after leader exit")
+            except subprocess.TimeoutExpired:
+                failures.append("process group disappeared but launcher remained")
+        except OSError as exc:
+            failures.append(f"attempt {attempt}: {exc}")
+        try:
+            process.wait(timeout=_PROCESS_KILL_WAIT_SECONDS)
+        except subprocess.TimeoutExpired:
+            failures.append(f"attempt {attempt}: launcher still running")
+            continue
+        # A normal launcher exit can leave a helper in the same dedicated
+        # session.  Verify the complete group in both normal and forced modes;
+        # only non-zombie members keep cleanup incomplete.
+        if not has_live_group_member():
+            return
+        if force:
+            try:
+                os.killpg(process.pid, 0)
+            except ProcessLookupError:
+                return
+            except OSError as exc:
+                failures.append(f"attempt {attempt}: process-group probe failed: {exc}")
+            else:
+                failures.append(f"attempt {attempt}: process group still running")
+                continue
+        failures.append(f"attempt {attempt}: process group still running")
+    raise RuntimeError(
+        f"{stage} process group did not stop after {_PROCESS_KILL_ATTEMPTS} bounded kill attempts"
+        + (f" ({'; '.join(failures)})" if failures else "")
+    )
 
 
 def _finish_process_capture(
@@ -333,8 +437,11 @@ def _finish_process_capture(
         try:
             process.wait(timeout=10)
         except subprocess.TimeoutExpired:
-            _kill_process_group(process)
-            process.wait(timeout=10)
+            _kill_process_group(process, stage=stage)
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired as exc:
+                raise RuntimeError(f"{stage} launcher remained after bounded process-group cleanup") from exc
     except subprocess.SubprocessError as exc:
         raise RuntimeError(f"{stage} launcher did not stop after termination: {exc}") from exc
     finally:
@@ -346,6 +453,7 @@ def _run_recovery_launcher(
     command: Path, *, env: dict[str, str], trial_dir: Path, timeout_seconds: float
 ) -> tuple[int, Path, str]:
     """Run recovery with streaming logs and a recovery-specific envelope."""
+    timeout_seconds = _validate_timeout(timeout_seconds, "recovery timeout")
     stdout_path = trial_dir / "recovery.stdout.log"
     stderr_path = trial_dir / "recovery.stderr.log"
     with stdout_path.open("wb") as stdout_log, stderr_path.open("wb") as stderr_log:
@@ -359,7 +467,7 @@ def _run_recovery_launcher(
         try:
             returncode = process.wait(timeout=timeout_seconds)
         except subprocess.TimeoutExpired as exc:
-            _kill_process_group(process)
+            _kill_process_group(process, stage="recovery", force=True)
             try:
                 process.wait(timeout=10)
             except subprocess.TimeoutExpired as wait_exc:
@@ -368,7 +476,7 @@ def _run_recovery_launcher(
                 f"recovery stage exceeded its {timeout_seconds:g}s envelope"
             ) from exc
         except BaseException:
-            _kill_process_group(process)
+            _kill_process_group(process, stage="recovery", force=True)
             try:
                 process.wait(timeout=10)
             except subprocess.TimeoutExpired:
@@ -377,7 +485,7 @@ def _run_recovery_launcher(
         # A launcher that returns while leaving a helper behind is not a
         # complete recovery.  The dedicated process group makes this cleanup
         # exact even after the leader has reaped itself.
-        _kill_process_group(process)
+        _kill_process_group(process, stage="recovery", force=True)
     # The serial terminal receipt is parsed only after the launcher exits. No
     # child PIPE is involved, and only a bounded tail is read for diagnostics.
     with stderr_path.open("rb") as handle:
@@ -394,10 +502,23 @@ def _kill_container(cid_path: Path, command_prefix: list[str]) -> str:
         raise RuntimeError(f"container cid unavailable: {exc}") from exc
     if not _CID.fullmatch(cid):
         raise RuntimeError("invalid container cid")
-    completed = subprocess.run(command_prefix + [cid], check=False, capture_output=True, text=True, timeout=15)
-    if completed.returncode != 0:
-        raise RuntimeError(f"container kill failed ({completed.returncode}): {completed.stderr.strip()}")
-    return cid
+    failures: list[str] = []
+    for attempt in range(1, _CONTAINER_KILL_ATTEMPTS + 1):
+        try:
+            completed = subprocess.run(
+                command_prefix + [cid], check=False, capture_output=True, text=True,
+                timeout=_CONTAINER_KILL_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as exc:
+            failures.append(f"attempt {attempt}: timeout after {_CONTAINER_KILL_TIMEOUT_SECONDS}s")
+            continue
+        if completed.returncode == 0:
+            return cid
+        failures.append(f"attempt {attempt}: exit {completed.returncode}: {completed.stderr.strip()}")
+    raise RuntimeError(
+        f"container kill failed after {_CONTAINER_KILL_ATTEMPTS} bounded attempts for {cid}: "
+        + "; ".join(failures)
+    )
 
 
 def _metric(*, run_id: str, variant: str, trial: int, cutpoint: str, cutpoint_id: int, crash_method: str,
@@ -452,6 +573,8 @@ def _metric(*, run_id: str, variant: str, trial: int, cutpoint: str, cutpoint_id
 def run_trial(args: argparse.Namespace) -> dict[str, Any]:
     if args.variant not in VARIANTS:
         raise ValueError("variant must be cser or baseline")
+    args.timeout_seconds = _validate_timeout(args.timeout_seconds, "QEMU timeout")
+    args.recovery_timeout_seconds = _validate_timeout(args.recovery_timeout_seconds, "recovery timeout")
     trial_dir = args.trial_dir.resolve()
     if trial_dir.exists() and not args.prepared_trial_dir:
         raise ValueError(f"trial directory already exists: {trial_dir}")
@@ -547,12 +670,31 @@ def run_trial(args: argparse.Namespace) -> dict[str, Any]:
                        guest=_guest_metrics(metrics_path), recovery=recovery,
                        recovery_metrics_authoritative=args.recovery_output_metrics,
                        container_id=container_id)
-    except BaseException:
-        _kill_process_group(process)
+    except BaseException as original:
+        cleanup_errors: list[BaseException] = []
+        # A container kill is an authority boundary separate from the host
+        # launcher process group.  Always retry the exact recorded container
+        # on an exception path; killing only the launcher can leave QEMU (and
+        # its attached media) running outside this controller.
+        if args.kill_mode == "container" and container_id is None:
+            try:
+                container_id = _kill_container(cid_path, args.container_kill_command)
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+        try:
+            _kill_process_group(process, stage="initial")
+        except BaseException as exc:
+            cleanup_errors.append(exc)
         if not initial_captured:
-            _finish_process_capture(process, initial_stdout, initial_stderr, stage="initial")
-            stage_timings["initial_end_ns"] = time.monotonic_ns()
-            _write_stage_timings(trial_dir, stage_timings)
+            try:
+                _finish_process_capture(process, initial_stdout, initial_stderr, stage="initial")
+                stage_timings["initial_end_ns"] = time.monotonic_ns()
+                _write_stage_timings(trial_dir, stage_timings)
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+        if cleanup_errors:
+            details = "; ".join(str(error) for error in cleanup_errors)
+            raise RuntimeError(f"matrix cleanup failed explicitly after {type(original).__name__}: {details}") from cleanup_errors[0]
         raise
 def append_jsonl(path: Path, metric: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -581,12 +723,16 @@ def main() -> None:
     parser.add_argument("--real-qemu", action="store_true", help="restrict this trial to the dedicated two-boot QEMU launcher")
     parser.add_argument("--container-kill-command", nargs="+", default=None); parser.add_argument("guest", nargs=argparse.REMAINDER)
     args = parser.parse_args()
-    if args.timeout_seconds <= 0:
-        parser.error("--timeout-seconds must be positive")
+    try:
+        _validate_timeout(args.timeout_seconds, "--timeout-seconds")
+    except ValueError as exc:
+        parser.error(str(exc))
     if args.recovery_timeout_seconds is None:
         args.recovery_timeout_seconds = args.timeout_seconds
-    if args.recovery_timeout_seconds <= 0:
-        parser.error("--recovery-timeout-seconds must be positive")
+    try:
+        _validate_timeout(args.recovery_timeout_seconds, "--recovery-timeout-seconds")
+    except ValueError as exc:
+        parser.error(str(exc))
     if args.catalog_digest is not None and not re.fullmatch(r"[0-9a-f]{64}", args.catalog_digest):
         parser.error("--catalog-digest must be exactly 64 lowercase hexadecimal characters")
     if args.namespace_id is not None and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", args.namespace_id):

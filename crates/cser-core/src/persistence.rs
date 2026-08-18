@@ -14,8 +14,8 @@
 //! instance until it is dropped and recovered from the trusted anchor.
 
 use crate::{
-    Digest, Freshness, JournalRecord, RecoveryAnchor, RecoveryAnchorError, RegistryInstance,
-    WorldId,
+    CheckpointAnchor, CheckpointRecordPlan, Digest, Freshness, JournalRecord, PreparedCheckpoint,
+    RecoveryAnchor, RecoveryAnchorError, RegistryInstance, WorldId,
 };
 
 /// Immutable schema coordinates which govern one recovery domain.
@@ -347,6 +347,41 @@ pub trait TransitionDurability {
     ) -> Result<(), Self::Error>;
 }
 
+/// Journal staging capability for the canonical streaming checkpoint path.
+///
+/// A backend writes the complete J10 record supplied by
+/// [`CheckpointRecordPlan::write_to`] into inactive or otherwise recoverable
+/// storage during [`Self::stage_checkpoint`].  Staging also selects all
+/// in-memory candidate ownership needed by recovery; there is deliberately no
+/// post-anchor callback which could allocate, fail, or drop a large image.
+pub trait StreamingJournalBackend {
+    /// Backend-specific failure from staging.
+    type Error;
+
+    /// Streams one exact J10 checkpoint record into inactive durable storage
+    /// and selects the candidate that recovery will observe after anchoring.
+    /// The backend must retain all ownership needed by that candidate before
+    /// returning; no callback runs after the trusted anchor advances.
+    fn stage_checkpoint(&mut self, plan: &CheckpointRecordPlan) -> Result<(), Self::Error>;
+}
+
+/// Durability boundary for a canonical streaming checkpoint.
+pub trait CheckpointDurability {
+    /// Persistence failure returned to the engine.
+    type Error;
+
+    /// Stages the already prepared checkpoint without advancing the trusted
+    /// anchor.  The prepared value can only originate from
+    /// [`crate::Engine::checkpoint_prepare`], which arms the engine recovery latch.
+    fn persist_checkpoint(&mut self, prepared: &PreparedCheckpoint) -> Result<(), Self::Error>;
+
+    /// Advances the trusted anchor for the sealed checkpoint candidate.  The
+    /// anchor is opaque and can only be minted from a prepared checkpoint by
+    /// the core publication path; callers cannot supply arbitrary revision,
+    /// freshness, projection, or digest metadata.
+    fn anchor_checkpoint(&mut self, anchor: CheckpointAnchor) -> Result<(), Self::Error>;
+}
+
 /// Failure from the ordered journal-plus-anchor protocol.
 #[derive(Debug, Eq, PartialEq)]
 pub enum CoordinatedPersistenceError<J, A> {
@@ -495,6 +530,17 @@ where
                 PersistenceProtocolError::RecoveryRequired,
             ));
         }
+        // `JournalRecord::build` establishes this relation for records
+        // prepared by the core, but the coordinator is also the final
+        // authority boundary for records supplied by a recovery/backend
+        // adapter.  Check the record's internal relation before any backend
+        // call or recovery latch so a checksum-valid tampered record cannot
+        // advance the anchor (or leave this instance poisoned).
+        if record.base_revision().checked_add(1) != Some(record.revision()) {
+            return Err(CoordinatedPersistenceError::Protocol(
+                PersistenceProtocolError::StaleJournalHead,
+            ));
+        }
         let expected_freshness = self.committed.committed_freshness();
         if record.base_revision() != self.committed.revision()
             || record.predecessor() != self.committed.head()
@@ -532,6 +578,14 @@ where
         // post-anchor assignment-only publication suffix.
         let committed_checkpoint = record.is_whole_state_checkpoint().then(|| record.clone());
 
+        // Replace the cached replay image before entering the ambiguous
+        // append/anchor boundary.  Assignment after anchor would release the
+        // previous checkpoint's potentially large Arc-backed record in the
+        // post-anchor suffix.
+        let retired_checkpoint =
+            core::mem::replace(&mut self.committed_checkpoint, committed_checkpoint);
+        drop(retired_checkpoint);
+
         self.recovery_required = true;
         self.journal
             .append_and_sync(record)
@@ -540,8 +594,92 @@ where
             .compare_and_advance(self.committed, replacement)
             .map_err(CoordinatedPersistenceError::Anchor)?;
         self.committed = replacement;
-        self.committed_checkpoint = committed_checkpoint;
         if self.reserved_recovery == Some(resulting_freshness) {
+            self.reserved_recovery = None;
+        }
+        self.recovery_required = false;
+        Ok(())
+    }
+}
+
+impl<J, A> CheckpointDurability for CoordinatedPersistence<J, A>
+where
+    J: StreamingJournalBackend,
+    A: TrustedAnchorBackend,
+{
+    type Error = CoordinatedPersistenceError<J::Error, A::Error>;
+
+    fn persist_checkpoint(&mut self, prepared: &PreparedCheckpoint) -> Result<(), Self::Error> {
+        if self.recovery_required {
+            return Err(CoordinatedPersistenceError::Protocol(
+                PersistenceProtocolError::RecoveryRequired,
+            ));
+        }
+        let plan = prepared.plan();
+        let expected_freshness = self.committed.committed_freshness();
+        if plan.base_revision() != self.committed.revision()
+            || plan.predecessor() != self.committed.head()
+            || plan.base_projection() != self.committed.projection()
+            || plan.binding() != self.committed.binding()
+            || plan.freshness() != expected_freshness
+        {
+            return Err(CoordinatedPersistenceError::Protocol(
+                PersistenceProtocolError::StaleJournalHead,
+            ));
+        }
+
+        // An old append-path checkpoint cache is not part of this protocol and
+        // must be released before the ambiguous stage/anchor boundary.  This
+        // keeps the suffix after anchor advancement assignment-only.  The
+        // journal backend owns all staged candidate storage before returning.
+        self.committed_checkpoint = None;
+        self.recovery_required = true;
+        self.journal
+            .stage_checkpoint(plan)
+            .map_err(CoordinatedPersistenceError::Journal)?;
+        Ok(())
+    }
+
+    fn anchor_checkpoint(&mut self, anchor: CheckpointAnchor) -> Result<(), Self::Error> {
+        if !self.recovery_required {
+            return Err(CoordinatedPersistenceError::Protocol(
+                PersistenceProtocolError::RecoveryRequired,
+            ));
+        }
+        let expected_freshness = self.committed.committed_freshness();
+        if anchor.base_revision() != self.committed.revision()
+            || anchor.predecessor() != self.committed.head()
+            || anchor.base_projection() != self.committed.projection()
+            || anchor.binding() != self.committed.binding()
+            || anchor.freshness() != expected_freshness
+        {
+            return Err(CoordinatedPersistenceError::Protocol(
+                PersistenceProtocolError::StaleJournalHead,
+            ));
+        }
+        if anchor.resulting_freshness() != expected_freshness
+            && self.reserved_recovery != Some(anchor.resulting_freshness())
+        {
+            return Err(CoordinatedPersistenceError::Protocol(
+                PersistenceProtocolError::StaleFreshness,
+            ));
+        }
+        let replacement = TrustedAnchorSnapshot::from_trusted_backend(
+            self.committed.binding(),
+            anchor.resulting_freshness(),
+            anchor.revision(),
+            anchor.digest(),
+            anchor.resulting_projection(),
+        )
+        .map_err(CoordinatedPersistenceError::Protocol)?;
+        self.anchor
+            .compare_and_advance(self.committed, replacement)
+            .map_err(CoordinatedPersistenceError::Anchor)?;
+
+        // No callback, hash, allocation, fallible check, or checkpoint-sized
+        // drop occurs after trusted-anchor advancement.
+        self.committed = replacement;
+        if self.reserved_recovery == Some(anchor.resulting_freshness()) {
             self.reserved_recovery = None;
         }
         self.recovery_required = false;
@@ -631,6 +769,66 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum StreamingTestError {
+        Stage,
+        Anchor,
+        Write,
+    }
+
+    #[derive(Debug, Default)]
+    struct StreamingTestJournal {
+        staged: Vec<u8>,
+        fail_stage: bool,
+    }
+
+    impl StreamingJournalBackend for StreamingTestJournal {
+        type Error = StreamingTestError;
+
+        fn stage_checkpoint(&mut self, plan: &CheckpointRecordPlan) -> Result<(), Self::Error> {
+            if self.fail_stage {
+                return Err(StreamingTestError::Stage);
+            }
+            self.staged.clear();
+            plan.write_to(&mut self.staged)
+                .map_err(|_| StreamingTestError::Write)?;
+            Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct StreamingTestAnchor {
+        committed: TrustedAnchorSnapshot,
+        fail_advance: bool,
+    }
+
+    impl TrustedAnchorBackend for StreamingTestAnchor {
+        type Error = StreamingTestError;
+
+        fn reserve_recovery_epoch(
+            &mut self,
+            _binding: RecoveryBinding,
+            _observed_device: crate::DeviceGeneration,
+        ) -> Result<RecoveryLease, Self::Error> {
+            Err(StreamingTestError::Anchor)
+        }
+
+        fn compare_and_advance(
+            &mut self,
+            expected: TrustedAnchorSnapshot,
+            replacement: TrustedAnchorSnapshot,
+        ) -> Result<(), Self::Error> {
+            if self.fail_advance {
+                return Err(StreamingTestError::Anchor);
+            }
+            if expected != self.committed {
+                return Err(StreamingTestError::Anchor);
+            }
+            self.committed = replacement;
+            Ok(())
+        }
+    }
+
     fn freshness(boot: u64) -> Freshness {
         Freshness::new(
             BootGeneration::new(boot).unwrap(),
@@ -678,6 +876,81 @@ mod tests {
             &lease,
         );
         (engine, persistence)
+    }
+
+    fn streaming_coordinator(
+        fail_stage: bool,
+        fail_advance: bool,
+    ) -> (
+        Engine,
+        CoordinatedPersistence<StreamingTestJournal, StreamingTestAnchor>,
+    ) {
+        let catalog = standard_catalog();
+        let catalog_set = CatalogSet::new(core::slice::from_ref(&catalog)).unwrap();
+        let engine = Engine::new(
+            crate::WorldId::new(1).unwrap(),
+            catalog_set.clone(),
+            CoreLimits::bounded_default(),
+            freshness(1),
+        );
+        let binding = RecoveryBinding::new(
+            RecoveryProfile::current(),
+            crate::WorldId::new(1).unwrap(),
+            catalog_set.digest(),
+            RegistryInstance::new(1).unwrap(),
+        )
+        .unwrap();
+        let committed = TrustedAnchorSnapshot::from_trusted_backend(
+            binding,
+            freshness(1),
+            0,
+            Digest::ZERO,
+            engine.projection_digest(),
+        )
+        .unwrap();
+        let lease = RecoveryLease::from_trusted_backend(committed, freshness(2)).unwrap();
+        let persistence = CoordinatedPersistence::from_recovery_lease(
+            StreamingTestJournal {
+                fail_stage,
+                ..StreamingTestJournal::default()
+            },
+            StreamingTestAnchor {
+                committed,
+                fail_advance,
+            },
+            &lease,
+        );
+        (engine, persistence)
+    }
+
+    #[test]
+    fn coordinator_rejects_a_checksum_valid_revision_tamper_before_mutation() {
+        let (engine, mut persistence) = coordinator(false);
+        let record = JournalRecord::build(
+            0,
+            freshness(1),
+            persistence.committed.binding(),
+            engine.projection_digest(),
+            Digest::ZERO,
+            crate::engine::CommandKind::CheckpointRecovery {
+                boot: BootGeneration::new(2).unwrap(),
+                journal: JournalGeneration::new(2).unwrap(),
+                device: DeviceGeneration::new(1).unwrap(),
+            },
+        )
+        .unwrap()
+        .with_revision_for_test(2);
+        let committed = persistence.committed;
+
+        assert_eq!(
+            persistence.persist_transition(&record, freshness(1), engine.projection_digest()),
+            Err(CoordinatedPersistenceError::Protocol(
+                PersistenceProtocolError::StaleJournalHead
+            ))
+        );
+        assert_eq!(persistence.committed, committed);
+        assert!(persistence.journal.records.is_empty());
+        assert!(!persistence.recovery_required());
     }
 
     #[test]
@@ -805,5 +1078,107 @@ mod tests {
         .expect("anchored checkpoint reopens after replacement failure");
         assert_eq!(recovered.acknowledged_revision(), receipt.revision());
         assert_eq!(recovered.acknowledged_head(), receipt.head());
+    }
+
+    #[test]
+    fn streaming_checkpoint_stages_anchors_then_publishes() {
+        let (mut engine, mut persistence) = streaming_coordinator(false, false);
+        let snapshot = engine.checkpoint_snapshot().unwrap();
+        let plan = snapshot.prepare_plan().unwrap();
+        let prepared = engine.checkpoint_prepare(plan).unwrap();
+        let expected_digest = prepared.plan().digest();
+        let expected_len = prepared.plan().record_len();
+        let durable = prepared.persist_checkpoint(&mut persistence).unwrap();
+        assert_eq!(persistence.journal().staged.len(), expected_len);
+        assert_eq!(
+            Digest::new(
+                persistence.journal().staged[expected_len - 32..]
+                    .try_into()
+                    .unwrap()
+            ),
+            expected_digest
+        );
+        let receipt = engine
+            .checkpoint_publish(durable, &mut persistence)
+            .unwrap();
+        assert_eq!(receipt.head(), expected_digest);
+        assert!(!persistence.recovery_required());
+        assert!(!engine.persistence_recovery_required());
+    }
+
+    #[test]
+    fn streaming_checkpoint_stage_failure_latches_before_publication() {
+        let (mut engine, mut persistence) = streaming_coordinator(true, false);
+        let prepared = engine
+            .checkpoint_prepare(
+                engine
+                    .checkpoint_snapshot()
+                    .unwrap()
+                    .prepare_plan()
+                    .unwrap(),
+            )
+            .unwrap();
+        let error = prepared.persist_checkpoint(&mut persistence);
+        assert!(matches!(
+            error,
+            Err(crate::TxError::Persist(
+                CoordinatedPersistenceError::Journal(StreamingTestError::Stage)
+            ))
+        ));
+        assert!(persistence.recovery_required());
+        assert!(engine.persistence_recovery_required());
+        assert!(persistence.journal().staged.is_empty());
+    }
+
+    #[test]
+    fn streaming_checkpoint_anchor_failure_latches_and_keeps_stage_private() {
+        let (mut engine, mut persistence) = streaming_coordinator(false, true);
+        let prepared = engine
+            .checkpoint_prepare(
+                engine
+                    .checkpoint_snapshot()
+                    .unwrap()
+                    .prepare_plan()
+                    .unwrap(),
+            )
+            .unwrap();
+        let durable = prepared.persist_checkpoint(&mut persistence).unwrap();
+        let error = engine.checkpoint_publish(durable, &mut persistence);
+        assert!(matches!(
+            error,
+            Err(crate::TxError::Persist(
+                CoordinatedPersistenceError::Anchor(StreamingTestError::Anchor)
+            ))
+        ));
+        assert!(persistence.recovery_required());
+        assert!(engine.persistence_recovery_required());
+        assert!(!persistence.journal().staged.is_empty());
+    }
+
+    #[test]
+    fn staged_checkpoint_cannot_publish_into_another_engine() {
+        let (mut engine_a, mut persistence_a) = streaming_coordinator(false, false);
+        let (mut engine_b, mut persistence_b) = streaming_coordinator(false, false);
+        let prepared = engine_a
+            .checkpoint_prepare(
+                engine_a
+                    .checkpoint_snapshot()
+                    .unwrap()
+                    .prepare_plan()
+                    .unwrap(),
+            )
+            .unwrap();
+        let durable = prepared.persist_checkpoint(&mut persistence_a).unwrap();
+
+        let result = engine_b.checkpoint_publish(durable, &mut persistence_b);
+        assert!(matches!(
+            result,
+            Err(crate::TxError::Core(crate::CoreError::InvariantViolation))
+        ));
+        assert!(!engine_b.persistence_recovery_required());
+        assert!(!persistence_b.recovery_required());
+        assert!(engine_a.persistence_recovery_required());
+        assert!(persistence_a.recovery_required());
+        assert!(persistence_b.journal().staged.is_empty());
     }
 }

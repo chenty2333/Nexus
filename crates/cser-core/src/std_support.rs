@@ -2,19 +2,24 @@
 
 //! Standard-library persistence helpers for host adapters and recovery tests.
 
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
 
+use sha2::{Digest as Sha2Digest, Sha256};
+
 use crate::{
     Digest, JournalRecord, JournalRepair,
     journal::{
         JOURNAL_RECORD_HEADER_LEN, MAX_JOURNAL_SCAN_BYTES, MAX_JOURNAL_SCAN_RECORDS,
-        journal_record_total_len, recognized_legacy_journal_version,
+        decode_journal_record_borrowed, journal_record_total_len,
+        recognized_legacy_journal_version, scan_journal_borrowed,
     },
-    scan_journal,
+    recovery_source::{JournalRecoverySource, RecoverySourceSnapshot},
 };
 
 mod persistence;
@@ -39,7 +44,50 @@ pub struct FileJournal {
     recovery_required: bool,
 }
 
+/// Stable coordinates of one locked file-journal recovery view.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FileRecoverySnapshot {
+    durable_len: u64,
+    revision: u64,
+    head: Digest,
+    identity: FileIdentity,
+    content_digest: [u8; 32],
+}
+
+/// Identity fields which cannot be restored by an ordinary same-length
+/// overwrite on Unix.  The journal is a host/Linux adapter; retaining a
+/// conservative fallback keeps the crate buildable elsewhere without
+/// pretending that the fallback provides Unix inode semantics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FileIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    change_seconds: i64,
+    #[cfg(unix)]
+    change_nanoseconds: i64,
+    #[cfg(not(unix))]
+    modified: Option<std::time::SystemTime>,
+    len: u64,
+}
+
+/// Crate-private positioned recovery view over a locked file journal.
+pub(crate) struct FileJournalRecoverySource<'a> {
+    journal: &'a mut FileJournal,
+}
+
 impl FileJournal {
+    /// Borrows this locked journal as one stable positioned recovery source.
+    ///
+    /// The returned adapter keeps its snapshot token private while still
+    /// allowing an embedding to pass the source directly to
+    /// [`crate::Engine::recover_from_source`].
+    pub fn recovery_source(&mut self) -> impl JournalRecoverySource<Error = io::Error> + '_ {
+        FileJournalRecoverySource { journal: self }
+    }
+
     /// Opens or creates a journal and validates every complete record.
     ///
     /// A torn tail is not silently discarded. Call
@@ -61,10 +109,9 @@ impl FileJournal {
         }
 
         let bytes = read_bounded_file(&mut file)?;
-        let scan = scan_journal(&bytes).map_err(invalid_journal)?;
-        validate_record_chain(scan.records())?;
+        let scan = scan_journal_borrowed(&bytes).map_err(invalid_journal)?;
         let (revision, head) = scan.records().last().map_or((0, Digest::ZERO), |record| {
-            (record.revision(), record.digest())
+            (record.meta().revision(), record.digest())
         });
         Ok(Self {
             path,
@@ -162,7 +209,7 @@ impl FileJournal {
             ));
         }
         let observed_len = self.file.metadata()?.len();
-        validate_record_revision(record)?;
+        validate_record_revision(record.base_revision(), record.revision())?;
         if observed_len != self.durable_len
             || record.base_revision() != self.revision
             || record.predecessor() != self.head
@@ -199,7 +246,9 @@ impl FileJournal {
     ///
     /// `accepted_revision` and `accepted_head` must identify the final complete
     /// record immediately before `accepted_len`. This method rejects complete
-    /// corruption and refuses to truncate a different prefix.
+    /// corruption and refuses to truncate a different prefix. A genesis
+    /// repair has only the empty accepted prefix; a complete prefix followed
+    /// by a torn tail remains ambiguous and is refused.
     pub fn repair_to_anchored_prefix(
         &mut self,
         accepted_len: usize,
@@ -229,6 +278,17 @@ impl FileJournal {
             ));
         }
         let (revision, head) = if accepted_revision == 0 && accepted_head.is_zero() {
+            // Genesis has no record boundary other than byte zero.  In
+            // particular, do not let the coordinate pair bypass the caller's
+            // accepted-length contract and silently reinterpret a non-empty
+            // prefix as genesis.
+            if accepted_len != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "genesis repair must use an empty accepted prefix",
+                ));
+            }
+            reject_genesis_records_before_torn_tail(&mut self.file)?;
             (0, Digest::ZERO)
         } else {
             self.file.seek(SeekFrom::Start(0))?;
@@ -316,6 +376,128 @@ impl crate::DurableJournalBackend for FileJournal {
 
     fn append_and_sync(&mut self, record: &JournalRecord) -> Result<(), Self::Error> {
         self.append(record)
+    }
+}
+
+fn file_identity(metadata: &fs::Metadata) -> FileIdentity {
+    FileIdentity {
+        #[cfg(unix)]
+        device: metadata.dev(),
+        #[cfg(unix)]
+        inode: metadata.ino(),
+        #[cfg(unix)]
+        change_seconds: metadata.ctime(),
+        #[cfg(unix)]
+        change_nanoseconds: metadata.ctime_nsec(),
+        #[cfg(not(unix))]
+        modified: metadata.modified().ok(),
+        len: metadata.len(),
+    }
+}
+
+fn current_file_identity(journal: &FileJournal) -> io::Result<FileIdentity> {
+    let descriptor = file_identity(&journal.file.metadata()?);
+    let path = file_identity(&fs::metadata(&journal.path)?);
+    if descriptor != path {
+        return Err(recovery_source_changed());
+    }
+    Ok(descriptor)
+}
+
+fn hash_file_prefix(file: &mut File, len: u64) -> io::Result<[u8; 32]> {
+    let mut hasher = Sha256::new();
+    let mut scratch = [0u8; 8192];
+    let mut offset = 0u64;
+    while offset != len {
+        let remaining = len - offset;
+        let amount = usize::try_from(remaining.min(scratch.len() as u64))
+            .map_err(|_| recovery_source_changed())?;
+        file.seek(SeekFrom::Start(offset))?;
+        file.read_exact(&mut scratch[..amount])?;
+        hasher.update(&scratch[..amount]);
+        offset = offset
+            .checked_add(amount as u64)
+            .ok_or_else(recovery_source_changed)?;
+    }
+    Ok(hasher.finalize().into())
+}
+
+fn validate_file_snapshot(
+    journal: &mut FileJournal,
+    snapshot: FileRecoverySnapshot,
+    rehash: bool,
+) -> io::Result<()> {
+    if journal.recovery_required
+        || snapshot.durable_len != journal.durable_len
+        || snapshot.revision != journal.revision
+        || snapshot.head != journal.head
+        || current_file_identity(journal)? != snapshot.identity
+    {
+        return Err(recovery_source_changed());
+    }
+    if rehash
+        && hash_file_prefix(&mut journal.file, snapshot.durable_len)? != snapshot.content_digest
+    {
+        return Err(recovery_source_changed());
+    }
+    Ok(())
+}
+
+impl JournalRecoverySource for FileJournalRecoverySource<'_> {
+    type Error = io::Error;
+    type Snapshot = FileRecoverySnapshot;
+
+    fn begin_snapshot(&mut self) -> Result<RecoverySourceSnapshot<Self::Snapshot>, Self::Error> {
+        if self.journal.recovery_required {
+            return Err(recovery_source_changed());
+        }
+        let identity = current_file_identity(self.journal)?;
+        if identity.len != self.journal.durable_len {
+            return Err(recovery_source_changed());
+        }
+        let content_digest = hash_file_prefix(&mut self.journal.file, identity.len)?;
+        if current_file_identity(self.journal)? != identity {
+            return Err(recovery_source_changed());
+        }
+        let token = FileRecoverySnapshot {
+            durable_len: self.journal.durable_len,
+            revision: self.journal.revision,
+            head: self.journal.head,
+            identity,
+            content_digest,
+        };
+        Ok(RecoverySourceSnapshot::new(token, token.durable_len))
+    }
+
+    fn read_exact_at(
+        &mut self,
+        snapshot: Self::Snapshot,
+        offset: u64,
+        output: &mut [u8],
+    ) -> Result<(), Self::Error> {
+        validate_file_snapshot(self.journal, snapshot, false)?;
+        let output_len = u64::try_from(output.len()).map_err(|_| recovery_source_changed())?;
+        let end = offset
+            .checked_add(output_len)
+            .ok_or_else(recovery_source_changed)?;
+        if end > snapshot.durable_len {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "positioned recovery read exceeds the stable journal view",
+            ));
+        }
+        self.journal.file.seek(SeekFrom::Start(offset))?;
+        self.journal.file.read_exact(output)?;
+        // Detect a same-length write or path replacement which raced this
+        // individual read before allowing the decoder to consume its bytes.
+        validate_file_snapshot(self.journal, snapshot, false)
+    }
+
+    fn validate_snapshot(&mut self, snapshot: Self::Snapshot) -> Result<(), Self::Error> {
+        // The final digest is the stable-source certificate. Inode/ctime
+        // catches ordinary races cheaply; rehashing also rejects a writer
+        // which changed bytes without changing the declared length.
+        validate_file_snapshot(self.journal, snapshot, true)
     }
 }
 
@@ -413,12 +595,23 @@ fn read_anchored_prefix<R: Read>(
             }
             Err(error) => return Err(error),
         }
-        let scan = scan_journal(&record).map_err(invalid_journal)?;
-        let current = scan.records().first().ok_or_else(anchor_not_found)?;
+        let current = decode_journal_record_borrowed(&record).map_err(invalid_journal)?;
+        let meta = current.meta();
         if let Some((previous_revision, previous_head)) = previous {
-            validate_record_successor(current, previous_revision, previous_head)?;
+            validate_record_successor(
+                meta.base_revision(),
+                meta.revision(),
+                meta.predecessor(),
+                previous_revision,
+                previous_head,
+            )?;
         } else {
-            validate_record_start(current)?;
+            validate_record_start(
+                meta.base_revision(),
+                meta.revision(),
+                meta.predecessor(),
+                current.whole_state_checkpoint().is_some(),
+            )?;
         }
         prefix_len = prefix_len
             .checked_add(total_len)
@@ -426,39 +619,23 @@ fn read_anchored_prefix<R: Read>(
         record_count += 1;
 
         if current.digest() == accepted_head {
-            if current.revision() != accepted_revision {
+            if meta.revision() != accepted_revision {
                 return Err(anchor_not_found());
             }
             return Ok(prefix_len);
         }
-        previous = Some((current.revision(), current.digest()));
+        previous = Some((meta.revision(), current.digest()));
     }
 }
 
-/// Validates the semantic chain which the byte scanner deliberately leaves to
-/// the embedding adapter. A checksum-valid record is not appendable merely
-/// because its envelope parsed: every revision must advance exactly one, the
-/// first ordinary record must be genesis, and each later record must name the
-/// immediately preceding record. A leading whole-state checkpoint is the
-/// sole exception to the genesis rule because it may rebuild a compressed
-/// prefix; the engine and trusted anchor validate that checkpoint's image and
-/// coordinates during recovery.
-fn validate_record_chain(records: &[JournalRecord]) -> io::Result<()> {
-    let Some(first) = records.first() else {
-        return Ok(());
-    };
-    validate_record_start(first)?;
-    for pair in records.windows(2) {
-        validate_record_successor(&pair[1], pair[0].revision(), pair[0].digest())?;
-    }
-    Ok(())
-}
-
-fn validate_record_start(record: &JournalRecord) -> io::Result<()> {
-    validate_record_revision(record)?;
-    if !record.is_whole_state_checkpoint()
-        && (record.base_revision() != 0 || !record.predecessor().is_zero())
-    {
+fn validate_record_start(
+    base_revision: u64,
+    revision: u64,
+    predecessor: Digest,
+    is_checkpoint: bool,
+) -> io::Result<()> {
+    validate_record_revision(base_revision, revision)?;
+    if !is_checkpoint && (base_revision != 0 || !predecessor.is_zero()) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "journal record chain does not begin at genesis",
@@ -468,12 +645,14 @@ fn validate_record_start(record: &JournalRecord) -> io::Result<()> {
 }
 
 fn validate_record_successor(
-    record: &JournalRecord,
+    base_revision: u64,
+    revision: u64,
+    predecessor: Digest,
     previous_revision: u64,
     previous_head: Digest,
 ) -> io::Result<()> {
-    validate_record_revision(record)?;
-    if record.base_revision() != previous_revision || record.predecessor() != previous_head {
+    validate_record_revision(base_revision, revision)?;
+    if base_revision != previous_revision || predecessor != previous_head {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "journal record chain is discontinuous",
@@ -482,14 +661,14 @@ fn validate_record_successor(
     Ok(())
 }
 
-fn validate_record_revision(record: &JournalRecord) -> io::Result<()> {
-    let expected = record.base_revision().checked_add(1).ok_or_else(|| {
+fn validate_record_revision(base_revision: u64, revision: u64) -> io::Result<()> {
+    let expected = base_revision.checked_add(1).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             "journal record base revision overflows",
         )
     })?;
-    if record.revision() != expected {
+    if revision != expected {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "journal record revision does not advance its base revision",
@@ -518,10 +697,34 @@ fn reject_genesis_legacy_prefix(file: &mut File, durable_len: u64) -> io::Result
     Ok(())
 }
 
+/// Refuses to erase a complete accepted-looking prefix together with a torn
+/// suffix while the trusted anchor still names genesis.  A complete-only
+/// unanchored first append remains the existing legal genesis repair case;
+/// the combination with a torn tail is ambiguous and must be recovered under
+/// a non-genesis anchored boundary instead.
+fn reject_genesis_records_before_torn_tail(file: &mut File) -> io::Result<()> {
+    let bytes = read_bounded_file(file)?;
+    let scan = scan_journal_borrowed(&bytes).map_err(invalid_journal)?;
+    if !scan.records().is_empty() && scan.torn_tail().is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "genesis repair cannot discard complete records before a torn tail",
+        ));
+    }
+    Ok(())
+}
+
 fn recovery_required() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
         "journal mutation failed ambiguously; drop and reopen before continuing",
+    )
+}
+
+fn recovery_source_changed() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "file journal changed during positioned recovery",
     )
 }
 
@@ -533,10 +736,28 @@ fn anchor_not_found() -> io::Error {
 }
 
 fn invalid_journal(error: crate::JournalDecodeError) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::InvalidData,
-        format!("invalid CSER journal: {error:?}"),
-    )
+    let message = match error {
+        crate::JournalDecodeError::ChainMismatch { offset: 0 } => {
+            return io::Error::new(
+                io::ErrorKind::InvalidData,
+                "journal record chain does not begin at genesis",
+            );
+        }
+        crate::JournalDecodeError::ChainMismatch { .. } => {
+            return io::Error::new(
+                io::ErrorKind::InvalidData,
+                "journal record chain is discontinuous",
+            );
+        }
+        crate::JournalDecodeError::RevisionOverflow => {
+            return io::Error::new(
+                io::ErrorKind::InvalidData,
+                "journal record base revision overflows",
+            );
+        }
+        _ => format!("invalid CSER journal: {error:?}"),
+    };
+    io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
 fn sync_parent_directory(path: &Path) -> io::Result<()> {
@@ -547,7 +768,7 @@ fn sync_parent_directory(path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use std::{
-        io::{Cursor, Read},
+        io::{Cursor, Read, Seek, SeekFrom, Write},
         path::PathBuf,
         sync::{
             Arc,
@@ -555,7 +776,9 @@ mod tests {
         },
     };
 
-    use crate::journal::{MAX_JOURNAL_SCAN_BYTES, MAX_JOURNAL_SCAN_RECORDS};
+    use crate::journal::{
+        MAX_JOURNAL_SCAN_BYTES, MAX_JOURNAL_SCAN_RECORDS, recovery_source::JournalRecoverySource,
+    };
     use crate::{
         BootGeneration, DeviceGeneration, Digest, JournalDecodeError, JournalGeneration,
         JournalRecord, JournalRepair, RegistryInstance, engine::CommandKind, scan_journal,
@@ -1050,6 +1273,24 @@ mod tests {
     }
 
     #[test]
+    fn genesis_repair_rejects_valid_records_followed_by_a_torn_tail() {
+        let temp = TempJournal::new("genesis-valid-prefix-torn-tail");
+        let first = record(0, Digest::ZERO);
+        let second = record(first.revision(), first.digest());
+        let mut bytes = first.bytes().to_vec();
+        bytes.extend_from_slice(&second.bytes()[..second.bytes().len() / 2]);
+        std::fs::write(&temp.path, &bytes).unwrap();
+
+        let mut journal = FileJournal::open_anchored(&temp.path, 0, Digest::ZERO).unwrap();
+        let error = journal
+            .repair_to_anchored_prefix(0, 0, Digest::ZERO)
+            .expect_err("genesis repair must not discard a valid prefix plus torn tail");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(journal.read_all().unwrap(), bytes);
+        assert!(!journal.recovery_required());
+    }
+
+    #[test]
     fn anchored_open_rejects_profile_one_before_repair_without_reclassifying_residue() {
         for (label, suffix) in [
             ("profile-one-prefix", &[][..]),
@@ -1094,5 +1335,72 @@ mod tests {
             Some(JournalRepair::UnanchoredSuffix { offset: 0 })
         );
         assert_eq!(journal.read_all().unwrap(), residue);
+    }
+
+    #[test]
+    fn file_journal_positioned_snapshot_reads_without_materializing_the_image() {
+        let temp = TempJournal::new("positioned-recovery-source");
+        let first = record(0, Digest::ZERO);
+        std::fs::write(&temp.path, first.bytes()).unwrap();
+        let mut journal = FileJournal::open(&temp.path).unwrap();
+        let mut source = journal.recovery_source();
+        let snapshot = source.begin_snapshot().unwrap();
+        assert_eq!(snapshot.logical_len(), first.bytes().len() as u64);
+
+        for chunk_len in [1, 7, 31, 511, 512, 4096] {
+            let mut actual = vec![0; chunk_len.min(first.bytes().len())];
+            source
+                .read_exact_at(snapshot.token(), 0, &mut actual)
+                .unwrap();
+            assert_eq!(actual, first.bytes()[..actual.len()]);
+        }
+        source.validate_snapshot(snapshot.token()).unwrap();
+
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&temp.path)
+            .unwrap()
+            .write_all(b"uncoordinated suffix")
+            .unwrap();
+        assert!(source.validate_snapshot(snapshot.token()).is_err());
+    }
+
+    #[test]
+    fn file_journal_positioned_snapshot_rejects_same_length_overwrite() {
+        let temp = TempJournal::new("positioned-recovery-overwrite");
+        let first = record(0, Digest::ZERO);
+        std::fs::write(&temp.path, first.bytes()).unwrap();
+        let mut journal = FileJournal::open(&temp.path).unwrap();
+        let mut source = journal.recovery_source();
+        let snapshot = source.begin_snapshot().unwrap();
+
+        let mut replacement = vec![0xa5; first.bytes().len()];
+        replacement[..8].copy_from_slice(&first.bytes()[..8]);
+        let mut bypass = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&temp.path)
+            .unwrap();
+        bypass.seek(SeekFrom::Start(0)).unwrap();
+        bypass.write_all(&replacement).unwrap();
+        bypass.sync_all().unwrap();
+
+        assert!(source.validate_snapshot(snapshot.token()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_journal_positioned_snapshot_rejects_path_replacement() {
+        let temp = TempJournal::new("positioned-recovery-path-replacement");
+        let first = record(0, Digest::ZERO);
+        std::fs::write(&temp.path, first.bytes()).unwrap();
+        let mut journal = FileJournal::open(&temp.path).unwrap();
+        let mut source = journal.recovery_source();
+        let snapshot = source.begin_snapshot().unwrap();
+
+        let replacement = temp.path.with_extension("replacement");
+        std::fs::write(&replacement, first.bytes()).unwrap();
+        std::fs::rename(&replacement, &temp.path).unwrap();
+
+        assert!(source.validate_snapshot(snapshot.token()).is_err());
     }
 }

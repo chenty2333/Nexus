@@ -1441,6 +1441,10 @@ fn nonterminal_component_cannot_authorize_artifact_release() {
         ),
         Err(CoreError::ArtifactNotReleasable)
     );
+    assert_eq!(
+        engine.artifact_release_challenge(effect, id(COMPONENT, ComponentId::new)),
+        Err(CoreError::ArtifactNotReleasable)
+    );
 }
 
 #[test]

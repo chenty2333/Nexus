@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import sqlite3
 import subprocess
 from dataclasses import dataclass
@@ -26,6 +27,11 @@ from matrix_controller import _recovery_metrics_from_serial_log
 
 _BOUNDARY = StudyClaimBoundary.BOUNDED_APPLICABILITY_SAMPLE
 _IDENTITY = {"namespace_id", "authority_id", "effect_id", "catalog_digest", "run_id"}
+_OPTIONAL_IDENTITY = {"operation_key", "input_digest"}
+_PERF_BACKGROUND_PREFIX = "perf-bg-"
+_OPERATION_KEY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_INPUT_DIGEST = re.compile(r"^[0-9a-f]{64}$")
+_TERMINAL_STATES = frozenset(("succeeded", "failed"))
 
 
 @dataclass(frozen=True)
@@ -45,9 +51,18 @@ def _object(path: Path) -> dict[str, Any]:
 
 def _identity(trial: Path) -> dict[str, str]:
     value = _object(trial / "experiment-identity.json")
-    if set(value) != _IDENTITY or not all(isinstance(value[key], str) and value[key] for key in _IDENTITY):
+    if not set(value) <= _IDENTITY | _OPTIONAL_IDENTITY or not _IDENTITY <= set(value):
         raise ValueError("experiment identity is incomplete")
-    return {key: value[key] for key in _IDENTITY}
+    if not all(isinstance(value[key], str) and value[key] for key in _IDENTITY):
+        raise ValueError("experiment identity is incomplete")
+    for key in _OPTIONAL_IDENTITY & set(value):
+        if not isinstance(value[key], str) or not value[key]:
+            raise ValueError(f"experiment identity has invalid {key}")
+        if key == "operation_key" and _OPERATION_KEY.fullmatch(value[key]) is None:
+            raise ValueError("experiment identity has invalid operation_key")
+        if key == "input_digest" and _INPUT_DIGEST.fullmatch(value[key]) is None:
+            raise ValueError("experiment identity has invalid input_digest")
+    return {key: value[key] for key in _IDENTITY | (_OPTIONAL_IDENTITY & set(value))}
 
 
 def _terminal_receipt(path: Path | None, identity: dict[str, str]) -> dict[str, Any] | None:
@@ -60,28 +75,95 @@ def _terminal_receipt(path: Path | None, identity: dict[str, str]) -> dict[str, 
     return receipt
 
 
-def _endpoint_row(database: Path, identity: dict[str, str]) -> dict[str, Any] | None:
-    if not database.is_file(): return None
-    con = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
-    try:
-        columns = {row[1] for row in con.execute("PRAGMA table_info(operations)")}
-        needed = _IDENTITY | {"operation_key", "state"}
-        if not needed <= columns: return None
-        row = con.execute("SELECT operation_key,state FROM operations WHERE namespace_id=? AND authority_id=? AND effect_id=? AND catalog_digest=? AND run_id=?", (identity["namespace_id"], identity["authority_id"], identity["effect_id"], identity["catalog_digest"], identity["run_id"])).fetchone()
-        return None if row is None else {"operation_key": row[0], "state": row[1]}
-    finally: con.close()
+def _operation_hint(identity: dict[str, str], operation_key: str | None) -> str | None:
+    selected = identity.get("operation_key") if operation_key is None else operation_key
+    if selected is not None:
+        if not isinstance(selected, str) or _OPERATION_KEY.fullmatch(selected) is None:
+            raise ValueError("operation key is invalid")
+        if selected.startswith(_PERF_BACKGROUND_PREFIX):
+            raise ValueError("performance background operation cannot be exported")
+    return selected
 
 
-def _provider_row(database: Path, identity: dict[str, str]) -> dict[str, Any] | None:
-    if not database.is_file(): return None
+def _rows_for_identity(con: sqlite3.Connection, table: str, identity: dict[str, str],
+                       operation_key: str | None) -> tuple[list[tuple[Any, ...]], bool]:
+    """Read one exact operation row, never an arbitrary ``fetchone`` result.
+
+    The bool reports whether the table has the modern input-digest column.  A
+    legacy endpoint-only fixture can still be inspected, but any two-store
+    comparison requires the modern column on both sides.
+    """
+    columns = {row[1] for row in con.execute(f"PRAGMA table_info({table})")}
+    needed = _IDENTITY | {"operation_key", "state"}
+    if not needed <= columns:
+        return [], False
+    modern = "input_digest" in columns
+    selected = "operation_key,input_digest,state" if modern else "operation_key,state"
+    where = "namespace_id=? AND authority_id=? AND effect_id=? AND catalog_digest=? AND run_id=?"
+    values: list[Any] = [identity["namespace_id"], identity["authority_id"], identity["effect_id"],
+                          identity["catalog_digest"], identity["run_id"]]
+    if operation_key is not None:
+        where += " AND operation_key=?"
+        values.append(operation_key)
+    elif modern:
+        # Background jobs are intentionally part of performance trials but
+        # have no applicability meaning.  Exclude them before enforcing the
+        # one-primary-row requirement so they cannot become accidental facts.
+        where += " AND operation_key NOT LIKE ?"
+        values.append(_PERF_BACKGROUND_PREFIX + "%")
+    rows = con.execute(f"SELECT {selected} FROM {table} WHERE {where}", values).fetchall()
+    return rows, modern
+
+
+def _row_value(row: tuple[Any, ...], modern: bool) -> dict[str, Any]:
+    if modern:
+        operation_key, input_digest, state = row
+    else:
+        operation_key, state = row
+        input_digest = None
+    if not isinstance(operation_key, str) or _OPERATION_KEY.fullmatch(operation_key) is None:
+        raise ValueError("operation row has an invalid operation key")
+    if operation_key.startswith(_PERF_BACKGROUND_PREFIX):
+        raise ValueError("performance background operation cannot be exported")
+    if not isinstance(state, str) or state not in _TERMINAL_STATES:
+        raise ValueError("operation row is not terminal")
+    if modern and (not isinstance(input_digest, str) or _INPUT_DIGEST.fullmatch(input_digest) is None):
+        raise ValueError("operation row has an invalid input digest")
+    return {"operation_key": operation_key, "input_digest": input_digest, "state": state}
+
+
+def _ledger_row(database: Path, table: str, identity: dict[str, str], operation_key: str | None) -> dict[str, Any] | None:
+    if not database.is_file():
+        return None
     con = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
     try:
-        columns = {row[1] for row in con.execute("PRAGMA table_info(provider_operations)")}
-        needed = _IDENTITY | {"operation_key", "state"}
-        if not needed <= columns: return None
-        row = con.execute("SELECT operation_key,state FROM provider_operations WHERE namespace_id=? AND authority_id=? AND effect_id=? AND catalog_digest=? AND run_id=?", (identity["namespace_id"], identity["authority_id"], identity["effect_id"], identity["catalog_digest"], identity["run_id"])).fetchone()
-        return None if row is None else {"operation_key": row[0], "state": row[1]}
-    finally: con.close()
+        rows, modern = _rows_for_identity(con, table, identity, operation_key)
+        if not rows:
+            if modern:
+                identity_values = [identity["namespace_id"], identity["authority_id"], identity["effect_id"],
+                                   identity["catalog_digest"], identity["run_id"]]
+                all_keys = [row[0] for row in con.execute(
+                    f"SELECT operation_key FROM {table} WHERE namespace_id=? AND authority_id=? AND effect_id=? AND catalog_digest=? AND run_id=?",
+                    identity_values,
+                ).fetchall()]
+                if all_keys and all(isinstance(key, str) and key.startswith(_PERF_BACKGROUND_PREFIX) for key in all_keys):
+                    raise ValueError(f"{table} contains only performance background operations")
+                if operation_key is not None and all_keys:
+                    raise ValueError(f"{table} has no row for the selected exact operation key")
+            return None
+        if len(rows) != 1:
+            raise ValueError(f"{table} must contain exactly one matching operation row")
+        return _row_value(tuple(rows[0]), modern)
+    finally:
+        con.close()
+
+
+def _endpoint_row(database: Path, identity: dict[str, str], operation_key: str | None = None) -> dict[str, Any] | None:
+    return _ledger_row(database, "operations", identity, _operation_hint(identity, operation_key))
+
+
+def _provider_row(database: Path, identity: dict[str, str], operation_key: str | None = None) -> dict[str, Any] | None:
+    return _ledger_row(database, "provider_operations", identity, _operation_hint(identity, operation_key))
 
 
 def _exported_record(path: Path | None, identity: dict[str, str]) -> dict[str, Any] | None:
@@ -90,9 +172,44 @@ def _exported_record(path: Path | None, identity: dict[str, str]) -> dict[str, A
     record = _object(path)
     if not _IDENTITY <= set(record) or any(record[key] != identity[key] for key in _IDENTITY):
         raise ValueError("exported record identity mismatch")
-    if not isinstance(record.get("operation_key"), str) or not isinstance(record.get("state"), str):
-        raise ValueError("exported record lacks operation state")
-    return {"operation_key": record["operation_key"], "state": record["state"]}
+    if (
+        not isinstance(record.get("operation_key"), str)
+        or _OPERATION_KEY.fullmatch(record["operation_key"]) is None
+        or not isinstance(record.get("state"), str)
+        or record["state"] not in _TERMINAL_STATES
+    ):
+        raise ValueError("exported record lacks a valid terminal operation state")
+    if record["operation_key"].startswith(_PERF_BACKGROUND_PREFIX):
+        raise ValueError("performance background operation cannot be exported")
+    input_digest = record.get("input_digest")
+    if input_digest is not None and (
+        not isinstance(input_digest, str) or _INPUT_DIGEST.fullmatch(input_digest) is None
+    ):
+        raise ValueError("exported record has invalid input digest")
+    return {"operation_key": record["operation_key"], "input_digest": input_digest, "state": record["state"]}
+
+
+def _cross_check_ledgers(endpoint: dict[str, Any] | None, provider: dict[str, Any] | None,
+                         identity: dict[str, str], operation_key: str | None) -> None:
+    """Require exact endpoint/provider identity when both ledgers exist."""
+    expected_key = _operation_hint(identity, operation_key)
+    expected_input = identity.get("input_digest")
+    for name, record in (("endpoint", endpoint), ("provider", provider)):
+        if record is None:
+            continue
+        if expected_key is not None and record["operation_key"] != expected_key:
+            raise ValueError(f"{name} operation key does not match the selected exact key")
+        if expected_input is not None and record.get("input_digest") not in (None, expected_input):
+            raise ValueError(f"{name} input digest does not match trial identity")
+    if endpoint is None or provider is None:
+        return
+    if endpoint["operation_key"] != provider["operation_key"]:
+        raise ValueError("endpoint/provider operation keys differ")
+    endpoint_input, provider_input = endpoint.get("input_digest"), provider.get("input_digest")
+    if endpoint_input is None or provider_input is None or endpoint_input != provider_input:
+        raise ValueError("endpoint/provider input digests differ or are missing")
+    if endpoint["state"] != provider["state"]:
+        raise ValueError("endpoint/provider states differ")
 
 
 def _terminal(state: Any) -> EffectState | None:
@@ -258,7 +375,7 @@ def export_trial(trial_dir: Path, output_dir: Path, *, study_id: str, key: bytes
                  endpoint_record: Path | None = None, provider_record: Path | None = None,
                  initial_receipt: Path | None = None, recovery_receipt: Path | None = None,
                  bridge_status: Path | None = None, sink_status: Path | None = None,
-                 raw_trace_output: Path | None = None) -> ExportOutputs:
+                 raw_trace_output: Path | None = None, operation_key: str | None = None) -> ExportOutputs:
     if output_dir.exists() and any(output_dir.iterdir()): raise ValueError("output directory must be empty")
     if raw_trace_output is not None:
         output_root = output_dir.resolve()
@@ -271,8 +388,14 @@ def export_trial(trial_dir: Path, output_dir: Path, *, study_id: str, key: bytes
     endpoint_db = endpoint_db or trial_dir / "tool-endpoint.sqlite"; provider_db = provider_db or trial_dir / "tool-endpoint.provider.sqlite"
     initial_receipt = initial_receipt or trial_dir / "initial.stdout.log"; recovery_receipt = recovery_receipt or trial_dir / "recovery.stdout.log"
     bridge_status = bridge_status or trial_dir / "bridge.status.json"; sink_status = sink_status or trial_dir / "recovery-sink.status.json"
-    endpoint = _exported_record(endpoint_record, identity) or _endpoint_row(endpoint_db, identity)
-    provider = _exported_record(provider_record, identity) or _provider_row(provider_db, identity)
+    selected_operation_key = _operation_hint(identity, operation_key)
+    endpoint = _exported_record(endpoint_record, identity) or _endpoint_row(
+        endpoint_db, identity, selected_operation_key
+    )
+    provider = _exported_record(provider_record, identity) or _provider_row(
+        provider_db, identity, selected_operation_key or (endpoint or {}).get("operation_key")
+    )
+    _cross_check_ledgers(endpoint, provider, identity, selected_operation_key)
     # Initial logs are never authority for a completed recovery observation.
     initial = initial_receipt.is_file()
     recovery = _terminal_receipt(recovery_receipt, identity)
@@ -330,8 +453,8 @@ def export_trial(trial_dir: Path, output_dir: Path, *, study_id: str, key: bytes
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__); parser.add_argument("--trial-dir", type=Path, required=True); parser.add_argument("--output-dir", type=Path, required=True); parser.add_argument("--study-id", default="tool_dma_qemu_v1"); parser.add_argument("--key-file", type=Path, required=True); parser.add_argument("--endpoint-db", type=Path); parser.add_argument("--provider-db", type=Path); parser.add_argument("--endpoint-record", type=Path); parser.add_argument("--provider-record", type=Path); parser.add_argument("--initial-receipt", type=Path); parser.add_argument("--recovery-receipt", type=Path); parser.add_argument("--bridge-status", type=Path); parser.add_argument("--sink-status", type=Path); parser.add_argument("--raw-trace-output", type=Path, help="local-only raw JSONL; must be outside --output-dir")
-    args = parser.parse_args(); outputs = export_trial(args.trial_dir, args.output_dir, study_id=args.study_id, key=args.key_file.read_bytes(), endpoint_db=args.endpoint_db, provider_db=args.provider_db, endpoint_record=args.endpoint_record, provider_record=args.provider_record, initial_receipt=args.initial_receipt, recovery_receipt=args.recovery_receipt, bridge_status=args.bridge_status, sink_status=args.sink_status, raw_trace_output=args.raw_trace_output); print(json.dumps({"trace": str(outputs.trace), "aggregate": str(outputs.aggregate), "bundle": str(outputs.bundle), "raw_trace": None if outputs.raw_trace is None else str(outputs.raw_trace)}, sort_keys=True))
+    parser = argparse.ArgumentParser(description=__doc__); parser.add_argument("--trial-dir", type=Path, required=True); parser.add_argument("--output-dir", type=Path, required=True); parser.add_argument("--study-id", default="tool_dma_qemu_v1"); parser.add_argument("--key-file", type=Path, required=True); parser.add_argument("--endpoint-db", type=Path); parser.add_argument("--provider-db", type=Path); parser.add_argument("--endpoint-record", type=Path); parser.add_argument("--provider-record", type=Path); parser.add_argument("--initial-receipt", type=Path); parser.add_argument("--recovery-receipt", type=Path); parser.add_argument("--bridge-status", type=Path); parser.add_argument("--sink-status", type=Path); parser.add_argument("--operation-key", help="select one exact primary operation; performance background keys are rejected"); parser.add_argument("--raw-trace-output", type=Path, help="local-only raw JSONL; must be outside --output-dir")
+    args = parser.parse_args(); outputs = export_trial(args.trial_dir, args.output_dir, study_id=args.study_id, key=args.key_file.read_bytes(), endpoint_db=args.endpoint_db, provider_db=args.provider_db, endpoint_record=args.endpoint_record, provider_record=args.provider_record, initial_receipt=args.initial_receipt, recovery_receipt=args.recovery_receipt, bridge_status=args.bridge_status, sink_status=args.sink_status, raw_trace_output=args.raw_trace_output, operation_key=args.operation_key); print(json.dumps({"trace": str(outputs.trace), "aggregate": str(outputs.aggregate), "bundle": str(outputs.bundle), "raw_trace": None if outputs.raw_trace is None else str(outputs.raw_trace)}, sort_keys=True))
 
 
 if __name__ == "__main__": main()

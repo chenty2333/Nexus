@@ -1,12 +1,36 @@
 from __future__ import annotations
 import json, os, socket, subprocess, sys, tempfile, time, unittest
 from pathlib import Path
+from unittest import mock
 TOOLS = Path(__file__).resolve().parents[1]; sys.path.insert(0, str(TOOLS))
-from matrix_controller import _CURRENT_GUEST_RUN_ID, _RECOVERY_DEFERRED_PREFIX, _RECOVERY_METRICS_PREFIX, _metric, _recovery_metrics_from_serial, observe_barriers
+from matrix_controller import (_CURRENT_GUEST_RUN_ID, _RECOVERY_DEFERRED_PREFIX,
+                               _RECOVERY_METRICS_PREFIX, _kill_container,
+                               _kill_process_group, _metric, _recovery_metrics_from_serial,
+                               _validate_timeout, observe_barriers)
 from matrix_protocol import BarrierProtocolError, barrier, parse_barrier, config_response, paced_sendall
 from summarize_metrics import load_metrics, summarize
 
 class MatrixProtocolTests(unittest.TestCase):
+    def test_container_kill_retries_are_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            cid_path = Path(temporary) / "container.cid"
+            cid_path.write_text("a" * 64 + "\n", encoding="ascii")
+            failed = mock.Mock(returncode=1, stderr="busy")
+            killed = mock.Mock(returncode=0, stderr="")
+            with mock.patch("matrix_controller.subprocess.run", side_effect=[failed, failed, killed]) as run:
+                self.assertEqual(_kill_container(cid_path, ["docker", "kill"]), "a" * 64)
+            self.assertEqual(run.call_count, 3)
+
+    def test_container_kill_failure_is_explicit_after_bounded_retries(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            cid_path = Path(temporary) / "container.cid"
+            cid_path.write_text("a" * 64 + "\n", encoding="ascii")
+            failed = mock.Mock(returncode=1, stderr="missing")
+            with mock.patch("matrix_controller.subprocess.run", return_value=failed) as run:
+                with self.assertRaisesRegex(RuntimeError, "bounded attempts"):
+                    _kill_container(cid_path, ["docker", "kill"])
+            self.assertEqual(run.call_count, 3)
+
     def test_paced_uart_write_chunks_and_preserves_the_complete_frame(self) -> None:
         class Capture:
             def __init__(self) -> None:
@@ -302,6 +326,35 @@ class MatrixControllerIntegrationTests(unittest.TestCase):
                 time.sleep(0.02)
             else:
                 self.fail(f"recovery descendant {pid} remained after timeout cleanup")
+
+    def test_initial_cleanup_kills_same_pgid_helper_after_leader_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            marker = Path(temporary) / "helper.pid"
+            process = subprocess.Popen(
+                ["bash", "-c", "sleep 30 & echo $! >\"$1\"; exit 0", "helper", str(marker)],
+                start_new_session=True,
+            )
+            process.wait(timeout=2)
+            for _ in range(100):
+                if marker.exists():
+                    break
+                time.sleep(0.01)
+            helper_pid = int(marker.read_text(encoding="ascii"))
+            _kill_process_group(process, stage="initial-test")
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                identity = self._proc_identity(helper_pid)
+                if identity is None or identity[0] == "Z":
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("same-PGID helper survived initial cleanup")
+
+    def test_controller_rejects_nonfinite_timeouts(self) -> None:
+        for value in (float("nan"), float("inf"), float("-inf"), 0.0, -1.0):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    _validate_timeout(value, "test timeout")
 
     def test_real_qemu_recovery_budget_cannot_race_internal_launcher_timeout(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

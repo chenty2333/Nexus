@@ -78,7 +78,7 @@ use super::{
     },
     core_qemu_persistent_boot::{
         PreparedQemuPersistentBoot, QemuPersistentAnchor, QemuPersistentBootError,
-        is_legacy_schema8, persistent_dma_arena_digest,
+        persistent_dma_arena_digest,
     },
     core_reboot::{BootActivationBlock, BootActivationFailure, QuarantinedRecoveredBoot},
     core_reply_adapter::{
@@ -891,11 +891,11 @@ fn run_persistent_recovery() {
         Err(error) => fail_closed(qemu_boot_failure_reason(error), ()),
     };
     let selected_tip = prepared.candidate().committed();
-    let selected_bytes = match prepared.journal_bytes() {
-        Ok(bytes) => bytes,
+    let schema8 = match prepared.journal_is_unambiguously_schema8() {
+        Ok(schema8) => schema8,
         Err(error) => fail_closed(qemu_boot_failure_reason(error), prepared),
     };
-    if is_legacy_schema8(&selected_bytes) {
+    if schema8 {
         if selected_tip.revision() == 0 || selected_tip.head().is_zero() {
             fail_closed("unanchored-schema8-journal", prepared);
         }

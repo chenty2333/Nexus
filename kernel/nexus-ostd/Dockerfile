@@ -24,6 +24,8 @@ COPY patches/virtio-drivers-0.13.0-cser.patch \
     /tmp/nexus-patches/virtio-drivers-0.13.0-cser.patch
 COPY patches/virtio-drivers-0.13.0-LICENSE-MIT \
     /tmp/nexus-patches/virtio-drivers-0.13.0-LICENSE-MIT
+COPY kernel/nexus-ostd/patches/virtio-drivers-0.13.0.lock \
+    /tmp/nexus-patches/virtio-drivers-0.13.0.lock
 COPY tools/ostd/assert-cser-patch.sh /usr/local/bin/assert-ostd-cser-patch
 COPY kernel/nexus-ostd/patches/assert-ostd-cser-arena-patch.sh \
     /usr/local/bin/assert-ostd-cser-arena-patch
@@ -70,6 +72,8 @@ RUN set -eu; \
     patch --batch --dry-run --reverse \
         -d /opt/nexus-virtio/virtio-drivers-0.13.0 -p1 \
         < /tmp/nexus-patches/virtio-drivers-0.13.0-cser.patch; \
+    cp /tmp/nexus-patches/virtio-drivers-0.13.0.lock \
+        /opt/nexus-virtio/virtio-drivers-0.13.0/Cargo.lock; \
     chmod -R a+rX /opt/nexus-source /opt/nexus-ostd /opt/nexus-virtio \
         /opt/nexus-spin /opt/nexus-osdk-test-kernel; \
     /usr/local/bin/assert-ostd-cser-arena-patch \
@@ -85,15 +89,23 @@ RUN set -eu; \
         /crates/nexus-ostd-virtio/src/lib.rs \
         /crates/nexus-ostd-virtio/src/pci.rs
 COPY patches/cser-cargo-config.toml /root/.cargo/config.toml
+COPY .dockerignore /nexus-source-inputs/repo.dockerignore
+COPY Cargo.toml Cargo.lock /nexus-source-inputs/
+COPY tests/guest/linux/sources/linux-runtime-fs-smoke/runtime_fs_smoke.S \
+    /nexus-source-inputs/runtime_fs_smoke.S
 COPY kernel/nexus-ostd/patches/osdk-test-kernel-fetch.toml \
     /tmp/nexus-osdk-test-kernel-fetch/Cargo.toml
+COPY kernel/nexus-ostd/patches/osdk-test-kernel-fetch.lock \
+    /tmp/nexus-osdk-test-kernel-fetch/Cargo.lock
 COPY kernel/nexus-ostd/patches/osdk-test-kernel-fetch.rs \
     /tmp/nexus-osdk-test-kernel-fetch/src/lib.rs
-RUN cargo fetch --manifest-path /tmp/nexus-osdk-test-kernel-fetch/Cargo.toml \
+RUN cargo fetch --locked --manifest-path /tmp/nexus-osdk-test-kernel-fetch/Cargo.toml \
     && rm -rf /tmp/nexus-osdk-test-kernel-fetch
 RUN cargo test --manifest-path /opt/nexus-virtio/virtio-drivers-0.13.0/Cargo.toml \
-        --lib --no-default-features \
-    && rm -rf /opt/nexus-virtio/virtio-drivers-0.13.0/target
+        --lib --no-default-features --locked \
+    && rm -rf /opt/nexus-virtio/virtio-drivers-0.13.0/target \
+    && rm -f /opt/nexus-virtio/virtio-drivers-0.13.0/Cargo.lock \
+        /tmp/nexus-patches/virtio-drivers-0.13.0.lock
 
 COPY kernel/nexus-ostd/src/lib.rs /kernel/nexus-ostd/src/lib.rs
 COPY kernel/nexus-ostd/src/cser/core_device_quarantine.rs \
@@ -128,8 +140,6 @@ COPY kernel/nexus-ostd/scripts/build-runtime-fs.sh \
     kernel/nexus-ostd/scripts/build-runtime-fs-block-image.sh \
     kernel/nexus-ostd/scripts/assert-runtime-fs-block-image.sh \
     /tmp/nexus-ostd-inputs/scripts/
-COPY tests/guest/linux/sources/linux-runtime-fs-smoke/runtime_fs_smoke.S \
-    /tmp/nexus-ostd-inputs/runtime_fs_smoke.S
 COPY crates/cser-core /crates/cser-core
 COPY crates/cser-model /crates/cser-model
 # The catalog-digest helper runs against the repository workspace lockfile in
@@ -164,7 +174,7 @@ RUN --mount=type=bind,source=kernel/nexus-ostd,target=/tmp/nexus-ostd-source,rea
     && rm -rf /work \
     && cp -a /tmp/nexus-ostd-source /work \
     && cd /work \
-    && NEXUS_RUNTIME_FS_SOURCE=/tmp/nexus-ostd-inputs/runtime_fs_smoke.S \
+    && NEXUS_RUNTIME_FS_SOURCE=/nexus-source-inputs/runtime_fs_smoke.S \
         bash scripts/build-runtime-fs.sh guest/linux-runtime-fs.elf \
     && mkdir -p /opt/nexus-fixtures \
     && bash scripts/build-runtime-fs-block-image.sh \
@@ -192,7 +202,8 @@ RUN --mount=type=bind,source=kernel/nexus-ostd,target=/tmp/nexus-ostd-source,rea
     && sed -i 's/[[:space:]]\+$//' target/osdk/nexus-kernel-run-base/*.ld \
     && diff -ru /tmp/nexus-ostd-inputs/osdk-runner-base \
         /work/target/osdk/nexus-kernel-run-base \
-    && rm -rf /work /tmp/nexus-ostd-inputs
+    && rm -rf /work/target /work/guest/*.bin /work/guest/*.elf \
+    && rm -rf /tmp/nexus-ostd-inputs
 
 # The upstream image stores its toolchain and firmware below a mode-0700
 # /root. Make only the traversal/read bits and Cargo's small lock databases
@@ -214,50 +225,37 @@ WORKDIR /work
 
 # Audit the immutable build-stage snapshot with a fresh pinned toolchain. No
 # repository-controlled build step executes in this stage, and both the
-# candidate root and source context are mounted read-only. The manifest is a
-# production-closure allowlist checked by the static cutover assertion; other
-# feature-gated experiment modules may coexist in src/cser without entering
-# this proof digest.
+# candidate root and source context are mounted read-only. The source-proof
+# enumerator in the pinned x front door is the canonical, sorted, path-bound
+# closure for every copied and compiled Nexus input. Compare the verifier
+# program before executing it, then run that candidate copy with an empty,
+# explicit environment so an unreviewed build-stage script cannot choose the
+# proof authority.
 FROM ${OSDK_IMAGE} AS cser-verifier
 RUN --network=none \
     --mount=type=bind,from=build,source=/,target=/candidate-root,readonly \
     --mount=type=bind,source=kernel/nexus-ostd,target=/expected-kernel,readonly \
+    --mount=type=bind,source=.,target=/expected-repo,readonly \
     set -eu; \
     test ! -e /candidate-root/nexus-cser-verified; \
     test ! -L /candidate-root/nexus-cser-verified; \
     test ! -e /verified; \
     test ! -L /verified; \
-    test -f /expected-kernel/cser-production-sources.txt; \
-    test ! -L /expected-kernel/cser-production-sources.txt; \
-    test -f /candidate-root/kernel/nexus-ostd/cser-production-sources.txt; \
-    test ! -L /candidate-root/kernel/nexus-ostd/cser-production-sources.txt; \
-    /usr/bin/cmp /expected-kernel/cser-production-sources.txt \
-        /candidate-root/kernel/nexus-ostd/cser-production-sources.txt; \
-    { \
-        printf '%s\n' nexus.cser.image-source-proof.v1; \
-        /usr/bin/sha256sum \
-            /candidate-root/kernel/nexus-ostd/cser-production-sources.txt; \
-        test -f /expected-kernel/src/lib.rs; \
-        test ! -L /expected-kernel/src/lib.rs; \
-        test -f /candidate-root/kernel/nexus-ostd/src/lib.rs; \
-        test ! -L /candidate-root/kernel/nexus-ostd/src/lib.rs; \
-        /usr/bin/cmp /expected-kernel/src/lib.rs \
-            /candidate-root/kernel/nexus-ostd/src/lib.rs; \
-        /usr/bin/sha256sum \
-            /candidate-root/kernel/nexus-ostd/src/lib.rs; \
-    } > /tmp/nexus-cser-proof-input; \
-    while IFS= read -r relative; do \
-        test -f "/expected-kernel/src/cser/$relative"; \
-        test ! -L "/expected-kernel/src/cser/$relative"; \
-        /usr/bin/cmp "/expected-kernel/src/cser/$relative" \
-            "/candidate-root/kernel/nexus-ostd/src/cser/$relative"; \
-        /usr/bin/sha256sum \
-            "/candidate-root/kernel/nexus-ostd/src/cser/$relative" \
-            >> /tmp/nexus-cser-proof-input; \
-    done < /candidate-root/kernel/nexus-ostd/cser-production-sources.txt; \
-    proof_digest=$(/usr/bin/sha256sum /tmp/nexus-cser-proof-input \
-        | /usr/bin/cut -d ' ' -f1); \
-    printf 'nexus.cser.image-source-proof.v1\n%s\n' "$proof_digest" > /verified; \
+    test -f /expected-kernel/x; \
+    test ! -L /expected-kernel/x; \
+    test -x /expected-kernel/x; \
+    test -f /candidate-root/work/x; \
+    test ! -L /candidate-root/work/x; \
+    test -x /candidate-root/work/x; \
+    cmp -- /expected-kernel/x /candidate-root/work/x; \
+    /usr/bin/env -i \
+        PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+        LC_ALL=C \
+        NEXUS_SOURCE_PROOF_MODE=verify \
+        NEXUS_SOURCE_PROOF_REPO_ROOT=/expected-repo \
+        NEXUS_SOURCE_PROOF_KERNEL_ROOT=/expected-kernel \
+        NEXUS_SOURCE_PROOF_CANDIDATE_ROOT=/candidate-root \
+        /usr/bin/bash -p /candidate-root/work/x > /verified; \
     chmod 0444 /verified; \
     test -f /verified; \
     test ! -L /verified; \

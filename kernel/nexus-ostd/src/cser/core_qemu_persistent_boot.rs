@@ -11,7 +11,7 @@
 
 use cser_core::{
     CatalogSet, CoordinatedPersistence, CoreError, CoreLimits, DeviceGeneration, Digest,
-    RecoveryBinding, scan_journal,
+    RecoveryBinding,
 };
 use nexus_ostd_virtio::{
     BootQuarantineGuard, BootQuarantineObservation, OwnerKind, PersistentDmaArenaLayout,
@@ -169,13 +169,39 @@ where
         self.arena
     }
 
-    /// A bounded, read-only inspection for callers that need to select an
-    /// explicit migration path before recovery.  This leaves the journal in
-    /// the prepared envelope and does not relax device quarantine.
-    pub(crate) fn journal_bytes(&mut self) -> Result<alloc::vec::Vec<u8>, QemuPersistentBootError> {
-        self.journal
-            .read_all()
-            .map_err(|_| QemuPersistentBootError::AtaJournalRead)
+    /// Returns whether every validated physical candidate carries the frozen
+    /// schema-8 prefix. The probe reads only the fixed magic and revalidates
+    /// each candidate; it never selects by physical generation or materializes
+    /// a journal image. Mixed old/current candidates remain ambiguous and fall
+    /// through to ordinary anchored recovery, which fails closed.
+    pub(crate) fn journal_is_unambiguously_schema8(
+        &mut self,
+    ) -> Result<bool, QemuPersistentBootError> {
+        const SCHEMA8_MAGIC: [u8; 8] = *b"CSERJR8\0";
+
+        let candidates = self
+            .journal
+            .recovery_candidates()
+            .map_err(|_| QemuPersistentBootError::AtaJournalRead)?;
+        if candidates.is_empty() {
+            return Ok(false);
+        }
+        for candidate in candidates {
+            if candidate.logical_len() < SCHEMA8_MAGIC.len() {
+                return Ok(false);
+            }
+            let mut magic = [0u8; 8];
+            self.journal
+                .read_recovery_at(candidate, 0, &mut magic)
+                .map_err(|_| QemuPersistentBootError::AtaJournalRead)?;
+            self.journal
+                .revalidate_recovery_candidate(candidate)
+                .map_err(|_| QemuPersistentBootError::AtaJournalRead)?;
+            if magic != SCHEMA8_MAGIC {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     pub(crate) const fn candidate(&self) -> &TpmNvAnchorCandidate<QemuTisTpm2> {
@@ -285,16 +311,6 @@ mod tests {
         assert_eq!(result, Err(QemuPersistentBootError::DeviceQuarantine));
         assert_eq!(events.into_inner(), ["quarantine-failed"]);
     }
-}
-
-/// Returns whether the prepared journal is a legacy schema-8 stream.  Kept here so
-/// production can preserve its explicit migration diagnostic while experiments
-/// still share all acquisition/recovery machinery.
-pub(crate) fn is_legacy_schema8(bytes: &[u8]) -> bool {
-    matches!(
-        scan_journal(bytes),
-        Err(cser_core::JournalDecodeError::UnsupportedVersion { version: 8 })
-    )
 }
 
 /// The frozen, QEMU-only DMA arena contract shared by production and the

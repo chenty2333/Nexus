@@ -26,14 +26,17 @@
 //! with its raw image, so cross-restart freshness still requires an independent
 //! non-rollback [`cser_core::TrustedAnchorBackend`].
 
-use alloc::vec::Vec;
+use alloc::{vec, vec::Vec};
 use core::{hint::spin_loop, mem::size_of};
 
-use cser_core::{CompactingJournalBackend, DurableJournalBackend, JournalRecord, JournalRepair};
+use cser_core::{
+    CheckpointRecordPlan, CheckpointWrite, CompactingJournalBackend, Digest, DurableJournalBackend,
+    JournalRecord, JournalRepair, StreamingJournalBackend,
+};
 use ostd::{arch::device::io_port::ReadWriteAccess, io::IoPort};
 use sha2::{Digest as _, Sha256};
 
-use crate::core_reboot::OstdBootJournal;
+use crate::core_reboot::{OstdBootJournal, RecoveryCandidate};
 
 pub(crate) const SECTOR_BYTES: usize = 512;
 const WORDS_PER_SECTOR: usize = SECTOR_BYTES / size_of::<u16>();
@@ -640,18 +643,48 @@ enum HeaderInspection {
     Valid(BankHeader),
 }
 
-#[derive(Debug)]
-enum BankInspection {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecoveryCandidateInspection {
     Blank,
     Invalid,
-    Valid(ActiveImage),
+    Valid(BankRecoveryCandidate),
 }
 
-#[derive(Clone, Debug)]
+/// A complete, physically validated bank retained for trusted logical
+/// selection.  The payload is intentionally not cached here; recovery reads
+/// it through the bounded `RecoveryCandidate` source interface only after a
+/// CSER anchor has been reserved.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BankRecoveryCandidate {
+    header: BankHeader,
+}
+
+impl BankRecoveryCandidate {
+    fn descriptor(self) -> RecoveryCandidate {
+        RecoveryCandidate::new(
+            self.header.bank,
+            self.header.generation,
+            self.header.logical_len,
+            Digest::new(self.header.payload_digest),
+        )
+    }
+}
+
+/// Selected/write metadata only; the logical payload remains on the bank.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ActiveImage {
     bank: Option<u32>,
     generation: u64,
-    bytes: Vec<u8>,
+    logical_len: usize,
+    payload_digest: [u8; 32],
+}
+
+struct PayloadWriteState {
+    sector: [u8; SECTOR_BYTES],
+    buffered: usize,
+    target_sector: u32,
+    written: usize,
+    digest: Sha256,
 }
 
 /// Default-off, operation-level accounting for the bounded journal.
@@ -730,14 +763,121 @@ pub(crate) enum AtaDoubleBankError<E> {
 #[derive(Debug)]
 struct BankedJournal<B> {
     backend: B,
-    // The provider owns its dedicated fixture exclusively.  No other writer
+    // The provider owns its dedicated fixture exclusively. No other writer
     // may mutate the two banks while this object is live; reopening validates
-    // both banks again before establishing a new cache.
+    // both banks again before establishing a new metadata cache.
     active: ActiveImage,
+    /// Every bank whose header and exact payload digest validated at open.
+    /// This is the recovery candidate set; `active` is only a selected/write
+    /// metadata cache and is never established from physical generation alone.
+    recovery_candidates: Vec<BankRecoveryCandidate>,
+    /// Any failed mutation or post-mutation validation poisons this owner.
+    /// The caller must reopen and re-enumerate the durable candidates before
+    /// issuing another operation.
+    poisoned: bool,
     // Disabled in production unless an owner explicitly opts in.  Keeping the
     // field absent from the default path avoids changing the measurement
     // envelope that the journal is intended to observe.
     telemetry: Option<JournalIoTelemetry>,
+}
+
+/// Fixed-scratch checkpoint destination for the legacy two-bank format.
+/// `CheckpointRecordPlan::write_to` supplies arbitrary-sized slices; this sink
+/// turns them into sector writes without constructing a checkpoint-sized
+/// `Vec` or a `JournalRecord`.
+struct BankCheckpointSink<'a, B>
+where
+    B: SectorBackend,
+{
+    journal: &'a mut BankedJournal<B>,
+    bank: u32,
+    sector_index: u32,
+    buffer: [u8; SECTOR_BYTES],
+    buffered: usize,
+    written: usize,
+    digest: Sha256,
+}
+
+impl<'a, B> BankCheckpointSink<'a, B>
+where
+    B: SectorBackend,
+{
+    fn new(journal: &'a mut BankedJournal<B>, bank: u32) -> Self {
+        Self {
+            journal,
+            bank,
+            sector_index: 0,
+            buffer: [0; SECTOR_BYTES],
+            buffered: 0,
+            written: 0,
+            digest: Sha256::new(),
+        }
+    }
+
+    fn flush_buffer(&mut self) -> Result<(), BankedJournalError<B::Error>> {
+        if self.buffered == 0 {
+            return Ok(());
+        }
+        let sector = self.buffer;
+        self.journal
+            .write_sector(bank_data_lba(self.bank) + self.sector_index, &sector)?;
+        self.sector_index = self
+            .sector_index
+            .checked_add(1)
+            .ok_or(BankedJournalError::CorruptBankMetadata)?;
+        self.buffer = [0; SECTOR_BYTES];
+        self.buffered = 0;
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<([u8; 32], usize), BankedJournalError<B::Error>> {
+        self.flush_buffer()?;
+        Ok((self.digest.finalize().into(), self.written))
+    }
+}
+
+impl<B> CheckpointWrite for BankCheckpointSink<'_, B>
+where
+    B: SectorBackend,
+{
+    type Error = BankedJournalError<B::Error>;
+
+    fn write_all(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
+        let resulting =
+            self.written
+                .checked_add(bytes.len())
+                .ok_or(BankedJournalError::JournalFull {
+                    current: self.written,
+                    additional: bytes.len(),
+                    capacity: JOURNAL_CAPACITY,
+                })?;
+        if resulting > JOURNAL_CAPACITY {
+            return Err(BankedJournalError::JournalFull {
+                current: self.written,
+                additional: bytes.len(),
+                capacity: JOURNAL_CAPACITY,
+            });
+        }
+
+        let mut remaining = bytes;
+        while !remaining.is_empty() {
+            let available = SECTOR_BYTES - self.buffered;
+            let amount = available.min(remaining.len());
+            self.buffer[self.buffered..self.buffered + amount]
+                .copy_from_slice(&remaining[..amount]);
+            self.digest.update(&remaining[..amount]);
+            if let Some(telemetry) = &mut self.journal.telemetry {
+                telemetry.hash_bytes = telemetry.hash_bytes.saturating_add(amount as u64);
+            }
+            self.buffered += amount;
+            self.written += amount;
+            remaining = &remaining[amount..];
+            if self.buffered == SECTOR_BYTES {
+                self.flush_buffer()?;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl<B> BankedJournal<B>
@@ -765,80 +905,364 @@ where
             active: ActiveImage {
                 bank: None,
                 generation: 0,
-                bytes: Vec::new(),
+                logical_len: 0,
+                payload_digest: Sha256::digest(&[] as &[u8]).into(),
             },
+            recovery_candidates: Vec::new(),
+            poisoned: false,
             telemetry: None,
         };
-        // Validate both banks once before trusting a cache.  Subsequent
-        // operations retain exclusive ownership and update it only after a
-        // complete new-bank readback succeeds.
-        journal.active = if strict {
-            journal.read_active_strict()?
-        } else {
-            journal.read_active()?
-        };
+        // Validate both banks once and retain every valid candidate.  No
+        // physical generation is promoted to an authority cache here; boot
+        // selects one only after the trusted CSER lease is available.
+        journal.recovery_candidates = journal.discover_candidates(strict)?;
         Ok(journal)
     }
 
     fn read_all_image(&mut self) -> Result<Vec<u8>, BankedJournalError<B::Error>> {
-        Ok(self.active.bytes.clone())
+        self.require_reopen()?;
+        let candidate = if let Some(bank) = self.active.bank {
+            Some(
+                self.recovery_candidates
+                    .iter()
+                    .copied()
+                    .find(|candidate| {
+                        candidate.header.bank == bank
+                            && candidate.header.generation == self.active.generation
+                            && candidate.header.logical_len == self.active.logical_len
+                            && candidate.header.payload_digest == self.active.payload_digest
+                    })
+                    .ok_or(BankedJournalError::CorruptBankMetadata)?,
+            )
+        } else {
+            let candidate = self
+                .recovery_candidates
+                .iter()
+                .max_by_key(|candidate| candidate.header.generation)
+                .copied();
+            if let Some(candidate) = candidate {
+                // This is an explicit compatibility read, outside the
+                // trusted candidate-selection path. Retain only metadata so
+                // raw two-bank callers can continue their revision protocol
+                // without making a payload cache authoritative for CSER.
+                self.active = self.load_candidate(candidate)?;
+            }
+            candidate
+        };
+        let Some(candidate) = candidate else {
+            return Ok(Vec::new());
+        };
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(candidate.header.logical_len)
+            .map_err(|_| BankedJournalError::AllocationFailed {
+                requested: candidate.header.logical_len,
+            })?;
+        bytes.resize(candidate.header.logical_len, 0);
+        self.read_candidate_at(candidate.descriptor(), 0, &mut bytes)?;
+        Ok(bytes)
+    }
+
+    fn discover_candidates(
+        &mut self,
+        strict: bool,
+    ) -> Result<Vec<BankRecoveryCandidate>, BankedJournalError<B::Error>> {
+        let first = self.inspect_bank_candidate(0)?;
+        let second = self.inspect_bank_candidate(1)?;
+        let mut candidates = Vec::new();
+        if let RecoveryCandidateInspection::Valid(candidate) = first {
+            candidates.push(candidate);
+        }
+        if let RecoveryCandidateInspection::Valid(candidate) = second {
+            candidates.push(candidate);
+        }
+        if candidates.is_empty() {
+            let invalid = matches!(first, RecoveryCandidateInspection::Invalid)
+                || matches!(second, RecoveryCandidateInspection::Invalid);
+            let both_invalid = matches!(first, RecoveryCandidateInspection::Invalid)
+                && matches!(second, RecoveryCandidateInspection::Invalid);
+            if (strict && invalid) || both_invalid {
+                return Err(BankedJournalError::CorruptBankMetadata);
+            }
+        }
+        Ok(candidates)
+    }
+
+    fn read_bank_header_state(
+        &mut self,
+        bank: u32,
+    ) -> Result<HeaderInspection, BankedJournalError<B::Error>> {
+        let mut header_sector = [0u8; SECTOR_BYTES];
+        self.read_sector(bank_header_lba(bank), &mut header_sector)?;
+        Ok(BankHeader::decode(bank, &header_sector))
+    }
+
+    /// Validates a bank's exact payload digest without retaining its logical
+    /// bytes. This keeps the candidate set bounded even when both banks carry
+    /// long divergent streams.
+    fn inspect_bank_candidate(
+        &mut self,
+        bank: u32,
+    ) -> Result<RecoveryCandidateInspection, BankedJournalError<B::Error>> {
+        let header = match self.read_bank_header_state(bank)? {
+            HeaderInspection::Blank => return Ok(RecoveryCandidateInspection::Blank),
+            HeaderInspection::Invalid => return Ok(RecoveryCandidateInspection::Invalid),
+            HeaderInspection::Valid(header) => header,
+        };
+        let mut hasher = Sha256::new();
+        let mut remaining = header.logical_len;
+        let mut sector_index = 0u32;
+        while remaining != 0 {
+            let mut sector = [0u8; SECTOR_BYTES];
+            self.read_sector(bank_data_lba(bank) + sector_index, &mut sector)?;
+            let used = remaining.min(SECTOR_BYTES);
+            hasher.update(&sector[..used]);
+            if let Some(telemetry) = &mut self.telemetry {
+                telemetry.hash_bytes = telemetry.hash_bytes.saturating_add(used as u64);
+            }
+            remaining -= used;
+            sector_index = sector_index
+                .checked_add(1)
+                .ok_or(BankedJournalError::CorruptBankMetadata)?;
+        }
+        if <[u8; 32]>::from(hasher.finalize()) != header.payload_digest {
+            return Ok(RecoveryCandidateInspection::Invalid);
+        }
+        Ok(RecoveryCandidateInspection::Valid(BankRecoveryCandidate {
+            header,
+        }))
+    }
+
+    fn load_candidate(
+        &mut self,
+        candidate: BankRecoveryCandidate,
+    ) -> Result<ActiveImage, BankedJournalError<B::Error>> {
+        // Candidate validation already streamed and hashed the exact payload.
+        // Selecting it therefore installs only the bounded metadata needed by
+        // the next append/repair; the logical bytes remain on media.
+        Ok(ActiveImage {
+            bank: Some(candidate.header.bank),
+            generation: candidate.header.generation,
+            logical_len: candidate.header.logical_len,
+            payload_digest: candidate.header.payload_digest,
+        })
+    }
+
+    fn select_candidate(
+        &mut self,
+        requested: Option<RecoveryCandidate>,
+    ) -> Result<(), BankedJournalError<B::Error>> {
+        self.require_reopen()?;
+        let Some(requested) = requested else {
+            self.active = ActiveImage {
+                bank: None,
+                generation: 0,
+                logical_len: 0,
+                payload_digest: Sha256::digest(&[] as &[u8]).into(),
+            };
+            return Ok(());
+        };
+        self.revalidate_candidate(requested)?;
+        let bank = self
+            .recovery_candidates
+            .iter()
+            .copied()
+            .find(|candidate| candidate.descriptor() == requested)
+            .ok_or(BankedJournalError::CorruptBankMetadata)?;
+        self.active = self.load_candidate(bank)?;
+        Ok(())
+    }
+
+    fn revalidate_candidate(
+        &mut self,
+        requested: RecoveryCandidate,
+    ) -> Result<(), BankedJournalError<B::Error>> {
+        self.require_reopen()?;
+        let bank = self
+            .recovery_candidates
+            .iter()
+            .copied()
+            .find(|candidate| candidate.descriptor() == requested)
+            .ok_or(BankedJournalError::CorruptBankMetadata)?;
+        match self.inspect_bank_candidate(bank.header.bank)? {
+            RecoveryCandidateInspection::Valid(current) if current.descriptor() == requested => {
+                Ok(())
+            }
+            RecoveryCandidateInspection::Blank
+            | RecoveryCandidateInspection::Invalid
+            | RecoveryCandidateInspection::Valid(_) => Err(BankedJournalError::CorruptBankMetadata),
+        }
+    }
+
+    fn recovery_candidates(
+        &mut self,
+    ) -> Result<Vec<RecoveryCandidate>, BankedJournalError<B::Error>> {
+        self.require_reopen()?;
+        // Re-enumerate after any anchored repair/append. The retained vector
+        // is the last validated set, not an authority cache which may outlive
+        // a durable bank replacement.
+        self.recovery_candidates = self.discover_candidates(true)?;
+        Ok(self
+            .recovery_candidates
+            .iter()
+            .copied()
+            .map(BankRecoveryCandidate::descriptor)
+            .collect())
+    }
+
+    fn read_candidate_at(
+        &mut self,
+        requested: RecoveryCandidate,
+        offset: usize,
+        output: &mut [u8],
+    ) -> Result<(), BankedJournalError<B::Error>> {
+        self.require_reopen()?;
+        let bank = self
+            .recovery_candidates
+            .iter()
+            .copied()
+            .find(|candidate| candidate.descriptor() == requested)
+            .ok_or(BankedJournalError::CorruptBankMetadata)?;
+        let end =
+            offset
+                .checked_add(output.len())
+                .ok_or(BankedJournalError::InvalidRepairOffset {
+                    offset,
+                    length: bank.header.logical_len,
+                })?;
+        if end > bank.header.logical_len {
+            return Err(BankedJournalError::InvalidRepairOffset {
+                offset,
+                length: bank.header.logical_len,
+            });
+        }
+        if output.is_empty() {
+            return Ok(());
+        }
+        let first_sector = offset / SECTOR_BYTES;
+        let last_sector = (end - 1) / SECTOR_BYTES;
+        for sector_index in first_sector..=last_sector {
+            let mut sector = [0u8; SECTOR_BYTES];
+            self.read_sector(
+                bank_data_lba(bank.header.bank)
+                    + u32::try_from(sector_index)
+                        .map_err(|_| BankedJournalError::CorruptBankMetadata)?,
+                &mut sector,
+            )?;
+            let sector_begin = sector_index * SECTOR_BYTES;
+            let begin = offset.max(sector_begin);
+            let copy_end = end.min(sector_begin + SECTOR_BYTES);
+            output[begin - offset..copy_end - offset]
+                .copy_from_slice(&sector[begin - sector_begin..copy_end - sector_begin]);
+        }
+        Ok(())
     }
 
     fn append_exact(&mut self, suffix: &[u8]) -> Result<(), BankedJournalError<B::Error>> {
-        let mut active = self.active.clone();
-        let resulting_len = active.bytes.len().checked_add(suffix.len()).ok_or(
+        self.require_reopen()?;
+        let resulting_len = self.active.logical_len.checked_add(suffix.len()).ok_or(
             BankedJournalError::JournalFull {
-                current: active.bytes.len(),
+                current: self.active.logical_len,
                 additional: suffix.len(),
                 capacity: JOURNAL_CAPACITY,
             },
         )?;
         if resulting_len > JOURNAL_CAPACITY {
             return Err(BankedJournalError::JournalFull {
-                current: active.bytes.len(),
+                current: self.active.logical_len,
                 additional: suffix.len(),
                 capacity: JOURNAL_CAPACITY,
             });
         }
-        active.bytes.try_reserve_exact(suffix.len()).map_err(|_| {
-            BankedJournalError::AllocationFailed {
-                requested: resulting_len,
-            }
-        })?;
-        active.bytes.extend_from_slice(suffix);
-        let published = self.publish_next(active.bank, active.generation, &active.bytes)?;
+        let target_bank = self.active.bank.map_or(0, |bank| bank ^ 1);
+        self.prepare_candidate_slot(target_bank)?;
+        let published = self.publish_next_stream(
+            self.active.bank,
+            self.active.generation,
+            self.active.logical_len,
+            suffix,
+        )?;
+        self.install_active_candidate(published);
         self.active = published;
         self.mark_phase(JournalIoPhase::CacheUpdated);
         Ok(())
     }
 
     fn repair_exact(&mut self, repair: JournalRepair) -> Result<(), BankedJournalError<B::Error>> {
-        let mut active = self.active.clone();
+        self.require_reopen()?;
         let offset = repair.offset();
-        if offset > active.bytes.len() {
+        if offset > self.active.logical_len {
             return Err(BankedJournalError::InvalidRepairOffset {
                 offset,
-                length: active.bytes.len(),
+                length: self.active.logical_len,
             });
         }
-        if offset == active.bytes.len() {
+        if offset == self.active.logical_len {
             // There is no suffix to rewrite, but the recovery contract still
             // asks this provider to complete a durability barrier.
             return self.flush();
         }
-        active.bytes.truncate(offset);
-        let published = self.publish_next(active.bank, active.generation, &active.bytes)?;
+        let target_bank = self.active.bank.map_or(0, |bank| bank ^ 1);
+        self.prepare_candidate_slot(target_bank)?;
+        let published =
+            self.publish_next_stream(self.active.bank, self.active.generation, offset, &[])?;
+        self.install_active_candidate(published);
         self.active = published;
         self.mark_phase(JournalIoPhase::CacheUpdated);
         Ok(())
     }
 
+    fn repair_exact_from_candidate(
+        &mut self,
+        repair: JournalRepair,
+        candidate: Option<RecoveryCandidate>,
+    ) -> Result<(), BankedJournalError<B::Error>> {
+        let Some(requested) = candidate else {
+            return self.repair_exact(repair);
+        };
+        self.require_reopen()?;
+        self.revalidate_candidate(requested)?;
+        let source = self
+            .recovery_candidates
+            .iter()
+            .copied()
+            .find(|candidate| candidate.descriptor() == requested)
+            .ok_or(BankedJournalError::CorruptBankMetadata)?;
+        let offset = repair.offset();
+        if offset > source.header.logical_len {
+            return Err(BankedJournalError::InvalidRepairOffset {
+                offset,
+                length: source.header.logical_len,
+            });
+        }
+        if offset == source.header.logical_len {
+            return self.flush();
+        }
+        let target_bank = source.header.bank ^ 1;
+        self.prepare_candidate_slot(target_bank)?;
+        let published = self.publish_next_stream(
+            Some(source.header.bank),
+            source.header.generation,
+            offset,
+            &[],
+        )?;
+        self.install_active_candidate(published);
+        self.active = published;
+        self.mark_phase(JournalIoPhase::CacheUpdated);
+        Ok(())
+    }
+
+    /// Publishes an independently supplied complete payload. This remains for
+    /// the raw two-bank facade; the CSER append/repair paths use
+    /// [`Self::publish_next_stream`] so the existing payload is copied sector
+    /// by sector instead of being cloned into a second `Vec`.
     fn publish_next(
         &mut self,
         active_bank: Option<u32>,
         generation: u64,
         bytes: &[u8],
     ) -> Result<ActiveImage, BankedJournalError<B::Error>> {
+        self.require_reopen()?;
         if bytes.len() > JOURNAL_CAPACITY {
             return Err(BankedJournalError::JournalFull {
                 current: 0,
@@ -846,89 +1270,274 @@ where
                 capacity: JOURNAL_CAPACITY,
             });
         }
+        let target_bank = active_bank.map_or(0, |bank| bank ^ 1);
+        self.prepare_candidate_slot(target_bank)?;
+        let published = self.publish_next_stream(active_bank, generation, 0, bytes)?;
+        self.install_active_candidate(published);
+        self.active = published;
+        self.mark_phase(JournalIoPhase::CacheUpdated);
+        Ok(published)
+    }
+
+    /// Copies the old logical prefix from its bank into the inactive bank and
+    /// appends `suffix` using one sector scratch buffer. The source is never
+    /// materialized, and the returned metadata is the only post-publication
+    /// cache installed by the journal.
+    fn publish_next_stream(
+        &mut self,
+        active_bank: Option<u32>,
+        generation: u64,
+        source_len: usize,
+        suffix: &[u8],
+    ) -> Result<ActiveImage, BankedJournalError<B::Error>> {
+        if active_bank.is_none() && source_len != 0 {
+            return Err(BankedJournalError::CorruptBankMetadata);
+        }
+        let logical_len =
+            source_len
+                .checked_add(suffix.len())
+                .ok_or(BankedJournalError::JournalFull {
+                    current: source_len,
+                    additional: suffix.len(),
+                    capacity: JOURNAL_CAPACITY,
+                })?;
+        if logical_len > JOURNAL_CAPACITY {
+            return Err(BankedJournalError::JournalFull {
+                current: source_len,
+                additional: suffix.len(),
+                capacity: JOURNAL_CAPACITY,
+            });
+        }
         let next_generation = generation
             .checked_add(1)
             .ok_or(BankedJournalError::GenerationExhausted)?;
         let target_bank = active_bank.map_or(0, |bank| bank ^ 1);
-        self.write_payload(target_bank, bytes)?;
-        self.mark_phase(JournalIoPhase::PayloadWritten);
-        self.flush()?;
-        self.mark_phase(JournalIoPhase::PayloadFlushed);
-
-        let header = BankHeader {
-            bank: target_bank,
-            generation: next_generation,
-            logical_len: bytes.len(),
-            payload_digest: self.hash(bytes),
-        }
-        .encode();
-        self.write_sector(bank_header_lba(target_bank), &header)?;
-        self.mark_phase(JournalIoPhase::HeaderWritten);
-        self.flush()?;
-        self.mark_phase(JournalIoPhase::HeaderFlushed);
-
-        match self.inspect_bank(target_bank)? {
-            BankInspection::Valid(image)
-                if image.generation == next_generation && image.bytes == bytes =>
-            {
-                self.mark_phase(JournalIoPhase::ReadbackValidated);
-                Ok(image)
+        let result = (|| {
+            let (payload_digest, written) =
+                self.write_payload_stream(target_bank, active_bank, source_len, suffix)?;
+            if written != logical_len {
+                return Err(BankedJournalError::CorruptBankMetadata);
             }
-            BankInspection::Blank | BankInspection::Invalid | BankInspection::Valid(_) => {
-                Err(BankedJournalError::ReadbackMismatch)
+            self.mark_phase(JournalIoPhase::PayloadWritten);
+            self.flush()?;
+            self.mark_phase(JournalIoPhase::PayloadFlushed);
+
+            let expected = BankHeader {
+                bank: target_bank,
+                generation: next_generation,
+                logical_len,
+                payload_digest,
+            };
+            let encoded = expected.encode();
+            self.write_sector(bank_header_lba(target_bank), &encoded)?;
+            self.mark_phase(JournalIoPhase::HeaderWritten);
+            self.flush()?;
+            self.mark_phase(JournalIoPhase::HeaderFlushed);
+
+            let RecoveryCandidateInspection::Valid(candidate) =
+                self.inspect_bank_candidate(target_bank)?
+            else {
+                return Err(BankedJournalError::ReadbackMismatch);
+            };
+            if candidate.header != expected {
+                return Err(BankedJournalError::ReadbackMismatch);
             }
+            self.mark_phase(JournalIoPhase::ReadbackValidated);
+            Ok(ActiveImage {
+                bank: Some(target_bank),
+                generation: next_generation,
+                logical_len,
+                payload_digest,
+            })
+        })();
+        if result.is_err() {
+            // From the first payload write onward the medium may contain an
+            // indistinguishable torn successor. Never continue using this
+            // owner after any such error; a fresh open must re-enumerate it.
+            self.poisoned = true;
         }
+        result
     }
 
-    fn write_payload(
+    fn write_payload_stream(
         &mut self,
-        bank: u32,
+        target_bank: u32,
+        source_bank: Option<u32>,
+        source_len: usize,
+        suffix: &[u8],
+    ) -> Result<([u8; 32], usize), BankedJournalError<B::Error>> {
+        let mut output = PayloadWriteState {
+            sector: [0u8; SECTOR_BYTES],
+            buffered: 0,
+            target_sector: 0,
+            written: 0,
+            digest: Sha256::new(),
+        };
+
+        let mut remaining = source_len;
+        let mut source_sector = 0u32;
+        while remaining != 0 {
+            let bank = source_bank.ok_or(BankedJournalError::CorruptBankMetadata)?;
+            let mut source = [0u8; SECTOR_BYTES];
+            self.read_sector(bank_data_lba(bank) + source_sector, &mut source)?;
+            let used = remaining.min(SECTOR_BYTES);
+            self.write_payload_piece(target_bank, &mut output, &source[..used])?;
+            remaining -= used;
+            source_sector = source_sector
+                .checked_add(1)
+                .ok_or(BankedJournalError::CorruptBankMetadata)?;
+        }
+        self.write_payload_piece(target_bank, &mut output, suffix)?;
+        if output.buffered != 0 {
+            self.write_sector(
+                bank_data_lba(target_bank) + output.target_sector,
+                &output.sector,
+            )?;
+        }
+        Ok((output.digest.finalize().into(), output.written))
+    }
+
+    fn write_payload_piece(
+        &mut self,
+        target_bank: u32,
+        output: &mut PayloadWriteState,
         bytes: &[u8],
     ) -> Result<(), BankedJournalError<B::Error>> {
-        for (sector_index, chunk) in bytes.chunks(SECTOR_BYTES).enumerate() {
-            let mut sector = [0u8; SECTOR_BYTES];
-            sector[..chunk.len()].copy_from_slice(chunk);
-            self.write_sector(
-                bank_data_lba(bank)
-                    + u32::try_from(sector_index).map_err(|_| BankedJournalError::JournalFull {
-                        current: 0,
-                        additional: bytes.len(),
-                        capacity: JOURNAL_CAPACITY,
-                    })?,
-                &sector,
-            )?;
+        let mut remaining = bytes;
+        while !remaining.is_empty() {
+            let amount = (SECTOR_BYTES - output.buffered).min(remaining.len());
+            output.sector[output.buffered..output.buffered + amount]
+                .copy_from_slice(&remaining[..amount]);
+            output.digest.update(&remaining[..amount]);
+            if let Some(telemetry) = &mut self.telemetry {
+                telemetry.hash_bytes = telemetry.hash_bytes.saturating_add(amount as u64);
+            }
+            output.buffered += amount;
+            output.written = output
+                .written
+                .checked_add(amount)
+                .ok_or(BankedJournalError::CorruptBankMetadata)?;
+            remaining = &remaining[amount..];
+            if output.buffered == SECTOR_BYTES {
+                let full = output.sector;
+                self.write_sector(bank_data_lba(target_bank) + output.target_sector, &full)?;
+                output.target_sector = output
+                    .target_sector
+                    .checked_add(1)
+                    .ok_or(BankedJournalError::CorruptBankMetadata)?;
+                output.sector = [0; SECTOR_BYTES];
+                output.buffered = 0;
+            }
         }
         Ok(())
     }
 
+    fn stage_checkpoint(
+        &mut self,
+        plan: &CheckpointRecordPlan,
+    ) -> Result<(), BankedJournalError<B::Error>> {
+        self.require_reopen()?;
+        let logical_len = plan.record_len();
+        if logical_len > JOURNAL_CAPACITY {
+            return Err(BankedJournalError::JournalFull {
+                current: 0,
+                additional: logical_len,
+                capacity: JOURNAL_CAPACITY,
+            });
+        }
+        if !self.recovery_candidates.is_empty() && self.active.bank.is_none() {
+            return Err(BankedJournalError::CorruptBankMetadata);
+        }
+        let target_bank = self.active.bank.map_or(0, |bank| bank ^ 1);
+        let generation = self
+            .active
+            .generation
+            .checked_add(1)
+            .ok_or(BankedJournalError::GenerationExhausted)?;
+        // The candidate vector is bounded to the two physical banks. Reserve
+        // its only possible growth before any durable write.
+        self.prepare_candidate_slot(target_bank)?;
+
+        let result = (|| {
+            let mut sink = BankCheckpointSink::new(self, target_bank);
+            let written = plan.write_to(&mut sink)?;
+            let (payload_digest, sink_written) = sink.finish()?;
+            if written != sink_written {
+                return Err(BankedJournalError::CorruptBankMetadata);
+            }
+            if written != logical_len {
+                return Err(BankedJournalError::CorruptBankMetadata);
+            }
+            self.mark_phase(JournalIoPhase::PayloadWritten);
+            self.flush()?;
+            self.mark_phase(JournalIoPhase::PayloadFlushed);
+
+            let expected_header = BankHeader {
+                bank: target_bank,
+                generation,
+                logical_len,
+                payload_digest,
+            };
+            let header = expected_header.encode();
+            self.write_sector(bank_header_lba(target_bank), &header)?;
+            self.mark_phase(JournalIoPhase::HeaderWritten);
+            self.flush()?;
+            self.mark_phase(JournalIoPhase::HeaderFlushed);
+
+            let RecoveryCandidateInspection::Valid(candidate) =
+                self.inspect_bank_candidate(target_bank)?
+            else {
+                return Err(BankedJournalError::ReadbackMismatch);
+            };
+            if candidate.header != expected_header {
+                return Err(BankedJournalError::ReadbackMismatch);
+            }
+            self.mark_phase(JournalIoPhase::ReadbackValidated);
+            self.install_candidate(candidate);
+            self.active = ActiveImage {
+                bank: Some(target_bank),
+                generation,
+                logical_len,
+                payload_digest,
+            };
+            self.mark_phase(JournalIoPhase::CacheUpdated);
+            Ok(())
+        })();
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+
     fn read_active(&mut self) -> Result<ActiveImage, BankedJournalError<B::Error>> {
-        let first = self.inspect_bank(0)?;
-        let second = self.inspect_bank(1)?;
-        match (first, second) {
-            (BankInspection::Valid(left), BankInspection::Valid(right)) => {
-                if left.generation > right.generation {
-                    Ok(left)
-                } else if right.generation > left.generation {
-                    Ok(right)
-                } else if left.bytes == right.bytes {
-                    Ok(left)
+        self.require_reopen()?;
+        let candidates = self.discover_candidates(false)?;
+        match candidates.as_slice() {
+            [] => Ok(ActiveImage {
+                bank: None,
+                generation: 0,
+                logical_len: 0,
+                payload_digest: Sha256::digest(&[] as &[u8]).into(),
+            }),
+            [candidate] => self.load_candidate(*candidate),
+            [left, right] => {
+                let left_image = self.load_candidate(*left)?;
+                let right_image = self.load_candidate(*right)?;
+                if left.header.logical_len == right.header.logical_len
+                    && left.header.payload_digest == right.header.payload_digest
+                {
+                    Ok(if left.header.generation >= right.header.generation {
+                        left_image
+                    } else {
+                        right_image
+                    })
                 } else {
                     Err(BankedJournalError::ConflictingGeneration {
-                        generation: left.generation,
+                        generation: left.header.generation.max(right.header.generation),
                     })
                 }
             }
-            (BankInspection::Valid(image), _) | (_, BankInspection::Valid(image)) => Ok(image),
-            (BankInspection::Blank, BankInspection::Blank)
-            | (BankInspection::Blank, BankInspection::Invalid)
-            | (BankInspection::Invalid, BankInspection::Blank) => Ok(ActiveImage {
-                bank: None,
-                generation: 0,
-                bytes: Vec::new(),
-            }),
-            (BankInspection::Invalid, BankInspection::Invalid) => {
-                Err(BankedJournalError::CorruptBankMetadata)
-            }
+            _ => Err(BankedJournalError::CorruptBankMetadata),
         }
     }
 
@@ -937,73 +1546,86 @@ where
     /// inactive update remains recoverable, which is the double-bank crash
     /// contract; a blank peer gives no such recovery authority.
     fn read_active_strict(&mut self) -> Result<ActiveImage, BankedJournalError<B::Error>> {
-        let first = self.inspect_bank(0)?;
-        let second = self.inspect_bank(1)?;
-        match (first, second) {
-            (BankInspection::Valid(left), BankInspection::Valid(right)) => {
-                if left.generation > right.generation {
-                    Ok(left)
-                } else if right.generation > left.generation {
-                    Ok(right)
-                } else if left.bytes == right.bytes {
-                    Ok(left)
+        self.require_reopen()?;
+        let candidates = self.discover_candidates(true)?;
+        match candidates.as_slice() {
+            [] => Ok(ActiveImage {
+                bank: None,
+                generation: 0,
+                logical_len: 0,
+                payload_digest: Sha256::digest(&[] as &[u8]).into(),
+            }),
+            [candidate] => self.load_candidate(*candidate),
+            [left, right] => {
+                let left_image = self.load_candidate(*left)?;
+                let right_image = self.load_candidate(*right)?;
+                if left.header.logical_len == right.header.logical_len
+                    && left.header.payload_digest == right.header.payload_digest
+                {
+                    Ok(if left.header.generation >= right.header.generation {
+                        left_image
+                    } else {
+                        right_image
+                    })
                 } else {
                     Err(BankedJournalError::ConflictingGeneration {
-                        generation: left.generation,
+                        generation: left.header.generation.max(right.header.generation),
                     })
                 }
             }
-            (BankInspection::Valid(image), _) | (_, BankInspection::Valid(image)) => Ok(image),
-            (BankInspection::Blank, BankInspection::Blank) => Ok(ActiveImage {
-                bank: None,
-                generation: 0,
-                bytes: Vec::new(),
-            }),
-            (BankInspection::Blank, BankInspection::Invalid)
-            | (BankInspection::Invalid, BankInspection::Blank)
-            | (BankInspection::Invalid, BankInspection::Invalid) => {
-                Err(BankedJournalError::CorruptBankMetadata)
-            }
+            _ => Err(BankedJournalError::CorruptBankMetadata),
         }
     }
 
-    fn inspect_bank(&mut self, bank: u32) -> Result<BankInspection, BankedJournalError<B::Error>> {
-        let mut header_sector = [0u8; SECTOR_BYTES];
-        self.read_sector(bank_header_lba(bank), &mut header_sector)?;
-        let HeaderInspection::Valid(header) = BankHeader::decode(bank, &header_sector) else {
-            return Ok(match BankHeader::decode(bank, &header_sector) {
-                HeaderInspection::Blank => BankInspection::Blank,
-                HeaderInspection::Invalid => BankInspection::Invalid,
-                HeaderInspection::Valid(_) => unreachable!(),
-            });
-        };
+    fn prepare_candidate_slot(&mut self, bank: u32) -> Result<(), BankedJournalError<B::Error>> {
+        if self
+            .recovery_candidates
+            .iter()
+            .any(|candidate| candidate.header.bank == bank)
+        {
+            return Ok(());
+        }
+        self.recovery_candidates
+            .try_reserve(1)
+            .map_err(|_| BankedJournalError::AllocationFailed { requested: 1 })?;
+        Ok(())
+    }
 
-        let mut bytes = Vec::new();
-        bytes.try_reserve_exact(header.logical_len).map_err(|_| {
-            BankedJournalError::AllocationFailed {
-                requested: header.logical_len,
-            }
-        })?;
-        bytes.resize(header.logical_len, 0);
-        for (sector_index, chunk) in bytes.chunks_mut(SECTOR_BYTES).enumerate() {
-            let mut sector = [0u8; SECTOR_BYTES];
-            self.read_sector(
-                bank_data_lba(bank)
-                    + u32::try_from(sector_index)
-                        .map_err(|_| BankedJournalError::CorruptBankMetadata)?,
-                &mut sector,
-            )?;
-            chunk.copy_from_slice(&sector[..chunk.len()]);
+    fn install_candidate(&mut self, candidate: BankRecoveryCandidate) {
+        if let Some(existing) = self
+            .recovery_candidates
+            .iter_mut()
+            .find(|existing| existing.header.bank == candidate.header.bank)
+        {
+            *existing = candidate;
+        } else {
+            // `prepare_candidate_slot` has reserved this bounded insertion
+            // before the first media mutation. The vector is therefore full
+            // only with the two fixed physical banks and cannot allocate here.
+            self.recovery_candidates.push(candidate);
         }
-        let actual_digest = self.hash(&bytes);
-        if actual_digest != header.payload_digest {
-            return Ok(BankInspection::Invalid);
+    }
+
+    fn install_active_candidate(&mut self, active: ActiveImage) {
+        let Some(bank) = active.bank else {
+            return;
+        };
+        self.install_candidate(BankRecoveryCandidate {
+            header: BankHeader {
+                bank,
+                generation: active.generation,
+                logical_len: active.logical_len,
+                payload_digest: active.payload_digest,
+            },
+        });
+    }
+
+    fn require_reopen(&self) -> Result<(), BankedJournalError<B::Error>> {
+        if self.poisoned {
+            Err(BankedJournalError::CorruptBankMetadata)
+        } else {
+            Ok(())
         }
-        Ok(BankInspection::Valid(ActiveImage {
-            bank: Some(header.bank),
-            generation: header.generation,
-            bytes,
-        }))
     }
 
     #[cfg(ktest)]
@@ -1022,6 +1644,10 @@ where
 
     fn telemetry(&self) -> Option<JournalIoTelemetry> {
         self.telemetry
+    }
+
+    fn active_logical_len(&self) -> usize {
+        self.active.bank.map_or(0, |_| self.active.logical_len)
     }
 
     #[cfg(ktest)]
@@ -1048,9 +1674,10 @@ where
         lba: u32,
         input: &[u8; SECTOR_BYTES],
     ) -> Result<(), BankedJournalError<B::Error>> {
-        self.backend
-            .write_sector(lba, input)
-            .map_err(BankedJournalError::Storage)?;
+        if let Err(error) = self.backend.write_sector(lba, input) {
+            self.poisoned = true;
+            return Err(BankedJournalError::Storage(error));
+        }
         if let Some(telemetry) = &mut self.telemetry {
             telemetry.sectors_written = telemetry.sectors_written.saturating_add(1);
         }
@@ -1058,18 +1685,14 @@ where
     }
 
     fn flush(&mut self) -> Result<(), BankedJournalError<B::Error>> {
-        self.backend.flush().map_err(BankedJournalError::Storage)?;
+        if let Err(error) = self.backend.flush() {
+            self.poisoned = true;
+            return Err(BankedJournalError::Storage(error));
+        }
         if let Some(telemetry) = &mut self.telemetry {
             telemetry.flushes = telemetry.flushes.saturating_add(1);
         }
         Ok(())
-    }
-
-    fn hash(&mut self, bytes: &[u8]) -> [u8; 32] {
-        if let Some(telemetry) = &mut self.telemetry {
-            telemetry.hash_bytes = telemetry.hash_bytes.saturating_add(bytes.len() as u64);
-        }
-        Sha256::digest(bytes).into()
     }
 
     fn mark_phase(&mut self, phase: JournalIoPhase) {
@@ -1150,7 +1773,10 @@ impl VNextHeader {
         let Ok(logical_len) = usize::try_from(read_u64(bytes, 32)) else {
             return VNextHeaderInspection::Invalid;
         };
-        if logical_len > VNEXT_SEGMENT_CAPACITY {
+        // Canonical vNext frames are padded to sectors. In-place append relies
+        // on this invariant so it never read-modify-writes a sector belonging
+        // to the previously committed endpoint.
+        if logical_len > VNEXT_SEGMENT_CAPACITY || logical_len % SECTOR_BYTES != 0 {
             return VNextHeaderInspection::Invalid;
         }
         let mut previous_head = [0u8; 32];
@@ -1220,19 +1846,61 @@ enum VNextHeaderInspection {
 enum VNextSegmentInspection {
     Blank,
     Invalid,
-    Valid(VNextSegmentImage),
+    Valid(VNextHeader),
 }
 
-#[derive(Clone, Debug)]
-struct VNextSegmentImage {
-    header: VNextHeader,
-    bytes: Vec<u8>,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct VNextFrameSpan {
+    raw_start: usize,
+    logical_start: usize,
+    logical_len: usize,
+}
+
+type VNextCheckpointFinish<E> = Result<
+    (
+        [Option<VNextHeader>; VNEXT_SEGMENT_COUNT as usize],
+        usize,
+        VNextHeader,
+    ),
+    BankedJournalError<E>,
+>;
+type VNextSegmentDigests<E> = Result<([u8; 32], [u8; 32]), BankedJournalError<E>>;
+type VNextFrameScan<E> = Result<Option<(Vec<VNextFrameSpan>, usize)>, BankedJournalError<E>>;
+
+/// A manifest-selected physical chain retained without its complete replay
+/// image. `head` is a storage hash only; logical CSER validation is performed
+/// by the recovery source after the trusted anchor is available.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct VNextRecoveryCandidate {
+    manifest_copy: u32,
+    /// Header copy which was observed to carry the selected endpoint.  The
+    /// other copy is kept intact while an in-place append is staged, so the
+    /// manifest-selected old endpoint remains recoverable until the final
+    /// manifest pivot.
+    endpoint_copy: u32,
+    endpoint: VNextHeader,
+    segments: Vec<VNextHeader>,
+    frames: Vec<VNextFrameSpan>,
+    logical_len: usize,
+}
+
+impl VNextRecoveryCandidate {
+    fn descriptor(&self) -> RecoveryCandidate {
+        RecoveryCandidate::new(
+            self.manifest_copy,
+            self.endpoint.generation,
+            self.logical_len,
+            Digest::new(self.endpoint.head),
+        )
+    }
 }
 
 #[derive(Clone, Debug)]
 struct VNextActiveImage {
     header: Option<VNextHeader>,
-    bytes: Vec<u8>,
+    /// Manifest copy selected by trusted recovery. Publication overwrites the
+    /// other copy first so this authority root survives every pre-pivot tear.
+    manifest_copy: Option<u32>,
     occupied: [bool; VNEXT_SEGMENT_COUNT as usize],
 }
 
@@ -1253,8 +1921,348 @@ struct VNextActiveImage {
 struct SegmentedJournalVNext<B> {
     backend: B,
     active: VNextActiveImage,
+    /// Whether the selected metadata snapshot was explicitly installed for
+    /// the legacy compatibility append/read facade. No payload bytes are
+    /// retained here; recovery always uses candidate metadata and read-at.
+    active_materialized: bool,
+    recovery_candidates: Vec<VNextRecoveryCandidate>,
     poisoned: bool,
     telemetry: Option<JournalIoTelemetry>,
+}
+
+struct VNextCheckpointSegment {
+    segment: u32,
+    generation: u64,
+    first_generation: u64,
+    previous_head: [u8; 32],
+    logical_len: usize,
+    sector_index: u32,
+    buffer: [u8; SECTOR_BYTES],
+    buffered: usize,
+    payload_digest: Sha256,
+    head_digest: Sha256,
+}
+
+impl VNextCheckpointSegment {
+    fn new(segment: u32, generation: u64, first_generation: u64, previous_head: [u8; 32]) -> Self {
+        let mut head_digest = Sha256::new();
+        head_digest.update(previous_head);
+        Self {
+            segment,
+            generation,
+            first_generation,
+            previous_head,
+            logical_len: 0,
+            sector_index: 0,
+            buffer: [0; SECTOR_BYTES],
+            buffered: 0,
+            payload_digest: Sha256::new(),
+            head_digest,
+        }
+    }
+}
+
+/// Streams one canonical checkpoint frame through inactive vNext segments.
+/// Only sector scratch, digest state, and a bounded header table are retained;
+/// the checkpoint record and framed image never become a `Vec`.
+struct VNextCheckpointWriter<'a, B>
+where
+    B: SectorBackend,
+{
+    journal: &'a mut SegmentedJournalVNext<B>,
+    free: [u32; VNEXT_SEGMENT_COUNT as usize],
+    free_len: usize,
+    next_free: usize,
+    needed: usize,
+    expected_raw_len: usize,
+    written: usize,
+    frame_digest: Sha256,
+    frame_payload_written: usize,
+    current: Option<VNextCheckpointSegment>,
+    headers: [Option<VNextHeader>; VNEXT_SEGMENT_COUNT as usize],
+    header_count: usize,
+    first_generation: u64,
+    previous_head: [u8; 32],
+}
+
+impl<'a, B> VNextCheckpointWriter<'a, B>
+where
+    B: SectorBackend,
+{
+    fn new(
+        journal: &'a mut SegmentedJournalVNext<B>,
+        free: [u32; VNEXT_SEGMENT_COUNT as usize],
+        free_len: usize,
+        needed: usize,
+        expected_raw_len: usize,
+        first_generation: u64,
+    ) -> Result<Self, BankedJournalError<B::Error>> {
+        if free_len < needed || needed == 0 || needed > VNEXT_SEGMENT_COUNT as usize {
+            return Err(BankedJournalError::JournalFull {
+                current: 0,
+                additional: expected_raw_len,
+                capacity: VNEXT_CAPACITY,
+            });
+        }
+        let first_segment = free[0];
+        let current =
+            VNextCheckpointSegment::new(first_segment, first_generation, first_generation, [0; 32]);
+        Ok(Self {
+            journal,
+            free,
+            free_len,
+            next_free: 1,
+            needed,
+            expected_raw_len,
+            written: 0,
+            frame_digest: Sha256::new(),
+            frame_payload_written: 0,
+            current: Some(current),
+            headers: core::array::from_fn(|_| None),
+            header_count: 0,
+            first_generation,
+            previous_head: [0; 32],
+        })
+    }
+
+    fn write_raw(&mut self, bytes: &[u8]) -> Result<(), BankedJournalError<B::Error>> {
+        let resulting =
+            self.written
+                .checked_add(bytes.len())
+                .ok_or(BankedJournalError::JournalFull {
+                    current: self.written,
+                    additional: bytes.len(),
+                    capacity: VNEXT_CAPACITY,
+                })?;
+        if resulting > self.expected_raw_len {
+            return Err(BankedJournalError::JournalFull {
+                current: self.written,
+                additional: bytes.len(),
+                capacity: VNEXT_CAPACITY,
+            });
+        }
+        let mut remaining = bytes;
+        while !remaining.is_empty() {
+            if self.current.is_none() {
+                self.start_next_segment()?;
+            }
+            let segment_remaining = {
+                let current = self
+                    .current
+                    .as_ref()
+                    .ok_or(BankedJournalError::CorruptBankMetadata)?;
+                VNEXT_SEGMENT_CAPACITY - current.logical_len
+            };
+            if segment_remaining == 0 {
+                self.finish_current_segment()?;
+                continue;
+            }
+            let sector_remaining = {
+                let current = self
+                    .current
+                    .as_ref()
+                    .ok_or(BankedJournalError::CorruptBankMetadata)?;
+                SECTOR_BYTES - current.buffered
+            };
+            let amount = remaining.len().min(segment_remaining).min(sector_remaining);
+            {
+                let current = self
+                    .current
+                    .as_mut()
+                    .ok_or(BankedJournalError::CorruptBankMetadata)?;
+                current.buffer[current.buffered..current.buffered + amount]
+                    .copy_from_slice(&remaining[..amount]);
+                current.payload_digest.update(&remaining[..amount]);
+                current.head_digest.update(&remaining[..amount]);
+                current.buffered += amount;
+                current.logical_len += amount;
+            }
+            self.written += amount;
+            remaining = &remaining[amount..];
+            let full_sector = self
+                .current
+                .as_ref()
+                .is_some_and(|current| current.buffered == SECTOR_BYTES);
+            if full_sector {
+                self.flush_current_sector()?;
+            }
+            let full_segment = self
+                .current
+                .as_ref()
+                .is_some_and(|current| current.logical_len == VNEXT_SEGMENT_CAPACITY);
+            if full_segment && !remaining.is_empty() {
+                self.finish_current_segment()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn write_candidate_raw(
+        &mut self,
+        candidate: &VNextRecoveryCandidate,
+    ) -> Result<(), BankedJournalError<B::Error>> {
+        let raw_len = SegmentedJournalVNext::<B>::candidate_raw_len(candidate)?;
+        let mut offset = 0usize;
+        let mut scratch = [0u8; SECTOR_BYTES];
+        while offset < raw_len {
+            let amount = (raw_len - offset).min(scratch.len());
+            self.journal
+                .read_candidate_raw_at_inner(candidate, offset, &mut scratch[..amount])?;
+            self.write_raw(&scratch[..amount])?;
+            offset = offset
+                .checked_add(amount)
+                .ok_or(BankedJournalError::CorruptBankMetadata)?;
+        }
+        Ok(())
+    }
+
+    fn write_candidate_logical_prefix(
+        &mut self,
+        candidate: &VNextRecoveryCandidate,
+        logical_len: usize,
+    ) -> Result<(), BankedJournalError<B::Error>> {
+        if logical_len > candidate.logical_len {
+            return Err(BankedJournalError::InvalidRepairOffset {
+                offset: logical_len,
+                length: candidate.logical_len,
+            });
+        }
+        let mut offset = 0usize;
+        let mut scratch = [0u8; SECTOR_BYTES];
+        while offset < logical_len {
+            let amount = (logical_len - offset).min(scratch.len());
+            self.journal
+                .read_candidate_at_inner(candidate, offset, &mut scratch[..amount])?;
+            self.write_all(&scratch[..amount])?;
+            offset = offset
+                .checked_add(amount)
+                .ok_or(BankedJournalError::CorruptBankMetadata)?;
+        }
+        Ok(())
+    }
+
+    fn flush_current_sector(&mut self) -> Result<(), BankedJournalError<B::Error>> {
+        let (segment, sector_index, sector) = {
+            let current = self
+                .current
+                .as_ref()
+                .ok_or(BankedJournalError::CorruptBankMetadata)?;
+            if current.buffered == 0 {
+                return Ok(());
+            }
+            (current.segment, current.sector_index, current.buffer)
+        };
+        self.journal
+            .write_sector(vnext_data_lba(segment) + sector_index, &sector)?;
+        let current = self
+            .current
+            .as_mut()
+            .ok_or(BankedJournalError::CorruptBankMetadata)?;
+        current.sector_index = current
+            .sector_index
+            .checked_add(1)
+            .ok_or(BankedJournalError::CorruptBankMetadata)?;
+        current.buffer = [0; SECTOR_BYTES];
+        current.buffered = 0;
+        Ok(())
+    }
+
+    fn start_next_segment(&mut self) -> Result<(), BankedJournalError<B::Error>> {
+        if self.next_free >= self.free_len || self.header_count >= self.needed {
+            return Err(BankedJournalError::JournalFull {
+                current: self.written,
+                additional: self.expected_raw_len.saturating_sub(self.written),
+                capacity: VNEXT_CAPACITY,
+            });
+        }
+        let generation = self
+            .first_generation
+            .checked_add(self.header_count as u64)
+            .ok_or(BankedJournalError::GenerationExhausted)?;
+        let segment = self.free[self.next_free];
+        self.next_free += 1;
+        self.current = Some(VNextCheckpointSegment::new(
+            segment,
+            generation,
+            self.first_generation,
+            self.previous_head,
+        ));
+        Ok(())
+    }
+
+    fn finish_current_segment(&mut self) -> Result<(), BankedJournalError<B::Error>> {
+        self.flush_current_sector()?;
+        let current = self
+            .current
+            .take()
+            .ok_or(BankedJournalError::CorruptBankMetadata)?;
+        let payload_digest: [u8; 32] = current.payload_digest.finalize().into();
+        let head: [u8; 32] = current.head_digest.finalize().into();
+        let header = VNextHeader {
+            segment: current.segment,
+            generation: current.generation,
+            first_generation: current.first_generation,
+            logical_len: current.logical_len,
+            previous_head: current.previous_head,
+            payload_digest,
+            head,
+        };
+        self.journal.publish_stream_segment_header(&header)?;
+        if self.header_count >= self.headers.len() {
+            return Err(BankedJournalError::CorruptBankMetadata);
+        }
+        self.headers[self.header_count] = Some(header.clone());
+        self.header_count += 1;
+        self.previous_head = header.head;
+        Ok(())
+    }
+
+    fn finish_frame_payload(
+        &mut self,
+        expected_digest: [u8; 32],
+        expected_len: usize,
+    ) -> Result<(), BankedJournalError<B::Error>> {
+        if self.frame_payload_written != expected_len
+            || <[u8; 32]>::from(self.frame_digest.clone().finalize()) != expected_digest
+        {
+            return Err(BankedJournalError::ReadbackMismatch);
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> VNextCheckpointFinish<B::Error> {
+        if self.written != self.expected_raw_len {
+            return Err(BankedJournalError::ReadbackMismatch);
+        }
+        self.finish_current_segment()?;
+        if self.header_count != self.needed {
+            return Err(BankedJournalError::CorruptBankMetadata);
+        }
+        let endpoint = self.headers[self.header_count - 1]
+            .as_ref()
+            .cloned()
+            .ok_or(BankedJournalError::CorruptBankMetadata)?;
+        Ok((self.headers, self.header_count, endpoint))
+    }
+}
+
+impl<B> CheckpointWrite for VNextCheckpointWriter<'_, B>
+where
+    B: SectorBackend,
+{
+    type Error = BankedJournalError<B::Error>;
+
+    fn write_all(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
+        self.frame_digest.update(bytes);
+        self.frame_payload_written = self.frame_payload_written.checked_add(bytes.len()).ok_or(
+            BankedJournalError::JournalFull {
+                current: self.frame_payload_written,
+                additional: bytes.len(),
+                capacity: VNEXT_CAPACITY,
+            },
+        )?;
+        self.write_raw(bytes)
+    }
 }
 
 impl<B> SegmentedJournalVNext<B>
@@ -1272,133 +2280,604 @@ where
             backend,
             active: VNextActiveImage {
                 header: None,
-                bytes: Vec::new(),
+                manifest_copy: None,
                 occupied: [false; VNEXT_SEGMENT_COUNT as usize],
             },
+            active_materialized: false,
+            recovery_candidates: Vec::new(),
             poisoned: false,
             telemetry: None,
         };
-        journal.active = journal.recover_prefix()?;
+        // Keep every valid manifest chain. No endpoint is promoted to the
+        // active cache until recovery compares its logical records with the
+        // trusted CSER snapshot.
+        journal.recovery_candidates = journal.discover_candidates()?;
+        journal.active_materialized = journal.recovery_candidates.is_empty();
         Ok(journal)
     }
 
     fn read_all_image(&mut self) -> Result<Vec<u8>, BankedJournalError<B::Error>> {
         self.require_reopen()?;
-        decode_vnext_frames(&self.active.bytes).ok_or(BankedJournalError::CorruptBankMetadata)
+        if self.active.header.is_none() && !self.recovery_candidates.is_empty() {
+            // Compatibility-only inspection. The trusted boot path uses
+            // `recovery_candidates` + `read_candidate_at` and never chooses by
+            // this physical generation ordering.
+            let candidate = self
+                .recovery_candidates
+                .iter()
+                .max_by_key(|candidate| candidate.endpoint.generation)
+                .cloned()
+                .ok_or(BankedJournalError::CorruptBankMetadata)?;
+            self.set_active_candidate(&candidate, true);
+            self.active_materialized = true;
+        }
+        let Some(candidate) = self.active_candidate().cloned() else {
+            return Ok(Vec::new());
+        };
+        let raw_len = Self::candidate_raw_len(&candidate)?;
+        let mut raw = Vec::new();
+        raw.try_reserve_exact(raw_len)
+            .map_err(|_| BankedJournalError::AllocationFailed { requested: raw_len })?;
+        raw.resize(raw_len, 0);
+        self.read_candidate_raw_at_inner(&candidate, 0, &mut raw)?;
+        decode_vnext_frames(&raw).ok_or(BankedJournalError::CorruptBankMetadata)
+    }
+
+    fn recovery_candidates(
+        &mut self,
+    ) -> Result<Vec<RecoveryCandidate>, BankedJournalError<B::Error>> {
+        self.require_reopen()?;
+        let candidates = self.discover_candidates()?;
+        let descriptors = candidates
+            .iter()
+            .map(VNextRecoveryCandidate::descriptor)
+            .collect();
+        self.recovery_candidates = candidates;
+        Ok(descriptors)
+    }
+
+    fn select_candidate(
+        &mut self,
+        requested: Option<RecoveryCandidate>,
+    ) -> Result<(), BankedJournalError<B::Error>> {
+        self.require_reopen()?;
+        let Some(requested) = requested else {
+            self.active = VNextActiveImage {
+                header: None,
+                manifest_copy: None,
+                occupied: [false; VNEXT_SEGMENT_COUNT as usize],
+            };
+            self.active_materialized = true;
+            return Ok(());
+        };
+        self.revalidate_candidate(requested)?;
+        let candidate = self
+            .recovery_candidates
+            .iter()
+            .find(|candidate| candidate.descriptor() == requested)
+            .cloned()
+            .ok_or(BankedJournalError::CorruptBankMetadata)?;
+        self.set_active_candidate(&candidate, true);
+        self.active_materialized = true;
+        Ok(())
+    }
+
+    fn revalidate_candidate(
+        &mut self,
+        requested: RecoveryCandidate,
+    ) -> Result<(), BankedJournalError<B::Error>> {
+        self.require_reopen()?;
+        let expected = self
+            .recovery_candidates
+            .iter()
+            .find(|candidate| candidate.descriptor() == requested)
+            .cloned()
+            .ok_or(BankedJournalError::CorruptBankMetadata)?;
+        let current = self
+            .discover_candidates()?
+            .into_iter()
+            .find(|candidate| candidate.descriptor() == requested);
+        if current.as_ref() == Some(&expected) {
+            Ok(())
+        } else {
+            Err(BankedJournalError::CorruptBankMetadata)
+        }
+    }
+
+    fn set_active_candidate(&mut self, candidate: &VNextRecoveryCandidate, _selected: bool) {
+        let mut occupied = [false; VNEXT_SEGMENT_COUNT as usize];
+        for segment in &candidate.segments {
+            occupied[segment.segment as usize] = true;
+        }
+        self.active = VNextActiveImage {
+            header: Some(candidate.endpoint.clone()),
+            manifest_copy: Some(candidate.manifest_copy),
+            occupied,
+        };
+    }
+
+    fn active_candidate(&self) -> Option<&VNextRecoveryCandidate> {
+        let endpoint = self.active.header.as_ref()?;
+        self.recovery_candidates
+            .iter()
+            .find(|candidate| candidate.endpoint == *endpoint)
+    }
+
+    fn candidate_raw_len(
+        candidate: &VNextRecoveryCandidate,
+    ) -> Result<usize, BankedJournalError<B::Error>> {
+        candidate
+            .segments
+            .iter()
+            .try_fold(0usize, |total, segment| {
+                total.checked_add(segment.logical_len)
+            })
+            .ok_or(BankedJournalError::CorruptBankMetadata)
+    }
+
+    fn read_candidate_at(
+        &mut self,
+        requested: RecoveryCandidate,
+        offset: usize,
+        output: &mut [u8],
+    ) -> Result<(), BankedJournalError<B::Error>> {
+        self.require_reopen()?;
+        let candidate = self
+            .recovery_candidates
+            .iter()
+            .find(|candidate| candidate.descriptor() == requested)
+            .cloned()
+            .ok_or(BankedJournalError::CorruptBankMetadata)?;
+        let end =
+            offset
+                .checked_add(output.len())
+                .ok_or(BankedJournalError::InvalidRepairOffset {
+                    offset,
+                    length: candidate.logical_len,
+                })?;
+        if end > candidate.logical_len {
+            return Err(BankedJournalError::InvalidRepairOffset {
+                offset,
+                length: candidate.logical_len,
+            });
+        }
+        if output.is_empty() {
+            return Ok(());
+        }
+        self.read_candidate_at_inner(&candidate, offset, output)
+    }
+
+    fn read_candidate_at_inner(
+        &mut self,
+        candidate: &VNextRecoveryCandidate,
+        offset: usize,
+        output: &mut [u8],
+    ) -> Result<(), BankedJournalError<B::Error>> {
+        let end = offset
+            .checked_add(output.len())
+            .ok_or(BankedJournalError::CorruptBankMetadata)?;
+        if end > candidate.logical_len {
+            return Err(BankedJournalError::InvalidRepairOffset {
+                offset,
+                length: candidate.logical_len,
+            });
+        }
+        let mut copied = 0usize;
+        for frame in &candidate.frames {
+            let frame_end = frame
+                .logical_start
+                .checked_add(frame.logical_len)
+                .ok_or(BankedJournalError::CorruptBankMetadata)?;
+            let begin = offset.max(frame.logical_start);
+            let copy_end = end.min(frame_end);
+            if begin >= copy_end {
+                continue;
+            }
+            let raw_offset = frame.raw_start + (begin - frame.logical_start);
+            let amount = copy_end - begin;
+            self.read_candidate_raw_at_inner(
+                candidate,
+                raw_offset,
+                &mut output[copied..copied + amount],
+            )?;
+            copied += amount;
+        }
+        if copied != output.len() {
+            return Err(BankedJournalError::CorruptBankMetadata);
+        }
+        Ok(())
+    }
+
+    fn read_candidate_raw_at_inner(
+        &mut self,
+        candidate: &VNextRecoveryCandidate,
+        offset: usize,
+        output: &mut [u8],
+    ) -> Result<(), BankedJournalError<B::Error>> {
+        self.read_segments_at(&candidate.segments, offset, output)
+    }
+
+    fn read_segments_at(
+        &mut self,
+        segments: &[VNextHeader],
+        offset: usize,
+        output: &mut [u8],
+    ) -> Result<(), BankedJournalError<B::Error>> {
+        let raw_len = segments
+            .iter()
+            .try_fold(0usize, |total, segment| {
+                total.checked_add(segment.logical_len)
+            })
+            .ok_or(BankedJournalError::CorruptBankMetadata)?;
+        let end = offset
+            .checked_add(output.len())
+            .ok_or(BankedJournalError::CorruptBankMetadata)?;
+        if end > raw_len {
+            return Err(BankedJournalError::CorruptBankMetadata);
+        }
+        if output.is_empty() {
+            return Ok(());
+        }
+        let mut destination = 0usize;
+        let mut raw_cursor = 0usize;
+        for segment in segments {
+            let segment_end = raw_cursor
+                .checked_add(segment.logical_len)
+                .ok_or(BankedJournalError::CorruptBankMetadata)?;
+            let begin = offset.max(raw_cursor);
+            let copy_end = end.min(segment_end);
+            if begin < copy_end {
+                let mut segment_offset = begin - raw_cursor;
+                let segment_end_offset = copy_end - raw_cursor;
+                while segment_offset < segment_end_offset {
+                    let sector_index = segment_offset / SECTOR_BYTES;
+                    let sector_offset = segment_offset % SECTOR_BYTES;
+                    let mut sector = [0u8; SECTOR_BYTES];
+                    self.read_sector(
+                        vnext_data_lba(segment.segment)
+                            + u32::try_from(sector_index)
+                                .map_err(|_| BankedJournalError::CorruptBankMetadata)?,
+                        &mut sector,
+                    )?;
+                    let amount =
+                        (segment_end_offset - segment_offset).min(SECTOR_BYTES - sector_offset);
+                    output[destination..destination + amount]
+                        .copy_from_slice(&sector[sector_offset..sector_offset + amount]);
+                    destination += amount;
+                    segment_offset = segment_offset
+                        .checked_add(amount)
+                        .ok_or(BankedJournalError::CorruptBankMetadata)?;
+                }
+            }
+            raw_cursor = segment_end;
+            if raw_cursor >= end {
+                break;
+            }
+        }
+        if destination != output.len() {
+            return Err(BankedJournalError::CorruptBankMetadata);
+        }
+        Ok(())
     }
 
     fn append_exact(&mut self, suffix: &[u8]) -> Result<(), BankedJournalError<B::Error>> {
         self.require_reopen()?;
+        let result = self.append_exact_inner(suffix);
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+
+    fn append_exact_inner(&mut self, suffix: &[u8]) -> Result<(), BankedJournalError<B::Error>> {
+        self.require_logical_selection()?;
         let framed = encode_vnext_frame(suffix).ok_or(BankedJournalError::AllocationFailed {
             requested: suffix.len(),
         })?;
-        let resulting = self.active.bytes.len().checked_add(framed.len()).ok_or(
-            BankedJournalError::JournalFull {
-                current: self.active.bytes.len(),
-                additional: framed.len(),
-                capacity: VNEXT_CAPACITY,
-            },
-        )?;
+        let source = self.active_candidate().cloned();
+        let raw_len = source
+            .as_ref()
+            .map(Self::candidate_raw_len)
+            .transpose()?
+            .unwrap_or(0);
+        let resulting =
+            raw_len
+                .checked_add(framed.len())
+                .ok_or(BankedJournalError::JournalFull {
+                    current: raw_len,
+                    additional: framed.len(),
+                    capacity: VNEXT_CAPACITY,
+                })?;
         if resulting > VNEXT_CAPACITY {
             return Err(BankedJournalError::JournalFull {
-                current: self.active.bytes.len(),
+                current: raw_len,
                 additional: framed.len(),
                 capacity: VNEXT_CAPACITY,
             });
         }
-        self.append_framed(&framed)
+
+        if let Some(source) = source {
+            let current = source
+                .segments
+                .last()
+                .cloned()
+                .ok_or(BankedJournalError::CorruptBankMetadata)?;
+            let available = VNEXT_SEGMENT_CAPACITY
+                .checked_sub(current.logical_len)
+                .ok_or(BankedJournalError::CorruptBankMetadata)?;
+            if framed.len() <= available {
+                let generation = current
+                    .generation
+                    .checked_add(1)
+                    .ok_or(BankedJournalError::GenerationExhausted)?;
+                let (header, _fresh_copy) = self.publish_append_in_place(
+                    &current,
+                    generation,
+                    &framed,
+                    source.endpoint_copy,
+                )?;
+                return self.install_in_place_append(&source, header, suffix.len());
+            }
+            // The whole frame is staged into an alternate chain. In
+            // particular, do not commit the prefix which happens to fit in
+            // the current segment: one final manifest names the complete
+            // frame and its complete segment chain.
+            return self.stage_append_frame(Some(&source), &framed, suffix.len());
+        }
+
+        if framed.len() <= VNEXT_SEGMENT_CAPACITY {
+            self.replace_exact(&framed)
+        } else {
+            self.stage_append_frame(None, &framed, suffix.len())
+        }
     }
 
-    fn append_framed(&mut self, suffix: &[u8]) -> Result<(), BankedJournalError<B::Error>> {
-        if suffix.is_empty() {
-            return self.flush();
-        }
-        let Some(current) = self.active.header.clone() else {
-            let first = suffix.len().min(VNEXT_SEGMENT_CAPACITY);
-            self.publish_new_segment(0, [0; 32], &suffix[..first], false)?;
-            return if first == suffix.len() {
-                Ok(())
-            } else {
-                self.append_framed(&suffix[first..])
-            };
-        };
-        let current_start = self
-            .active
-            .bytes
-            .len()
-            .checked_sub(current.logical_len)
-            .ok_or(BankedJournalError::CorruptBankMetadata)?;
-        let current_bytes = &self.active.bytes[current_start..];
-        let new_len = current.logical_len.checked_add(suffix.len()).ok_or(
-            BankedJournalError::JournalFull {
-                current: self.active.bytes.len(),
-                additional: suffix.len(),
-                capacity: VNEXT_CAPACITY,
-            },
-        )?;
-        if new_len <= VNEXT_SEGMENT_CAPACITY {
-            let mut payload = current_bytes.to_vec();
-            payload
-                .try_reserve_exact(suffix.len())
-                .map_err(|_| BankedJournalError::AllocationFailed { requested: new_len })?;
-            payload.extend_from_slice(suffix);
-            // Cache publication follows the manifest authority pivot. Reserve
-            // every byte it will need before touching disk, so an allocation
-            // failure cannot leave a new durable endpoint with stale cache.
-            self.active
-                .bytes
-                .try_reserve_exact(suffix.len())
-                .map_err(|_| BankedJournalError::AllocationFailed {
-                    requested: self.active.bytes.len().saturating_add(suffix.len()),
-                })?;
-            let generation = current
-                .generation
-                .checked_add(1)
-                .ok_or(BankedJournalError::GenerationExhausted)?;
-            let header = self.publish_append_in_place(&current, generation, &payload)?;
-            self.active.bytes.truncate(current_start);
-            self.active.bytes.extend_from_slice(&payload);
-            self.active.header = Some(header);
-            self.mark_phase(JournalIoPhase::CacheUpdated);
-            return Ok(());
-        }
-        let available = VNEXT_SEGMENT_CAPACITY - current.logical_len;
-        if available != 0 {
-            // A single journal record may cross a physical segment boundary.
-            // The intermediate manifest is an unanchored prefix after a crash
-            // and is therefore repaired by the existing anchor protocol.
-            self.append_framed(&suffix[..available])?;
-            return self.append_framed(&suffix[available..]);
-        }
-        if self
-            .active
-            .occupied
-            .iter()
-            .filter(|occupied| **occupied)
-            .count()
-            >= VNEXT_LIVE_SEGMENT_LIMIT
+    /// Stages a complete frame and, when present, the already committed
+    /// framed prefix into alternate segments. Segment headers are validated
+    /// as they are sealed, but no manifest is written until the writer has
+    /// consumed and validated every byte. This is the atomic path for a
+    /// frame which crosses a segment boundary.
+    fn stage_append_frame(
+        &mut self,
+        source: Option<&VNextRecoveryCandidate>,
+        framed: &[u8],
+        logical_len: usize,
+    ) -> Result<(), BankedJournalError<B::Error>> {
+        if framed.len() < VNEXT_FRAME_HEADER
+            || framed[..8] != VNEXT_FRAME_MAGIC
+            || framed[12..16].iter().any(|byte| *byte != 0)
         {
+            return Err(BankedJournalError::CorruptBankMetadata);
+        }
+        let payload_len = usize::try_from(read_u32(framed, 8))
+            .map_err(|_| BankedJournalError::CorruptBankMetadata)?;
+        let used = VNEXT_FRAME_HEADER
+            .checked_add(payload_len)
+            .ok_or(BankedJournalError::CorruptBankMetadata)?;
+        if used > framed.len() {
+            return Err(BankedJournalError::CorruptBankMetadata);
+        }
+        let raw_len = source
+            .map(Self::candidate_raw_len)
+            .transpose()?
+            .unwrap_or(0);
+        let total_len =
+            raw_len
+                .checked_add(framed.len())
+                .ok_or(BankedJournalError::JournalFull {
+                    current: raw_len,
+                    additional: framed.len(),
+                    capacity: VNEXT_CAPACITY,
+                })?;
+        if total_len > VNEXT_CAPACITY {
             return Err(BankedJournalError::JournalFull {
-                current: self.active.bytes.len(),
-                additional: suffix.len(),
+                current: raw_len,
+                additional: framed.len(),
                 capacity: VNEXT_CAPACITY,
             });
         }
-        let next = (1..=VNEXT_SEGMENT_COUNT)
-            .map(|offset| (current.segment + offset) % VNEXT_SEGMENT_COUNT)
-            .find(|segment| !self.active.occupied[*segment as usize])
-            .ok_or(BankedJournalError::JournalFull {
-                current: self.active.bytes.len(),
-                additional: suffix.len(),
+        let needed = total_len.div_ceil(VNEXT_SEGMENT_CAPACITY).max(1);
+        if needed > VNEXT_LIVE_SEGMENT_LIMIT {
+            return Err(BankedJournalError::JournalFull {
+                current: raw_len,
+                additional: framed.len(),
                 capacity: VNEXT_CAPACITY,
-            })?;
-        let first_len = suffix.len().min(VNEXT_SEGMENT_CAPACITY);
-        self.publish_new_segment(next, current.head, &suffix[..first_len], false)?;
-        if first_len == suffix.len() {
-            Ok(())
-        } else {
-            self.append_framed(&suffix[first_len..])
+            });
         }
+
+        let mut occupied = [false; VNEXT_SEGMENT_COUNT as usize];
+        if let Some(source) = source {
+            for segment in &source.segments {
+                if segment.segment >= VNEXT_SEGMENT_COUNT {
+                    return Err(BankedJournalError::CorruptBankMetadata);
+                }
+                occupied[segment.segment as usize] = true;
+            }
+        }
+        let mut free = [0u32; VNEXT_SEGMENT_COUNT as usize];
+        let mut free_len = 0usize;
+        for segment in 0..VNEXT_SEGMENT_COUNT {
+            if !occupied[segment as usize] {
+                free[free_len] = segment;
+                free_len += 1;
+            }
+        }
+        if free_len < needed {
+            return Err(BankedJournalError::JournalFull {
+                current: raw_len,
+                additional: framed.len(),
+                capacity: VNEXT_CAPACITY,
+            });
+        }
+        let base_generation = source.map_or(0, |candidate| candidate.endpoint.generation);
+        let first_generation = base_generation
+            .checked_add(1)
+            .ok_or(BankedJournalError::GenerationExhausted)?;
+        first_generation
+            .checked_add((needed - 1) as u64)
+            .ok_or(BankedJournalError::GenerationExhausted)?;
+
+        // All post-pivot metadata allocations happen before the first sector
+        // write. The vectors contain only bounded headers and frame spans.
+        let mut staged_segments = Vec::new();
+        staged_segments
+            .try_reserve_exact(needed)
+            .map_err(|_| BankedJournalError::AllocationFailed { requested: needed })?;
+        let mut staged_segments_mirror = Vec::new();
+        staged_segments_mirror
+            .try_reserve_exact(needed)
+            .map_err(|_| BankedJournalError::AllocationFailed { requested: needed })?;
+        let old_frame_count = source.map_or(0, |candidate| candidate.frames.len());
+        let mut staged_frames = Vec::new();
+        staged_frames
+            .try_reserve_exact(old_frame_count.saturating_add(1))
+            .map_err(|_| BankedJournalError::AllocationFailed {
+                requested: old_frame_count.saturating_add(1),
+            })?;
+        let mut staged_frames_mirror = Vec::new();
+        staged_frames_mirror
+            .try_reserve_exact(old_frame_count.saturating_add(1))
+            .map_err(|_| BankedJournalError::AllocationFailed {
+                requested: old_frame_count.saturating_add(1),
+            })?;
+        let mut staged_candidates = Vec::new();
+        staged_candidates
+            .try_reserve_exact(VNEXT_HEADER_COPIES as usize)
+            .map_err(|_| BankedJournalError::AllocationFailed {
+                requested: VNEXT_HEADER_COPIES as usize,
+            })?;
+
+        let (headers, header_count, endpoint) = {
+            let mut writer = VNextCheckpointWriter::new(
+                self,
+                free,
+                free_len,
+                needed,
+                total_len,
+                first_generation,
+            )?;
+            if let Some(source) = source {
+                writer.write_candidate_raw(source)?;
+            }
+            writer.write_raw(&framed[..VNEXT_FRAME_HEADER])?;
+            writer.write_all(&framed[VNEXT_FRAME_HEADER..used])?;
+            writer.finish_frame_payload(
+                <[u8; 32]>::try_from(&framed[16..48])
+                    .map_err(|_| BankedJournalError::CorruptBankMetadata)?,
+                logical_len,
+            )?;
+            writer.write_raw(&framed[used..])?;
+            writer.finish()?
+        };
+
+        for header in headers.iter().take(header_count).flatten() {
+            staged_segments.push(header.clone());
+            staged_segments_mirror.push(header.clone());
+        }
+        if let Some(source) = source {
+            staged_frames.extend(source.frames.iter().copied());
+        }
+        let logical_start = source.map_or(0, |candidate| candidate.logical_len);
+        let frame = VNextFrameSpan {
+            raw_start: raw_len
+                .checked_add(VNEXT_FRAME_HEADER)
+                .ok_or(BankedJournalError::CorruptBankMetadata)?,
+            logical_start,
+            logical_len,
+        };
+        staged_frames.push(frame);
+        staged_frames_mirror.extend(staged_frames.iter().copied());
+
+        // This is the sole authority pivot for the entire append. A crash
+        // before it leaves the old manifest-selected chain; a crash after it
+        // leaves the complete newly validated chain.
+        self.publish_manifest(&endpoint)?;
+
+        let candidate = VNextRecoveryCandidate {
+            manifest_copy: 0,
+            endpoint_copy: 0,
+            endpoint: endpoint.clone(),
+            segments: staged_segments,
+            frames: staged_frames,
+            logical_len: logical_start
+                .checked_add(logical_len)
+                .ok_or(BankedJournalError::CorruptBankMetadata)?,
+        };
+        let mirror_candidate = VNextRecoveryCandidate {
+            manifest_copy: 1,
+            endpoint_copy: 0,
+            endpoint,
+            segments: staged_segments_mirror,
+            frames: staged_frames_mirror,
+            logical_len: candidate.logical_len,
+        };
+        staged_candidates.push(candidate);
+        staged_candidates.push(mirror_candidate);
+        let selected = staged_candidates[0].clone();
+        self.recovery_candidates = staged_candidates;
+        self.set_active_candidate(&selected, true);
+        self.active_materialized = true;
+        self.mark_phase(JournalIoPhase::CacheUpdated);
+        Ok(())
+    }
+
+    fn install_in_place_append(
+        &mut self,
+        source: &VNextRecoveryCandidate,
+        header: VNextHeader,
+        logical_frame_len: usize,
+    ) -> Result<(), BankedJournalError<B::Error>> {
+        let raw_len = Self::candidate_raw_len(source)?;
+        let logical_len = source
+            .logical_len
+            .checked_add(logical_frame_len)
+            .ok_or(BankedJournalError::CorruptBankMetadata)?;
+        let frame = VNextFrameSpan {
+            raw_start: raw_len
+                .checked_add(VNEXT_FRAME_HEADER)
+                .ok_or(BankedJournalError::CorruptBankMetadata)?,
+            logical_start: source.logical_len,
+            logical_len: logical_frame_len,
+        };
+        let mut segments = source.segments.clone();
+        let last = segments
+            .last_mut()
+            .ok_or(BankedJournalError::CorruptBankMetadata)?;
+        *last = header.clone();
+        let mut frames = source.frames.clone();
+        frames
+            .try_reserve_exact(1)
+            .map_err(|_| BankedJournalError::AllocationFailed { requested: 1 })?;
+        frames.push(frame);
+        let mut candidates = Vec::new();
+        candidates
+            .try_reserve_exact(VNEXT_HEADER_COPIES as usize)
+            .map_err(|_| BankedJournalError::AllocationFailed {
+                requested: VNEXT_HEADER_COPIES as usize,
+            })?;
+        let candidate = VNextRecoveryCandidate {
+            manifest_copy: 0,
+            endpoint_copy: 0,
+            endpoint: header.clone(),
+            segments: segments.clone(),
+            frames: frames.clone(),
+            logical_len,
+        };
+        candidates.push(candidate);
+        candidates.push(VNextRecoveryCandidate {
+            manifest_copy: 1,
+            endpoint_copy: 0,
+            endpoint: header,
+            segments,
+            frames,
+            logical_len,
+        });
+        let selected = candidates[0].clone();
+        self.recovery_candidates = candidates;
+        self.set_active_candidate(&selected, true);
+        self.active_materialized = true;
+        self.mark_phase(JournalIoPhase::CacheUpdated);
+        Ok(())
     }
 
     /// Publishes a replacement replay image in an alternate segment.
@@ -1409,31 +2888,432 @@ where
     /// same atomic alternate-chain publication path.
     fn checkpoint_exact(&mut self, image: &[u8]) -> Result<(), BankedJournalError<B::Error>> {
         self.require_reopen()?;
-        let framed = encode_vnext_frame(image).ok_or(BankedJournalError::AllocationFailed {
-            requested: image.len(),
-        })?;
-        self.replace_exact(&framed)
+        self.require_logical_selection()?;
+        let result = encode_vnext_frame(image)
+            .ok_or(BankedJournalError::AllocationFailed {
+                requested: image.len(),
+            })
+            .and_then(|framed| self.replace_exact(&framed));
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+
+    /// Streams one canonical J10 checkpoint into an inactive segment chain.
+    ///
+    /// The plan's sealed digest and length are the preflight metadata. The
+    /// single `write_to` pass writes the frame header, plan bytes, and
+    /// sector-aligned zero padding directly through
+    /// [`VNextCheckpointWriter`]. No checkpoint image or framed journal `Vec`
+    /// exists at the durability boundary.
+    fn stage_checkpoint(
+        &mut self,
+        plan: &CheckpointRecordPlan,
+    ) -> Result<(), BankedJournalError<B::Error>> {
+        let result = self.stage_checkpoint_inner(plan);
+        if result.is_err() {
+            // A streaming stage error is ambiguous once any device operation
+            // may have run.  Reopening re-enumerates manifest candidates and
+            // prevents a caller from selecting stale in-memory metadata.
+            self.poisoned = true;
+        }
+        result
+    }
+
+    fn stage_checkpoint_inner(
+        &mut self,
+        plan: &CheckpointRecordPlan,
+    ) -> Result<(), BankedJournalError<B::Error>> {
+        self.require_reopen()?;
+
+        let logical_len = plan.record_len();
+        let used =
+            VNEXT_FRAME_HEADER
+                .checked_add(logical_len)
+                .ok_or(BankedJournalError::JournalFull {
+                    current: 0,
+                    additional: logical_len,
+                    capacity: VNEXT_CAPACITY,
+                })?;
+        let framed_len = used
+            .div_ceil(SECTOR_BYTES)
+            .checked_mul(SECTOR_BYTES)
+            .ok_or(BankedJournalError::JournalFull {
+                current: 0,
+                additional: used,
+                capacity: VNEXT_CAPACITY,
+            })?;
+        if framed_len > VNEXT_CAPACITY {
+            return Err(BankedJournalError::JournalFull {
+                current: 0,
+                additional: framed_len,
+                capacity: VNEXT_CAPACITY,
+            });
+        }
+        let needed = framed_len.div_ceil(VNEXT_SEGMENT_CAPACITY).max(1);
+        if needed > VNEXT_LIVE_SEGMENT_LIMIT
+            || logical_len > u32::MAX as usize
+            || framed_len > u32::MAX as usize
+        {
+            return Err(BankedJournalError::JournalFull {
+                current: 0,
+                additional: framed_len,
+                capacity: VNEXT_CAPACITY,
+            });
+        }
+        self.require_logical_selection()?;
+        let preserved_candidate = self.active_candidate().cloned();
+
+        // The outer vNext frame authenticates the complete J10 record,
+        // including its trailing inner record digest. The Core derives this
+        // domain during the plan's single preimage hash pass; the writer
+        // recomputes it while consuming the stream and rejects any mismatch
+        // before a manifest can name the chain.
+        let frame_digest = plan.image_digest().bytes();
+
+        let mut free = [0u32; VNEXT_SEGMENT_COUNT as usize];
+        let mut free_len = 0usize;
+        for segment in 0..VNEXT_SEGMENT_COUNT {
+            if !self.active.occupied[segment as usize] {
+                free[free_len] = segment;
+                free_len += 1;
+            }
+        }
+        if free_len < needed {
+            return Err(BankedJournalError::JournalFull {
+                current: self.active_raw_len(),
+                additional: framed_len,
+                capacity: VNEXT_CAPACITY,
+            });
+        }
+        let base_generation = self
+            .active
+            .header
+            .as_ref()
+            .map_or(0, |header| header.generation);
+        let first_generation = base_generation
+            .checked_add(1)
+            .ok_or(BankedJournalError::GenerationExhausted)?;
+        first_generation
+            .checked_add((needed - 1) as u64)
+            .ok_or(BankedJournalError::GenerationExhausted)?;
+
+        // Reserve the small post-publication metadata before any inactive
+        // sector is written.  Once the manifest is durable, these vectors are
+        // filled within their proven capacities and installed by assignment.
+        let mut staged_segments = Vec::new();
+        staged_segments
+            .try_reserve_exact(needed)
+            .map_err(|_| BankedJournalError::AllocationFailed { requested: needed })?;
+        let mut staged_frames = Vec::new();
+        staged_frames
+            .try_reserve_exact(1)
+            .map_err(|_| BankedJournalError::AllocationFailed { requested: 1 })?;
+        let mut staged_candidates = Vec::new();
+        staged_candidates
+            .try_reserve_exact(VNEXT_HEADER_COPIES as usize)
+            .map_err(|_| BankedJournalError::AllocationFailed {
+                requested: VNEXT_HEADER_COPIES as usize,
+            })?;
+
+        let (headers, header_count, endpoint) = {
+            let mut writer = VNextCheckpointWriter::new(
+                self,
+                free,
+                free_len,
+                needed,
+                framed_len,
+                first_generation,
+            )?;
+            let mut frame_header = [0u8; VNEXT_FRAME_HEADER];
+            frame_header[..8].copy_from_slice(&VNEXT_FRAME_MAGIC);
+            frame_header[8..12].copy_from_slice(&(logical_len as u32).to_le_bytes());
+            frame_header[16..48].copy_from_slice(&frame_digest);
+            writer.write_raw(&frame_header)?;
+
+            let streamed = plan.write_to(&mut writer)?;
+            if streamed != logical_len {
+                return Err(BankedJournalError::ReadbackMismatch);
+            }
+            writer.finish_frame_payload(frame_digest, logical_len)?;
+
+            let mut padding = framed_len - used;
+            let zeroes = [0u8; SECTOR_BYTES];
+            while padding != 0 {
+                let amount = padding.min(zeroes.len());
+                writer.write_raw(&zeroes[..amount])?;
+                padding -= amount;
+            }
+            writer.finish()?
+        };
+
+        for header in headers.iter().take(header_count).flatten() {
+            staged_segments.push(header.clone());
+        }
+        let frame = VNextFrameSpan {
+            raw_start: VNEXT_FRAME_HEADER,
+            logical_start: 0,
+            logical_len,
+        };
+        staged_frames.push(frame);
+
+        // Staging writes only the manifest copy opposite the currently
+        // selected authority root. Until the trusted anchor advances, boot
+        // can still recover the old chain; after it advances, the new copy is
+        // already complete. No fallible post-anchor callback is required.
+        let staged_manifest_copy = self.stage_manifest(&endpoint)?;
+
+        let candidate = VNextRecoveryCandidate {
+            manifest_copy: staged_manifest_copy,
+            endpoint_copy: 0,
+            endpoint: endpoint.clone(),
+            segments: staged_segments,
+            frames: staged_frames,
+            logical_len,
+        };
+        staged_candidates.push(candidate);
+        if let Some(preserved) = preserved_candidate {
+            staged_candidates.push(preserved);
+        }
+
+        let mut occupied = [false; VNEXT_SEGMENT_COUNT as usize];
+        for header in headers.iter().take(header_count).flatten() {
+            occupied[header.segment as usize] = true;
+        }
+        self.recovery_candidates = staged_candidates;
+        self.active = VNextActiveImage {
+            header: Some(endpoint),
+            manifest_copy: Some(staged_manifest_copy),
+            occupied,
+        };
+        self.active_materialized = false;
+        self.mark_phase(JournalIoPhase::CacheUpdated);
+        Ok(())
     }
 
     fn repair_exact(&mut self, offset: usize) -> Result<(), BankedJournalError<B::Error>> {
         self.require_reopen()?;
-        let raw = decode_vnext_frames(&self.active.bytes)
-            .ok_or(BankedJournalError::CorruptBankMetadata)?;
-        if offset > raw.len() {
+        let result = self.repair_exact_inner(offset);
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+
+    fn repair_exact_inner(&mut self, offset: usize) -> Result<(), BankedJournalError<B::Error>> {
+        self.require_logical_selection()?;
+        let Some(source) = self.active_candidate().cloned() else {
+            if offset == 0 {
+                return self.flush();
+            }
+            return Err(BankedJournalError::InvalidRepairOffset { offset, length: 0 });
+        };
+        self.repair_prefix_from_candidate(&source, offset)
+    }
+
+    fn repair_exact_from_candidate(
+        &mut self,
+        repair: JournalRepair,
+        candidate: Option<RecoveryCandidate>,
+    ) -> Result<(), BankedJournalError<B::Error>> {
+        self.require_reopen()?;
+        let result = (|| {
+            let Some(requested) = candidate else {
+                return self.repair_exact_inner(repair.offset());
+            };
+            self.revalidate_candidate(requested)?;
+            let source = self
+                .recovery_candidates
+                .iter()
+                .find(|candidate| candidate.descriptor() == requested)
+                .cloned()
+                .ok_or(BankedJournalError::CorruptBankMetadata)?;
+            self.repair_prefix_from_candidate(&source, repair.offset())
+        })();
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+
+    fn repair_prefix_from_candidate(
+        &mut self,
+        source: &VNextRecoveryCandidate,
+        offset: usize,
+    ) -> Result<(), BankedJournalError<B::Error>> {
+        if offset > source.logical_len {
             return Err(BankedJournalError::InvalidRepairOffset {
                 offset,
-                length: raw.len(),
+                length: source.logical_len,
             });
         }
-        if offset == raw.len() {
+        if offset == source.logical_len {
             return self.flush();
         }
-        let prefix = encode_vnext_frame(&raw[..offset])
-            .ok_or(BankedJournalError::AllocationFailed { requested: offset })?;
-        self.replace_exact(&prefix)
+
+        // Hash and copy the prefix in separate bounded passes. The complete
+        // repair prefix is never retained as an owned Vec.
+        let mut digest = Sha256::new();
+        let mut hashed = 0usize;
+        let mut scratch = [0u8; SECTOR_BYTES];
+        while hashed < offset {
+            let amount = (offset - hashed).min(scratch.len());
+            self.read_candidate_at_inner(source, hashed, &mut scratch[..amount])?;
+            digest.update(&scratch[..amount]);
+            if let Some(telemetry) = &mut self.telemetry {
+                telemetry.hash_bytes = telemetry.hash_bytes.saturating_add(amount as u64);
+            }
+            hashed = hashed
+                .checked_add(amount)
+                .ok_or(BankedJournalError::CorruptBankMetadata)?;
+        }
+        let frame_digest: [u8; 32] = digest.finalize().into();
+        self.stage_repair_frame(source, offset, frame_digest)
+    }
+
+    fn stage_repair_frame(
+        &mut self,
+        source: &VNextRecoveryCandidate,
+        logical_len: usize,
+        frame_digest: [u8; 32],
+    ) -> Result<(), BankedJournalError<B::Error>> {
+        let used =
+            VNEXT_FRAME_HEADER
+                .checked_add(logical_len)
+                .ok_or(BankedJournalError::JournalFull {
+                    current: 0,
+                    additional: logical_len,
+                    capacity: VNEXT_CAPACITY,
+                })?;
+        let framed_len = used
+            .div_ceil(SECTOR_BYTES)
+            .checked_mul(SECTOR_BYTES)
+            .ok_or(BankedJournalError::JournalFull {
+                current: 0,
+                additional: used,
+                capacity: VNEXT_CAPACITY,
+            })?;
+        let needed = framed_len.div_ceil(VNEXT_SEGMENT_CAPACITY).max(1);
+        if framed_len > VNEXT_CAPACITY || needed > VNEXT_LIVE_SEGMENT_LIMIT {
+            return Err(BankedJournalError::JournalFull {
+                current: 0,
+                additional: framed_len,
+                capacity: VNEXT_CAPACITY,
+            });
+        }
+        let mut occupied = [false; VNEXT_SEGMENT_COUNT as usize];
+        for segment in &source.segments {
+            if segment.segment >= VNEXT_SEGMENT_COUNT {
+                return Err(BankedJournalError::CorruptBankMetadata);
+            }
+            occupied[segment.segment as usize] = true;
+        }
+        let mut free = [0u32; VNEXT_SEGMENT_COUNT as usize];
+        let mut free_len = 0usize;
+        for segment in 0..VNEXT_SEGMENT_COUNT {
+            if !occupied[segment as usize] {
+                free[free_len] = segment;
+                free_len += 1;
+            }
+        }
+        if free_len < needed {
+            return Err(BankedJournalError::JournalFull {
+                current: Self::candidate_raw_len(source)?,
+                additional: framed_len,
+                capacity: VNEXT_CAPACITY,
+            });
+        }
+        let first_generation = source
+            .endpoint
+            .generation
+            .checked_add(1)
+            .ok_or(BankedJournalError::GenerationExhausted)?;
+        first_generation
+            .checked_add((needed - 1) as u64)
+            .ok_or(BankedJournalError::GenerationExhausted)?;
+
+        let mut staged_segments = Vec::new();
+        staged_segments
+            .try_reserve_exact(needed)
+            .map_err(|_| BankedJournalError::AllocationFailed { requested: needed })?;
+        let mut staged_segments_mirror = Vec::new();
+        staged_segments_mirror
+            .try_reserve_exact(needed)
+            .map_err(|_| BankedJournalError::AllocationFailed { requested: needed })?;
+        let mut staged_candidates = Vec::new();
+        staged_candidates
+            .try_reserve_exact(VNEXT_HEADER_COPIES as usize)
+            .map_err(|_| BankedJournalError::AllocationFailed {
+                requested: VNEXT_HEADER_COPIES as usize,
+            })?;
+        let (headers, header_count, endpoint) = {
+            let mut writer = VNextCheckpointWriter::new(
+                self,
+                free,
+                free_len,
+                needed,
+                framed_len,
+                first_generation,
+            )?;
+            let mut frame_header = [0u8; VNEXT_FRAME_HEADER];
+            frame_header[..8].copy_from_slice(&VNEXT_FRAME_MAGIC);
+            frame_header[8..12].copy_from_slice(&(logical_len as u32).to_le_bytes());
+            frame_header[16..48].copy_from_slice(&frame_digest);
+            writer.write_raw(&frame_header)?;
+            writer.write_candidate_logical_prefix(source, logical_len)?;
+            writer.finish_frame_payload(frame_digest, logical_len)?;
+            let mut padding = framed_len - used;
+            let zeroes = [0u8; SECTOR_BYTES];
+            while padding != 0 {
+                let amount = padding.min(zeroes.len());
+                writer.write_raw(&zeroes[..amount])?;
+                padding -= amount;
+            }
+            writer.finish()?
+        };
+        for header in headers.iter().take(header_count).flatten() {
+            staged_segments.push(header.clone());
+            staged_segments_mirror.push(header.clone());
+        }
+        let frame = VNextFrameSpan {
+            raw_start: VNEXT_FRAME_HEADER,
+            logical_start: 0,
+            logical_len,
+        };
+        let mut frames = Vec::new();
+        frames
+            .try_reserve_exact(1)
+            .map_err(|_| BankedJournalError::AllocationFailed { requested: 1 })?;
+        frames.push(frame);
+        let mirror_frames = frames.clone();
+        self.publish_manifest(&endpoint)?;
+        staged_candidates.push(VNextRecoveryCandidate {
+            manifest_copy: 0,
+            endpoint_copy: 0,
+            endpoint: endpoint.clone(),
+            segments: staged_segments,
+            frames,
+            logical_len,
+        });
+        staged_candidates.push(VNextRecoveryCandidate {
+            manifest_copy: 1,
+            endpoint_copy: 0,
+            endpoint,
+            segments: staged_segments_mirror,
+            frames: mirror_frames,
+            logical_len,
+        });
+        let selected = staged_candidates[0].clone();
+        self.recovery_candidates = staged_candidates;
+        self.set_active_candidate(&selected, true);
+        self.active_materialized = true;
+        self.mark_phase(JournalIoPhase::CacheUpdated);
+        Ok(())
     }
 
     fn replace_exact(&mut self, image: &[u8]) -> Result<(), BankedJournalError<B::Error>> {
+        self.require_logical_selection()?;
         if image.len() > VNEXT_CAPACITY {
             return Err(BankedJournalError::JournalFull {
                 current: 0,
@@ -1442,29 +3322,53 @@ where
             });
         }
         let needed = image.len().div_ceil(VNEXT_SEGMENT_CAPACITY).max(1);
-        let mut free = Vec::new();
+        let mut free = [0u32; VNEXT_SEGMENT_COUNT as usize];
+        let mut free_len = 0usize;
         for segment in 0..VNEXT_SEGMENT_COUNT {
             if !self.active.occupied[segment as usize] {
-                free.push(segment);
+                free[free_len] = segment;
+                free_len += 1;
             }
         }
-        if free.len() < needed {
+        if free_len < needed {
             return Err(BankedJournalError::JournalFull {
-                current: self.active.bytes.len(),
+                current: self.active_raw_len(),
                 additional: image.len(),
                 capacity: VNEXT_CAPACITY,
             });
         }
-        // Complete the next cache image before any replacement segment can be
-        // committed. Once M0 is durable, every remaining cache transition is
-        // an infallible move rather than an allocation point.
-        let mut next_bytes = Vec::new();
-        next_bytes.try_reserve_exact(image.len()).map_err(|_| {
-            BankedJournalError::AllocationFailed {
-                requested: image.len(),
-            }
-        })?;
-        next_bytes.extend_from_slice(image);
+        let frames =
+            decode_vnext_frame_spans(image).ok_or(BankedJournalError::CorruptBankMetadata)?;
+        let logical_len = frames
+            .last()
+            .map(|frame| {
+                frame
+                    .logical_start
+                    .checked_add(frame.logical_len)
+                    .ok_or(BankedJournalError::CorruptBankMetadata)
+            })
+            .transpose()?
+            .unwrap_or(0);
+
+        // Prepare bounded metadata before the first sector write. The image
+        // itself is an explicit checkpoint input; it is never retained by
+        // `VNextActiveImage` or by candidate discovery.
+        let mut staged_segments = Vec::new();
+        staged_segments
+            .try_reserve_exact(needed)
+            .map_err(|_| BankedJournalError::AllocationFailed { requested: needed })?;
+        let mut staged_segments_mirror = Vec::new();
+        staged_segments_mirror
+            .try_reserve_exact(needed)
+            .map_err(|_| BankedJournalError::AllocationFailed { requested: needed })?;
+        let staged_frames = frames;
+        let staged_frames_mirror = staged_frames.clone();
+        let mut staged_candidates = Vec::new();
+        staged_candidates
+            .try_reserve_exact(VNEXT_HEADER_COPIES as usize)
+            .map_err(|_| BankedJournalError::AllocationFailed {
+                requested: VNEXT_HEADER_COPIES as usize,
+            })?;
         let mut next_occupied = [false; VNEXT_SEGMENT_COUNT as usize];
         for &segment in free.iter().take(needed) {
             next_occupied[segment as usize] = true;
@@ -1476,7 +3380,7 @@ where
             .map_or(0, |header| header.generation);
         let mut previous_head = [0; 32];
         let mut endpoint = None;
-        for (index, &segment) in free.iter().enumerate().take(needed) {
+        for (index, &segment) in free.iter().take(needed).enumerate() {
             generation = generation
                 .checked_add(1)
                 .ok_or(BankedJournalError::GenerationExhausted)?;
@@ -1490,63 +3394,34 @@ where
                 &image[begin..end],
                 0,
             )?;
+            staged_segments.push(header.clone());
+            staged_segments_mirror.push(header.clone());
             previous_head = header.head;
             endpoint = Some(header);
         }
         let endpoint = endpoint.ok_or(BankedJournalError::CorruptBankMetadata)?;
         self.publish_manifest(&endpoint)?;
-        self.active.bytes = next_bytes;
+        staged_candidates.push(VNextRecoveryCandidate {
+            manifest_copy: 0,
+            endpoint_copy: 0,
+            endpoint: endpoint.clone(),
+            segments: staged_segments,
+            frames: staged_frames,
+            logical_len,
+        });
+        staged_candidates.push(VNextRecoveryCandidate {
+            manifest_copy: 1,
+            endpoint_copy: 0,
+            endpoint,
+            segments: staged_segments_mirror,
+            frames: staged_frames_mirror,
+            logical_len,
+        });
+        let selected = staged_candidates[0].clone();
+        self.recovery_candidates = staged_candidates;
+        self.set_active_candidate(&selected, true);
         self.active.occupied = next_occupied;
-        self.active.header = Some(endpoint);
-        self.mark_phase(JournalIoPhase::CacheUpdated);
-        Ok(())
-    }
-
-    fn publish_new_segment(
-        &mut self,
-        segment: u32,
-        previous_head: [u8; 32],
-        payload: &[u8],
-        checkpoint: bool,
-    ) -> Result<(), BankedJournalError<B::Error>> {
-        // Prebuild the cache image before starting disk mutation. This is
-        // required for the same reason as replacement: manifest publication
-        // is the authority pivot and cannot be followed by fallible growth.
-        let next_len = if checkpoint {
-            payload.len()
-        } else {
-            self.active.bytes.len().checked_add(payload.len()).ok_or(
-                BankedJournalError::AllocationFailed {
-                    requested: usize::MAX,
-                },
-            )?
-        };
-        let mut next_bytes = Vec::new();
-        next_bytes.try_reserve_exact(next_len).map_err(|_| {
-            BankedJournalError::AllocationFailed {
-                requested: next_len,
-            }
-        })?;
-        if !checkpoint {
-            next_bytes.extend_from_slice(&self.active.bytes);
-        }
-        next_bytes.extend_from_slice(payload);
-        let generation = match self.active.header.as_ref() {
-            Some(header) => header
-                .generation
-                .checked_add(1)
-                .ok_or(BankedJournalError::GenerationExhausted)?,
-            None => 1,
-        };
-        let header =
-            self.publish_segment(segment, generation, generation, previous_head, payload, 0)?;
-        self.publish_manifest(&header)?;
-        if checkpoint {
-            self.active.occupied = [false; VNEXT_SEGMENT_COUNT as usize];
-        }
-        self.active.bytes = next_bytes;
-        self.active.occupied[segment as usize] = true;
-        self.active.header = Some(header);
+        self.active_materialized = true;
         self.mark_phase(JournalIoPhase::CacheUpdated);
         Ok(())
     }
@@ -1596,9 +3471,7 @@ where
             self.mark_phase(JournalIoPhase::HeaderFlushed);
 
             match self.inspect_segment(segment)? {
-                VNextSegmentInspection::Valid(image)
-                    if image.header == header && image.bytes == payload =>
-                {
+                VNextSegmentInspection::Valid(actual) if actual == header => {
                     self.mark_phase(JournalIoPhase::ReadbackValidated);
                     Ok(header.clone())
                 }
@@ -1613,6 +3486,66 @@ where
         result
     }
 
+    /// Publishes a segment produced by the streaming checkpoint writer.
+    ///
+    /// The payload is already present in inactive sectors when this method is
+    /// called. It is flushed before either header copy can name it. Copy 0
+    /// gets a complete header-plus-payload readback; copy 1 then gets an exact
+    /// header readback. The second payload pass is unnecessary here because
+    /// this fresh segment is still exclusively owned by this journal writer,
+    /// no manifest can select it yet, and no other operation may mutate the
+    /// backend between the two reads. Ordinary discovery cannot make that
+    /// immutability/single-owner proof, so it intentionally keeps the generic
+    /// double-read validator below.
+    fn publish_stream_segment_header(
+        &mut self,
+        header: &VNextHeader,
+    ) -> Result<(), BankedJournalError<B::Error>> {
+        let encoded = header.encode();
+        let result = (|| {
+            self.mark_phase(JournalIoPhase::PayloadWritten);
+            self.flush()?;
+            self.mark_phase(JournalIoPhase::PayloadFlushed);
+
+            self.write_sector(vnext_header_lba(header.segment, 0), &encoded)?;
+            self.mark_phase(JournalIoPhase::HeaderWritten);
+            self.flush()?;
+            self.validate_stream_header_copy(header, 0, true)?;
+
+            self.write_sector(vnext_header_lba(header.segment, 1), &encoded)?;
+            self.flush()?;
+            self.validate_stream_header_copy(header, 1, false)?;
+            self.mark_phase(JournalIoPhase::HeaderFlushed);
+            self.mark_phase(JournalIoPhase::ReadbackValidated);
+            Ok(())
+        })();
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+
+    fn validate_stream_header_copy(
+        &mut self,
+        expected: &VNextHeader,
+        copy: u32,
+        validate_payload: bool,
+    ) -> Result<(), BankedJournalError<B::Error>> {
+        let mut bytes = [0u8; SECTOR_BYTES];
+        self.read_sector(vnext_header_lba(expected.segment, copy), &mut bytes)?;
+        let VNextHeaderInspection::Valid(header) = VNextHeader::decode(expected.segment, &bytes)
+        else {
+            return Err(BankedJournalError::ReadbackMismatch);
+        };
+        if header != *expected {
+            return Err(BankedJournalError::ReadbackMismatch);
+        }
+        if validate_payload && !self.validate_published_segment_metadata_once(expected)? {
+            return Err(BankedJournalError::ReadbackMismatch);
+        }
+        Ok(())
+    }
+
     /// Publish one same-segment append without rebuilding the existing
     /// segment.  The data tail is durable before a fresh header copy can name
     /// it.  The old header copy remains usable until the manifest selects the
@@ -1622,23 +3555,36 @@ where
         current: &VNextHeader,
         generation: u64,
         payload: &[u8],
-    ) -> Result<VNextHeader, BankedJournalError<B::Error>> {
+        endpoint_copy: u32,
+    ) -> Result<(VNextHeader, u32), BankedJournalError<B::Error>> {
+        let logical_len = current.logical_len.checked_add(payload.len()).ok_or(
+            BankedJournalError::JournalFull {
+                current: current.logical_len,
+                additional: payload.len(),
+                capacity: VNEXT_SEGMENT_CAPACITY,
+            },
+        )?;
+        if logical_len > VNEXT_SEGMENT_CAPACITY || endpoint_copy >= VNEXT_HEADER_COPIES {
+            return Err(BankedJournalError::CorruptBankMetadata);
+        }
+        let (payload_digest, head) = self.hash_segment_with_suffix(current, payload)?;
         let header = VNextHeader {
             segment: current.segment,
             generation,
             first_generation: current.first_generation,
-            logical_len: payload.len(),
+            logical_len,
             previous_head: current.previous_head,
-            payload_digest: self.hash(payload),
-            head: self.segment_head(current.previous_head, payload),
+            payload_digest,
+            head,
         };
         let encoded = header.encode();
-        // Alternate the first committed slot.  This leaves the preceding
+        // Write the new header to the copy which was not observed to carry
+        // the manifest-selected old endpoint. This leaves the preceding
         // header intact while the manifest still names the old payload.
-        let fresh_copy = (generation & 1) as u32;
-        let mirror_copy = 1 - fresh_copy;
+        let fresh_copy = 1 - endpoint_copy;
+        let mirror_copy = endpoint_copy;
         let result = (|| {
-            self.write_segment_tail(current.segment, payload, current.logical_len)?;
+            self.write_segment_append(current.segment, current.logical_len, payload)?;
             self.mark_phase(JournalIoPhase::PayloadWritten);
             self.flush()?;
             self.mark_phase(JournalIoPhase::PayloadFlushed);
@@ -1649,7 +3595,7 @@ where
             // Before the manifest can pivot authority, prove the staged copy
             // names the exact new payload. The untouched mirror still names
             // the old endpoint if this validation fails or power cuts here.
-            self.validate_exact_header_copy(current.segment, fresh_copy, &header, payload)?;
+            self.validate_exact_header_copy(current.segment, fresh_copy, &header)?;
 
             // Header and manifest together bind the new exact prefix.  If
             // only M0 is durable after a cut, its larger generation wins over
@@ -1662,14 +3608,14 @@ where
             self.write_sector(vnext_header_lba(current.segment, mirror_copy), &encoded)?;
             self.flush()?;
             self.mark_phase(JournalIoPhase::HeaderFlushed);
-            self.validate_exact_header_copy(current.segment, mirror_copy, &header, payload)?;
+            self.validate_exact_header_copy(current.segment, mirror_copy, &header)?;
             self.mark_phase(JournalIoPhase::ReadbackValidated);
             Ok(())
         })();
         if result.is_err() {
             self.poisoned = true;
         }
-        result.map(|()| header)
+        result.map(|()| (header, fresh_copy))
     }
 
     fn validate_exact_header_copy(
@@ -1677,7 +3623,6 @@ where
         segment: u32,
         copy: u32,
         expected: &VNextHeader,
-        payload: &[u8],
     ) -> Result<(), BankedJournalError<B::Error>> {
         let mut bytes = [0u8; SECTOR_BYTES];
         self.read_sector(vnext_header_lba(segment, copy), &mut bytes)?;
@@ -1687,10 +3632,45 @@ where
         if &header != expected {
             return Err(BankedJournalError::ReadbackMismatch);
         }
-        match self.validate_segment_payload(header)? {
-            Some(image) if image.bytes == payload => Ok(()),
-            Some(_) | None => Err(BankedJournalError::ReadbackMismatch),
+        if self.validate_published_segment_metadata_once(&header)? {
+            Ok(())
+        } else {
+            Err(BankedJournalError::ReadbackMismatch)
         }
+    }
+
+    fn hash_segment_with_suffix(
+        &mut self,
+        current: &VNextHeader,
+        suffix: &[u8],
+    ) -> VNextSegmentDigests<B::Error> {
+        let mut payload_digest = Sha256::new();
+        let mut head_digest = Sha256::new();
+        head_digest.update(current.previous_head);
+        let mut remaining = current.logical_len;
+        let mut sector_index = 0u32;
+        while remaining != 0 {
+            let mut sector = [0u8; SECTOR_BYTES];
+            self.read_sector(vnext_data_lba(current.segment) + sector_index, &mut sector)?;
+            let used = remaining.min(SECTOR_BYTES);
+            payload_digest.update(&sector[..used]);
+            head_digest.update(&sector[..used]);
+            remaining -= used;
+            sector_index = sector_index
+                .checked_add(1)
+                .ok_or(BankedJournalError::CorruptBankMetadata)?;
+        }
+        payload_digest.update(suffix);
+        head_digest.update(suffix);
+        if let Some(telemetry) = &mut self.telemetry {
+            telemetry.hash_bytes = telemetry
+                .hash_bytes
+                .saturating_add((current.logical_len + suffix.len()) as u64);
+        }
+        Ok((
+            payload_digest.finalize().into(),
+            head_digest.finalize().into(),
+        ))
     }
 
     fn write_segment_tail(
@@ -1722,115 +3702,348 @@ where
         Ok(())
     }
 
-    fn recover_prefix(&mut self) -> Result<VNextActiveImage, BankedJournalError<B::Error>> {
-        let Some(manifest) = self.read_manifest()? else {
-            return Ok(VNextActiveImage {
-                header: None,
-                bytes: Vec::new(),
-                occupied: [false; VNEXT_SEGMENT_COUNT as usize],
+    fn write_segment_append(
+        &mut self,
+        segment: u32,
+        previous_len: usize,
+        suffix: &[u8],
+    ) -> Result<(), BankedJournalError<B::Error>> {
+        if previous_len > VNEXT_SEGMENT_CAPACITY
+            || previous_len + suffix.len() > VNEXT_SEGMENT_CAPACITY
+        {
+            return Err(BankedJournalError::JournalFull {
+                current: previous_len,
+                additional: suffix.len(),
+                capacity: VNEXT_SEGMENT_CAPACITY,
             });
-        };
-        let endpoint = manifest.endpoint;
-        if !self.has_exact_segment_header(&endpoint)? {
-            return Err(BankedJournalError::CorruptBankMetadata);
         }
-        let Some(current) = self.validate_segment_payload(endpoint.clone())? else {
-            return Err(BankedJournalError::CorruptBankMetadata);
-        };
-        // The manifest pins this exact header, not merely the newest valid
-        // header physically present in the segment.  During an interrupted
-        // in-place append the fresh header may be newer while the manifest
-        // still selects this old one; both payload prefixes remain valid.
-        let mut images = Vec::new();
-        for segment in 0..VNEXT_SEGMENT_COUNT {
-            match self.inspect_segment(segment)? {
-                VNextSegmentInspection::Valid(image) => images.push(image),
-                VNextSegmentInspection::Invalid | VNextSegmentInspection::Blank => {}
+        let mut source_offset = 0usize;
+        let mut destination_offset = previous_len;
+        while source_offset < suffix.len() {
+            let sector_index = destination_offset / SECTOR_BYTES;
+            let sector_offset = destination_offset % SECTOR_BYTES;
+            let amount = (suffix.len() - source_offset).min(SECTOR_BYTES - sector_offset);
+            let mut sector = [0u8; SECTOR_BYTES];
+            if sector_offset != 0 || amount != SECTOR_BYTES {
+                self.read_sector(
+                    vnext_data_lba(segment)
+                        + u32::try_from(sector_index)
+                            .map_err(|_| BankedJournalError::CorruptBankMetadata)?,
+                    &mut sector,
+                )?;
             }
+            sector[sector_offset..sector_offset + amount]
+                .copy_from_slice(&suffix[source_offset..source_offset + amount]);
+            self.write_sector(
+                vnext_data_lba(segment)
+                    + u32::try_from(sector_index)
+                        .map_err(|_| BankedJournalError::CorruptBankMetadata)?,
+                &sector,
+            )?;
+            source_offset += amount;
+            destination_offset += amount;
         }
-        let mut chain = Vec::new();
-        let mut next_head = endpoint.previous_head;
-        let mut next_generation = endpoint.generation;
-        loop {
-            if next_head == [0; 32] {
-                break;
-            }
-            let Some(found) = images
-                .iter()
-                .position(|image| image.header.head == next_head)
-            else {
-                // The newest independent header lacks its required prefix. It
-                // is a corrupt/uncommitted suffix, not a new authority.
-                return Err(BankedJournalError::CorruptBankMetadata);
-            };
-            if chain.contains(&found) {
-                return Err(BankedJournalError::CorruptBankMetadata);
-            }
-            if images[found].header.first_generation > images[found].header.generation
-                || images[found].header.generation >= next_generation
-            {
-                return Err(BankedJournalError::CorruptBankMetadata);
-            }
-            next_head = images[found].header.previous_head;
-            next_generation = images[found].header.generation;
-            let segment_count = chain
-                .len()
-                .checked_add(2)
-                .ok_or(BankedJournalError::CorruptBankMetadata)?;
-            if segment_count > VNEXT_LIVE_SEGMENT_LIMIT {
-                return Err(BankedJournalError::CorruptBankMetadata);
-            }
-            chain.push(found);
-        }
-        chain.reverse();
-        let mut total_len = current.bytes.len();
-        for &index in &chain {
-            total_len = total_len
-                .checked_add(images[index].bytes.len())
-                .ok_or(BankedJournalError::CorruptBankMetadata)?;
-        }
-        if total_len > VNEXT_CAPACITY {
-            return Err(BankedJournalError::CorruptBankMetadata);
-        }
-        let mut bytes = Vec::new();
-        let mut occupied = [false; VNEXT_SEGMENT_COUNT as usize];
-        for index in chain {
-            let image = &images[index];
-            bytes.try_reserve_exact(image.bytes.len()).map_err(|_| {
-                BankedJournalError::AllocationFailed {
-                    requested: bytes.len().saturating_add(image.bytes.len()),
-                }
-            })?;
-            bytes.extend_from_slice(&image.bytes);
-            occupied[image.header.segment as usize] = true;
-        }
-        bytes.try_reserve_exact(current.bytes.len()).map_err(|_| {
-            BankedJournalError::AllocationFailed {
-                requested: bytes.len().saturating_add(current.bytes.len()),
-            }
-        })?;
-        bytes.extend_from_slice(&current.bytes);
-        occupied[current.header.segment as usize] = true;
-        Ok(VNextActiveImage {
-            header: Some(endpoint),
-            bytes,
-            occupied,
-        })
+        Ok(())
     }
 
-    fn has_exact_segment_header(
+    fn discover_candidates(
         &mut self,
-        expected: &VNextHeader,
-    ) -> Result<bool, BankedJournalError<B::Error>> {
+    ) -> Result<Vec<VNextRecoveryCandidate>, BankedJournalError<B::Error>> {
+        let mut manifests = Vec::new();
+        let mut invalid_manifest = false;
         for copy in 0..VNEXT_HEADER_COPIES {
             let mut bytes = [0u8; SECTOR_BYTES];
-            self.read_sector(vnext_header_lba(expected.segment, copy), &mut bytes)?;
-            if matches!(VNextHeader::decode(expected.segment, &bytes), VNextHeaderInspection::Valid(header) if header == *expected)
-            {
-                return Ok(true);
+            self.read_sector(vnext_manifest_lba(copy), &mut bytes)?;
+            match VNextManifest::decode(&bytes) {
+                VNextManifestInspection::Blank => {}
+                VNextManifestInspection::Invalid => invalid_manifest = true,
+                VNextManifestInspection::Valid(manifest) => manifests.push((copy, manifest)),
             }
         }
-        Ok(false)
+        if manifests.is_empty() {
+            return if invalid_manifest {
+                Err(BankedJournalError::CorruptBankMetadata)
+            } else {
+                Ok(Vec::new())
+            };
+        }
+
+        let all_headers = self.discover_segment_headers()?;
+        let mut candidates = Vec::new();
+        for (manifest_copy, manifest) in manifests {
+            if let Some(candidate) =
+                self.build_recovery_candidate(manifest_copy, manifest.endpoint, &all_headers)?
+            {
+                candidates.push(candidate);
+            }
+        }
+        if candidates.is_empty() {
+            return Err(BankedJournalError::CorruptBankMetadata);
+        }
+        Ok(candidates)
+    }
+
+    /// Returns every header copy whose exact payload and physical hash-chain
+    /// fields validate. No generation sort is performed here; a manifest
+    /// candidate later names the endpoint explicitly.
+    fn discover_segment_headers(
+        &mut self,
+    ) -> Result<Vec<(VNextHeader, u32)>, BankedJournalError<B::Error>> {
+        let mut headers = Vec::new();
+        for segment in 0..VNEXT_SEGMENT_COUNT {
+            for copy in 0..VNEXT_HEADER_COPIES {
+                let mut bytes = [0u8; SECTOR_BYTES];
+                self.read_sector(vnext_header_lba(segment, copy), &mut bytes)?;
+                let VNextHeaderInspection::Valid(header) = VNextHeader::decode(segment, &bytes)
+                else {
+                    continue;
+                };
+                if headers
+                    .iter()
+                    .any(|(existing, _): &(VNextHeader, u32)| *existing == header)
+                {
+                    continue;
+                }
+                if self.validate_segment_payload_metadata(&header)? {
+                    headers.push((header, copy));
+                }
+            }
+        }
+        Ok(headers)
+    }
+
+    fn build_recovery_candidate(
+        &mut self,
+        manifest_copy: u32,
+        endpoint: VNextHeader,
+        all_headers: &[(VNextHeader, u32)],
+    ) -> Result<Option<VNextRecoveryCandidate>, BankedJournalError<B::Error>> {
+        let Some((endpoint_header, endpoint_copy)) = all_headers
+            .iter()
+            .find(|(header, _)| *header == endpoint)
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        let mut reverse = vec![endpoint_header];
+        let mut next_head = reverse[0].previous_head;
+        let mut next_generation = reverse[0].generation;
+        while next_head != [0; 32] {
+            let Some(previous) = all_headers.iter().find(|(header, _)| {
+                header.head == next_head && header.generation < next_generation
+            }) else {
+                return Ok(None);
+            };
+            if reverse
+                .iter()
+                .any(|header| header.segment == previous.0.segment)
+            {
+                return Ok(None);
+            }
+            reverse.push(previous.0.clone());
+            next_head = previous.0.previous_head;
+            next_generation = previous.0.generation;
+            if reverse.len() > VNEXT_LIVE_SEGMENT_LIMIT {
+                return Ok(None);
+            }
+        }
+        reverse.reverse();
+
+        let Some((frames, logical_len)) = self.scan_frame_spans(&reverse)? else {
+            return Ok(None);
+        };
+        Ok(Some(VNextRecoveryCandidate {
+            manifest_copy,
+            endpoint_copy,
+            endpoint,
+            segments: reverse,
+            frames,
+            logical_len,
+        }))
+    }
+
+    /// Decodes frame headers and payload digests directly from the segment
+    /// chain. Only sector-sized scratch is retained; discovery never builds a
+    /// candidate-sized framed image.
+    fn scan_frame_spans(&mut self, segments: &[VNextHeader]) -> VNextFrameScan<B::Error> {
+        let raw_len = segments
+            .iter()
+            .try_fold(0usize, |total, segment| {
+                total.checked_add(segment.logical_len)
+            })
+            .ok_or(BankedJournalError::CorruptBankMetadata)?;
+        if raw_len > VNEXT_CAPACITY {
+            return Ok(None);
+        }
+        let mut cursor = 0usize;
+        let mut logical_start = 0usize;
+        let mut spans = Vec::new();
+        let maximum_frames = raw_len / SECTOR_BYTES;
+        spans.try_reserve_exact(maximum_frames).map_err(|_| {
+            BankedJournalError::AllocationFailed {
+                requested: maximum_frames,
+            }
+        })?;
+        while cursor < raw_len {
+            let remaining = raw_len
+                .checked_sub(cursor)
+                .ok_or(BankedJournalError::CorruptBankMetadata)?;
+            if remaining < VNEXT_FRAME_HEADER {
+                return Ok(None);
+            }
+            let mut frame_header = [0u8; VNEXT_FRAME_HEADER];
+            self.read_segments_at(segments, cursor, &mut frame_header)?;
+            if frame_header[..8] != VNEXT_FRAME_MAGIC
+                || frame_header[12..16].iter().any(|byte| *byte != 0)
+            {
+                return Ok(None);
+            }
+            let frame_len = usize::try_from(read_u32(&frame_header, 8))
+                .map_err(|_| BankedJournalError::CorruptBankMetadata)?;
+            let used = VNEXT_FRAME_HEADER
+                .checked_add(frame_len)
+                .ok_or(BankedJournalError::CorruptBankMetadata)?;
+            let padded = used
+                .div_ceil(SECTOR_BYTES)
+                .checked_mul(SECTOR_BYTES)
+                .ok_or(BankedJournalError::CorruptBankMetadata)?;
+            let end = cursor
+                .checked_add(padded)
+                .ok_or(BankedJournalError::CorruptBankMetadata)?;
+            if end > raw_len {
+                return Ok(None);
+            }
+            let expected_digest: [u8; 32] = frame_header[16..48]
+                .try_into()
+                .map_err(|_| BankedJournalError::CorruptBankMetadata)?;
+            let payload_start = cursor
+                .checked_add(VNEXT_FRAME_HEADER)
+                .ok_or(BankedJournalError::CorruptBankMetadata)?;
+            let mut digest = Sha256::new();
+            let mut payload_offset = 0usize;
+            let mut scratch = [0u8; SECTOR_BYTES];
+            while payload_offset < frame_len {
+                let amount = (frame_len - payload_offset).min(scratch.len());
+                self.read_segments_at(
+                    segments,
+                    payload_start
+                        .checked_add(payload_offset)
+                        .ok_or(BankedJournalError::CorruptBankMetadata)?,
+                    &mut scratch[..amount],
+                )?;
+                digest.update(&scratch[..amount]);
+                payload_offset += amount;
+            }
+            if <[u8; 32]>::from(digest.finalize()) != expected_digest {
+                return Ok(None);
+            }
+            let padding = padded - used;
+            let mut padding_offset = 0usize;
+            while padding_offset < padding {
+                let amount = (padding - padding_offset).min(scratch.len());
+                self.read_segments_at(
+                    segments,
+                    cursor
+                        .checked_add(used)
+                        .and_then(|value| value.checked_add(padding_offset))
+                        .ok_or(BankedJournalError::CorruptBankMetadata)?,
+                    &mut scratch[..amount],
+                )?;
+                if scratch[..amount].iter().any(|byte| *byte != 0) {
+                    return Ok(None);
+                }
+                padding_offset += amount;
+            }
+            spans.push(VNextFrameSpan {
+                raw_start: payload_start,
+                logical_start,
+                logical_len: frame_len,
+            });
+            logical_start = logical_start
+                .checked_add(frame_len)
+                .ok_or(BankedJournalError::CorruptBankMetadata)?;
+            cursor = end;
+        }
+        Ok(Some((spans, logical_start)))
+    }
+
+    fn validate_segment_payload_metadata(
+        &mut self,
+        header: &VNextHeader,
+    ) -> Result<bool, BankedJournalError<B::Error>> {
+        // Reopened media is not proven immutable or single-owner. Keep the
+        // payload and chain-head passes separate so a device/controller race
+        // cannot combine bytes from two observations into one accepted hash.
+        let mut digest = Sha256::new();
+        let mut remaining = header.logical_len;
+        let mut index = 0u32;
+        while remaining != 0 {
+            let mut sector = [0u8; SECTOR_BYTES];
+            self.read_sector(vnext_data_lba(header.segment) + index, &mut sector)?;
+            let used = remaining.min(SECTOR_BYTES);
+            digest.update(&sector[..used]);
+            remaining -= used;
+            index = index
+                .checked_add(1)
+                .ok_or(BankedJournalError::CorruptBankMetadata)?;
+        }
+        if <[u8; 32]>::from(digest.finalize()) != header.payload_digest {
+            return Ok(false);
+        }
+        let mut head = Sha256::new();
+        head.update(header.previous_head);
+        // The payload must be read a second time to bind the physical chain
+        // head. This remains bounded sector scratch, never a retained image.
+        let mut remaining = header.logical_len;
+        let mut index = 0u32;
+        while remaining != 0 {
+            let mut sector = [0u8; SECTOR_BYTES];
+            self.read_sector(vnext_data_lba(header.segment) + index, &mut sector)?;
+            let used = remaining.min(SECTOR_BYTES);
+            head.update(&sector[..used]);
+            remaining -= used;
+            index = index
+                .checked_add(1)
+                .ok_or(BankedJournalError::CorruptBankMetadata)?;
+        }
+        Ok(<[u8; 32]>::from(head.finalize()) == header.head)
+    }
+
+    /// Validates a freshly staged segment with one bounded payload read.
+    ///
+    /// This helper is deliberately narrower than
+    /// [`Self::validate_segment_payload_metadata`]. The writer owns the
+    /// backend exclusively, the segment is inactive and not yet manifest
+    /// authoritative, and no concurrent mutation can occur between the
+    /// payload write and this readback. Under those conditions one sector
+    /// observation can feed both canonical hashers. It must not be reused by
+    /// arbitrary recovery scans.
+    fn validate_published_segment_metadata_once(
+        &mut self,
+        header: &VNextHeader,
+    ) -> Result<bool, BankedJournalError<B::Error>> {
+        if header.logical_len > VNEXT_SEGMENT_CAPACITY {
+            return Ok(false);
+        }
+        let mut payload = Sha256::new();
+        let mut head = Sha256::new();
+        head.update(header.previous_head);
+        let mut remaining = header.logical_len;
+        let mut index = 0u32;
+        while remaining != 0 {
+            let mut sector = [0u8; SECTOR_BYTES];
+            self.read_sector(vnext_data_lba(header.segment) + index, &mut sector)?;
+            let used = remaining.min(SECTOR_BYTES);
+            payload.update(&sector[..used]);
+            head.update(&sector[..used]);
+            remaining -= used;
+            index = index
+                .checked_add(1)
+                .ok_or(BankedJournalError::CorruptBankMetadata)?;
+        }
+        let payload_digest: [u8; 32] = payload.finalize().into();
+        let head_digest: [u8; 32] = head.finalize().into();
+        Ok(payload_digest == header.payload_digest && head_digest == header.head)
     }
 
     fn read_manifest(&mut self) -> Result<Option<VNextManifest>, BankedJournalError<B::Error>> {
@@ -1846,14 +4059,10 @@ where
             (VNextManifestInspection::Valid(left), VNextManifestInspection::Valid(right)) => {
                 if left == right {
                     Ok(Some(left))
-                } else if left.endpoint.generation == right.endpoint.generation {
-                    Err(BankedJournalError::ConflictingGeneration {
-                        generation: left.endpoint.generation,
-                    })
-                } else if left.endpoint.generation > right.endpoint.generation {
-                    Ok(Some(left))
                 } else {
-                    Ok(Some(right))
+                    Err(BankedJournalError::ConflictingGeneration {
+                        generation: left.endpoint.generation.max(right.endpoint.generation),
+                    })
                 }
             }
             (VNextManifestInspection::Valid(manifest), _)
@@ -1870,10 +4079,27 @@ where
             endpoint: endpoint.clone(),
         };
         let bytes = manifest.encode();
+        let preserved = self.active.manifest_copy.unwrap_or(1);
+        if preserved >= VNEXT_HEADER_COPIES {
+            return Err(BankedJournalError::CorruptBankMetadata);
+        }
+        let pivot_copy = 1 - preserved;
         let result = (|| {
-            self.write_sector(vnext_manifest_lba(0), &bytes)?;
+            // Keep the manifest selected by trusted recovery intact until a
+            // complete new root is durable. This remains safe even when the
+            // other valid manifest names a divergent chain whose segments
+            // were reused while staging the new image.
+            self.write_sector(vnext_manifest_lba(pivot_copy), &bytes)?;
             self.flush()?;
-            self.write_sector(vnext_manifest_lba(1), &bytes)?;
+            let mut readback = [0u8; SECTOR_BYTES];
+            self.read_sector(vnext_manifest_lba(pivot_copy), &mut readback)?;
+            if !matches!(
+                VNextManifest::decode(&readback),
+                VNextManifestInspection::Valid(observed) if observed == manifest
+            ) {
+                return Err(BankedJournalError::ReadbackMismatch);
+            }
+            self.write_sector(vnext_manifest_lba(preserved), &bytes)?;
             self.flush()?;
             if self.read_manifest()?.as_ref() != Some(&manifest) {
                 return Err(BankedJournalError::ReadbackMismatch);
@@ -1886,8 +4112,51 @@ where
         result
     }
 
+    /// Publishes one durable replacement root while retaining the manifest
+    /// selected by the current trusted anchor. Recovery can therefore choose
+    /// the old or staged checkpoint solely from the anchor coordinate.
+    fn stage_manifest(
+        &mut self,
+        endpoint: &VNextHeader,
+    ) -> Result<u32, BankedJournalError<B::Error>> {
+        let preserved = self.active.manifest_copy.unwrap_or(1);
+        if preserved >= VNEXT_HEADER_COPIES {
+            return Err(BankedJournalError::CorruptBankMetadata);
+        }
+        let staged_copy = 1 - preserved;
+        let manifest = VNextManifest {
+            endpoint: endpoint.clone(),
+        };
+        let bytes = manifest.encode();
+        let result = (|| {
+            self.write_sector(vnext_manifest_lba(staged_copy), &bytes)?;
+            self.flush()?;
+            let mut readback = [0u8; SECTOR_BYTES];
+            self.read_sector(vnext_manifest_lba(staged_copy), &mut readback)?;
+            if !matches!(
+                VNextManifest::decode(&readback),
+                VNextManifestInspection::Valid(observed) if observed == manifest
+            ) {
+                return Err(BankedJournalError::ReadbackMismatch);
+            }
+            Ok(staged_copy)
+        })();
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+
     fn require_reopen(&self) -> Result<(), BankedJournalError<B::Error>> {
         if self.poisoned {
+            Err(BankedJournalError::CorruptBankMetadata)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn require_logical_selection(&self) -> Result<(), BankedJournalError<B::Error>> {
+        if self.active.header.is_none() && !self.recovery_candidates.is_empty() {
             Err(BankedJournalError::CorruptBankMetadata)
         } else {
             Ok(())
@@ -1920,20 +4189,25 @@ where
                 VNextSegmentInspection::Invalid
             });
         }
-        if candidates.len() == 2 {
-            if candidates[0].generation == candidates[1].generation
-                && candidates[0] != candidates[1]
-            {
-                return Ok(VNextSegmentInspection::Invalid);
-            }
-            if candidates[1].generation > candidates[0].generation {
-                candidates.swap(0, 1);
+        let mut valid = Vec::new();
+        for header in candidates {
+            if self.validate_segment_payload(header.clone())? {
+                valid.push(header);
             }
         }
-        for header in candidates {
-            if let Some(image) = self.validate_segment_payload(header)? {
-                return Ok(VNextSegmentInspection::Valid(image));
+        if valid.len() == 1 {
+            return Ok(VNextSegmentInspection::Valid(
+                valid.pop().expect("one validated segment"),
+            ));
+        }
+        if valid.len() == 2 {
+            if valid[0] == valid[1] {
+                return Ok(VNextSegmentInspection::Valid(valid.remove(0)));
             }
+            // Both header copies are independently valid but disagree. A
+            // manifest must select one exact endpoint; no local generation
+            // ordering may manufacture authority here.
+            return Ok(VNextSegmentInspection::Invalid);
         }
         Ok(VNextSegmentInspection::Invalid)
     }
@@ -1941,29 +4215,8 @@ where
     fn validate_segment_payload(
         &mut self,
         header: VNextHeader,
-    ) -> Result<Option<VNextSegmentImage>, BankedJournalError<B::Error>> {
-        let mut bytes = Vec::new();
-        bytes.try_reserve_exact(header.logical_len).map_err(|_| {
-            BankedJournalError::AllocationFailed {
-                requested: header.logical_len,
-            }
-        })?;
-        bytes.resize(header.logical_len, 0);
-        for (index, chunk) in bytes.chunks_mut(SECTOR_BYTES).enumerate() {
-            let mut sector = [0u8; SECTOR_BYTES];
-            self.read_sector(
-                vnext_data_lba(header.segment)
-                    + u32::try_from(index).map_err(|_| BankedJournalError::CorruptBankMetadata)?,
-                &mut sector,
-            )?;
-            chunk.copy_from_slice(&sector[..chunk.len()]);
-        }
-        if self.hash(&bytes) != header.payload_digest
-            || self.segment_head(header.previous_head, &bytes) != header.head
-        {
-            return Ok(None);
-        }
-        Ok(Some(VNextSegmentImage { header, bytes }))
+    ) -> Result<bool, BankedJournalError<B::Error>> {
+        self.validate_segment_payload_metadata(&header)
     }
 
     #[cfg(ktest)]
@@ -1982,6 +4235,27 @@ where
 
     fn telemetry(&self) -> Option<JournalIoTelemetry> {
         self.telemetry
+    }
+
+    fn active_raw_len(&self) -> usize {
+        self.active
+            .header
+            .as_ref()
+            .and_then(|header| {
+                self.recovery_candidates
+                    .iter()
+                    .find(|candidate| candidate.endpoint == *header)
+                    .map(|candidate| {
+                        candidate
+                            .segments
+                            .iter()
+                            .try_fold(0usize, |total, segment| {
+                                total.checked_add(segment.logical_len)
+                            })
+                            .unwrap_or(0)
+                    })
+            })
+            .unwrap_or(0)
     }
 
     #[cfg(ktest)]
@@ -2020,9 +4294,10 @@ where
         lba: u32,
         input: &[u8; SECTOR_BYTES],
     ) -> Result<(), BankedJournalError<B::Error>> {
-        self.backend
-            .write_sector(lba, input)
-            .map_err(BankedJournalError::Storage)?;
+        if let Err(error) = self.backend.write_sector(lba, input) {
+            self.poisoned = true;
+            return Err(BankedJournalError::Storage(error));
+        }
         if let Some(telemetry) = &mut self.telemetry {
             telemetry.sectors_written = telemetry.sectors_written.saturating_add(1);
         }
@@ -2030,7 +4305,10 @@ where
     }
 
     fn flush(&mut self) -> Result<(), BankedJournalError<B::Error>> {
-        self.backend.flush().map_err(BankedJournalError::Storage)?;
+        if let Err(error) = self.backend.flush() {
+            self.poisoned = true;
+            return Err(BankedJournalError::Storage(error));
+        }
         if let Some(telemetry) = &mut self.telemetry {
             telemetry.flushes = telemetry.flushes.saturating_add(1);
         }
@@ -2101,6 +4379,9 @@ fn decode_vnext_frames(bytes: &[u8]) -> Option<Vec<u8>> {
     while cursor < bytes.len() {
         if bytes.len().checked_sub(cursor)? < VNEXT_FRAME_HEADER
             || bytes[cursor..cursor + 8] != VNEXT_FRAME_MAGIC
+            || bytes[cursor + 12..cursor + 16]
+                .iter()
+                .any(|byte| *byte != 0)
         {
             return None;
         }
@@ -2123,6 +4404,44 @@ fn decode_vnext_frames(bytes: &[u8]) -> Option<Vec<u8>> {
         cursor += padded;
     }
     Some(raw)
+}
+
+fn decode_vnext_frame_spans(bytes: &[u8]) -> Option<Vec<VNextFrameSpan>> {
+    let mut cursor = 0usize;
+    let mut logical_start = 0usize;
+    let mut spans = Vec::new();
+    while cursor < bytes.len() {
+        if bytes.len().checked_sub(cursor)? < VNEXT_FRAME_HEADER
+            || bytes[cursor..cursor + 8] != VNEXT_FRAME_MAGIC
+            || bytes[cursor + 12..cursor + 16]
+                .iter()
+                .any(|byte| *byte != 0)
+        {
+            return None;
+        }
+        let logical_len = usize::try_from(read_u32(bytes, cursor + 8)).ok()?;
+        let used = VNEXT_FRAME_HEADER.checked_add(logical_len)?;
+        let padded = used.div_ceil(SECTOR_BYTES).checked_mul(SECTOR_BYTES)?;
+        let end = cursor.checked_add(padded)?;
+        if end > bytes.len() {
+            return None;
+        }
+        let payload = &bytes[cursor + VNEXT_FRAME_HEADER..cursor + used];
+        let digest: [u8; 32] = Sha256::digest(payload).into();
+        if bytes[cursor + 16..cursor + 48] != digest
+            || bytes[cursor + used..end].iter().any(|byte| *byte != 0)
+        {
+            return None;
+        }
+        spans.push(VNextFrameSpan {
+            raw_start: cursor + VNEXT_FRAME_HEADER,
+            logical_start,
+            logical_len,
+        });
+        logical_start = logical_start.checked_add(logical_len)?;
+        cursor = end;
+    }
+    Some(spans)
 }
 
 fn read_u16(bytes: &[u8], offset: usize) -> u16 {
@@ -2178,7 +4497,7 @@ impl AtaPioJournal {
     pub(crate) fn telemetry(&self) -> Option<JournalIoSnapshot> {
         self.journal.telemetry().map(|counters| JournalIoSnapshot {
             counters,
-            image_bytes: self.journal.active.bytes.len() as u64,
+            image_bytes: self.journal.active_logical_len() as u64,
             capacity_bytes: JOURNAL_CAPACITY as u64,
         })
     }
@@ -2192,15 +4511,50 @@ impl DurableJournalBackend for AtaPioJournal {
     }
 }
 
+impl StreamingJournalBackend for AtaPioJournal {
+    type Error = AtaPioJournalError;
+
+    fn stage_checkpoint(&mut self, plan: &CheckpointRecordPlan) -> Result<(), Self::Error> {
+        self.journal.stage_checkpoint(plan)
+    }
+}
+
 impl OstdBootJournal for AtaPioJournal {
     type RecoveryError = AtaPioJournalError;
 
-    fn read_all(&mut self) -> Result<Vec<u8>, Self::RecoveryError> {
-        self.journal.read_all_image()
+    fn recovery_candidates(&mut self) -> Result<Vec<RecoveryCandidate>, Self::RecoveryError> {
+        self.journal.recovery_candidates()
     }
 
-    fn repair_and_sync(&mut self, repair: JournalRepair) -> Result<(), Self::RecoveryError> {
-        self.journal.repair_exact(repair)
+    fn select_recovery_candidate(
+        &mut self,
+        candidate: Option<RecoveryCandidate>,
+    ) -> Result<(), Self::RecoveryError> {
+        self.journal.select_candidate(candidate)
+    }
+
+    fn read_recovery_at(
+        &mut self,
+        candidate: RecoveryCandidate,
+        offset: usize,
+        output: &mut [u8],
+    ) -> Result<(), Self::RecoveryError> {
+        self.journal.read_candidate_at(candidate, offset, output)
+    }
+
+    fn revalidate_recovery_candidate(
+        &mut self,
+        candidate: RecoveryCandidate,
+    ) -> Result<(), Self::RecoveryError> {
+        self.journal.revalidate_candidate(candidate)
+    }
+
+    fn repair_and_sync(
+        &mut self,
+        repair: JournalRepair,
+        candidate: Option<RecoveryCandidate>,
+    ) -> Result<(), Self::RecoveryError> {
+        self.journal.repair_exact_from_candidate(repair, candidate)
     }
 }
 
@@ -2236,7 +4590,7 @@ impl AtaPioJournalVNext {
     pub(crate) fn telemetry(&self) -> Option<JournalIoSnapshot> {
         self.journal.telemetry().map(|counters| JournalIoSnapshot {
             counters,
-            image_bytes: self.journal.active.bytes.len() as u64,
+            image_bytes: self.journal.active_raw_len() as u64,
             capacity_bytes: VNEXT_CAPACITY as u64,
         })
     }
@@ -2272,13 +4626,50 @@ impl CompactingJournalBackend for AtaPioJournalVNext {
     }
 }
 
+impl StreamingJournalBackend for AtaPioJournalVNext {
+    type Error = AtaPioJournalError;
+
+    fn stage_checkpoint(&mut self, plan: &CheckpointRecordPlan) -> Result<(), Self::Error> {
+        self.journal.stage_checkpoint(plan)
+    }
+}
+
 impl OstdBootJournal for AtaPioJournalVNext {
     type RecoveryError = AtaPioJournalError;
-    fn read_all(&mut self) -> Result<Vec<u8>, Self::RecoveryError> {
-        self.journal.read_all_image()
+
+    fn recovery_candidates(&mut self) -> Result<Vec<RecoveryCandidate>, Self::RecoveryError> {
+        self.journal.recovery_candidates()
     }
-    fn repair_and_sync(&mut self, repair: JournalRepair) -> Result<(), Self::RecoveryError> {
-        self.journal.repair_exact(repair.offset())
+
+    fn select_recovery_candidate(
+        &mut self,
+        candidate: Option<RecoveryCandidate>,
+    ) -> Result<(), Self::RecoveryError> {
+        self.journal.select_candidate(candidate)
+    }
+
+    fn read_recovery_at(
+        &mut self,
+        candidate: RecoveryCandidate,
+        offset: usize,
+        output: &mut [u8],
+    ) -> Result<(), Self::RecoveryError> {
+        self.journal.read_candidate_at(candidate, offset, output)
+    }
+
+    fn revalidate_recovery_candidate(
+        &mut self,
+        candidate: RecoveryCandidate,
+    ) -> Result<(), Self::RecoveryError> {
+        self.journal.revalidate_candidate(candidate)
+    }
+
+    fn repair_and_sync(
+        &mut self,
+        repair: JournalRepair,
+        candidate: Option<RecoveryCandidate>,
+    ) -> Result<(), Self::RecoveryError> {
+        self.journal.repair_exact_from_candidate(repair, candidate)
     }
 }
 
@@ -2309,15 +4700,28 @@ impl AtaDoubleBank {
     pub(crate) fn load(
         &mut self,
     ) -> Result<Option<AtaDoubleBankSnapshot>, AtaDoubleBankError<AtaPioError>> {
-        let active = self.banks.active.clone();
-        if active.bank.is_none() {
+        let bytes = self
+            .banks
+            .read_all_image()
+            .map_err(AtaDoubleBankError::Banked)?;
+        let generation = if self.banks.active.bank.is_some() {
+            self.banks.active.generation
+        } else {
+            self.banks
+                .recovery_candidates
+                .iter()
+                .map(|candidate| candidate.header.generation)
+                .max()
+                .unwrap_or(0)
+        };
+        if generation == 0 {
             return Ok(None);
         }
-        let digest: [u8; 32] = Sha256::digest(&active.bytes).into();
+        let digest: [u8; 32] = Sha256::digest(&bytes).into();
         Ok(Some(AtaDoubleBankSnapshot {
-            revision: active.generation,
+            revision: generation,
             digest,
-            bytes: active.bytes,
+            bytes,
         }))
     }
 
@@ -2336,10 +4740,13 @@ impl AtaDoubleBank {
                 BankedJournalError::ReadbackMismatch,
             ));
         }
-        let active = self
-            .banks
-            .read_active_strict()
+        // This facade is an explicitly non-CSER raw cell. It retains the
+        // legacy compatibility ordering needed by its standalone revision
+        // protocol; the CSER recovery path never calls this method.
+        self.banks
+            .read_all_image()
             .map_err(AtaDoubleBankError::Banked)?;
+        let active = self.banks.active;
         let expected = active
             .generation
             .checked_add(1)
@@ -2373,6 +4780,11 @@ impl AtaDoubleBank {
 mod tests {
     use alloc::{vec, vec::Vec};
 
+    use cser_core::{
+        BootGeneration, CatalogSet, CommandRequest, CoreLimits, DeviceGeneration, Engine,
+        Freshness, JournalGeneration, ProviderCoordinate, ProviderGeneration, ProviderId,
+        RegistryInstance, VerifierBinding, VerifierGeneration, WorldId, standard_catalog,
+    };
     use ostd::prelude::ktest;
 
     use super::*;
@@ -2568,6 +4980,21 @@ mod tests {
     }
 
     #[ktest]
+    fn strict_double_bank_rejects_a_valid_header_with_corrupt_payload() {
+        let mut journal = journal();
+        journal
+            .append_exact(b"committed")
+            .expect("publish baseline");
+        let bank = journal.active.bank.expect("published bank");
+        journal.backend_mut().sectors[bank_data_lba(bank) as usize][0] ^= 0xff;
+
+        assert!(matches!(
+            journal.read_active_strict(),
+            Err(BankedJournalError::CorruptBankMetadata)
+        ));
+    }
+
+    #[ktest]
     fn strict_double_bank_keeps_a_valid_predecessor_after_torn_successor() {
         let mut journal = journal();
         journal
@@ -2575,11 +5002,12 @@ mod tests {
             .expect("publish predecessor");
         inject_invalid_bank(&mut journal, 1);
 
+        let selected = journal
+            .read_active_strict()
+            .expect("valid predecessor remains authoritative");
+        assert_eq!(selected.logical_len, b"committed".len());
         assert_eq!(
-            journal
-                .read_active_strict()
-                .expect("valid predecessor remains authoritative")
-                .bytes,
+            journal.read_all_image().expect("read predecessor"),
             b"committed"
         );
     }
@@ -2614,9 +5042,15 @@ mod tests {
             .expect("publish valid peer");
         inject_invalid_bank(&mut journal, 1);
 
-        let reopened =
+        let mut reopened =
             production_open(journal.into_backend()).expect("valid peer remains authoritative");
-        assert_eq!(reopened.active.bytes, b"committed");
+        assert!(reopened.active.bank.is_none());
+        assert_eq!(
+            reopened
+                .read_all_image()
+                .expect("read selected physical peer"),
+            b"committed"
+        );
     }
 
     #[ktest]
@@ -2662,9 +5096,10 @@ mod tests {
         let mut journal = journal();
         journal.enable_telemetry();
 
-        // A deterministic fill profile makes the full-bank rewrite visible:
-        // committing the first 64 KiB in 512-byte records writes and reads
-        // 8,384 sectors each, for 65.5x the logical payload in writes alone.
+        // A deterministic fill profile makes the fixed two-bank rewrite
+        // visible: committing the first 64 KiB in 512-byte records still
+        // writes 8,384 sectors, while metadata-only publication additionally
+        // reads each source prefix before writing its inactive successor.
         for record in 1..=BANK_DATA_SECTORS {
             journal
                 .append_exact(&vec![record as u8; SECTOR_BYTES])
@@ -2673,7 +5108,7 @@ mod tests {
 
         let telemetry = journal.telemetry().expect("telemetry enabled");
         assert_eq!(telemetry.sectors_written, 8_384);
-        assert_eq!(telemetry.sectors_read, 8_384);
+        assert_eq!(telemetry.sectors_read, 16_512);
         assert_eq!(telemetry.flushes, 256);
         assert_eq!(telemetry.hash_bytes, 8_454_144);
         assert_ne!(
@@ -2687,7 +5122,7 @@ mod tests {
     }
 
     #[ktest]
-    fn pio_journal_failed_append_keeps_the_validated_cache() {
+    fn pio_journal_failed_append_requires_reopen() {
         let mut journal = journal();
         journal
             .append_exact(b"committed")
@@ -2700,14 +5135,20 @@ mod tests {
                 MemoryError::InjectedWriteFailure
             ))
         );
+        assert!(matches!(
+            journal.read_all_image(),
+            Err(BankedJournalError::CorruptBankMetadata)
+        ));
+        journal.backend_mut().fail_writes_after = None;
+        let mut reopened = BankedJournal::open(journal.into_backend()).expect("reopen");
         assert_eq!(
-            journal.read_all_image().expect("cache remains valid"),
+            reopened.read_all_image().expect("old bank remains"),
             b"committed"
         );
     }
 
     #[ktest]
-    fn pio_journal_failed_repair_keeps_the_validated_cache() {
+    fn pio_journal_failed_repair_requires_reopen() {
         let mut journal = journal();
         journal
             .append_exact(b"anchored-unanchored")
@@ -2720,8 +5161,14 @@ mod tests {
                 MemoryError::InjectedWriteFailure
             ))
         );
+        assert!(matches!(
+            journal.read_all_image(),
+            Err(BankedJournalError::CorruptBankMetadata)
+        ));
+        journal.backend_mut().fail_writes_after = None;
+        let mut reopened = BankedJournal::open(journal.into_backend()).expect("reopen");
         assert_eq!(
-            journal.read_all_image().expect("cache remains valid"),
+            reopened.read_all_image().expect("old bank remains"),
             b"anchored-unanchored"
         );
     }
@@ -2737,7 +5184,7 @@ mod tests {
 
         let reopened = BankedJournal::open(journal.into_backend()).expect("reopen fixture");
         assert!(reopened.active.bank.is_none());
-        assert!(reopened.active.bytes.is_empty());
+        assert_eq!(reopened.active.logical_len, 0);
     }
 
     #[ktest]
@@ -2755,8 +5202,321 @@ mod tests {
         );
     }
 
+    #[ktest]
+    fn pio_journal_reopen_retains_both_valid_banks_until_logical_selection() {
+        let mut journal = journal();
+        journal.append_exact(b"first").expect("first bank");
+        journal.append_exact(b"-second").expect("second bank");
+        let mut reopened = BankedJournal::open(journal.into_backend()).expect("reopen");
+
+        assert_eq!(reopened.recovery_candidates.len(), 2);
+        assert!(reopened.active.bank.is_none());
+        let first = reopened.recovery_candidates[0].descriptor();
+        let second = reopened.recovery_candidates[1].descriptor();
+        assert_ne!(first, second);
+
+        let mut first_bytes = vec![0u8; first.logical_len()];
+        reopened
+            .read_candidate_at(first, 0, &mut first_bytes)
+            .expect("bounded first read");
+        let mut second_bytes = vec![0u8; second.logical_len()];
+        reopened
+            .read_candidate_at(second, 0, &mut second_bytes)
+            .expect("bounded second read");
+        assert_eq!(first_bytes, b"first");
+        assert_eq!(second_bytes, b"first-second");
+    }
+
     fn vnext_journal() -> SegmentedJournalVNext<MemoryDisk> {
         SegmentedJournalVNext::open(MemoryDisk::fixture()).expect("open vNext memory disk")
+    }
+
+    fn streaming_checkpoint_plan(provider_count: u64) -> CheckpointRecordPlan {
+        let world = WorldId::new(1).expect("world");
+        let catalog = standard_catalog();
+        let catalogs = CatalogSet::new(core::slice::from_ref(&catalog)).expect("catalogs");
+        let freshness = Freshness::new(
+            BootGeneration::new(1).expect("boot"),
+            RegistryInstance::new(1).expect("registry"),
+            DeviceGeneration::new(1).expect("device"),
+            JournalGeneration::new(1).expect("journal"),
+        );
+        let verifier_generation = VerifierGeneration::new(1).expect("verifier generation");
+        let mut engine = Engine::new(world, catalogs, CoreLimits::bounded_default(), freshness);
+        for provider_id in 1..=provider_count {
+            let provider = ProviderCoordinate::new(
+                world,
+                ProviderId::new(provider_id).expect("provider"),
+                ProviderGeneration::new(1).expect("provider generation"),
+            );
+            let verifier_bindings = catalog
+                .verifier_class_bindings()
+                .into_iter()
+                .enumerate()
+                .map(|(index, class)| {
+                    VerifierBinding::new(
+                        class.verifier(),
+                        verifier_generation,
+                        class.receipt_schema(),
+                        cser_core::Digest::new([0x40u8.wrapping_add(index as u8); 32]),
+                    )
+                    .expect("verifier binding")
+                })
+                .collect();
+            engine
+                .transact(
+                    CommandRequest::RegisterProviderGeneration {
+                        coordinate: provider,
+                        catalog_digest: catalog.digest(),
+                        verifier_bindings,
+                    },
+                    |_| Ok::<(), MemoryError>(()),
+                )
+                .expect("register provider generation");
+        }
+        engine
+            .checkpoint_snapshot()
+            .expect("checkpoint snapshot")
+            .prepare_plan()
+            .expect("checkpoint plan")
+    }
+
+    #[ktest]
+    fn pio_vnext_streaming_checkpoint_crosses_segments_without_image_cache() {
+        let plan = streaming_checkpoint_plan(320);
+        assert!(plan.record_len() + VNEXT_FRAME_HEADER > VNEXT_SEGMENT_CAPACITY);
+        let mut expected = Vec::new();
+        let written = plan.write_to(&mut expected).expect("encode expected plan");
+        assert_eq!(written, plan.record_len());
+
+        let mut journal = vnext_journal();
+        journal
+            .stage_checkpoint(&plan)
+            .expect("stream checkpoint into inactive segments");
+        assert!(!journal.active_materialized);
+        assert!(journal.active.header.is_some());
+        assert_eq!(journal.recovery_candidates.len(), 1);
+        assert_eq!(journal.recovery_candidates[0].logical_len, expected.len());
+
+        let descriptor = journal.recovery_candidates[0].descriptor();
+        let mut bounded = vec![0u8; expected.len()];
+        journal
+            .read_candidate_at(descriptor, 0, &mut bounded)
+            .expect("bounded read-at candidate");
+        assert_eq!(bounded, expected);
+
+        let mut reopened = SegmentedJournalVNext::open(journal.into_backend()).expect("reopen");
+        assert_eq!(
+            reopened.read_all_image().expect("decode staged frame"),
+            expected
+        );
+    }
+
+    #[ktest]
+    fn pio_vnext_streaming_checkpoint_flush_cut_fails_closed_before_manifest() {
+        let plan = streaming_checkpoint_plan(1);
+        let mut journal = vnext_journal();
+        journal.backend_mut().fail_flushes_after = Some(1);
+        assert!(matches!(
+            journal.stage_checkpoint(&plan),
+            Err(BankedJournalError::Storage(
+                MemoryError::InjectedFlushFailure
+            ))
+        ));
+        journal.backend_mut().fail_flushes_after = None;
+
+        let mut reopened = SegmentedJournalVNext::open(journal.into_backend()).expect("reopen");
+        assert!(reopened.recovery_candidates.is_empty());
+        assert!(
+            reopened
+                .read_all_image()
+                .expect("blank old endpoint")
+                .is_empty()
+        );
+    }
+
+    #[ktest]
+    fn pio_vnext_streaming_checkpoint_retains_old_root_until_anchor_selection() {
+        let plan = streaming_checkpoint_plan(1);
+        let mut expected = Vec::new();
+        plan.write_to(&mut expected).expect("checkpoint bytes");
+        let mut journal = vnext_journal();
+        journal.append_exact(b"anchored-old").expect("old root");
+        journal
+            .stage_checkpoint(&plan)
+            .expect("stage replacement root");
+
+        let mut reopened = SegmentedJournalVNext::open(journal.into_backend())
+            .expect("reopen both authority candidates");
+        let descriptors = reopened
+            .recovery_candidates()
+            .expect("enumerate both roots");
+        assert_eq!(descriptors.len(), 2);
+        let old = descriptors
+            .iter()
+            .copied()
+            .find(|candidate| candidate.generation() == 1)
+            .expect("old anchored root");
+        let staged = descriptors
+            .iter()
+            .copied()
+            .find(|candidate| candidate.generation() != 1)
+            .expect("staged checkpoint root");
+
+        reopened
+            .select_candidate(Some(old))
+            .expect("old anchor selects old root");
+        assert_eq!(
+            reopened.read_all_image().expect("old image"),
+            b"anchored-old"
+        );
+        reopened
+            .select_candidate(Some(staged))
+            .expect("new anchor selects checkpoint root");
+        assert_eq!(
+            reopened.read_all_image().expect("checkpoint image"),
+            expected
+        );
+    }
+
+    #[ktest]
+    fn pio_vnext_streaming_checkpoint_header_readback_cut_fails_closed() {
+        let plan = streaming_checkpoint_plan(1);
+        let mut journal = vnext_journal();
+        journal.backend_mut().fail_reads_after = Some(0);
+        assert!(matches!(
+            journal.stage_checkpoint(&plan),
+            Err(BankedJournalError::Storage(
+                MemoryError::InjectedReadFailure
+            ))
+        ));
+        journal.backend_mut().fail_reads_after = None;
+
+        assert!(
+            SegmentedJournalVNext::open(journal.into_backend())
+                .expect("reopen after header readback cut")
+                .recovery_candidates
+                .is_empty()
+        );
+    }
+
+    #[ktest]
+    fn pio_vnext_streaming_checkpoint_torn_payload_is_rejected() {
+        let plan = streaming_checkpoint_plan(1);
+        let mut journal = vnext_journal();
+        journal
+            .stage_checkpoint(&plan)
+            .expect("stage candidate before torn payload");
+        let endpoint = journal.active.header.clone().expect("staged endpoint");
+        journal.backend_mut().sectors[vnext_data_lba(endpoint.segment) as usize][0] ^= 0xff;
+
+        assert!(matches!(
+            SegmentedJournalVNext::open(journal.into_backend()),
+            Err(BankedJournalError::CorruptBankMetadata)
+        ));
+    }
+
+    #[ktest]
+    fn pio_vnext_streaming_checkpoint_retains_ambiguous_manifest_candidates() {
+        let plan = streaming_checkpoint_plan(1);
+        let mut journal = vnext_journal();
+        journal
+            .stage_checkpoint(&plan)
+            .expect("stage baseline candidate");
+        let alternate_frame = encode_vnext_frame(b"alternate").expect("alternate frame");
+        let alternate = journal
+            .publish_segment(5, 99, 99, [0; 32], &alternate_frame, 0)
+            .expect("publish alternate valid segment");
+        let conflicting = VNextManifest {
+            endpoint: alternate,
+        }
+        .encode();
+        journal
+            .backend_mut()
+            .write_sector(vnext_manifest_lba(1), &conflicting)
+            .expect("inject conflicting valid manifest");
+
+        let reopened = SegmentedJournalVNext::open(journal.into_backend())
+            .expect("retain both valid manifest candidates");
+        assert_eq!(reopened.recovery_candidates.len(), 2);
+        assert_ne!(
+            reopened.recovery_candidates[0].descriptor(),
+            reopened.recovery_candidates[1].descriptor()
+        );
+    }
+
+    #[ktest]
+    fn pio_vnext_divergent_manifest_reuse_preserves_selected_root_at_every_write_cut() {
+        for cut in 0..=8 {
+            let mut journal = vnext_journal();
+            journal.append_exact(b"selected-old").expect("baseline");
+
+            // Copy one names a valid but unselected chain in segment one.
+            // Replacing the selected image is allowed to reuse that segment,
+            // but copy zero must remain untouched until the new root is
+            // durable in copy one.
+            let alternate_frame = encode_vnext_frame(b"unselected").expect("alternate frame");
+            let alternate = journal
+                .publish_segment(1, 99, 99, [0; 32], &alternate_frame, 0)
+                .expect("alternate segment");
+            let alternate_manifest = VNextManifest {
+                endpoint: alternate,
+            }
+            .encode();
+            journal
+                .backend_mut()
+                .write_sector(vnext_manifest_lba(1), &alternate_manifest)
+                .expect("alternate manifest");
+
+            let mut reopened = SegmentedJournalVNext::open(journal.into_backend())
+                .expect("retain divergent roots");
+            let selected = reopened
+                .recovery_candidates
+                .iter()
+                .find(|candidate| candidate.endpoint.generation == 1)
+                .map(VNextRecoveryCandidate::descriptor)
+                .expect("baseline descriptor");
+            reopened
+                .select_candidate(Some(selected))
+                .expect("trusted selection");
+            reopened.backend_mut().fail_writes_after = Some(cut);
+            let _ = reopened.checkpoint_exact(b"replacement");
+            reopened.backend_mut().fail_writes_after = None;
+
+            let mut recovered = SegmentedJournalVNext::open(reopened.into_backend())
+                .expect("one authority root always survives");
+            let candidates = recovered
+                .recovery_candidates()
+                .expect("enumerate surviving roots");
+            let authoritative = candidates
+                .iter()
+                .copied()
+                .find(|candidate| candidate.generation() == 2)
+                .or_else(|| {
+                    candidates
+                        .iter()
+                        .copied()
+                        .find(|candidate| candidate.generation() == 1)
+                })
+                .expect("selected old or replacement root survives");
+            recovered
+                .select_candidate(Some(authoritative))
+                .expect("select surviving authority root");
+            let image = recovered.read_all_image().expect("recover endpoint");
+            assert!(
+                image == b"selected-old" || image == b"replacement",
+                "unexpected image at write cut {cut}"
+            );
+        }
+    }
+
+    #[ktest]
+    fn pio_vnext_rejects_unaligned_segment_before_in_place_append() {
+        let mut journal = vnext_journal();
+        assert_eq!(
+            journal.publish_segment(0, 1, 1, [0; 32], b"unaligned", 0),
+            Err(BankedJournalError::ReadbackMismatch)
+        );
     }
 
     #[ktest]
@@ -2772,17 +5532,45 @@ mod tests {
         // Same-segment append writes its changed data sector, one fresh
         // header, both manifest copies, then the mirrored header. It reads
         // the exact header-plus-two-sector payload for both staged and mirror
-        // validation and reads back both manifests (3 + 2 + 3 sectors). It
-        // never copies the committed prefix into another segment.
+        // validation reads back the pivot manifest before replacing the
+        // preserved root, then validates both copies (3 + 1 + 2 + 3 sectors).
+        // existing one-sector prefix is also read once to extend its digest,
+        // so no committed bytes need to be cached in memory. It never copies
+        // the committed prefix into another segment.
         assert_eq!(after.sectors_written - before.sectors_written, 5);
         assert_eq!(after.flushes - before.flushes, 5);
-        assert_eq!(after.sectors_read - before.sectors_read, 8);
+        assert_eq!(after.sectors_read - before.sectors_read, 10);
         assert!(after.hash_bytes > before.hash_bytes);
         assert_ne!(after.phase_tsc[JournalIoPhase::PayloadWritten as usize], 0);
         assert_ne!(
             after.phase_tsc[JournalIoPhase::ReadbackValidated as usize],
             0
         );
+    }
+
+    #[ktest]
+    fn pio_vnext_rejects_nonzero_frame_reserved_bytes_after_resealing_outer_checksums() {
+        let payload = b"canonical";
+        let mut frame = encode_vnext_frame(payload).expect("canonical frame");
+        assert_eq!(decode_vnext_frames(&frame).as_deref(), Some(&payload[..]));
+
+        for (index, byte) in frame[12..16].iter_mut().enumerate() {
+            *byte = (index + 1) as u8;
+        }
+
+        // Recompute and publish the segment digest and hash chain after the
+        // mutation. Only the frame's noncanonical reserved bytes remain
+        // invalid, so recovery must reject it at frame decoding.
+        let mut journal = vnext_journal();
+        let header = journal
+            .publish_segment(0, 1, 1, [0; 32], &frame, 0)
+            .expect("reseal outer checksums");
+        journal.publish_manifest(&header).expect("publish manifest");
+
+        assert!(matches!(
+            SegmentedJournalVNext::open(journal.into_backend()),
+            Err(BankedJournalError::CorruptBankMetadata)
+        ));
     }
 
     #[ktest]
@@ -2855,10 +5643,29 @@ mod tests {
         endpoint.head[0] ^= 0xff;
         let conflicting = VNextManifest { endpoint }.encode();
         reopened.backend_mut().sectors[vnext_manifest_lba(1) as usize] = conflicting;
-        assert!(matches!(
-            SegmentedJournalVNext::open(reopened.into_backend()),
-            Err(BankedJournalError::ConflictingGeneration { .. })
-        ));
+        let reopened =
+            SegmentedJournalVNext::open(reopened.into_backend()).expect("retain valid manifest");
+        assert_eq!(reopened.recovery_candidates.len(), 1);
+    }
+
+    #[ktest]
+    fn pio_vnext_reopen_retains_both_manifest_candidates_until_logical_selection() {
+        let mut journal = vnext_journal();
+        journal.append_exact(b"first").expect("first append");
+        journal.append_exact(b"-second").expect("second append");
+        let mut reopened = SegmentedJournalVNext::open(journal.into_backend()).expect("reopen");
+
+        assert_eq!(reopened.recovery_candidates.len(), 2);
+        assert!(reopened.active.header.is_none());
+        let first = reopened.recovery_candidates[0].descriptor();
+        let second = reopened.recovery_candidates[1].descriptor();
+        assert_eq!(first.storage_digest(), second.storage_digest());
+
+        let mut bytes = vec![0u8; first.logical_len()];
+        reopened
+            .read_candidate_at(first, 0, &mut bytes)
+            .expect("bounded logical read");
+        assert_eq!(bytes, b"first-second");
     }
 
     #[ktest]
@@ -3150,15 +5957,24 @@ mod tests {
         );
         // The legacy 64-KiB fill deterministically writes and reads 8,384
         // sectors, flushes 256 times, and hashes 8,454,144 bytes.  vNext
-        // removes the cumulative payload rewrite, but its exact staged-header
-        // validation rereads and rehashes the growing segment twice per
-        // append and its publication protocol uses five flushes per frame.
+        // removes the cumulative payload rewrite. Crossing a segment boundary
+        // copies the committed prefix into an alternate chain before the
+        // single manifest pivot; exact staged-header validation also rereads
+        // on every append. Metadata-only frame scanning reads more sectors,
+        // but hashes only canonical frame bytes instead of repeatedly hashing
+        // complete segment images. Crossing the segment boundary adds three
+        // durability flushes for the alternate-chain pivot.
         // Retain the full tradeoff rather than reporting only the favorable
         // write count.
-        assert_eq!(telemetry.sectors_written, 768);
-        assert_eq!(telemetry.sectors_read, 17_148);
-        assert_eq!(telemetry.flushes, 640);
-        assert_eq!(telemetry.hash_bytes, 25_567_168);
+        assert_eq!(
+            (
+                telemetry.sectors_written,
+                telemetry.sectors_read,
+                telemetry.flushes,
+                telemetry.hash_bytes,
+            ),
+            (898, 25_604, 643, 4_259_872)
+        );
         assert!(telemetry.sectors_written * 8 < 8_384);
     }
 
@@ -3190,18 +6006,30 @@ mod tests {
         pio_journal_torn_data_falls_back_to_last_committed_bank();
         pio_journal_torn_header_falls_back_to_last_committed_bank();
         strict_double_bank_rejects_a_lone_corrupt_bank();
+        strict_double_bank_rejects_a_valid_header_with_corrupt_payload();
         strict_double_bank_keeps_a_valid_predecessor_after_torn_successor();
         pio_journal_repair_publishes_the_exact_prefix();
         pio_journal_capacity_is_explicit_backpressure();
         pio_journal_cache_avoids_revalidating_banks_between_appends();
-        pio_journal_failed_append_keeps_the_validated_cache();
-        pio_journal_failed_repair_keeps_the_validated_cache();
+        pio_journal_failed_append_requires_reopen();
+        pio_journal_failed_repair_requires_reopen();
         pio_journal_reopen_revalidates_corrupted_cached_bank();
         pio_journal_repair_updates_cache_only_after_readback();
+        pio_journal_reopen_retains_both_valid_banks_until_logical_selection();
+        pio_vnext_streaming_checkpoint_crosses_segments_without_image_cache();
+        pio_vnext_streaming_checkpoint_flush_cut_fails_closed_before_manifest();
+        pio_vnext_streaming_checkpoint_retains_old_root_until_anchor_selection();
+        pio_vnext_streaming_checkpoint_header_readback_cut_fails_closed();
+        pio_vnext_streaming_checkpoint_torn_payload_is_rejected();
+        pio_vnext_streaming_checkpoint_retains_ambiguous_manifest_candidates();
+        pio_vnext_divergent_manifest_reuse_preserves_selected_root_at_every_write_cut();
+        pio_vnext_rejects_unaligned_segment_before_in_place_append();
         pio_vnext_appends_without_rewriting_the_prefix_and_reports_io();
+        pio_vnext_rejects_nonzero_frame_reserved_bytes_after_resealing_outer_checksums();
         pio_vnext_unpublished_in_place_header_keeps_the_manifest_selected_prefix();
         pio_vnext_torn_header_copy_keeps_the_other_committed_copy();
         pio_vnext_manifest_selects_the_committed_endpoint_and_rejects_a_tie();
+        pio_vnext_reopen_retains_both_manifest_candidates_until_logical_selection();
         pio_vnext_interrupted_checkpoint_keeps_the_old_chain();
         pio_vnext_post_publication_readback_failure_requires_reopen();
         pio_vnext_flush_failure_requires_reopen_for_old_endpoint();
