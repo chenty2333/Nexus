@@ -1208,7 +1208,10 @@ pub(crate) fn scan_journal_borrowed(
 /// chain without retaining record bytes. Whole-state checkpoint framing is
 /// also validated and returned as offsets. Allocation-free semantic preflight
 /// of ordinary command payloads belongs to the engine integration slice; this
-/// function therefore must not be used as its substitute.
+/// function therefore must not be used as its substitute. The one deliberate
+/// freshness exception is a terminal `CheckpointRecovery` record: its
+/// pre-transition envelope freshness is accepted only when the command target
+/// itself matches the trusted post-transition anchor.
 #[cfg(test)]
 pub(crate) fn inspect_journal_source_to_head<S: JournalRecoverySource>(
     expectation: RecoveryExpectation,
@@ -1485,8 +1488,24 @@ pub(crate) fn inspect_journal_snapshot_to_head<S: JournalRecoverySource>(
         record_count += 1;
         previous = Some((meta.revision, expected));
         if expected == expectation.head() {
-            if meta.revision != expectation.revision() || meta.freshness != expectation.freshness()
-            {
+            let freshness_matches = if meta.freshness == expectation.freshness() {
+                true
+            } else if !checkpoint && tag[0] == 17 && payload_len == 25 {
+                let mut recovery_payload = [0u8; 25];
+                read_source_exact(
+                    source,
+                    snapshot,
+                    offset - total_len + FIXED_WITHOUT_DIGEST,
+                    &mut recovery_payload,
+                    scratch,
+                )?;
+                read_u64(&recovery_payload, 1) == expectation.freshness().boot().get()
+                    && read_u64(&recovery_payload, 9) == expectation.freshness().journal().get()
+                    && read_u64(&recovery_payload, 17) == expectation.freshness().device().get()
+            } else {
+                false
+            };
+            if meta.revision != expectation.revision() || !freshness_matches {
                 return Err(AnchoredJournalInspectionError::Journal(
                     JournalDecodeError::ChainMismatch {
                         offset: offset - total_len,

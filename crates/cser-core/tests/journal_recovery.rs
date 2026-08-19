@@ -142,6 +142,67 @@ fn record_roundtrip_recovers_the_exact_acknowledged_chain_head() {
 }
 
 #[test]
+fn one_record_checkpoint_recovery_cold_reopens_after_anchor_advance() {
+    let committed = freshness(1, 1, 1, 1);
+    let target = freshness(2, 1, 1, 2);
+    let catalog = tool_dma_catalog();
+    let catalogs = CatalogSet::new(core::slice::from_ref(&catalog)).unwrap();
+    let catalog_digest = catalogs.digest();
+    let genesis_projection = Engine::new(
+        support::test_world(),
+        CatalogSet::new(core::slice::from_ref(&catalog)).unwrap(),
+        CoreLimits::bounded_default(),
+        committed,
+    )
+    .projection_digest();
+    let mut engine = Engine::recover(
+        catalogs,
+        CoreLimits::bounded_default(),
+        recovery_anchor(
+            catalog_digest,
+            committed,
+            target,
+            0,
+            Digest::ZERO,
+            genesis_projection,
+        ),
+        &[],
+    )
+    .unwrap()
+    .into_engine();
+    let mut journal = Vec::new();
+    let receipt = engine
+        .transact(
+            Command::CheckpointRecovery {
+                boot: target.boot(),
+                journal: target.journal(),
+                device: target.device(),
+            },
+            |record| {
+                journal.extend_from_slice(record.bytes());
+                Ok::<(), ()>(())
+            },
+        )
+        .unwrap();
+    assert_eq!(engine.freshness(), target);
+
+    // The durable record retains `committed` in its envelope, while the
+    // trusted anchor has advanced to the command's resulting freshness.
+    let report = recover(
+        &journal,
+        target,
+        freshness(3, 1, 1, 3),
+        receipt.revision(),
+        receipt.head(),
+        receipt.projection(),
+    )
+    .expect("a sole CheckpointRecovery record must cold-reopen");
+    assert_eq!(report.acknowledged_revision(), receipt.revision());
+    assert_eq!(report.acknowledged_head(), receipt.head());
+    assert_eq!(report.into_engine().freshness(), target);
+}
+
+#[test]
 fn genesis_anchor_does_not_interpret_an_unanchored_old_journal_prefix() {
     let committed = freshness(1, 1, 1, 1);
     let target = freshness(2, 1, 1, 2);
