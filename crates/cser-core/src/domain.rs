@@ -762,7 +762,12 @@ impl SingleHopHandoffRule {
 pub struct FreshnessAxes(u8);
 
 impl FreshnessAxes {
-    const NONE: Self = Self(0);
+    /// No freshness coordinate is required to advance strictly.
+    ///
+    /// This is useful for evidence which must match the exact enrolled and
+    /// active coordinates but does not itself advance a generation, such as
+    /// an exact request completion or a DMA-unmap acknowledgement.
+    pub const NONE: Self = Self(0);
     /// Evidence must match the active boot.
     pub const BOOT: Self = Self(1 << 0);
     /// Evidence must match the Registry instance.
