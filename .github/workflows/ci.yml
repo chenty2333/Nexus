@@ -23,5 +23,5 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Run quick gate
+      - name: Run quick tests
         run: ./x test --quick
