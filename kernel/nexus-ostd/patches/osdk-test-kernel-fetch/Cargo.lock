@@ -794,3 +794,7 @@ dependencies = [
  "quote",
  "syn 2.0.119",
 ]
+
+[[patch.unused]]
+name = "virtio-drivers"
+version = "0.13.0"
