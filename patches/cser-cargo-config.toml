@@ -1,9 +1,3 @@
-paths = [
-    "/opt/nexus-x86_64/x86_64-0.14.13",
-    "/opt/nexus-unwinding/unwinding-0.2.8",
-]
-
 [patch.crates-io]
-ostd = { path = "/opt/nexus-ostd/ostd-0.18.0" }
-spin = { path = "/opt/nexus-spin/spin-0.9.8" }
+ostd = { path = "/opt/nexus-ostd/ostd-0.18.1" }
 virtio-drivers = { path = "/opt/nexus-virtio/virtio-drivers-0.13.0" }

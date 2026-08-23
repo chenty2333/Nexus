@@ -493,7 +493,7 @@ impl BootVirtioIsrEmptyReceipt {
 
 /// Typed completed global-IOTLB observation for one exact replayed claim.
 ///
-/// The global invalidation is supplied by the audited OSTD 0.18 CSER patch.
+/// The global invalidation is supplied by the audited OSTD 0.18.1 CSER patch.
 /// This receipt is not sufficient to retire or reuse the replayed resource:
 /// the current journal has no exact PFN/IOVA extent and this crate owns no
 /// crash-persistent DMA arena. A recovery adapter must combine it with an
@@ -540,7 +540,7 @@ impl BootGlobalIotlbInvalidationReceipt {
         true
     }
 
-    /// OSTD 0.18 installs one shared second-stage table for every PCI requester.
+    /// OSTD 0.18.1 installs one shared second-stage table for every PCI requester.
     ///
     /// This is a pinned source contract, not an independently sampled runtime
     /// root-table identity.

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! Safe facade for Nexus's OSTD 0.18.0 VirtIO block ownership substrate.
+//! Safe facade for Nexus's OSTD 0.18.1 VirtIO block ownership substrate.
 //!
 //! The public API contains no raw pointer, unsafe function, raw PCI root, or
 //! copyable hardware owner. All unsafe operations are confined to the four

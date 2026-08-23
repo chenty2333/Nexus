@@ -128,9 +128,9 @@ couple the returned hardware plans to Registry apply. The unregistered path is
 only for the failure-atomic window where the adapter independently proves under
 its Registry transition gate that cohort installation never happened.
 
-The implementation is pinned to `ostd = 0.18.0` and
+The implementation is pinned to `ostd = 0.18.1` and
 `virtio-drivers = 0.13.0`. Complete DMA closure additionally requires the
-repository-wide audited OSTD patch at `patches/ostd-0.18.0-cser.patch`. Split
+repository-wide audited OSTD patch at `patches/ostd-0.18.1-cser.patch`. Split
 preparation/publication additionally requires the canonical MIT
 `patches/virtio-drivers-0.13.0-cser.patch` overlay (SHA-256
 `7576d6810af8ff4a2d4cbcd0dc02373946031aa2e3f7ae0528b0127b5ea33762`).

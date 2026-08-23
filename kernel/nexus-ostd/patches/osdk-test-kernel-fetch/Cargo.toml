@@ -7,4 +7,4 @@ publish = false
 [workspace]
 
 [dependencies]
-osdk-test-kernel = "=0.18.0"
+osdk-test-kernel = "=0.18.1"

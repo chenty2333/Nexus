@@ -329,7 +329,7 @@ fn kernel_checks(root: &Path, image: &Image) -> Result<()> {
             root,
             image,
             &format!(
-                "cd /work && cargo --config 'paths = [\"/opt/nexus-x86_64/x86_64-0.14.13\", \"/opt/nexus-unwinding/unwinding-0.2.8\"]' check --locked --offline --target x86_64-unknown-none --no-default-features --features {feature}"
+                "cd /work && cargo check --locked --offline --target x86_64-unknown-none --no-default-features --features {feature}"
             ),
             false,
         )?;

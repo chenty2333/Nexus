@@ -64,7 +64,7 @@ index 3a60ef4..3d93be4 100644
  }
 
 +/// A queued-invalidation descriptor that invalidates every cached I/O
-+/// translation.  OSTD 0.18 currently installs one shared second-stage page
++/// translation.  OSTD 0.18.1 currently installs one shared second-stage page
 +/// table in domain zero, so the Stage 5A patch deliberately uses global
 +/// granularity rather than manufacturing a per-device/domain identity.
 +pub struct Iotlb(pub u128);
@@ -725,7 +725,7 @@ index bda5ce2..aa5fc2b 100644
 +    /// Waits for controller-pending and in-flight callbacks, including the
 +    /// controller acknowledgement after each callback, to finish.
 +    ///
-+    /// OSTD 0.18 exposes no IOAPIC/LAPIC/IRTE pending-delivery drain. Callers
++    /// OSTD 0.18.1 exposes no IOAPIC/LAPIC/IRTE pending-delivery drain. Callers
 +    /// must retain callback and request ownership when this returns
 +    /// [`IrqPendingSynchronizationError::Unsupported`].
 +    pub fn synchronize_pending_callbacks(

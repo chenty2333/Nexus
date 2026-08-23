@@ -12,7 +12,7 @@ index 93a806d..03b99a4 100644
 +    poll_dma_unmap, prepare_dma, prepare_dma_at, split_daddr, unprepare_dma,
  };
 @@ -39,3 +39,44 @@ pub struct DmaCoherent {
-+/// Why an exact coherent DMA mapping could not be established.
++/// Why an exact coherent DMA mapping could not be established on OSTD 0.18.1.
 +#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 +pub enum ExactDmaMapFailure {
 +    /// The caller-supplied segment cannot use its ordinary coherent linear

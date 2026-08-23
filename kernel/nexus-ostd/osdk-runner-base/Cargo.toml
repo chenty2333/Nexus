@@ -10,13 +10,13 @@ path = "/work"
 default-features = false
 
 [dependencies.osdk-frame-allocator]
-version = "0.18.0"
+version = "=0.18.1"
 
 [dependencies.osdk-heap-allocator]
-version = "0.18.0"
+version = "=0.18.1"
 
 [dependencies.ostd]
-version = "0.18.0"
+version = "=0.18.1"
 
 [features]
 cser-core-dma-recovery = ["nexus-kernel/cser-core-dma-recovery"]
