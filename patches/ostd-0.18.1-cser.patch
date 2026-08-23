@@ -1373,8 +1373,14 @@ index 6289955..3729e60 100644
 diff --git a/src/arch/x86/cpu/context/mod.rs b/src/arch/x86/cpu/context/mod.rs
 --- a/src/arch/x86/cpu/context/mod.rs
 +++ b/src/arch/x86/cpu/context/mod.rs
-@@ -354,0 +355 @@ impl UserContextApiInternal for UserContext {
+@@ -351,6 +351,7 @@ impl UserContextApiInternal for UserContext {
+                         &HwIrqLine::new(self.as_trap_frame().trap_num as u8),
+                         PrivilegeLevel::User,
+                     );
 +                    crate::arch::timer::complete_irq(self.as_trap_frame().trap_num as u8);
+                     crate::arch::irq::enable_local();
+                 }
+             }
 diff --git a/src/arch/x86/timer/apic.rs b/src/arch/x86/timer/apic.rs
 --- a/src/arch/x86/timer/apic.rs
 +++ b/src/arch/x86/timer/apic.rs
@@ -1442,8 +1448,14 @@ diff --git a/src/arch/x86/timer/mod.rs b/src/arch/x86/timer/mod.rs
 diff --git a/src/arch/x86/trap/mod.rs b/src/arch/x86/trap/mod.rs
 --- a/src/arch/x86/trap/mod.rs
 +++ b/src/arch/x86/trap/mod.rs
-@@ -192,0 +193 @@ unsafe extern "sysv64" fn trap_handler(f: &mut TrapFrame) {
+@@ -197,6 +197,7 @@ unsafe extern "sysv64" fn trap_handler(f: &mut TrapFrame) {
+                 &HwIrqLine::new(f.trap_num as u8),
+                 PrivilegeLevel::Kernel,
+             );
 +            super::timer::complete_irq(f.trap_num as u8);
+         }
+     }
+ }
 diff --git a/src/sync/wait.rs b/src/sync/wait.rs
 --- a/src/sync/wait.rs
 +++ b/src/sync/wait.rs
@@ -1460,17 +1472,16 @@ diff --git a/src/sync/wait.rs b/src/sync/wait.rs
 diff --git a/src/task/mod.rs b/src/task/mod.rs
 --- a/src/task/mod.rs
 +++ b/src/task/mod.rs
-@@ -18 +18 @@ use core::{
+@@ -18 +18 @@
 -    sync::atomic::AtomicBool,
 +    sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
-@@ -39,0 +40,6 @@ static POST_SCHEDULE_HANDLER: Once<fn()> = Once::new();
+@@ -39,0 +40,13 @@
 +static POST_TASK_EXIT_HANDLER: Once<fn(&Task)> = Once::new();
 +
 +static FIRST_TASK_PRE_IRQ_HANDLER: Once<fn(&DisabledLocalIrqGuard)> = Once::new();
 +
 +static FIRST_TASK_ENTRY_HANDLER: Once<fn()> = Once::new();
 +
-@@ -41,0 +48,8 @@ static PRE_USER_RUN_HANDLER: Once<fn(&DisabledLocalIrqGuard)> = Once::new();
 +const TASK_LIFECYCLE_CREATED: u8 = 0;
 +const TASK_LIFECYCLE_STARTED: u8 = 1;
 +const TASK_LIFECYCLE_EXIT_DEQUEUED: u8 = 2;
@@ -1478,8 +1489,7 @@ diff --git a/src/task/mod.rs b/src/task/mod.rs
 +const TASK_LIFECYCLE_OBSERVATION_CLAIMED: u8 = 4;
 +const WAKE_GATE_CLOSED: usize = 1 << (usize::BITS - 1);
 +const WAKE_GATE_RESERVATION_MASK: usize = WAKE_GATE_CLOSED - 1;
-+
-@@ -51,0 +66,20 @@ pub fn inject_post_schedule_handler(handler: fn()) {
+@@ -49,0 +63,19 @@
 +/// Injects an observation handler for completed task exits.
 +///
 +/// The handler runs once for each task after the task has been dequeued for
@@ -1499,17 +1509,16 @@ diff --git a/src/task/mod.rs b/src/task/mod.rs
 +pub fn inject_first_task_entry_handler(handler: fn()) {
 +    FIRST_TASK_ENTRY_HANDLER.call_once(|| handler);
 +}
-+
-@@ -89,0 +124,6 @@ pub struct Task {
+@@ -72,0 +105,6 @@
 +    /// Monotonic task lifecycle used to reject replay and claim exit observation.
 +    exit_lifecycle: AtomicU8,
 +
 +    /// Closing bit plus the number of wake enqueues admitted before exit.
 +    wake_gate: AtomicUsize,
 +
-@@ -121,0 +162 @@ impl Task {
+@@ -104,0 +143 @@
 +        self.publish_started();
-@@ -133,0 +175,104 @@ impl Task {
+@@ -116,0 +156,104 @@
 +
 +    /// Returns whether the task has completed its terminal CPU switch-out.
 +    ///
@@ -1614,14 +1623,14 @@ diff --git a/src/task/mod.rs b/src/task/mod.rs
 +            )
 +            .is_ok()
 +    }
-@@ -198 +343,5 @@ impl TaskOptions {
+@@ -181 +324,5 @@
 -            unsafe { processor::after_switching_to() };
 +            unsafe { processor::after_switching_to(processor::SwitchTailKind::FirstTask) };
 +
 +            if let Some(handler) = FIRST_TASK_ENTRY_HANDLER.get() {
 +                handler();
 +            }
-@@ -245,0 +395,2 @@ impl TaskOptions {
+@@ -226,0 +374,2 @@
 +            exit_lifecycle: AtomicU8::new(TASK_LIFECYCLE_CREATED),
 +            wake_gate: AtomicUsize::new(0),
 diff --git a/src/task/processor.rs b/src/task/processor.rs
