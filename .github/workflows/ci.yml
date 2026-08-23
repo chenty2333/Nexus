@@ -15,8 +15,8 @@ permissions:
   contents: read
 
 jobs:
-  quick:
-    name: quick feedback
+  host:
+    name: host
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -24,11 +24,14 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Verify current portable core, oracle, and host checks
-        run: ./x test --quick
+      - name: Check Nexus
+        run: cargo nexus check
+      - name: Test Nexus
+        run: cargo nexus test
 
-  verify:
-    name: CSER production recovery verification
+  seal:
+    name: system seal
+    needs: host
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
@@ -36,29 +39,16 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Install TPM fixture tools
+      - name: Install host TPM tools
         run: |
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends swtpm tpm2-tools xxd
-          swtpm --version
-          tpm2_nvdefine --version
-      - name: Seal guest reply/DMA evidence and four-boot production recovery
-        env:
-          NEXUS_REBUILD: "1"
-        run: ./x verify
-      - name: Upload combined CSER production recovery evidence
+          sudo apt-get install --yes --no-install-recommends swtpm tpm2-tools
+      - name: Seal Nexus
+        run: cargo nexus seal
+      - name: Upload sanitized receipt
         if: success()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: nexus-cser-production-${{ github.run_attempt }}
+          name: nexus-public-receipt
           if-no-files-found: error
-          path: kernel/nexus-ostd/artifacts/cser-production
-      - name: Upload failure evidence
-        if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: nexus-cser-production-failure-${{ github.run_attempt }}
-          if-no-files-found: ignore
-          include-hidden-files: true
-          path: |
-            kernel/nexus-ostd/artifacts/cser-production
+          path: target/nexus/public

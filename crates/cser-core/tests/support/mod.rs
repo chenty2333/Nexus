@@ -35,7 +35,9 @@ pub struct TestReceipt {
     pub resource: ResourceId,
     pub resource_generation: ResourceGeneration,
     pub subject: Freshness,
+    pub subject_binding: cser_core::ExecutorBinding,
     pub observation: Freshness,
+    pub observation_binding: cser_core::ExecutorBinding,
     pub digest: Digest,
 }
 
@@ -71,13 +73,17 @@ impl ReceiptVerifier for ExactTestVerifier {
             || receipt.resource != challenge.resource()
             || receipt.resource_generation != challenge.resource_generation()
             || receipt.subject != challenge.subject()
+            || receipt.subject_binding != challenge.subject_binding()
+            || receipt.observation_binding != challenge.current_binding()
             || receipt.digest.is_zero()
         {
             return Err(VerificationError::Rejected);
         }
-        Ok(VerifiedObservation::new(
+        Ok(VerifiedObservation::new_bound(
             receipt.subject,
+            receipt.subject_binding,
             receipt.observation,
+            receipt.observation_binding,
             receipt.digest,
         ))
     }
@@ -358,7 +364,9 @@ pub fn verified_evidence_command(
         resource: challenge.resource(),
         resource_generation: challenge.resource_generation(),
         subject: challenge.subject(),
+        subject_binding: challenge.subject_binding(),
         observation,
+        observation_binding: challenge.current_binding(),
         digest: receipt_digest,
     };
     harness

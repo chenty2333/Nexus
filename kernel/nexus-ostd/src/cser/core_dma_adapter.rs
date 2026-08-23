@@ -23,8 +23,8 @@ use cser_core::{
     DEVICE_EVIDENCE_IRQ_DRAINED, DEVICE_EVIDENCE_RESET, DEVICE_OBLIGATION_DMA,
     DEVICE_RECEIPT_SCHEMA, DEVICE_VERIFIER, DeviceGeneration, DeviceScopeId, Digest,
     EffectFactChallenge, EffectFactKind, EffectReceiptVerifier, Engine, EvidenceChallenge,
-    EvidenceKindId, ExecutorCoordinate, ExternalOutcome, ReceiptSchemaId, ReceiptVerifier,
-    ResourceGeneration, ResourceId, VerificationError, VerifiedEffectObservation,
+    EvidenceKindId, ExecutorBinding, ExecutorCoordinate, ExternalOutcome, ReceiptSchemaId,
+    ReceiptVerifier, ResourceGeneration, ResourceId, VerificationError, VerifiedEffectObservation,
     VerifiedObservation, VerifierBinding, VerifierGeneration, VerifierIdentity,
 };
 #[cfg(not(feature = "cser-production"))]
@@ -602,7 +602,18 @@ pub(crate) struct RetirementObservation {
     successor_generation: u64,
     completed_pages: usize,
     irq_queue_observed: bool,
+    subject_binding: ExecutorBinding,
+    current_binding: ExecutorBinding,
     digest: Digest,
+}
+
+/// Exact executor authorities which the physical receipt is bound to before
+/// the DMA action occurs.  Retaining these in the receipt prevents a later
+/// executor replacement from rebasing already-observed hardware evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DmaReceiptBindings {
+    subject: ExecutorBinding,
+    current: ExecutorBinding,
 }
 
 #[derive(Clone, Copy)]
@@ -692,6 +703,8 @@ impl ReceiptVerifier for CoreRetirementVerifier {
             || challenge.resource() != claim.resource
             || challenge.resource_generation() != claim.generation
             || challenge.subject().device().get() != old_generation
+            || receipt.subject_binding != challenge.subject_binding()
+            || receipt.current_binding != challenge.current_binding()
             || receipt.component != self.cohort.component
             || receipt.hardware != self.cohort.hardware
             || old_generation.checked_add(1) != Some(receipt.successor_generation)
@@ -708,9 +721,11 @@ impl ReceiptVerifier for CoreRetirementVerifier {
         }
         let successor = DeviceGeneration::new(receipt.successor_generation)
             .map_err(|_| VerificationError::Rejected)?;
-        Ok(VerifiedObservation::new(
+        Ok(VerifiedObservation::new_bound(
             challenge.subject(),
+            receipt.subject_binding,
             challenge.current_observation().with_device(successor),
+            receipt.current_binding,
             receipt.digest,
         ))
     }
@@ -973,6 +988,7 @@ pub(crate) fn apply_real_reset_generation(
     device: &mut ProductionDevice,
     mut reset: ProductionResetAck,
     cohort: CoreDmaCohort,
+    bindings: DmaReceiptBindings,
 ) -> Result<CoreResetEvidence, CoreResetEvidenceFailure> {
     if reset.identity() != cohort.hardware || reset.retained_dma_pages() != 3 {
         return Err(CoreResetEvidenceFailure {
@@ -997,6 +1013,7 @@ pub(crate) fn apply_real_reset_generation(
         attempt.sequence(),
         next,
         reset.retained_dma_pages(),
+        bindings,
     );
     Ok(CoreResetEvidence { reset, observation })
 }
@@ -1118,6 +1135,7 @@ pub(crate) fn apply_real_iotlb_closure(
     device: &mut ProductionDevice,
     mut closure: ProductionClosureReceipt,
     cohort: CoreDmaCohort,
+    bindings: DmaReceiptBindings,
 ) -> Result<CoreIotlbEvidence, CoreIotlbEvidenceFailure> {
     if closure.identity() != cohort.hardware || closure.completed_pages() != 3 {
         return Err(CoreIotlbEvidenceFailure {
@@ -1159,6 +1177,7 @@ pub(crate) fn apply_real_iotlb_closure(
         attempt.sequence(),
         successor_generation,
         completed_pages,
+        bindings,
     );
     Ok(CoreIotlbEvidence {
         closure,
@@ -1214,6 +1233,38 @@ fn verify_retirement(
         .map(|evidence| evidence.submit())
 }
 
+/// Snapshots the exact claim bindings before a physical receipt is produced.
+/// The caller must retain the returned values with that receipt; the verifier
+/// subsequently compares them with its fresh challenge rather than rebasing
+/// them from it.
+pub(crate) fn bind_retirement_receipt(
+    engine: &Engine,
+    cohort: CoreDmaCohort,
+    role: ClaimRole,
+    kind: EvidenceKindId,
+) -> Result<DmaReceiptBindings, CoreError> {
+    let claim = cohort.claim(role);
+    let challenge =
+        engine.component_evidence_challenge(cohort.effect, cohort.component, claim.claim, kind)?;
+    if challenge.effect() != cohort.effect
+        || challenge.component() != cohort.component
+        || challenge.claim() != claim.claim
+        || challenge.domain() != DEVICE_DOMAIN
+        || challenge.kind() != kind
+        || challenge.scope() != ClaimScope::Device(cohort.scope)
+        || challenge.resource() != claim.resource
+        || challenge.resource_generation() != claim.generation
+        || challenge.subject().device().get() != cohort.hardware.device_generation()
+        || !dma_evidence_scope_matches(&challenge, DEVICE_RECEIPT_SCHEMA)
+    {
+        return Err(CoreError::VerificationFailed);
+    }
+    Ok(DmaReceiptBindings {
+        subject: challenge.subject_binding(),
+        current: challenge.current_binding(),
+    })
+}
+
 fn evidence_was_accepted(
     engine: &Engine,
     cohort: CoreDmaCohort,
@@ -1256,6 +1307,7 @@ fn retirement_observation(
     attempt_sequence: u64,
     successor_generation: u64,
     completed_pages: usize,
+    bindings: DmaReceiptBindings,
 ) -> RetirementObservation {
     let mut observation = RetirementObservation {
         event,
@@ -1266,6 +1318,8 @@ fn retirement_observation(
         successor_generation,
         completed_pages,
         irq_queue_observed: false,
+        subject_binding: bindings.subject,
+        current_binding: bindings.current,
         digest: Digest::ZERO,
     };
     observation.digest = retirement_digest(&observation);
@@ -1311,7 +1365,7 @@ fn hash_queue_binding(hasher: &mut Sha256, binding: QueueCommitBinding) {
 
 fn retirement_digest(observation: &RetirementObservation) -> Digest {
     let mut hasher = Sha256::new();
-    hasher.update(b"nexus.ostd.cser-core.dma.retirement.v2");
+    hasher.update(b"nexus.ostd.cser-core.dma.retirement.v3");
     hasher.update([observation.event.tag()]);
     hasher.update([match observation.event.role() {
         ClaimRole::Queue => 1,
@@ -1325,7 +1379,16 @@ fn retirement_digest(observation: &RetirementObservation) -> Digest {
     hasher.update(observation.successor_generation.to_le_bytes());
     hasher.update((observation.completed_pages as u64).to_le_bytes());
     hasher.update([u8::from(observation.irq_queue_observed)]);
+    hash_executor_binding(&mut hasher, observation.subject_binding);
+    hash_executor_binding(&mut hasher, observation.current_binding);
     Digest::new(hasher.finalize().into())
+}
+
+fn hash_executor_binding(hasher: &mut Sha256, binding: ExecutorBinding) {
+    let executor = binding.executor();
+    hasher.update(executor.executor().get().to_le_bytes());
+    hasher.update(executor.generation().get().to_le_bytes());
+    hasher.update(binding.authority_epoch().to_le_bytes());
 }
 
 fn hash_component(hasher: &mut Sha256, component: ComponentId) {
@@ -1349,9 +1412,10 @@ mod tests {
     use cser_core::{
         AGENT_COMPONENT_DMA, AGENT_COMPONENT_REPLY, AGENT_OPERATION_COMPOSITE, BootGeneration,
         CatalogSet, ComponentCommitOperation, CoreLimits, DMA_ARENA_REUSE_COMPOSITE,
-        ExecutorCoordinate, ExecutorGeneration, ExecutorId, Freshness, JournalGeneration,
-        OperationId, REPLY_CLAIM_PUBLICATION_SLOT, RegistryInstance, SnapshotId, TransitionOutput,
-        TransitionReceipt, TxError, VerifierBinding, VerifierGeneration, WorldId, standard_catalog,
+        ExecutorBinding, ExecutorCoordinate, ExecutorGeneration, ExecutorId, Freshness,
+        JournalGeneration, OperationId, REPLY_CLAIM_PUBLICATION_SLOT, RegistryInstance, SnapshotId,
+        TransitionOutput, TransitionReceipt, TxError, VerifierBinding, VerifierGeneration, WorldId,
+        standard_catalog,
     };
     use ostd::prelude::ktest;
 
@@ -1526,6 +1590,11 @@ mod tests {
             12,
             2,
             3,
+            retirement_bindings(
+                &harness.engine,
+                cohort,
+                RetirementEvent::Reset(ClaimRole::Queue),
+            ),
         );
         let command = verify_retirement(&harness.engine, cohort, reset).unwrap();
         harness.tx(command).unwrap();
@@ -1566,8 +1635,19 @@ mod tests {
             );
         }
 
-        let reset =
-            retirement_observation(RetirementEvent::Reset(ClaimRole::Queue), cohort, 7, 9, 2, 3);
+        let reset = retirement_observation(
+            RetirementEvent::Reset(ClaimRole::Queue),
+            cohort,
+            7,
+            9,
+            2,
+            3,
+            retirement_bindings(
+                &harness.engine,
+                cohort,
+                RetirementEvent::Reset(ClaimRole::Queue),
+            ),
+        );
         for role in [ClaimRole::Queue, ClaimRole::PinnedPages, ClaimRole::Iova] {
             let mut receipt = reset;
             receipt.event = RetirementEvent::Reset(role);
@@ -1685,6 +1765,11 @@ mod tests {
             12,
             2,
             3,
+            retirement_bindings(
+                &harness.engine,
+                first,
+                RetirementEvent::Reset(ClaimRole::Queue),
+            ),
         );
         let command = verify_retirement(&harness.engine, first, reset).unwrap();
         harness.tx(command).unwrap();
@@ -1698,7 +1783,18 @@ mod tests {
             RetirementEvent::Iotlb(ClaimRole::PinnedPages),
             RetirementEvent::Iotlb(ClaimRole::Iova),
         ] {
-            let stale = retirement_observation(event, first, 11, 12, 2, 3);
+            let stale = retirement_observation(
+                event,
+                first,
+                11,
+                12,
+                2,
+                3,
+                DmaReceiptBindings {
+                    subject: reset.subject_binding,
+                    current: reset.current_binding,
+                },
+            );
             assert_eq!(
                 verify_retirement(&harness.engine, second, stale),
                 Err(CoreError::VerificationFailed)
@@ -1711,6 +1807,48 @@ mod tests {
                 second.claim(ClaimRole::Queue).generation,
             ),
             Err(CoreError::ResourceRetained)
+        );
+    }
+
+    #[ktest]
+    fn retirement_receipt_rejects_rebound_executor_authority() {
+        let mut harness = Harness::new();
+        let cohort = cohort(12, 1);
+        enroll_and_commit(&mut harness, cohort);
+        let event = RetirementEvent::Reset(ClaimRole::Queue);
+        let bindings = retirement_bindings(&harness.engine, cohort, event);
+        let receipt = retirement_observation(event, cohort, 11, 12, 2, 3, bindings);
+        let mut rebound = receipt;
+        rebound.current_binding = ExecutorBinding::new(
+            ExecutorCoordinate::new(
+                executor(12, 2).executor(),
+                ExecutorGeneration::new(2).unwrap(),
+            ),
+            receipt.current_binding.authority_epoch() + 1,
+        )
+        .unwrap();
+        rebound.digest = retirement_digest(&rebound);
+
+        assert_eq!(
+            verify_retirement(&harness.engine, cohort, rebound),
+            Err(CoreError::VerificationFailed)
+        );
+        let challenge = harness
+            .engine
+            .component_evidence_challenge(
+                cohort.effect,
+                cohort.component,
+                cohort.claim(ClaimRole::Queue).claim,
+                DEVICE_EVIDENCE_RESET,
+            )
+            .unwrap();
+        let verified = CoreRetirementVerifier { cohort }
+            .verify(&challenge, &receipt)
+            .unwrap();
+        assert_eq!(verified.subject_binding(), Some(receipt.subject_binding));
+        assert_eq!(
+            verified.observation_binding(),
+            Some(receipt.current_binding)
         );
     }
 
@@ -1863,6 +2001,15 @@ mod tests {
             .verify_commit_outcome(&intent, &verifier, &observation)
             .unwrap();
         harness.tx(intent.acknowledge(outcome).unwrap()).unwrap();
+    }
+
+    fn retirement_bindings(
+        engine: &Engine,
+        cohort: CoreDmaCohort,
+        event: RetirementEvent,
+    ) -> DmaReceiptBindings {
+        bind_retirement_receipt(engine, cohort, event.role(), event.kind())
+            .unwrap_or_else(|_| panic!("exact DMA evidence challenge binds receipt authority"))
     }
 
     fn enroll_and_intent(

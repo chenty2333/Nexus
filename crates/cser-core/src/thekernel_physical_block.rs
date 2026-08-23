@@ -336,8 +336,12 @@ pub struct BlockUsedCompletionReceipt {
     pub resource_generation: ResourceGeneration,
     /// Enrolled freshness subject named by the device receipt.
     pub subject: Freshness,
+    /// Exact executor authority under which the claim was enrolled.
+    pub subject_binding: crate::ExecutorBinding,
     /// Active freshness observation named by the device receipt.
     pub observation: Freshness,
+    /// Exact current executor authority named by the completion receipt.
+    pub observation_binding: crate::ExecutorBinding,
     /// Exact device generation carried by the completion tuple.
     pub device_generation: crate::DeviceGeneration,
     /// Queue identity which consumed the used entry.
@@ -452,7 +456,9 @@ impl BlockUsedCompletionVerifier {
             || receipt.resource != challenge.resource()
             || receipt.resource_generation != challenge.resource_generation()
             || receipt.subject != challenge.subject()
+            || receipt.subject_binding != challenge.subject_binding()
             || receipt.observation != challenge.current_observation()
+            || receipt.observation_binding != challenge.current_binding()
             || receipt.device_generation != challenge.subject().device()
             || receipt.device_generation != challenge.current_observation().device()
             || receipt.queue != self.queue
@@ -465,9 +471,11 @@ impl BlockUsedCompletionVerifier {
         {
             return Err(VerificationError::Rejected);
         }
-        Ok(VerifiedObservation::new(
+        Ok(VerifiedObservation::new_bound(
             receipt.subject,
+            receipt.subject_binding,
             receipt.observation,
+            receipt.observation_binding,
             receipt.digest,
         ))
     }

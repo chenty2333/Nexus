@@ -10,7 +10,7 @@
 
 use crate::{
     ComponentId, Digest, EffectId, OperationId, ProviderCoordinate, RecoveryArtifactId,
-    VerificationError, VerifierBinding, VerifierIdentity,
+    VerificationError, VerifierBinding,
 };
 
 /// Errors returned by the recovery-artifact lease protocol.
@@ -38,28 +38,88 @@ pub enum ArtifactProtocolError {
     ReleaseIdentityMismatch,
 }
 
+/// Stable identity of one configured artifact verifier engine.
+///
+/// A [`VerifierBinding`] identifies the verifier implementation admitted by
+/// the provider generation. The configuration digest additionally identifies
+/// the concrete key set, trust roots, policy, or engine configuration used to
+/// interpret artifact receipts. Both coordinates are required because two
+/// configured engines running the same implementation are not interchangeable
+/// proof authorities.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ArtifactVerifierIdentity {
+    verifier: VerifierBinding,
+    configuration_digest: Digest,
+}
+
+impl ArtifactVerifierIdentity {
+    /// Creates an exact configured artifact-verifier identity.
+    pub const fn new(
+        verifier: VerifierBinding,
+        configuration_digest: Digest,
+    ) -> Result<Self, ArtifactProtocolError> {
+        if configuration_digest.is_zero() {
+            return Err(ArtifactProtocolError::ZeroDigest);
+        }
+        Ok(Self {
+            verifier,
+            configuration_digest,
+        })
+    }
+
+    /// Returns the provider-bound verifier implementation identity.
+    pub const fn verifier_binding(self) -> VerifierBinding {
+        self.verifier
+    }
+
+    /// Returns the verifier class.
+    pub const fn verifier(self) -> crate::VerifierId {
+        self.verifier.verifier()
+    }
+
+    /// Returns the verifier generation.
+    pub const fn generation(self) -> crate::VerifierGeneration {
+        self.verifier.generation()
+    }
+
+    /// Returns the receipt schema.
+    pub const fn receipt_schema(self) -> crate::ReceiptSchemaId {
+        self.verifier.receipt_schema()
+    }
+
+    /// Returns the verifier implementation identity.
+    pub const fn implementation_digest(self) -> Digest {
+        self.verifier.implementation_digest()
+    }
+
+    /// Returns the stable configured-engine identity.
+    pub const fn configuration_digest(self) -> Digest {
+        self.configuration_digest
+    }
+}
+
 /// Exact verifier bindings used to authenticate pin and release receipts for
 /// one provider generation. Artifact storage and authentication remain an
 /// embedding concern; CSER only retains these immutable identities.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ArtifactReceiptBindings {
-    pin: VerifierBinding,
-    release: VerifierBinding,
+    pin: ArtifactVerifierIdentity,
+    release: ArtifactVerifierIdentity,
 }
 
 impl ArtifactReceiptBindings {
     /// Creates the exact pin/release verifier pair.
-    pub const fn new(pin: VerifierBinding, release: VerifierBinding) -> Self {
+    pub const fn new(pin: ArtifactVerifierIdentity, release: ArtifactVerifierIdentity) -> Self {
         Self { pin, release }
     }
 
     /// Returns the verifier binding required to authenticate a pin receipt.
-    pub const fn pin(self) -> VerifierBinding {
+    pub const fn pin(self) -> ArtifactVerifierIdentity {
         self.pin
     }
 
     /// Returns the verifier binding required to authenticate a release receipt.
-    pub const fn release(self) -> VerifierBinding {
+    pub const fn release(self) -> ArtifactVerifierIdentity {
         self.release
     }
 }
@@ -68,17 +128,17 @@ impl ArtifactReceiptBindings {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ArtifactPinChallenge {
     binding: ArtifactBinding,
-    expected_verifier_binding: VerifierBinding,
+    expected_receipts: ArtifactReceiptBindings,
 }
 
 impl ArtifactPinChallenge {
     pub(crate) const fn new(
         binding: ArtifactBinding,
-        expected_verifier_binding: VerifierBinding,
+        expected_receipts: ArtifactReceiptBindings,
     ) -> Self {
         Self {
             binding,
-            expected_verifier_binding,
+            expected_receipts,
         }
     }
 
@@ -88,8 +148,13 @@ impl ArtifactPinChallenge {
     }
 
     /// Returns the exact provider-bound verifier identity expected by Core.
-    pub const fn expected_verifier_binding(self) -> VerifierBinding {
-        self.expected_verifier_binding
+    pub const fn expected_verifier_identity(self) -> ArtifactVerifierIdentity {
+        self.expected_receipts.pin()
+    }
+
+    /// Returns both immutable receipt-verifier identities bound to the lease.
+    pub const fn expected_receipt_bindings(self) -> ArtifactReceiptBindings {
+        self.expected_receipts
     }
 }
 
@@ -100,7 +165,7 @@ pub struct ArtifactReleaseChallenge {
     pin_stamp: Digest,
     release_operation: OperationId,
     nonce: u64,
-    expected_verifier_binding: VerifierBinding,
+    expected_receipts: ArtifactReceiptBindings,
 }
 
 impl ArtifactReleaseChallenge {
@@ -109,14 +174,14 @@ impl ArtifactReleaseChallenge {
         pin_stamp: Digest,
         release_operation: OperationId,
         nonce: u64,
-        expected_verifier_binding: VerifierBinding,
+        expected_receipts: ArtifactReceiptBindings,
     ) -> Self {
         Self {
             binding,
             pin_stamp,
             release_operation,
             nonce,
-            expected_verifier_binding,
+            expected_receipts,
         }
     }
 
@@ -141,8 +206,13 @@ impl ArtifactReleaseChallenge {
     }
 
     /// Returns the exact provider-bound verifier identity expected by Core.
-    pub const fn expected_verifier_binding(self) -> VerifierBinding {
-        self.expected_verifier_binding
+    pub const fn expected_verifier_identity(self) -> ArtifactVerifierIdentity {
+        self.expected_receipts.release()
+    }
+
+    /// Returns both immutable receipt-verifier identities bound to the lease.
+    pub const fn expected_receipt_bindings(self) -> ArtifactReceiptBindings {
+        self.expected_receipts
     }
 }
 
@@ -152,7 +222,7 @@ pub trait ArtifactPinVerifier {
     type Receipt: ?Sized;
 
     /// Returns the configured verifier identity.
-    fn identity(&self) -> VerifierIdentity;
+    fn identity(&self) -> ArtifactVerifierIdentity;
 
     /// Verifies and canonicalizes one exact pin receipt.
     fn verify(
@@ -168,7 +238,7 @@ pub trait ArtifactReleaseVerifier {
     type Receipt: ?Sized;
 
     /// Returns the configured verifier identity.
-    fn identity(&self) -> VerifierIdentity;
+    fn identity(&self) -> ArtifactVerifierIdentity;
 
     /// Verifies and canonicalizes one exact release receipt.
     fn verify(
@@ -325,6 +395,8 @@ pub enum ArtifactLeaseState {
         binding: ArtifactBinding,
         /// Receipt stamp proving that the closure was pinned.
         pin_stamp: Digest,
+        /// Exact configured verifier engines which bracket this lease.
+        receipts: ArtifactReceiptBindings,
     },
     /// Release has been durably authorized but the artifact authority has not
     /// yet confirmed unpinning.
@@ -337,6 +409,8 @@ pub enum ArtifactLeaseState {
         release_operation: OperationId,
         /// Durable permit nonce; reissue must preserve this value.
         nonce: u64,
+        /// Exact configured verifier engines which bracket this lease.
+        receipts: ArtifactReceiptBindings,
     },
     /// The artifact authority has confirmed physical release.
     Released {
@@ -346,6 +420,8 @@ pub enum ArtifactLeaseState {
         pin_stamp: Digest,
         /// Receipt stamp proving that the closure was released.
         release_stamp: Digest,
+        /// Exact configured verifier engines which authenticated the lease.
+        receipts: ArtifactReceiptBindings,
     },
 }
 
@@ -354,19 +430,25 @@ impl ArtifactLeaseState {
     pub const fn pin(
         binding: ArtifactBinding,
         pin_stamp: Digest,
+        receipts: ArtifactReceiptBindings,
     ) -> Result<Self, ArtifactProtocolError> {
         if pin_stamp.is_zero() {
             return Err(ArtifactProtocolError::ZeroDigest);
         }
-        Ok(Self::Pinned { binding, pin_stamp })
+        Ok(Self::Pinned {
+            binding,
+            pin_stamp,
+            receipts,
+        })
     }
 
     /// Alias for [`ArtifactLeaseState::pin`] emphasizing the resulting state.
     pub const fn pinned(
         binding: ArtifactBinding,
         pin_stamp: Digest,
+        receipts: ArtifactReceiptBindings,
     ) -> Result<Self, ArtifactProtocolError> {
-        Self::pin(binding, pin_stamp)
+        Self::pin(binding, pin_stamp, receipts)
     }
 
     /// Returns the exact binding retained by this lease.
@@ -384,6 +466,15 @@ impl ArtifactLeaseState {
             Self::Pinned { pin_stamp, .. }
             | Self::ReleaseAuthorized { pin_stamp, .. }
             | Self::Released { pin_stamp, .. } => *pin_stamp,
+        }
+    }
+
+    /// Returns the configured pin/release verifier identities retained by the lease.
+    pub const fn receipt_bindings(&self) -> ArtifactReceiptBindings {
+        match self {
+            Self::Pinned { receipts, .. }
+            | Self::ReleaseAuthorized { receipts, .. }
+            | Self::Released { receipts, .. } => *receipts,
         }
     }
 
@@ -424,7 +515,11 @@ impl ArtifactLeaseState {
         nonce: u64,
     ) -> Result<(Self, ArtifactReleasePermit), ArtifactProtocolError> {
         match self {
-            Self::Pinned { binding, pin_stamp } => {
+            Self::Pinned {
+                binding,
+                pin_stamp,
+                receipts,
+            } => {
                 if nonce == 0 {
                     return Err(ArtifactProtocolError::ZeroNonce);
                 }
@@ -433,6 +528,7 @@ impl ArtifactLeaseState {
                     pin_stamp,
                     release_operation,
                     nonce,
+                    receipts,
                 };
                 Ok((
                     Self::ReleaseAuthorized {
@@ -440,6 +536,7 @@ impl ArtifactLeaseState {
                         pin_stamp,
                         release_operation,
                         nonce,
+                        receipts,
                     },
                     permit,
                 ))
@@ -461,11 +558,13 @@ impl ArtifactLeaseState {
                 pin_stamp,
                 release_operation,
                 nonce,
+                receipts,
             } => Ok(ArtifactReleasePermit {
                 binding: *binding,
                 pin_stamp: *pin_stamp,
                 release_operation: *release_operation,
                 nonce: *nonce,
+                receipts: *receipts,
             }),
             Self::Pinned { .. } => Err(ArtifactProtocolError::ReleaseNotAuthorized),
             Self::Released { .. } => Err(ArtifactProtocolError::AlreadyReleased),
@@ -491,6 +590,7 @@ impl ArtifactLeaseState {
                 pin_stamp,
                 release_operation,
                 nonce,
+                receipts,
             } => {
                 if permit.binding != binding {
                     return Err(ArtifactProtocolError::BindingMismatch);
@@ -501,6 +601,9 @@ impl ArtifactLeaseState {
                 if permit.release_operation != release_operation || permit.nonce != nonce {
                     return Err(ArtifactProtocolError::ReleaseIdentityMismatch);
                 }
+                if permit.receipts != receipts {
+                    return Err(ArtifactProtocolError::BindingMismatch);
+                }
                 if release_stamp.is_zero() {
                     return Err(ArtifactProtocolError::ZeroDigest);
                 }
@@ -508,6 +611,7 @@ impl ArtifactLeaseState {
                     binding,
                     pin_stamp,
                     release_stamp,
+                    receipts,
                 })
             }
         }
@@ -528,6 +632,7 @@ pub struct ArtifactReleasePermit {
     pin_stamp: Digest,
     release_operation: OperationId,
     nonce: u64,
+    receipts: ArtifactReceiptBindings,
 }
 
 impl ArtifactReleasePermit {
@@ -536,12 +641,14 @@ impl ArtifactReleasePermit {
         pin_stamp: Digest,
         release_operation: OperationId,
         nonce: u64,
+        receipts: ArtifactReceiptBindings,
     ) -> Self {
         Self {
             binding,
             pin_stamp,
             release_operation,
             nonce,
+            receipts,
         }
     }
 
@@ -565,23 +672,41 @@ impl ArtifactReleasePermit {
         self.nonce
     }
 
+    /// Returns the exact configured artifact-verifier identities.
+    pub const fn receipt_bindings(&self) -> ArtifactReceiptBindings {
+        self.receipts
+    }
+
     /// Returns the complete permit tuple in canonical comparison order.
-    pub const fn exact_tuple(&self) -> (ArtifactBinding, Digest, OperationId, u64) {
+    pub const fn exact_tuple(
+        &self,
+    ) -> (
+        ArtifactBinding,
+        Digest,
+        OperationId,
+        u64,
+        ArtifactReceiptBindings,
+    ) {
         (
             self.binding,
             self.pin_stamp,
             self.release_operation,
             self.nonce,
+            self.receipts,
         )
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ArtifactBinding, ArtifactLeaseState, ArtifactProtocolError};
+    use super::{
+        ArtifactBinding, ArtifactLeaseState, ArtifactProtocolError, ArtifactReceiptBindings,
+        ArtifactVerifierIdentity,
+    };
     use crate::{
         ComponentId, Digest, EffectId, OperationId, ProviderCoordinate, ProviderGeneration,
-        ProviderId, RecoveryArtifactId, WorldId,
+        ProviderId, ReceiptSchemaId, RecoveryArtifactId, VerifierBinding, VerifierGeneration,
+        VerifierId, WorldId,
     };
 
     fn id<T>(result: Result<T, crate::IdentityError>) -> T {
@@ -608,13 +733,31 @@ mod tests {
     }
 
     fn pinned() -> ArtifactLeaseState {
-        ArtifactLeaseState::pin(binding(1), Digest::new([10; 32])).expect("pin succeeds")
+        ArtifactLeaseState::pin(binding(1), Digest::new([10; 32]), receipts())
+            .expect("pin succeeds")
+    }
+
+    fn receipts() -> ArtifactReceiptBindings {
+        let verifier = |value, digest| {
+            ArtifactVerifierIdentity::new(
+                VerifierBinding::new(
+                    id(VerifierId::new(value)),
+                    id(VerifierGeneration::new(1)),
+                    id(ReceiptSchemaId::new(value)),
+                    Digest::new([digest; 32]),
+                )
+                .unwrap(),
+                Digest::new([digest.wrapping_add(1); 32]),
+            )
+            .unwrap()
+        };
+        ArtifactReceiptBindings::new(verifier(21, 21), verifier(22, 23))
     }
 
     #[test]
     fn pin_requires_non_zero_stamp_and_release_follows_pin() {
         assert_eq!(
-            ArtifactLeaseState::pin(binding(1), Digest::ZERO),
+            ArtifactLeaseState::pin(binding(1), Digest::ZERO, receipts()),
             Err(ArtifactProtocolError::ZeroDigest)
         );
         assert_eq!(
@@ -639,10 +782,11 @@ mod tests {
             .authorize_release(id(OperationId::new(11)), 12)
             .expect("authorization succeeds");
 
-        let (_, foreign_permit) = ArtifactLeaseState::pin(binding(20), Digest::new([10; 32]))
-            .expect("foreign pin succeeds")
-            .authorize_release(id(OperationId::new(11)), 12)
-            .expect("foreign authorization succeeds");
+        let (_, foreign_permit) =
+            ArtifactLeaseState::pin(binding(20), Digest::new([10; 32]), receipts())
+                .expect("foreign pin succeeds")
+                .authorize_release(id(OperationId::new(11)), 12)
+                .expect("foreign authorization succeeds");
         assert_eq!(
             authorized.confirm_release(foreign_permit, Digest::new([13; 32])),
             Err(ArtifactProtocolError::BindingMismatch)
@@ -651,10 +795,11 @@ mod tests {
         let (authorized, permit) = pinned()
             .authorize_release(id(OperationId::new(11)), 12)
             .expect("authorization succeeds");
-        let (_, new_identity) = ArtifactLeaseState::pin(binding(1), Digest::new([10; 32]))
-            .expect("pin succeeds")
-            .authorize_release(id(OperationId::new(14)), 15)
-            .expect("new identity can exist on another lease");
+        let (_, new_identity) =
+            ArtifactLeaseState::pin(binding(1), Digest::new([10; 32]), receipts())
+                .expect("pin succeeds")
+                .authorize_release(id(OperationId::new(14)), 15)
+                .expect("new identity can exist on another lease");
         assert_eq!(
             authorized.confirm_release(new_identity, Digest::new([13; 32])),
             Err(ArtifactProtocolError::ReleaseIdentityMismatch)

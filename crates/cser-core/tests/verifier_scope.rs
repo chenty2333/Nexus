@@ -119,9 +119,11 @@ impl ReceiptVerifier for ScopeVerifier {
         if challenge.verification_scope() != self.expected_scope {
             return Err(VerificationError::Rejected);
         }
-        Ok(VerifiedObservation::new(
+        Ok(VerifiedObservation::new_bound(
             challenge.subject(),
+            challenge.subject_binding(),
             challenge.current_observation(),
+            challenge.current_binding(),
             Digest::new([0xa5; 32]),
         ))
     }

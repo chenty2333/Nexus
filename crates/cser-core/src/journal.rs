@@ -16,10 +16,10 @@ use crate::recovery_source::{
 };
 
 /// Magic prefix of every CSER journal record.
-pub const JOURNAL_MAGIC: [u8; 8] = *b"CSERJ10\0";
+pub const JOURNAL_MAGIC: [u8; 8] = *b"CSERJ12\0";
 /// Frozen journal schema for the current CSER Core semantic API profile.
-pub const JOURNAL_SCHEMA_VERSION: u16 = 10;
-/// Semantic core API profile explicitly bound in every schema-10 envelope.
+pub const JOURNAL_SCHEMA_VERSION: u16 = 12;
+/// Semantic core API profile explicitly bound in every schema-11 envelope.
 pub const JOURNAL_CORE_API_PROFILE: u16 = CSER_CORE_API_PROFILE_VERSION;
 
 /// Magic prefix of a portable exact-replay checkpoint envelope.
@@ -27,18 +27,18 @@ pub const JOURNAL_CORE_API_PROFILE: u16 = CSER_CORE_API_PROFILE_VERSION;
 /// This is deliberately distinct from a journal record. A checkpoint carries
 /// a canonical *image* of the exact journal prefix it replaces; it is not a
 /// lossy serialization of the private engine state.
-pub const JOURNAL_CHECKPOINT_MAGIC: [u8; 8] = *b"CSERCP3\0";
+pub const JOURNAL_CHECKPOINT_MAGIC: [u8; 8] = *b"CSERCP5\0";
 /// Version of [`JournalCheckpoint`] envelopes.
-pub const JOURNAL_CHECKPOINT_VERSION: u16 = 3;
-const PREVIOUS_CHECKPOINT_MAGIC: [u8; 8] = *b"CSERCP2\0";
+pub const JOURNAL_CHECKPOINT_VERSION: u16 = 5;
+const PREVIOUS_CHECKPOINT_MAGIC: [u8; 8] = *b"CSERCP4\0";
 const LEGACY_CHECKPOINT_MAGIC: [u8; 8] = *b"CSERCP1\0";
 
 const PRE_HANDOFF_RESOLUTION_JOURNAL_MAGIC: [u8; 8] = *b"CSERJR7\0";
 const PRE_HANDOFF_RESOLUTION_JOURNAL_SCHEMA_VERSION: u16 = 7;
-const PREVIOUS_JOURNAL_MAGIC: [u8; 8] = *b"CSERJR9\0";
-const PREVIOUS_JOURNAL_SCHEMA_VERSION: u16 = 9;
-const PREVIOUS_PREVIOUS_JOURNAL_MAGIC: [u8; 8] = *b"CSERJR8\0";
-const PREVIOUS_PREVIOUS_JOURNAL_SCHEMA_VERSION: u16 = 8;
+const PREVIOUS_JOURNAL_MAGIC: [u8; 8] = *b"CSERJ11\0";
+const PREVIOUS_JOURNAL_SCHEMA_VERSION: u16 = 11;
+const PREVIOUS_PREVIOUS_JOURNAL_MAGIC: [u8; 8] = *b"CSERJR9\0";
+const PREVIOUS_PREVIOUS_JOURNAL_SCHEMA_VERSION: u16 = 9;
 const PROFILE_ONE_JOURNAL_MAGIC: [u8; 8] = *b"CSERJR5\0";
 const PROFILE_ONE_JOURNAL_SCHEMA_VERSION: u16 = 5;
 const LEGACY_JOURNAL_MAGIC: [u8; 8] = *b"CSERJR4\0";
@@ -46,12 +46,12 @@ const LEGACY_JOURNAL_SCHEMA_VERSION: u16 = 4;
 
 // prefix + revisions + profile + world + catalog + registry +
 // freshness axes + base projection + predecessor + payload length.
-/// Fixed prefix length of a schema-10 journal record, excluding its digest.
+/// Fixed prefix length of the current journal record, excluding its digest.
 ///
 /// The streaming checkpoint plan uses this exact envelope width instead of a
 /// second checkpoint-specific wire grammar.
 pub(crate) const JOURNAL_RECORD_FIXED_WITHOUT_DIGEST: usize = 180;
-/// Width of the schema-10 record digest.
+/// Width of the current record digest.
 pub(crate) const JOURNAL_RECORD_DIGEST_LEN: usize = 32;
 const FIXED_WITHOUT_DIGEST: usize = JOURNAL_RECORD_FIXED_WITHOUT_DIGEST;
 const DIGEST_LEN: usize = JOURNAL_RECORD_DIGEST_LEN;
@@ -217,7 +217,7 @@ impl JournalCheckpoint {
     pub fn decode(bytes: &[u8]) -> Result<Self, JournalCheckpointDecodeError> {
         if bytes.len() >= PREVIOUS_CHECKPOINT_MAGIC.len() && bytes[..8] == PREVIOUS_CHECKPOINT_MAGIC
         {
-            return Err(JournalCheckpointDecodeError::UnsupportedVersion { version: 2 });
+            return Err(JournalCheckpointDecodeError::UnsupportedVersion { version: 4 });
         }
         if bytes.len() >= LEGACY_CHECKPOINT_MAGIC.len() && bytes[..8] == LEGACY_CHECKPOINT_MAGIC {
             return Err(JournalCheckpointDecodeError::UnsupportedVersion { version: 1 });
@@ -1773,8 +1773,9 @@ pub(crate) fn recognized_legacy_journal_version(bytes: &[u8]) -> Option<u16> {
         return None;
     }
     match &bytes[..JOURNAL_MAGIC.len()] {
-        b"CSERJR9\0" => Some(PREVIOUS_JOURNAL_SCHEMA_VERSION),
-        b"CSERJR8\0" => Some(PREVIOUS_PREVIOUS_JOURNAL_SCHEMA_VERSION),
+        b"CSERJ11\0" => Some(PREVIOUS_JOURNAL_SCHEMA_VERSION),
+        b"CSERJR9\0" => Some(PREVIOUS_PREVIOUS_JOURNAL_SCHEMA_VERSION),
+        b"CSERJR8\0" => Some(8),
         b"CSERJR7\0" => Some(PRE_HANDOFF_RESOLUTION_JOURNAL_SCHEMA_VERSION),
         b"CSERJR6\0" => Some(6),
         b"CSERJR5\0" => Some(PROFILE_ONE_JOURNAL_SCHEMA_VERSION),
@@ -2606,22 +2607,22 @@ mod checkpoint_tests {
     }
 
     #[test]
-    fn decode_identifies_the_predecessor_checkpoint_before_vnext_length_checks() {
+    fn decode_identifies_checkpoint_four_before_vnext_length_checks() {
         let mut bytes = vec![0u8; 196];
         bytes[..8].copy_from_slice(&PREVIOUS_CHECKPOINT_MAGIC);
         assert_eq!(
             JournalCheckpoint::decode(&bytes),
-            Err(JournalCheckpointDecodeError::UnsupportedVersion { version: 2 })
+            Err(JournalCheckpointDecodeError::UnsupportedVersion { version: 4 })
         );
     }
 
     #[test]
-    fn decode_identifies_schema_nine_journal_before_vnext_length_checks() {
+    fn decode_identifies_predecessor_journal_before_vnext_length_checks() {
         let mut bytes = vec![0u8; 16];
         bytes[..8].copy_from_slice(&PREVIOUS_JOURNAL_MAGIC);
         assert!(matches!(
             scan_journal(&bytes),
-            Err(JournalDecodeError::UnsupportedVersion { version: 9 })
+            Err(JournalDecodeError::UnsupportedVersion { version: 11 })
         ));
     }
 

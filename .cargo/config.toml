@@ -8,3 +8,6 @@ rustflags = [
     "-C",
     "no-redzone=yes",
 ]
+
+[alias]
+nexus = ["run", "--locked", "-p", "nexus-xtask", "--"]

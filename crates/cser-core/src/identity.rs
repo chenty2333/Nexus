@@ -207,6 +207,46 @@ pub struct ExecutorCoordinate {
     generation: ExecutorGeneration,
 }
 
+/// Exact effect-local executor authority bound to an evidence receipt.
+///
+/// The executor coordinate identifies the implementation generation, while
+/// the authority epoch is advanced by the core whenever that effect is
+/// fenced or adopted. Keeping both coordinates prevents a receipt verified
+/// before a fence from becoming current again when provider and resource
+/// identities remain unchanged.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ExecutorBinding {
+    executor: ExecutorCoordinate,
+    authority_epoch: u64,
+}
+
+impl ExecutorBinding {
+    /// Creates a validated effect-local executor binding.
+    pub const fn new(
+        executor: ExecutorCoordinate,
+        authority_epoch: u64,
+    ) -> Result<Self, IdentityError> {
+        if authority_epoch == 0 {
+            Err(IdentityError::Zero)
+        } else {
+            Ok(Self {
+                executor,
+                authority_epoch,
+            })
+        }
+    }
+
+    /// Returns the exact executor coordinate.
+    pub const fn executor(self) -> ExecutorCoordinate {
+        self.executor
+    }
+
+    /// Returns the effect-local authority epoch.
+    pub const fn authority_epoch(self) -> u64 {
+        self.authority_epoch
+    }
+}
+
 impl ExecutorCoordinate {
     /// Creates an executor coordinate from its non-zero identity components.
     pub const fn new(executor: ExecutorId, generation: ExecutorGeneration) -> Self {
@@ -368,9 +408,9 @@ impl Freshness {
 #[cfg(test)]
 mod tests {
     use super::{
-        ExecutorCoordinate, ExecutorGeneration, ExecutorId, IdentityError, OperationId,
-        ProviderCoordinate, ProviderGeneration, ProviderId, RecoveryArtifactId, VerifierGeneration,
-        WorldId,
+        ExecutorBinding, ExecutorCoordinate, ExecutorGeneration, ExecutorId, IdentityError,
+        OperationId, ProviderCoordinate, ProviderGeneration, ProviderId, RecoveryArtifactId,
+        VerifierGeneration, WorldId,
     };
 
     #[test]
@@ -383,6 +423,11 @@ mod tests {
         assert_eq!(OperationId::new(0), Err(IdentityError::Zero));
         assert_eq!(RecoveryArtifactId::new(0), Err(IdentityError::Zero));
         assert_eq!(VerifierGeneration::new(0), Err(IdentityError::Zero));
+        let executor = ExecutorCoordinate::new(
+            ExecutorId::new(1).unwrap(),
+            ExecutorGeneration::new(1).unwrap(),
+        );
+        assert_eq!(ExecutorBinding::new(executor, 0), Err(IdentityError::Zero));
     }
 
     #[test]

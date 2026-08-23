@@ -366,7 +366,9 @@ fn device_tombstone_and_quarantine_survive_process_and_cold_reopen() {
         resource: challenge.resource(),
         resource_generation: challenge.resource_generation(),
         subject: reopened.engine.freshness(),
+        subject_binding: challenge.subject_binding(),
         observation: challenge.current_observation(),
+        observation_binding: challenge.current_binding(),
         digest: digest(90),
     };
     assert_eq!(
@@ -388,12 +390,14 @@ fn device_tombstone_and_quarantine_survive_process_and_cold_reopen() {
         resource: challenge.resource(),
         resource_generation: challenge.resource_generation(),
         subject: challenge.subject(),
+        subject_binding: challenge.subject_binding(),
         observation: Freshness::new(
             challenge.current_observation().boot(),
             challenge.current_observation().registry(),
             DeviceGeneration::new(challenge.subject().device().get() + 1).unwrap(),
             challenge.current_observation().journal(),
         ),
+        observation_binding: challenge.current_binding(),
         digest: digest(91),
     };
     let verified = reopened
@@ -428,7 +432,9 @@ fn device_tombstone_and_quarantine_survive_process_and_cold_reopen() {
         resource: challenge.resource(),
         resource_generation: challenge.resource_generation(),
         subject: challenge.subject(),
+        subject_binding: challenge.subject_binding(),
         observation: challenge.current_observation(),
+        observation_binding: challenge.current_binding(),
         digest: digest(92),
     };
     let verified = reopened

@@ -12,14 +12,15 @@ use cser_core::{
     DEVICE_EVIDENCE_IRQ_DRAINED, DEVICE_EVIDENCE_RESET, DEVICE_RECEIPT_SCHEMA, DEVICE_VERIFIER,
     DMA_ARENA_REUSE_COMPOSITE, DeviceScopeId, DomainCatalogBuilder, EffectEscapeState, EffectId,
     Engine, EvidenceKindId, EvidenceRule, ExternalOutcome, Freshness, FreshnessAxes,
-    JOURNAL_CORE_API_PROFILE, JOURNAL_SCHEMA_VERSION, JournalDecodeError, NORMALIZED_TRACE_VERSION,
-    ObligationKindId, ObligationPolicy, ObligationReceipts, ObligationSpec, OperationRecoveryState,
-    PROJECTION_VERSION, RECOVERY_SNAPSHOT_VERSION, REPLY_APPLY_RECEIPT_SCHEMA,
-    REPLY_CLAIM_PUBLICATION_SLOT, REPLY_COMMIT_RECEIPT_SCHEMA, REPLY_DOMAIN,
-    REPLY_EVIDENCE_PUBLICATION_ACK, REPLY_RECEIPT_SCHEMA, REPLY_SETTLEMENT_RECEIPT_SCHEMA,
-    REPLY_VERIFIER, ReceiptBinding, ReceiptSchemaId, RecoveryAnchor, ResourceId, RetirementState,
-    SettlementState, TransitionDurability, TransitionEvent, TransitionOutput, TransitionResult,
-    TxError, VerifierId, scan_journal, standard_catalog,
+    JOURNAL_CORE_API_PROFILE, JOURNAL_SCHEMA_VERSION, JournalCheckpoint, JournalDecodeError,
+    NORMALIZED_TRACE_VERSION, ObligationKindId, ObligationPolicy, ObligationReceipts,
+    ObligationSpec, OperationRecoveryState, PROJECTION_VERSION, RECOVERY_SNAPSHOT_VERSION,
+    REPLY_APPLY_RECEIPT_SCHEMA, REPLY_CLAIM_PUBLICATION_SLOT, REPLY_COMMIT_RECEIPT_SCHEMA,
+    REPLY_DOMAIN, REPLY_EVIDENCE_PUBLICATION_ACK, REPLY_RECEIPT_SCHEMA,
+    REPLY_SETTLEMENT_RECEIPT_SCHEMA, REPLY_VERIFIER, ReceiptBinding, ReceiptSchemaId,
+    RecoveryAnchor, ResourceId, RetirementState, SettlementState, TransitionDurability,
+    TransitionEvent, TransitionOutput, TransitionResult, TxError, VerifierId, scan_journal,
+    standard_catalog,
 };
 use support::{
     ExactTestVerifier, Harness, TestReceipt, charge, claim, digest, effect, executor, freshness,
@@ -133,6 +134,79 @@ fn composite_receipt_journal_and_snapshot_are_self_describing() {
     assert_eq!(composite.components.len(), 2);
     assert_eq!(composite.components[0].component, AGENT_COMPONENT_REPLY);
     assert_eq!(composite.components[1].component, AGENT_COMPONENT_DMA);
+}
+
+#[test]
+fn claim_capacity_is_one_effect_wide_budget_across_components() {
+    let limits = CoreLimits::new(8, 8, 16, 16, 2, 8, 8).unwrap();
+    let mut harness = Harness::with_catalog(standard_catalog(), limits);
+    let operation = effect(0xc501_1000, 1);
+    let origin = executor(0xc501_1000, 1);
+    let scope = device_scope();
+
+    admit_composite(
+        &mut harness,
+        operation,
+        origin,
+        AGENT_OPERATION_COMPOSITE,
+        charge(0xc501_1000),
+        &[AGENT_COMPONENT_REPLY, AGENT_COMPONENT_DMA],
+    );
+    harness
+        .tx(Command::AddComponentClaim {
+            effect: operation,
+            component: AGENT_COMPONENT_REPLY,
+            actor: origin,
+            claim: claim(1),
+            kind: REPLY_CLAIM_PUBLICATION_SLOT,
+            scope: ClaimScope::Logical,
+            resource: resource(0xc501_1001),
+            resource_generation: resource_generation(1),
+            units: 1,
+        })
+        .expect("the first component claim must fit below the effect limit");
+    harness
+        .tx(Command::AddComponentClaim {
+            effect: operation,
+            component: AGENT_COMPONENT_DMA,
+            actor: origin,
+            claim: claim(2),
+            kind: DEVICE_CLAIM_QUEUE_SLOT,
+            scope: ClaimScope::Device(scope),
+            resource: resource(0xc501_1002),
+            resource_generation: resource_generation(1),
+            units: 1,
+        })
+        .expect("claims split across components must fit exactly at the effect limit");
+
+    let before = harness.engine.projection_digest();
+    assert_eq!(
+        harness.tx(Command::AddComponentClaim {
+            effect: operation,
+            component: AGENT_COMPONENT_DMA,
+            actor: origin,
+            claim: claim(3),
+            kind: DEVICE_CLAIM_IOVA,
+            scope: ClaimScope::Device(scope),
+            resource: resource(0xc501_1003),
+            resource_generation: resource_generation(1),
+            units: 1,
+        }),
+        Err(CoreError::CapacityExceeded)
+    );
+    assert_eq!(harness.engine.projection_digest(), before);
+}
+
+#[test]
+fn claim_capacity_rejects_values_above_the_checkpoint_count_width() {
+    let encoded_max = u32::MAX as usize;
+    assert!(CoreLimits::new(1, 1, 1, 1, encoded_max, 1, 1).is_ok());
+    if let Some(too_large) = encoded_max.checked_add(1) {
+        assert_eq!(
+            CoreLimits::new(1, 1, 1, 1, too_large, 1, 1),
+            Err(CoreError::InvalidLimits)
+        );
+    }
 }
 
 #[test]
@@ -669,7 +743,9 @@ fn component_evidence_command(
         resource: challenge.resource(),
         resource_generation: challenge.resource_generation(),
         subject: challenge.subject(),
+        subject_binding: challenge.subject_binding(),
         observation,
+        observation_binding: challenge.current_binding(),
         digest: receipt_digest,
     };
     harness
@@ -2538,6 +2614,8 @@ fn adopted_precommit_claim_rebase_clears_quarantine_and_replays_current_schema()
     assert_eq!(receipt.into_output(), TransitionOutput::None);
 
     let current = freshness(2, 1, 2, 2);
+    let expected_binding =
+        cser_core::ExecutorBinding::new(successor, parent_before.authority_epoch).unwrap();
     let reply = harness
         .engine
         .component_claims(operation, AGENT_COMPONENT_REPLY)
@@ -2548,8 +2626,10 @@ fn adopted_precommit_claim_rebase_clears_quarantine_and_replays_current_schema()
         .unwrap();
     assert_eq!(reply[0].claim, reply_claim);
     assert_eq!(reply[0].enrolled_freshness, current);
+    assert_eq!(reply[0].enrolled_binding, expected_binding);
     assert_eq!(dma[0].claim, queue_claim);
     assert_eq!(dma[0].enrolled_freshness, current);
+    assert_eq!(dma[0].enrolled_binding, expected_binding);
     assert!(!harness.engine.pressure().quarantined);
     assert_eq!(
         harness.engine.composite_effect(operation).unwrap(),
@@ -2612,14 +2692,61 @@ fn adopted_precommit_claim_rebase_clears_quarantine_and_replays_current_schema()
     );
     assert_eq!(
         replay
+            .component_claims(operation, AGENT_COMPONENT_REPLY)
+            .unwrap()[0]
+            .enrolled_binding,
+        expected_binding,
+        "journal cold recovery must retain the rebased reply binding"
+    );
+    assert_eq!(
+        replay
             .component_claims(operation, AGENT_COMPONENT_DMA)
             .unwrap()[0]
             .enrolled_freshness,
         current
     );
+    assert_eq!(
+        replay
+            .component_claims(operation, AGENT_COMPONENT_DMA)
+            .unwrap()[0]
+            .enrolled_binding,
+        expected_binding,
+        "journal cold recovery must retain the rebased DMA binding"
+    );
     assert!(
         replay.pressure().quarantined,
         "the next boot must establish its own quarantine before another rebase"
+    );
+
+    let checkpoint = harness.checkpoint();
+    let checkpoint = JournalCheckpoint::decode(&checkpoint.encode()).unwrap();
+    let checkpoint_replay = Engine::recover(
+        standard_catalog_set(),
+        CoreLimits::bounded_default(),
+        anchor(
+            &harness.engine,
+            freshness(2, 1, 2, 2),
+            freshness(3, 1, 2, 3),
+        ),
+        checkpoint.image(),
+    )
+    .unwrap()
+    .into_engine();
+    assert_eq!(
+        checkpoint_replay
+            .component_claims(operation, AGENT_COMPONENT_REPLY)
+            .unwrap()[0]
+            .enrolled_binding,
+        expected_binding,
+        "checkpoint cold recovery must retain the rebased reply binding"
+    );
+    assert_eq!(
+        checkpoint_replay
+            .component_claims(operation, AGENT_COMPONENT_DMA)
+            .unwrap()[0]
+            .enrolled_binding,
+        expected_binding,
+        "checkpoint cold recovery must retain the rebased DMA binding"
     );
 }
 

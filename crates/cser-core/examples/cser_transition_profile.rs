@@ -11,9 +11,10 @@
 //! with `CSER_PROFILE_N=4096`, `CSER_PROFILE_SIZES=4096`, `--n 4096`,
 //! `--n=4096`, or a positional `4096` argument.  Comma-separated sizes are
 //! accepted for either environment variable or CLI form.
-//! Run it with `cargo run --release --no-default-features -p cser-core
-//! --example cser_transition_profile`; the example refuses to publish timing
-//! rows while the test-only full invariant oracle is enabled.
+//! Run it with `cargo run --release --no-default-features --features
+//! test-support -p cser-core --example cser_transition_profile`; the explicit
+//! development feature enables its intentionally volatile setup path, while
+//! the example refuses to publish timing rows with the full invariant oracle.
 
 use std::env;
 use std::hint::black_box;
@@ -54,7 +55,7 @@ struct Fixture {
 fn transact(engine: &mut Engine, command: CommandRequest) {
     engine
         .transact(command, |_| Ok::<(), core::convert::Infallible>(()))
-        .expect("in-memory production transition succeeds");
+        .expect("in-memory development transition succeeds");
 }
 
 fn freshness() -> Freshness {

@@ -2,89 +2,74 @@
 
 Nexus is a research codebase with no external compatibility users. Breaking
 changes are acceptable when they simplify the authoritative model, strengthen a
-safety boundary, or remove obsolete research machinery.
+safety boundary, or remove obsolete machinery.
 
-Read these before substantive work:
-
-- [maproom/terrain.md](maproom/terrain.md)
-- [maproom/basecamp.md](maproom/basecamp.md)
-- [maproom/route.md](maproom/route.md)
-- [maproom/hazards.md](maproom/hazards.md)
-
-Do not introduce another current roadmap, architecture ledger, evidence claim
-ledger, or status file outside `maproom/`.
+Read the [terrain](maproom/terrain.md), [basecamp](maproom/basecamp.md),
+[route](maproom/route.md), and [hazards](maproom/hazards.md) before substantive
+work. Do not create another roadmap, architecture ledger, evidence ledger, or
+status file outside `maproom/`.
 
 ## Supported workflow
 
-Use the root `./x` entry point:
+Use only this interface:
+
+```text
+cargo nexus {check,test,kernel,system,seal,clean}
+```
 
 | Command | Purpose |
 | --- | --- |
-| `./x doctor` | Validate Docker, repository layout, and pinned toolchain |
-| `./x build` | Build the host workspace and OSTD kernel |
-| `./x test --unit` | Run current host unit and differential tests |
-| `./x test --quick` | Run host checks plus the kernel static gate |
-| `./x test --system` | Run the current persistent recovery system path |
-| `./x test --full` | Run the complete supported local verification path |
-| `./x check` | Run schema, Rust, host experiment, and kernel checks |
-| `./x fmt` | Format the current Rust workspaces |
-| `./x verify` | Seal the current clean-source production recovery gate |
-| `./x clean --all` | Remove generated caches and local run evidence |
+| `cargo nexus check` | Check the portable workspace and bare-metal profiles. |
+| `cargo nexus test` | Run endpoint/provider reference tests plus portable core and model tests. |
+| `cargo nexus kernel` | Validate and build the OSTD kernel in the exact image. |
+| `cargo nexus system` | Exercise ATA PIO persistence, focused reply recovery, the DMA IRQ fail-closed gate, predecessor rejection, and four persistent QEMU boots. |
+| `cargo nexus seal` | From a clean Git snapshot, run the same system path and create the public sanitized receipt. |
+| `cargo nexus clean` | Remove build output but retain raw system artifacts for local inspection. |
+| `cargo nexus clean --raw` | Explicitly remove the raw system artifacts as well. |
 
-The root container is intentionally independent of host Rust. The OSTD kernel
-has a separate pinned build graph under `kernel/nexus-ostd`.
+The root Cargo workspace uses its rolling `nightly`. xtask reads the local
+rustup toolchain manifest for its release date, builds or verifies the matching
+dated-nightly OSDK/QEMU image, and checks the image's `rustc` commit hash. Do
+not substitute a date by hand: image identity and the compiler that launched
+xtask must agree.
+
+Cargo owns the root workspace and `nexus` alias; `OSDK.toml` owns the four
+kernel profiles; the root `Dockerfile` owns the OSTD/cargo-osdk/QEMU build
+image; the host owns Docker and `swtpm`. The host TPM fixture remains outside
+the container, and the controlled QEMU run connects to it. Cargo-OSDK's
+generated runner does not inherit `--locked`; the reviewed
+`kernel/nexus-ostd/osdk-runner-base/` snapshot and its lockfile are the sole
+controlled exception and must remain unchanged.
 
 ## Change discipline
 
-- Keep one authoritative semantic path. Do not dual-write a historical state
-  machine and the current core.
-- Add a core transition only when a smaller adapter/runtime policy cannot
-  enforce the required invariant.
+- Keep one authoritative semantic path; do not dual-write a historical model.
 - Preserve exact claim coordinates, fencing generations, journal-before-anchor
   ordering, and evidence-specific retirement.
-- Do not translate timeout, unavailable transport, missing telemetry, or
+- Do not convert timeout, unavailable transport, missing telemetry, or a
   nonterminal endpoint state into business failure.
-- Keep the independent current oracles independent: do not call production
-  transition helpers to compute their expected result.
-- Prefer focused tests for the changed invariant. Historical gate shapes and
-  frozen receipt populations are not compatibility obligations on current
-  main.
+- Keep endpoint/provider reference tests and model oracles independent of
+  production transition helpers.
+- Prefer focused regression tests for the changed invariant.
 
-## Evidence changes
+## Evidence and documentation
 
-Every checked or observed claim must identify its code revision, environment,
-workload, and source. A newer implementation does not inherit an older
-source-bound bundle automatically.
+Every checked or observed claim must identify its source revision, environment,
+workload, and evidence source. A newer implementation does not inherit older
+evidence automatically. Do not edit an immutable bundle to describe newer
+code.
 
-Do not edit a committed evidence bundle to make it describe newer code. Capture
-a new bundle when the new claim needs execution evidence, or state that the old
-bundle applies only to its recorded source commit.
+Raw operation/effect/resource identities, databases, logs, media, TPM state,
+absolute paths, container identifiers, and keys are not public evidence. A
+successful `cargo nexus seal` records the dist date plus the verified `rustc`
+commit date and hash, and publishes only the sanitized receipt and checksum
+under `target/nexus/public/`; it does not upload raw artifacts.
 
-Public evidence must exclude raw operation/effect/resource identities,
-databases, logs, media, TPM state, absolute paths, container identifiers, and
-HMAC keys. Missing evidence remains unknown or right-censored.
-
-## Documentation changes
-
-Maproom maintenance is user-directed. Do not update terrain, basecamp, or route
-merely because work progressed or seems worth recording. When the user asks
-for an update, change only the relevant document:
-
-- conceptual or semantic reasoning: `maproom/terrain.md`;
-- deliberately established current position: `maproom/basecamp.md`;
-- user-selected high-level direction: `maproom/route.md`;
-- verified project-specific failure modes: `maproom/hazards.md`.
-
-General development conventions belong in this contributing guide, not in the
-hazards file. Status feeds, session logs, result ledgers, and detailed execution
-plans do not belong in the maproom.
-
-README should remain a concise entry point. Historical states belong to Git
-history, tags, and release archives rather than duplicated archive trees on
-current main.
+Maproom maintenance is user-directed. Update terrain, basecamp, route, or
+hazards only when the user requests the relevant change. Keep general
+development conventions here, and keep the README a concise entry point.
 
 ## Publication boundary
 
 Do not configure, synchronize, push, publish, or submit the sibling
-`nexus-hotos` paper repository without explicit user authorization. Local code
-or documentation cleanup in Nexus does not grant that authorization.
+`nexus-hotos` paper repository without explicit user authorization.

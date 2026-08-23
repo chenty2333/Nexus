@@ -18,16 +18,16 @@ use cser_core::{
 
 #[test]
 fn semantic_api_current_profile_freezes_journal_and_domain_catalog() {
-    assert_eq!(CSER_CORE_API_PROFILE_VERSION, 6);
-    assert_eq!(JOURNAL_MAGIC, *b"CSERJ10\0");
-    assert_eq!(JOURNAL_SCHEMA_VERSION, 10);
-    assert_eq!(JOURNAL_CORE_API_PROFILE, 6);
+    assert_eq!(CSER_CORE_API_PROFILE_VERSION, 8);
+    assert_eq!(JOURNAL_MAGIC, *b"CSERJ12\0");
+    assert_eq!(JOURNAL_SCHEMA_VERSION, 12);
+    assert_eq!(JOURNAL_CORE_API_PROFILE, 8);
     assert_eq!(STANDARD_CATALOG_VERSION, 8);
-    assert_eq!(PROJECTION_VERSION, 10);
-    assert_eq!(RECOVERY_SNAPSHOT_VERSION, 6);
-    assert_eq!(NORMALIZED_TRACE_VERSION, 3);
-    assert_eq!(JOURNAL_CHECKPOINT_MAGIC, *b"CSERCP3\0");
-    assert_eq!(JOURNAL_CHECKPOINT_VERSION, 3);
+    assert_eq!(PROJECTION_VERSION, 12);
+    assert_eq!(RECOVERY_SNAPSHOT_VERSION, 8);
+    assert_eq!(NORMALIZED_TRACE_VERSION, 5);
+    assert_eq!(JOURNAL_CHECKPOINT_MAGIC, *b"CSERCP5\0");
+    assert_eq!(JOURNAL_CHECKPOINT_VERSION, 5);
     let catalog = standard_catalog();
     let agent_operation = catalog
         .composite_rule(AGENT_OPERATION_COMPOSITE)

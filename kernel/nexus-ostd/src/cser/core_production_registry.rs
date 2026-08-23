@@ -13,7 +13,7 @@ use alloc::{
     vec,
     vec::Vec,
 };
-use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use cser_core::{
     Command, CommandRequest, CommitIntent, ComponentProviderBinding, CoreError,
@@ -35,9 +35,13 @@ use super::{
 };
 
 const MAX_LINEAR_PORTAL_BEARERS: usize = 8;
-const INGRESS_CLOSED: u8 = 0;
-const INGRESS_INSTALLING: u8 = 1;
-const INGRESS_OPEN: u8 = 2;
+const INGRESS_STATE_BITS: u32 = 2;
+const INGRESS_STATE_MASK: u64 = (1 << INGRESS_STATE_BITS) - 1;
+const INGRESS_CLOSED: u64 = 0;
+const INGRESS_INSTALLING: u64 = 1;
+const INGRESS_OPEN: u64 = 2;
+const INGRESS_CLOSING: u64 = 3;
+const INGRESS_MAX_INCARNATION: u64 = u64::MAX >> INGRESS_STATE_BITS;
 
 /// Semantic world used by the production persistent CSER owner.
 ///
@@ -194,25 +198,77 @@ pub(crate) trait ProductionIngressExitObserver: Send + Sync {
     fn observe_exit(&self, identity: ProductionIngressIdentity, gate_closed: bool);
 }
 
+/// Opaque one-use authority to close one exact ingress incarnation.
+///
+/// This deliberately carries the complete OPEN control word rather than an
+/// identity lookup. A semantic identity may be reused after a close/reopen,
+/// while this token remains bound to only the incarnation that opened it.
+struct ProductionIngressCloseToken {
+    open: u64,
+    identity: ProductionIngressIdentity,
+}
+
+/// Shared installation endpoint for the task-bound close token.
+pub(crate) struct ProductionIngressCloseTokenInstaller {
+    identity: ProductionIngressIdentity,
+    state: Arc<Mutex<ProductionIngressCloseTokenState>>,
+}
+
+enum ProductionIngressCloseTokenState {
+    Pending,
+    Bound(ProductionIngressCloseToken),
+    Exited,
+}
+
+impl ProductionIngressCloseTokenInstaller {
+    /// Binds an opening token unless its task has already exited.
+    ///
+    /// Returns the token unchanged when the task already exited or this slot
+    /// was previously bound, so the opener can close that exact incarnation.
+    fn install(&self, token: ProductionIngressCloseToken) -> Option<ProductionIngressCloseToken> {
+        if token.identity != self.identity {
+            return Some(token);
+        }
+        let mut state = self.state.lock();
+        match &*state {
+            ProductionIngressCloseTokenState::Pending => {
+                *state = ProductionIngressCloseTokenState::Bound(token);
+                None
+            }
+            ProductionIngressCloseTokenState::Bound(_)
+            | ProductionIngressCloseTokenState::Exited => Some(token),
+        }
+    }
+}
+
 /// OSTD task data binding one real task to one production owner and ingress.
 pub(crate) struct ProductionIngressTaskData<S> {
     identity: ProductionIngressIdentity,
     owner: Weak<ProductionCoreOwner<S>>,
     exit_observer: Arc<dyn ProductionIngressExitObserver>,
+    close_token: Arc<Mutex<ProductionIngressCloseTokenState>>,
 }
 
 impl<S> ProductionIngressTaskData<S> {
-    /// Binds task data to the exact shared owner; no owner may be substituted.
+    /// Binds task data and an installation endpoint to one exact shared owner.
     pub(crate) fn new(
         owner: &Arc<ProductionCoreOwner<S>>,
         identity: ProductionIngressIdentity,
         exit_observer: Arc<dyn ProductionIngressExitObserver>,
-    ) -> Self {
-        Self {
-            identity,
-            owner: Arc::downgrade(owner),
-            exit_observer,
-        }
+    ) -> (Self, ProductionIngressCloseTokenInstaller) {
+        let close_token = Arc::new(Mutex::new(ProductionIngressCloseTokenState::Pending));
+        (
+            Self {
+                identity,
+                owner: Arc::downgrade(owner),
+                exit_observer,
+                close_token: Arc::clone(&close_token),
+            },
+            ProductionIngressCloseTokenInstaller {
+                identity,
+                state: close_token,
+            },
+        )
     }
 
     /// Closes the real production gate before publishing exact-reap metadata.
@@ -220,16 +276,29 @@ impl<S> ProductionIngressTaskData<S> {
         if !task.is_reaped() {
             return;
         }
-        let gate_closed = self
-            .owner
-            .upgrade()
-            .is_some_and(|owner| owner.close_ingress(self.identity));
+        let token = match core::mem::replace(
+            &mut *self.close_token.lock(),
+            ProductionIngressCloseTokenState::Exited,
+        ) {
+            ProductionIngressCloseTokenState::Bound(token) => Some(token),
+            ProductionIngressCloseTokenState::Pending
+            | ProductionIngressCloseTokenState::Exited => None,
+        };
+        let gate_closed = match (self.owner.upgrade(), token) {
+            (Some(owner), Some(token)) => owner.close_ingress(token),
+            _ => false,
+        };
         self.exit_observer.observe_exit(self.identity, gate_closed);
     }
 }
 
 struct ProductionIngressGate {
-    state: AtomicU8,
+    // The incarnation and lifecycle state are one CAS word. Identity fields
+    // are published only while INSTALLING and may be consumed only when two
+    // reads of this word observe the same OPEN incarnation. This prevents a
+    // reader from assembling fields from different installations and makes a
+    // delayed closer fail after a close/reopen ABA cycle.
+    control: AtomicU64,
     operation: AtomicU64,
     executor: AtomicU64,
     executor_generation: AtomicU64,
@@ -238,60 +307,105 @@ struct ProductionIngressGate {
 impl ProductionIngressGate {
     const fn closed() -> Self {
         Self {
-            state: AtomicU8::new(INGRESS_CLOSED),
+            control: AtomicU64::new(INGRESS_CLOSED),
             operation: AtomicU64::new(0),
             executor: AtomicU64::new(0),
             executor_generation: AtomicU64::new(0),
         }
     }
 
-    fn open(&self, identity: ProductionIngressIdentity) -> Result<(), ProductionIngressError> {
-        self.state
-            .compare_exchange(
-                INGRESS_CLOSED,
-                INGRESS_INSTALLING,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
+    fn open(
+        &self,
+        identity: ProductionIngressIdentity,
+    ) -> Result<ProductionIngressCloseToken, ProductionIngressError> {
+        let closed = self.control.load(Ordering::SeqCst);
+        if ingress_state(closed) != INGRESS_CLOSED {
+            return Err(ProductionIngressError::AlreadyOpen);
+        }
+        let incarnation = ingress_incarnation(closed)
+            .checked_add(1)
+            .filter(|incarnation| *incarnation <= INGRESS_MAX_INCARNATION)
+            .ok_or(ProductionIngressError::AlreadyOpen)?;
+        let installing = ingress_control(incarnation, INGRESS_INSTALLING);
+        self.control
+            .compare_exchange(closed, installing, Ordering::SeqCst, Ordering::SeqCst)
             .map_err(|_| ProductionIngressError::AlreadyOpen)?;
         self.operation
-            .store(identity.operation().get(), Ordering::Relaxed);
+            .store(identity.operation().get(), Ordering::SeqCst);
         self.executor
-            .store(identity.executor().executor().get(), Ordering::Relaxed);
+            .store(identity.executor().executor().get(), Ordering::SeqCst);
         self.executor_generation
-            .store(identity.executor().generation().get(), Ordering::Relaxed);
-        self.state.store(INGRESS_OPEN, Ordering::Release);
-        Ok(())
+            .store(identity.executor().generation().get(), Ordering::SeqCst);
+        self.control
+            .store(ingress_control(incarnation, INGRESS_OPEN), Ordering::SeqCst);
+        Ok(ProductionIngressCloseToken {
+            open: ingress_control(incarnation, INGRESS_OPEN),
+            identity,
+        })
     }
 
     fn identity(&self) -> Option<ProductionIngressIdentity> {
-        if self.state.load(Ordering::Acquire) != INGRESS_OPEN {
+        self.open_snapshot().map(|(_, identity)| identity)
+    }
+
+    fn close(&self, token: ProductionIngressCloseToken) -> bool {
+        self.close_incarnation(token.open)
+    }
+
+    fn open_snapshot(&self) -> Option<(u64, ProductionIngressIdentity)> {
+        let open = self.control.load(Ordering::SeqCst);
+        self.identity_for_open(open)
+            .map(|identity| (open, identity))
+    }
+
+    fn identity_for_open(&self, open: u64) -> Option<ProductionIngressIdentity> {
+        if ingress_state(open) != INGRESS_OPEN {
             return None;
         }
-        let operation = OperationId::new(self.operation.load(Ordering::Relaxed)).ok()?;
-        let executor = ExecutorId::new(self.executor.load(Ordering::Relaxed)).ok()?;
+        let operation = OperationId::new(self.operation.load(Ordering::SeqCst)).ok()?;
+        let executor = ExecutorId::new(self.executor.load(Ordering::SeqCst)).ok()?;
         let generation =
-            ExecutorGeneration::new(self.executor_generation.load(Ordering::Relaxed)).ok()?;
+            ExecutorGeneration::new(self.executor_generation.load(Ordering::SeqCst)).ok()?;
         let identity = ProductionIngressIdentity::new(
             operation,
             ExecutorCoordinate::new(executor, generation),
         );
-        (self.state.load(Ordering::Acquire) == INGRESS_OPEN).then_some(identity)
+        (self.control.load(Ordering::SeqCst) == open).then_some(identity)
     }
 
-    fn close(&self, identity: ProductionIngressIdentity) -> bool {
-        if self.identity() != Some(identity) {
+    fn close_incarnation(&self, open: u64) -> bool {
+        debug_assert_eq!(ingress_state(open), INGRESS_OPEN);
+        let incarnation = ingress_incarnation(open);
+        if self
+            .control
+            .compare_exchange(
+                open,
+                ingress_control(incarnation, INGRESS_CLOSING),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_err()
+        {
             return false;
         }
-        self.state
-            .compare_exchange(
-                INGRESS_OPEN,
-                INGRESS_CLOSED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
+        self.control.store(
+            ingress_control(incarnation, INGRESS_CLOSED),
+            Ordering::SeqCst,
+        );
+        true
     }
+}
+
+const fn ingress_control(incarnation: u64, state: u64) -> u64 {
+    (incarnation << INGRESS_STATE_BITS) | state
+}
+
+const fn ingress_incarnation(control: u64) -> u64 {
+    control >> INGRESS_STATE_BITS
+}
+
+const fn ingress_state(control: u64) -> u64 {
+    control & INGRESS_STATE_MASK
 }
 
 /// One installed core state. Implementations may be active or boot-quarantined,
@@ -386,8 +500,14 @@ impl<S> ProductionCoreOwner<S> {
     pub(crate) fn open_ingress(
         &self,
         identity: ProductionIngressIdentity,
+        close_token: &ProductionIngressCloseTokenInstaller,
     ) -> Result<(), ProductionIngressError> {
-        self.ingress.open(identity)
+        let token = self.ingress.open(identity)?;
+        if let Some(token) = close_token.install(token) {
+            self.ingress.close(token);
+            return Err(ProductionIngressError::TaskMismatch);
+        }
+        Ok(())
     }
 
     /// Returns the exact currently admitted service binding, if any.
@@ -504,8 +624,8 @@ impl<S> ProductionCoreOwner<S> {
         owner.installed
     }
 
-    fn close_ingress(&self, identity: ProductionIngressIdentity) -> bool {
-        self.ingress.close(identity)
+    fn close_ingress(&self, token: ProductionIngressCloseToken) -> bool {
+        self.ingress.close(token)
     }
 }
 
@@ -813,6 +933,20 @@ mod tests {
         )
     }
 
+    fn ingress_identity(
+        operation: u64,
+        executor: u64,
+        generation: u64,
+    ) -> ProductionIngressIdentity {
+        ProductionIngressIdentity::new(
+            OperationId::new(operation).unwrap(),
+            ExecutorCoordinate::new(
+                ExecutorId::new(executor).unwrap(),
+                ExecutorGeneration::new(generation).unwrap(),
+            ),
+        )
+    }
+
     fn add_claim() -> CommandRequest {
         CommandRequest::AddComponentClaim {
             effect: effect(),
@@ -905,6 +1039,36 @@ mod tests {
     fn custody_reservation_is_preallocated_to_the_publication_bound() {
         let custody = Vec::<TransitionOutput>::with_capacity(MAX_LINEAR_PORTAL_BEARERS);
         assert!(custody.capacity() >= MAX_LINEAR_PORTAL_BEARERS);
+    }
+
+    #[test]
+    fn same_identity_stale_closer_cannot_close_a_new_ingress_incarnation() {
+        let gate = ProductionIngressGate::closed();
+        let first = ingress_identity(1, 1, 1);
+
+        let stale_close = gate.open(first).unwrap();
+        let (stale_open, installed) = gate.open_snapshot().unwrap();
+        assert_eq!(installed, first);
+        assert!(gate.close_incarnation(stale_open));
+        let _current_close = gate.open(first).unwrap();
+
+        assert!(!gate.close(stale_close));
+        assert_eq!(gate.identity(), Some(first));
+    }
+
+    #[test]
+    fn identity_snapshot_rejects_fields_from_a_replaced_incarnation() {
+        let gate = ProductionIngressGate::closed();
+        let first = ingress_identity(1, 1, 1);
+        let second = ingress_identity(2, 2, 2);
+
+        let first_close = gate.open(first).unwrap();
+        let stale_open = gate.control.load(Ordering::SeqCst);
+        assert!(gate.close(first_close));
+        let _second_close = gate.open(second).unwrap();
+
+        assert_eq!(gate.identity_for_open(stale_open), None);
+        assert_eq!(gate.open_snapshot().unwrap().1, second);
     }
 }
 

@@ -1,34 +1,39 @@
-# Nexus kernel prototypes
+# Nexus kernel
 
-`kernel/` contains implementation code that has graduated from an API or
-feasibility experiment into the maintained Nexus kernel prototype.
+`kernel/` contains the maintained OSTD embedding of the Nexus CSER Core.
+`nexus-ostd/` is an isolated cargo-osdk workspace, while the root workspace
+keeps the portable core and independent model oracle separate from the kernel
+implementation.
 
-`nexus-ostd/` is deliberately an isolated cargo-osdk workspace. The root Cargo
-workspace contains the independent `cser-model` oracle and the separate
-`cser-transition-gates` production-source Loom harness, while the kernel uses a
-pinned OSTD/OSDK toolchain and its own immutable lock and generated runner-base
-graph. The separation prevents the executable oracle from silently sharing the
-kernel's transition implementation; the transition-gate crate checks the exact
-released source boundary without becoming the kernel implementation.
+The kernel is reached only through:
 
-Within `nexus-ostd/src/`, physical source layout records responsibility without
-changing the established crate-root API:
+```text
+cargo nexus kernel
+cargo nexus system
+cargo nexus seal
+```
 
-- `cser/` owns scope/effect registry and composition coordination;
-- `domains/` owns scheduler, pager, and readiness refinements;
-- `personality/` owns bounded Linux compatibility-pressure harnesses;
-- `probes/` records platform feasibility boundaries.
+The root rolling nightly launches xtask. xtask reads the local rustup toolchain
+manifest for its release date, uses the matching dated-nightly OSDK/QEMU image,
+and verifies the image's `rustc` commit hash; the root `Dockerfile` owns that
+image. `OSDK.toml` owns the kernel's four profiles, and the host owns Docker
+plus the `swtpm` fixture daemon used by the controlled QEMU path.
 
-The Linux and QEMU paths remain bounded evidence harnesses. All six fixed Linux
-core inputs now have bounded Checked/Observed receipts, including the separate
-runtime-filesystem and runtime-network successors. Their presence in the
-formal prototype does not turn Linux compatibility into Nexus's research
-identity or claim general filesystem, TCP/IP, external-packet, VirtIO-net/NIC,
-or SMP support. The historical five-domain composition receipt remains frozen
-with `runtime_fs=false` and `runtime_net=false`. Its additive seven-domain
-successor uses a fresh root cohort and bounded filesystem/network adapters; it
-does not preserve the retained workload effects or Stage 5B device identity.
+The four profiles are `cser-production`, `cser-core-reply-recovery`,
+`cser-core-dma-recovery`, and `cser-pio-journal-ktest`. The first is the
+persistent system profile; reply is a focused recovery profile, while DMA
+currently proves only pre-escape fail-closed behavior when controller callback
+synchronization is unavailable; the PIO profile is a focused journal check. Cargo-OSDK's generated runner does not
+receive `--locked`, so the reviewed `osdk-runner-base/` snapshot and its own
+lockfile are checked unchanged as the sole controlled exception.
 
-Use only the repository-root `./x` as the public developer interface. The
-private `nexus-ostd/x` entrypoint is a backend retained for isolation and
-reproducibility.
+`cargo nexus system` exercises ATA PIO persistence, focused reply recovery, the
+DMA IRQ fail-closed capability gate, typed predecessor rejection, and four production boots over retained
+raw state. `cargo nexus seal` requires a clean Git snapshot, follows that same
+path, records the dist date plus verified `rustc` commit date and hash, and
+copies only a sanitized receipt and checksum to `target/nexus/public/`. Raw
+artifacts stay local; `cargo nexus clean` preserves them, while
+`cargo nexus clean --raw` removes them explicitly.
+
+The QEMU protocol profile is evidence for its declared emulated configuration.
+It does not establish physical-hardware behavior.

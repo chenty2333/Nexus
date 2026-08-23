@@ -33,7 +33,7 @@ fn digest_chunked(chunks: &[&[u8]]) -> [u8; 32] {
 fn hex_bytes(value: &str) -> [u8; 32] {
     assert_eq!(value.len(), 64, "SHA-256 test vector must contain 32 bytes");
     let mut result = [0u8; 32];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let high = hex_nibble(pair[0]);
         let low = hex_nibble(pair[1]);
         result[index] = (high << 4) | low;

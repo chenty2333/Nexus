@@ -14,13 +14,17 @@ import time
 from http import HTTPStatus
 from pathlib import Path
 
-from matrix_protocol import UART_WRITE_INTER_CHUNK_SECONDS, paced_sendall
 from protocol import (MAX_LINE_BYTES, ProtocolError, digest, parse_request, parse_request_v2, parse_request_v3, record_digest,
                       response, response_v2, response_v3, evidence_record_digest, evidence_record_digest_v3, validate_run_id)
 from handoff_identity import (ParentDescriptorContext, child_transport_effect_id,
                               expected_child_request, validate_child_descriptor_v1)
 
 MAX_FIRMWARE_PREAMBLE_BYTES = 64 * 1024
+# QEMU's emulated 16550 can lose a host frame when it arrives faster than the
+# polling guest can consume it. This reference bridge therefore uses a
+# conservative byte-at-a-time drain window for real UART use.
+UART_WRITE_INTER_CHUNK_SECONDS = 0.002
+_UART_WRITE_CHUNK_BYTES = 1
 # Development-tunable bound for one boot's same-identity reconciliation.  It
 # is deliberately a protocol backpressure bound, not a claim about endpoint
 # completion latency.  The guest retains on exhaustion and reconnects on a
@@ -39,6 +43,26 @@ _V3_ENDPOINT_RECORD_KEYS = frozenset({
     "output_len", "output_digest", "output_b64", "evidence_record_digest", "created_at_ns",
     "updated_at_ns", "expires_at_ns", "replayed",
 })
+
+
+def paced_sendall(sock: object, frame: bytes, *,
+                  chunk_bytes: int = _UART_WRITE_CHUNK_BYTES,
+                  inter_chunk_seconds: float = 0.0) -> None:
+    """Write one bounded UART frame without adding retry or framing behavior."""
+    if not frame or len(frame) > MAX_LINE_BYTES:
+        raise ProtocolError("invalid paced UART frame")
+    if not 1 <= chunk_bytes <= 16 or inter_chunk_seconds < 0:
+        raise ValueError("invalid UART pacing")
+    sender = getattr(sock, "sendall", None)
+    if sender is None:
+        raise TypeError("UART peer does not provide sendall")
+    if inter_chunk_seconds == 0:
+        sender(frame)
+        return
+    for offset in range(0, len(frame), chunk_bytes):
+        sender(frame[offset:offset + chunk_bytes])
+        if offset + chunk_bytes < len(frame):
+            time.sleep(inter_chunk_seconds)
 
 
 def _write_signal(path: Path | None, state: str, *, stage: str | None = None,

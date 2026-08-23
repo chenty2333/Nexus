@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/cser-core",
     "crates/cser-model",
+    "tools/xtask",
 ]
 exclude = [
     "crates/nexus-ostd-virtio",

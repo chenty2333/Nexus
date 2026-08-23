@@ -4,7 +4,3 @@ version = "0.1.0"
 edition = "2024"
 license = "Unlicense"
 publish = false
-
-# Keep the production workflow tool independent from both the portable-core
-# workspace and the cargo-osdk kernel workspace.
-[workspace]

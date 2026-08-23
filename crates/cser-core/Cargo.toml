@@ -25,6 +25,9 @@ std = []
 # features are additive and cannot encode a mutual-exclusion check here; the
 # documented no-default profile is therefore the minimal reliable A/B split.
 sha2-software-baseline = ["sha2/force-soft"]
+# Explicit development surface. This enables volatile transactions and custom
+# transition-durability fixtures; production/no-default builds expose only the
+# sealed CoordinatedPersistence transition boundary.
 test-support = []
 # Runs the authoritative whole-state invariant oracle after every prepared
 # transition. Production embeddings may enable `test-support` fixtures without
@@ -51,6 +54,16 @@ required-features = ["std"]
 name = "cser_hash_profile"
 path = "examples/cser_hash_profile.rs"
 required-features = ["std"]
+
+[[example]]
+name = "cser_transition_profile"
+path = "examples/cser_transition_profile.rs"
+required-features = ["test-support"]
+
+[[example]]
+name = "cser_checkpoint_profile"
+path = "examples/cser_checkpoint_profile.rs"
+required-features = ["test-support"]
 
 [[test]]
 name = "persistent_provider"

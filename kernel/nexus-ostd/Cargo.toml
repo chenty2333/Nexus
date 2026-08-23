@@ -10,32 +10,9 @@ publish = false
 [features]
 default = ["cser-production"]
 cser-production = ["dep:nexus-ostd-virtio", "dep:osdk-frame-allocator"]
-# Historical, non-production recovery probes intentionally use the core's
-# in-memory legacy fixtures. Keep that capability absent from the production
-# and tool-plus-DMA profiles.
 cser-core-reply-recovery = ["cser-core/test-support"]
 cser-core-dma-recovery = ["dep:nexus-ostd-virtio", "cser-core/test-support"]
-cser-core-tpm-anchor = []
-cser-smp-smoke = ["cser-core/test-support"]
-# Minimal kernel-test profile for the ATA journal's in-memory crash and
-# telemetry regressions.  It deliberately avoids the production device stack.
 cser-pio-journal-ktest = []
-# These are deliberately separate from `cser-production`: the experiment
-# profiles may evolve their UART/crash harness without changing the sealed
-# production profile or its source closure.
-cser-tool-dma-experiment = ["dep:nexus-ostd-virtio", "dep:osdk-frame-allocator"]
-# Fresh-media append/checkpoint journal selection for the CSER experiment.
-# It deliberately retains the ordinary experiment feature so all device and
-# recovery machinery is identical; only the typed ATA backend changes.
-cser-tool-dma-experiment-vnext = ["cser-tool-dma-experiment"]
-cser-tool-dma-baseline-experiment = ["dep:nexus-ostd-virtio", "dep:osdk-frame-allocator"]
-# Logical-only, CSER3 single-hop handoff lane.  It retains the same bounded
-# persistent-QEMU substrate as the Tool+DMA profiles but never enables their
-# device-flow entry points.
-cser-tool-handoff-experiment = ["dep:nexus-ostd-virtio", "dep:osdk-frame-allocator"]
-# Matched independent-finalizer counterpart of the logical CSER3 handoff
-# lane. The feature owns no CSER engine/runtime entry point.
-cser-tool-handoff-baseline-experiment = ["dep:nexus-ostd-virtio", "dep:osdk-frame-allocator"]
 
 [dependencies]
 cser-core = { path = "../../crates/cser-core", default-features = false }

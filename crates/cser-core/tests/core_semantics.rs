@@ -96,7 +96,9 @@ fn dma_evidence_command(
         resource: challenge.resource(),
         resource_generation: challenge.resource_generation(),
         subject,
+        subject_binding: challenge.subject_binding(),
         observation,
+        observation_binding: challenge.current_binding(),
         digest: digest(digest_value),
     };
     let verifier =

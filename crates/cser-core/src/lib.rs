@@ -24,19 +24,19 @@ extern crate std;
 /// migration. Standard catalog grammar and validation evolve under the
 /// separate [`STANDARD_CATALOG_VERSION`] coordinate and exact catalog digest;
 /// recovery never reinterprets a journal bound to an older catalog digest.
-pub const CSER_CORE_API_PROFILE_VERSION: u16 = 6;
+pub const CSER_CORE_API_PROFILE_VERSION: u16 = 8;
 
 /// Frozen standard catalog format used by the current semantic API profile.
 pub const STANDARD_CATALOG_VERSION: u16 = 8;
 
 /// Frozen deterministic projection format used by the current semantic API profile.
-pub const PROJECTION_VERSION: u16 = 10;
+pub const PROJECTION_VERSION: u16 = 12;
 
 /// Frozen recovery snapshot format used by the current semantic API profile.
-pub const RECOVERY_SNAPSHOT_VERSION: u16 = 6;
+pub const RECOVERY_SNAPSHOT_VERSION: u16 = 8;
 
 /// Frozen normalized transition trace format used by the current semantic API profile.
-pub const NORMALIZED_TRACE_VERSION: u16 = 3;
+pub const NORMALIZED_TRACE_VERSION: u16 = 5;
 
 mod artifact;
 mod authenticated_map;
@@ -57,7 +57,7 @@ pub mod std_support;
 pub use artifact::{
     ArtifactBinding, ArtifactLeaseState, ArtifactPinChallenge, ArtifactPinVerifier,
     ArtifactProtocolError, ArtifactReceiptBindings, ArtifactReleaseChallenge,
-    ArtifactReleasePermit, ArtifactReleaseVerifier,
+    ArtifactReleasePermit, ArtifactReleaseVerifier, ArtifactVerifierIdentity,
 };
 pub use domain::{
     AdoptionPolicy, CatalogSet, CatalogSetError, ClaimCardinality, ClaimRule, ClaimScopePolicy,
@@ -76,19 +76,21 @@ pub use engine::{
     CommitUseError, ComponentClaimProjection, ComponentClaimRecoveryItem, ComponentCommitOperation,
     ComponentProjection, ComponentProviderBinding, ComponentRecoveryItem,
     CompositeEffectProjection, CompositeRecoveryItem, CoreError, CoreLimits, CustodyState,
-    DurablePreparedCheckpoint, EffectEscapeState, EffectFactChallenge, EffectFactKind,
-    EffectReceiptVerifier, Engine, EvidenceChallenge, ExternalOutcome,
-    HandoffChildResolutionVerifier, HandoffResolutionChallenge, HandoffResolutionVerifier,
-    HistoryLimits, JournalFailure, OperationRecoveryState, OutcomeState, PreparedCheckpoint,
-    PressureProjection, ProviderEffectState, ProviderGenerationProjection, ProviderObligation,
-    ProviderVerificationScope, ReceiptVerifier, RecoveryAnchor, RecoveryAnchorError,
-    RecoveryEvidenceItem, RecoveryFromSourceError, RecoveryReport, RecoverySnapshot,
-    RetirementState, ReusePermit, SettlementClaim, SettlementState, SingleHopHandoffProjection,
-    TransitionCoordinates, TransitionEvent, TransitionOutput, TransitionReceipt, TransitionResult,
-    TxError, VerificationError, VerifiedApplyReceipt, VerifiedArtifactPin, VerifiedArtifactRelease,
-    VerifiedChildDescriptor, VerifiedCommitOutcome, VerifiedEffectObservation,
-    VerifiedHandoffChildResolution, VerifiedHandoffResolution, VerifiedObservation,
-    VerifiedRetirementEvidence, VerifiedSettlementAck, VerifierIdentity, VerifierStamp,
+    DurablePreparedCheckpoint, DurablePreparedWorldRollover, EffectEscapeState,
+    EffectFactChallenge, EffectFactKind, EffectReceiptVerifier, Engine, EvidenceChallenge,
+    ExternalOutcome, HandoffChildResolutionVerifier, HandoffResolutionChallenge,
+    HandoffResolutionVerifier, HistoryLimits, JournalFailure, OperationRecoveryState, OutcomeState,
+    PreparedCheckpoint, PreparedWorldRollover, PressureProjection, ProviderEffectState,
+    ProviderGenerationProjection, ProviderObligation, ProviderVerificationScope, ReceiptVerifier,
+    RecoveryAnchor, RecoveryAnchorError, RecoveryEvidenceItem, RecoveryFromSourceError,
+    RecoveryReport, RecoverySnapshot, RetirementState, ReusePermit, SettlementClaim,
+    SettlementState, SingleHopHandoffProjection, TransitionCoordinates, TransitionEvent,
+    TransitionOutput, TransitionReceipt, TransitionResult, TxError, VerificationError,
+    VerifiedApplyReceipt, VerifiedArtifactPin, VerifiedArtifactRelease, VerifiedChildDescriptor,
+    VerifiedCommitOutcome, VerifiedEffectObservation, VerifiedHandoffChildResolution,
+    VerifiedHandoffResolution, VerifiedObservation, VerifiedRetirementEvidence,
+    VerifiedSettlementAck, VerifierIdentity, VerifierStamp, WorldRolloverAnchor,
+    WorldRolloverSource,
 };
 pub use engine::{
     CHILD_DESCRIPTOR_V1_WIRE_LEN, MAX_COMMAND_PAYLOAD_BYTES, MAX_COMMAND_VECTOR_ITEMS,
@@ -96,7 +98,7 @@ pub use engine::{
 pub use identity::{
     BootGeneration, ChargeAccountId, ClaimId, ClaimKindId, ComponentId, CompositeKindId,
     CreditClassId, DeviceGeneration, DeviceScopeId, Digest, DomainId, EffectId, EvidenceKindId,
-    ExecutorCoordinate, ExecutorGeneration, ExecutorId, Freshness, IdentityError,
+    ExecutorBinding, ExecutorCoordinate, ExecutorGeneration, ExecutorId, Freshness, IdentityError,
     JournalGeneration, ObligationKindId, OperationId, ProviderCoordinate, ProviderGeneration,
     ProviderId, ReceiptSchemaId, RecoveryArtifactId, RegistryInstance, ResourceGeneration,
     ResourceId, SnapshotId, VerifierGeneration, VerifierId, WorldId,
@@ -108,10 +110,11 @@ pub use journal::{
     MAX_JOURNAL_CHECKPOINT_IMAGE_BYTES, scan_journal, scan_journal_to_head,
 };
 pub use persistence::{
-    CheckpointDurability, CompactingJournalBackend, CoordinatedPersistence,
-    CoordinatedPersistenceError, DurableJournalBackend, PersistenceProtocolError, RecoveryBinding,
-    RecoveryLease, RecoveryProfile, StreamingJournalBackend, TransitionDurability,
-    TrustedAnchorBackend, TrustedAnchorSnapshot,
+    CatalogEvolutionAnchorBackend, CatalogEvolutionDurability, CheckpointDurability,
+    CompactingJournalBackend, CoordinatedPersistence, CoordinatedPersistenceError,
+    DurableJournalBackend, PersistenceProtocolError, RecoveryBinding, RecoveryLease,
+    RecoveryProfile, StreamingJournalBackend, TransitionDurability, TrustedAnchorBackend,
+    TrustedAnchorSnapshot, WorldRolloverAnchorBackend, WorldRolloverDurability,
 };
 pub use profiles::{
     AGENT_COMPONENT_DMA, AGENT_COMPONENT_REPLY, AGENT_OPERATION_COMPOSITE, CREDIT_IOVA,

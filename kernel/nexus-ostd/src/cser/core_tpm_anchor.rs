@@ -46,16 +46,12 @@ use core::{
 };
 
 use cser_core::{
-    BootGeneration, DeviceGeneration, Digest, Freshness, JournalGeneration,
-    PersistenceProtocolError, RecoveryBinding, RecoveryLease, RecoveryProfile, RegistryInstance,
-    TrustedAnchorBackend, TrustedAnchorSnapshot, WorldId,
+    BootGeneration, CatalogEvolutionAnchorBackend, DeviceGeneration, Digest, Freshness,
+    JournalGeneration, PersistenceProtocolError, RecoveryBinding, RecoveryLease, RecoveryProfile,
+    RegistryInstance, TrustedAnchorBackend, TrustedAnchorSnapshot, WorldId,
+    WorldRolloverAnchorBackend,
 };
-use ostd::{
-    io::IoMem,
-    mm::VmIoOnce,
-    power::{ExitCode, poweroff},
-    prelude::*,
-};
+use ostd::{io::IoMem, mm::VmIoOnce, prelude::*};
 use sha2::{Digest as ShaDigest, Sha256};
 
 const TPM_ST_NO_SESSIONS: u16 = 0x8001;
@@ -148,21 +144,6 @@ const TIP_BODY_LEN: usize = 180;
 const TIP_SLOT_LEN: usize = TIP_BODY_LEN + 32;
 const LEASE_BODY_LEN: usize = 108;
 const LEASE_SLOT_LEN: usize = LEASE_BODY_LEN + 32;
-
-// The OSTD fixture has one stable semantic world. Genesis projection is the digest of
-// Engine::new(WorldId(1), standard_catalog(), bounded_default(),
-// Freshness(1, 1, 1, 1)); the shell provisioner carries this exact fixed
-// value because it cannot instantiate the scoped Core engine itself.
-const OSTD_WORLD_ID: u64 = 1;
-const OSTD_REGISTRY_INSTANCE: u64 = 1;
-const OSTD_STANDARD_CATALOG_DIGEST: Digest = Digest::new([
-    0x1d, 0x69, 0xf2, 0xfc, 0x7e, 0x9c, 0x1b, 0xdc, 0x60, 0xbc, 0x99, 0x18, 0x7f, 0x8c, 0x38, 0xdc,
-    0x6b, 0xcd, 0xe1, 0x46, 0x7e, 0x11, 0xae, 0xd9, 0x19, 0xa2, 0xf4, 0x6d, 0x93, 0x6c, 0x03, 0xb1,
-]);
-const OSTD_GENESIS_PROJECTION: Digest = Digest::new([
-    0xa3, 0x10, 0x75, 0x61, 0x4d, 0x23, 0x36, 0x5a, 0x05, 0xfe, 0x24, 0xeb, 0xc8, 0x2a, 0xcb, 0x6b,
-    0x9f, 0x6d, 0x85, 0x86, 0x5d, 0xf5, 0x70, 0x3a, 0x15, 0x0b, 0x71, 0x2f, 0xe4, 0x4e, 0x11, 0x8e,
-]);
 
 // TPM2 ordinary NV has no compare-and-swap command. The double-slot selector
 // protocol is atomic only under one writer, so construction acquires a
@@ -888,7 +869,7 @@ where
         let (tip_sequence, committed) = read_selected_tip(&mut transport, layout, &auth)?;
         let (lease_sequence, lease_binding, issued) =
             read_selected_lease(&mut transport, layout, &auth)?;
-        validate_inspected_state(committed, lease_binding, issued)?;
+        let issued = validate_inspected_state(committed, lease_binding, issued)?;
         Ok(TpmNvAnchorCandidate {
             transport: Some(transport),
             layout,
@@ -966,7 +947,8 @@ where
         let (tip_sequence, committed) = read_selected_tip(transport, self.layout, &self.auth)?;
         let (lease_sequence, lease_binding, issued) =
             read_selected_lease(transport, self.layout, &self.auth)?;
-        validate_loaded_state(self.expected_binding, committed, lease_binding, issued)?;
+        let issued =
+            validate_loaded_state(self.expected_binding, committed, lease_binding, issued)?;
         self.tip_sequence = tip_sequence;
         self.lease_sequence = lease_sequence;
         self.committed = committed;
@@ -1104,6 +1086,84 @@ where
     }
 }
 
+/// The lease selector is deliberately not advanced during a catalog rebind.
+///
+/// Tip and lease counters are independent TPM operations, so advancing both
+/// would create a crash-visible mixed state.  Catalog evolution is permitted
+/// only with no outstanding issued epoch; after the tip CAS, the old lease is
+/// a recognized inert predecessor and the tip freshness remains authoritative.
+impl<T> CatalogEvolutionAnchorBackend for TpmNvTrustedAnchor<T>
+where
+    T: TpmNvTransport,
+{
+    fn compare_and_rebind_catalog(
+        &mut self,
+        expected: TrustedAnchorSnapshot,
+        replacement: TrustedAnchorSnapshot,
+    ) -> Result<(), Self::Error> {
+        self.refresh()?;
+        if expected != self.committed {
+            return Err(PersistenceProtocolError::StaleJournalHead.into());
+        }
+        validate_catalog_rebind(expected, replacement, self.issued)?;
+
+        let next_sequence =
+            self.tip_sequence
+                .checked_add(1)
+                .ok_or(TpmNvAnchorError::CounterOverflow {
+                    index: self.layout.tip_counter,
+                })?;
+        let slot = slot_for_sequence(self.layout.tip_slots, next_sequence);
+        let encoded = encode_tip_slot(next_sequence, replacement);
+        self.write_verified_slot(slot, &encoded)?;
+        self.increment_and_verify(self.layout.tip_counter, next_sequence)?;
+        self.tip_sequence = next_sequence;
+        self.committed = replacement;
+        self.expected_binding = replacement.binding();
+        Ok(())
+    }
+}
+
+/// The lease selector is deliberately not advanced during a world rollover.
+///
+/// A cross-world operation changes the Registry coordinate, so there is no
+/// safe two-selector atomic update in this layout.  The new tip starts at its
+/// supplied freshness and is the sole authority for the successor world; the
+/// predecessor lease remains recognizable only as inert history until the
+/// first successor recovery lease atomically replaces it.
+impl<T> WorldRolloverAnchorBackend for TpmNvTrustedAnchor<T>
+where
+    T: TpmNvTransport,
+{
+    fn compare_and_rebind_world(
+        &mut self,
+        expected: TrustedAnchorSnapshot,
+        replacement: TrustedAnchorSnapshot,
+    ) -> Result<(), Self::Error> {
+        self.refresh()?;
+        if expected != self.committed {
+            return Err(PersistenceProtocolError::StaleJournalHead.into());
+        }
+        validate_world_rebind(expected, replacement, self.issued)?;
+
+        let next_sequence =
+            self.tip_sequence
+                .checked_add(1)
+                .ok_or(TpmNvAnchorError::CounterOverflow {
+                    index: self.layout.tip_counter,
+                })?;
+        let slot = slot_for_sequence(self.layout.tip_slots, next_sequence);
+        let encoded = encode_tip_slot(next_sequence, replacement);
+        self.write_verified_slot(slot, &encoded)?;
+        self.increment_and_verify(self.layout.tip_counter, next_sequence)?;
+        self.tip_sequence = next_sequence;
+        self.committed = replacement;
+        self.issued = replacement.committed_freshness();
+        self.expected_binding = replacement.binding();
+        Ok(())
+    }
+}
+
 fn validate_unique_indices<E>(layout: TpmNvLayout) -> Result<(), TpmNvAnchorError<E>> {
     let indices = layout.all_indices();
     for left in 0..indices.len() {
@@ -1178,30 +1238,57 @@ fn validate_loaded_state<E>(
     committed: TrustedAnchorSnapshot,
     lease_binding: RecoveryBinding,
     issued: Freshness,
-) -> Result<(), TpmNvAnchorError<E>> {
-    validate_inspected_state(committed, lease_binding, issued)?;
+) -> Result<Freshness, TpmNvAnchorError<E>> {
+    let issued = validate_inspected_state(committed, lease_binding, issued)?;
     if committed.binding() != expected_binding {
         return Err(PersistenceProtocolError::BindingMismatch.into());
     }
-    Ok(())
+    Ok(issued)
 }
 
 fn validate_inspected_state<E>(
     committed: TrustedAnchorSnapshot,
     lease_binding: RecoveryBinding,
     issued: Freshness,
-) -> Result<(), TpmNvAnchorError<E>> {
-    if committed.binding() != lease_binding || issued.registry() != lease_binding.registry() {
+) -> Result<Freshness, TpmNvAnchorError<E>> {
+    if issued.registry() != lease_binding.registry() {
         return Err(PersistenceProtocolError::BindingMismatch.into());
     }
     let committed_freshness = committed.committed_freshness();
-    if issued.boot().get() < committed_freshness.boot().get()
-        || issued.journal().get() < committed_freshness.journal().get()
-        || issued.device().get() < committed_freshness.device().get()
-    {
-        return Err(PersistenceProtocolError::StaleFreshness.into());
+    let tip_binding = committed.binding();
+    if tip_binding == lease_binding {
+        if issued.boot().get() < committed_freshness.boot().get()
+            || issued.journal().get() < committed_freshness.journal().get()
+            || issued.device().get() < committed_freshness.device().get()
+        {
+            return Err(PersistenceProtocolError::StaleFreshness.into());
+        }
+        return Ok(issued);
     }
-    Ok(())
+
+    // A catalog rebind is safe only from an exact committed/issued boundary.
+    // This makes the untouched lease a non-authoritative predecessor rather
+    // than evidence that a recovery epoch was abandoned during the rebind.
+    if tip_binding.profile() == lease_binding.profile()
+        && tip_binding.world() == lease_binding.world()
+        && tip_binding.registry() == lease_binding.registry()
+        && tip_binding.catalog_digest() != lease_binding.catalog_digest()
+        && issued == committed_freshness
+    {
+        return Ok(committed_freshness);
+    }
+
+    // A rebind retains the prior lease until the successor reserves its first
+    // epoch. It cannot authorize the current tip: its binding differs and its
+    // selector axes are never newer than the committed high-water mark. A
+    // catalog-only predecessor is exact; a cross-world predecessor strictly
+    // precedes it. This admits catalog->world and world->catalog sequences
+    // without treating an arbitrary newer lease as inert.
+    if is_inert_predecessor_lease(tip_binding, committed_freshness, lease_binding, issued) {
+        return Ok(committed_freshness);
+    }
+
+    Err(PersistenceProtocolError::BindingMismatch.into())
 }
 
 fn validate_replacement<E>(
@@ -1211,16 +1298,112 @@ fn validate_replacement<E>(
 ) -> Result<(), TpmNvAnchorError<E>> {
     let expected_freshness = expected.committed_freshness();
     let replacement_freshness = replacement.committed_freshness();
+    let required_freshness = if issued != expected_freshness {
+        issued
+    } else {
+        expected_freshness
+    };
     if replacement.binding() != expected.binding()
         || expected.revision().checked_add(1) != Some(replacement.revision())
         || replacement_freshness.boot().get() < expected_freshness.boot().get()
         || replacement_freshness.journal().get() < expected_freshness.journal().get()
         || replacement_freshness.device().get() < expected_freshness.device().get()
-        || (replacement_freshness != expected_freshness && replacement_freshness != issued)
+        || replacement_freshness != required_freshness
     {
         return Err(PersistenceProtocolError::StaleFreshness.into());
     }
     Ok(())
+}
+
+fn validate_catalog_rebind<E>(
+    expected: TrustedAnchorSnapshot,
+    replacement: TrustedAnchorSnapshot,
+    issued: Freshness,
+) -> Result<(), TpmNvAnchorError<E>> {
+    let source = expected.binding();
+    let target = replacement.binding();
+    if target.catalog_digest() == source.catalog_digest()
+        || target.profile() != source.profile()
+        || target.world() != source.world()
+        || target.registry() != source.registry()
+    {
+        return Err(PersistenceProtocolError::BindingMismatch.into());
+    }
+    if expected.revision().checked_add(1) != Some(replacement.revision()) {
+        return Err(PersistenceProtocolError::StaleJournalHead.into());
+    }
+    if issued != expected.committed_freshness()
+        || replacement.committed_freshness() != expected.committed_freshness()
+    {
+        return Err(PersistenceProtocolError::StaleFreshness.into());
+    }
+    Ok(())
+}
+
+fn validate_world_rebind<E>(
+    expected: TrustedAnchorSnapshot,
+    replacement: TrustedAnchorSnapshot,
+    issued: Freshness,
+) -> Result<(), TpmNvAnchorError<E>> {
+    let source = expected.binding();
+    let target = replacement.binding();
+    let source_freshness = expected.committed_freshness();
+    let target_freshness = replacement.committed_freshness();
+    if target.profile() != source.profile()
+        || target.catalog_digest() != source.catalog_digest()
+        || target.world() == source.world()
+        || target.registry() == source.registry()
+        || replacement.revision() != 1
+        || target_freshness.registry() != target.registry()
+    {
+        return Err(PersistenceProtocolError::BindingMismatch.into());
+    }
+    // The TPM lease selector is shared across worlds. A successor cannot
+    // regress below either the committed source or a recovery epoch already
+    // issued above that source. DeviceGeneration is included so a new Registry
+    // cannot reuse a physically quarantined source generation. Every axis
+    // strictly advances the source and effective issued high-water marks.
+    if target_freshness.boot().get() <= source_freshness.boot().get()
+        || target_freshness.boot().get() <= issued.boot().get()
+        || target_freshness.device().get() <= source_freshness.device().get()
+        || target_freshness.device().get() <= issued.device().get()
+        || target_freshness.journal().get() <= source_freshness.journal().get()
+        || target_freshness.journal().get() <= issued.journal().get()
+    {
+        return Err(PersistenceProtocolError::StaleFreshness.into());
+    }
+    Ok(())
+}
+
+fn is_inert_predecessor_lease(
+    tip_binding: RecoveryBinding,
+    tip_freshness: Freshness,
+    lease_binding: RecoveryBinding,
+    lease_freshness: Freshness,
+) -> bool {
+    if tip_binding.profile() != lease_binding.profile()
+        || tip_freshness.registry() != tip_binding.registry()
+        || lease_freshness.registry() != lease_binding.registry()
+        || tip_freshness.boot().get() < lease_freshness.boot().get()
+        || tip_freshness.device().get() < lease_freshness.device().get()
+        || tip_freshness.journal().get() < lease_freshness.journal().get()
+    {
+        return false;
+    }
+
+    // Catalog-only evolution leaves the same recovery domain, so it requires
+    // an exact freshness boundary. Cross-world rollover changes both World and
+    // Registry; its catalog may already have evolved before rollover or evolve
+    // afterwards, but the old lease is still bounded below the current tip.
+    (tip_binding.world() == lease_binding.world()
+        && tip_binding.registry() == lease_binding.registry()
+        && tip_binding.catalog_digest() != lease_binding.catalog_digest()
+        && tip_freshness == lease_freshness)
+        || (tip_binding.world() != lease_binding.world()
+            && tip_binding.registry() != lease_binding.registry()
+            && tip_freshness.boot().get() > lease_freshness.boot().get()
+            && tip_freshness.device().get() > lease_freshness.device().get()
+            && tip_freshness.journal().get() > lease_freshness.journal().get())
 }
 
 fn next_boot<E>(freshness: Freshness) -> Result<BootGeneration, TpmNvAnchorError<E>> {
@@ -1946,86 +2129,6 @@ fn take_u32_response(input: &[u8], cursor: &mut usize) -> Result<u32, TisTpmErro
     ))
 }
 
-/// Runs the dedicated QEMU `tpm-tis` provider profile.
-///
-/// The fixture reserves one recovery epoch and advances one trusted journal
-/// tip per launch. Running the same image twice against one swtpm state
-/// therefore proves that both selectors survive a guest/QEMU restart. The
-/// marker explicitly excludes physical anti-rollback and device-reset
-/// evidence: the host can roll back swtpm's state directory, and this profile
-/// does not own a physical device.
-pub(crate) fn launch() -> ! {
-    assert_eq!(
-        cser_core::standard_catalog().digest(),
-        OSTD_STANDARD_CATALOG_DIGEST,
-        "update the fixed shell genesis projection when the standard catalog changes",
-    );
-    let profile = RecoveryProfile::current();
-    let binding = RecoveryBinding::new(
-        profile,
-        WorldId::new(OSTD_WORLD_ID).expect("fixture World identity is nonzero"),
-        OSTD_STANDARD_CATALOG_DIGEST,
-        RegistryInstance::new(OSTD_REGISTRY_INSTANCE)
-            .expect("fixture Registry identity is nonzero"),
-    )
-    .expect("fixture recovery binding is valid");
-    let transport =
-        QemuTisTpm2::acquire_qemu_fixture().expect("QEMU TPM2 TIS transport must be present");
-    let auth = TpmNvIndexAuth::new(&[]).expect("empty fixture index auth fits");
-    let mut anchor =
-        TpmNvTrustedAnchor::open(transport, TpmNvLayout::qemu_fixture(), auth, binding)
-            .expect("pre-provisioned TPM2 NV anchor must validate");
-
-    let before = anchor.committed();
-    if before.revision() == 0 {
-        assert_eq!(
-            before.projection(),
-            OSTD_GENESIS_PROJECTION,
-            "vNext genesis must be the scoped empty Engine projection",
-        );
-    }
-    let observed_device = anchor.issued.device();
-    let lease = anchor
-        .reserve_recovery_epoch(binding, observed_device)
-        .expect("TPM2 NV recovery epoch reservation must commit");
-    let next_revision = before
-        .revision()
-        .checked_add(1)
-        .expect("fixture revision must not overflow");
-    let mut digest_input = [0; 56];
-    digest_input[..32].copy_from_slice(&before.head().bytes());
-    digest_input[32..40].copy_from_slice(&next_revision.to_be_bytes());
-    digest_input[40..48].copy_from_slice(&lease.next_freshness().boot().get().to_be_bytes());
-    digest_input[48..56].copy_from_slice(&lease.next_freshness().journal().get().to_be_bytes());
-    let next_head = Digest::new(Sha256::digest(digest_input).into());
-    let mut projection_input = [0; 64];
-    projection_input[..32].copy_from_slice(&next_head.bytes());
-    projection_input[32..].copy_from_slice(&OSTD_GENESIS_PROJECTION.bytes());
-    let next_projection = Digest::new(Sha256::digest(projection_input).into());
-    let replacement = TrustedAnchorSnapshot::from_trusted_backend(
-        binding,
-        lease.next_freshness(),
-        next_revision,
-        next_head,
-        next_projection,
-    )
-    .expect("fixture replacement trusted tip is valid");
-    anchor
-        .compare_and_advance(lease.committed(), replacement)
-        .expect("TPM2 NV trusted tip advance must commit");
-
-    println!(
-        "CSER_TPM_NV_QEMU PASS transport=qemu-tis provider=tpm2-nv selectors=tip+lease single_writer_enforced=true writeall=true before_revision={} after_revision={} before_boot={} after_boot={} before_journal={} after_journal={} transition_committed=true physical_antirollback=false swtpm_state_rollbackable=true device_reset_evidence=false journal_payload=absent",
-        before.revision(),
-        replacement.revision(),
-        before.committed_freshness().boot().get(),
-        replacement.committed_freshness().boot().get(),
-        before.committed_freshness().journal().get(),
-        replacement.committed_freshness().journal().get(),
-    );
-    poweroff(ExitCode::Success)
-}
-
 const _: () = {
     assert!(TIP_SLOT_LEN <= u16::MAX as usize);
     assert!(LEASE_SLOT_LEN <= u16::MAX as usize);
@@ -2250,9 +2353,13 @@ mod tests {
     }
 
     fn freshness(boot: u64, device: u64, journal: u64) -> Freshness {
+        freshness_for(boot, 9, device, journal)
+    }
+
+    fn freshness_for(boot: u64, registry: u64, device: u64, journal: u64) -> Freshness {
         Freshness::new(
             BootGeneration::new(boot).unwrap(),
-            RegistryInstance::new(9).unwrap(),
+            RegistryInstance::new(registry).unwrap(),
             DeviceGeneration::new(device).unwrap(),
             JournalGeneration::new(journal).unwrap(),
         )
@@ -2314,6 +2421,20 @@ mod tests {
             .reserve_recovery_epoch(binding(), DeviceGeneration::new(2).unwrap())
             .unwrap();
         assert_eq!(lease.next_freshness(), freshness(2, 2, 2));
+        let stale_replacement = TrustedAnchorSnapshot::from_trusted_backend(
+            binding(),
+            freshness(1, 1, 1),
+            1,
+            digest(12),
+            digest(12),
+        )
+        .unwrap();
+        assert!(matches!(
+            anchor.compare_and_advance(lease.committed(), stale_replacement),
+            Err(TpmNvAnchorError::Protocol(
+                PersistenceProtocolError::StaleFreshness
+            ))
+        ));
         let replacement = TrustedAnchorSnapshot::from_trusted_backend(
             binding(),
             lease.next_freshness(),
@@ -2494,6 +2615,215 @@ mod tests {
                 PersistenceProtocolError::BindingMismatch
             ))
         ));
+    }
+
+    #[ktest]
+    fn catalog_rebind_requires_an_exact_unissued_boundary_and_survives_reopen() {
+        let layout = TpmNvLayout::qemu_fixture();
+        let source = binding();
+        let freshness = freshness(1, 1, 1);
+        let transport = MockNv::provision(layout, 1, source, freshness);
+        let mut anchor = TpmNvTrustedAnchor::open(transport, layout, auth(), source).unwrap();
+        let old = anchor.committed();
+        let target = RecoveryBinding::new(
+            source.profile(),
+            source.world(),
+            digest(8),
+            source.registry(),
+        )
+        .unwrap();
+        let replacement = TrustedAnchorSnapshot::from_trusted_backend(
+            target,
+            freshness,
+            old.revision() + 1,
+            digest(0x31),
+            digest(0x32),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            anchor.compare_and_advance(old, replacement),
+            Err(TpmNvAnchorError::Protocol(
+                PersistenceProtocolError::StaleFreshness
+            ))
+        ));
+        anchor.compare_and_rebind_catalog(old, replacement).unwrap();
+        assert_eq!(anchor.committed(), replacement);
+        assert_eq!(anchor.issued(), freshness);
+
+        let reopened = TpmNvTrustedAnchor::open(anchor.into_transport(), layout, auth(), target)
+            .expect("the unchanged predecessor lease is inert after exact catalog rebind");
+        assert_eq!(reopened.committed(), replacement);
+        assert_eq!(reopened.issued(), freshness);
+    }
+
+    #[ktest]
+    fn world_rebind_preserves_global_lease_monotonicity_and_reopens_after_tip_advance() {
+        let layout = TpmNvLayout::qemu_fixture();
+        let source = binding();
+        let transport = MockNv::provision(layout, 1, source, freshness(3, 3, 3));
+        let mut anchor = TpmNvTrustedAnchor::open(transport, layout, auth(), source).unwrap();
+        let old = anchor.committed();
+        let issued = anchor
+            .reserve_recovery_epoch(source, DeviceGeneration::new(4).unwrap())
+            .unwrap()
+            .next_freshness();
+        assert_eq!(issued, freshness(4, 4, 4));
+        let target = RecoveryBinding::new(
+            source.profile(),
+            WorldId::new(8).unwrap(),
+            source.catalog_digest(),
+            RegistryInstance::new(10).unwrap(),
+        )
+        .unwrap();
+        let reused_device_freshness = freshness_for(1, 10, 1, 1);
+        let reused_device = TrustedAnchorSnapshot::from_trusted_backend(
+            target,
+            reused_device_freshness,
+            1,
+            digest(0x40),
+            digest(0x40),
+        )
+        .unwrap();
+        assert!(matches!(
+            anchor.compare_and_rebind_world(old, reused_device),
+            Err(TpmNvAnchorError::Protocol(
+                PersistenceProtocolError::StaleFreshness
+            ))
+        ));
+
+        let target_freshness = freshness_for(5, 10, 5, 5);
+        let replacement = TrustedAnchorSnapshot::from_trusted_backend(
+            target,
+            target_freshness,
+            1,
+            digest(0x41),
+            digest(0x42),
+        )
+        .unwrap();
+
+        anchor.compare_and_rebind_world(old, replacement).unwrap();
+        assert_eq!(anchor.committed(), replacement);
+        assert_eq!(anchor.issued(), target_freshness);
+        let successor_tip = TrustedAnchorSnapshot::from_trusted_backend(
+            target,
+            target_freshness,
+            2,
+            digest(0x43),
+            digest(0x44),
+        )
+        .unwrap();
+        anchor
+            .compare_and_advance(replacement, successor_tip)
+            .unwrap();
+
+        let reopened = TpmNvTrustedAnchor::open(anchor.into_transport(), layout, auth(), target)
+            .expect("the exact predecessor lease remains inert after successor tip advances");
+        assert_eq!(reopened.committed(), successor_tip);
+        assert_eq!(reopened.issued(), target_freshness);
+    }
+
+    #[ktest]
+    fn catalog_then_world_rebind_reopens_with_the_original_inert_lease() {
+        let layout = TpmNvLayout::qemu_fixture();
+        let source = binding();
+        let source_freshness = freshness(3, 3, 3);
+        let transport = MockNv::provision(layout, 1, source, source_freshness);
+        let mut anchor = TpmNvTrustedAnchor::open(transport, layout, auth(), source).unwrap();
+        let old = anchor.committed();
+        let evolved_catalog = RecoveryBinding::new(
+            source.profile(),
+            source.world(),
+            digest(8),
+            source.registry(),
+        )
+        .unwrap();
+        let catalog_tip = TrustedAnchorSnapshot::from_trusted_backend(
+            evolved_catalog,
+            source_freshness,
+            old.revision() + 1,
+            digest(0x51),
+            digest(0x52),
+        )
+        .unwrap();
+        anchor.compare_and_rebind_catalog(old, catalog_tip).unwrap();
+
+        let successor = RecoveryBinding::new(
+            source.profile(),
+            WorldId::new(8).unwrap(),
+            evolved_catalog.catalog_digest(),
+            RegistryInstance::new(10).unwrap(),
+        )
+        .unwrap();
+        let successor_freshness = freshness_for(4, 10, 4, 4);
+        let world_tip = TrustedAnchorSnapshot::from_trusted_backend(
+            successor,
+            successor_freshness,
+            1,
+            digest(0x53),
+            digest(0x54),
+        )
+        .unwrap();
+        anchor
+            .compare_and_rebind_world(catalog_tip, world_tip)
+            .unwrap();
+
+        let reopened = TpmNvTrustedAnchor::open(anchor.into_transport(), layout, auth(), successor)
+            .expect("original catalog/world lease is inert below successor tip");
+        assert_eq!(reopened.committed(), world_tip);
+        assert_eq!(reopened.issued(), successor_freshness);
+    }
+
+    #[ktest]
+    fn world_then_catalog_rebind_reopens_with_the_original_inert_lease() {
+        let layout = TpmNvLayout::qemu_fixture();
+        let source = binding();
+        let source_freshness = freshness(3, 3, 3);
+        let transport = MockNv::provision(layout, 1, source, source_freshness);
+        let mut anchor = TpmNvTrustedAnchor::open(transport, layout, auth(), source).unwrap();
+        let old = anchor.committed();
+        let successor = RecoveryBinding::new(
+            source.profile(),
+            WorldId::new(8).unwrap(),
+            source.catalog_digest(),
+            RegistryInstance::new(10).unwrap(),
+        )
+        .unwrap();
+        let successor_freshness = freshness_for(4, 10, 4, 4);
+        let world_tip = TrustedAnchorSnapshot::from_trusted_backend(
+            successor,
+            successor_freshness,
+            1,
+            digest(0x61),
+            digest(0x62),
+        )
+        .unwrap();
+        anchor.compare_and_rebind_world(old, world_tip).unwrap();
+
+        let evolved_catalog = RecoveryBinding::new(
+            successor.profile(),
+            successor.world(),
+            digest(8),
+            successor.registry(),
+        )
+        .unwrap();
+        let catalog_tip = TrustedAnchorSnapshot::from_trusted_backend(
+            evolved_catalog,
+            successor_freshness,
+            world_tip.revision() + 1,
+            digest(0x63),
+            digest(0x64),
+        )
+        .unwrap();
+        anchor
+            .compare_and_rebind_catalog(world_tip, catalog_tip)
+            .unwrap();
+
+        let reopened =
+            TpmNvTrustedAnchor::open(anchor.into_transport(), layout, auth(), evolved_catalog)
+                .expect("original world lease is inert below evolved successor tip");
+        assert_eq!(reopened.committed(), catalog_tip);
+        assert_eq!(reopened.issued(), successor_freshness);
     }
 
     #[ktest]

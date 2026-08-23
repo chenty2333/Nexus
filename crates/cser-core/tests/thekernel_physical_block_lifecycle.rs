@@ -56,7 +56,9 @@ struct BlockReceipt {
     resource: cser_core::ResourceId,
     resource_generation: ResourceGeneration,
     subject: Freshness,
+    subject_binding: cser_core::ExecutorBinding,
     observation: Freshness,
+    observation_binding: cser_core::ExecutorBinding,
     queue: cser_core::ResourceId,
     queue_generation: ResourceGeneration,
     request: cser_core::ResourceId,
@@ -109,6 +111,8 @@ impl ReceiptVerifier for BlockVerifier {
             || receipt.resource != challenge.resource()
             || receipt.resource_generation != challenge.resource_generation()
             || receipt.subject != challenge.subject()
+            || receipt.subject_binding != challenge.subject_binding()
+            || receipt.observation_binding != challenge.current_binding()
             || receipt.queue != self.queue
             || receipt.queue_generation != self.queue_generation
             || receipt.request != self.request
@@ -122,9 +126,11 @@ impl ReceiptVerifier for BlockVerifier {
         {
             return Err(VerificationError::Rejected);
         }
-        Ok(VerifiedObservation::new(
+        Ok(VerifiedObservation::new_bound(
             receipt.subject,
+            receipt.subject_binding,
             receipt.observation,
+            receipt.observation_binding,
             receipt.digest,
         ))
     }
@@ -783,7 +789,9 @@ fn evidence_command_with_verifier_generations(
             resource: challenge.resource(),
             resource_generation: challenge.resource_generation(),
             subject,
+            subject_binding: challenge.subject_binding(),
             observation,
+            observation_binding: challenge.current_binding(),
             device_generation: subject.device(),
             queue: resource(queue),
             queue_generation,
@@ -819,7 +827,9 @@ fn evidence_command_with_verifier_generations(
         resource: challenge.resource(),
         resource_generation: challenge.resource_generation(),
         subject,
+        subject_binding: challenge.subject_binding(),
         observation,
+        observation_binding: challenge.current_binding(),
         queue: resource(queue),
         queue_generation,
         request: resource(request),

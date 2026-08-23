@@ -59,8 +59,8 @@ impl ProviderPhase {
         matches!(self, Self::Active)
     }
 
-    const fn is_retired(self) -> bool {
-        matches!(self, Self::Retired)
+    const fn allows_successor(self) -> bool {
+        matches!(self, Self::SettlementOnly | Self::Retired)
     }
 }
 
@@ -222,8 +222,6 @@ pub enum ArtifactError {
     InvalidPhaseTransition,
     /// An effect identity is already used.
     EffectAlreadyExists,
-    /// An operation identity is already used.
-    OperationAlreadyExists,
     /// An effect identity is unknown.
     UnknownEffect,
     /// A component identity is not part of the effect.
@@ -295,7 +293,6 @@ pub struct RecoveryArtifactOracle {
     current: BTreeMap<ProviderId, ProviderGeneration>,
     providers: BTreeMap<(ProviderId, ProviderGeneration), ProviderRecord>,
     effects: BTreeMap<EffectId, EffectRecord>,
-    operations: BTreeMap<OperationId, EffectId>,
     artifacts: BTreeMap<ArtifactId, ArtifactRecord>,
 }
 
@@ -310,7 +307,6 @@ impl RecoveryArtifactOracle {
             current: BTreeMap::new(),
             providers: BTreeMap::new(),
             effects: BTreeMap::new(),
-            operations: BTreeMap::new(),
             artifacts: BTreeMap::new(),
         }
     }
@@ -344,7 +340,7 @@ impl RecoveryArtifactOracle {
             && self
                 .providers
                 .get(&(provider, old_generation))
-                .is_none_or(|record| !record.phase.is_retired())
+                .is_none_or(|record| !record.phase.allows_successor())
         {
             return Err(ArtifactError::GenerationStillLive);
         }
@@ -373,14 +369,10 @@ impl RecoveryArtifactOracle {
         if self.effects.contains_key(&effect) {
             return Err(ArtifactError::EffectAlreadyExists);
         }
-        let operation = effect.operation();
-        if self.operations.contains_key(&operation) {
-            return Err(ArtifactError::OperationAlreadyExists);
-        }
         if components.is_empty() || components.iter().any(|component| component.get() == 0) {
             return Err(ArtifactError::InvalidIdentity);
         }
-        let provider_record = self.provider_record(provider, generation)?;
+        let provider_record = self.current_provider_record(provider, generation)?;
         if !provider_record.phase.admits_execution() {
             return Err(ArtifactError::WrongProviderPhase);
         }
@@ -411,7 +403,6 @@ impl RecoveryArtifactOracle {
                 components: component_records,
             },
         );
-        self.operations.insert(operation, effect);
         self.bump_revision();
         Ok(())
     }
@@ -471,7 +462,7 @@ impl RecoveryArtifactOracle {
     ) -> Result<(), ArtifactError> {
         let (provider, generation) = self.effect_coordinate(effect)?;
         if !self
-            .provider_record(provider, generation)?
+            .current_provider_record(provider, generation)?
             .phase
             .admits_execution()
         {
@@ -501,7 +492,7 @@ impl RecoveryArtifactOracle {
     ) -> Result<(), ArtifactError> {
         let (provider, generation) = self.effect_coordinate(effect)?;
         if !self
-            .provider_record(provider, generation)?
+            .current_provider_record(provider, generation)?
             .phase
             .admits_execution()
         {
@@ -847,7 +838,7 @@ impl RecoveryArtifactOracle {
             if provider.provider != key.0
                 || provider.generation != key.1
                 || self.world.get() == 0
-                || provider.phase.is_retired()
+                || matches!(provider.phase, ProviderPhase::Retired)
                     && self.effects.values().any(|effect| {
                         effect.provider == provider.provider
                             && effect.generation == provider.generation
@@ -902,10 +893,27 @@ impl RecoveryArtifactOracle {
                 _ => return false,
             }
         }
+        for (provider, high) in &self.high_water {
+            let Some(current) = self.current.get(provider) else {
+                return false;
+            };
+            if *high < *current
+                || self
+                    .providers
+                    .iter()
+                    .any(|((candidate, generation), record)| {
+                        candidate == provider
+                            && generation < current
+                            && !record.phase.allows_successor()
+                    })
+            {
+                return false;
+            }
+        }
         true
     }
 
-    fn provider_record(
+    fn current_provider_record(
         &self,
         provider: ProviderId,
         generation: ProviderGeneration,
@@ -917,6 +925,14 @@ impl RecoveryArtifactOracle {
                 ArtifactError::UnknownProvider
             });
         }
+        self.provider_record(provider, generation)
+    }
+
+    fn provider_record(
+        &self,
+        provider: ProviderId,
+        generation: ProviderGeneration,
+    ) -> Result<&ProviderRecord, ArtifactError> {
         self.providers
             .get(&(provider, generation))
             .ok_or(ArtifactError::UnknownProvider)
@@ -927,7 +943,6 @@ impl RecoveryArtifactOracle {
         provider: ProviderId,
         generation: ProviderGeneration,
     ) -> Result<&mut ProviderRecord, ArtifactError> {
-        self.provider_record(provider, generation)?;
         self.providers
             .get_mut(&(provider, generation))
             .ok_or(ArtifactError::UnknownProvider)
@@ -1312,6 +1327,88 @@ mod tests {
         oracle
             .release_component(fixture.effect, fixture.component)
             .unwrap();
+        oracle
+            .retire_provider(fixture.provider, fixture.generation)
+            .unwrap();
+        assert!(oracle.check_invariants());
+    }
+
+    #[test]
+    fn same_operation_artifacts_and_claims_drain_by_exact_effect() {
+        let fixture = fixture();
+        let child =
+            EffectId::new(fixture.effect.operation(), fixture.effect.sequence() + 1).unwrap();
+        let child_lease = ArtifactId::new(fixture.lease.get() + 1).unwrap();
+        let child_owner = ArtifactOwner {
+            effect: child,
+            ..fixture.owner
+        };
+        let mut oracle = admitted(&fixture);
+        oracle
+            .admit_effect(
+                child,
+                fixture.provider,
+                fixture.generation,
+                &[fixture.component],
+            )
+            .unwrap();
+        for (lease, owner) in [(fixture.lease, fixture.owner), (child_lease, child_owner)] {
+            oracle.require_artifact(lease, owner).unwrap();
+            oracle.pin_artifact(lease, owner).unwrap();
+        }
+        assert_eq!(oracle.projection().providers[0].live_effects, 2);
+
+        for effect in [fixture.effect, child] {
+            oracle.commit_intent(effect, fixture.component).unwrap();
+            oracle.execute(effect, fixture.component).unwrap();
+        }
+        oracle
+            .fence_provider(fixture.provider, fixture.generation)
+            .unwrap();
+        for effect in [fixture.effect, child] {
+            oracle.record_outcome(effect, fixture.component).unwrap();
+            oracle.settle(effect, fixture.component).unwrap();
+        }
+
+        assert_eq!(
+            oracle.retire_claims(child, fixture.component),
+            Err(ArtifactError::PhysicalRetirementRequired)
+        );
+        oracle
+            .retire_physical(fixture.effect, fixture.component)
+            .unwrap();
+        oracle
+            .retire_claims(fixture.effect, fixture.component)
+            .unwrap();
+        let first_permit = oracle
+            .authorize_artifact_release(fixture.lease, fixture.owner)
+            .unwrap();
+        oracle.confirm_artifact_released(first_permit).unwrap();
+        oracle
+            .release_component(fixture.effect, fixture.component)
+            .unwrap();
+
+        oracle
+            .enter_settlement_only(fixture.provider, fixture.generation)
+            .unwrap();
+        oracle
+            .register_provider(
+                fixture.provider,
+                ProviderGeneration::new(fixture.generation.get() + 1).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            oracle.retire_provider(fixture.provider, fixture.generation),
+            Err(ArtifactError::LiveObligationsRemain)
+        );
+
+        oracle.retire_physical(child, fixture.component).unwrap();
+        oracle.retire_claims(child, fixture.component).unwrap();
+        let child_permit = oracle
+            .authorize_artifact_release(child_lease, child_owner)
+            .unwrap();
+        oracle.confirm_artifact_released(child_permit).unwrap();
+        oracle.release_component(child, fixture.component).unwrap();
         oracle
             .retire_provider(fixture.provider, fixture.generation)
             .unwrap();

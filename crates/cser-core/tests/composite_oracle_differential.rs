@@ -103,6 +103,7 @@ enum NormalizedEscape {
 struct NormalizedClaim {
     resource: Option<u64>,
     old_generation: Option<u64>,
+    enrolled_binding: Option<NormalizedClaimBinding>,
     high_water: Option<u64>,
     units: u64,
     old_tombstone: bool,
@@ -114,12 +115,19 @@ impl NormalizedClaim {
     const ABSENT: Self = Self {
         resource: None,
         old_generation: None,
+        enrolled_binding: None,
         high_water: None,
         units: 0,
         old_tombstone: false,
         lifecycle: NormalizedClaimLifecycle::Absent,
         permit: None,
     };
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NormalizedClaimBinding {
+    executor: OracleExecutorCoordinate,
+    authority_epoch: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -302,7 +310,9 @@ fn component_evidence_command(
         resource: challenge.resource(),
         resource_generation: challenge.resource_generation(),
         subject: challenge.subject(),
+        subject_binding: challenge.subject_binding(),
         observation,
+        observation_binding: challenge.current_binding(),
         digest: digest(marker),
     };
     harness
@@ -538,6 +548,7 @@ fn core_claim(
     assert_eq!(original_claim.resource, coordinates.resource);
     assert_eq!(original_claim.resource_generation, resource_generation(1));
     assert_eq!(original_claim.units, 1);
+    let enrolled_binding = original_claim.enrolled_binding;
 
     let stage = reuse_index(index)
         .map(|reuse| context.reuse[reuse])
@@ -588,6 +599,10 @@ fn core_claim(
     NormalizedClaim {
         resource: Some(coordinates.resource.get()),
         old_generation: Some(1),
+        enrolled_binding: Some(NormalizedClaimBinding {
+            executor: oracle_executor(enrolled_binding.executor()),
+            authority_epoch: enrolled_binding.authority_epoch(),
+        }),
         high_water: Some(high_water),
         units: original_claim.units,
         old_tombstone: original_claim.retired,
@@ -628,6 +643,10 @@ fn oracle_claim(
     NormalizedClaim {
         resource: Some(coordinates.resource.get()),
         old_generation: Some(projection.enrolled_generation),
+        enrolled_binding: Some(NormalizedClaimBinding {
+            executor: projection.enrolled_executor,
+            authority_epoch: projection.enrolled_authority_epoch,
+        }),
         high_water: Some(high_water),
         units: 1,
         old_tombstone,
@@ -1055,27 +1074,14 @@ fn assert_failed_core_command_is_atomic(
     );
 }
 
-fn assert_unnecessary_rebase_is_atomic(harness: &mut Harness, command: Command, label: &str) {
-    let before = (
-        harness.engine.revision(),
-        harness.engine.head(),
-        harness.engine.projection_digest(),
-        harness.journal.len(),
-    );
+fn assert_executor_binding_rebase(harness: &mut Harness, command: Command, label: &str) {
+    let receipt = harness
+        .tx(command)
+        .unwrap_or_else(|error| panic!("{label}: executor binding rebase failed: {error:?}"));
     assert_eq!(
-        harness.tx(command),
-        Err(CoreError::StaleEvidence),
-        "{label}: executor adoption alone must not age scoped claim freshness"
-    );
-    assert_eq!(
-        (
-            harness.engine.revision(),
-            harness.engine.head(),
-            harness.engine.projection_digest(),
-            harness.journal.len(),
-        ),
-        before,
-        "{label}: rejected rebase must not mutate or append"
+        receipt.event(),
+        cser_core::TransitionEvent::CompositePrecommitClaimsRebased,
+        "{label}: replacement must rebind enrolled claim authority"
     );
 }
 
@@ -1243,7 +1249,7 @@ fn provider_scoped_core_and_independent_oracle_match_every_durable_prefix() {
         .adopt_effect(oracle.observe_authority().unwrap())
         .unwrap();
     assert_checkpoint(&harness, &oracle, original, context, "precommit-adopt");
-    assert_unnecessary_rebase_is_atomic(
+    assert_executor_binding_rebase(
         &mut harness,
         Command::RebaseCompositePrecommitClaims {
             effect: original,
@@ -1251,6 +1257,9 @@ fn provider_scoped_core_and_independent_oracle_match_every_durable_prefix() {
         },
         "precommit claim rebase without a freshness change",
     );
+    oracle
+        .rebase_precommit_claims(oracle.observe_authority().unwrap())
+        .unwrap();
     assert_checkpoint(
         &harness,
         &oracle,
@@ -1705,7 +1714,7 @@ fn provider_scoped_core_and_independent_oracle_match_every_durable_prefix() {
             .unwrap();
     }
 
-    assert_unnecessary_rebase_is_atomic(
+    assert_executor_binding_rebase(
         &mut harness,
         Command::RebaseCompositePrecommitClaims {
             effect: target,

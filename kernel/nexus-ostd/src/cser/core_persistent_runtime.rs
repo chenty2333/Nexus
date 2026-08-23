@@ -33,14 +33,14 @@ use cser_core::{
     CoordinatedPersistence, CoreError, CoreLimits, CustodyState, DEVICE_CLAIM_IOVA,
     DEVICE_CLAIM_PINNED_PAGE, DEVICE_CLAIM_QUEUE_SLOT, DEVICE_DOMAIN, DEVICE_EVIDENCE_IOTLB,
     DEVICE_EVIDENCE_IRQ_DRAINED, DEVICE_EVIDENCE_RESET, DEVICE_OBLIGATION_DMA,
-    DMA_ARENA_REUSE_COMPOSITE, Digest, EffectEscapeState, EffectId, Engine, ExecutorCoordinate,
-    ExecutorGeneration, ExecutorId, JOURNAL_SCHEMA_VERSION, OperationId, OperationRecoveryState,
-    OutcomeState, PROJECTION_VERSION, ProviderEffectState, RECOVERY_SNAPSHOT_VERSION,
-    REPLY_CLAIM_PUBLICATION_SLOT, REPLY_DOMAIN, REPLY_EVIDENCE_PUBLICATION_ACK,
-    REPLY_OBLIGATION_PUBLICATION, RecoveryBinding, RecoveryProfile, RegistryInstance,
-    ResourceGeneration, ResourceId, RetirementState, ReusePermit, STANDARD_CATALOG_VERSION,
-    SettlementClaim, SettlementState, SnapshotId, TransitionDurability, TransitionOutput,
-    TransitionReceipt, TxError, standard_catalog,
+    DMA_ARENA_REUSE_COMPOSITE, Digest, EffectEscapeState, EffectId, Engine, ExecutorBinding,
+    ExecutorCoordinate, ExecutorGeneration, ExecutorId, JOURNAL_SCHEMA_VERSION, OperationId,
+    OperationRecoveryState, OutcomeState, PROJECTION_VERSION, ProviderEffectState,
+    RECOVERY_SNAPSHOT_VERSION, REPLY_CLAIM_PUBLICATION_SLOT, REPLY_DOMAIN,
+    REPLY_EVIDENCE_PUBLICATION_ACK, REPLY_OBLIGATION_PUBLICATION, RecoveryBinding, RecoveryProfile,
+    RegistryInstance, ResourceGeneration, ResourceId, RetirementState, ReusePermit,
+    STANDARD_CATALOG_VERSION, SettlementClaim, SettlementState, SnapshotId, TransitionDurability,
+    TransitionOutput, TransitionReceipt, TxError, standard_catalog,
 };
 use nexus_ostd_virtio::{
     BootQuarantineGuard, MaskedIntx, OwnerKind, PersistentDmaArenaLayout, ProductionDevice,
@@ -57,7 +57,8 @@ use ostd::{
 
 use super::{
     core_device_quarantine::{
-        OstdBootClaimVerifier, OstdBootIrqVerifier, QemuArenaIotlbVerifier,
+        OstdBootClaimVerifier, OstdBootIrqVerifier, OstdBootReceiptCurrent, QemuArenaIotlbVerifier,
+        bind_replayed_iotlb_receipt, bind_replayed_irq_receipt, bind_replayed_reset_receipt,
         project_replayed_component_claim,
     },
     core_dma_adapter::{
@@ -71,10 +72,10 @@ use super::{
         PortalResponseBody,
     },
     core_production_registry::{
-        InstalledCore, PRODUCTION_WORLD, ProductionCoreOwner, ProductionIngressError,
-        ProductionIngressExitObserver, ProductionIngressIdentity, ProductionIngressTaskData,
-        ProductionRegistryError, STANDARD_DMA_PROVIDER, STANDARD_REPLY_PROVIDER,
-        standard_verifier_bindings,
+        InstalledCore, PRODUCTION_WORLD, ProductionCoreOwner, ProductionIngressCloseTokenInstaller,
+        ProductionIngressError, ProductionIngressExitObserver, ProductionIngressIdentity,
+        ProductionIngressTaskData, ProductionRegistryError, STANDARD_DMA_PROVIDER,
+        STANDARD_REPLY_PROVIDER, standard_verifier_bindings,
     },
     core_qemu_persistent_boot::{
         PreparedQemuPersistentBoot, QemuPersistentAnchor, QemuPersistentBootError,
@@ -280,6 +281,7 @@ struct ProductionServiceRun {
     exits: Arc<ProductionServiceExitInbox>,
     result: Arc<OneShot<Result<(), &'static str>>>,
     identity: ProductionServiceIdentity,
+    close_token: ProductionIngressCloseTokenInstaller,
 }
 
 struct InitialCompositeOutput {
@@ -599,7 +601,8 @@ where
             control: Arc::downgrade(&control),
             inbox: Arc::downgrade(&exits),
         });
-    let task_data = ProductionIngressTaskData::new(owner, identity.ingress, exit_observer);
+    let (task_data, close_token) =
+        ProductionIngressTaskData::new(owner, identity.ingress, exit_observer);
     let task = Arc::new(
         TaskOptions::new(move || {
             let entered = task_control.advance(SERVICE_CREATED, SERVICE_ENTERED);
@@ -627,6 +630,7 @@ where
         exits,
         result,
         identity,
+        close_token,
     })
 }
 
@@ -635,7 +639,7 @@ fn open_initial_service<S>(
     run: &ProductionServiceRun,
 ) -> Result<(), &'static str> {
     owner
-        .open_ingress(run.identity.ingress)
+        .open_ingress(run.identity.ingress, &run.close_token)
         .map_err(|_| "initial-service-ingress-open")?;
     run.control.mark_ingress_open()?;
     run.task.run();
@@ -675,7 +679,7 @@ where
             .map_err(|_| "service-rebind")?,
     )?;
     owner
-        .open_ingress(run.identity.ingress)
+        .open_ingress(run.identity.ingress, &run.close_token)
         .map_err(|_| "service-ingress-open-after-rebind")?;
     run.control.mark_ingress_open()?;
     run.control.advance(SERVICE_READY, SERVICE_REBOUND)
@@ -2801,8 +2805,23 @@ where
             if result.wait_take_bounded() != Some(Ok(REPLY_VALUE)) {
                 return Err("reply-client-result");
             }
+            let challenge = ingress
+                .observe(|engine| {
+                    engine.component_evidence_challenge(
+                        operation_effect(),
+                        AGENT_COMPONENT_REPLY,
+                        reply_claim(),
+                        REPLY_EVIDENCE_PUBLICATION_ACK,
+                    )
+                })?
+                .map_err(|_| "reply-durable-retirement-challenge")?;
             outbox
-                .record_acknowledgement(plan, apply)
+                .record_acknowledgement(
+                    plan,
+                    apply,
+                    challenge.subject_binding(),
+                    challenge.current_binding(),
+                )
                 .map_err(|_| "reply-durable-ack")?
         }
     };
@@ -3020,11 +3039,15 @@ fn reconcile_dma_tombstones(
             .installed()
             .inspect_with_guard(|_, guard| project_replayed_component_claim(guard, claim))
             .map_err(|_| "dma-quarantine-projection")?;
-        let (reset, irq, iotlb) = receipts.into_parts();
-        if iotlb.resource_reuse_authorized() {
+        let (raw_reset, raw_irq, raw_iotlb) = receipts.into_parts();
+        if raw_iotlb.resource_reuse_authorized() {
             return Err("dma-global-iotlb-overclaimed-reuse");
         }
         if reset_missing {
+            let current = owner
+                .observe_engine(|engine| boot_receipt_current(engine, claim.effect))
+                .map_err(|_| "dma-quarantine-current-binding")?;
+            let reset = bind_replayed_reset_receipt(raw_reset, claim, current);
             let command = owner
                 .observe_engine(|engine| {
                     engine.verify_component_retirement_evidence(
@@ -3042,6 +3065,10 @@ fn reconcile_dma_tombstones(
             report.reset_submitted += 1;
         }
         if irq_missing {
+            let current = owner
+                .observe_engine(|engine| boot_receipt_current(engine, claim.effect))
+                .map_err(|_| "dma-quarantine-current-binding")?;
+            let irq = bind_replayed_irq_receipt(raw_irq, claim, current);
             let irq_command = owner
                 .observe_engine(|engine| {
                     engine.verify_component_retirement_evidence(
@@ -3059,6 +3086,10 @@ fn reconcile_dma_tombstones(
             report.irq_submitted += 1;
         }
         if iotlb_missing {
+            let current = owner
+                .observe_engine(|engine| boot_receipt_current(engine, claim.effect))
+                .map_err(|_| "dma-quarantine-current-binding")?;
+            let iotlb = bind_replayed_iotlb_receipt(raw_iotlb, claim, current);
             let verifier = QemuArenaIotlbVerifier::new_component(
                 claim,
                 layout,
@@ -3089,6 +3120,35 @@ fn reconcile_dma_tombstones(
         return Err("dma-resource-reuse-boundary");
     }
     Ok(report)
+}
+
+/// Derives the receipt's current authority from durable Engine projections,
+/// rather than reading the verifier challenge and copying its fields back into
+/// the receipt.  This is the exact authority that the subsequent challenge
+/// independently reconstructs.
+fn boot_receipt_current(
+    engine: &Engine,
+    effect: EffectId,
+) -> Result<OstdBootReceiptCurrent, &'static str> {
+    let composite = engine
+        .composite_effect(effect)
+        .ok_or("dma-quarantine-composite")?;
+    let executor = match engine.operation(effect.operation()) {
+        Some(OperationRecoveryState::Active { executor }) => executor,
+        Some(OperationRecoveryState::Fenced { crashed, .. }) => crashed,
+        Some(OperationRecoveryState::Ready { successor, .. })
+        | Some(OperationRecoveryState::Rebound { successor }) => successor,
+        Some(OperationRecoveryState::Snapshotted { .. }) => {
+            return Err("dma-quarantine-operation-snapshotted");
+        }
+        Some(OperationRecoveryState::RecoveryExhausted { .. }) => {
+            return Err("dma-quarantine-operation-exhausted");
+        }
+        None => return Err("dma-quarantine-operation-absent"),
+    };
+    let binding = ExecutorBinding::new(executor, composite.authority_epoch)
+        .map_err(|_| "dma-quarantine-binding")?;
+    Ok(OstdBootReceiptCurrent::new(engine.freshness(), binding))
 }
 
 fn validate_dma_reuse_boundary(

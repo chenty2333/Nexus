@@ -14,12 +14,12 @@ use core::sync::atomic::{AtomicU8, Ordering};
 use cser_core::ProviderCoordinate;
 use cser_core::{
     ClaimId, ClaimScope, ComponentId, CoreError, Digest, EffectFactChallenge, EffectFactKind,
-    EffectReceiptVerifier, Engine, EvidenceChallenge, REPLY_APPLY_RECEIPT_SCHEMA, REPLY_DOMAIN,
-    REPLY_EVIDENCE_PUBLICATION_ACK, REPLY_OBLIGATION_PUBLICATION, REPLY_RECEIPT_SCHEMA,
-    REPLY_SETTLEMENT_RECEIPT_SCHEMA, REPLY_VERIFIER, ReceiptSchemaId, ReceiptVerifier,
-    ResourceGeneration, ResourceId, SettlementClaim, VerificationError, VerifiedApplyReceipt,
-    VerifiedEffectObservation, VerifiedObservation, VerifiedRetirementEvidence,
-    VerifiedSettlementAck, VerifierIdentity,
+    EffectReceiptVerifier, Engine, EvidenceChallenge, ExecutorBinding, REPLY_APPLY_RECEIPT_SCHEMA,
+    REPLY_DOMAIN, REPLY_EVIDENCE_PUBLICATION_ACK, REPLY_OBLIGATION_PUBLICATION,
+    REPLY_RECEIPT_SCHEMA, REPLY_SETTLEMENT_RECEIPT_SCHEMA, REPLY_VERIFIER, ReceiptSchemaId,
+    ReceiptVerifier, ResourceGeneration, ResourceId, SettlementClaim, VerificationError,
+    VerifiedApplyReceipt, VerifiedEffectObservation, VerifiedObservation,
+    VerifiedRetirementEvidence, VerifiedSettlementAck, VerifierIdentity,
 };
 #[cfg(not(feature = "cser-production"))]
 use cser_core::{ProviderGeneration, ProviderId, WorldId};
@@ -135,12 +135,20 @@ impl ReplyPlan {
         apply_digest(self)
     }
 
-    pub(crate) fn acknowledgement_digest(self) -> Digest {
-        ack_digest(self)
+    pub(crate) fn acknowledgement_digest(
+        self,
+        subject_binding: ExecutorBinding,
+        current_binding: ExecutorBinding,
+    ) -> Digest {
+        ack_digest(self, subject_binding, current_binding)
     }
 
-    pub(crate) fn retirement_receipt_digest(self) -> Digest {
-        retirement_digest(self)
+    pub(crate) fn retirement_receipt_digest(
+        self,
+        subject_binding: ExecutorBinding,
+        current_binding: ExecutorBinding,
+    ) -> Digest {
+        retirement_digest(self, subject_binding, current_binding)
     }
 }
 
@@ -200,6 +208,8 @@ pub(crate) struct ReplyApplyObservation {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ReplyAckObservation {
     plan: ReplyPlan,
+    subject_binding: ExecutorBinding,
+    current_binding: ExecutorBinding,
     digest: Digest,
 }
 
@@ -403,6 +413,8 @@ impl ReplyCustody {
     pub(crate) fn observe_ack(
         &self,
         plan: ReplyPlan,
+        subject_binding: ExecutorBinding,
+        current_binding: ExecutorBinding,
     ) -> Result<ReplyAckObservation, ReplyAckError> {
         if plan.coordinate != self.coordinate {
             return Err(ReplyAckError::MissingPublication);
@@ -413,7 +425,7 @@ impl ReplyCustody {
         let published = *self.state.published.lock();
         match published {
             Some(PublishedReply { plan: observed }) if observed == plan => {
-                Ok(ack_observation(observed))
+                Ok(ack_observation(observed, subject_binding, current_binding))
             }
             _ => Err(ReplyAckError::MissingPublication),
         }
@@ -539,7 +551,12 @@ impl EffectReceiptVerifier for ReplyAckVerifier<'_> {
             || !reply_challenge_scope_matches(challenge, REPLY_SETTLEMENT_RECEIPT_SCHEMA)
             || challenge.predecessor() != Some(apply_digest(receipt.plan))
             || receipt.plan.coordinate != self.custody.coordinate
-            || receipt.digest != ack_digest(receipt.plan)
+            || receipt.digest
+                != ack_digest(
+                    receipt.plan,
+                    receipt.subject_binding,
+                    receipt.current_binding,
+                )
             || self.custody.state.phase.load(Ordering::Acquire) != REPLY_ACKNOWLEDGED
             || *self.custody.state.published.lock() != Some(PublishedReply { plan: receipt.plan })
         {
@@ -582,16 +599,29 @@ impl ReceiptVerifier for ReplyRetirementVerifier<'_> {
             || challenge.resource_generation() != self.custody.coordinate.resource_generation
             || !reply_evidence_scope_matches(challenge, REPLY_RECEIPT_SCHEMA)
             || receipt.plan.coordinate != self.custody.coordinate
-            || receipt.digest != ack_digest(receipt.plan)
+            || receipt.digest
+                != ack_digest(
+                    receipt.plan,
+                    receipt.subject_binding,
+                    receipt.current_binding,
+                )
+            || receipt.subject_binding != challenge.subject_binding()
+            || receipt.current_binding != challenge.current_binding()
             || self.custody.state.phase.load(Ordering::Acquire) != REPLY_ACKNOWLEDGED
             || *self.custody.state.published.lock() != Some(PublishedReply { plan: receipt.plan })
         {
             return Err(VerificationError::Rejected);
         }
-        Ok(VerifiedObservation::new(
+        Ok(VerifiedObservation::new_bound(
             challenge.subject(),
+            receipt.subject_binding,
             challenge.current_observation(),
-            retirement_digest(receipt.plan),
+            receipt.current_binding,
+            retirement_digest(
+                receipt.plan,
+                receipt.subject_binding,
+                receipt.current_binding,
+            ),
         ))
     }
 }
@@ -671,10 +701,16 @@ fn apply_observation(plan: ReplyPlan) -> ReplyApplyObservation {
     }
 }
 
-fn ack_observation(plan: ReplyPlan) -> ReplyAckObservation {
+fn ack_observation(
+    plan: ReplyPlan,
+    subject_binding: ExecutorBinding,
+    current_binding: ExecutorBinding,
+) -> ReplyAckObservation {
     ReplyAckObservation {
         plan,
-        digest: ack_digest(plan),
+        subject_binding,
+        current_binding,
+        digest: ack_digest(plan, subject_binding, current_binding),
     }
 }
 
@@ -682,12 +718,30 @@ fn apply_digest(plan: ReplyPlan) -> Digest {
     hash_receipt(b"nexus.ostd.cser-core.reply-apply.v1", plan)
 }
 
-fn ack_digest(plan: ReplyPlan) -> Digest {
-    hash_receipt(b"nexus.ostd.cser-core.reply-ack.v1", plan)
+fn ack_digest(
+    plan: ReplyPlan,
+    subject_binding: ExecutorBinding,
+    current_binding: ExecutorBinding,
+) -> Digest {
+    hash_bound_receipt(
+        b"nexus.ostd.cser-core.reply-ack.v1",
+        plan,
+        subject_binding,
+        current_binding,
+    )
 }
 
-fn retirement_digest(plan: ReplyPlan) -> Digest {
-    hash_receipt(b"nexus.ostd.cser-core.reply-retirement.v1", plan)
+fn retirement_digest(
+    plan: ReplyPlan,
+    subject_binding: ExecutorBinding,
+    current_binding: ExecutorBinding,
+) -> Digest {
+    hash_bound_receipt(
+        b"nexus.ostd.cser-core.reply-retirement.v1",
+        plan,
+        subject_binding,
+        current_binding,
+    )
 }
 
 fn hash_receipt(domain: &[u8], plan: ReplyPlan) -> Digest {
@@ -698,6 +752,24 @@ fn hash_receipt(domain: &[u8], plan: ReplyPlan) -> Digest {
     hasher.update(plan.value.to_le_bytes());
     hasher.update(plan.intent_digest.bytes());
     hasher.update(plan.payload_digest.bytes());
+    Digest::new(hasher.finalize().into())
+}
+
+fn hash_bound_receipt(
+    domain: &[u8],
+    plan: ReplyPlan,
+    subject_binding: ExecutorBinding,
+    current_binding: ExecutorBinding,
+) -> Digest {
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    hash_coordinate(&mut hasher, plan.coordinate);
+    hasher.update(plan.publication_sequence.to_le_bytes());
+    hasher.update(plan.value.to_le_bytes());
+    hasher.update(plan.intent_digest.bytes());
+    hasher.update(plan.payload_digest.bytes());
+    hash_executor_binding(&mut hasher, subject_binding);
+    hash_executor_binding(&mut hasher, current_binding);
     Digest::new(hasher.finalize().into())
 }
 
@@ -723,4 +795,10 @@ fn hash_coordinate(hasher: &mut Sha256, coordinate: ReplyCoordinate) {
     hasher.update(coordinate.claim.get().to_le_bytes());
     hasher.update(coordinate.resource.get().to_le_bytes());
     hasher.update(coordinate.resource_generation.get().to_le_bytes());
+}
+
+fn hash_executor_binding(hasher: &mut Sha256, binding: ExecutorBinding) {
+    hasher.update(binding.executor().executor().get().to_le_bytes());
+    hasher.update(binding.executor().generation().get().to_le_bytes());
+    hasher.update(binding.authority_epoch().to_le_bytes());
 }

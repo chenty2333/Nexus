@@ -11,9 +11,7 @@
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
-use crate::{
-    ComponentId, EffectId, OperationId, ProviderCoordinate, ProviderGeneration, ProviderId, WorldId,
-};
+use crate::{ComponentId, EffectId, ProviderCoordinate, ProviderGeneration, ProviderId, WorldId};
 
 /// Maximum number of components in this bounded composite profile.
 pub const MAX_COMPONENTS: usize = 4;
@@ -61,10 +59,10 @@ impl ProviderPhase {
         matches!(self, Self::Active { .. })
     }
 
-    /// Returns whether the phase is permanently retired.
+    /// Returns whether a newer generation may become the admission authority.
     #[must_use]
-    pub const fn is_retired(self) -> bool {
-        matches!(self, Self::Retired { .. })
+    pub const fn allows_successor(self) -> bool {
+        matches!(self, Self::SettlementOnly { .. } | Self::Retired { .. })
     }
 }
 
@@ -163,8 +161,6 @@ pub enum LifecycleError {
     EffectAlreadyExists,
     /// An effect identity is not known.
     UnknownEffect,
-    /// An operation identity is already used by another effect.
-    OperationAlreadyExists,
     /// The requested component is outside this effect's bounded catalog.
     ComponentOutOfBounds,
     /// A component is not in the requested lifecycle stage.
@@ -207,7 +203,6 @@ pub struct ProviderLifecycleOracle {
     current: BTreeMap<ProviderId, ProviderGeneration>,
     providers: BTreeMap<ProviderCoordinate, ProviderRecord>,
     effects: BTreeMap<EffectId, EffectRecord>,
-    operations: BTreeMap<OperationId, EffectId>,
 }
 
 impl ProviderLifecycleOracle {
@@ -221,7 +216,6 @@ impl ProviderLifecycleOracle {
             current: BTreeMap::new(),
             providers: BTreeMap::new(),
             effects: BTreeMap::new(),
-            operations: BTreeMap::new(),
         }
     }
 
@@ -278,7 +272,7 @@ impl ProviderLifecycleOracle {
     }
 
     /// Registers a strictly newer provider generation after the predecessor
-    /// has become a retired tombstone.
+    /// has become settlement-only or a retired tombstone.
     pub fn register_provider(
         &mut self,
         provider: ProviderId,
@@ -294,7 +288,7 @@ impl ProviderLifecycleOracle {
                 .providers
                 .get(&old_coordinate)
                 .ok_or(LifecycleError::UnknownProviderGeneration)?;
-            if !old.phase.is_retired() {
+            if !old.phase.allows_successor() {
                 return Err(LifecycleError::GenerationStillLive);
             }
         }
@@ -323,10 +317,6 @@ impl ProviderLifecycleOracle {
     ) -> Result<(), LifecycleError> {
         if self.effects.contains_key(&effect) {
             return Err(LifecycleError::EffectAlreadyExists);
-        }
-        let operation = effect.operation();
-        if self.operations.contains_key(&operation) {
-            return Err(LifecycleError::OperationAlreadyExists);
         }
         if coordinate.world() != self.world {
             return Err(LifecycleError::WrongWorld);
@@ -365,7 +355,6 @@ impl ProviderLifecycleOracle {
             .checked_add(u64::from(component_count))
             .ok_or(LifecycleError::InvalidIdentity)?;
         self.effects.insert(effect, EffectRecord { projection });
-        self.operations.insert(operation, effect);
         self.bump_revision();
         Ok(())
     }
@@ -479,7 +468,7 @@ impl ProviderLifecycleOracle {
             }
             self.set_component_state(effect, component, ComponentLifecycle::Released);
             let effect_fully_released = self.effect_is_fully_released(effect)?;
-            let record = self.current_record_mut(coordinate)?;
+            let record = self.generation_record_mut(coordinate)?;
             record.live_components = record
                 .live_components
                 .checked_sub(1)
@@ -502,7 +491,7 @@ impl ProviderLifecycleOracle {
 
     /// Fences provider execution at one unique authority epoch.
     pub fn fence_provider(&mut self, coordinate: ProviderCoordinate) -> Result<(), LifecycleError> {
-        let record = self.current_record_mut(coordinate)?;
+        let record = self.generation_record_mut(coordinate)?;
         let epoch = record.phase.epoch();
         if !matches!(record.phase, ProviderPhase::Active { .. }) {
             return Err(LifecycleError::InvalidPhaseTransition);
@@ -538,7 +527,7 @@ impl ProviderLifecycleOracle {
         }) {
             return Err(LifecycleError::PrecommitStillLive);
         }
-        let record = self.current_record_mut(coordinate)?;
+        let record = self.generation_record_mut(coordinate)?;
         let epoch = record.phase.epoch();
         record.phase = ProviderPhase::SettlementOnly { epoch: next(epoch) };
         self.bump_revision();
@@ -550,7 +539,7 @@ impl ProviderLifecycleOracle {
         &mut self,
         coordinate: ProviderCoordinate,
     ) -> Result<(), LifecycleError> {
-        let record = self.current_record_mut(coordinate)?;
+        let record = self.generation_record_mut(coordinate)?;
         if !matches!(record.phase, ProviderPhase::SettlementOnly { .. }) {
             return Err(LifecycleError::InvalidPhaseTransition);
         }
@@ -665,7 +654,8 @@ impl ProviderLifecycleOracle {
             {
                 return false;
             }
-            if record.phase.is_retired() && record.live_components != 0 {
+            if matches!(record.phase, ProviderPhase::Retired { .. }) && record.live_components != 0
+            {
                 return false;
             }
         }
@@ -676,12 +666,15 @@ impl ProviderLifecycleOracle {
             if *high < *current {
                 return false;
             }
+            if self.providers.iter().any(|(coordinate, record)| {
+                coordinate.provider() == *provider
+                    && coordinate.generation() < *current
+                    && !record.phase.allows_successor()
+            }) {
+                return false;
+            }
         }
-        self.operations.iter().all(|(operation, effect)| {
-            self.effects
-                .get(effect)
-                .is_some_and(|record| record.projection.effect.operation() == *operation)
-        })
+        true
     }
 
     fn current_record_mut(
@@ -698,6 +691,18 @@ impl ProviderLifecycleOracle {
             } else {
                 LifecycleError::UnknownProviderGeneration
             });
+        }
+        self.providers
+            .get_mut(&coordinate)
+            .ok_or(LifecycleError::UnknownProviderGeneration)
+    }
+
+    fn generation_record_mut(
+        &mut self,
+        coordinate: ProviderCoordinate,
+    ) -> Result<&mut ProviderRecord, LifecycleError> {
+        if coordinate.world() != self.world {
+            return Err(LifecycleError::WrongWorld);
         }
         self.providers
             .get_mut(&coordinate)
@@ -849,6 +854,7 @@ const fn next(value: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::OperationId;
 
     fn ids() -> (WorldId, ProviderId, ProviderGeneration, ProviderCoordinate) {
         let world = WorldId::new(1).unwrap();
@@ -863,7 +869,7 @@ mod tests {
     }
 
     #[test]
-    fn generation_high_water_requires_retired_predecessor() {
+    fn generation_high_water_accepts_settlement_only_predecessor() {
         let (world, provider, generation, coordinate) = ids();
         let mut oracle = ProviderLifecycleOracle::new(world);
         oracle.register_provider(provider, generation).unwrap();
@@ -877,12 +883,12 @@ mod tests {
         );
         oracle.fence_provider(coordinate).unwrap();
         oracle.enter_settlement_only(coordinate).unwrap();
-        oracle.retire_provider(coordinate).unwrap();
         let next = oracle
             .register_provider(provider, ProviderGeneration::new(2).unwrap())
             .unwrap();
         assert_eq!(next.generation().get(), 2);
         assert_eq!(oracle.high_water(provider).unwrap().get(), 2);
+        oracle.retire_provider(coordinate).unwrap();
         assert!(oracle.check_invariants());
     }
 
@@ -984,6 +990,52 @@ mod tests {
             provider_projection.released_components
         );
         assert_eq!(provider_projection.live_effects, 0);
+        assert!(oracle.check_invariants());
+    }
+
+    #[test]
+    fn same_operation_effects_drain_independently_across_generation_rotation() {
+        let (world, provider, generation, coordinate) = ids();
+        let operation = OperationId::new(61).unwrap();
+        let first = EffectId::new(operation, 1).unwrap();
+        let second = EffectId::new(operation, 2).unwrap();
+        let component = ComponentId::Reply;
+        let mut oracle = ProviderLifecycleOracle::new(world);
+        oracle.register_provider(provider, generation).unwrap();
+        oracle
+            .admit_effect(first, coordinate, &[component])
+            .unwrap();
+        oracle
+            .admit_effect(second, coordinate, &[component])
+            .unwrap();
+        assert_eq!(oracle.projection().providers[0].live_effects, 2);
+
+        for effect in [first, second] {
+            oracle.commit_intent(effect, component).unwrap();
+            oracle.execute(effect, component).unwrap();
+        }
+        oracle.fence_provider(coordinate).unwrap();
+        for effect in [first, second] {
+            oracle.record_outcome(effect, component).unwrap();
+            oracle.settle(effect, component).unwrap();
+        }
+        oracle.release(first, component).unwrap();
+        oracle.enter_settlement_only(coordinate).unwrap();
+        let successor = oracle
+            .register_provider(provider, ProviderGeneration::new(2).unwrap())
+            .unwrap();
+        assert_eq!(oracle.projection().providers[0].live_effects, 1);
+        assert_eq!(
+            oracle.retire_provider(coordinate),
+            Err(LifecycleError::LiveEffectsRemain)
+        );
+
+        oracle.release(second, component).unwrap();
+        oracle.retire_provider(coordinate).unwrap();
+        assert!(matches!(
+            oracle.provider_phase(successor),
+            Some(ProviderPhase::Active { .. })
+        ));
         assert!(oracle.check_invariants());
     }
 }

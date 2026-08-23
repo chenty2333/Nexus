@@ -25,13 +25,13 @@
 
 use cser_core::{
     ClaimId, ClaimScope, ComponentId, Digest, EffectFactChallenge, EffectFactKind, EffectId,
-    EffectReceiptVerifier, EvidenceChallenge, ExecutorCoordinate, ExecutorGeneration, ExecutorId,
-    ExternalOutcome, ProviderVerificationScope, REPLY_APPLY_RECEIPT_SCHEMA,
-    REPLY_COMMIT_RECEIPT_SCHEMA, REPLY_DOMAIN, REPLY_EVIDENCE_PUBLICATION_ACK,
-    REPLY_OBLIGATION_PUBLICATION, REPLY_RECEIPT_SCHEMA, REPLY_SETTLEMENT_RECEIPT_SCHEMA,
-    REPLY_VERIFIER, ReceiptSchemaId, ReceiptVerifier, ResourceGeneration, ResourceId,
-    VerificationError, VerifiedEffectObservation, VerifiedObservation, VerifierBinding,
-    VerifierGeneration, VerifierIdentity,
+    EffectReceiptVerifier, EvidenceChallenge, ExecutorBinding, ExecutorCoordinate,
+    ExecutorGeneration, ExecutorId, ExternalOutcome, ProviderVerificationScope,
+    REPLY_APPLY_RECEIPT_SCHEMA, REPLY_COMMIT_RECEIPT_SCHEMA, REPLY_DOMAIN,
+    REPLY_EVIDENCE_PUBLICATION_ACK, REPLY_OBLIGATION_PUBLICATION, REPLY_RECEIPT_SCHEMA,
+    REPLY_SETTLEMENT_RECEIPT_SCHEMA, REPLY_VERIFIER, ReceiptSchemaId, ReceiptVerifier,
+    ResourceGeneration, ResourceId, VerificationError, VerifiedEffectObservation,
+    VerifiedObservation, VerifierBinding, VerifierGeneration, VerifierIdentity,
 };
 use sha2::{Digest as _, Sha256};
 
@@ -63,15 +63,15 @@ const CHECKSUM_OFFSET: usize = 176;
 const CHECKSUM_END: usize = 208;
 
 const DELIVERY_MAGIC: [u8; 8] = *b"CSERDLV\0";
-const DELIVERY_VERSION: u16 = 1;
-const DELIVERY_RECORD_LEN: u16 = 288;
+const DELIVERY_VERSION: u16 = 2;
+const DELIVERY_RECORD_LEN: u16 = 312;
 const DELIVERY_STATE_APPLIED: u32 = 1;
 const DELIVERY_STATE_ACKNOWLEDGED: u32 = 2;
 const DELIVERY_SOURCE_COMMIT: u32 = 1;
 const DELIVERY_SOURCE_ATOMIC_ARM: u32 = 2;
 const DELIVERY_SOURCE_APPLY: u32 = 3;
-const DELIVERY_CHECKSUM_OFFSET: usize = 256;
-const DELIVERY_CHECKSUM_END: usize = 288;
+const DELIVERY_CHECKSUM_OFFSET: usize = 280;
+const DELIVERY_CHECKSUM_END: usize = 312;
 
 /// Stable reply identity below an exact CSER effect.
 ///
@@ -248,6 +248,10 @@ pub(crate) enum ReplyOutboxCorruption {
 /// An observation which cannot establish absence, success, or known failure.
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum ReplyOutboxIndeterminate<E> {
+    /// This instance previously observed an indeterminate disk mutation and
+    /// can no longer use its backend-visible cache as durability evidence.
+    /// Recovery must acquire a fresh instance and rescan the durable source.
+    InstancePoisoned,
     Storage {
         operation: ReplyOutboxOperation,
         slot: Option<u32>,
@@ -360,10 +364,25 @@ impl ReplyAckRecord {
         self.record.record_checksum
     }
 
+    pub(crate) fn subject_binding(self) -> ExecutorBinding {
+        match self.record.subject_binding {
+            Some(binding) => binding,
+            None => unreachable!("validated acknowledgement records carry a subject binding"),
+        }
+    }
+
+    pub(crate) fn current_binding(self) -> ExecutorBinding {
+        match self.record.current_binding {
+            Some(binding) => binding,
+            None => unreachable!("validated acknowledgement records carry a current binding"),
+        }
+    }
+
     pub(crate) fn matches_plan(self, plan: ReplyPlan, apply: ReplyApplyRecord) -> bool {
         self.record.kind == ReplyDeliveryKind::Acknowledged
             && self.record.key == ReplyDeliveryKey::from_plan(plan)
-            && self.record.semantic_digest == plan.acknowledgement_digest()
+            && self.record.semantic_digest
+                == plan.acknowledgement_digest(self.subject_binding(), self.current_binding())
             && self.record.predecessor == apply.record_checksum()
             && self.record.self_authenticates()
     }
@@ -552,6 +571,8 @@ struct ReplyDeliveryRecord {
     generation: u64,
     key: ReplyDeliveryKey,
     source_kind: u32,
+    subject_binding: Option<ExecutorBinding>,
+    current_binding: Option<ExecutorBinding>,
     predecessor: Digest,
     semantic_digest: Digest,
     record_checksum: Digest,
@@ -565,6 +586,8 @@ impl ReplyDeliveryRecord {
             generation,
             key: ReplyDeliveryKey::from_plan(plan),
             source_kind,
+            subject_binding: None,
+            current_binding: None,
             predecessor,
             semantic_digest: plan.apply_receipt_digest(),
             record_checksum: Digest::ZERO,
@@ -573,7 +596,13 @@ impl ReplyDeliveryRecord {
         Some(record)
     }
 
-    fn acknowledged(generation: u64, plan: ReplyPlan, apply: ReplyApplyRecord) -> Option<Self> {
+    fn acknowledged(
+        generation: u64,
+        plan: ReplyPlan,
+        apply: ReplyApplyRecord,
+        subject_binding: ExecutorBinding,
+        current_binding: ExecutorBinding,
+    ) -> Option<Self> {
         if !apply.matches_plan(plan) {
             return None;
         }
@@ -582,8 +611,10 @@ impl ReplyDeliveryRecord {
             generation,
             key: ReplyDeliveryKey::from_plan(plan),
             source_kind: DELIVERY_SOURCE_APPLY,
+            subject_binding: Some(subject_binding),
+            current_binding: Some(current_binding),
             predecessor: apply.record_checksum(),
-            semantic_digest: plan.acknowledgement_digest(),
+            semantic_digest: plan.acknowledgement_digest(subject_binding, current_binding),
             record_checksum: Digest::ZERO,
         };
         record.record_checksum = delivery_sector_checksum(record.encode());
@@ -609,8 +640,14 @@ impl ReplyDeliveryRecord {
         bytes[96..128].copy_from_slice(&self.key.intent_digest.bytes());
         bytes[128..160].copy_from_slice(&self.key.payload_digest.bytes());
         bytes[160..164].copy_from_slice(&self.source_kind.to_le_bytes());
-        bytes[192..224].copy_from_slice(&self.predecessor.bytes());
-        bytes[224..256].copy_from_slice(&self.semantic_digest.bytes());
+        if let Some(binding) = self.subject_binding {
+            put_executor_binding(&mut bytes, 168, binding);
+        }
+        if let Some(binding) = self.current_binding {
+            put_executor_binding(&mut bytes, 192, binding);
+        }
+        bytes[216..248].copy_from_slice(&self.predecessor.bytes());
+        bytes[248..280].copy_from_slice(&self.semantic_digest.bytes());
         bytes[DELIVERY_CHECKSUM_OFFSET..DELIVERY_CHECKSUM_END]
             .copy_from_slice(&self.record_checksum.bytes());
         bytes
@@ -624,6 +661,14 @@ impl ReplyDeliveryRecord {
             || self.key.intent_digest.is_zero()
             || self.key.payload_digest.is_zero()
             || self.key.publication_sequence == 0
+            || match self.kind {
+                ReplyDeliveryKind::Applied => {
+                    self.subject_binding.is_some() || self.current_binding.is_some()
+                }
+                ReplyDeliveryKind::Acknowledged => {
+                    self.subject_binding.is_none() || self.current_binding.is_none()
+                }
+            }
         {
             return false;
         }
@@ -641,11 +686,30 @@ impl ReplyDeliveryRecord {
         };
         let generation = read_u64(bytes, 16);
         let source_kind = read_u32(bytes, 160);
-        let predecessor = Digest::new(read_array_32(bytes, 192));
-        let semantic_digest = Digest::new(read_array_32(bytes, 224));
+        let predecessor = Digest::new(read_array_32(bytes, 216));
+        let semantic_digest = Digest::new(read_array_32(bytes, 248));
         let record_checksum = Digest::new(read_array_32(bytes, DELIVERY_CHECKSUM_OFFSET));
+        let (subject_binding, current_binding) = match kind {
+            ReplyDeliveryKind::Applied => {
+                if bytes[164..216].iter().any(|byte| *byte != 0) {
+                    return DeliverySlotInspection::TargetCorrupt(key.reply);
+                }
+                (None, None)
+            }
+            ReplyDeliveryKind::Acknowledged => {
+                if bytes[164..168].iter().any(|byte| *byte != 0) {
+                    return DeliverySlotInspection::TargetCorrupt(key.reply);
+                }
+                let Some(subject_binding) = read_executor_binding(bytes, 168) else {
+                    return DeliverySlotInspection::TargetCorrupt(key.reply);
+                };
+                let Some(current_binding) = read_executor_binding(bytes, 192) else {
+                    return DeliverySlotInspection::TargetCorrupt(key.reply);
+                };
+                (Some(subject_binding), Some(current_binding))
+            }
+        };
         let reserved_valid = bytes[52..56].iter().all(|byte| *byte == 0)
-            && bytes[164..192].iter().all(|byte| *byte == 0)
             && bytes[DELIVERY_CHECKSUM_END..].iter().all(|byte| *byte == 0);
         let source_valid = match kind {
             ReplyDeliveryKind::Applied => {
@@ -661,6 +725,8 @@ impl ReplyDeliveryRecord {
             generation,
             key,
             source_kind,
+            subject_binding,
+            current_binding,
             predecessor,
             semantic_digest,
             record_checksum,
@@ -793,6 +859,7 @@ enum DeliveryScanResult<E> {
 #[derive(Debug)]
 struct ReplyOutbox<B> {
     backend: B,
+    poisoned: bool,
 }
 
 impl<B> ReplyOutbox<B>
@@ -807,10 +874,18 @@ where
                 required: REQUIRED_OUTBOX_SECTORS,
             });
         }
-        Ok(Self { backend })
+        Ok(Self {
+            backend,
+            poisoned: false,
+        })
     }
 
     fn inspect(&mut self, reply: ReplyOutboxIdentity) -> ReplyCommitInspection<B::Error> {
+        if self.poisoned {
+            return ReplyCommitInspection::Indeterminate(
+                ReplyOutboxIndeterminate::InstancePoisoned,
+            );
+        }
         match self.scan(reply) {
             ScanResult::Clean(scan) => scan
                 .matching
@@ -826,6 +901,11 @@ where
         &mut self,
         reply: ReplyOutboxIdentity,
     ) -> ReplyDeliveryInspection<B::Error> {
+        if self.poisoned {
+            return ReplyDeliveryInspection::Indeterminate(
+                ReplyOutboxIndeterminate::InstancePoisoned,
+            );
+        }
         match self.scan_delivery(reply) {
             DeliveryScanResult::Clean(scan) => match (scan.apply, scan.acknowledgement) {
                 (None, None) => ReplyDeliveryInspection::Absent,
@@ -852,6 +932,11 @@ where
         plan: ReplyPlan,
         source: ReplyApplySource,
     ) -> Result<ReplyApplyRecord, ReplyDeliveryError<B::Error>> {
+        if self.poisoned {
+            return Err(ReplyDeliveryError::Indeterminate(
+                ReplyOutboxIndeterminate::InstancePoisoned,
+            ));
+        }
         if source.parts().is_none() {
             return Err(ReplyDeliveryError::InvalidSource);
         }
@@ -891,7 +976,14 @@ where
         &mut self,
         plan: ReplyPlan,
         apply: ReplyApplyRecord,
+        subject_binding: ExecutorBinding,
+        current_binding: ExecutorBinding,
     ) -> Result<ReplyAckRecord, ReplyDeliveryError<B::Error>> {
+        if self.poisoned {
+            return Err(ReplyDeliveryError::Indeterminate(
+                ReplyOutboxIndeterminate::InstancePoisoned,
+            ));
+        }
         if !apply.matches_plan(plan) {
             return Err(ReplyDeliveryError::PlanConflict);
         }
@@ -912,7 +1004,10 @@ where
             return Err(ReplyDeliveryError::PlanConflict);
         }
         if let Some((_, existing)) = scan.acknowledgement {
-            if existing.matches_plan(plan, apply) {
+            if existing.matches_plan(plan, apply)
+                && existing.subject_binding() == subject_binding
+                && existing.current_binding() == current_binding
+            {
                 return Ok(existing);
             }
             return Err(ReplyDeliveryError::PlanConflict);
@@ -924,8 +1019,14 @@ where
             .max_generation
             .checked_add(1)
             .ok_or(ReplyDeliveryError::GenerationExhausted)?;
-        let record = ReplyDeliveryRecord::acknowledged(generation, plan, apply)
-            .ok_or(ReplyDeliveryError::PlanConflict)?;
+        let record = ReplyDeliveryRecord::acknowledged(
+            generation,
+            plan,
+            apply,
+            subject_binding,
+            current_binding,
+        )
+        .ok_or(ReplyDeliveryError::PlanConflict)?;
         self.append_delivery(slot, record)?;
         Ok(ReplyAckRecord { record })
     }
@@ -938,6 +1039,7 @@ where
         let encoded = record.encode();
         let lba = delivery_slot_lba(slot);
         if let Err(error) = self.backend.write_sector(lba, &encoded) {
+            self.poisoned = true;
             return Err(ReplyDeliveryError::Indeterminate(
                 ReplyOutboxIndeterminate::Storage {
                     operation: ReplyOutboxOperation::Write,
@@ -947,6 +1049,7 @@ where
             ));
         }
         if let Err(error) = self.backend.flush() {
+            self.poisoned = true;
             return Err(ReplyDeliveryError::Indeterminate(
                 ReplyOutboxIndeterminate::Storage {
                     operation: ReplyOutboxOperation::Flush,
@@ -957,6 +1060,7 @@ where
         }
         let mut readback = [0u8; SECTOR_BYTES];
         if let Err(error) = self.backend.read_sector(lba, &mut readback) {
+            self.poisoned = true;
             return Err(ReplyDeliveryError::Indeterminate(
                 ReplyOutboxIndeterminate::Storage {
                     operation: ReplyOutboxOperation::Readback,
@@ -966,6 +1070,7 @@ where
             ));
         }
         if readback != encoded {
+            self.poisoned = true;
             return Err(ReplyDeliveryError::Indeterminate(
                 ReplyOutboxIndeterminate::PublishReadbackMismatch { slot },
             ));
@@ -975,9 +1080,12 @@ where
             DeliverySlotInspection::Blank
             | DeliverySlotInspection::Valid(_)
             | DeliverySlotInspection::TargetCorrupt(_)
-            | DeliverySlotInspection::UnknownCorrupt => Err(ReplyDeliveryError::Indeterminate(
-                ReplyOutboxIndeterminate::PublishReadbackMismatch { slot },
-            )),
+            | DeliverySlotInspection::UnknownCorrupt => {
+                self.poisoned = true;
+                Err(ReplyDeliveryError::Indeterminate(
+                    ReplyOutboxIndeterminate::PublishReadbackMismatch { slot },
+                ))
+            }
         }
     }
 
@@ -986,6 +1094,11 @@ where
         key: ReplyCommitKey,
         payload_digest: Digest,
     ) -> Result<ReplyCommitReceipt, ReplyOutboxCommitError<B::Error>> {
+        if self.poisoned {
+            return Err(ReplyOutboxCommitError::Indeterminate(
+                ReplyOutboxIndeterminate::InstancePoisoned,
+            ));
+        }
         if payload_digest.is_zero() {
             return Err(ReplyOutboxCommitError::Request(
                 ReplyOutboxRequestError::InvalidPayloadDigest,
@@ -1031,6 +1144,7 @@ where
         let encoded = record.encode();
         let lba = slot_lba(slot);
         if let Err(error) = self.backend.write_sector(lba, &encoded) {
+            self.poisoned = true;
             return Err(ReplyOutboxCommitError::Indeterminate(
                 ReplyOutboxIndeterminate::Storage {
                     operation: ReplyOutboxOperation::Write,
@@ -1040,6 +1154,7 @@ where
             ));
         }
         if let Err(error) = self.backend.flush() {
+            self.poisoned = true;
             return Err(ReplyOutboxCommitError::Indeterminate(
                 ReplyOutboxIndeterminate::Storage {
                     operation: ReplyOutboxOperation::Flush,
@@ -1050,6 +1165,7 @@ where
         }
         let mut readback = [0u8; SECTOR_BYTES];
         if let Err(error) = self.backend.read_sector(lba, &mut readback) {
+            self.poisoned = true;
             return Err(ReplyOutboxCommitError::Indeterminate(
                 ReplyOutboxIndeterminate::Storage {
                     operation: ReplyOutboxOperation::Readback,
@@ -1059,6 +1175,7 @@ where
             ));
         }
         if readback != encoded {
+            self.poisoned = true;
             return Err(ReplyOutboxCommitError::Indeterminate(
                 ReplyOutboxIndeterminate::PublishReadbackMismatch { slot },
             ));
@@ -1075,9 +1192,12 @@ where
             SlotInspection::Blank
             | SlotInspection::Valid(_)
             | SlotInspection::TargetCorrupt(_)
-            | SlotInspection::UnknownCorrupt => Err(ReplyOutboxCommitError::Indeterminate(
-                ReplyOutboxIndeterminate::PublishReadbackMismatch { slot },
-            )),
+            | SlotInspection::UnknownCorrupt => {
+                self.poisoned = true;
+                Err(ReplyOutboxCommitError::Indeterminate(
+                    ReplyOutboxIndeterminate::PublishReadbackMismatch { slot },
+                ))
+            }
         }
     }
 
@@ -1285,6 +1405,11 @@ impl AtaPioReplyOutbox {
         reply_sequence: u64,
         payload_digest: Digest,
     ) -> Result<ReplyCommitReceipt, ReplyOutboxCommitError<AtaPioError>> {
+        if self.outbox.poisoned {
+            return Err(ReplyOutboxCommitError::Indeterminate(
+                ReplyOutboxIndeterminate::InstancePoisoned,
+            ));
+        }
         let key = ReplyCommitKey::from_challenge(challenge, reply_sequence)
             .map_err(ReplyOutboxCommitError::Request)?;
         self.outbox.commit_exact(key, payload_digest)
@@ -1322,8 +1447,11 @@ impl AtaPioReplyOutbox {
         &mut self,
         plan: ReplyPlan,
         apply: ReplyApplyRecord,
+        subject_binding: ExecutorBinding,
+        current_binding: ExecutorBinding,
     ) -> Result<ReplyAckRecord, ReplyDeliveryError<AtaPioError>> {
-        self.outbox.record_acknowledgement(plan, apply)
+        self.outbox
+            .record_acknowledgement(plan, apply, subject_binding, current_binding)
     }
 }
 
@@ -1467,13 +1595,18 @@ impl ReceiptVerifier for ReplyDurableRetirementVerifier {
             || !reply_outbox_evidence_scope_matches(challenge, REPLY_RECEIPT_SCHEMA, 1)
             || !self.apply.matches_plan(self.plan)
             || !receipt.matches_plan(self.plan, self.apply)
+            || receipt.subject_binding() != challenge.subject_binding()
+            || receipt.current_binding() != challenge.current_binding()
         {
             return Err(VerificationError::Rejected);
         }
-        Ok(VerifiedObservation::new(
+        Ok(VerifiedObservation::new_bound(
             challenge.subject(),
+            receipt.subject_binding(),
             challenge.current_observation(),
-            self.plan.retirement_receipt_digest(),
+            receipt.current_binding(),
+            self.plan
+                .retirement_receipt_digest(receipt.subject_binding(), receipt.current_binding()),
         ))
     }
 }
@@ -1666,6 +1799,20 @@ fn read_u64(bytes: &[u8], offset: usize) -> u64 {
     ])
 }
 
+fn put_executor_binding(bytes: &mut [u8; SECTOR_BYTES], offset: usize, binding: ExecutorBinding) {
+    bytes[offset..offset + 8].copy_from_slice(&binding.executor().executor().get().to_le_bytes());
+    bytes[offset + 8..offset + 16]
+        .copy_from_slice(&binding.executor().generation().get().to_le_bytes());
+    bytes[offset + 16..offset + 24].copy_from_slice(&binding.authority_epoch().to_le_bytes());
+}
+
+fn read_executor_binding(bytes: &[u8; SECTOR_BYTES], offset: usize) -> Option<ExecutorBinding> {
+    let executor = ExecutorId::new(read_u64(bytes, offset)).ok()?;
+    let generation = ExecutorGeneration::new(read_u64(bytes, offset + 8)).ok()?;
+    let coordinate = ExecutorCoordinate::new(executor, generation);
+    ExecutorBinding::new(coordinate, read_u64(bytes, offset + 16)).ok()
+}
+
 #[cfg(ktest)]
 mod tests {
     use alloc::{vec, vec::Vec};
@@ -1675,8 +1822,8 @@ mod tests {
         CatalogSet, ChargeAccountId, ClaimId, ClaimScope, CommandRequest, ComponentCommitOperation,
         ComponentProviderBinding, CoreError, CoreLimits, DEVICE_CLAIM_QUEUE_SLOT,
         DEVICE_COMMIT_RECEIPT_SCHEMA, DEVICE_RECEIPT_SCHEMA, DEVICE_VERIFIER, DeviceGeneration,
-        DeviceScopeId, Digest, Engine, ExecutorCoordinate, ExecutorGeneration, ExecutorId,
-        Freshness, JournalGeneration, JournalRecord, OperationId, ProviderCoordinate,
+        DeviceScopeId, Digest, Engine, ExecutorBinding, ExecutorCoordinate, ExecutorGeneration,
+        ExecutorId, Freshness, JournalGeneration, JournalRecord, OperationId, ProviderCoordinate,
         ProviderGeneration, ProviderId, RegistryInstance, ResourceGeneration, ResourceId,
         TransitionDurability, TransitionOutput, VerifierBinding, VerifierGeneration, WorldId,
         standard_catalog,
@@ -1711,9 +1858,12 @@ mod tests {
     #[derive(Debug)]
     struct MemoryDisk {
         sectors: Vec<[u8; SECTOR_BYTES]>,
+        durable_sectors: Vec<[u8; SECTOR_BYTES]>,
         flushes: u32,
         fail_write: bool,
+        fail_write_after_store: bool,
         fail_flush: bool,
+        fail_readback_lba: Option<u32>,
         corrupt_readback_lba: Option<u32>,
         last_written_lba: Option<u32>,
     }
@@ -1722,12 +1872,26 @@ mod tests {
         fn fixture() -> Self {
             Self {
                 sectors: vec![[0u8; SECTOR_BYTES]; REQUIRED_OUTBOX_SECTORS as usize],
+                durable_sectors: vec![[0u8; SECTOR_BYTES]; REQUIRED_OUTBOX_SECTORS as usize],
                 flushes: 0,
                 fail_write: false,
+                fail_write_after_store: false,
                 fail_flush: false,
+                fail_readback_lba: None,
                 corrupt_readback_lba: None,
                 last_written_lba: None,
             }
+        }
+
+        fn reboot(mut self) -> Self {
+            self.sectors.clone_from(&self.durable_sectors);
+            self.fail_write = false;
+            self.fail_write_after_store = false;
+            self.fail_flush = false;
+            self.fail_readback_lba = None;
+            self.corrupt_readback_lba = None;
+            self.last_written_lba = None;
+            self
         }
     }
 
@@ -1743,6 +1907,9 @@ mod tests {
             lba: u32,
             output: &mut [u8; SECTOR_BYTES],
         ) -> Result<(), Self::Error> {
+            if self.fail_readback_lba == Some(lba) && self.last_written_lba == Some(lba) {
+                return Err(MemoryError::Injected);
+            }
             *output = *self.sectors.get(lba as usize).ok_or(MemoryError::Bounds)?;
             if self.corrupt_readback_lba == Some(lba) && self.last_written_lba == Some(lba) {
                 output[111] ^= 0x80;
@@ -1763,6 +1930,9 @@ mod tests {
                 .get_mut(lba as usize)
                 .ok_or(MemoryError::Bounds)? = *input;
             self.last_written_lba = Some(lba);
+            if self.fail_write_after_store {
+                return Err(MemoryError::Injected);
+            }
             Ok(())
         }
 
@@ -1770,6 +1940,7 @@ mod tests {
             if self.fail_flush {
                 return Err(MemoryError::Injected);
             }
+            self.durable_sectors.clone_from(&self.sectors);
             self.flushes += 1;
             Ok(())
         }
@@ -1807,6 +1978,17 @@ mod tests {
             ResourceGeneration::new(1).unwrap(),
         );
         reply_plan(coordinate, 1, 0xc5e2).unwrap()
+    }
+
+    fn delivery_bindings(plan: ReplyPlan) -> (ExecutorBinding, ExecutorBinding) {
+        let executor = ExecutorCoordinate::new(
+            ExecutorId::new(plan.coordinate().effect().operation().get()).unwrap(),
+            ExecutorGeneration::new(1).unwrap(),
+        );
+        (
+            ExecutorBinding::new(executor, 1).unwrap(),
+            ExecutorBinding::new(executor, 2).unwrap(),
+        )
     }
 
     fn commit_challenge(root_value: u64) -> (Engine, cser_core::CommitIntent, EffectFactChallenge) {
@@ -2043,13 +2225,14 @@ mod tests {
     }
 
     #[ktest]
-    fn reply_outbox_never_mints_a_receipt_after_write_or_readback_failure() {
+    fn reply_outbox_poison_requires_a_fresh_instance_after_indeterminate_publish() {
         let target = key(43, 9, 5);
+        let payload = digest(0x53);
         let mut write_failure = MemoryDisk::fixture();
-        write_failure.fail_write = true;
+        write_failure.fail_write_after_store = true;
         let mut outbox = ReplyOutbox::open(write_failure).unwrap();
         assert_eq!(
-            outbox.commit_exact(target, digest(0x53)),
+            outbox.commit_exact(target, payload),
             Err(ReplyOutboxCommitError::Indeterminate(
                 ReplyOutboxIndeterminate::Storage {
                     operation: ReplyOutboxOperation::Write,
@@ -2058,25 +2241,130 @@ mod tests {
                 }
             ))
         );
+        assert_eq!(
+            outbox.commit_exact(target, payload),
+            Err(ReplyOutboxCommitError::Indeterminate(
+                ReplyOutboxIndeterminate::InstancePoisoned
+            ))
+        );
+        let disk = outbox.into_backend();
+        assert!(
+            disk.sectors[slot_lba(0) as usize]
+                .iter()
+                .any(|byte| *byte != 0)
+        );
+        let mut recovered = ReplyOutbox::open(disk.reboot()).unwrap();
+        assert_eq!(
+            recovered.inspect(target.reply),
+            ReplyCommitInspection::Absent
+        );
+        recovered.commit_exact(target, payload).unwrap();
+
+        let mut flush_failure = MemoryDisk::fixture();
+        flush_failure.fail_flush = true;
+        let mut outbox = ReplyOutbox::open(flush_failure).unwrap();
+        assert_eq!(
+            outbox.commit_exact(target, payload),
+            Err(ReplyOutboxCommitError::Indeterminate(
+                ReplyOutboxIndeterminate::Storage {
+                    operation: ReplyOutboxOperation::Flush,
+                    slot: Some(0),
+                    error: MemoryError::Injected,
+                }
+            ))
+        );
+        assert_eq!(
+            outbox.inspect(target.reply),
+            ReplyCommitInspection::Indeterminate(ReplyOutboxIndeterminate::InstancePoisoned)
+        );
+        assert!(
+            outbox
+                .inspect_delivery(ReplyOutboxIdentity::new(target.reply.effect(), 1).unwrap())
+                .eq(&ReplyDeliveryInspection::Indeterminate(
+                    ReplyOutboxIndeterminate::InstancePoisoned,
+                ))
+        );
+        assert_eq!(
+            outbox.commit_exact(target, payload),
+            Err(ReplyOutboxCommitError::Indeterminate(
+                ReplyOutboxIndeterminate::InstancePoisoned
+            ))
+        );
+        let disk = outbox.into_backend();
+        assert!(
+            disk.sectors[slot_lba(0) as usize]
+                .iter()
+                .any(|byte| *byte != 0)
+        );
+        let mut recovered = ReplyOutbox::open(disk.reboot()).unwrap();
+        assert_eq!(
+            recovered.inspect(target.reply),
+            ReplyCommitInspection::Absent
+        );
+        recovered.commit_exact(target, payload).unwrap();
+
+        let mut readback_io_failure = MemoryDisk::fixture();
+        readback_io_failure.fail_readback_lba = Some(slot_lba(0));
+        let mut outbox = ReplyOutbox::open(readback_io_failure).unwrap();
+        assert_eq!(
+            outbox.commit_exact(target, payload),
+            Err(ReplyOutboxCommitError::Indeterminate(
+                ReplyOutboxIndeterminate::Storage {
+                    operation: ReplyOutboxOperation::Readback,
+                    slot: Some(0),
+                    error: MemoryError::Injected,
+                }
+            ))
+        );
+        assert_eq!(
+            outbox.commit_exact(target, payload),
+            Err(ReplyOutboxCommitError::Indeterminate(
+                ReplyOutboxIndeterminate::InstancePoisoned
+            ))
+        );
+        let disk = outbox.into_backend();
+        let mut recovered = ReplyOutbox::open(disk.reboot()).unwrap();
+        assert!(matches!(
+            recovered.inspect(target.reply),
+            ReplyCommitInspection::Committed(_)
+        ));
 
         let mut readback_failure = MemoryDisk::fixture();
         readback_failure.corrupt_readback_lba = Some(slot_lba(0));
         let mut outbox = ReplyOutbox::open(readback_failure).unwrap();
         assert_eq!(
-            outbox.commit_exact(target, digest(0x53)),
+            outbox.commit_exact(target, payload),
             Err(ReplyOutboxCommitError::Indeterminate(
                 ReplyOutboxIndeterminate::PublishReadbackMismatch { slot: 0 }
             ))
         );
+        assert_eq!(
+            outbox.commit_exact(target, payload),
+            Err(ReplyOutboxCommitError::Indeterminate(
+                ReplyOutboxIndeterminate::InstancePoisoned
+            ))
+        );
+        let disk = outbox.into_backend();
+        let mut recovered = ReplyOutbox::open(disk.reboot()).unwrap();
+        assert!(matches!(
+            recovered.inspect(target.reply),
+            ReplyCommitInspection::Committed(_)
+        ));
     }
 
     #[ktest]
     fn reply_outbox_identity_is_immutable_and_payload_conflict_backpressures() {
         let target = key(44, 10, 6);
         let mut outbox = ReplyOutbox::open(MemoryDisk::fixture()).unwrap();
+        assert_eq!(
+            outbox.commit_exact(target, Digest::ZERO),
+            Err(ReplyOutboxCommitError::Request(
+                ReplyOutboxRequestError::InvalidPayloadDigest
+            ))
+        );
         outbox
             .commit_exact(target, digest(0x54))
-            .expect("first payload commits");
+            .expect("a deterministic preflight rejection does not poison the instance");
         assert_eq!(
             outbox.commit_exact(target, digest(0x55)),
             Err(ReplyOutboxCommitError::Corrupt(
@@ -2086,6 +2374,7 @@ mod tests {
                 }
             ))
         );
+        assert!(outbox.commit_exact(target, digest(0x54)).is_ok());
     }
 
     #[ktest]
@@ -2182,6 +2471,7 @@ mod tests {
     #[ktest]
     fn reply_delivery_flushes_readbacks_reopens_and_is_idempotent() {
         let plan = delivery_plan(47, AGENT_COMPONENT_REPLY);
+        let (subject_binding, current_binding) = delivery_bindings(plan);
         let identity = ReplyOutboxIdentity::new(plan.coordinate().effect(), 1).unwrap();
         let source = ReplyApplySource::Committed(digest(0x64));
         let mut outbox = ReplyOutbox::open(MemoryDisk::fixture()).unwrap();
@@ -2196,15 +2486,21 @@ mod tests {
         assert!(!apply.semantic_digest().is_zero());
         assert_eq!(outbox.record_apply(plan, source).unwrap(), apply);
 
-        let acknowledgement = outbox.record_acknowledgement(plan, apply).unwrap();
+        let acknowledgement = outbox
+            .record_acknowledgement(plan, apply, subject_binding, current_binding)
+            .unwrap();
         assert!(acknowledgement.matches_plan(plan, apply));
+        assert_eq!(acknowledgement.subject_binding(), subject_binding);
+        assert_eq!(acknowledgement.current_binding(), current_binding);
         assert_eq!(
             acknowledgement.apply_record_checksum(),
             apply.record_checksum()
         );
         assert!(!acknowledgement.record_checksum().is_zero());
         assert_eq!(
-            outbox.record_acknowledgement(plan, apply).unwrap(),
+            outbox
+                .record_acknowledgement(plan, apply, subject_binding, current_binding)
+                .unwrap(),
             acknowledgement
         );
 
@@ -2220,8 +2516,15 @@ mod tests {
         );
         assert_eq!(reopened.record_apply(plan, source).unwrap(), apply);
         assert_eq!(
-            reopened.record_acknowledgement(plan, apply).unwrap(),
+            reopened
+                .record_acknowledgement(plan, apply, subject_binding, current_binding)
+                .unwrap(),
             acknowledgement
+        );
+        let wrong_current = ExecutorBinding::new(current_binding.executor(), 3).unwrap();
+        assert_eq!(
+            reopened.record_acknowledgement(plan, apply, subject_binding, wrong_current),
+            Err(ReplyDeliveryError::PlanConflict)
         );
         assert_eq!(reopened.into_backend().flushes, 2);
     }
@@ -2229,6 +2532,7 @@ mod tests {
     #[ktest]
     fn reply_delivery_rejects_ack_without_apply_and_wrong_predecessor() {
         let plan = delivery_plan(48, AGENT_COMPONENT_REPLY);
+        let (subject_binding, current_binding) = delivery_bindings(plan);
         let identity = ReplyOutboxIdentity::new(plan.coordinate().effect(), 1).unwrap();
         let apply_record =
             ReplyDeliveryRecord::applied(1, plan, ReplyApplySource::Committed(digest(0x65)))
@@ -2236,7 +2540,9 @@ mod tests {
         let apply = ReplyApplyRecord {
             record: apply_record,
         };
-        let acknowledgement = ReplyDeliveryRecord::acknowledged(2, plan, apply).unwrap();
+        let acknowledgement =
+            ReplyDeliveryRecord::acknowledged(2, plan, apply, subject_binding, current_binding)
+                .unwrap();
 
         let mut no_apply_disk = MemoryDisk::fixture();
         no_apply_disk.sectors[delivery_slot_lba(0) as usize] = acknowledgement.encode();
@@ -2265,12 +2571,13 @@ mod tests {
     }
 
     #[ktest]
-    fn reply_delivery_never_mints_records_after_write_flush_or_readback_failure() {
+    fn reply_delivery_poison_requires_a_fresh_instance_after_indeterminate_publish() {
         let plan = delivery_plan(49, AGENT_COMPONENT_REPLY);
+        let (subject_binding, current_binding) = delivery_bindings(plan);
         let source = ReplyApplySource::AtomicArmIndeterminate(digest(0x67));
 
         let mut write_failure = MemoryDisk::fixture();
-        write_failure.fail_write = true;
+        write_failure.fail_write_after_store = true;
         let mut outbox = ReplyOutbox::open(write_failure).unwrap();
         assert_eq!(
             outbox.record_apply(plan, source),
@@ -2282,6 +2589,27 @@ mod tests {
                 }
             ))
         );
+        assert_eq!(
+            outbox.record_apply(plan, source),
+            Err(ReplyDeliveryError::Indeterminate(
+                ReplyOutboxIndeterminate::InstancePoisoned
+            ))
+        );
+        assert_eq!(
+            outbox.inspect(
+                ReplyOutboxIdentity::new(plan.coordinate().effect(), plan.publication_sequence(),)
+                    .unwrap()
+            ),
+            ReplyCommitInspection::Indeterminate(ReplyOutboxIndeterminate::InstancePoisoned)
+        );
+        let disk = outbox.into_backend();
+        assert!(
+            disk.sectors[delivery_slot_lba(0) as usize]
+                .iter()
+                .any(|byte| *byte != 0)
+        );
+        let mut recovered = ReplyOutbox::open(disk.reboot()).unwrap();
+        assert!(recovered.record_apply(plan, source).is_ok());
 
         let mut flush_failure = MemoryDisk::fixture();
         flush_failure.fail_flush = true;
@@ -2296,6 +2624,27 @@ mod tests {
                 }
             ))
         );
+        assert_eq!(
+            outbox.record_apply(plan, source),
+            Err(ReplyDeliveryError::Indeterminate(
+                ReplyOutboxIndeterminate::InstancePoisoned
+            ))
+        );
+        let disk = outbox.into_backend();
+        assert!(
+            disk.sectors[delivery_slot_lba(0) as usize]
+                .iter()
+                .any(|byte| *byte != 0)
+        );
+        let mut recovered = ReplyOutbox::open(disk.reboot()).unwrap();
+        assert_eq!(
+            recovered.inspect_delivery(
+                ReplyOutboxIdentity::new(plan.coordinate().effect(), plan.publication_sequence(),)
+                    .unwrap()
+            ),
+            ReplyDeliveryInspection::Absent
+        );
+        recovered.record_apply(plan, source).unwrap();
 
         let mut readback_failure = MemoryDisk::fixture();
         readback_failure.corrupt_readback_lba = Some(delivery_slot_lba(0));
@@ -2306,6 +2655,15 @@ mod tests {
                 ReplyOutboxIndeterminate::PublishReadbackMismatch { slot: 0 }
             ))
         );
+        assert_eq!(
+            outbox.record_apply(plan, source),
+            Err(ReplyDeliveryError::Indeterminate(
+                ReplyOutboxIndeterminate::InstancePoisoned
+            ))
+        );
+        let disk = outbox.into_backend();
+        let mut recovered = ReplyOutbox::open(disk.reboot()).unwrap();
+        assert!(recovered.record_apply(plan, source).is_ok());
 
         let mut outbox = ReplyOutbox::open(MemoryDisk::fixture()).unwrap();
         let apply = outbox.record_apply(plan, source).unwrap();
@@ -2313,7 +2671,7 @@ mod tests {
         ack_failure_disk.fail_flush = true;
         let mut outbox = ReplyOutbox::open(ack_failure_disk).unwrap();
         assert_eq!(
-            outbox.record_acknowledgement(plan, apply),
+            outbox.record_acknowledgement(plan, apply, subject_binding, current_binding),
             Err(ReplyDeliveryError::Indeterminate(
                 ReplyOutboxIndeterminate::Storage {
                     operation: ReplyOutboxOperation::Flush,
@@ -2322,12 +2680,28 @@ mod tests {
                 }
             ))
         );
+        assert_eq!(
+            outbox.record_acknowledgement(plan, apply, subject_binding, current_binding),
+            Err(ReplyDeliveryError::Indeterminate(
+                ReplyOutboxIndeterminate::InstancePoisoned
+            ))
+        );
+        let disk = outbox.into_backend();
+        let mut recovered = ReplyOutbox::open(disk.reboot()).unwrap();
+        assert!(matches!(
+            recovered.inspect_delivery(
+                ReplyOutboxIdentity::new(plan.coordinate().effect(), plan.publication_sequence(),)
+                    .unwrap()
+            ),
+            ReplyDeliveryInspection::Applied(_)
+        ));
     }
 
     #[ktest]
     fn reply_delivery_rejects_forged_component_plan() {
         let plan = delivery_plan(50, AGENT_COMPONENT_REPLY);
         let forged = delivery_plan(50, AGENT_COMPONENT_DMA);
+        let (subject_binding, current_binding) = delivery_bindings(plan);
         let source = ReplyApplySource::Committed(digest(0x68));
         let mut outbox = ReplyOutbox::open(MemoryDisk::fixture()).unwrap();
         let apply = outbox.record_apply(plan, source).unwrap();
@@ -2337,8 +2711,13 @@ mod tests {
             Err(ReplyDeliveryError::PlanConflict)
         );
         assert_eq!(
-            outbox.record_acknowledgement(forged, apply),
+            outbox.record_acknowledgement(forged, apply, subject_binding, current_binding),
             Err(ReplyDeliveryError::PlanConflict)
+        );
+        assert!(
+            outbox
+                .record_acknowledgement(plan, apply, subject_binding, current_binding)
+                .is_ok()
         );
     }
 }

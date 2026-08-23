@@ -5,122 +5,103 @@ Effect Revocation (CSER)**: keeping escaped effects and their logical or
 physical claims under enforceable custody after the executor that created them
 exits or is replaced.
 
-> Process death can revoke future authority. It is not evidence that an
-> already published reply, provider operation, queue entry, pinned page, DMA
-> mapping, or other external effect disappeared.
+> Process death can revoke future authority. It is not evidence that a
+> published reply, provider operation, queue entry, pinned page, DMA mapping,
+> or other external effect disappeared.
 
 CSER separates executor lifetime, durable effect lifetime, and resource-claim
-custody. Unknown outcomes require reconciliation. Missing physical quiescence
-evidence retains the affected claim and refuses reuse. The project is a bounded
-research prototype, not a production, exactly-once, rollback, or
-hardware-general claim.
+custody. Unknown outcomes require reconciliation; missing physical-quiescence
+evidence retains the claim. Nexus is a bounded research prototype, not a
+production, exactly-once, rollback, or physical-hardware claim.
 
 ## Start here
 
-- [Terrain](maproom/terrain.md): research question, safety model, design
-  reasoning, evidence discipline, and claim limits.
-- [Basecamp](maproom/basecamp.md): the deliberately established current
-  position, evidence boundary, and paused work.
-- [Route](maproom/route.md): the user-selected high-level direction.
-- [Hazards](maproom/hazards.md): verified project-specific failure modes and
-  operational pitfalls.
-- [Contributing](CONTRIBUTING.md): supported local workflows.
+- [Terrain](maproom/terrain.md): research question, safety model, and claim
+  limits.
+- [Basecamp](maproom/basecamp.md): deliberately established project position.
+- [Route](maproom/route.md): user-selected direction.
+- [Hazards](maproom/hazards.md): verified project-specific pitfalls.
+- [Contributing](CONTRIBUTING.md): development workflow and boundaries.
 
-The maproom is the only current project-orientation source. Its terrain,
-basecamp, and route are user-directed documents, not progress files to update
-automatically. Historical
-architecture, vision, RFC, release-ledger, and vertical-slice documents remain
-available through Git history and immutable release tags rather than competing
-with current main.
+Maproom maintenance is user-directed. Historical design material and evidence
+belong to Git history and immutable release archives, not another current
+source of truth.
 
-## Current implementation
+## Implementation
 
-The portable authoritative state machine is `crates/cser-core`. It owns catalog
-admission, estates and composite effects, claims, exact custody, fencing,
-settlement, retirement evidence, journal records, checkpoints, recovery, and
-canonical invariants. `crates/cser-model` contains the independent normalized
-oracles used by current differential and Loom tests.
+`crates/cser-core` is the portable authoritative state machine. It owns
+catalog admission, effects, claims, exact custody, fencing, settlement,
+retirement evidence, journaling, recovery, and canonical invariants.
+`crates/cser-model` supplies independent normalized oracles.
 
-`kernel/nexus-ostd` embeds that core in the OSTD kernel and contains the current
-ATA/TPM persistence, reply/DMA recovery, asynchronous Tool endpoint adapter,
-bounded CSER3 handoff, strongest independent handoff baseline, and experimental
-vNext journal paths.
+`kernel/nexus-ostd` embeds the core in the OSTD kernel. Its system path covers
+ATA PIO persistence, focused reply recovery, a DMA IRQ pre-escape fail-closed
+capability gate, typed predecessor
+rejection, and persistent restart recovery in QEMU. The endpoint/provider
+reference tests remain host-side tests of the trusted-local reference path.
 
-The trusted-local endpoint uses independently durable adapter and provider
-databases. POST persists Accepted work; leased workers persist Pending, query
-the provider by exact operation identity, and publish terminal evidence only
-after a verified provider result. Guest recovery performs an exact GET before
-any same-key retry, and exact 404 is the sole absence authority.
+## Development entry point
 
-The bounded single-hop handoff verifies one canonical `ChildDescriptorV1` and
-permits child first observation only after the durable parent-release/child-
-intent pivot. It is not a general workflow graph or dynamic-component API.
+The only supported developer interface is:
 
-The legacy journal remains the default. The vNext same-segment append and
-checkpoint implementation is opt-in and experimental: it reduces controlled
-fill write amplification while increasing read, flush, and hashing work in the
-current measurements.
+```text
+cargo nexus {check,test,kernel,system,seal,clean}
+```
 
-## Evidence
+The root workspace follows the rolling `nightly` selected by
+`rust-toolchain.toml`. xtask reads the local rustup toolchain manifest to find
+that toolchain's release date, then builds or verifies the corresponding dated
+nightly OSDK/QEMU image and checks the image's `rustc` commit hash. This keeps
+the kernel image tied to the compiler actually invoking the front door.
 
-The current public development evidence is intentionally small:
+| Command | Purpose |
+| --- | --- |
+| `cargo nexus check` | Check the portable workspace and its bare-metal profiles. |
+| `cargo nexus test` | Run endpoint/provider reference tests and portable core/model tests. |
+| `cargo nexus kernel` | Check and build the OSTD kernel through the exact image. |
+| `cargo nexus system` | Run ATA PIO, focused reply recovery, the DMA IRQ fail-closed gate, predecessor rejection, and four persistent QEMU boots. |
+| `cargo nexus seal` | Require a clean Git snapshot, run the same system path, and publish a sanitized receipt. |
+| `cargo nexus clean` | Clean build output while preserving raw system artifacts. |
+| `cargo nexus clean --raw` | Also remove raw system artifacts. |
 
-- [Final asynchronous applicability and vNext evidence](docs/research/evidence/cser-async-vnext-final/README.md)
-  contains six sanitized real-QEMU rows, four portable state-profile rows, a
-  bounded journal-fill comparison, and a HMAC-pseudonymized applicability
-  projection.
-- [Matched logical handoff evidence](docs/research/evidence/cser-handoff-matched/README.md)
-  contains five crash cuts for CSER and the structurally independent baseline,
-  with two recovery boots and exact endpoint/provider ledgers per row.
+`seal` records the dist date plus the verified `rustc` commit date and hash,
+then writes only the sanitized receipt and checksum to `target/nexus/public/`;
+raw journals, logs, media, and TPM-fixture state stay local and are not
+uploaded.
 
-Both bundles state their source commits and limits. Raw identities, databases,
-logs, media, TPM state, paths, container identities, and HMAC keys are not
-published. QEMU/TCG observations are not physical-hardware evidence.
+## Build boundaries
 
-The historical `v0.1.0` artifact remains available from the immutable
-[GitHub release](https://github.com/chenty2333/Nexus/releases/tag/v0.1.0),
-[Zenodo record 21343496](https://zenodo.org/records/21343496), and
-[DOI 10.5281/zenodo.21343496](https://doi.org/10.5281/zenodo.21343496).
-Reproduce that historical release from its tag; current main does not carry a
-second mutable copy of its prose, models, and receipts.
+- Cargo owns the root workspace, rolling nightly selection, and the `nexus`
+  alias that starts xtask.
+- xtask reads the local rustup manifest's release date to select the dated
+  nightly image, verifies its `rustc` commit hash, and owns the supported
+  command composition.
+- `kernel/nexus-ostd/OSDK.toml` defines the four OSDK profiles and their QEMU
+  configuration.
+- The root `Dockerfile` creates the exact-nightly OSDK/QEMU image and supplies
+  the OSTD, cargo-osdk, QEMU, and firmware build environment.
+- The host supplies Docker and `swtpm`; the TPM fixture daemon stays on the
+  host while QEMU connects to it through the controlled system run.
+
+Cargo-OSDK generates a runner workspace for which `--locked` is not propagated.
+That is the sole controlled lock exception: the reviewed
+`kernel/nexus-ostd/osdk-runner-base/` snapshot has its own lockfile and is
+checked unchanged before use.
 
 ## Repository map
 
 | Path | Role |
 | --- | --- |
-| `maproom/` | Conceptual terrain, established position, selected route, and verified hazards |
+| `maproom/` | Conceptual terrain, established position, route, and hazards |
 | `crates/cser-core/` | Portable authoritative CSER state machine |
-| `crates/cser-model/` | Current independent differential oracles |
-| `crates/nexus-ostd-virtio/` | Pinned VirtIO/PCI/IOMMU substrate used by the kernel |
-| `kernel/nexus-ostd/` | OSTD production embedding and bounded experiment lanes |
-| `kernel/nexus-ostd/tools/cser-experiment/` | Trusted-local endpoint, provider, bridge, matrix, and evidence tools |
-| `docs/research/evidence/` | Current sanitized source-bound evidence bundles |
-| `tools/xtask/` | Small host workspace build/check/test runner |
-| `./x` | Public local workflow entry point |
-
-## Local workflows
-
-The supported front door is `./x`:
-
-```text
-./x doctor
-./x build [all|model|kernel]
-./x test [--unit|--quick|--system|--full]
-./x check
-./x fmt
-./x verify
-./x clean [--all]
-```
-
-The root workflow uses a pinned Rust container. Kernel experiment-specific
-commands remain under `kernel/nexus-ostd/x` and are documented beside the
-experiment tools. See [CONTRIBUTING.md](CONTRIBUTING.md) before changing safety
-or evidence boundaries.
+| `crates/cser-model/` | Independent normalized oracles |
+| `crates/nexus-ostd-virtio/` | VirtIO/PCI/IOMMU substrate used by the kernel |
+| `kernel/nexus-ostd/` | OSTD embedding and its four OSDK profiles |
+| `kernel/nexus-ostd/tools/cser-experiment/` | Endpoint/provider reference implementation and tests |
+| `tools/xtask/` | `cargo nexus` command runner |
 
 ## Citation and license
 
-There is no peer-reviewed Nexus paper at this time. Cite the archived software
-release using `CITATION.cff` or the Zenodo DOI above.
-
-Nexus is released under the [Unlicense](LICENSE). Third-party and derived
-components retain their own license boundaries and notices.
+There is no peer-reviewed Nexus paper. Cite the archived software release using
+`CITATION.cff` or its recorded DOI. Nexus is released under the
+[Unlicense](LICENSE); third-party components retain their own notices.

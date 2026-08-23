@@ -18,7 +18,7 @@ use sha2::{Digest as _, Sha256};
 use crate::{
     BootGeneration, DeviceGeneration, Digest, Freshness, JournalGeneration,
     PersistenceProtocolError, RecoveryBinding, RecoveryLease, TrustedAnchorBackend,
-    TrustedAnchorSnapshot,
+    TrustedAnchorSnapshot, WorldRolloverAnchorBackend,
 };
 
 const MAGIC: [u8; 8] = *b"CSERAN2\0";
@@ -263,14 +263,88 @@ impl TrustedAnchorBackend for HostFileTrustedAnchor {
                 < expected.committed_freshness().journal().get()
             || replacement.committed_freshness().device().get()
                 < expected.committed_freshness().device().get()
-            || (replacement.committed_freshness() != expected.committed_freshness()
-                && replacement.committed_freshness() != self.state.issued)
+            || replacement.committed_freshness()
+                != if self.state.issued != expected.committed_freshness() {
+                    self.state.issued
+                } else {
+                    expected.committed_freshness()
+                }
         {
             return Err(PersistenceProtocolError::StaleFreshness.into());
         }
         self.replace(HostAnchorState {
             committed: replacement,
             issued: self.state.issued,
+        })
+    }
+}
+
+impl crate::CatalogEvolutionAnchorBackend for HostFileTrustedAnchor {
+    fn compare_and_rebind_catalog(
+        &mut self,
+        expected: TrustedAnchorSnapshot,
+        replacement: TrustedAnchorSnapshot,
+    ) -> Result<(), Self::Error> {
+        self.ensure_usable()?;
+        let source = expected.binding();
+        let target = replacement.binding();
+        if expected != self.state.committed
+            || target.catalog_digest() == source.catalog_digest()
+            || target.profile() != source.profile()
+            || target.world() != source.world()
+            || target.registry() != source.registry()
+            || expected.revision().checked_add(1) != Some(replacement.revision())
+            || replacement.committed_freshness().boot().get()
+                < expected.committed_freshness().boot().get()
+            || replacement.committed_freshness().journal().get()
+                < expected.committed_freshness().journal().get()
+            || replacement.committed_freshness().device().get()
+                < expected.committed_freshness().device().get()
+            || replacement.committed_freshness()
+                != if self.state.issued != expected.committed_freshness() {
+                    self.state.issued
+                } else {
+                    expected.committed_freshness()
+                }
+        {
+            return Err(PersistenceProtocolError::StaleFreshness.into());
+        }
+        self.replace(HostAnchorState {
+            committed: replacement,
+            issued: self.state.issued,
+        })
+    }
+}
+
+impl WorldRolloverAnchorBackend for HostFileTrustedAnchor {
+    fn compare_and_rebind_world(
+        &mut self,
+        expected: TrustedAnchorSnapshot,
+        replacement: TrustedAnchorSnapshot,
+    ) -> Result<(), Self::Error> {
+        self.ensure_usable()?;
+        if expected != self.state.committed {
+            return Err(PersistenceProtocolError::StaleJournalHead.into());
+        }
+        if self.state.issued != expected.committed_freshness()
+            || replacement.binding().profile() != expected.binding().profile()
+            || replacement.binding().catalog_digest() != expected.binding().catalog_digest()
+            || replacement.binding().world() == expected.binding().world()
+            || replacement.binding().registry() == expected.binding().registry()
+            || replacement.committed_freshness().registry() != replacement.binding().registry()
+            || replacement.committed_freshness().boot().get()
+                <= expected.committed_freshness().boot().get()
+            || replacement.committed_freshness().device().get()
+                <= expected.committed_freshness().device().get()
+            || replacement.committed_freshness().journal().get()
+                <= expected.committed_freshness().journal().get()
+            || replacement.revision() != 1
+        {
+            return Err(PersistenceProtocolError::BindingMismatch.into());
+        }
+        self.replace(HostAnchorState {
+            committed: replacement,
+            issued: replacement.committed_freshness(),
         })
     }
 }
@@ -652,5 +726,249 @@ mod tests {
             anchor.committed().expect("precondition keeps state usable"),
             old
         );
+    }
+
+    #[test]
+    fn catalog_rebind_requires_the_explicit_host_anchor_capability() {
+        let temp = TempAnchor::new("catalog-rebind");
+        let mut anchor = open(&temp);
+        let old = anchor.committed().expect("unpoisoned observation");
+        let evolved_catalogs = CatalogSet::new(&[standard_catalog(), crate::tool_dma_catalog()])
+            .expect("test catalog extension is valid");
+        let evolved_binding = RecoveryBinding::new(
+            old.binding().profile(),
+            old.binding().world(),
+            evolved_catalogs.digest(),
+            old.binding().registry(),
+        )
+        .unwrap();
+        let replacement = TrustedAnchorSnapshot::from_trusted_backend(
+            evolved_binding,
+            old.committed_freshness(),
+            old.revision() + 1,
+            Digest::new([0x41; 32]),
+            Digest::new([0x42; 32]),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            anchor.compare_and_advance(old, replacement),
+            Err(HostAnchorError::Protocol(
+                PersistenceProtocolError::StaleFreshness
+            ))
+        ));
+        assert_eq!(anchor.committed().unwrap(), old);
+        crate::CatalogEvolutionAnchorBackend::compare_and_rebind_catalog(
+            &mut anchor,
+            old,
+            replacement,
+        )
+        .expect("explicit catalog rebind is accepted");
+        assert_eq!(anchor.committed().unwrap(), replacement);
+    }
+
+    fn replacement(
+        expected: TrustedAnchorSnapshot,
+        committed_freshness: Freshness,
+        marker: u8,
+    ) -> TrustedAnchorSnapshot {
+        TrustedAnchorSnapshot::from_trusted_backend(
+            expected.binding(),
+            committed_freshness,
+            expected.revision() + 1,
+            Digest::new([marker; 32]),
+            Digest::new([marker.wrapping_add(1); 32]),
+        )
+        .expect("test replacement is structurally valid")
+    }
+
+    #[test]
+    fn world_rebind_is_explicit_exact_and_durable() {
+        let temp = TempAnchor::new("world-rebind");
+        let source_freshness = Freshness::new(
+            BootGeneration::new(3).unwrap(),
+            binding().registry(),
+            DeviceGeneration::new(3).unwrap(),
+            JournalGeneration::new(3).unwrap(),
+        );
+        let mut anchor = HostFileTrustedAnchor::open_or_initialize(
+            &temp.path,
+            binding(),
+            source_freshness,
+            Digest::new([0xab; 32]),
+        )
+        .unwrap();
+        let old = anchor.committed().expect("unpoisoned observation");
+        let target_binding = RecoveryBinding::new(
+            old.binding().profile(),
+            WorldId::new(8).unwrap(),
+            old.binding().catalog_digest(),
+            RegistryInstance::new(4).unwrap(),
+        )
+        .unwrap();
+        let rollback_freshness = Freshness::new(
+            BootGeneration::new(1).unwrap(),
+            target_binding.registry(),
+            DeviceGeneration::new(1).unwrap(),
+            JournalGeneration::new(1).unwrap(),
+        );
+        let rollback = TrustedAnchorSnapshot::from_trusted_backend(
+            target_binding,
+            rollback_freshness,
+            1,
+            Digest::new([0x81; 32]),
+            Digest::new([0x82; 32]),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            anchor.compare_and_advance(old, rollback),
+            Err(HostAnchorError::Protocol(_))
+        ));
+        assert!(matches!(
+            anchor.compare_and_rebind_world(old, rollback),
+            Err(HostAnchorError::Protocol(
+                PersistenceProtocolError::BindingMismatch
+            ))
+        ));
+        let target_freshness = Freshness::new(
+            BootGeneration::new(source_freshness.boot().get() + 1).unwrap(),
+            target_binding.registry(),
+            DeviceGeneration::new(source_freshness.device().get() + 1).unwrap(),
+            JournalGeneration::new(source_freshness.journal().get() + 1).unwrap(),
+        );
+        let target = TrustedAnchorSnapshot::from_trusted_backend(
+            target_binding,
+            target_freshness,
+            1,
+            Digest::new([0x83; 32]),
+            Digest::new([0x84; 32]),
+        )
+        .unwrap();
+        anchor
+            .compare_and_rebind_world(old, target)
+            .expect("dedicated cross-world CAS succeeds");
+        assert_eq!(anchor.committed().unwrap(), target);
+        drop(anchor);
+
+        let reopened = open(&temp);
+        assert_eq!(reopened.committed().unwrap(), target);
+    }
+
+    #[test]
+    fn issued_epoch_fences_ordinary_advance_and_only_exact_lease_commits() {
+        let temp = TempAnchor::new("issued-fence");
+        let mut anchor = open(&temp);
+        let old = anchor.committed().expect("unpoisoned observation");
+        let lease = anchor
+            .reserve_recovery_epoch(binding(), DeviceGeneration::new(2).unwrap())
+            .expect("reserve recovery epoch");
+
+        assert!(matches!(
+            anchor.compare_and_advance(old, replacement(old, old.committed_freshness(), 0x41)),
+            Err(HostAnchorError::Protocol(
+                PersistenceProtocolError::StaleFreshness
+            ))
+        ));
+        assert!(!anchor.recovery_required());
+        assert_eq!(anchor.committed().unwrap(), old);
+
+        let recovery = replacement(old, lease.next_freshness(), 0x42);
+        anchor
+            .compare_and_advance(old, recovery)
+            .expect("exact lease recovery commit advances");
+        assert_eq!(anchor.committed().unwrap(), recovery);
+        assert!(matches!(
+            anchor.compare_and_advance(old, replacement(old, lease.next_freshness(), 0x43)),
+            Err(HostAnchorError::Protocol(
+                PersistenceProtocolError::StaleJournalHead
+            ))
+        ));
+    }
+
+    #[test]
+    fn newer_reservation_invalidates_stale_lease_without_poisoning() {
+        let temp = TempAnchor::new("stale-lease");
+        let mut anchor = open(&temp);
+        let old = anchor.committed().expect("unpoisoned observation");
+        let stale = anchor
+            .reserve_recovery_epoch(binding(), DeviceGeneration::new(2).unwrap())
+            .expect("reserve first recovery epoch");
+        let current = anchor
+            .reserve_recovery_epoch(binding(), DeviceGeneration::new(2).unwrap())
+            .expect("reserve retry recovery epoch");
+
+        assert!(matches!(
+            anchor.compare_and_advance(old, replacement(old, stale.next_freshness(), 0x51)),
+            Err(HostAnchorError::Protocol(
+                PersistenceProtocolError::StaleFreshness
+            ))
+        ));
+        assert!(!anchor.recovery_required());
+
+        let recovery = replacement(old, current.next_freshness(), 0x52);
+        anchor
+            .compare_and_advance(old, recovery)
+            .expect("latest exact lease remains consumable");
+        assert_eq!(anchor.committed().unwrap(), recovery);
+    }
+
+    #[test]
+    fn recovery_commit_retry_before_replace_reopens_old_tip_and_succeeds() {
+        let temp = TempAnchor::new("recovery-commit-before-replace");
+        let mut anchor = open(&temp);
+        let old = anchor.committed().expect("unpoisoned observation");
+        let lease = anchor
+            .reserve_recovery_epoch(binding(), DeviceGeneration::new(2).unwrap())
+            .expect("reserve recovery epoch");
+        let recovery = replacement(old, lease.next_freshness(), 0x61);
+
+        anchor.set_failpoint(HostAnchorFailpoint::BeforeAtomicReplace);
+        assert!(matches!(
+            anchor.compare_and_advance(old, recovery),
+            Err(HostAnchorError::Injected(
+                HostAnchorFailpoint::BeforeAtomicReplace
+            ))
+        ));
+        assert!(anchor.recovery_required());
+        drop(anchor);
+
+        let mut reopened = open(&temp);
+        assert_eq!(reopened.committed().unwrap(), old);
+        reopened
+            .compare_and_advance(old, recovery)
+            .expect("retry exact recovery commit from durable old tip");
+        assert_eq!(reopened.committed().unwrap(), recovery);
+    }
+
+    #[test]
+    fn recovery_commit_lost_ack_reopens_new_tip_and_rejects_duplicate() {
+        let temp = TempAnchor::new("recovery-commit-after-replace");
+        let mut anchor = open(&temp);
+        let old = anchor.committed().expect("unpoisoned observation");
+        let lease = anchor
+            .reserve_recovery_epoch(binding(), DeviceGeneration::new(2).unwrap())
+            .expect("reserve recovery epoch");
+        let recovery = replacement(old, lease.next_freshness(), 0x71);
+
+        anchor.set_failpoint(HostAnchorFailpoint::AfterAtomicReplaceBeforeReturn);
+        assert!(matches!(
+            anchor.compare_and_advance(old, recovery),
+            Err(HostAnchorError::Injected(
+                HostAnchorFailpoint::AfterAtomicReplaceBeforeReturn
+            ))
+        ));
+        assert!(anchor.recovery_required());
+        drop(anchor);
+
+        let mut reopened = open(&temp);
+        assert_eq!(reopened.committed().unwrap(), recovery);
+        assert!(matches!(
+            reopened.compare_and_advance(old, recovery),
+            Err(HostAnchorError::Protocol(
+                PersistenceProtocolError::StaleJournalHead
+            ))
+        ));
+        assert!(!reopened.recovery_required());
     }
 }

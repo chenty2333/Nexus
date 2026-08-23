@@ -1,19 +1,20 @@
 use cser_core::{
     AdoptionPolicy, ArtifactAdmission, ArtifactLeaseState as CoreArtifactLeaseState,
     ArtifactPinChallenge, ArtifactPinVerifier, ArtifactReceiptBindings, ArtifactReleaseChallenge,
-    ArtifactReleaseVerifier, BootGeneration, CatalogSet, ClaimCardinality, ClaimId, ClaimKindId,
-    ClaimScope, CommandRequest, CommitState, ComponentId, ComponentProviderBinding,
-    CompositeComponentSpec, CompositeKindId, CoreError, CoreLimits, CreditClassId, CustodyState,
-    DeviceGeneration, DeviceGenerationEffect, Digest, DomainCatalog, DomainCatalogBuilder,
-    DomainId, EffectFactChallenge, EffectId, EffectReceiptVerifier, Engine, EvidenceKindId,
-    EvidenceRule, ExecutorCoordinate, ExecutorGeneration, ExecutorId, ExternalOutcome, Freshness,
-    FreshnessAxes, JournalGeneration, ObligationKindId, ObligationPolicy, ObligationReceipts,
-    ObligationSpec, OperationId, OutcomeState, ProviderCoordinate, ProviderEffectState,
-    ProviderGeneration, ProviderId, ReceiptBinding, ReceiptSchemaId, ReceiptVerifier,
-    RecoveryAnchor, RecoveryArtifactId, RecoveryArtifactPolicy, RecoveryBinding, RecoveryProfile,
-    RegistryInstance, ResourceGeneration, ResourceId, RetirementState, SettlementState,
-    TransitionEvent, TransitionOutput, VerificationError, VerifiedEffectObservation,
-    VerifiedObservation, VerifierBinding, VerifierGeneration, VerifierIdentity, WorldId,
+    ArtifactReleaseVerifier, ArtifactVerifierIdentity, BootGeneration, CatalogSet,
+    ClaimCardinality, ClaimId, ClaimKindId, ClaimScope, CommandRequest, CommitState, ComponentId,
+    ComponentProviderBinding, CompositeComponentSpec, CompositeKindId, CoreError, CoreLimits,
+    CreditClassId, CustodyState, DeviceGeneration, DeviceGenerationEffect, Digest, DomainCatalog,
+    DomainCatalogBuilder, DomainId, EffectFactChallenge, EffectId, EffectReceiptVerifier, Engine,
+    EvidenceKindId, EvidenceRule, ExecutorCoordinate, ExecutorGeneration, ExecutorId,
+    ExternalOutcome, Freshness, FreshnessAxes, JournalGeneration, ObligationKindId,
+    ObligationPolicy, ObligationReceipts, ObligationSpec, OperationId, OutcomeState,
+    ProviderCoordinate, ProviderEffectState, ProviderGeneration, ProviderId, ReceiptBinding,
+    ReceiptSchemaId, ReceiptVerifier, RecoveryAnchor, RecoveryArtifactId, RecoveryArtifactPolicy,
+    RecoveryBinding, RecoveryProfile, RegistryInstance, ResourceGeneration, ResourceId,
+    RetirementState, SettlementState, TransitionEvent, TransitionOutput, VerificationError,
+    VerifiedEffectObservation, VerifiedObservation, VerifierBinding, VerifierGeneration,
+    VerifierIdentity, WorldId,
 };
 
 use cser_model::recovery_artifact_oracle::{
@@ -204,19 +205,31 @@ fn provider(world: WorldId) -> ProviderCoordinate {
 }
 
 fn artifact_receipts() -> ArtifactReceiptBindings {
+    artifact_receipts_with_config(0xb0)
+}
+
+fn artifact_receipts_with_config(configuration: u8) -> ArtifactReceiptBindings {
     ArtifactReceiptBindings::new(
-        VerifierBinding::new(
-            id(ARTIFACT_PIN_VERIFIER, cser_core::VerifierId::new),
-            VerifierGeneration::new(1).unwrap(),
-            id(ARTIFACT_PIN_SCHEMA, ReceiptSchemaId::new),
-            Digest::new([0xa1; 32]),
+        ArtifactVerifierIdentity::new(
+            VerifierBinding::new(
+                id(ARTIFACT_PIN_VERIFIER, cser_core::VerifierId::new),
+                VerifierGeneration::new(1).unwrap(),
+                id(ARTIFACT_PIN_SCHEMA, ReceiptSchemaId::new),
+                Digest::new([0xa1; 32]),
+            )
+            .unwrap(),
+            Digest::new([configuration; 32]),
         )
         .unwrap(),
-        VerifierBinding::new(
-            id(ARTIFACT_RELEASE_VERIFIER, cser_core::VerifierId::new),
-            VerifierGeneration::new(1).unwrap(),
-            id(ARTIFACT_RELEASE_SCHEMA, ReceiptSchemaId::new),
-            Digest::new([0xa2; 32]),
+        ArtifactVerifierIdentity::new(
+            VerifierBinding::new(
+                id(ARTIFACT_RELEASE_VERIFIER, cser_core::VerifierId::new),
+                VerifierGeneration::new(1).unwrap(),
+                id(ARTIFACT_RELEASE_SCHEMA, ReceiptSchemaId::new),
+                Digest::new([0xa2; 32]),
+            )
+            .unwrap(),
+            Digest::new([configuration.wrapping_add(1); 32]),
         )
         .unwrap(),
     )
@@ -242,6 +255,13 @@ fn provider_verifiers(catalog: &DomainCatalog) -> Vec<VerifierBinding> {
 fn registered_engine_with_catalog(
     catalog: DomainCatalog,
 ) -> (Engine, DomainCatalog, ProviderCoordinate) {
+    registered_engine_with_catalog_and_receipts(catalog, artifact_receipts())
+}
+
+fn registered_engine_with_catalog_and_receipts(
+    catalog: DomainCatalog,
+    receipts: ArtifactReceiptBindings,
+) -> (Engine, DomainCatalog, ProviderCoordinate) {
     let world = WorldId::new(WORLD).unwrap();
     let provider = provider(world);
     let mut engine = Engine::new(
@@ -260,7 +280,7 @@ fn registered_engine_with_catalog(
     engine
         .transact_volatile(CommandRequest::BindArtifactReceiptVerifiers {
             coordinate: provider,
-            receipts: artifact_receipts(),
+            receipts,
         })
         .unwrap();
     (engine, catalog, provider)
@@ -279,7 +299,21 @@ fn fixture(
     EffectId,
     ExecutorCoordinate,
 ) {
-    let (mut engine, catalog, provider) = registered_engine();
+    fixture_with_receipts(effect_value, artifact_receipts())
+}
+
+fn fixture_with_receipts(
+    effect_value: u64,
+    receipts: ArtifactReceiptBindings,
+) -> (
+    Engine,
+    DomainCatalog,
+    ProviderCoordinate,
+    EffectId,
+    ExecutorCoordinate,
+) {
+    let (mut engine, catalog, provider) =
+        registered_engine_with_catalog_and_receipts(catalog(), receipts);
     let effect = EffectId::new(OperationId::new(effect_value).unwrap(), 1).unwrap();
     let actor = ExecutorCoordinate::new(
         ExecutorId::new(effect_value).unwrap(),
@@ -370,13 +404,13 @@ fn pin(engine: &mut Engine, effect: EffectId) {
     pin_component(engine, effect, id(COMPONENT, ComponentId::new));
 }
 
-struct AcceptPin(VerifierBinding);
+struct AcceptPin(ArtifactVerifierIdentity);
 
 impl ArtifactPinVerifier for AcceptPin {
     type Receipt = ();
 
-    fn identity(&self) -> VerifierIdentity {
-        VerifierIdentity::new_exact(self.0)
+    fn identity(&self) -> ArtifactVerifierIdentity {
+        self.0
     }
 
     fn verify(
@@ -388,13 +422,13 @@ impl ArtifactPinVerifier for AcceptPin {
     }
 }
 
-struct AcceptRelease(VerifierBinding);
+struct AcceptRelease(ArtifactVerifierIdentity);
 
 impl ArtifactReleaseVerifier for AcceptRelease {
     type Receipt = ();
 
-    fn identity(&self) -> VerifierIdentity {
-        VerifierIdentity::new_exact(self.0)
+    fn identity(&self) -> ArtifactVerifierIdentity {
+        self.0
     }
 
     fn verify(
@@ -451,9 +485,11 @@ impl ReceiptVerifier for AcceptEvidence {
         challenge: &cser_core::EvidenceChallenge,
         _receipt: &Self::Receipt,
     ) -> Result<VerifiedObservation, VerificationError> {
-        Ok(VerifiedObservation::new(
+        Ok(VerifiedObservation::new_bound(
             challenge.subject(),
+            challenge.subject_binding(),
             challenge.current_observation(),
+            challenge.current_binding(),
             Digest::new([0x79; 32]),
         ))
     }
@@ -1085,6 +1121,10 @@ fn required_artifact_core_matches_oracle_through_pin_settle_release_and_retire()
     )
     .unwrap()
     .into_engine();
+    assert_eq!(
+        engine.artifact_lease(artifact).unwrap().receipt_bindings(),
+        artifact_receipts()
+    );
     durable_tx(
         &mut engine,
         &mut journal,
@@ -1377,11 +1417,15 @@ fn unpinned_component_commit_intent_is_rejected() {
 fn artifact_pin_requires_exact_verifier_identity() {
     let (engine, _catalog, _provider, effect, _actor) = fixture(73_001);
     let expected = artifact_receipts().pin();
-    let wrong = VerifierBinding::new(
-        expected.verifier(),
-        expected.generation(),
-        expected.receipt_schema(),
-        Digest::new([0xee; 32]),
+    let wrong = ArtifactVerifierIdentity::new(
+        VerifierBinding::new(
+            expected.verifier(),
+            expected.generation(),
+            expected.receipt_schema(),
+            Digest::new([0xee; 32]),
+        )
+        .unwrap(),
+        expected.configuration_digest(),
     )
     .unwrap();
     let revision = engine.revision();
@@ -1395,6 +1439,94 @@ fn artifact_pin_requires_exact_verifier_identity() {
         Err(CoreError::UnknownVerifier)
     );
     assert_eq!(engine.revision(), revision);
+}
+
+#[test]
+fn artifact_pin_proof_cannot_cross_configured_verifier_engines() {
+    let effect_value = 73_101;
+    let receipts_a = artifact_receipts_with_config(0xc0);
+    let receipts_b = artifact_receipts_with_config(0xd0);
+    let (engine_a, _, _, effect, _) = fixture_with_receipts(effect_value, receipts_a);
+    let (mut engine_b, _, _, effect_b, _) = fixture_with_receipts(effect_value, receipts_b);
+    let component = id(COMPONENT, ComponentId::new);
+
+    assert_eq!(effect, effect_b);
+    assert_eq!(
+        engine_a
+            .artifact_pin_challenge(effect, component)
+            .unwrap()
+            .binding(),
+        engine_b
+            .artifact_pin_challenge(effect_b, component)
+            .unwrap()
+            .binding()
+    );
+    let proof = engine_a
+        .verify_artifact_pin(effect, component, &AcceptPin(receipts_a.pin()), &())
+        .unwrap();
+    let revision = engine_b.revision();
+
+    assert_eq!(
+        engine_b.transact_volatile(proof.record()),
+        Err(CoreError::ArtifactVerifierMismatch)
+    );
+    assert_eq!(engine_b.revision(), revision);
+}
+
+#[test]
+fn artifact_release_proof_cannot_cross_configured_verifier_engines() {
+    let effect_value = 73_201;
+    let receipts_a = artifact_receipts_with_config(0xc2);
+    let receipts_b = artifact_receipts_with_config(0xd2);
+    let (mut engine_a, _, provider, effect, _) = fixture_with_receipts(effect_value, receipts_a);
+    let (mut engine_b, _, provider_b, effect_b, _) =
+        fixture_with_receipts(effect_value, receipts_b);
+    let component = id(COMPONENT, ComponentId::new);
+
+    for (engine, effect, provider, receipts) in [
+        (&mut engine_a, effect, provider, receipts_a),
+        (&mut engine_b, effect_b, provider_b, receipts_b),
+    ] {
+        let proof = engine
+            .verify_artifact_pin(effect, component, &AcceptPin(receipts.pin()), &())
+            .unwrap();
+        engine.transact_volatile(proof.record()).unwrap();
+        engine
+            .transact_volatile(CommandRequest::FenceProviderEffects {
+                coordinate: provider,
+                expected_epoch: 1,
+            })
+            .unwrap();
+        engine
+            .transact_volatile(CommandRequest::AbortUnescapedEffect { effect })
+            .unwrap();
+        engine
+            .transact_volatile(CommandRequest::AuthorizeArtifactRelease { effect, component })
+            .unwrap();
+    }
+
+    assert_eq!(
+        engine_a
+            .artifact_release_permit(effect, component)
+            .unwrap()
+            .exact_tuple()
+            .0,
+        engine_b
+            .artifact_release_permit(effect_b, component)
+            .unwrap()
+            .exact_tuple()
+            .0
+    );
+    let proof = engine_a
+        .verify_artifact_release(effect, component, &AcceptRelease(receipts_a.release()), &())
+        .unwrap();
+    let revision = engine_b.revision();
+
+    assert_eq!(
+        engine_b.transact_volatile(proof.confirm()),
+        Err(CoreError::ArtifactVerifierMismatch)
+    );
+    assert_eq!(engine_b.revision(), revision);
 }
 
 #[test]
@@ -1686,4 +1818,301 @@ fn abort_unescaped_then_release_reissues_the_same_permit_and_confirms_once() {
             .live_component_bindings,
         0
     );
+}
+
+#[test]
+fn terminal_compaction_burns_nonzero_artifact_ids_across_cold_recovery() {
+    let value = 79_001;
+    let catalog = catalog();
+    let world = WorldId::new(WORLD).unwrap();
+    let provider = provider(world);
+    let mut engine = Engine::new(
+        world,
+        CatalogSet::new(std::slice::from_ref(&catalog)).unwrap(),
+        CoreLimits::bounded_default(),
+        freshness(),
+    );
+    let mut journal = Vec::new();
+    durable_tx(
+        &mut engine,
+        &mut journal,
+        CommandRequest::RegisterProviderGeneration {
+            coordinate: provider,
+            catalog_digest: catalog.digest(),
+            verifier_bindings: provider_verifiers(&catalog),
+        },
+    );
+    durable_tx(
+        &mut engine,
+        &mut journal,
+        CommandRequest::BindArtifactReceiptVerifiers {
+            coordinate: provider,
+            receipts: artifact_receipts(),
+        },
+    );
+
+    let effect = EffectId::new(OperationId::new(value).unwrap(), 1).unwrap();
+    let actor = ExecutorCoordinate::new(
+        ExecutorId::new(value).unwrap(),
+        ExecutorGeneration::new(1).unwrap(),
+    );
+    let component = id(COMPONENT, ComponentId::new);
+    let artifact = RecoveryArtifactId::new(value + 2).unwrap();
+    let pending_operation = OperationId::new(value - 1).unwrap();
+    let pending_effect = EffectId::new(pending_operation, 1).unwrap();
+    let pending_actor = ExecutorCoordinate::new(
+        ExecutorId::new(pending_operation.get()).unwrap(),
+        ExecutorGeneration::new(1).unwrap(),
+    );
+    let pending_artifact = RecoveryArtifactId::new(value + 3).unwrap();
+    durable_tx(
+        &mut engine,
+        &mut journal,
+        CommandRequest::AdmitScopedCompositeEffect {
+            effect,
+            origin: actor,
+            kind: id(COMPOSITE, CompositeKindId::new),
+            charge_account: cser_core::ChargeAccountId::new(value).unwrap(),
+            bindings: vec![
+                ComponentProviderBinding::new(component, provider).with_artifact(
+                    ArtifactAdmission::new(
+                        artifact,
+                        Digest::new([0x51; 32]),
+                        Digest::new([0x52; 32]),
+                    ),
+                ),
+            ],
+        },
+    );
+    durable_tx(
+        &mut engine,
+        &mut journal,
+        CommandRequest::AdmitScopedCompositeEffect {
+            effect: pending_effect,
+            origin: pending_actor,
+            kind: id(COMPOSITE, CompositeKindId::new),
+            charge_account: cser_core::ChargeAccountId::new(pending_operation.get()).unwrap(),
+            bindings: vec![
+                ComponentProviderBinding::new(component, provider).with_artifact(
+                    ArtifactAdmission::new(
+                        pending_artifact,
+                        Digest::new([0x53; 32]),
+                        Digest::new([0x54; 32]),
+                    ),
+                ),
+            ],
+        },
+    );
+    let pin = engine
+        .verify_artifact_pin(
+            effect,
+            component,
+            &AcceptPin(artifact_receipts().pin()),
+            &(),
+        )
+        .unwrap();
+    durable_tx(&mut engine, &mut journal, pin.record());
+    let pending_pin = engine
+        .verify_artifact_pin(
+            pending_effect,
+            component,
+            &AcceptPin(artifact_receipts().pin()),
+            &(),
+        )
+        .unwrap();
+    durable_tx(&mut engine, &mut journal, pending_pin.record());
+    durable_tx(
+        &mut engine,
+        &mut journal,
+        CommandRequest::FenceProviderEffects {
+            coordinate: provider,
+            expected_epoch: 1,
+        },
+    );
+    durable_tx(
+        &mut engine,
+        &mut journal,
+        CommandRequest::AbortUnescapedEffect { effect },
+    );
+    durable_tx(
+        &mut engine,
+        &mut journal,
+        CommandRequest::AbortUnescapedEffect {
+            effect: pending_effect,
+        },
+    );
+    durable_tx(
+        &mut engine,
+        &mut journal,
+        CommandRequest::AuthorizeArtifactRelease { effect, component },
+    );
+    let release = engine
+        .verify_artifact_release(
+            effect,
+            component,
+            &AcceptRelease(artifact_receipts().release()),
+            &(),
+        )
+        .unwrap();
+    durable_tx(&mut engine, &mut journal, release.confirm());
+    durable_tx(
+        &mut engine,
+        &mut journal,
+        CommandRequest::ReleaseCompositeEffect { effect },
+    );
+
+    let archive_root = engine.terminal_archive_root();
+    let archive_entries = engine.terminal_archive_entries();
+    durable_tx(
+        &mut engine,
+        &mut journal,
+        cser_core::Command::compact_terminal_operation(effect.operation()),
+    );
+    assert_ne!(engine.terminal_archive_root(), archive_root);
+    assert_eq!(engine.terminal_archive_entries(), archive_entries + 1);
+    assert!(engine.terminal_artifact_high_water() >= artifact.get());
+    assert!(engine.composite_effect(effect).is_none());
+    assert!(engine.operation(effect.operation()).is_none());
+    assert!(engine.artifact_lease(artifact).is_none());
+
+    let pending_permit = match durable_tx(
+        &mut engine,
+        &mut journal,
+        CommandRequest::AuthorizeArtifactRelease {
+            effect: pending_effect,
+            component,
+        },
+    )
+    .into_output()
+    {
+        TransitionOutput::ArtifactReleasePermit(permit) => permit,
+        other => panic!("expected artifact release permit, got {other:?}"),
+    };
+    assert!(pending_permit.release_operation().get() > engine.terminal_operation_high_water());
+    let pending_release = engine
+        .verify_artifact_release(
+            pending_effect,
+            component,
+            &AcceptRelease(artifact_receipts().release()),
+            &(),
+        )
+        .unwrap();
+    durable_tx(&mut engine, &mut journal, pending_release.confirm());
+    durable_tx(
+        &mut engine,
+        &mut journal,
+        CommandRequest::ReleaseCompositeEffect {
+            effect: pending_effect,
+        },
+    );
+
+    let terminal_archive_root = engine.terminal_archive_root();
+    let terminal_archive_entries = engine.terminal_archive_entries();
+    let terminal_artifact_high_water = engine.terminal_artifact_high_water();
+    let checkpoint = engine.journal_checkpoint(&journal).unwrap();
+    let committed = engine.freshness();
+    let next = Freshness::new(
+        BootGeneration::new(committed.boot().get() + 1).unwrap(),
+        committed.registry(),
+        committed.device(),
+        JournalGeneration::new(committed.journal().get() + 1).unwrap(),
+    );
+    let recovery_binding = RecoveryBinding::new(
+        RecoveryProfile::current(),
+        world,
+        CatalogSet::new(std::slice::from_ref(&catalog))
+            .unwrap()
+            .digest(),
+        committed.registry(),
+    )
+    .unwrap();
+    let anchor = RecoveryAnchor::from_trusted_provider(
+        recovery_binding,
+        committed,
+        next,
+        engine.revision(),
+        engine.head(),
+        engine.projection_digest(),
+    )
+    .unwrap();
+    let mut recovered = Engine::recover(
+        CatalogSet::new(std::slice::from_ref(&catalog)).unwrap(),
+        CoreLimits::bounded_default(),
+        anchor,
+        checkpoint.image(),
+    )
+    .unwrap()
+    .into_engine();
+    assert_eq!(recovered.terminal_archive_root(), terminal_archive_root);
+    assert_eq!(
+        recovered.terminal_archive_entries(),
+        terminal_archive_entries
+    );
+    assert_eq!(
+        recovered.terminal_artifact_high_water(),
+        terminal_artifact_high_water
+    );
+    assert!(recovered.composite_effect(effect).is_none());
+    assert!(recovered.operation(effect.operation()).is_none());
+    assert!(recovered.artifact_lease(artifact).is_none());
+    recovered
+        .transact(
+            CommandRequest::CheckpointRecovery {
+                boot: next.boot(),
+                journal: next.journal(),
+                device: next.device(),
+            },
+            |_| Ok::<(), ()>(()),
+        )
+        .unwrap();
+
+    let replay_provider = ProviderCoordinate::new(
+        world,
+        ProviderId::new(PROVIDER + 1).unwrap(),
+        ProviderGeneration::new(1).unwrap(),
+    );
+    recovered
+        .transact_volatile(CommandRequest::RegisterProviderGeneration {
+            coordinate: replay_provider,
+            catalog_digest: catalog.digest(),
+            verifier_bindings: provider_verifiers(&catalog),
+        })
+        .unwrap();
+    recovered
+        .transact_volatile(CommandRequest::BindArtifactReceiptVerifiers {
+            coordinate: replay_provider,
+            receipts: artifact_receipts(),
+        })
+        .unwrap();
+
+    let replay_operation = OperationId::new(value + 100).unwrap();
+    let replay_effect = EffectId::new(replay_operation, 1).unwrap();
+    let revision = recovered.revision();
+    let head = recovered.head();
+    let projection = recovered.projection_digest();
+    assert_eq!(
+        recovered.transact_volatile(CommandRequest::AdmitScopedCompositeEffect {
+            effect: replay_effect,
+            origin: ExecutorCoordinate::new(
+                ExecutorId::new(replay_operation.get()).unwrap(),
+                ExecutorGeneration::new(1).unwrap(),
+            ),
+            kind: id(COMPOSITE, CompositeKindId::new),
+            charge_account: cser_core::ChargeAccountId::new(replay_operation.get()).unwrap(),
+            bindings: vec![
+                ComponentProviderBinding::new(component, replay_provider).with_artifact(
+                    ArtifactAdmission::new(
+                        artifact,
+                        Digest::new([0x51; 32]),
+                        Digest::new([0x52; 32]),
+                    ),
+                ),
+            ],
+        }),
+        Err(CoreError::ArtifactBindingMismatch)
+    );
+    assert_eq!(recovered.revision(), revision);
+    assert_eq!(recovered.head(), head);
+    assert_eq!(recovered.projection_digest(), projection);
+    assert!(recovered.composite_effect(replay_effect).is_none());
 }

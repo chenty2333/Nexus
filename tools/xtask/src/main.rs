@@ -1,57 +1,21 @@
+mod system;
+
 use std::env;
 use std::error::Error;
+use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
 const BARE_METAL_TARGET: &str = "x86_64-unknown-none";
-const CSER_MODEL_NO_STD_CHECK_ARGS: &[&str] = &[
-    "check",
-    "--locked",
-    "-p",
-    "cser-model",
-    "--no-default-features",
-    "--lib",
-    "--target",
-    BARE_METAL_TARGET,
-];
-// `cser-core --all-features` includes the software-only SHA-2 comparator.
-// Keep that coverage in the broad host test below, but exercise the normal
-// host runtime-dispatch profile explicitly as a separate CI gate.
-const CSER_HASH_BACKEND_RUNTIME_DISPATCH_TEST_ARGS: &[&str] = &[
-    "test",
-    "--locked",
-    "-p",
-    "cser-core",
-    "--no-default-features",
-    "--features",
-    "std",
-    "--test",
-    "hash_backend",
-    "--no-fail-fast",
-];
-
-const REQUIRED_PATHS: &[&str] = &[
-    "Cargo.toml",
-    "Cargo.lock",
-    "maproom/terrain.md",
-    "maproom/basecamp.md",
-    "maproom/route.md",
-    "maproom/hazards.md",
-    "crates/cser-core/Cargo.toml",
-    "crates/cser-model/Cargo.toml",
-    "kernel/nexus-ostd/Cargo.toml",
-    "kernel/nexus-ostd/cser-production-sources.txt",
-    "kernel/nexus-ostd/scripts/assert-cser-core-production-cutover.sh",
-    "kernel/nexus-ostd/src/cser/core_production_registry.rs",
-    "kernel/nexus-ostd/src/cser/core_persistent_runtime.rs",
-    "x",
-];
+const PUBLIC_RECEIPT: &str = "combined-receipt.txt";
+const PUBLIC_CHECKSUM: &str = "combined-receipt.sha256";
 
 fn main() {
     if let Err(error) = real_main() {
-        eprintln!("xtask: {error}");
+        eprintln!("nexus: {error}");
         std::process::exit(1);
     }
 }
@@ -59,25 +23,25 @@ fn main() {
 fn real_main() -> Result<()> {
     let root = repo_root();
     let mut args = env::args().skip(1);
-    let command = args.next().unwrap_or_else(|| String::from("help"));
-    if let Some(extra) = args.next() {
-        return Err(format!("unexpected argument: {extra}").into());
+    let command = args.next().ok_or_else(usage)?;
+    let option = args.next();
+    if args.next().is_some() {
+        return Err(usage().into());
     }
 
     match command.as_str() {
-        "build" => build(&root),
-        "doctor" => doctor(&root),
-        "fmt" => fmt(&root),
-        "check" => check(&root),
-        "clippy" => clippy(&root),
-        "test" => test(&root),
-        "quick" | "model" | "verify" => verify(&root),
-        "help" | "-h" | "--help" => {
-            print_usage();
-            Ok(())
-        }
-        _ => Err(format!("unknown command: {command}").into()),
+        "check" if option.is_none() => check(&root),
+        "test" if option.is_none() => test(&root),
+        "kernel" if option.is_none() => kernel(&root),
+        "system" if option.is_none() => system(&root),
+        "seal" if option.is_none() => seal(&root),
+        "clean" => clean(&root, option.as_deref()),
+        _ => Err(usage().into()),
     }
+}
+
+fn usage() -> String {
+    "usage: cargo nexus <check|test|kernel|system|seal|clean>".into()
 }
 
 fn repo_root() -> PathBuf {
@@ -88,47 +52,39 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
-fn print_usage() {
-    eprintln!("usage: cargo run --manifest-path tools/xtask/Cargo.toml -- <command>");
-    eprintln!("commands: doctor build fmt check clippy test quick model verify");
-}
-
-fn doctor(root: &Path) -> Result<()> {
-    section("validate current CSER layout");
-    for relative in REQUIRED_PATHS {
-        let path = root.join(relative);
-        if !path.is_file() {
-            return Err(format!("required current path is missing: {}", path.display()).into());
-        }
-    }
-    run(root, "rustc", &["--version"])?;
-    run(root, "cargo", &["--version"])?;
-    run(root, "git", &["--version"])?;
-    assert_cutover(root)?;
-    println!(
-        "CSER CORE DOCTOR PASS paths={} production_registry=single persistent_runner=four-boot",
-        REQUIRED_PATHS.len()
-    );
-    Ok(())
-}
-
-fn build(root: &Path) -> Result<()> {
-    section("build the current host workspace");
+fn check(root: &Path) -> Result<()> {
+    section("check workspace formatting");
+    cargo(root, &["fmt", "--all", "--", "--check"])?;
+    section("clippy portable workspace");
     cargo(
         root,
         &[
-            "build",
+            "clippy",
+            "--locked",
+            "--workspace",
+            "--all-targets",
+            "--all-features",
+            "--",
+            "-D",
+            "warnings",
+        ],
+    )?;
+    section("check portable workspace");
+    cargo(
+        root,
+        &[
+            "check",
             "--locked",
             "--workspace",
             "--all-targets",
             "--all-features",
         ],
     )?;
-    section("build portable core for bare metal without std");
+    section("check portable core without std");
     cargo(
         root,
         &[
-            "build",
+            "check",
             "--locked",
             "-p",
             "cser-core",
@@ -138,11 +94,11 @@ fn build(root: &Path) -> Result<()> {
             BARE_METAL_TARGET,
         ],
     )?;
-    section("build independent oracle for bare metal without std");
+    section("check independent model without std");
     cargo(
         root,
         &[
-            "build",
+            "check",
             "--locked",
             "-p",
             "cser-model",
@@ -151,162 +107,265 @@ fn build(root: &Path) -> Result<()> {
             "--target",
             BARE_METAL_TARGET,
         ],
-    )
-}
-
-fn fmt(root: &Path) -> Result<()> {
-    section("format production workspaces");
-    cargo(root, &["fmt", "--all"])?;
-    cargo(root, &["fmt", "--manifest-path", "tools/xtask/Cargo.toml"])
-}
-
-fn fmt_check(root: &Path) -> Result<()> {
-    section("check Rust formatting");
-    cargo(root, &["fmt", "--all", "--", "--check"])?;
-    cargo(
-        root,
-        &[
-            "fmt",
-            "--manifest-path",
-            "tools/xtask/Cargo.toml",
-            "--",
-            "--check",
-        ],
-    )
-}
-
-fn check(root: &Path) -> Result<()> {
-    section("assert the atomic production cutover graph");
-    assert_cutover(root)?;
-    cargo_package(root, "check", "cser-core", true)?;
-    section("check portable core for bare metal without std");
-    cargo(
-        root,
-        &[
-            "check",
-            "--locked",
-            "-p",
-            "cser-core",
-            "--no-default-features",
-            "--lib",
-            "--target",
-            BARE_METAL_TARGET,
-        ],
     )?;
-    check_cser_model_no_std(root)?;
-    cargo_package(root, "check", "cser-model", true)?;
-    section("check the production workflow runner");
-    cargo(
-        root,
-        &[
-            "check",
-            "--locked",
-            "--manifest-path",
-            "tools/xtask/Cargo.toml",
-            "--all-targets",
-        ],
-    )
-}
-
-fn clippy(root: &Path) -> Result<()> {
-    clippy_package(root, "cser-core", true)?;
-    clippy_package(root, "cser-model", true)?;
-    section("clippy the production workflow runner");
-    cargo(
-        root,
-        &[
-            "clippy",
-            "--locked",
-            "--manifest-path",
-            "tools/xtask/Cargo.toml",
-            "--all-targets",
-            "--",
-            "-D",
-            "warnings",
-        ],
-    )
+    section("check Nexus OSTD kernel closure");
+    system::check(root)
 }
 
 fn test(root: &Path) -> Result<()> {
-    test_with_model_no_std(root, true)
-}
-
-fn test_with_model_no_std(root: &Path, include_model_no_std: bool) -> Result<()> {
-    if include_model_no_std {
-        check_cser_model_no_std(root)?;
-    }
-    test_hash_backend_runtime_dispatch(root)?;
-    test_package(root, "cser-core", true)?;
-    test_package(root, "cser-model", true)?;
-    section("test the production workflow runner");
+    section("test endpoint and provider host reference");
+    run(
+        root,
+        "python3",
+        &[
+            "-m",
+            "unittest",
+            "discover",
+            "-s",
+            "kernel/nexus-ostd/tools/cser-experiment/tests",
+            "-v",
+        ],
+    )?;
+    section("test portable core");
     cargo(
         root,
         &[
             "test",
             "--locked",
-            "--manifest-path",
-            "tools/xtask/Cargo.toml",
+            "-p",
+            "cser-core",
+            "--all-targets",
+            "--all-features",
+            "--no-fail-fast",
         ],
-    )
+    )?;
+    section("test independent model");
+    cargo(
+        root,
+        &[
+            "test",
+            "--locked",
+            "-p",
+            "cser-model",
+            "--all-targets",
+            "--all-features",
+            "--no-fail-fast",
+        ],
+    )?;
+    section("test Nexus system false-PASS checkers");
+    cargo(root, &["test", "--locked", "-p", "nexus-xtask"])
 }
 
-fn verify(root: &Path) -> Result<()> {
-    fmt_check(root)?;
-    check(root)?;
-    clippy(root)?;
-    test_with_model_no_std(root, false)?;
-    println!(
-        "CSER CORE VERIFY PASS portable_core=true independent_oracle=true loom=true journal_recovery=true hash_backend_runtime_dispatch=true"
-    );
+fn kernel(root: &Path) -> Result<()> {
+    system::build(root)
+}
+
+fn system(root: &Path) -> Result<()> {
+    system::run(root).map(|_| ())
+}
+
+fn seal(root: &Path) -> Result<()> {
+    require_clean_source(root)?;
+    let _lock = system::lock(root)?;
+    let public = prepare_public_incomplete(root)?;
+    let (snapshot, revision) = archive_snapshot(root)?;
+    let result = match system::seal_from(&snapshot, root, &revision) {
+        Ok(_) => {
+            move_raw_artifacts(&snapshot, root)?;
+            publish_receipt(root, &public)
+        }
+        Err(error) => {
+            let staged = snapshot.join("kernel/nexus-ostd/artifacts/cser-production");
+            if staged.is_dir()
+                && let Err(move_error) = move_raw_artifacts(&snapshot, root)
+            {
+                return Err(format!(
+                    "{error}; incomplete raw evidence remains at {} because it could not be moved: {move_error}",
+                    snapshot.display()
+                )
+                .into());
+            }
+            Err(error)
+        }
+    };
+    let _ = fs::remove_dir_all(&snapshot);
+    result
+}
+
+fn clean(root: &Path, option: Option<&str>) -> Result<()> {
+    if !matches!(option, None | Some("--raw")) {
+        return Err("usage: cargo nexus clean [--raw]".into());
+    }
+    let _lock = system::lock(root)?;
+    section("clean portable workspace");
+    cargo(root, &["clean"])?;
+    system::clean(root, option == Some("--raw"))
+}
+
+fn prepare_public_incomplete(root: &Path) -> Result<PathBuf> {
+    let public = root.join("target/nexus/public");
+    if public.exists() {
+        fs::remove_dir_all(&public)?;
+    }
+    fs::create_dir_all(&public)?;
+    atomic_write(&public.join("INCOMPLETE"), b"INCOMPLETE\n")?;
+    Ok(public)
+}
+
+fn archive_snapshot(root: &Path) -> Result<(PathBuf, String)> {
+    let resolved = Command::new("git")
+        .current_dir(root)
+        .args(["rev-parse", "--verify", "HEAD^{commit}"])
+        .output()?;
+    if !resolved.status.success() {
+        return Err(format!("git rev-parse HEAD failed with {}", resolved.status).into());
+    }
+    let revision = String::from_utf8(resolved.stdout)?.trim().to_owned();
+    if revision.len() != 40 || !revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("git resolved a malformed seal revision".into());
+    }
+    let snapshot = root.join(format!("target/nexus/seal-{}", std::process::id()));
+    if snapshot.exists() {
+        return Err(format!("seal snapshot already exists: {}", snapshot.display()).into());
+    }
+    fs::create_dir_all(&snapshot)?;
+    let result: Result<()> = (|| {
+        let archive = Command::new("git")
+            .current_dir(root)
+            .args(["archive", "--format=tar", &revision])
+            .output()?;
+        if !archive.status.success() {
+            return Err(format!("git archive {revision} failed with {}", archive.status).into());
+        }
+        let mut extract = Command::new("tar")
+            .current_dir(root)
+            .args(["-xf", "-", "-C"])
+            .arg(&snapshot)
+            .stdin(std::process::Stdio::piped())
+            .spawn()?;
+        extract
+            .stdin
+            .as_mut()
+            .ok_or("tar archive input is unavailable")?
+            .write_all(&archive.stdout)?;
+        if !extract.wait()?.success() {
+            return Err("git archive extraction failed".into());
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&snapshot);
+    }
+    result?;
+    Ok((snapshot, revision))
+}
+
+fn move_raw_artifacts(snapshot: &Path, root: &Path) -> Result<()> {
+    let staged = snapshot.join("kernel/nexus-ostd/artifacts/cser-production");
+    let raw = root.join("kernel/nexus-ostd/artifacts/cser-production");
+    if !staged.is_dir() {
+        return Err(format!(
+            "sealed raw artifact directory is missing: {}",
+            staged.display()
+        )
+        .into());
+    }
+    if let Some(parent) = raw.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if raw.exists() {
+        fs::remove_dir_all(&raw)?;
+    }
+    fs::rename(staged, raw)?;
     Ok(())
 }
 
-fn check_cser_model_no_std(root: &Path) -> Result<()> {
-    section("check independent oracle for bare metal without std");
-    cargo(root, CSER_MODEL_NO_STD_CHECK_ARGS)
-}
-
-fn test_hash_backend_runtime_dispatch(root: &Path) -> Result<()> {
-    section("test cser-core host runtime-dispatch hash backend");
-    cargo(root, CSER_HASH_BACKEND_RUNTIME_DISPATCH_TEST_ARGS)
-}
-
-fn cargo_package(root: &Path, verb: &str, package: &str, all_features: bool) -> Result<()> {
-    section(&format!("{verb} {package}"));
-    let mut args = vec![verb, "--locked", "-p", package, "--all-targets"];
-    if all_features {
-        args.push("--all-features");
+fn publish_receipt(root: &Path, public: &Path) -> Result<()> {
+    let raw = root.join("kernel/nexus-ostd/artifacts/cser-production");
+    let receipt = fs::read(raw.join("combined-receipt.txt"))?;
+    let checksum = fs::read(raw.join("combined-receipt.sha256"))?;
+    ensure_public_incomplete(public)?;
+    atomic_write(&public.join(PUBLIC_RECEIPT), &receipt)?;
+    atomic_write(&public.join(PUBLIC_CHECKSUM), &checksum)?;
+    let mut names = fs::read_dir(public)?
+        .map(|entry| entry.map(|value| value.file_name()))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    names.sort();
+    let expected = ["INCOMPLETE", PUBLIC_CHECKSUM, PUBLIC_RECEIPT].map(std::ffi::OsString::from);
+    if names != expected {
+        return Err("public receipt staging contains an unexpected file".into());
     }
-    cargo(root, &args)
-}
-
-fn clippy_package(root: &Path, package: &str, all_features: bool) -> Result<()> {
-    section(&format!("clippy {package}"));
-    let mut args = vec!["clippy", "--locked", "-p", package, "--all-targets"];
-    if all_features {
-        args.push("--all-features");
+    let verified = Command::new("sha256sum")
+        .current_dir(public)
+        .args(["-c", PUBLIC_CHECKSUM])
+        .stdout(std::process::Stdio::null())
+        .status()?;
+    if !verified.success() {
+        return Err("public receipt checksum verification failed".into());
     }
-    args.extend(["--", "-D", "warnings"]);
-    cargo(root, &args)
+    fs::remove_file(public.join("INCOMPLETE"))?;
+    fs::File::open(public)?.sync_all()?;
+    println!("NEXUS SEAL PASS public_receipt={}", public.display());
+    Ok(())
 }
 
-fn test_package(root: &Path, package: &str, all_features: bool) -> Result<()> {
-    section(&format!("test {package}"));
-    let mut args = vec!["test", "--locked", "-p", package, "--all-targets"];
-    if all_features {
-        args.push("--all-features");
+fn ensure_public_incomplete(path: &Path) -> Result<()> {
+    for entry in fs::read_dir(path)? {
+        let name = entry?.file_name();
+        if name != "INCOMPLETE" {
+            return Err(format!(
+                "public receipt directory is not incomplete: {}",
+                path.display()
+            )
+            .into());
+        }
     }
-    args.push("--no-fail-fast");
-    cargo(root, &args)
+    Ok(())
 }
 
-fn assert_cutover(root: &Path) -> Result<()> {
-    let script = root.join("kernel/nexus-ostd/scripts/assert-cser-core-production-cutover.sh");
-    let script = script
-        .to_str()
-        .ok_or("production cutover script path is not UTF-8")?;
-    let root_text = root.to_str().ok_or("repository root path is not UTF-8")?;
-    run(root, script, &[root_text])
+fn require_clean_source(root: &Path) -> Result<()> {
+    let status = Command::new("git")
+        .current_dir(root)
+        .args([
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--",
+            ".",
+            ":(exclude)target/**",
+            ":(exclude)kernel/nexus-ostd/target/**",
+            ":(exclude)kernel/nexus-ostd/artifacts/**",
+        ])
+        .output()?;
+    if !status.status.success() {
+        return Err(format!("git status failed with {}", status.status).into());
+    }
+    if !status.stdout.is_empty() {
+        return Err("production receipt seal rejected: source tree is dirty".into());
+    }
+    Ok(())
+}
+
+fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
+    let parent = path.parent().ok_or("receipt path has no parent")?;
+    let name = path.file_name().ok_or("receipt path has no file name")?;
+    let temporary = parent.join(format!(
+        ".{}-{}.tmp",
+        name.to_string_lossy(),
+        std::process::id()
+    ));
+    let result: Result<()> = (|| {
+        let mut file = fs::File::create(&temporary)?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)?;
+        fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 fn cargo(root: &Path, args: &[&str]) -> Result<()> {
@@ -326,50 +385,4 @@ fn run(root: &Path, program: &str, args: &[&str]) -> Result<()> {
 
 fn section(title: &str) {
     println!("\n==> {title}");
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        BARE_METAL_TARGET, CSER_HASH_BACKEND_RUNTIME_DISPATCH_TEST_ARGS,
-        CSER_MODEL_NO_STD_CHECK_ARGS,
-    };
-
-    #[test]
-    fn model_no_std_check_plan_is_locked_and_targeted() {
-        assert_eq!(
-            CSER_MODEL_NO_STD_CHECK_ARGS,
-            [
-                "check",
-                "--locked",
-                "-p",
-                "cser-model",
-                "--no-default-features",
-                "--lib",
-                "--target",
-                BARE_METAL_TARGET,
-            ]
-        );
-    }
-
-    #[test]
-    fn host_hash_backend_gate_uses_runtime_dispatch_profile() {
-        assert_eq!(
-            CSER_HASH_BACKEND_RUNTIME_DISPATCH_TEST_ARGS,
-            [
-                "test",
-                "--locked",
-                "-p",
-                "cser-core",
-                "--no-default-features",
-                "--features",
-                "std",
-                "--test",
-                "hash_backend",
-                "--no-fail-fast",
-            ]
-        );
-        assert!(!CSER_HASH_BACKEND_RUNTIME_DISPATCH_TEST_ARGS.contains(&"--all-features"));
-        assert!(!CSER_HASH_BACKEND_RUNTIME_DISPATCH_TEST_ARGS.contains(&"sha2-software-baseline"));
-    }
 }

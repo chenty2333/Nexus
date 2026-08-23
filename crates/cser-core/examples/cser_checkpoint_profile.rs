@@ -1019,9 +1019,10 @@ fn parse_sizes() -> Vec<usize> {
 }
 
 fn main() {
-    if cfg!(feature = "test-support") || cfg!(feature = "full-invariant-oracle") {
+    if cfg!(feature = "full-invariant-oracle") {
         eprintln!(
-            "cser_checkpoint_profile requires the production transition gate; rerun with --no-default-features"
+            "cser_checkpoint_profile requires the diagnostic oracle disabled; rerun with \
+             --no-default-features --features test-support"
         );
         std::process::exit(2);
     }

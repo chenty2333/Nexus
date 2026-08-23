@@ -32,14 +32,14 @@ use cser_core::{
     DEVICE_CLAIM_QUEUE_SLOT, DEVICE_COMMIT_RECEIPT_SCHEMA, DEVICE_EVIDENCE_IRQ_DRAINED,
     DEVICE_EVIDENCE_RESET, DEVICE_RECEIPT_SCHEMA, DEVICE_VERIFIER, DeviceGeneration, DeviceScopeId,
     Digest, EffectFactChallenge, EffectFactKind, EffectId, EffectReceiptVerifier,
-    EvidenceChallenge, ExecutorCoordinate, ExecutorGeneration, ExecutorId, ExternalOutcome,
-    Freshness, JournalGeneration, JournalRecord, OperationId, OutcomeState, ProviderCoordinate,
-    ProviderGeneration, ProviderId, REPLY_CLAIM_PUBLICATION_SLOT, REPLY_COMMIT_RECEIPT_SCHEMA,
-    REPLY_VERIFIER, ReceiptSchemaId, ReceiptVerifier, RegistryInstance, ResourceGeneration,
-    ResourceId, RetirementState, SettlementClaim, SettlementState, SnapshotId,
-    TransitionDurability, TransitionOutput, TransitionReceipt, TxError, VerificationError,
-    VerifiedEffectObservation, VerifiedObservation, VerifierBinding, VerifierGeneration,
-    VerifierIdentity, WorldId, standard_catalog,
+    EvidenceChallenge, ExecutorBinding, ExecutorCoordinate, ExecutorGeneration, ExecutorId,
+    ExternalOutcome, Freshness, JournalGeneration, JournalRecord, OperationId, OutcomeState,
+    ProviderCoordinate, ProviderGeneration, ProviderId, REPLY_CLAIM_PUBLICATION_SLOT,
+    REPLY_COMMIT_RECEIPT_SCHEMA, REPLY_EVIDENCE_PUBLICATION_ACK, REPLY_VERIFIER, ReceiptSchemaId,
+    ReceiptVerifier, RegistryInstance, ResourceGeneration, ResourceId, RetirementState,
+    SettlementClaim, SettlementState, SnapshotId, TransitionDurability, TransitionOutput,
+    TransitionReceipt, TxError, VerificationError, VerifiedEffectObservation, VerifiedObservation,
+    VerifierBinding, VerifierGeneration, VerifierIdentity, WorldId, standard_catalog,
 };
 use ostd::{
     power::{ExitCode, poweroff},
@@ -254,6 +254,8 @@ struct ProbeEffectVerifier {
 struct ProbeEvidenceReceipt {
     challenge: EvidenceChallenge,
     observation: Freshness,
+    subject_binding: ExecutorBinding,
+    observation_binding: ExecutorBinding,
     digest: Digest,
 }
 
@@ -274,15 +276,19 @@ impl ReceiptVerifier for ProbeEvidenceVerifier {
         receipt: &Self::Receipt,
     ) -> Result<VerifiedObservation, VerificationError> {
         if *challenge != receipt.challenge
+            || receipt.subject_binding != challenge.subject_binding()
+            || receipt.observation_binding != challenge.current_binding()
             || challenge.expected_verifier_binding() != self.binding
             || challenge.verification_scope().verifier_binding() != self.binding
             || receipt.digest.is_zero()
         {
             return Err(VerificationError::Rejected);
         }
-        Ok(VerifiedObservation::new(
+        Ok(VerifiedObservation::new_bound(
             challenge.subject(),
+            receipt.subject_binding,
             receipt.observation,
+            receipt.observation_binding,
             receipt.digest,
         ))
     }
@@ -914,6 +920,8 @@ fn retire_probe_dma_claim(runtime: &SpikeRuntime, effect: EffectId, claim: Claim
     let reset_receipt = ProbeEvidenceReceipt {
         challenge: reset_challenge,
         observation: reset_observation,
+        subject_binding: reset_challenge.subject_binding(),
+        observation_binding: reset_challenge.current_binding(),
         digest: digest(14),
     };
     let reset = runtime.observe(|engine| {
@@ -943,6 +951,8 @@ fn retire_probe_dma_claim(runtime: &SpikeRuntime, effect: EffectId, claim: Claim
     let irq_receipt = ProbeEvidenceReceipt {
         challenge: irq_challenge,
         observation: irq_challenge.current_observation(),
+        subject_binding: irq_challenge.subject_binding(),
+        observation_binding: irq_challenge.current_binding(),
         digest: digest(15),
     };
     let irq = runtime.observe(|engine| {
@@ -1046,8 +1056,22 @@ fn settle_real_reply(
     );
 
     assert_eq!(client_result.wait_take(), Ok(plan.value()));
+    let retirement_challenge = runtime.observe(|engine| {
+        engine
+            .component_evidence_challenge(
+                plan.coordinate().effect(),
+                plan.coordinate().component(),
+                plan.coordinate().claim(),
+                REPLY_EVIDENCE_PUBLICATION_ACK,
+            )
+            .expect("reply retirement challenge is available before acknowledgement receipt")
+    });
     let ack_observation = custody
-        .observe_ack(plan)
+        .observe_ack(
+            plan,
+            retirement_challenge.subject_binding(),
+            retirement_challenge.current_binding(),
+        )
         .expect("real client acknowledgement is visible");
     let acknowledgement = runtime.observe(|engine| {
         custody

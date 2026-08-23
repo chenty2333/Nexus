@@ -1439,6 +1439,7 @@ impl DomainCatalogBuilder {
                 || !rule
                     .observation_freshness()
                     .contains(rule.strictly_advanced())
+                || rule.strictly_advanced().contains(FreshnessAxes::BINDING)
             {
                 return Err(DomainCatalogError::InvalidFreshnessRelation);
             }
@@ -1842,6 +1843,21 @@ impl CatalogSet {
     pub fn iter(&self) -> impl Iterator<Item = (&Digest, &DomainCatalog)> {
         self.catalogs.iter()
     }
+
+    /// Returns whether `candidate` is a strict append-only evolution of this
+    /// set.
+    ///
+    /// Every existing digest must retain byte-for-byte equivalent canonical
+    /// material and at least one new digest must be present.  Catalog-set
+    /// evolution uses this predicate before a durable checkpoint rebind, so a
+    /// caller cannot turn removal or replacement into an availability update.
+    pub fn is_strict_extension(&self, candidate: &Self) -> bool {
+        candidate.len() > self.len()
+            && self
+                .catalogs
+                .iter()
+                .all(|(digest, catalog)| candidate.catalogs.get(digest) == Some(catalog))
+    }
 }
 
 fn catalog_set_digest(catalogs: &BTreeMap<Digest, DomainCatalog>) -> Digest {
@@ -2063,5 +2079,19 @@ mod catalog_set_tests {
             CatalogSet::new(&[invalid]),
             Err(CatalogSetError::InvalidCatalogDigest)
         );
+    }
+
+    #[test]
+    fn extension_is_strict_append_only() {
+        let first = catalog(1);
+        let second = catalog(2);
+        let original = CatalogSet::new(core::slice::from_ref(&first)).unwrap();
+        let extended = CatalogSet::new(&[first.clone(), second.clone()]).unwrap();
+        let replacement = CatalogSet::new(core::slice::from_ref(&second)).unwrap();
+
+        assert!(original.is_strict_extension(&extended));
+        assert!(!extended.is_strict_extension(&original));
+        assert!(!original.is_strict_extension(&original));
+        assert!(!original.is_strict_extension(&replacement));
     }
 }

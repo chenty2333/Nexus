@@ -708,6 +708,10 @@ pub struct ClaimProjection {
     pub resource: ResourceId,
     /// Generation enrolled by the old effect.
     pub enrolled_generation: u64,
+    /// Exact executor coordinate under which the claim was enrolled.
+    pub enrolled_executor: ExecutorCoordinate,
+    /// Effect-local authority epoch under which the claim was enrolled.
+    pub enrolled_authority_epoch: u64,
     /// Current claim lifecycle.
     pub state: ClaimState,
     /// Durable next-generation reservation retained across executor crashes.
@@ -795,6 +799,8 @@ struct ClaimRecord {
     kind: ClaimKind,
     resource: ResourceId,
     enrolled_generation: u64,
+    enrolled_executor: ExecutorCoordinate,
+    enrolled_authority_epoch: u64,
     state: ClaimState,
     pending_reuse: Option<ReuseReservation>,
 }
@@ -866,6 +872,8 @@ impl CompositeEffectOracle {
                 kind,
                 resource: resources.get(kind),
                 enrolled_generation: resource_generation,
+                enrolled_executor: executor,
+                enrolled_authority_epoch: 1,
                 state: ClaimState::Staged,
                 pending_reuse: None,
             }
@@ -1091,6 +1099,37 @@ impl CompositeEffectOracle {
         }
         self.authority = CompositeAuthority::Active;
         self.authority_epoch = next_generation_of(self.authority_epoch);
+        self.bump_revision();
+        debug_assert!(self.check_invariants());
+        Ok(())
+    }
+
+    /// Rebinds every wholly-precommit claim to the adopted executor authority.
+    pub fn rebase_precommit_claims(
+        &mut self,
+        observation: AuthorityObservation,
+    ) -> Result<(), CompositeError> {
+        self.require_active(observation)?;
+        if self.authority_epoch <= 1
+            || self.reply != ReplyState::Staged
+            || self.dma != DmaOutcome::Staged
+            || self
+                .claims
+                .iter()
+                .any(|claim| claim.state != ClaimState::Staged)
+        {
+            return Err(CompositeError::WrongComponentState);
+        }
+        if self.claims.iter().all(|claim| {
+            claim.enrolled_executor == observation.executor
+                && claim.enrolled_authority_epoch == observation.authority_epoch
+        }) {
+            return Err(CompositeError::StaleAuthority);
+        }
+        for claim in &mut self.claims {
+            claim.enrolled_executor = observation.executor;
+            claim.enrolled_authority_epoch = observation.authority_epoch;
+        }
         self.bump_revision();
         debug_assert!(self.check_invariants());
         Ok(())
@@ -1572,6 +1611,9 @@ impl CompositeEffectOracle {
         if self.claims.iter().enumerate().any(|(index, claim)| {
             claim.kind != ClaimKind::ALL[index]
                 || claim.enrolled_generation != self.dma_resource_generation
+                || claim.enrolled_executor.executor() != self.origin_executor
+                || claim.enrolled_authority_epoch == 0
+                || claim.enrolled_authority_epoch > self.authority_epoch
                 || matches!(claim.state, ClaimState::ReusePermitted { .. })
                     != claim.pending_reuse.is_some()
                 || claim.pending_reuse.is_some_and(|pending| {
@@ -1771,6 +1813,8 @@ impl CompositeEffectOracle {
             kind,
             resource: record.resource,
             enrolled_generation: record.enrolled_generation,
+            enrolled_executor: record.enrolled_executor,
+            enrolled_authority_epoch: record.enrolled_authority_epoch,
             state: record.state,
             pending_reuse: record
                 .pending_reuse

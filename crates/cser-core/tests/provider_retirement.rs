@@ -128,9 +128,11 @@ impl ReceiptVerifier for ScopedEvidenceVerifier {
         challenge: &cser_core::EvidenceChallenge,
         _receipt: &Self::Receipt,
     ) -> Result<VerifiedObservation, cser_core::VerificationError> {
-        Ok(VerifiedObservation::new(
+        Ok(VerifiedObservation::new_bound(
             challenge.subject(),
+            challenge.subject_binding(),
             challenge.current_observation(),
+            challenge.current_binding(),
             Digest::new([0xb7; 32]),
         ))
     }
@@ -769,6 +771,7 @@ fn handoff_source_release_removes_scoped_binding_at_the_pivot() {
             .acknowledge_handoff_parent_success(verified_outcome, verified_descriptor)
             .unwrap()
     );
+    let child = descriptor.child_effect().unwrap();
     let verified = engine
         .verify_child_descriptor(descriptor, &AcceptDescriptor, &())
         .unwrap();
@@ -880,7 +883,6 @@ fn handoff_source_release_removes_scoped_binding_at_the_pivot() {
     // still reserves it until the child pivot or an explicit abort.  Both the
     // read-only reusable check and the durable reuse command must observe that
     // reservation instead of advancing the generation behind the descriptor.
-    let child = descriptor.child_effect().unwrap();
     assert_eq!(
         engine.check_reusable(descriptor.resource, descriptor.resource_generation,),
         Err(CoreError::ResourceRetained)
@@ -968,6 +970,7 @@ fn handoff_source_release_removes_scoped_binding_at_the_pivot() {
         DeviceGeneration::new(1).unwrap(),
         JournalGeneration::new(2).unwrap(),
     );
+    let mut recovered_journal = journal.clone();
     let mut recovered = Engine::recover(
         CatalogSet::new(std::slice::from_ref(&catalog)).unwrap(),
         CoreLimits::bounded_default(),
@@ -980,17 +983,89 @@ fn handoff_source_release_removes_scoped_binding_at_the_pivot() {
             engine.projection_digest(),
         )
         .unwrap(),
-        &journal,
+        &recovered_journal,
     )
     .unwrap()
     .into_engine();
-    recovered
-        .transact_volatile(CommandRequest::CheckpointRecovery {
+    durable_output(
+        &mut recovered,
+        &mut recovered_journal,
+        CommandRequest::CheckpointRecovery {
             boot: next_freshness.boot(),
             journal: next_freshness.journal(),
             device: next_freshness.device(),
-        })
+        },
+    );
+    let verified = recovered
+        .verify_child_descriptor(descriptor, &AcceptDescriptor, &())
         .unwrap();
+    let stale_resolution = recovered
+        .verify_handoff_child_resolution(
+            verified,
+            &AcceptHandoffChildRecovery {
+                identity: scoped_identity(
+                    &catalog,
+                    TOOL_VERIFIER,
+                    TOOL_COMMIT_RECEIPT_SCHEMA,
+                    0x75,
+                ),
+            },
+            &(),
+        )
+        .unwrap();
+    let later_freshness = Freshness::new(
+        BootGeneration::new(3).unwrap(),
+        RegistryInstance::new(1).unwrap(),
+        DeviceGeneration::new(1).unwrap(),
+        JournalGeneration::new(3).unwrap(),
+    );
+    let mut stale_journal = recovered_journal.clone();
+    let mut advanced = Engine::recover(
+        CatalogSet::new(std::slice::from_ref(&catalog)).unwrap(),
+        CoreLimits::bounded_default(),
+        RecoveryAnchor::from_trusted_provider(
+            recovery_binding(world, &catalog, next_freshness),
+            next_freshness,
+            later_freshness,
+            recovered.revision(),
+            recovered.head(),
+            recovered.projection_digest(),
+        )
+        .unwrap(),
+        &stale_journal,
+    )
+    .unwrap()
+    .into_engine();
+    durable_output(
+        &mut advanced,
+        &mut stale_journal,
+        CommandRequest::CheckpointRecovery {
+            boot: later_freshness.boot(),
+            journal: later_freshness.journal(),
+            device: later_freshness.device(),
+        },
+    );
+    let revision_after_checkpoint = advanced.revision();
+    let head_after_checkpoint = advanced.head();
+    let projection_after_checkpoint = advanced.projection_digest();
+    let outcome_after_checkpoint = advanced
+        .component(child, TOOL_HANDOFF_COMPONENT)
+        .unwrap()
+        .outcome;
+    assert_eq!(
+        advanced.transact_volatile(stale_resolution.resolve()),
+        Err(CoreError::HandoffGuardRequired)
+    );
+    assert_eq!(advanced.revision(), revision_after_checkpoint);
+    assert_eq!(advanced.head(), head_after_checkpoint);
+    assert_eq!(advanced.projection_digest(), projection_after_checkpoint);
+    assert_eq!(
+        advanced
+            .component(child, TOOL_HANDOFF_COMPONENT)
+            .unwrap()
+            .outcome,
+        outcome_after_checkpoint
+    );
     let verified = recovered
         .verify_child_descriptor(descriptor, &AcceptDescriptor, &())
         .unwrap();
@@ -1008,7 +1083,7 @@ fn handoff_source_release_removes_scoped_binding_at_the_pivot() {
             &(),
         )
         .unwrap();
-    recovered.transact_volatile(resolution.resolve()).unwrap();
+    durable_output(&mut recovered, &mut recovered_journal, resolution.resolve());
     assert_eq!(
         recovered
             .component(child, TOOL_HANDOFF_COMPONENT)
@@ -1016,6 +1091,39 @@ fn handoff_source_release_removes_scoped_binding_at_the_pivot() {
             .outcome,
         cser_core::OutcomeState::KnownSuccess(Digest::new([0xa7; 32]))
     );
+
+    // The accepted child fact is historical verification provenance. A
+    // second production-shaped cold recovery must keep it valid when the
+    // checkpoint advances from N to N+1, while the full invariant oracle
+    // audits the hot transition and checkpoint replay.
+    let mut recovered_again = Engine::recover(
+        CatalogSet::new(std::slice::from_ref(&catalog)).unwrap(),
+        CoreLimits::bounded_default(),
+        RecoveryAnchor::from_trusted_provider(
+            recovery_binding(world, &catalog, next_freshness),
+            next_freshness,
+            later_freshness,
+            recovered.revision(),
+            recovered.head(),
+            recovered.projection_digest(),
+        )
+        .unwrap(),
+        &recovered_journal,
+    )
+    .unwrap()
+    .into_engine();
+    durable_output(
+        &mut recovered_again,
+        &mut recovered_journal,
+        CommandRequest::CheckpointRecovery {
+            boot: later_freshness.boot(),
+            journal: later_freshness.journal(),
+            device: later_freshness.device(),
+        },
+    );
+    recovered_again
+        .journal_checkpoint(&recovered_journal)
+        .unwrap();
 
     tx(
         &mut engine,
@@ -1971,4 +2079,222 @@ fn provider_rotation_accepts_only_effect_retired_predecessor_and_fences_old_admi
             .state,
         ProviderEffectState::Active
     ));
+}
+
+#[test]
+fn settlement_only_predecessor_with_indeterminate_effect_does_not_block_successor() {
+    let world = WorldId::new(921).unwrap();
+    let catalog = tool_dma_catalog();
+    let digest = catalog.digest();
+    let mut engine = Engine::new(
+        world,
+        CatalogSet::new(std::slice::from_ref(&catalog)).unwrap(),
+        CoreLimits::bounded_default(),
+        freshness(),
+    );
+    let mut journal = Vec::new();
+    macro_rules! durable {
+        ($request:expr $(,)?) => {
+            engine
+                .transact($request, |record| {
+                    journal.extend_from_slice(record.bytes());
+                    Ok::<(), ()>(())
+                })
+                .unwrap()
+        };
+    }
+
+    let predecessor = coordinate(921, 922, 1);
+    let successor = coordinate(921, 922, 2);
+    durable!(CommandRequest::RegisterProviderGeneration {
+        coordinate: predecessor,
+        catalog_digest: digest,
+        verifier_bindings: verifiers_for(&catalog, 0x95),
+    });
+
+    let old_effect = EffectId::new(OperationId::new(9211).unwrap(), 1).unwrap();
+    let old_actor = ExecutorCoordinate::new(
+        ExecutorId::new(9211).unwrap(),
+        ExecutorGeneration::new(1).unwrap(),
+    );
+    durable!(CommandRequest::AdmitScopedCompositeEffect {
+        effect: old_effect,
+        origin: old_actor,
+        kind: TOOL_HANDOFF_SOURCE_COMPOSITE,
+        charge_account: cser_core::ChargeAccountId::new(9211).unwrap(),
+        bindings: vec![ComponentProviderBinding::new(
+            TOOL_HANDOFF_SOURCE_COMPONENT,
+            predecessor,
+        )],
+    });
+    durable!(CommandRequest::AddComponentClaim {
+        effect: old_effect,
+        component: TOOL_HANDOFF_SOURCE_COMPONENT,
+        actor: old_actor,
+        claim: ClaimId::new(9211).unwrap(),
+        kind: TOOL_CLAIM_OUTCOME_SLOT,
+        scope: ClaimScope::Logical,
+        resource: ResourceId::new(9211).unwrap(),
+        resource_generation: ResourceGeneration::new(1).unwrap(),
+        units: 1,
+    });
+    durable!(CommandRequest::PrepareCompositeEffect {
+        effect: old_effect,
+        actor: old_actor,
+    });
+    let commit_intent = match durable!(CommandRequest::RecordComponentCommitIntent {
+        effect: old_effect,
+        component: TOOL_HANDOFF_SOURCE_COMPONENT,
+        actor: old_actor,
+        operation: Digest::new([0x96; 32]),
+    })
+    .into_output()
+    {
+        TransitionOutput::CommitIntent(intent) => intent,
+        other => panic!("expected commit intent, got {other:?}"),
+    };
+    let outcome = engine
+        .verify_commit_outcome(
+            &commit_intent,
+            &ScopedEffectVerifier {
+                identity: scoped_identity(
+                    &catalog,
+                    TOOL_VERIFIER,
+                    TOOL_COMMIT_RECEIPT_SCHEMA,
+                    0x95,
+                ),
+            },
+            &(),
+        )
+        .unwrap();
+    durable!(commit_intent.acknowledge(outcome).unwrap());
+    durable!(CommandRequest::FenceProviderEffects {
+        coordinate: predecessor,
+        expected_epoch: 1,
+    });
+    durable!(CommandRequest::EnterProviderSettlementOnly {
+        coordinate: predecessor,
+        expected_epoch: 2,
+    });
+
+    let settlement = match durable!(CommandRequest::ClaimComponentSettlement {
+        effect: old_effect,
+        component: TOOL_HANDOFF_SOURCE_COMPONENT,
+        claimant: old_actor,
+    })
+    .into_output()
+    {
+        TransitionOutput::SettlementClaim(claim) => claim,
+        other => panic!("expected settlement claim, got {other:?}"),
+    };
+    durable!(settlement.mark_indeterminate(Digest::new([0x97; 32])));
+
+    // The unresolved predecessor remains the exact owner of its old effect,
+    // while the successor becomes the only generation allowed to admit work.
+    durable!(CommandRequest::RegisterProviderGeneration {
+        coordinate: successor,
+        catalog_digest: digest,
+        verifier_bindings: verifiers_for(&catalog, 0x98),
+    });
+    let _old_reconciliation = match durable!(CommandRequest::ClaimComponentSettlement {
+        effect: old_effect,
+        component: TOOL_HANDOFF_SOURCE_COMPONENT,
+        claimant: old_actor,
+    })
+    .into_output()
+    {
+        TransitionOutput::SettlementClaim(claim) => claim,
+        other => panic!("expected old-generation reconciliation claim, got {other:?}"),
+    };
+    assert_eq!(
+        tx(
+            &mut engine,
+            CommandRequest::RetireProviderEffects {
+                coordinate: predecessor,
+                expected_epoch: 3,
+            },
+        ),
+        Err(CoreError::ProviderEffectsLive)
+    );
+    assert_eq!(
+        tx(
+            &mut engine,
+            CommandRequest::AdmitScopedCompositeEffect {
+                effect: EffectId::new(OperationId::new(9212).unwrap(), 1).unwrap(),
+                origin: old_actor,
+                kind: TOOL_HANDOFF_SOURCE_COMPOSITE,
+                charge_account: cser_core::ChargeAccountId::new(9212).unwrap(),
+                bindings: vec![ComponentProviderBinding::new(
+                    TOOL_HANDOFF_SOURCE_COMPONENT,
+                    predecessor,
+                )],
+            },
+        ),
+        Err(CoreError::ProviderLifecycleViolation)
+    );
+    let new_effect = EffectId::new(OperationId::new(9213).unwrap(), 1).unwrap();
+    durable!(CommandRequest::AdmitScopedCompositeEffect {
+        effect: new_effect,
+        origin: old_actor,
+        kind: TOOL_HANDOFF_SOURCE_COMPOSITE,
+        charge_account: cser_core::ChargeAccountId::new(9213).unwrap(),
+        bindings: vec![ComponentProviderBinding::new(
+            TOOL_HANDOFF_SOURCE_COMPONENT,
+            successor,
+        )],
+    });
+    let old_obligations = engine.provider_obligations(predecessor);
+    assert_eq!(old_obligations.len(), 1);
+    assert_eq!(old_obligations[0].effect, old_effect);
+    assert_eq!(old_obligations[0].provider, predecessor);
+    assert_eq!(
+        old_obligations[0].outcome,
+        cser_core::OutcomeState::Indeterminate(Digest::new([0x97; 32]))
+    );
+    assert_eq!(engine.provider_obligations(successor)[0].effect, new_effect);
+
+    let next_freshness = Freshness::new(
+        BootGeneration::new(2).unwrap(),
+        RegistryInstance::new(1).unwrap(),
+        DeviceGeneration::new(1).unwrap(),
+        JournalGeneration::new(2).unwrap(),
+    );
+    let recovered = Engine::recover(
+        CatalogSet::new(std::slice::from_ref(&catalog)).unwrap(),
+        CoreLimits::bounded_default(),
+        RecoveryAnchor::from_trusted_provider(
+            recovery_binding(world, &catalog, freshness()),
+            freshness(),
+            next_freshness,
+            engine.revision(),
+            engine.head(),
+            engine.projection_digest(),
+        )
+        .unwrap(),
+        &journal,
+    )
+    .unwrap()
+    .into_engine();
+    assert!(matches!(
+        recovered
+            .provider_generation_projection(predecessor)
+            .unwrap()
+            .state,
+        ProviderEffectState::SettlementOnly { epoch: 3 }
+    ));
+    assert_eq!(
+        recovered
+            .provider_generation_projection(successor)
+            .unwrap()
+            .state,
+        ProviderEffectState::Active
+    );
+    assert_eq!(
+        recovered.provider_obligations(predecessor)[0].effect,
+        old_effect
+    );
+    assert_eq!(
+        recovered.provider_obligations(successor)[0].effect,
+        new_effect
+    );
 }

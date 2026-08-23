@@ -315,7 +315,9 @@ fn verified_evidence_command_at(
         claim: claim(claim_value),
         kind,
         subject,
+        subject_binding: challenge.subject_binding(),
         observation,
+        observation_binding: challenge.current_binding(),
         resource: challenge.resource(),
         resource_generation: challenge.resource_generation(),
         digest: digest(digest_value),
@@ -517,6 +519,15 @@ fn unsupported_retirement_evidence_is_failure_atomic_and_retains_the_resource() 
             cser_core::ResourceGeneration::new(1).unwrap(),
         ),
     );
+    let binding_challenge = harness
+        .engine
+        .component_evidence_challenge(
+            effect,
+            AGENT_COMPONENT_DMA,
+            claim(IOVA_CLAIM),
+            DEVICE_EVIDENCE_RESET,
+        )
+        .unwrap();
     let verifier = ExactTestVerifier::new(DEVICE_VERIFIER, DEVICE_RECEIPT_SCHEMA);
     let receipt = TestReceipt {
         effect,
@@ -525,7 +536,9 @@ fn unsupported_retirement_evidence_is_failure_atomic_and_retains_the_resource() 
         resource: resource(IOVA_RESOURCE),
         resource_generation: cser_core::ResourceGeneration::new(1).unwrap(),
         subject,
+        subject_binding: binding_challenge.subject_binding(),
         observation: subject,
+        observation_binding: binding_challenge.current_binding(),
         digest: digest(61),
     };
 
@@ -831,9 +844,11 @@ fn late_old_generation_receipt_retires_only_its_exact_tombstone() {
         resource: challenge.resource(),
         resource_generation: challenge.resource_generation(),
         subject: old_subject,
+        subject_binding: challenge.subject_binding(),
         observation: challenge
             .current_observation()
             .with_device(DeviceGeneration::new(3).unwrap()),
+        observation_binding: challenge.current_binding(),
         digest: digest(29),
     };
     let verifier =
@@ -1104,9 +1119,11 @@ fn reboot_recovers_device_tombstones_under_quarantine_until_fresh_evidence() {
         resource: challenge.resource(),
         resource_generation: challenge.resource_generation(),
         subject: recovered.engine.freshness(),
+        subject_binding: challenge.subject_binding(),
         observation: challenge
             .current_observation()
             .with_device(DeviceGeneration::new(2).unwrap()),
+        observation_binding: challenge.current_binding(),
         digest: digest(40),
     };
     let verifier =

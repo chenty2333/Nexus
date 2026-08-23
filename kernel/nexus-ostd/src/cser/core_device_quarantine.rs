@@ -13,9 +13,9 @@ use cser_core::{
     ClaimScope, ComponentClaimProjection, ComponentId, DEVICE_CLAIM_IOVA, DEVICE_CLAIM_PINNED_PAGE,
     DEVICE_DOMAIN, DEVICE_EVIDENCE_IOTLB, DEVICE_EVIDENCE_IRQ_DRAINED, DEVICE_EVIDENCE_RESET,
     DEVICE_RECEIPT_SCHEMA, DEVICE_VERIFIER, DeviceGeneration, Digest, EffectId, EvidenceChallenge,
-    Freshness, ProviderCoordinate, ReceiptSchemaId, ReceiptVerifier, ResourceGeneration,
-    ResourceId, VerificationError, VerifiedObservation, VerifierBinding, VerifierGeneration,
-    VerifierIdentity, WorldId,
+    ExecutorBinding, Freshness, ProviderCoordinate, ReceiptSchemaId, ReceiptVerifier,
+    ResourceGeneration, ResourceId, VerificationError, VerifiedObservation, VerifierBinding,
+    VerifierGeneration, VerifierIdentity, WorldId,
 };
 #[cfg(not(feature = "cser-production"))]
 use cser_core::{ProviderGeneration, ProviderId};
@@ -122,8 +122,138 @@ pub(crate) enum OstdBootClaimBindingError {
     Hardware(BootReceiptBindingError),
 }
 
+/// Current core authority independently observed before a raw hardware
+/// quarantine receipt is bound. VirtIO remains hardware-only, so this CSER
+/// context is retained by the quarantine adapter rather than pushed into the
+/// transport crate.
+#[derive(Clone, Copy)]
+pub(crate) struct OstdBootReceiptCurrent {
+    observation: Freshness,
+    binding: ExecutorBinding,
+}
+
+impl OstdBootReceiptCurrent {
+    pub(crate) const fn new(observation: Freshness, binding: ExecutorBinding) -> Self {
+        Self {
+            observation,
+            binding,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct OstdBootReceiptContext {
+    subject: Freshness,
+    subject_binding: ExecutorBinding,
+    observation: Freshness,
+    observation_binding: ExecutorBinding,
+}
+
+impl OstdBootReceiptContext {
+    const fn for_reset(
+        claim: ComponentClaimProjection,
+        current: OstdBootReceiptCurrent,
+        successor: DeviceGeneration,
+    ) -> Self {
+        Self {
+            subject: claim.enrolled_freshness,
+            subject_binding: claim.enrolled_binding,
+            observation: current.observation.with_device(successor),
+            observation_binding: current.binding,
+        }
+    }
+
+    const fn current(claim: ComponentClaimProjection, current: OstdBootReceiptCurrent) -> Self {
+        Self {
+            subject: claim.enrolled_freshness,
+            subject_binding: claim.enrolled_binding,
+            observation: current.observation,
+            observation_binding: current.binding,
+        }
+    }
+}
+
+/// Raw reset receipt plus the durable core authority coordinates it attests.
+pub(crate) struct OstdBootResetReceipt {
+    raw: BootVirtioStatusResetReceipt,
+    context: OstdBootReceiptContext,
+}
+
+impl OstdBootResetReceipt {
+    const fn subject(&self) -> Freshness {
+        self.context.subject
+    }
+
+    const fn subject_binding(&self) -> ExecutorBinding {
+        self.context.subject_binding
+    }
+
+    const fn observation(&self) -> Freshness {
+        self.context.observation
+    }
+
+    const fn observation_binding(&self) -> ExecutorBinding {
+        self.context.observation_binding
+    }
+}
+
+/// Raw ISR-drain receipt plus the durable core authority coordinates it
+/// attests.
+pub(crate) struct OstdBootIrqReceipt {
+    raw: BootVirtioIsrEmptyReceipt,
+    context: OstdBootReceiptContext,
+}
+
+impl OstdBootIrqReceipt {
+    const fn subject(&self) -> Freshness {
+        self.context.subject
+    }
+
+    const fn subject_binding(&self) -> ExecutorBinding {
+        self.context.subject_binding
+    }
+
+    const fn observation(&self) -> Freshness {
+        self.context.observation
+    }
+
+    const fn observation_binding(&self) -> ExecutorBinding {
+        self.context.observation_binding
+    }
+}
+
+/// Raw global-IOTLB receipt plus the durable core authority coordinates it
+/// attests.
+pub(crate) struct OstdBootIotlbReceipt {
+    raw: BootGlobalIotlbInvalidationReceipt,
+    context: OstdBootReceiptContext,
+}
+
+impl OstdBootIotlbReceipt {
+    const fn subject(&self) -> Freshness {
+        self.context.subject
+    }
+
+    const fn subject_binding(&self) -> ExecutorBinding {
+        self.context.subject_binding
+    }
+
+    const fn observation(&self) -> Freshness {
+        self.context.observation
+    }
+
+    const fn observation_binding(&self) -> ExecutorBinding {
+        self.context.observation_binding
+    }
+
+    pub(crate) const fn resource_reuse_authorized(&self) -> bool {
+        self.raw.resource_reuse_authorized()
+    }
+}
+
 /// Projects whole-device quarantine observations onto one component-local
-/// replayed claim, preserving the component coordinate in every receipt.
+/// replayed claim. The returned values remain raw hardware observations until
+/// each production verifier receives a separately derived core context.
 pub(crate) fn project_replayed_component_claim(
     guard: &BootQuarantineGuard,
     claim: ComponentClaimProjection,
@@ -150,6 +280,48 @@ pub(crate) fn project_replayed_component_claim(
         .map_err(OstdBootClaimBindingError::Hardware)
 }
 
+/// Combines the reset's raw hardware fact with independently derived core
+/// authority. This runs immediately before reset verification, rather than
+/// copying the verifier challenge back into the receipt.
+pub(crate) fn bind_replayed_reset_receipt(
+    raw: BootVirtioStatusResetReceipt,
+    claim: ComponentClaimProjection,
+    current: OstdBootReceiptCurrent,
+) -> OstdBootResetReceipt {
+    let successor = DeviceGeneration::new(raw.successor_generation())
+        .expect("quarantine provider returns a non-zero generation");
+    OstdBootResetReceipt {
+        raw,
+        context: OstdBootReceiptContext::for_reset(claim, current, successor),
+    }
+}
+
+/// Combines the ISR-drain's raw hardware fact with the current core authority
+/// observed after any preceding reset evidence was accepted.
+pub(crate) fn bind_replayed_irq_receipt(
+    raw: BootVirtioIsrEmptyReceipt,
+    claim: ComponentClaimProjection,
+    current: OstdBootReceiptCurrent,
+) -> OstdBootIrqReceipt {
+    OstdBootIrqReceipt {
+        raw,
+        context: OstdBootReceiptContext::current(claim, current),
+    }
+}
+
+/// Combines the IOTLB raw hardware fact with the current core authority
+/// observed after any preceding reset evidence was accepted.
+pub(crate) fn bind_replayed_iotlb_receipt(
+    raw: BootGlobalIotlbInvalidationReceipt,
+    claim: ComponentClaimProjection,
+    current: OstdBootReceiptCurrent,
+) -> OstdBootIotlbReceipt {
+    OstdBootIotlbReceipt {
+        raw,
+        context: OstdBootReceiptContext::current(claim, current),
+    }
+}
+
 #[derive(Clone, Copy)]
 struct ReplayedClaim {
     effect: EffectId,
@@ -161,6 +333,7 @@ struct ReplayedClaim {
     resource_generation: ResourceGeneration,
     units: u64,
     enrolled_freshness: Freshness,
+    enrolled_binding: ExecutorBinding,
 }
 
 impl From<ComponentClaimProjection> for ReplayedClaim {
@@ -175,6 +348,7 @@ impl From<ComponentClaimProjection> for ReplayedClaim {
             resource_generation: claim.resource_generation,
             units: claim.units,
             enrolled_freshness: claim.enrolled_freshness,
+            enrolled_binding: claim.enrolled_binding,
         }
     }
 }
@@ -198,6 +372,7 @@ impl OstdBootClaimVerifier {
                 resource_generation: claim.resource_generation,
                 units: claim.units,
                 enrolled_freshness: claim.enrolled_freshness,
+                enrolled_binding: claim.enrolled_binding,
             },
         }
     }
@@ -222,6 +397,7 @@ impl OstdBootClaimVerifier {
             && challenge.resource() == self.claim.resource
             && challenge.resource_generation() == self.claim.resource_generation
             && challenge.subject() == self.claim.enrolled_freshness
+            && challenge.subject_binding() == self.claim.enrolled_binding
             && coordinates.scope().get() == scope.get()
             && coordinates.effect_root() == self.claim.effect.operation().get()
             && coordinates.effect_sequence() == self.claim.effect.sequence()
@@ -266,7 +442,7 @@ fn quarantine_scope_matches(challenge: &EvidenceChallenge, schema: ReceiptSchema
 }
 
 impl ReceiptVerifier for OstdBootClaimVerifier {
-    type Receipt = BootVirtioStatusResetReceipt;
+    type Receipt = OstdBootResetReceipt;
 
     fn identity(&self) -> VerifierIdentity {
         quarantine_verifier_identity()
@@ -277,22 +453,28 @@ impl ReceiptVerifier for OstdBootClaimVerifier {
         challenge: &EvidenceChallenge,
         receipt: &Self::Receipt,
     ) -> Result<VerifiedObservation, VerificationError> {
-        let successor = DeviceGeneration::new(receipt.successor_generation())
+        let successor = DeviceGeneration::new(receipt.raw.successor_generation())
             .map_err(|_| VerificationError::Rejected)?;
         let current_device = challenge.current_observation().device();
-        if !self.challenge_matches(challenge, receipt.claim(), DEVICE_EVIDENCE_RESET)
-            || receipt.old_generation() != challenge.subject().device().get()
-            || !receipt.reset_status_zero()
-            || !receipt.bus_master_disabled()
-            || !receipt.intx_masked()
+        if !self.challenge_matches(challenge, receipt.raw.claim(), DEVICE_EVIDENCE_RESET)
+            || receipt.subject() != challenge.subject()
+            || receipt.subject_binding() != challenge.subject_binding()
+            || receipt.observation() != challenge.current_observation().with_device(successor)
+            || receipt.observation_binding() != challenge.current_binding()
+            || receipt.raw.old_generation() != challenge.subject().device().get()
+            || !receipt.raw.reset_status_zero()
+            || !receipt.raw.bus_master_disabled()
+            || !receipt.raw.intx_masked()
             || (current_device != challenge.subject().device() && current_device != successor)
-            || successor.get() <= receipt.old_generation()
+            || successor.get() <= receipt.raw.old_generation()
         {
             return Err(VerificationError::Rejected);
         }
-        Ok(VerifiedObservation::new(
-            challenge.subject(),
-            challenge.current_observation().with_device(successor),
+        Ok(VerifiedObservation::new_bound(
+            receipt.subject(),
+            receipt.subject_binding(),
+            receipt.observation(),
+            receipt.observation_binding(),
             reset_digest(receipt),
         ))
     }
@@ -312,7 +494,7 @@ impl OstdBootIrqVerifier {
 }
 
 impl ReceiptVerifier for OstdBootIrqVerifier {
-    type Receipt = BootVirtioIsrEmptyReceipt;
+    type Receipt = OstdBootIrqReceipt;
 
     fn identity(&self) -> VerifierIdentity {
         quarantine_verifier_identity()
@@ -323,19 +505,25 @@ impl ReceiptVerifier for OstdBootIrqVerifier {
         challenge: &EvidenceChallenge,
         receipt: &Self::Receipt,
     ) -> Result<VerifiedObservation, VerificationError> {
-        let coordinates = receipt.claim();
+        let coordinates = receipt.raw.claim();
         let reset_verifier = OstdBootClaimVerifier { claim: self.claim };
         if !reset_verifier.challenge_matches(challenge, coordinates, DEVICE_EVIDENCE_IRQ_DRAINED)
-            || !receipt.intx_masked()
-            || receipt.isr_reads() < 2
-            || receipt.consecutive_empty_reads() < 2
-            || receipt.successor_generation() != challenge.current_observation().device().get()
+            || receipt.subject() != challenge.subject()
+            || receipt.subject_binding() != challenge.subject_binding()
+            || receipt.observation() != challenge.current_observation()
+            || receipt.observation_binding() != challenge.current_binding()
+            || !receipt.raw.intx_masked()
+            || receipt.raw.isr_reads() < 2
+            || receipt.raw.consecutive_empty_reads() < 2
+            || receipt.raw.successor_generation() != challenge.current_observation().device().get()
         {
             return Err(VerificationError::Rejected);
         }
-        Ok(VerifiedObservation::new(
-            challenge.subject(),
-            challenge.current_observation(),
+        Ok(VerifiedObservation::new_bound(
+            receipt.subject(),
+            receipt.subject_binding(),
+            receipt.observation(),
+            receipt.observation_binding(),
             irq_digest(receipt),
         ))
     }
@@ -377,7 +565,7 @@ impl QemuArenaIotlbVerifier {
 }
 
 impl ReceiptVerifier for QemuArenaIotlbVerifier {
-    type Receipt = BootGlobalIotlbInvalidationReceipt;
+    type Receipt = OstdBootIotlbReceipt;
 
     fn identity(&self) -> VerifierIdentity {
         quarantine_verifier_identity()
@@ -393,84 +581,93 @@ impl ReceiptVerifier for QemuArenaIotlbVerifier {
             self.claim.kind,
             DEVICE_CLAIM_PINNED_PAGE | DEVICE_CLAIM_IOVA
         ) && self.claim.units == self.layout.page_count() as u64;
-        if !reset_verifier.challenge_matches(challenge, receipt.claim(), DEVICE_EVIDENCE_IOTLB)
+        if !reset_verifier.challenge_matches(challenge, receipt.raw.claim(), DEVICE_EVIDENCE_IOTLB)
             || !arena_claim
             || !self.qemu_detected
             || !self.arena_withheld
             || self.layout_digest.is_zero()
             || self.component_commit_operation != Some(self.layout_digest)
-            || receipt.old_generation() != challenge.subject().device().get()
-            || receipt.successor_generation() != challenge.current_observation().device().get()
-            || !receipt.used_remapped_iova()
-            || receipt.completed_trigger_pages() == 0
-            || !receipt.global_invalidation()
-            || !receipt.shared_second_stage_source_contract()
-            || receipt.dma_transaction_drain_observed()
-            || receipt.resource_reuse_authorized()
+            || receipt.subject() != challenge.subject()
+            || receipt.subject_binding() != challenge.subject_binding()
+            || receipt.observation() != challenge.current_observation()
+            || receipt.observation_binding() != challenge.current_binding()
+            || receipt.raw.old_generation() != challenge.subject().device().get()
+            || receipt.raw.successor_generation() != challenge.current_observation().device().get()
+            || !receipt.raw.used_remapped_iova()
+            || receipt.raw.completed_trigger_pages() == 0
+            || !receipt.raw.global_invalidation()
+            || !receipt.raw.shared_second_stage_source_contract()
+            || receipt.raw.dma_transaction_drain_observed()
+            || receipt.raw.resource_reuse_authorized()
         {
             return Err(VerificationError::Rejected);
         }
-        Ok(VerifiedObservation::new(
-            challenge.subject(),
-            challenge.current_observation(),
+        Ok(VerifiedObservation::new_bound(
+            receipt.subject(),
+            receipt.subject_binding(),
+            receipt.observation(),
+            receipt.observation_binding(),
             qemu_arena_iotlb_digest(receipt, self.layout, self.layout_digest),
         ))
     }
 }
 
-fn reset_digest(receipt: &BootVirtioStatusResetReceipt) -> Digest {
+fn reset_digest(receipt: &OstdBootResetReceipt) -> Digest {
     let mut hasher = Sha256::new();
     hasher.update(b"nexus-cser-boot-reset-v1");
-    hash_coordinates(&mut hasher, receipt.claim());
-    let bdf = receipt.device_bdf();
+    hash_coordinates(&mut hasher, receipt.raw.claim());
+    let bdf = receipt.raw.device_bdf();
     hasher.update([bdf.bus(), bdf.device(), bdf.function()]);
-    hasher.update(receipt.old_generation().to_le_bytes());
-    hasher.update(receipt.successor_generation().to_le_bytes());
+    hasher.update(receipt.raw.old_generation().to_le_bytes());
+    hasher.update(receipt.raw.successor_generation().to_le_bytes());
     hasher.update([
-        receipt.reset_status_zero() as u8,
-        receipt.bus_master_disabled() as u8,
-        receipt.intx_masked() as u8,
+        receipt.raw.reset_status_zero() as u8,
+        receipt.raw.bus_master_disabled() as u8,
+        receipt.raw.intx_masked() as u8,
     ]);
+    hash_receipt_context(&mut hasher, receipt.context);
     Digest::new(hasher.finalize().into())
 }
 
-fn irq_digest(receipt: &BootVirtioIsrEmptyReceipt) -> Digest {
+fn irq_digest(receipt: &OstdBootIrqReceipt) -> Digest {
     let mut hasher = Sha256::new();
     hasher.update(b"nexus-cser-boot-isr-empty-v1");
-    hash_coordinates(&mut hasher, receipt.claim());
-    let bdf = receipt.device_bdf();
+    hash_coordinates(&mut hasher, receipt.raw.claim());
+    let bdf = receipt.raw.device_bdf();
     hasher.update([bdf.bus(), bdf.device(), bdf.function()]);
-    hasher.update(receipt.successor_generation().to_le_bytes());
-    hasher.update(receipt.observed_isr_bits().to_le_bytes());
-    hasher.update((receipt.isr_reads() as u64).to_le_bytes());
-    hasher.update((receipt.consecutive_empty_reads() as u64).to_le_bytes());
-    hasher.update([receipt.intx_masked() as u8]);
+    hasher.update(receipt.raw.successor_generation().to_le_bytes());
+    hasher.update(receipt.raw.observed_isr_bits().to_le_bytes());
+    hasher.update((receipt.raw.isr_reads() as u64).to_le_bytes());
+    hasher.update((receipt.raw.consecutive_empty_reads() as u64).to_le_bytes());
+    hasher.update([receipt.raw.intx_masked() as u8]);
+    hash_receipt_context(&mut hasher, receipt.context);
     Digest::new(hasher.finalize().into())
 }
 
 fn qemu_arena_iotlb_digest(
-    receipt: &BootGlobalIotlbInvalidationReceipt,
+    receipt: &OstdBootIotlbReceipt,
     layout: PersistentDmaArenaLayout,
     layout_digest: Digest,
 ) -> Digest {
     let mut hasher = Sha256::new();
     hasher.update(b"nexus-cser-qemu-arena-iotlb-v1");
-    hash_coordinates(&mut hasher, receipt.claim());
-    let bdf = receipt.device_bdf();
+    hash_coordinates(&mut hasher, receipt.raw.claim());
+    let bdf = receipt.raw.device_bdf();
     hasher.update([bdf.bus(), bdf.device(), bdf.function()]);
-    hasher.update(receipt.old_generation().to_le_bytes());
-    hasher.update(receipt.successor_generation().to_le_bytes());
+    hasher.update(receipt.raw.old_generation().to_le_bytes());
+    hasher.update(receipt.raw.successor_generation().to_le_bytes());
     hasher.update(layout.version().to_le_bytes());
     hasher.update((layout.page_count() as u64).to_le_bytes());
     hasher.update((layout.paddr_base() as u64).to_le_bytes());
     hasher.update((layout.daddr_base() as u64).to_le_bytes());
     hasher.update(layout_digest.bytes());
     hasher.update([
-        receipt.used_remapped_iova() as u8,
-        receipt.global_invalidation() as u8,
-        receipt.shared_second_stage_source_contract() as u8,
+        receipt.raw.used_remapped_iova() as u8,
+        receipt.raw.global_invalidation() as u8,
+        receipt.raw.shared_second_stage_source_contract() as u8,
         1, // QEMU process-restart protocol, never physical hardware.
     ]);
+    hash_receipt_context(&mut hasher, receipt.context);
     Digest::new(hasher.finalize().into())
 }
 
@@ -491,4 +688,103 @@ fn hash_coordinates(hasher: &mut Sha256, coordinates: BootClaimCoordinates) {
     hasher.update(coordinates.resource_generation().to_le_bytes());
     hasher.update(coordinates.units().to_le_bytes());
     hasher.update(coordinates.subject_device_generation().to_le_bytes());
+}
+
+fn hash_receipt_context(hasher: &mut Sha256, context: OstdBootReceiptContext) {
+    hash_freshness(hasher, context.subject);
+    hash_executor_binding(hasher, context.subject_binding);
+    hash_freshness(hasher, context.observation);
+    hash_executor_binding(hasher, context.observation_binding);
+}
+
+fn hash_freshness(hasher: &mut Sha256, freshness: Freshness) {
+    hasher.update(freshness.boot().get().to_le_bytes());
+    hasher.update(freshness.registry().get().to_le_bytes());
+    hasher.update(freshness.device().get().to_le_bytes());
+    hasher.update(freshness.journal().get().to_le_bytes());
+}
+
+fn hash_executor_binding(hasher: &mut Sha256, binding: ExecutorBinding) {
+    let executor = binding.executor();
+    hasher.update(executor.executor().get().to_le_bytes());
+    hasher.update(executor.generation().get().to_le_bytes());
+    hasher.update(binding.authority_epoch().to_le_bytes());
+}
+
+#[cfg(any(test, ktest))]
+mod tests {
+    use super::{OstdBootReceiptContext, hash_receipt_context};
+    use cser_core::{
+        BootGeneration, DeviceGeneration, ExecutorBinding, ExecutorCoordinate, ExecutorGeneration,
+        ExecutorId, Freshness, JournalGeneration, RegistryInstance,
+    };
+    use sha2::{Digest as _, Sha256};
+
+    const fn freshness(device: u64) -> Freshness {
+        Freshness::new(
+            match BootGeneration::new(1) {
+                Ok(value) => value,
+                Err(_) => unreachable!(),
+            },
+            match RegistryInstance::new(2) {
+                Ok(value) => value,
+                Err(_) => unreachable!(),
+            },
+            match DeviceGeneration::new(device) {
+                Ok(value) => value,
+                Err(_) => unreachable!(),
+            },
+            match JournalGeneration::new(3) {
+                Ok(value) => value,
+                Err(_) => unreachable!(),
+            },
+        )
+    }
+
+    const fn binding(authority_epoch: u64) -> ExecutorBinding {
+        let executor = ExecutorCoordinate::new(
+            match ExecutorId::new(4) {
+                Ok(value) => value,
+                Err(_) => unreachable!(),
+            },
+            match ExecutorGeneration::new(5) {
+                Ok(value) => value,
+                Err(_) => unreachable!(),
+            },
+        );
+        match ExecutorBinding::new(executor, authority_epoch) {
+            Ok(value) => value,
+            Err(_) => unreachable!(),
+        }
+    }
+
+    fn context_digest(context: OstdBootReceiptContext) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hash_receipt_context(&mut hasher, context);
+        hasher.finalize().into()
+    }
+
+    #[cfg_attr(test, test)]
+    #[cfg_attr(ktest, ktest)]
+    fn receipt_codec_binds_both_executor_authority_coordinates() {
+        let subject = freshness(6);
+        let observation = freshness(7);
+        let context = OstdBootReceiptContext {
+            subject,
+            subject_binding: binding(8),
+            observation,
+            observation_binding: binding(9),
+        };
+        let changed_subject = OstdBootReceiptContext {
+            subject_binding: binding(10),
+            ..context
+        };
+        let changed_observation = OstdBootReceiptContext {
+            observation_binding: binding(11),
+            ..context
+        };
+
+        assert_ne!(context_digest(context), context_digest(changed_subject));
+        assert_ne!(context_digest(context), context_digest(changed_observation));
+    }
 }

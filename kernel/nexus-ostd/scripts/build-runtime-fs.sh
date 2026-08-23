@@ -20,7 +20,7 @@ fi
 
 output=$1
 expected_artifact_sha=${2-}
-source_file=${NEXUS_RUNTIME_FS_SOURCE:-/repo/tests/guest/linux/sources/linux-runtime-fs-smoke/runtime_fs_smoke.S}
+source_file=${NEXUS_RUNTIME_FS_SOURCE:-/work/guest/runtime_fs_smoke.S}
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 oracle=${NEXUS_RUNTIME_FS_ARTIFACT_ORACLE:-$script_dir/assert-runtime-fs-artifacts.sh}
 

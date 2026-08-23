@@ -701,7 +701,7 @@ index bda5ce2..aa5fc2b 100644
              irq_chip: self,
          })
      }
-@@ -125,6 +202,7 @@ impl IrqChip {
+@@ -125,14 +202,42 @@ impl IrqChip {
  pub struct MappedIrqLine {
      irq_line: IrqLine,
      gsi_index: u32,
@@ -709,7 +709,34 @@ index bda5ce2..aa5fc2b 100644
      irq_chip: &'static IrqChip,
  }
 
-@@ -133,6 +211,7 @@ impl fmt::Debug for MappedIrqLine {
++/// Failure to synchronize callbacks already delivered by the IRQ controller.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum IrqPendingSynchronizationError {
++    /// This OSTD version exposes no controller pending-delivery drain.
++    Unsupported,
++}
++
++impl MappedIrqLine {
++    /// Reports whether this mapping can establish the synchronization contract.
++    pub const fn supports_pending_callback_synchronization(&self) -> bool {
++        false
++    }
++
++    /// Waits for controller-pending and in-flight callbacks, including the
++    /// controller acknowledgement after each callback, to finish.
++    ///
++    /// OSTD 0.18 exposes no IOAPIC/LAPIC/IRTE pending-delivery drain. Callers
++    /// must retain callback and request ownership when this returns
++    /// [`IrqPendingSynchronizationError::Unsupported`].
++    pub fn synchronize_pending_callbacks(
++        &self,
++    ) -> Result<(), IrqPendingSynchronizationError> {
++        Err(IrqPendingSynchronizationError::Unsupported)
++    }
++}
++
+ impl fmt::Debug for MappedIrqLine {
+     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
          f.debug_struct("MappedIrqLine")
              .field("irq_line", &self.irq_line)
              .field("gsi_index", &self.gsi_index)
@@ -717,7 +744,7 @@ index bda5ce2..aa5fc2b 100644
              .finish_non_exhaustive()
      }
  }
-@@ -153,7 +232,8 @@ impl DerefMut for MappedIrqLine {
+@@ -153,7 +258,8 @@ impl DerefMut for MappedIrqLine {
 
  impl Drop for MappedIrqLine {
      fn drop(&mut self) {
@@ -731,12 +758,15 @@ diff --git a/src/arch/x86/irq/mod.rs b/src/arch/x86/irq/mod.rs
 index 6e5b8e3..58dd660 100644
 --- a/src/arch/x86/irq/mod.rs
 +++ b/src/arch/x86/irq/mod.rs
-@@ -14,7 +14,7 @@ pub(super) mod ipi;
+@@ -14,7 +14,10 @@ pub(super) mod ipi;
  mod ops;
  mod remapping;
 
 -pub use chip::{IRQ_CHIP, IrqChip, MappedIrqLine};
-+pub use chip::{GsiConfig, GsiPolarity, GsiTriggerMode, IRQ_CHIP, IrqChip, MappedIrqLine};
++pub use chip::{
++    GsiConfig, GsiPolarity, GsiTriggerMode, IRQ_CHIP, IrqChip, IrqPendingSynchronizationError,
++    MappedIrqLine,
++};
  pub(crate) use ipi::{HwCpuId, send_ipi};
  pub(crate) use ops::{
      disable_local, disable_local_and_halt, enable_local, enable_local_and_halt, is_local_enabled,

@@ -8,10 +8,10 @@ use cser_core::{
 };
 use support::{
     EFFECT_APPLY_RECEIPT_SCHEMA, EFFECT_CLAIM_KIND, EFFECT_COMMIT_RECEIPT_SCHEMA, EFFECT_COMPONENT,
-    EFFECT_SETTLEMENT_RECEIPT_SCHEMA, EFFECT_VERIFIER, Harness, admit_command, claim,
-    committed_reply, digest, effect, executor, fence_and_rebind, freshness, resource,
-    resource_generation, test_effect_receipt, verified_apply_completion, verified_commit_outcome,
-    verified_settlement_ack, verifier_binding,
+    EFFECT_SETTLEMENT_RECEIPT_SCHEMA, EFFECT_VERIFIER, ExactTestVerifier, Harness, TestReceipt,
+    admit_command, claim, committed_reply, digest, effect, executor, fence_and_rebind, freshness,
+    resource, resource_generation, test_effect_receipt, verified_apply_completion,
+    verified_commit_outcome, verified_evidence_command, verified_settlement_ack, verifier_binding,
 };
 
 #[derive(Clone, Copy)]
@@ -405,4 +405,113 @@ fn a_verified_fact_loses_the_race_to_a_real_fence_without_mutation() {
             applied: false
         }
     ));
+}
+
+#[test]
+fn verified_retirement_evidence_loses_the_race_to_executor_replacement() {
+    let mut harness = Harness::new();
+    let (effect, origin) = committed_reply(&mut harness, 921);
+    let before_replacement = harness
+        .engine
+        .component_evidence_challenge(
+            effect,
+            EFFECT_COMPONENT,
+            claim(921),
+            support::EFFECT_EVIDENCE_KIND,
+        )
+        .unwrap();
+    let old_receipt = TestReceipt {
+        effect,
+        claim: claim(921),
+        kind: support::EFFECT_EVIDENCE_KIND,
+        resource: before_replacement.resource(),
+        resource_generation: before_replacement.resource_generation(),
+        subject: before_replacement.subject(),
+        subject_binding: before_replacement.subject_binding(),
+        observation: before_replacement.current_observation(),
+        observation_binding: before_replacement.current_binding(),
+        digest: digest(22),
+    };
+    let stale = verified_evidence_command(
+        &harness,
+        effect,
+        claim(921),
+        support::EFFECT_EVIDENCE_KIND,
+        cser_core::ReceiptBinding::new(EFFECT_VERIFIER, support::EFFECT_RECEIPT_SCHEMA),
+        before_replacement.current_observation(),
+        digest(22),
+    );
+
+    let successor = executor(921, 2);
+    fence_and_rebind(&mut harness, effect, origin, successor, 9210);
+    let after_replacement = harness
+        .engine
+        .component_evidence_challenge(
+            effect,
+            EFFECT_COMPONENT,
+            claim(921),
+            support::EFFECT_EVIDENCE_KIND,
+        )
+        .unwrap();
+    assert_eq!(before_replacement.effect(), after_replacement.effect());
+    assert_eq!(before_replacement.resource(), after_replacement.resource());
+    assert_eq!(
+        before_replacement.resource_generation(),
+        after_replacement.resource_generation()
+    );
+    assert_eq!(
+        before_replacement.verification_scope(),
+        after_replacement.verification_scope()
+    );
+    assert_ne!(
+        before_replacement.current_binding(),
+        after_replacement.current_binding()
+    );
+    let verifier = ExactTestVerifier::new(EFFECT_VERIFIER, support::EFFECT_RECEIPT_SCHEMA);
+    assert_eq!(
+        harness.engine.verify_component_retirement_evidence(
+            effect,
+            EFFECT_COMPONENT,
+            claim(921),
+            support::EFFECT_EVIDENCE_KIND,
+            &verifier,
+            &old_receipt,
+        ),
+        Err(CoreError::VerificationFailed)
+    );
+
+    let before = harness.engine.projection_digest();
+    let revision = harness.engine.revision();
+    assert_eq!(harness.tx(stale), Err(CoreError::StaleEvidence));
+    assert_eq!(harness.engine.projection_digest(), before);
+    assert_eq!(harness.engine.revision(), revision);
+    assert_eq!(
+        harness.engine.component_retirement_evidence_accepted(
+            effect,
+            EFFECT_COMPONENT,
+            claim(921),
+            support::EFFECT_EVIDENCE_KIND,
+        ),
+        Ok(false)
+    );
+
+    let current = verified_evidence_command(
+        &harness,
+        effect,
+        claim(921),
+        support::EFFECT_EVIDENCE_KIND,
+        cser_core::ReceiptBinding::new(EFFECT_VERIFIER, support::EFFECT_RECEIPT_SCHEMA),
+        after_replacement.current_observation(),
+        digest(23),
+    );
+    harness.tx(current).unwrap();
+    assert_eq!(
+        harness.engine.component_retirement_evidence_accepted(
+            effect,
+            EFFECT_COMPONENT,
+            claim(921),
+            support::EFFECT_EVIDENCE_KIND,
+        ),
+        Ok(true)
+    );
 }

@@ -12,8 +12,11 @@
 //!
 //! A real OSTD IRQ line is mapped to the firmware GSI before PCI INTx is
 //! unmasked. Its top half performs exactly the device ISR read/ack and deposits
-//! the opaque receipt; the manager remasks INTx before extracting the request
-//! for task-context completion. QEMU is hardware emulation, not
+//! the opaque receipt; the manager remasks INTx and synchronizes controller
+//! pending callbacks before extracting the request for task-context completion.
+//! The pinned OSTD platform currently exposes no such synchronization and this
+//! optional path therefore fails closed before queue publication. QEMU is
+//! hardware emulation, not
 //! physical-hardware evidence. Core transitions use an in-memory journal in
 //! this development slice; reboot persistence is proved by the independent
 //! persistent-provider suite.
@@ -28,13 +31,14 @@ use cser_core::{
     AGENT_COMPONENT_DMA, BootGeneration, CSER_CORE_API_PROFILE_VERSION, CatalogSet,
     ChargeAccountId, ClaimId, ClaimScope, Command, CommandRequest, ComponentProviderBinding,
     CoreError, CoreLimits, DEVICE_CLAIM_IOVA, DEVICE_CLAIM_PINNED_PAGE, DEVICE_CLAIM_QUEUE_SLOT,
-    DEVICE_COMMIT_RECEIPT_SCHEMA, DEVICE_RECEIPT_SCHEMA, DEVICE_VERIFIER,
-    DMA_ARENA_REUSE_COMPOSITE, DeviceGeneration, DeviceScopeId, Digest, EffectId, Engine,
-    ExecutorCoordinate, ExecutorGeneration, ExecutorId, Freshness, JournalGeneration,
-    JournalRecord, OperationId, REPLY_APPLY_RECEIPT_SCHEMA, REPLY_COMMIT_RECEIPT_SCHEMA,
-    REPLY_RECEIPT_SCHEMA, REPLY_SETTLEMENT_RECEIPT_SCHEMA, REPLY_VERIFIER, RegistryInstance,
-    ResourceGeneration, ResourceId, SnapshotId, TransitionDurability, TransitionOutput,
-    TransitionReceipt, TxError, VerifierBinding, VerifierGeneration, standard_catalog,
+    DEVICE_COMMIT_RECEIPT_SCHEMA, DEVICE_EVIDENCE_IOTLB, DEVICE_EVIDENCE_RESET,
+    DEVICE_RECEIPT_SCHEMA, DEVICE_VERIFIER, DMA_ARENA_REUSE_COMPOSITE, DeviceGeneration,
+    DeviceScopeId, Digest, EffectId, Engine, ExecutorCoordinate, ExecutorGeneration, ExecutorId,
+    Freshness, JournalGeneration, JournalRecord, OperationId, REPLY_APPLY_RECEIPT_SCHEMA,
+    REPLY_COMMIT_RECEIPT_SCHEMA, REPLY_RECEIPT_SCHEMA, REPLY_SETTLEMENT_RECEIPT_SCHEMA,
+    REPLY_VERIFIER, RegistryInstance, ResourceGeneration, ResourceId, SnapshotId,
+    TransitionDurability, TransitionOutput, TransitionReceipt, TxError, VerifierBinding,
+    VerifierGeneration, standard_catalog,
 };
 use nexus_ostd_virtio::{
     CompletedRequest, CompletionMode, InterruptCompletionProgress, InterruptNotReadyReason,
@@ -42,7 +46,7 @@ use nexus_ostd_virtio::{
     ProductionResetRetryError, PublishedRequest, Root, discover_and_own_bars, owner_address,
 };
 use ostd::{
-    arch::irq::IRQ_CHIP,
+    arch::irq::{IRQ_CHIP, IrqPendingSynchronizationError, MappedIrqLine},
     irq::IrqLine,
     power::{ExitCode, poweroff},
     prelude::*,
@@ -51,9 +55,10 @@ use ostd::{
 };
 
 use super::core_dma_adapter::{
-    ClaimRole, CoreDmaClaim, CoreDmaClaims, CoreDmaCohort, CoreReuseReservation,
-    DMA_RECOVERY_PROVIDER, acknowledge_real_irq, apply_real_iotlb_closure,
-    apply_real_reset_generation, bind_queue_commit, complete_real_irq, publish_real_queue,
+    ClaimRole, CoreDmaClaim, CoreDmaClaims, CoreDmaCohort, CoreIotlbBeginFailure,
+    CoreReuseReservation, DMA_RECOVERY_PROVIDER, acknowledge_real_irq, apply_real_iotlb_closure,
+    apply_real_reset_generation, bind_queue_commit, bind_retirement_receipt, complete_real_irq,
+    publish_real_queue,
 };
 use super::core_runtime::OstdCserRuntime;
 
@@ -193,12 +198,27 @@ struct DmaServiceTask {
     executor: ExecutorCoordinate,
 }
 
+/// Linear proof that PCI INTx was masked and the controller subsequently
+/// synchronized every delivery which could still enter the callback.
+struct ControllerSynchronizedIntx(MaskedIntx);
+
+fn synchronize_masked_intx(
+    mapped_irq: &MappedIrqLine,
+    masked: MaskedIntx,
+) -> Result<ControllerSynchronizedIntx, (MaskedIntx, IrqPendingSynchronizationError)> {
+    match mapped_irq.synchronize_pending_callbacks() {
+        Ok(()) => Ok(ControllerSynchronizedIntx(masked)),
+        Err(error) => Err((masked, error)),
+    }
+}
+
 /// Single-request handoff between the real OSTD top half and manager task.
 ///
-/// Task context only installs or extracts owners while PCI INTx is masked.
-/// Consequently the top half's request lock cannot interrupt a task-context
-/// holder on this CPU. The callback performs one ISR read/ack and publishes
-/// only the opaque receipt.
+/// Task context only installs owners while PCI INTx is masked, and extraction
+/// additionally consumes [`ControllerSynchronizedIntx`]. Consequently the top
+/// half's request lock cannot interrupt a task-context holder on this CPU and
+/// an already pending callback cannot observe removed/replacement ownership.
+/// The callback performs one ISR read/ack and publishes only the opaque receipt.
 struct IrqActorSlot {
     request: SpinLock<Option<PublishedRequest>>,
     receipt: SpinLock<Option<InterruptReceipt>>,
@@ -248,7 +268,10 @@ impl IrqActorSlot {
         self.ready.store(true, Ordering::Release);
     }
 
-    fn take_remasked(&self) -> (PublishedRequest, InterruptReceipt) {
+    fn take_synchronized(
+        &self,
+        synchronized: ControllerSynchronizedIntx,
+    ) -> (PublishedRequest, InterruptReceipt, MaskedIntx) {
         assert!(self.ready.load(Ordering::Acquire));
         let request = self
             .request
@@ -261,7 +284,7 @@ impl IrqActorSlot {
             .take()
             .expect("remasked IRQ slot retains receipt");
         self.ready.store(false, Ordering::Release);
-        (request, receipt)
+        (request, receipt, synchronized.0)
     }
 }
 
@@ -308,6 +331,20 @@ fn run_dma_recovery_slice() {
         .expect("OSTD IRQ chip is initialized")
         .map_gsi_pin_to(irq_line, u32::from(intx_route.line()))
         .expect("firmware-programmed VirtIO GSI maps to the OSTD IRQ actor");
+    if !mapped_irq.supports_pending_callback_synchronization() {
+        println!(
+            "CSER_CORE_DMA_IRQ UNSUPPORTED outcome=FAIL_CLOSED \
+             reason=controller_pending_synchronization_unsupported pci_intx_masked=true \
+             queue_published=false request_owner_created=false \
+             irq_mapping_retained=true qemu_evidence=false physical_hardware_evidence=false"
+        );
+        // `poweroff` does not unwind. Keep the mapping, callback, vector, slot,
+        // and masked PCI owner live rather than publishing DMA which this
+        // platform cannot later detach from pending controller delivery.
+        // The guest successfully reported the unsupported capability; this is
+        // not a hardware-closure success marker.
+        poweroff(ExitCode::Success);
+    }
     let mut device =
         ProductionDevice::for_owned_device(&mut root).expect("owned root yields one device");
 
@@ -435,7 +472,7 @@ fn run_dma_recovery_slice() {
     );
 
     let (completed1, irq1, irq_turns1, masked_intx) =
-        wait_for_real_irq_completion(&mut root, &irq_slot, masked_intx, request1);
+        wait_for_real_irq_completion(&mut root, &mapped_irq, &irq_slot, masked_intx, request1);
     let first_close = close_real_generation(
         &core,
         &mut root,
@@ -544,7 +581,7 @@ fn run_dma_recovery_slice() {
     );
 
     let (completed2, irq2, irq_turns2, masked_intx) =
-        wait_for_real_irq_completion(&mut root, &irq_slot, masked_intx, request2);
+        wait_for_real_irq_completion(&mut root, &mapped_irq, &irq_slot, masked_intx, request2);
     stop_and_reap(&successor2_task, &successor2_control);
     tx(
         &core,
@@ -577,12 +614,11 @@ fn run_dma_recovery_slice() {
     assert_eq!(masked_intx.route(), intx_route);
     assert_eq!(irq_slot.deliveries.load(Ordering::Acquire), 2);
     assert_eq!(irq_slot.duplicate_callbacks.load(Ordering::Acquire), 0);
-    drop(mapped_irq);
-
     println!(
-        "CSER_CORE_DMA HardwareClosure PASS qemu=true physical_hardware=false real_pci=true \
+        "CSER_CORE_DMA_IRQ SUPPORTED_CLOSURE qemu=true physical_hardware=false real_pci=true \
          real_virtio=true avail_idx_release=true completion=true isr_status_read_ack=true \
-         irq_controller_delivery=true hard_irq_actor=true intx_remap=true intx_remasked=true \
+         irq_controller_delivery=true controller_pending_synchronized=true hard_irq_actor=true \
+         intx_remap=true intx_remasked=true \
          irq_vector={} irq_remapping_index={:?} reset_status_zero=true \
          bus_master_disabled=true reset_generation=3 vt_d_iotlb_submit_poll_complete=true \
          iommu_software_typestate=false retained_dma_pages=3 core_resource_reuse=true \
@@ -591,7 +627,7 @@ fn run_dma_recovery_slice() {
         irq_vector, irq_remapping_index, address_reuse, irq_turns1, irq_turns2,
     );
     println!(
-        "CSER_CORE_DMA_OSTD_QEMU PASS death=real-task-reap fence=immediate-manager \
+        "CSER_CORE_DMA_IRQ SUPPORTED_QEMU_COMPLETION death=real-task-reap fence=immediate-manager \
          second_crash=true post_mortem_owner=kernel-manager reply_registry=false \
          legacy_registry=false portal_glue=false live_dual_write=false \
          api_profile={} scoped_providers=true exact_verifier_binding=true \
@@ -759,6 +795,7 @@ fn stop_and_reap(task: &Arc<Task>, control: &Arc<ServiceControl>) {
 
 fn wait_for_real_irq_completion(
     root: &mut Root,
+    mapped_irq: &MappedIrqLine,
     irq_slot: &IrqActorSlot,
     mut masked: MaskedIntx,
     mut request: PublishedRequest,
@@ -776,11 +813,30 @@ fn wait_for_real_irq_completion(
         masked = root
             .mask_intx(unmasked)
             .unwrap_or_else(|_| panic!("PCI INTx remasks before task-context owner extraction"));
+        let synchronized = match synchronize_masked_intx(mapped_irq, masked) {
+            Ok(synchronized) => synchronized,
+            Err((_retained_masked, error)) => {
+                println!(
+                    "CSER_CORE_DMA_IRQ UNSUPPORTED outcome=FAIL_CLOSED \
+                     reason=controller_pending_synchronization_{:?} pci_intx_masked=true \
+                     request_owner_retained=true irq_mapping_retained=true qemu_evidence=false \
+                     physical_hardware_evidence=false",
+                    error,
+                );
+                // Do not call `take_synchronized`: the slot remains the exact
+                // owner until a controller primitive proves pending delivery
+                // and the trailing acknowledgement are both complete.
+                // The guest successfully reported retained ownership; it did
+                // not establish hardware closure.
+                poweroff(ExitCode::Success);
+            }
+        };
         assert!(
             irq_slot.ready.load(Ordering::Acquire),
             "real OSTD IRQ actor did not receive the bounded QEMU delivery"
         );
-        let (returned, irq) = irq_slot.take_remasked();
+        let (returned, irq, returned_masked) = irq_slot.take_synchronized(synchronized);
+        masked = returned_masked;
         request = returned;
         match complete_real_irq(request, irq) {
             InterruptCompletionProgress::Complete(completed) => {
@@ -818,6 +874,11 @@ fn close_real_generation(
     irq: InterruptReceipt,
     inject_pending: bool,
 ) -> CloseObservation {
+    let reset_bindings = core
+        .observe(|engine| {
+            bind_retirement_receipt(engine, cohort, ClaimRole::Queue, DEVICE_EVIDENCE_RESET)
+        })
+        .expect("reset receipt binds executor authority before the physical reset");
     let reset_intent = completed
         .preflight_reset(cohort.hardware())
         .unwrap_or_else(|_| panic!("completed owner preflights exact reset"));
@@ -841,7 +902,7 @@ fn close_real_generation(
             }
         }
     };
-    let reset = apply_real_reset_generation(device, reset, cohort)
+    let reset = apply_real_reset_generation(device, reset, cohort, reset_bindings)
         .unwrap_or_else(|_| panic!("real reset generation binds to core cohort"));
     for role in [ClaimRole::Queue, ClaimRole::PinnedPages, ClaimRole::Iova] {
         let command = core
@@ -855,8 +916,24 @@ fn close_real_generation(
     tx(core, irq_command);
 
     let progress = core
-        .observe(|engine| reset.begin_iotlb(engine, device, cohort, inject_pending))
+        .observe(|engine| {
+            let iotlb_bindings = match bind_retirement_receipt(
+                engine,
+                cohort,
+                ClaimRole::PinnedPages,
+                DEVICE_EVIDENCE_IOTLB,
+            ) {
+                Ok(bindings) => bindings,
+                Err(error) => {
+                    return Err(CoreIotlbBeginFailure::CoreNotDurable { error, reset });
+                }
+            };
+            reset
+                .begin_iotlb(engine, device, cohort, inject_pending)
+                .map(|progress| (progress, iotlb_bindings))
+        })
         .unwrap_or_else(|_| panic!("real IOTLB closure begins after durable reset/IRQ facts"));
+    let (progress, iotlb_bindings) = progress;
     let (closure, iotlb_pending_observed) = match progress {
         ProductionClosureProgress::Complete(closure) => (closure, false),
         ProductionClosureProgress::Pending(tombstone) => {
@@ -874,7 +951,7 @@ fn close_real_generation(
             (closure, true)
         }
     };
-    let closure = apply_real_iotlb_closure(device, closure, cohort)
+    let closure = apply_real_iotlb_closure(device, closure, cohort, iotlb_bindings)
         .unwrap_or_else(|_| panic!("real IOTLB closure binds to core cohort"));
     let retirement_commands = core
         .observe(|engine| closure.retirement_commands(engine, cohort))
@@ -999,4 +1076,61 @@ impl_nonzero_id!(
 
 fn nz<T: NonZeroId>(value: u64) -> T {
     T::from_nonzero(value)
+}
+
+#[cfg(ktest)]
+mod tests {
+    use ostd::prelude::ktest;
+
+    const SOURCE: &str = include_str!("core_dma_runtime.rs");
+
+    #[ktest]
+    fn optional_irq_owner_removal_is_controller_synchronized_or_fail_closed() {
+        let implementation = SOURCE
+            .split_once("#[cfg(ktest)]")
+            .expect("focused test follows the DMA implementation")
+            .0;
+        let capability_gate = implementation
+            .find("if !mapped_irq.supports_pending_callback_synchronization()")
+            .expect("optional IRQ path checks controller capability");
+        let device_construction = implementation
+            .find("ProductionDevice::for_owned_device")
+            .expect("DMA device construction remains explicit");
+        let first_publication = implementation
+            .find("let published1 = publish_real_queue")
+            .expect("DMA queue publication remains explicit");
+        assert!(capability_gate < device_construction);
+        assert!(capability_gate < first_publication);
+
+        let wait_body = implementation
+            .split_once("fn wait_for_real_irq_completion(")
+            .expect("IRQ wait helper exists")
+            .1
+            .split_once("struct CloseObservation")
+            .expect("IRQ wait helper precedes close observation")
+            .0;
+        let mask = wait_body
+            .find(".mask_intx(unmasked)")
+            .expect("PCI INTx is masked before extraction");
+        let synchronize = wait_body
+            .find("synchronize_masked_intx(mapped_irq, masked)")
+            .expect("masked token is consumed by controller synchronization");
+        let removal = wait_body
+            .find("irq_slot.take_synchronized(synchronized)")
+            .expect("request removal requires the synchronized token");
+        assert!(mask < synchronize);
+        assert!(synchronize < removal);
+        assert!(!implementation.contains("take_remasked"));
+        assert!(!implementation.contains("drop(mapped_irq)"));
+        assert!(!implementation.contains("CSER_CORE_DMA HardwareClosure PASS"));
+        assert!(!implementation.contains("CSER_CORE_DMA_OSTD_QEMU PASS"));
+        assert!(implementation.contains("CSER_CORE_DMA_IRQ UNSUPPORTED outcome=FAIL_CLOSED"));
+        assert!(implementation.contains("Err((_retained_masked, error))"));
+        assert_eq!(
+            implementation
+                .match_indices("ControllerSynchronizedIntx(masked)")
+                .count(),
+            1
+        );
+    }
 }
