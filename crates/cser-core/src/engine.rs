@@ -18910,6 +18910,7 @@ fn put_handoff_recovery_fact<V: core::borrow::Borrow<VerifiedHandoffRecoveryFact
 // bounded decoder.
 const WHOLE_STATE_CHECKPOINT_MAGIC: &[u8; 8] = b"CSERWS5\0";
 const PREVIOUS_WHOLE_STATE_CHECKPOINT_MAGIC: &[u8; 8] = b"CSERWS4\0";
+const PROFILE_SIX_WHOLE_STATE_CHECKPOINT_MAGIC: &[u8; 8] = b"CSERWS3\0";
 
 /// Minimal sink contract for canonical checkpoint and J10 record streaming.
 /// Implementations may buffer, split, or directly persist each supplied
@@ -19821,7 +19822,9 @@ fn checkpoint_preflight_cursor(
     limits: CoreLimits,
 ) -> Result<CheckpointPreflightPlan, CoreError> {
     let magic = checkpoint_preflight_error(cursor.fixed::<8>())?;
-    if magic == *PREVIOUS_WHOLE_STATE_CHECKPOINT_MAGIC {
+    if magic == *PREVIOUS_WHOLE_STATE_CHECKPOINT_MAGIC
+        || magic == *PROFILE_SIX_WHOLE_STATE_CHECKPOINT_MAGIC
+    {
         return Err(CoreError::UnsupportedCheckpointState);
     }
     if magic != *WHOLE_STATE_CHECKPOINT_MAGIC {
@@ -20228,7 +20231,9 @@ fn decode_whole_state_checkpoint_cursor(
     let magic = cursor
         .fixed::<8>()
         .map_err(|_| CoreError::InvariantViolation)?;
-    if magic == *PREVIOUS_WHOLE_STATE_CHECKPOINT_MAGIC {
+    if magic == *PREVIOUS_WHOLE_STATE_CHECKPOINT_MAGIC
+        || magic == *PROFILE_SIX_WHOLE_STATE_CHECKPOINT_MAGIC
+    {
         return Err(CoreError::UnsupportedCheckpointState);
     }
     if magic != *WHOLE_STATE_CHECKPOINT_MAGIC {
@@ -23626,12 +23631,25 @@ mod whole_state_checkpoint_tests {
     }
 
     #[test]
-    fn whole_state_schema_two_is_recognized_and_rejected() {
+    fn whole_state_schema_four_is_recognized_and_rejected() {
         let mut journal = Vec::new();
         let (engine, _, _) = seed(&mut journal);
         let mut image = encode_whole_state_checkpoint(&engine.state);
         image[..8].copy_from_slice(PREVIOUS_WHOLE_STATE_CHECKPOINT_MAGIC);
-        image[8..10].copy_from_slice(&2u16.to_le_bytes());
+        image[8..10].copy_from_slice(&4u16.to_le_bytes());
+        assert_eq!(
+            decode_whole_state_checkpoint(&image, engine.catalog_set(), engine.limits),
+            Err(CoreError::UnsupportedCheckpointState)
+        );
+    }
+
+    #[test]
+    fn profile_six_whole_state_is_recognized_and_rejected() {
+        let mut journal = Vec::new();
+        let (engine, _, _) = seed(&mut journal);
+        let mut image = encode_whole_state_checkpoint(&engine.state);
+        image[..8].copy_from_slice(PROFILE_SIX_WHOLE_STATE_CHECKPOINT_MAGIC);
+        image[8..10].copy_from_slice(&3u16.to_le_bytes());
         assert_eq!(
             decode_whole_state_checkpoint(&image, engine.catalog_set(), engine.limits),
             Err(CoreError::UnsupportedCheckpointState)

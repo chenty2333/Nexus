@@ -31,12 +31,15 @@ pub const JOURNAL_CHECKPOINT_MAGIC: [u8; 8] = *b"CSERCP5\0";
 /// Version of [`JournalCheckpoint`] envelopes.
 pub const JOURNAL_CHECKPOINT_VERSION: u16 = 5;
 const PREVIOUS_CHECKPOINT_MAGIC: [u8; 8] = *b"CSERCP4\0";
+const PROFILE_SIX_CHECKPOINT_MAGIC: [u8; 8] = *b"CSERCP3\0";
 const LEGACY_CHECKPOINT_MAGIC: [u8; 8] = *b"CSERCP1\0";
 
 const PRE_HANDOFF_RESOLUTION_JOURNAL_MAGIC: [u8; 8] = *b"CSERJR7\0";
 const PRE_HANDOFF_RESOLUTION_JOURNAL_SCHEMA_VERSION: u16 = 7;
 const PREVIOUS_JOURNAL_MAGIC: [u8; 8] = *b"CSERJ11\0";
 const PREVIOUS_JOURNAL_SCHEMA_VERSION: u16 = 11;
+const PROFILE_SIX_JOURNAL_MAGIC: [u8; 8] = *b"CSERJ10\0";
+const PROFILE_SIX_JOURNAL_SCHEMA_VERSION: u16 = 10;
 const PREVIOUS_PREVIOUS_JOURNAL_MAGIC: [u8; 8] = *b"CSERJR9\0";
 const PREVIOUS_PREVIOUS_JOURNAL_SCHEMA_VERSION: u16 = 9;
 const PROFILE_ONE_JOURNAL_MAGIC: [u8; 8] = *b"CSERJR5\0";
@@ -218,6 +221,11 @@ impl JournalCheckpoint {
         if bytes.len() >= PREVIOUS_CHECKPOINT_MAGIC.len() && bytes[..8] == PREVIOUS_CHECKPOINT_MAGIC
         {
             return Err(JournalCheckpointDecodeError::UnsupportedVersion { version: 4 });
+        }
+        if bytes.len() >= PROFILE_SIX_CHECKPOINT_MAGIC.len()
+            && bytes[..8] == PROFILE_SIX_CHECKPOINT_MAGIC
+        {
+            return Err(JournalCheckpointDecodeError::UnsupportedVersion { version: 3 });
         }
         if bytes.len() >= LEGACY_CHECKPOINT_MAGIC.len() && bytes[..8] == LEGACY_CHECKPOINT_MAGIC {
             return Err(JournalCheckpointDecodeError::UnsupportedVersion { version: 1 });
@@ -1743,6 +1751,7 @@ fn reject_read_at_record_magic_prefix<E>(
     let version = match &fixed[..8] {
         magic if magic == JOURNAL_MAGIC => return Ok(()),
         magic if magic == PREVIOUS_JOURNAL_MAGIC => PREVIOUS_JOURNAL_SCHEMA_VERSION,
+        magic if magic == PROFILE_SIX_JOURNAL_MAGIC => PROFILE_SIX_JOURNAL_SCHEMA_VERSION,
         magic if magic == PREVIOUS_PREVIOUS_JOURNAL_MAGIC => {
             PREVIOUS_PREVIOUS_JOURNAL_SCHEMA_VERSION
         }
@@ -1774,6 +1783,7 @@ pub(crate) fn recognized_legacy_journal_version(bytes: &[u8]) -> Option<u16> {
     }
     match &bytes[..JOURNAL_MAGIC.len()] {
         b"CSERJ11\0" => Some(PREVIOUS_JOURNAL_SCHEMA_VERSION),
+        b"CSERJ10\0" => Some(PROFILE_SIX_JOURNAL_SCHEMA_VERSION),
         b"CSERJR9\0" => Some(PREVIOUS_PREVIOUS_JOURNAL_SCHEMA_VERSION),
         b"CSERJR8\0" => Some(8),
         b"CSERJR7\0" => Some(PRE_HANDOFF_RESOLUTION_JOURNAL_SCHEMA_VERSION),
@@ -1866,6 +1876,11 @@ fn scan_journal_inner(
         if remaining[..8] == PREVIOUS_JOURNAL_MAGIC {
             return Err(JournalDecodeError::UnsupportedVersion {
                 version: PREVIOUS_JOURNAL_SCHEMA_VERSION,
+            });
+        }
+        if remaining[..8] == PROFILE_SIX_JOURNAL_MAGIC {
+            return Err(JournalDecodeError::UnsupportedVersion {
+                version: PROFILE_SIX_JOURNAL_SCHEMA_VERSION,
             });
         }
         if remaining[..8] == PREVIOUS_PREVIOUS_JOURNAL_MAGIC {
@@ -2216,6 +2231,11 @@ fn scan_journal_views_inner(
         if remaining[..8] == PREVIOUS_JOURNAL_MAGIC {
             return Err(JournalDecodeError::UnsupportedVersion {
                 version: PREVIOUS_JOURNAL_SCHEMA_VERSION,
+            });
+        }
+        if remaining[..8] == PROFILE_SIX_JOURNAL_MAGIC {
+            return Err(JournalDecodeError::UnsupportedVersion {
+                version: PROFILE_SIX_JOURNAL_SCHEMA_VERSION,
             });
         }
         if remaining[..8] == PREVIOUS_PREVIOUS_JOURNAL_MAGIC {
@@ -2617,12 +2637,32 @@ mod checkpoint_tests {
     }
 
     #[test]
+    fn decode_identifies_profile_six_checkpoint_before_vnext_length_checks() {
+        let mut bytes = vec![0u8; 196];
+        bytes[..8].copy_from_slice(&PROFILE_SIX_CHECKPOINT_MAGIC);
+        assert_eq!(
+            JournalCheckpoint::decode(&bytes),
+            Err(JournalCheckpointDecodeError::UnsupportedVersion { version: 3 })
+        );
+    }
+
+    #[test]
     fn decode_identifies_predecessor_journal_before_vnext_length_checks() {
         let mut bytes = vec![0u8; 16];
         bytes[..8].copy_from_slice(&PREVIOUS_JOURNAL_MAGIC);
         assert!(matches!(
             scan_journal(&bytes),
             Err(JournalDecodeError::UnsupportedVersion { version: 11 })
+        ));
+    }
+
+    #[test]
+    fn decode_identifies_profile_six_journal_before_vnext_length_checks() {
+        let mut bytes = vec![0u8; 16];
+        bytes[..8].copy_from_slice(&PROFILE_SIX_JOURNAL_MAGIC);
+        assert!(matches!(
+            scan_journal(&bytes),
+            Err(JournalDecodeError::UnsupportedVersion { version: 10 })
         ));
     }
 

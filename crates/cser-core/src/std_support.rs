@@ -1338,6 +1338,22 @@ mod tests {
     }
 
     #[test]
+    fn anchored_open_rejects_profile_six_before_genesis_repair() {
+        let temp = TempJournal::new("profile-six-genesis-prefix");
+        let bytes = Vec::from(*b"CSERJ10\0");
+        std::fs::write(&temp.path, &bytes).unwrap();
+
+        let error = FileJournal::open_anchored(&temp.path, 0, Digest::ZERO)
+            .expect_err("profile six must not be reclassified as repairable residue");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "invalid CSER journal: UnsupportedVersion { version: 10 }"
+        );
+        assert_eq!(std::fs::read(&temp.path).unwrap(), bytes);
+    }
+
+    #[test]
     fn file_journal_positioned_snapshot_reads_without_materializing_the_image() {
         let temp = TempJournal::new("positioned-recovery-source");
         let first = record(0, Digest::ZERO);
