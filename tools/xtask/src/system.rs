@@ -374,9 +374,8 @@ fn assert_runner_unchanged(root: &Path, runner: &Path, before: &str) -> Result<(
 }
 
 fn run_pio_ktest(root: &Path, image: &Image) -> Result<()> {
-    build_scheme(root, image, "cser-pio-journal-ktest")?;
+    let runner_before = prepare_runner(root)?;
     let runner = root.join(KERNEL).join("target/osdk/nexus-kernel-run-base");
-    let runner_before = runner_controls(root, &runner)?;
     let result = container_output(
         root,
         image,
