@@ -4,7 +4,7 @@ This directory is the OSTD embedding of the CSER Core. Its supported developer
 interface is the root command:
 
 ```text
-cargo nexus {kernel,system,seal,clean}
+cargo nexus {kernel,system,clean}
 ```
 
 The root workspace follows rolling `nightly`. xtask reads the local rustup
@@ -32,20 +32,16 @@ owner. Cargo-OSDK creates a runner workspace without propagating `--locked`;
 the reviewed `osdk-runner-base/` snapshot, with its own lockfile, is checked
 unchanged as the sole controlled runner-lock exception.
 
-## System and seal
+## System verification
 
 `cargo nexus system` runs the PIO profile, focused reply recovery, the DMA IRQ
 fail-closed capability gate,
 typed predecessor rejection, then four `cser-production` QEMU boots over the
-same retained raw journal, outbox, and TPM-fixture state. It is the only
+same temporary journal, outbox, and TPM-fixture state. It is the only
 supported persistent kernel execution path.
 
-`cargo nexus seal` first requires a clean Git snapshot, then uses that same
-system path. On success it records the dist date plus verified `rustc` commit
-date and hash, and publishes only `combined-receipt.txt` and its checksum to
-`target/nexus/public/`. Raw journals, logs, media, and TPM-fixture state are
-local-only and are never uploaded. `cargo nexus clean` preserves raw artifacts;
-use `cargo nexus clean --raw` to delete them explicitly.
+The temporary state lives under `kernel/nexus-ostd/target/nexus/system/` and is
+removed by `cargo nexus clean`.
 
 ## Evidence boundary
 

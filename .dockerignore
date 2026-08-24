@@ -1,7 +1,6 @@
 .git
 target
 **/target
-**/artifacts
 **/__pycache__
 **/*.pyc
 **/mutants.out*

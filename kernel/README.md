@@ -10,7 +10,6 @@ The kernel is reached only through:
 ```text
 cargo nexus kernel
 cargo nexus system
-cargo nexus seal
 ```
 
 The root rolling nightly launches xtask. xtask reads the local rustup toolchain
@@ -28,12 +27,9 @@ receive `--locked`, so the reviewed `osdk-runner-base/` snapshot and its own
 lockfile are checked unchanged as the sole controlled exception.
 
 `cargo nexus system` exercises ATA PIO persistence, focused reply recovery, the
-DMA IRQ fail-closed capability gate, typed predecessor rejection, and four production boots over retained
-raw state. `cargo nexus seal` requires a clean Git snapshot, follows that same
-path, records the dist date plus verified `rustc` commit date and hash, and
-copies only a sanitized receipt and checksum to `target/nexus/public/`. Raw
-artifacts stay local; `cargo nexus clean` preserves them, while
-`cargo nexus clean --raw` removes them explicitly.
+DMA IRQ fail-closed capability gate, typed predecessor rejection, and four
+production boots over temporary state under `target/`. `cargo nexus clean`
+removes that state together with build output.
 
 The QEMU protocol profile is evidence for its declared emulated configuration.
 It does not establish physical-hardware behavior.

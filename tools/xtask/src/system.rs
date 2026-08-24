@@ -1,7 +1,7 @@
 //! The deliberately small, direct production-system runner.
 //!
 //! This module is the only host-side owner of the OSTD production sequence;
-//! all OSDK, QEMU, TPM, and receipt steps below are explicit.
+//! all OSDK, QEMU, and TPM steps below are explicit.
 
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -15,7 +15,7 @@ use std::time::Duration;
 pub(crate) type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
 const KERNEL: &str = "kernel/nexus-ostd";
-const ARTIFACTS: &str = "kernel/nexus-ostd/artifacts/cser-production";
+const SYSTEM_OUTPUT: &str = "kernel/nexus-ostd/target/nexus/system";
 const FIXTURE_REVISION: &str = "041113950b5e45e63099a164c7d1915ccb8a1018";
 const FIXTURE_ARCHIVE_SHA256: &str =
     "6f35a75b26851aac209b102585f80bf18c2629aec3f91e42d2ddee030b1a2a75";
@@ -24,20 +24,6 @@ const FIXTURE_HEAD: &str = "21442cc39e8704bf2fdfa860053cb40aab3c88779d8efd1ea7a3
 const FIXTURE_JOURNAL_SHA256: &str =
     "b3156d2dcbb622c6a12a8e155fc398357bbf1151b01834e1c7549fffc53bc898";
 const RUNTIME_FS_SHA256: &str = "9357413ed9a96a23af1750cc304265dd7dd1835eb58eb1fb50119cd80d0bc8ca";
-
-#[derive(Debug, Clone)]
-pub(crate) struct SystemReceipt {
-    /// Short public statements only.  Never put serial output, identities,
-    /// media coordinates, paths, container ids, or TPM material here.
-    pub pass_summaries: Vec<String>,
-    pub rustc_commit: String,
-    pub rustc_dist_date: String,
-    pub rustc_date: String,
-    pub image_id: String,
-    pub lock_hashes: BTreeMap<String, String>,
-    pub git_revision: String,
-    pub raw_tree_sha256: String,
-}
 
 pub(crate) fn check(root: &Path) -> Result<()> {
     let _lock = SystemLock::acquire(root)?;
@@ -54,59 +40,26 @@ pub(crate) fn build(root: &Path) -> Result<()> {
     build_scheme(root, &image, "cser-production")
 }
 
-pub(crate) fn run(root: &Path) -> Result<SystemReceipt> {
+pub(crate) fn run(root: &Path) -> Result<()> {
     let _lock = SystemLock::acquire(root)?;
-    let revision = git_revision(root)?;
-    run_with_git_repo(root, root, &revision)
-}
-
-/// Runs source mounted at `source_root`, but obtains the immutable
-/// predecessor archive from `git_repo`.  Sealing uses this with a clean
-/// `git archive HEAD` snapshot so no runner step needs a worktree `.git`.
-fn run_with_git_repo(source_root: &Path, git_repo: &Path, revision: &str) -> Result<SystemReceipt> {
-    let root = source_root;
     let image = image(root)?;
     ensure_image(root, &image)?;
     kernel_checks(root, &image)?;
     run_pio_ktest(root, &image)?;
-    let artifact = artifact_dir(root);
-    prepare_artifacts(&artifact)?;
-    run_focused_reply(root, &image, &artifact)?;
-    run_focused_dma(root, &image, &artifact)?;
+    let run_dir = system_output(root);
+    prepare_system_output(&run_dir)?;
+    run_focused_reply(root, &image, &run_dir)?;
+    run_focused_dma(root, &image, &run_dir)?;
     let catalog = catalog_digest(root, &image)?;
-    schema8_negative_boot(root, git_repo, &image, &artifact, &catalog)?;
-    run_four_boots(root, &image, &artifact, &catalog)?;
-    receipt(root, &image, &artifact, revision)
+    schema8_negative_boot(root, &image, &run_dir, &catalog)?;
+    run_four_boots(root, &image, &run_dir, &catalog)?;
+    Ok(())
 }
 
-/// The clean-snapshot seal entry point. `source_root` may be a Git-archive
-/// extraction; `git_repo` remains the original object database and revision
-/// authority for the archived predecessor and public revision.
-pub(crate) fn seal_from(
-    source_root: &Path,
-    git_repo: &Path,
-    revision: &str,
-) -> Result<SystemReceipt> {
-    if !valid_hex(revision, 40) {
-        return Err("seal revision is malformed".into());
-    }
-    let receipt = run_with_git_repo(source_root, git_repo, revision)?;
-    write_complete_receipt(&artifact_dir(source_root), &receipt)?;
-    Ok(receipt)
-}
-
-/// `raw=true` also removes raw production artifacts; normal cleanup retains
-/// them so a caller can copy a just-created sealed receipt.
-pub(crate) fn clean(root: &Path, raw: bool) -> Result<()> {
+pub(crate) fn clean(root: &Path) -> Result<()> {
     let kernel_target = root.join(KERNEL).join("target");
     if kernel_target.exists() {
         fs::remove_dir_all(&kernel_target)?;
-    }
-    if raw {
-        let artifacts = root.join(KERNEL).join("artifacts");
-        if artifacts.exists() {
-            fs::remove_dir_all(artifacts)?;
-        }
     }
     Ok(())
 }
@@ -144,7 +97,7 @@ impl SystemLock {
             .truncate(false)
             .open(path)?;
         file.try_lock()
-            .map_err(|_| "another cargo nexus kernel/system/seal operation is running")?;
+            .map_err(|_| "another cargo nexus kernel/system operation is running")?;
         Ok(Self { _file: file })
     }
 }
@@ -154,7 +107,6 @@ struct Image {
     reference: String,
     rustc_commit: String,
     rustc_dist_date: String,
-    rustc_date: String,
 }
 
 fn image(root: &Path) -> Result<Image> {
@@ -167,12 +119,8 @@ fn image(root: &Path) -> Result<Image> {
         .get("commit-hash")
         .ok_or("rustc -Vv omitted commit-hash")?
         .to_string();
-    let date = values
-        .get("commit-date")
-        .ok_or("rustc -Vv omitted commit-date")?
-        .to_string();
-    if !valid_hex(&commit, 40) || !valid_date(&date) {
-        return Err("rustc -Vv returned malformed nightly identity".into());
+    if !valid_hex(&commit, 40) {
+        return Err("rustc -Vv returned malformed commit hash".into());
     }
     let sysroot = output(root, "rustc", &["--print", "sysroot"])?;
     let manifest =
@@ -194,7 +142,6 @@ fn image(root: &Path) -> Result<Image> {
         reference: format!("nexus/nexus-ostd:{dist_date}-{}", &build_inputs[..16]),
         rustc_commit: commit,
         rustc_dist_date: dist_date,
-        rustc_date: date,
     })
 }
 
@@ -248,7 +195,7 @@ fn collect_docker_inputs(current: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
             );
         }
         if kind.is_dir() {
-            if name == "target" || name == "artifacts" || name == "__pycache__" {
+            if name == "target" || name == "__pycache__" {
                 continue;
             }
             collect_docker_inputs(&path, out)?;
@@ -407,31 +354,30 @@ fn run_pio_ktest(root: &Path, image: &Image) -> Result<()> {
     Ok(())
 }
 
-fn prepare_artifacts(artifact: &Path) -> Result<()> {
-    if artifact.exists() {
-        fs::remove_dir_all(artifact)?;
+fn prepare_system_output(run_dir: &Path) -> Result<()> {
+    if run_dir.exists() {
+        fs::remove_dir_all(run_dir)?;
     }
-    fs::create_dir_all(artifact)?;
-    write_len(&artifact.join("journal.raw"), 4 * 1024 * 1024)?;
-    write_len(&artifact.join("outbox.raw"), 4 * 1024 * 1024)?;
-    write_len(&artifact.join("ram.raw"), 1024 * 1024 * 1024)?;
-    atomic_write(&artifact.join("INCOMPLETE"), b"INCOMPLETE\n")?;
+    fs::create_dir_all(run_dir)?;
+    write_len(&run_dir.join("journal.raw"), 4 * 1024 * 1024)?;
+    write_len(&run_dir.join("outbox.raw"), 4 * 1024 * 1024)?;
+    write_len(&run_dir.join("ram.raw"), 1024 * 1024 * 1024)?;
     Ok(())
 }
 
-fn run_focused_reply(root: &Path, image: &Image, artifact: &Path) -> Result<()> {
+fn run_focused_reply(root: &Path, image: &Image, run_dir: &Path) -> Result<()> {
     build_scheme(root, image, "cser-core-reply-recovery")?;
     capture(
         root,
         image,
-        artifact,
+        run_dir,
         "reply-evidence",
         "cser-core-reply-recovery",
         60,
         false,
     )?;
     let marker = exact_marker(
-        &artifact.join("reply-evidence-serial.log"),
+        &run_dir.join("reply-evidence-serial.log"),
         "CSER_CORE_OSTD_TASK_RECOVERY PASS",
         &[
             "death=task-return",
@@ -456,19 +402,19 @@ fn run_focused_reply(root: &Path, image: &Image, artifact: &Path) -> Result<()> 
     Ok(())
 }
 
-fn run_focused_dma(root: &Path, image: &Image, artifact: &Path) -> Result<()> {
+fn run_focused_dma(root: &Path, image: &Image, run_dir: &Path) -> Result<()> {
     build_scheme(root, image, "cser-core-dma-recovery")?;
     capture(
         root,
         image,
-        artifact,
+        run_dir,
         "dma-evidence",
         "cser-core-dma-recovery",
         90,
         false,
     )?;
-    let serial = fs::read_to_string(artifact.join("dma-evidence-serial.log"))?;
-    let trace = fs::read_to_string(artifact.join("dma-evidence-qemu-debug.log"))?;
+    let serial = fs::read_to_string(run_dir.join("dma-evidence-serial.log"))?;
+    let trace = fs::read_to_string(run_dir.join("dma-evidence-qemu-debug.log"))?;
     assert_dma_irq_unsupported(&serial, &trace)
 }
 
@@ -533,15 +479,9 @@ fn catalog_digest(root: &Path, image: &Image) -> Result<String> {
     Ok(digest)
 }
 
-fn schema8_negative_boot(
-    root: &Path,
-    git_repo: &Path,
-    image: &Image,
-    artifact: &Path,
-    catalog: &str,
-) -> Result<()> {
-    let original = build_schema8_fixture(root, git_repo, image, artifact)?;
-    let state = artifact.join("tpmstate");
+fn schema8_negative_boot(root: &Path, image: &Image, run_dir: &Path, catalog: &str) -> Result<()> {
+    let original = build_schema8_fixture(root, image, run_dir)?;
+    let state = run_dir.join("tpmstate");
     status(
         root,
         "bash",
@@ -558,12 +498,12 @@ fn schema8_negative_boot(
     let before = snapshot_tpm(
         root,
         &state,
-        &artifact.join("schema8-negative-tpm-before.txt"),
+        &run_dir.join("schema8-negative-tpm-before.txt"),
     )?;
     capture(
         root,
         image,
-        artifact,
+        run_dir,
         "schema8-negative",
         "cser-production",
         90,
@@ -572,15 +512,15 @@ fn schema8_negative_boot(
     let after = snapshot_tpm(
         root,
         &state,
-        &artifact.join("schema8-negative-tpm-after.txt"),
+        &run_dir.join("schema8-negative-tpm-after.txt"),
     )?;
     if !tpm_snapshot_unchanged(&before, &after) {
         return Err("schema8 negative boot changed provisioned TPM NV state".into());
     }
-    if fs::read(artifact.join("journal.raw"))? != original {
+    if fs::read(run_dir.join("journal.raw"))? != original {
         return Err("schema8 negative boot rewrote its journal".into());
     }
-    let serial = artifact.join("schema8-negative-serial.log");
+    let serial = run_dir.join("schema8-negative-serial.log");
     let migration = exact_marker(
         &serial,
         "CSER_CORE_SCHEMA8_MIGRATION_REQUIRED PASS",
@@ -626,28 +566,23 @@ fn schema8_negative_boot(
         return Err("schema8 negative boot published production state".into());
     }
     assert_schema8_trace(
-        &fs::read_to_string(artifact.join("schema8-negative-qemu-debug.log"))?,
+        &fs::read_to_string(run_dir.join("schema8-negative-qemu-debug.log"))?,
         &migration,
     )?;
-    let negative_state = artifact.join("schema8-negative-tpmstate");
+    let negative_state = run_dir.join("schema8-negative-tpmstate");
     fs::rename(&state, negative_state)?;
-    write_len(&artifact.join("journal.raw"), 4 * 1024 * 1024)?;
-    write_len(&artifact.join("outbox.raw"), 4 * 1024 * 1024)?;
+    write_len(&run_dir.join("journal.raw"), 4 * 1024 * 1024)?;
+    write_len(&run_dir.join("outbox.raw"), 4 * 1024 * 1024)?;
     Ok(())
 }
 
-fn build_schema8_fixture(
-    root: &Path,
-    git_repo: &Path,
-    image: &Image,
-    artifact: &Path,
-) -> Result<Vec<u8>> {
-    let source = artifact.join("schema8-source");
+fn build_schema8_fixture(root: &Path, image: &Image, run_dir: &Path) -> Result<Vec<u8>> {
+    let source = run_dir.join("schema8-source");
     fs::create_dir_all(&source)?;
     let archive = source.join("source.tar");
     let archive_file = File::create(&archive)?;
     let archive_status = Command::new("git")
-        .current_dir(git_repo)
+        .current_dir(root)
         .args(["archive", "--format=tar", FIXTURE_REVISION])
         .stdout(archive_file)
         .status()?;
@@ -719,7 +654,7 @@ fn build_schema8_fixture(
     ))?;
     header.extend(hex_bytes(&sha256_bytes(root, &header)?)?);
     header.resize(512, 0);
-    let journal = artifact.join("journal.raw");
+    let journal = run_dir.join("journal.raw");
     write_len(&journal, 4 * 1024 * 1024)?;
     let mut file = OpenOptions::new().write(true).open(&journal)?;
     file.seek(SeekFrom::Start(512))?;
@@ -727,9 +662,9 @@ fn build_schema8_fixture(
     file.seek(SeekFrom::Start(1024))?;
     file.write_all(&logical)?;
     file.sync_all()?;
-    fs::copy(&journal, artifact.join("schema8-negative-journal.raw"))?;
+    fs::copy(&journal, run_dir.join("schema8-negative-journal.raw"))?;
     fs::write(
-        artifact.join("schema8-negative-fixture.txt"),
+        run_dir.join("schema8-negative-fixture.txt"),
         format!(
             "nexus.cser.schema8-selected-fixture.v1\nprofile4_source_revision={FIXTURE_REVISION}\nprofile4_source_archive_sha256={FIXTURE_ARCHIVE_SHA256}\nprofile4_catalog_digest={FIXTURE_CATALOG}\nselected_revision=5\nselected_head={FIXTURE_HEAD}\nlogical_journal_sha256={FIXTURE_JOURNAL_SHA256}\n"
         ),
@@ -737,8 +672,8 @@ fn build_schema8_fixture(
     Ok(fs::read(&journal)?)
 }
 
-fn run_four_boots(root: &Path, image: &Image, artifact: &Path, catalog: &str) -> Result<()> {
-    let state = artifact.join("tpmstate");
+fn run_four_boots(root: &Path, image: &Image, run_dir: &Path, catalog: &str) -> Result<()> {
+    let state = run_dir.join("tpmstate");
     status(
         root,
         "bash",
@@ -754,7 +689,7 @@ fn run_four_boots(root: &Path, image: &Image, artifact: &Path, catalog: &str) ->
         capture(
             root,
             image,
-            artifact,
+            run_dir,
             &format!("boot{boot}"),
             "cser-production",
             90,
@@ -764,7 +699,7 @@ fn run_four_boots(root: &Path, image: &Image, artifact: &Path, catalog: &str) ->
     let mut markers = Vec::new();
     for boot in 1..=4 {
         markers.push(exact_marker(
-            &artifact.join(format!("boot{boot}-serial.log")),
+            &run_dir.join(format!("boot{boot}-serial.log")),
             &format!("CSER_CORE_PERSISTENT_BOOT{boot} PASS"),
             &["shared_runtime=true", "production_registry=single"],
         )?);
@@ -774,11 +709,11 @@ fn run_four_boots(root: &Path, image: &Image, artifact: &Path, catalog: &str) ->
     assert_dma_arena(
         &markers[0],
         &markers[2],
-        &fs::read_to_string(artifact.join("boot1-qemu-debug.log"))?,
-        &fs::read_to_string(artifact.join("boot3-qemu-debug.log"))?,
+        &fs::read_to_string(run_dir.join("boot1-qemu-debug.log"))?,
+        &fs::read_to_string(run_dir.join("boot3-qemu-debug.log"))?,
     )?;
     let traces = (1..=4)
-        .map(|boot| fs::read_to_string(artifact.join(format!("boot{boot}-qemu-debug.log"))))
+        .map(|boot| fs::read_to_string(run_dir.join(format!("boot{boot}-qemu-debug.log"))))
         .collect::<std::result::Result<Vec<_>, _>>()?;
     for (index, trace) in traces.iter().enumerate() {
         let boot = index + 1;
@@ -793,16 +728,16 @@ fn run_four_boots(root: &Path, image: &Image, artifact: &Path, catalog: &str) ->
 fn capture(
     root: &Path,
     image: &Image,
-    artifact: &Path,
+    run_dir: &Path,
     name: &str,
     scheme: &str,
     seconds: u32,
     production_tpm: bool,
 ) -> Result<()> {
-    let serial = format!("/work/artifacts/cser-production/{name}-serial.log");
-    let debug = format!("/work/artifacts/cser-production/{name}-qemu-debug.log");
+    let serial = format!("/work/target/nexus/system/{name}-serial.log");
+    let debug = format!("/work/target/nexus/system/{name}-qemu-debug.log");
     let mut host_tpm = if production_tpm {
-        Some(start_swtpm(artifact)?)
+        Some(start_swtpm(run_dir)?)
     } else {
         None
     };
@@ -833,30 +768,30 @@ impl Drop for Swtpm {
     }
 }
 
-fn start_swtpm(artifact: &Path) -> Result<Swtpm> {
-    let socket = artifact.join("swtpm-qemu.sock");
-    let pid = artifact.join("swtpm.pid");
+fn start_swtpm(run_dir: &Path) -> Result<Swtpm> {
+    let socket = run_dir.join("swtpm-qemu.sock");
+    let pid = run_dir.join("swtpm.pid");
     let _ = fs::remove_file(&socket);
     let _ = fs::remove_file(&pid);
-    let caps = output(artifact, "swtpm", &["socket", "--print-capabilities"])?;
+    let caps = output(run_dir, "swtpm", &["socket", "--print-capabilities"])?;
     let flags = if caps.contains("flags-opt-disable-auto-shutdown") {
         "not-need-init,startup-none,disable-auto-shutdown"
     } else {
         "not-need-init,startup-none"
     };
     let child = Command::new("swtpm")
-        .current_dir(artifact)
+        .current_dir(run_dir)
         .args([
             "socket",
             "--tpm2",
             "--tpmstate",
-            &format!("dir={}", artifact.join("tpmstate").display()),
+            &format!("dir={}", run_dir.join("tpmstate").display()),
             "--ctrl",
             &format!("type=unixio,path={}", socket.display()),
             "--flags",
             flags,
             "--log",
-            &format!("file={},level=20", artifact.join("swtpm.log").display()),
+            &format!("file={},level=20", run_dir.join("swtpm.log").display()),
             "--pid",
             &format!("file={}", pid.display()),
         ])
@@ -973,89 +908,6 @@ fn snapshot_tpm(root: &Path, state: &Path, output_path: &Path) -> Result<String>
     stop_swtpm(&mut daemon)?;
     fs::remove_dir_all(work)?;
     Ok(snapshot)
-}
-
-fn receipt(root: &Path, image: &Image, artifact: &Path, revision: &str) -> Result<SystemReceipt> {
-    let image_id = output(
-        root,
-        "docker",
-        &["image", "inspect", "--format", "{{.Id}}", &image.reference],
-    )?
-    .trim()
-    .to_string();
-    if !image_id.starts_with("sha256:") || !valid_hex(&image_id[7..], 64) {
-        return Err("Docker image id is malformed".into());
-    }
-    if !valid_hex(revision, 40) {
-        return Err("git revision is malformed".into());
-    }
-    let mut locks = BTreeMap::new();
-    for (name, path) in [
-        ("workspace", root.join("Cargo.lock")),
-        ("kernel", root.join(KERNEL).join("Cargo.lock")),
-        (
-            "runner",
-            root.join(KERNEL).join("osdk-runner-base/Cargo.lock"),
-        ),
-        ("osdk", root.join(KERNEL).join("OSDK.toml")),
-    ] {
-        locks.insert(name.into(), sha256(root, &path)?);
-    }
-    Ok(SystemReceipt {
-        pass_summaries: vec![
-            "PIO journal ktest PASS".into(),
-            "schema8 predecessor boot rejected fail-closed with all provisioned TPM NV payloads unchanged PASS".into(),
-            "focused reply recovery PASS".into(),
-            "focused DMA pre-escape fail-closed unsupported PASS".into(),
-            "four shared-media production boots PASS".into(),
-        ],
-        rustc_commit: image.rustc_commit.clone(),
-        rustc_dist_date: image.rustc_dist_date.clone(),
-        rustc_date: image.rustc_date.clone(),
-        image_id,
-        lock_hashes: locks,
-        git_revision: revision.into(),
-        raw_tree_sha256: tree_hash(root, artifact)?,
-    })
-}
-
-fn write_complete_receipt(artifact: &Path, receipt: &SystemReceipt) -> Result<()> {
-    if fs::read(artifact.join("INCOMPLETE"))? != b"INCOMPLETE\n" {
-        return Err("raw seal has no active incomplete marker".into());
-    }
-    let mut text = String::from("nexus.cser.production-receipt.v2\nresult=PASS\n");
-    for summary in &receipt.pass_summaries {
-        text.push_str("summary=");
-        text.push_str(summary);
-        text.push('\n');
-    }
-    text.push_str(&format!(
-        "rustc_commit={}\nrustc_dist_date={}\nrustc_date={}\nimage_id={}\ngit_revision={}\nraw_tree_sha256={}\n",
-        receipt.rustc_commit,
-        receipt.rustc_dist_date,
-        receipt.rustc_date,
-        receipt.image_id,
-        receipt.git_revision,
-        receipt.raw_tree_sha256
-    ));
-    for (name, digest) in &receipt.lock_hashes {
-        text.push_str(&format!("lock_{name}_sha256={digest}\n"));
-    }
-    atomic_write(&artifact.join("combined-receipt.txt"), text.as_bytes())?;
-    let digest = sha256(artifact, &artifact.join("combined-receipt.txt"))?;
-    atomic_write(
-        &artifact.join("combined-receipt.sha256"),
-        format!("{digest}  combined-receipt.txt\n").as_bytes(),
-    )?;
-    if sha256(artifact, &artifact.join("combined-receipt.txt"))? != digest
-        || tree_hash(artifact, artifact)? != receipt.raw_tree_sha256
-    {
-        return Err("raw seal receipt or evidence tree changed before completion".into());
-    }
-    atomic_write(&artifact.join("COMPLETE"), b"COMPLETE\n")?;
-    fs::remove_file(artifact.join("INCOMPLETE"))?;
-    File::open(artifact)?.sync_all()?;
-    Ok(())
 }
 
 fn container(root: &Path, image: &Image, command: &str, host_socket: bool) -> Result<()> {
@@ -1578,15 +1430,6 @@ fn number(marker: &str, field: &str) -> Result<u64> {
     Ok(values[0].parse()?)
 }
 
-fn git_revision(root: &Path) -> Result<String> {
-    let revision = output(root, "git", &["rev-parse", "--verify", "HEAD"])?
-        .trim()
-        .to_string();
-    if !valid_hex(&revision, 40) {
-        return Err("git revision is malformed".into());
-    }
-    Ok(revision)
-}
 fn script(root: &Path, name: &str) -> Result<PathBuf> {
     let path = root.join(KERNEL).join("scripts").join(name);
     if !path.is_file() || fs::symlink_metadata(&path)?.file_type().is_symlink() {
@@ -1598,8 +1441,8 @@ fn script(root: &Path, name: &str) -> Result<PathBuf> {
     }
     Ok(path)
 }
-fn artifact_dir(root: &Path) -> PathBuf {
-    root.join(ARTIFACTS)
+fn system_output(root: &Path) -> PathBuf {
+    root.join(SYSTEM_OUTPUT)
 }
 fn write_len(path: &Path, length: u64) -> Result<()> {
     let file = File::create(path)?;
@@ -1629,26 +1472,6 @@ fn copy_tree(from: &Path, to: &Path) -> Result<()> {
     }
     Ok(())
 }
-fn tree_hash(root: &Path, dir: &Path) -> Result<String> {
-    let mut files = Vec::new();
-    collect_files(dir, &mut files)?;
-    files.sort();
-    let mut material = Vec::new();
-    for file in files {
-        let relative = file.strip_prefix(dir)?;
-        if matches!(
-            relative.to_str(),
-            Some("INCOMPLETE" | "COMPLETE" | "combined-receipt.txt" | "combined-receipt.sha256")
-        ) {
-            continue;
-        }
-        material.extend_from_slice(relative.as_os_str().as_encoded_bytes());
-        material.push(0);
-        material.extend_from_slice(sha256(root, &file)?.as_bytes());
-        material.push(0);
-    }
-    sha256_bytes(root, &material)
-}
 fn runner_controls(root: &Path, runner: &Path) -> Result<String> {
     let mut bytes = Vec::new();
     for relative in ["Cargo.toml", "Cargo.lock", "src/main.rs"] {
@@ -1659,25 +1482,6 @@ fn runner_controls(root: &Path, runner: &Path) -> Result<String> {
         bytes.push(0);
     }
     sha256_bytes(root, &bytes)
-}
-fn collect_files(current: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
-    for entry in fs::read_dir(current)? {
-        let entry = entry?;
-        let kind = entry.file_type()?;
-        if kind.is_symlink() {
-            return Err(format!(
-                "raw artifact tree contains a symlink: {}",
-                entry.path().display()
-            )
-            .into());
-        }
-        if kind.is_dir() {
-            collect_files(&entry.path(), out)?;
-        } else if kind.is_file() {
-            out.push(entry.path());
-        }
-    }
-    Ok(())
 }
 fn sha256(root: &Path, path: &Path) -> Result<String> {
     let path = path.to_str().ok_or("non-utf8 hash input")?;
@@ -1749,16 +1553,6 @@ fn valid_date(value: &str) -> bool {
             .bytes()
             .enumerate()
             .all(|(i, b)| matches!(i, 4 | 7) || b.is_ascii_digit())
-}
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
-    {
-        let mut file = File::create(&temporary)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-    }
-    fs::rename(&temporary, path)?;
-    Ok(())
 }
 fn status(root: &Path, program: &str, args: &[&str]) -> Result<()> {
     command_output(

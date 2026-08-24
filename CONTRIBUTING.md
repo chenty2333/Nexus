@@ -14,7 +14,7 @@ status file outside `maproom/`.
 Use only this interface:
 
 ```text
-cargo nexus {check,test,kernel,system,seal,clean}
+cargo nexus {check,test,kernel,system,clean}
 ```
 
 | Command | Purpose |
@@ -23,9 +23,7 @@ cargo nexus {check,test,kernel,system,seal,clean}
 | `cargo nexus test` | Run endpoint/provider reference tests plus portable core and model tests. |
 | `cargo nexus kernel` | Validate and build the OSTD kernel in the exact image. |
 | `cargo nexus system` | Exercise ATA PIO persistence, focused reply recovery, the DMA IRQ fail-closed gate, predecessor rejection, and four persistent QEMU boots. |
-| `cargo nexus seal` | From a clean Git snapshot, run the same system path and create the public sanitized receipt. |
-| `cargo nexus clean` | Remove build output but retain raw system artifacts for local inspection. |
-| `cargo nexus clean --raw` | Explicitly remove the raw system artifacts as well. |
+| `cargo nexus clean` | Remove build output and temporary system-run state. |
 
 The root Cargo workspace uses its rolling `nightly`. xtask reads the local
 rustup toolchain manifest for its release date, builds or verifies the matching
@@ -60,10 +58,7 @@ evidence automatically. Do not edit an immutable bundle to describe newer
 code.
 
 Raw operation/effect/resource identities, databases, logs, media, TPM state,
-absolute paths, container identifiers, and keys are not public evidence. A
-successful `cargo nexus seal` records the dist date plus the verified `rustc`
-commit date and hash, and publishes only the sanitized receipt and checksum
-under `target/nexus/public/`; it does not upload raw artifacts.
+absolute paths, container identifiers, and keys are not public evidence.
 
 Maproom maintenance is user-directed. Update terrain, basecamp, route, or
 hazards only when the user requests the relevant change. Keep general

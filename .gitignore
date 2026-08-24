@@ -10,7 +10,6 @@
 **/*.pyc
 
 # OSDK/QEMU outputs
-kernel/nexus-ostd/artifacts/
 kernel/nexus-ostd/guest/*.bin
 
 # Local agent/editor control files

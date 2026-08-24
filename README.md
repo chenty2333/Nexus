@@ -45,7 +45,7 @@ reference tests remain host-side tests of the trusted-local reference path.
 The only supported developer interface is:
 
 ```text
-cargo nexus {check,test,kernel,system,seal,clean}
+cargo nexus {check,test,kernel,system,clean}
 ```
 
 The root workspace follows the rolling `nightly` selected by
@@ -60,14 +60,7 @@ the kernel image tied to the compiler actually invoking the front door.
 | `cargo nexus test` | Run endpoint/provider reference tests and portable core/model tests. |
 | `cargo nexus kernel` | Check and build the OSTD kernel through the exact image. |
 | `cargo nexus system` | Run ATA PIO, focused reply recovery, the DMA IRQ fail-closed gate, predecessor rejection, and four persistent QEMU boots. |
-| `cargo nexus seal` | Require a clean Git snapshot, run the same system path, and publish a sanitized receipt. |
-| `cargo nexus clean` | Clean build output while preserving raw system artifacts. |
-| `cargo nexus clean --raw` | Also remove raw system artifacts. |
-
-`seal` records the dist date plus the verified `rustc` commit date and hash,
-then writes only the sanitized receipt and checksum to `target/nexus/public/`;
-raw journals, logs, media, and TPM-fixture state stay local and are not
-uploaded.
+| `cargo nexus clean` | Remove build output and temporary system-run state. |
 
 ## Build boundaries
 
