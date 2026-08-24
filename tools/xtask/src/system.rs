@@ -321,37 +321,53 @@ fn assert_runner_unchanged(root: &Path, runner: &Path, before: &str) -> Result<(
 }
 
 fn run_pio_ktest(root: &Path, image: &Image) -> Result<()> {
+    const GATES: [(&str, u64); 5] = [
+        ("cser_pio_journal_format_gate", 180),
+        ("cser_pio_journal_recovery_gate", 180),
+        ("cser_pio_journal_vnext_checkpoint_gate", 180),
+        ("cser_pio_journal_vnext_recovery_gate", 180),
+        ("cser_pio_journal_vnext_compaction_gate", 180),
+    ];
+
     let runner_before = prepare_runner(root)?;
     let runner = root.join(KERNEL).join("target/osdk/nexus-kernel-run-base");
-    let result = container_output(
-        root,
-        image,
-        "cd /work; cp /root/ovmf/release/OVMF_VARS.fd \"$HOME/OVMF_VARS.fd\"; timeout --signal=TERM --kill-after=2s 300s cargo osdk test --scheme cser-pio-journal-ktest cser_pio_journal_gate",
-        false,
-    );
-    let runner_result = assert_runner_unchanged(root, &runner, &runner_before);
-    let out = result?;
-    runner_result?;
-    let clean = out.replace('\r', "");
-    let test_passes = clean
+    for (gate, timeout_seconds) in GATES {
+        let command = format!(
+            "cd /work; cp /root/ovmf/release/OVMF_VARS.fd \"$HOME/OVMF_VARS.fd\"; timeout --signal=TERM --kill-after=2s {timeout_seconds}s cargo osdk test --scheme cser-pio-journal-ktest {gate}"
+        );
+        let result = container_output(root, image, &command, false);
+        let runner_result = assert_runner_unchanged(root, &runner, &runner_before);
+        let out = result?;
+        runner_result?;
+        let clean = out.replace('\r', "");
+        if !pio_gate_passed(&clean, gate) {
+            return Err(format!("PIO journal ktest gate {gate} did not report one pass").into());
+        }
+    }
+    Ok(())
+}
+
+fn pio_gate_passed(output: &str, gate: &str) -> bool {
+    let prefix = "test nexus_kernel::core_pio_journal::tests::cser_pio_journal_";
+    let expected = format!("test nexus_kernel::core_pio_journal::tests::{gate} ...");
+    let reports = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with(prefix))
+        .collect::<Vec<_>>();
+    let summaries = output
         .lines()
         .filter(|line| {
-            line.contains("test nexus_kernel::core_pio_journal::tests::cser_pio_journal_gate")
+            line.contains("test result:")
+                && line.contains(". 1 passed; 0 failed;")
                 && !line.contains("FAILED")
         })
         .count();
-    let summaries = clean
-        .lines()
-        .filter(|line| line.contains("test result: ok. 1 passed; 0 failed"))
-        .count();
-    if test_passes != 1
-        || summaries != 1
-        || clean.contains("cser_pio_journal_gate ... FAILED")
-        || clean.contains("test result: FAILED")
-    {
-        return Err("PIO journal ktest did not report its single passing gate".into());
-    }
-    Ok(())
+    reports.len() == 1
+        && reports[0].starts_with(&expected)
+        && !reports[0].contains("FAILED")
+        && summaries == 1
+        && !output.contains("test result: FAILED")
 }
 
 fn prepare_system_output(run_dir: &Path) -> Result<()> {
@@ -1637,6 +1653,26 @@ mod tests {
         .to_string();
         assert!(error.contains("stdout:\nguest-progress"));
         assert!(error.contains("stderr:\nguest-error"));
+    }
+
+    #[test]
+    fn pio_gate_result_requires_one_exact_pass_and_summary() {
+        let gate = "cser_pio_journal_format_gate";
+        let pass = "test nexus_kernel::core_pio_journal::tests::cser_pio_journal_format_gate ... \u{1b}[32mok\u{1b}[39m\ntest result: \u{1b}[32mok\u{1b}[39m. 1 passed; 0 failed; 0 ignored";
+        assert!(pio_gate_passed(pass, gate));
+        assert!(!pio_gate_passed(&format!("{pass}\n{pass}"), gate));
+        assert!(!pio_gate_passed(
+            "test nexus_kernel::core_pio_journal::tests::cser_pio_journal_recovery_gate ... ok\ntest result: ok. 1 passed; 0 failed",
+            gate
+        ));
+        assert!(!pio_gate_passed(
+            "test nexus_kernel::core_pio_journal::tests::cser_pio_journal_format_gate ... FAILED\ntest result: FAILED. 0 passed; 1 failed",
+            gate
+        ));
+        assert!(!pio_gate_passed(
+            "test nexus_kernel::core_pio_journal::tests::cser_pio_journal_format_gate ... ok\ntest result: ok. 11 passed; 0 failed; 0 filtered out",
+            gate
+        ));
     }
 
     #[test]
