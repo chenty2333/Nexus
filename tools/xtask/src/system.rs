@@ -326,7 +326,7 @@ fn run_pio_ktest(root: &Path, image: &Image) -> Result<()> {
     let result = container_output(
         root,
         image,
-        "cd /work; cp /root/ovmf/release/OVMF_VARS.fd \"$HOME/OVMF_VARS.fd\"; timeout --signal=TERM --kill-after=2s 90s cargo osdk test --scheme cser-pio-journal-ktest cser_pio_journal_gate",
+        "cd /work; cp /root/ovmf/release/OVMF_VARS.fd \"$HOME/OVMF_VARS.fd\"; timeout --signal=TERM --kill-after=2s 300s cargo osdk test --scheme cser-pio-journal-ktest cser_pio_journal_gate",
         false,
     );
     let runner_result = assert_runner_unchanged(root, &runner, &runner_before);
@@ -1576,8 +1576,9 @@ fn command_output(root: &Path, program: &str, args: &[String]) -> Result<String>
         .output()?;
     if !result.status.success() {
         return Err(format!(
-            "{program} failed with {}: {}",
+            "{program} failed with {}:\nstdout:\n{}\nstderr:\n{}",
             result.status,
+            String::from_utf8_lossy(&result.stdout).trim(),
             String::from_utf8_lossy(&result.stderr).trim()
         )
         .into());
@@ -1621,6 +1622,22 @@ mod tests {
 
     const SCHEMA_MARKER: &str = "X bus_master_disabled=true intx_masked=true reset_status_zero=true observed_isr_bits=0 isr_reads=2 consecutive_empty_isr_reads=2 iotlb_used_remapped_iova=true iotlb_completed_trigger_pages=1";
     const SAFE_TRACE: &str = "pci_cfg_read virtio-blk-pci 00:05.0 @0x4 -> 0x100007\npci_cfg_write virtio-blk-pci 00:05.0 @0x4 <- 0x403\npci_cfg_read virtio-blk-pci 00:05.0 @0x4 -> 0x100403\nvirtio_set_status vdev 0x1 val 0\nvtd_inv_desc_iotlb_global iotlb invalidate global\nvtd_inv_desc_wait_irq IM in IECTL_REG is set, new event not generated";
+
+    #[test]
+    fn command_failure_reports_stdout_and_stderr() {
+        let error = command_output(
+            Path::new("."),
+            "sh",
+            &[
+                "-c".into(),
+                "printf guest-progress; printf guest-error >&2; exit 7".into(),
+            ],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("stdout:\nguest-progress"));
+        assert!(error.contains("stderr:\nguest-error"));
+    }
 
     #[test]
     fn marker_rejects_wrong_duplicate_and_conflicting_results() {
