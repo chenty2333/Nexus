@@ -534,7 +534,7 @@ fn catalog_digest(root: &Path, image: &Image) -> Result<String> {
     // The image's Cargo home patches OSTD and virtio-drivers for kernel builds.
     // Keep those patches out of the portable workspace while reusing the
     // image's offline registry and Git caches.
-    let digest = container_output(
+    let output = container_output(
         root,
         image,
         &format!(
@@ -546,11 +546,9 @@ fn catalog_digest(root: &Path, image: &Image) -> Result<String> {
         ),
         false,
     )?;
-    let digest = digest.trim().to_string();
-    if !valid_hex(&digest, 64) {
-        return Err("cser-catalog-digest returned malformed output".into());
-    }
-    Ok(digest)
+    unique_output_line(&output, |line| valid_hex(line, 64))
+        .map(str::to_owned)
+        .ok_or_else(|| "cser-catalog-digest returned no unique digest".into())
 }
 
 fn schema8_negative_boot(root: &Path, image: &Image, run_dir: &Path, catalog: &str) -> Result<()> {
@@ -681,14 +679,22 @@ fn build_schema8_fixture(root: &Path, image: &Image, run_dir: &Path) -> Result<V
         .to_str()
         .ok_or("non-utf8 source")?;
     let logical_rel = format!("{source_rel}/profile4.journal");
-    let origin = container_output(
+    container(
         root,
         image,
         &format!(
             "{PORTABLE_CARGO_SETUP} cd /work/{source_rel}; \
              CARGO_HOME={PORTABLE_CARGO_HOME} \
              CARGO_TARGET_DIR=/tmp/nexus-schema8-target \
-             cargo generate-lockfile --offline --manifest-path Cargo.toml; \
+             cargo generate-lockfile --offline --manifest-path Cargo.toml"
+        ),
+        false,
+    )?;
+    let origin = container_output(
+        root,
+        image,
+        &format!(
+            "{PORTABLE_CARGO_SETUP} cd /work/{source_rel}; \
              CARGO_HOME={PORTABLE_CARGO_HOME} \
              CARGO_TARGET_DIR=/tmp/nexus-schema8-target \
              cargo run --offline -q --locked --manifest-path Cargo.toml \
@@ -697,8 +703,21 @@ fn build_schema8_fixture(root: &Path, image: &Image, run_dir: &Path) -> Result<V
         ),
         false,
     )?;
-    if origin.trim() != format!("5 {FIXTURE_HEAD}") {
-        return Err("pinned predecessor encoder returned wrong coordinates".into());
+    let expected_origin = format!("5 {FIXTURE_HEAD}");
+    let origin_coordinate = unique_output_line(&origin, |line| {
+        let mut fields = line.split_whitespace();
+        fields
+            .next()
+            .is_some_and(|revision| revision.bytes().all(|byte| byte.is_ascii_digit()))
+            && fields.next().is_some_and(|head| valid_hex(head, 64))
+            && fields.next().is_none()
+    });
+    if origin_coordinate != Some(expected_origin.as_str()) {
+        return Err(format!(
+            "pinned predecessor encoder returned wrong coordinates: {:?}",
+            origin.trim()
+        )
+        .into());
     }
     let catalog = container_output(
         root,
@@ -712,8 +731,9 @@ fn build_schema8_fixture(root: &Path, image: &Image, run_dir: &Path) -> Result<V
         ),
         false,
     )?;
-    if catalog.trim() != FIXTURE_CATALOG {
-        return Err("pinned predecessor catalog differs".into());
+    let catalog_digest = unique_output_line(&catalog, |line| valid_hex(line, 64));
+    if catalog_digest != Some(FIXTURE_CATALOG) {
+        return Err(format!("pinned predecessor catalog differs: {:?}", catalog.trim()).into());
     }
     let logical = fs::read(source.join("profile4.journal"))?;
     if logical.len() != 1289
@@ -1609,6 +1629,11 @@ fn hex_bytes(value: &str) -> Result<Vec<u8>> {
 fn valid_hex(value: &str, len: usize) -> bool {
     value.len() == len && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
+fn unique_output_line(output: &str, accept: impl Fn(&str) -> bool) -> Option<&str> {
+    let mut lines = output.lines().map(str::trim).filter(|line| accept(line));
+    let line = lines.next()?;
+    lines.next().is_none().then_some(line)
+}
 fn valid_date(value: &str) -> bool {
     value.len() == 10
         && value.as_bytes()[4] == b'-'
@@ -1701,6 +1726,21 @@ mod tests {
         .to_string();
         assert!(error.contains("stdout:\nguest-progress"));
         assert!(error.contains("stderr:\nguest-error"));
+    }
+
+    #[test]
+    fn scalar_output_ignores_diagnostics_and_rejects_ambiguity() {
+        let digest = "a".repeat(64);
+        let other = "b".repeat(64);
+        let noisy = format!("{digest}\nLocking 71 packages to latest compatible versions\n");
+        assert_eq!(
+            unique_output_line(&noisy, |line| valid_hex(line, 64)),
+            Some(digest.as_str())
+        );
+        assert!(
+            unique_output_line(&format!("{digest}\n{other}\n"), |line| valid_hex(line, 64))
+                .is_none()
+        );
     }
 
     #[test]
