@@ -24,6 +24,10 @@ const FIXTURE_HEAD: &str = "21442cc39e8704bf2fdfa860053cb40aab3c88779d8efd1ea7a3
 const FIXTURE_JOURNAL_SHA256: &str =
     "b3156d2dcbb622c6a12a8e155fc398357bbf1151b01834e1c7549fffc53bc898";
 const RUNTIME_FS_SHA256: &str = "9357413ed9a96a23af1750cc304265dd7dd1835eb58eb1fb50119cd80d0bc8ca";
+const PORTABLE_CARGO_HOME: &str = "/tmp/nexus-portable-cargo";
+const PORTABLE_CARGO_SETUP: &str = "mkdir -p /tmp/nexus-portable-cargo; \
+     ln -s /root/.cargo/registry /tmp/nexus-portable-cargo/registry; \
+     ln -s /root/.cargo/git /tmp/nexus-portable-cargo/git;";
 
 pub(crate) fn build(root: &Path) -> Result<()> {
     let _lock = SystemLock::acquire(root)?;
@@ -527,10 +531,19 @@ fn assert_dma_irq_unsupported(serial: &str, trace: &str) -> Result<()> {
 }
 
 fn catalog_digest(root: &Path, image: &Image) -> Result<String> {
+    // The image's Cargo home patches OSTD and virtio-drivers for kernel builds.
+    // Keep those patches out of the portable workspace while reusing the
+    // image's offline registry and Git caches.
     let digest = container_output(
         root,
         image,
-        "cd /repo && CARGO_TARGET_DIR=/tmp/nexus-catalog-target cargo run --offline -q --locked --manifest-path Cargo.toml -p cser-core --features std --bin cser-catalog-digest",
+        &format!(
+            "{PORTABLE_CARGO_SETUP} cd /repo; \
+             CARGO_HOME={PORTABLE_CARGO_HOME} \
+             CARGO_TARGET_DIR=/tmp/nexus-catalog-target \
+             cargo run --offline -q --locked --manifest-path Cargo.toml \
+             -p cser-core --features std --bin cser-catalog-digest"
+        ),
         false,
     )?;
     let digest = digest.trim().to_string();
@@ -672,7 +685,15 @@ fn build_schema8_fixture(root: &Path, image: &Image, run_dir: &Path) -> Result<V
         root,
         image,
         &format!(
-            "cd /work/{source_rel}; CARGO_TARGET_DIR=/tmp/nexus-schema8-target cargo generate-lockfile --offline --manifest-path Cargo.toml; CARGO_TARGET_DIR=/tmp/nexus-schema8-target cargo run --offline -q --locked --manifest-path Cargo.toml -p cser-core --features std --bin cser-restart-fixture -- origin /work/{logical_rel}"
+            "{PORTABLE_CARGO_SETUP} cd /work/{source_rel}; \
+             CARGO_HOME={PORTABLE_CARGO_HOME} \
+             CARGO_TARGET_DIR=/tmp/nexus-schema8-target \
+             cargo generate-lockfile --offline --manifest-path Cargo.toml; \
+             CARGO_HOME={PORTABLE_CARGO_HOME} \
+             CARGO_TARGET_DIR=/tmp/nexus-schema8-target \
+             cargo run --offline -q --locked --manifest-path Cargo.toml \
+             -p cser-core --features std --bin cser-restart-fixture \
+             -- origin /work/{logical_rel}"
         ),
         false,
     )?;
@@ -683,7 +704,11 @@ fn build_schema8_fixture(root: &Path, image: &Image, run_dir: &Path) -> Result<V
         root,
         image,
         &format!(
-            "cd /work/{source_rel}; cargo run --offline -q --locked --manifest-path Cargo.toml -p cser-core --features std --bin cser-catalog-digest"
+            "{PORTABLE_CARGO_SETUP} cd /work/{source_rel}; \
+             CARGO_HOME={PORTABLE_CARGO_HOME} \
+             CARGO_TARGET_DIR=/tmp/nexus-schema8-target \
+             cargo run --offline -q --locked --manifest-path Cargo.toml \
+             -p cser-core --features std --bin cser-catalog-digest"
         ),
         false,
     )?;
