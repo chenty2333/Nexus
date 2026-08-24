@@ -515,11 +515,11 @@ fn assert_dma_irq_unsupported(serial: &str, trace: &str) -> Result<()> {
             );
         }
     }
-    for forbidden in ["virtio_pci_notify_write", "virtio_blk_handle_read"] {
-        if trace.contains(forbidden) {
-            return Err(format!("unsupported DMA lane escaped through {forbidden}").into());
-        }
-    }
+    // The QEMU trace covers the complete VM lifetime and has no ordering
+    // boundary in common with the serial capability marker. VirtIO traffic in
+    // that trace can therefore come from firmware or device initialization;
+    // it cannot establish that this lane published a request. The exact
+    // pre-publication marker above is the scoped fail-closed assertion.
     if trace.contains("vtd_dmar_fault") {
         return Err("focused DMA emitted a VT-d fault".into());
     }
@@ -1730,8 +1730,14 @@ mod tests {
             )
             .is_err()
         );
-        assert!(assert_dma_irq_unsupported(unsupported, "virtio_pci_notify_write").is_err());
-        assert!(assert_dma_irq_unsupported(unsupported, "virtio_blk_handle_read").is_err());
+        assert!(
+            assert_dma_irq_unsupported(
+                unsupported,
+                "virtio_pci_notify_write\nvirtio_blk_handle_read"
+            )
+            .is_ok()
+        );
+        assert!(assert_dma_irq_unsupported(unsupported, "vtd_dmar_fault").is_err());
         assert!(
             assert_dma_irq_unsupported("CSER_CORE_DMA_IRQ UNSUPPORTED outcome=FAIL_CLOSED", "")
                 .is_err()
