@@ -5283,8 +5283,13 @@ mod tests {
 
     #[ktest]
     fn pio_vnext_streaming_checkpoint_crosses_segments_without_image_cache() {
-        let plan = streaming_checkpoint_plan(320);
-        assert!(plan.record_len() + VNEXT_FRAME_HEADER > VNEXT_SEGMENT_CAPACITY);
+        // With the standard catalog, 157 providers fill exactly one physical
+        // segment after framing and sector alignment.  The next provider is
+        // therefore the smallest fixture that exercises cross-segment writes.
+        let plan = streaming_checkpoint_plan(158);
+        let framed_len = plan.record_len() + VNEXT_FRAME_HEADER;
+        let stored_len = framed_len.div_ceil(SECTOR_BYTES) * SECTOR_BYTES;
+        assert_eq!(stored_len.div_ceil(VNEXT_SEGMENT_CAPACITY), 2);
         let mut expected = Vec::new();
         let written = plan.write_to(&mut expected).expect("encode expected plan");
         assert_eq!(written, plan.record_len());
