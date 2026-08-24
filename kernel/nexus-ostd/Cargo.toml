@@ -12,7 +12,7 @@ default = ["cser-production"]
 cser-production = ["dep:nexus-ostd-virtio", "dep:osdk-frame-allocator"]
 cser-core-reply-recovery = ["cser-core/test-support"]
 cser-core-dma-recovery = ["dep:nexus-ostd-virtio", "cser-core/test-support"]
-cser-pio-journal-ktest = []
+cser-pio-journal-ktest = ["cser-core/test-support"]
 
 [dependencies]
 cser-core = { path = "../../crates/cser-core", default-features = false }
