@@ -22,8 +22,6 @@ qemu.args = """\
     -monitor none \
     -chardev stdio,id=serial0,signal=off \
     -serial chardev:serial0 \
-    -chardev file,id=entry-debugcon,path=/work/target/nexus/system/task-entry-debugcon.log \
-    -device isa-debugcon,iobase=0xe9,chardev=entry-debugcon \
     -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
     -device intel-iommu,intremap=on,caching-mode=on,dma-drain=on \
     -blockdev driver=file,filename=/opt/nexus-fixtures/runtime-fs-block.raw,node-name=nexusfs-file,read-only=on,auto-read-only=off \
@@ -70,8 +68,6 @@ qemu.args = """\
     -monitor none \
     -chardev stdio,id=serial0,signal=off \
     -serial chardev:serial0 \
-    -chardev file,id=entry-debugcon,path=/work/target/nexus/system/reply-evidence-task-entry-debugcon.log \
-    -device isa-debugcon,iobase=0xe9,chardev=entry-debugcon \
     -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
     -drive if=pflash,format=raw,unit=0,readonly=on,file=/root/ovmf/release/OVMF.fd \
     -drive if=pflash,format=raw,unit=1,file=/tmp/nexus-home/OVMF_VARS.fd \
@@ -112,8 +108,6 @@ qemu.args = """\
     -monitor none \
     -chardev stdio,id=serial0,signal=off \
     -serial chardev:serial0 \
-    -chardev file,id=entry-debugcon,path=/work/target/nexus/system/dma-evidence-task-entry-debugcon.log \
-    -device isa-debugcon,iobase=0xe9,chardev=entry-debugcon \
     -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
     -device intel-iommu,intremap=on,caching-mode=on,dma-drain=on \
     -blockdev driver=file,filename=/opt/nexus-fixtures/runtime-fs-block.raw,node-name=nexusfs-file,read-only=on,auto-read-only=off \

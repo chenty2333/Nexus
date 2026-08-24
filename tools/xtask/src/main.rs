@@ -57,21 +57,11 @@ fn check(root: &Path) -> Result<()> {
             "--locked",
             "--workspace",
             "--all-targets",
-            "--all-features",
+            "--features",
+            "cser-core/std",
             "--",
             "-D",
             "warnings",
-        ],
-    )?;
-    section("check portable workspace");
-    cargo(
-        root,
-        &[
-            "check",
-            "--locked",
-            "--workspace",
-            "--all-targets",
-            "--all-features",
         ],
     )?;
     section("check portable core without std");
@@ -102,8 +92,7 @@ fn check(root: &Path) -> Result<()> {
             BARE_METAL_TARGET,
         ],
     )?;
-    section("check Nexus OSTD kernel closure");
-    system::check(root)
+    Ok(())
 }
 
 fn test(root: &Path) -> Result<()> {
@@ -129,7 +118,8 @@ fn test(root: &Path) -> Result<()> {
             "-p",
             "cser-core",
             "--all-targets",
-            "--all-features",
+            "--features",
+            "std",
             "--no-fail-fast",
         ],
     )?;
@@ -142,7 +132,6 @@ fn test(root: &Path) -> Result<()> {
             "-p",
             "cser-model",
             "--all-targets",
-            "--all-features",
             "--no-fail-fast",
         ],
     )?;

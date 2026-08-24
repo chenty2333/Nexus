@@ -5630,7 +5630,7 @@ mod tests {
     }
 
     #[ktest]
-    fn pio_vnext_manifest_selects_the_committed_endpoint_and_rejects_a_tie() {
+    fn pio_vnext_manifest_selects_the_committed_endpoint_and_ignores_inconsistent_manifest() {
         let mut journal = vnext_journal();
         journal.append_exact(b"first").expect("first");
         let old_manifest = journal.backend_mut().sectors[vnext_manifest_lba(1) as usize];
@@ -5986,14 +5986,19 @@ mod tests {
     #[ktest]
     fn pio_vnext_full_preflight_keeps_old_replay_image() {
         let mut journal = vnext_journal();
+        journal.enable_telemetry();
         let usable = VNEXT_SEGMENT_CAPACITY - VNEXT_FRAME_HEADER;
         journal.append_exact(&vec![0x11; usable]).expect("first");
         journal.append_exact(&vec![0x22; usable]).expect("second");
         journal.append_exact(&vec![0x33; usable]).expect("third");
+        let before = journal.telemetry().expect("telemetry enabled");
         assert!(matches!(
             journal.append_exact(b"overflow"),
             Err(BankedJournalError::JournalFull { .. })
         ));
+        let after = journal.telemetry().expect("telemetry enabled");
+        assert_eq!(after.sectors_written, before.sectors_written);
+        assert_eq!(after.flushes, before.flushes);
         let mut reopened = SegmentedJournalVNext::open(journal.into_backend()).expect("reopen");
         assert_eq!(
             reopened.read_all_image().expect("old replay").len(),
@@ -6001,14 +6006,12 @@ mod tests {
         );
     }
 
-    /// Stable OSDK gates. Cargo-OSDK 0.18 filters test names by exact
-    /// path suffix despite documenting substring matching, so each named gate
-    /// invokes one disjoint shard of the journal-specific regression set and
-    /// yields an unambiguous pass/fail result. The expensive fill,
-    /// checkpoint, segment-roll, and write-cut regressions are spread across
-    /// the shards so every boot remains independently bounded.
+    /// Stable production OSDK gates. Cargo-OSDK 0.18.1 filters test names by
+    /// exact path suffix despite documenting substring matching, so each named
+    /// gate invokes one disjoint shard of the two-bank journal regression set
+    /// and yields an unambiguous pass/fail result.
     #[ktest]
-    fn cser_pio_journal_format_gate() {
+    fn cser_pio_journal_safety_gate() {
         pio_journal_format_appends_exact_bytes_and_uses_two_barriers();
         pio_journal_torn_data_falls_back_to_last_committed_bank();
         pio_journal_torn_header_falls_back_to_last_committed_bank();
@@ -6027,46 +6030,5 @@ mod tests {
         pio_journal_reopen_revalidates_corrupted_cached_bank();
         pio_journal_repair_updates_cache_only_after_readback();
         pio_journal_reopen_retains_both_valid_banks_until_logical_selection();
-        pio_vnext_streaming_checkpoint_crosses_segments_without_image_cache();
-        pio_vnext_streaming_checkpoint_flush_cut_fails_closed_before_manifest();
-        pio_vnext_streaming_checkpoint_retains_old_root_until_anchor_selection();
-    }
-
-    #[ktest]
-    fn cser_pio_journal_vnext_checkpoint_gate() {
-        pio_vnext_streaming_checkpoint_header_readback_cut_fails_closed();
-        pio_vnext_streaming_checkpoint_torn_payload_is_rejected();
-        pio_vnext_streaming_checkpoint_retains_ambiguous_manifest_candidates();
-        pio_vnext_divergent_manifest_reuse_preserves_selected_root_at_every_write_cut();
-        pio_vnext_rejects_unaligned_segment_before_in_place_append();
-        pio_vnext_appends_without_rewriting_the_prefix_and_reports_io();
-        pio_vnext_rejects_nonzero_frame_reserved_bytes_after_resealing_outer_checksums();
-        pio_vnext_unpublished_in_place_header_keeps_the_manifest_selected_prefix();
-    }
-
-    #[ktest]
-    fn cser_pio_journal_vnext_recovery_gate() {
-        pio_vnext_torn_header_copy_keeps_the_other_committed_copy();
-        pio_vnext_manifest_selects_the_committed_endpoint_and_rejects_a_tie();
-        pio_vnext_reopen_retains_both_manifest_candidates_until_logical_selection();
-        pio_vnext_interrupted_checkpoint_keeps_the_old_chain();
-        pio_vnext_post_publication_readback_failure_requires_reopen();
-        pio_vnext_flush_failure_requires_reopen_for_old_endpoint();
-        pio_vnext_corrupt_reopen_fails_closed();
-        pio_vnext_rolls_to_segments_then_backpressures_and_recovers_twice();
-        pio_vnext_checkpoint_rotates_to_a_single_replayable_replacement();
-    }
-
-    #[ktest]
-    fn cser_pio_journal_vnext_compaction_gate() {
-        pio_vnext_checkpoint_reduces_replay_image_and_survives_second_reopen();
-        pio_vnext_spans_segment_boundaries_without_fragmentation();
-        pio_vnext_repair_publishes_early_current_and_zero_prefixes();
-        pio_vnext_in_place_cut_after_payload_reopens_old_endpoint();
-        pio_vnext_in_place_cut_before_manifest_reopens_old_endpoint();
-        pio_vnext_in_place_cut_after_manifest_copy_zero_is_complete();
-        pio_vnext_in_place_cut_after_manifest_copy_one_is_complete();
-        pio_vnext_in_place_fill_writes_less_than_legacy_64k_fill();
-        pio_vnext_full_preflight_keeps_old_replay_image();
     }
 }

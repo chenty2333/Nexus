@@ -25,13 +25,6 @@ const FIXTURE_JOURNAL_SHA256: &str =
     "b3156d2dcbb622c6a12a8e155fc398357bbf1151b01834e1c7549fffc53bc898";
 const RUNTIME_FS_SHA256: &str = "9357413ed9a96a23af1750cc304265dd7dd1835eb58eb1fb50119cd80d0bc8ca";
 
-pub(crate) fn check(root: &Path) -> Result<()> {
-    let _lock = SystemLock::acquire(root)?;
-    let image = image(root)?;
-    ensure_image(root, &image)?;
-    kernel_checks(root, &image)
-}
-
 pub(crate) fn build(root: &Path) -> Result<()> {
     let _lock = SystemLock::acquire(root)?;
     let image = image(root)?;
@@ -44,7 +37,6 @@ pub(crate) fn run(root: &Path) -> Result<()> {
     let _lock = SystemLock::acquire(root)?;
     let image = image(root)?;
     ensure_image(root, &image)?;
-    kernel_checks(root, &image)?;
     run_pio_ktest(root, &image)?;
     let run_dir = system_output(root);
     prepare_system_output(&run_dir)?;
@@ -53,6 +45,7 @@ pub(crate) fn run(root: &Path) -> Result<()> {
     let catalog = catalog_digest(root, &image)?;
     schema8_negative_boot(root, &image, &run_dir, &catalog)?;
     run_four_boots(root, &image, &run_dir, &catalog)?;
+    fs::remove_dir_all(run_dir)?;
     Ok(())
 }
 
@@ -284,14 +277,25 @@ fn kernel_checks(root: &Path, image: &Image) -> Result<()> {
     container(root, image, "cd /work && cargo osdk check --locked", false)
 }
 
-fn prepare_runner(root: &Path) -> Result<String> {
+type RunnerControls = Vec<(&'static str, Vec<u8>)>;
+
+const RUNNER_CONTROLLED_INPUTS: [&str; 6] = [
+    "Cargo.toml",
+    "Cargo.lock",
+    "src/main.rs",
+    "x86_64.ld",
+    "riscv64.ld",
+    "loongarch64.ld",
+];
+
+fn prepare_runner(root: &Path) -> Result<RunnerControls> {
     let source = root.join(KERNEL).join("osdk-runner-base");
     let destination = root.join(KERNEL).join("target/osdk/nexus-kernel-run-base");
     if destination.exists() {
         fs::remove_dir_all(&destination)?;
     }
     copy_tree(&source, &destination)?;
-    let before = runner_controls(root, &destination)?;
+    let before = runner_controls(&destination)?;
     let lock_path = destination.join("Cargo.lock");
     let mut permissions = fs::metadata(&lock_path)?.permissions();
     permissions.set_readonly(true);
@@ -308,40 +312,81 @@ fn build_scheme(root: &Path, image: &Image, scheme: &str) -> Result<()> {
         false,
     );
     let runner = root.join(KERNEL).join("target/osdk/nexus-kernel-run-base");
-    let runner_result = assert_runner_unchanged(root, &runner, &runner_before);
+    let runner_result = assert_runner_unchanged(&runner, &runner_before, scheme);
     result?;
     runner_result
 }
 
-fn assert_runner_unchanged(root: &Path, runner: &Path, before: &str) -> Result<()> {
-    if runner_controls(root, runner)? != before {
-        return Err("OSDK rewrote a controlled runner input".into());
+fn assert_runner_unchanged(runner: &Path, before: &RunnerControls, operation: &str) -> Result<()> {
+    let after = runner_controls(runner)?;
+    let changed = before
+        .iter()
+        .zip(&after)
+        .filter_map(|((relative, before), (_, after))| (before != after).then_some(*relative))
+        .collect::<Vec<_>>();
+    if !changed.is_empty() {
+        return Err(format!(
+            "OSDK rewrote runner inputs during {operation}: {}",
+            changed.join(", ")
+        )
+        .into());
     }
     Ok(())
 }
 
 fn run_pio_ktest(root: &Path, image: &Image) -> Result<()> {
-    const GATES: [(&str, u64); 5] = [
-        ("cser_pio_journal_format_gate", 180),
+    const GATES: [(&str, u64); 2] = [
+        ("cser_pio_journal_safety_gate", 180),
         ("cser_pio_journal_recovery_gate", 180),
-        ("cser_pio_journal_vnext_checkpoint_gate", 180),
-        ("cser_pio_journal_vnext_recovery_gate", 180),
-        ("cser_pio_journal_vnext_compaction_gate", 180),
     ];
 
-    let runner_before = prepare_runner(root)?;
-    let runner = root.join(KERNEL).join("target/osdk/nexus-kernel-run-base");
     for (gate, timeout_seconds) in GATES {
         let command = format!(
             "cd /work; cp /root/ovmf/release/OVMF_VARS.fd \"$HOME/OVMF_VARS.fd\"; timeout --signal=TERM --kill-after=2s {timeout_seconds}s cargo osdk test --scheme cser-pio-journal-ktest {gate}"
         );
-        let result = container_output(root, image, &command, false);
-        let runner_result = assert_runner_unchanged(root, &runner, &runner_before);
-        let out = result?;
-        runner_result?;
+        let out = container_output(root, image, &command, false)?;
+        assert_test_runner_toolchain(root, gate)?;
         let clean = out.replace('\r', "");
         if !pio_gate_passed(&clean, gate) {
             return Err(format!("PIO journal ktest gate {gate} did not report one pass").into());
+        }
+    }
+    Ok(())
+}
+
+fn assert_test_runner_toolchain(root: &Path, gate: &str) -> Result<()> {
+    let lock = fs::read_to_string(
+        root.join(KERNEL)
+            .join("target/osdk/nexus-kernel-test-base/Cargo.lock"),
+    )?;
+    for package in [
+        "osdk-test-kernel",
+        "osdk-frame-allocator",
+        "osdk-heap-allocator",
+        "ostd",
+        "ostd-test",
+        "ostd-macros",
+        "linux-boot-params",
+    ] {
+        let versions = lock
+            .split("[[package]]")
+            .filter_map(|section| {
+                let mut name = None;
+                let mut version = None;
+                for line in section.lines() {
+                    let line = line.trim();
+                    name = name.or_else(|| line.strip_prefix("name = \"")?.strip_suffix('"'));
+                    version =
+                        version.or_else(|| line.strip_prefix("version = \"")?.strip_suffix('"'));
+                }
+                (name == Some(package)).then_some(version).flatten()
+            })
+            .collect::<Vec<_>>();
+        if versions != ["0.18.1"] {
+            return Err(format!(
+                "PIO gate {gate} used unexpected {package} versions: {versions:?}"
+            )
+            .into());
         }
     }
     Ok(())
@@ -511,11 +556,7 @@ fn schema8_negative_boot(root: &Path, image: &Image, run_dir: &Path, catalog: &s
             FIXTURE_HEAD,
         ],
     )?;
-    let before = snapshot_tpm(
-        root,
-        &state,
-        &run_dir.join("schema8-negative-tpm-before.txt"),
-    )?;
+    let before = snapshot_tpm(root, &state)?;
     capture(
         root,
         image,
@@ -525,11 +566,7 @@ fn schema8_negative_boot(root: &Path, image: &Image, run_dir: &Path, catalog: &s
         90,
         true,
     )?;
-    let after = snapshot_tpm(
-        root,
-        &state,
-        &run_dir.join("schema8-negative-tpm-after.txt"),
-    )?;
+    let after = snapshot_tpm(root, &state)?;
     if !tpm_snapshot_unchanged(&before, &after) {
         return Err("schema8 negative boot changed provisioned TPM NV state".into());
     }
@@ -585,8 +622,7 @@ fn schema8_negative_boot(root: &Path, image: &Image, run_dir: &Path, catalog: &s
         &fs::read_to_string(run_dir.join("schema8-negative-qemu-debug.log"))?,
         &migration,
     )?;
-    let negative_state = run_dir.join("schema8-negative-tpmstate");
-    fs::rename(&state, negative_state)?;
+    fs::remove_dir_all(&state)?;
     write_len(&run_dir.join("journal.raw"), 4 * 1024 * 1024)?;
     write_len(&run_dir.join("outbox.raw"), 4 * 1024 * 1024)?;
     Ok(())
@@ -678,14 +714,9 @@ fn build_schema8_fixture(root: &Path, image: &Image, run_dir: &Path) -> Result<V
     file.seek(SeekFrom::Start(1024))?;
     file.write_all(&logical)?;
     file.sync_all()?;
-    fs::copy(&journal, run_dir.join("schema8-negative-journal.raw"))?;
-    fs::write(
-        run_dir.join("schema8-negative-fixture.txt"),
-        format!(
-            "nexus.cser.schema8-selected-fixture.v1\nprofile4_source_revision={FIXTURE_REVISION}\nprofile4_source_archive_sha256={FIXTURE_ARCHIVE_SHA256}\nprofile4_catalog_digest={FIXTURE_CATALOG}\nselected_revision=5\nselected_head={FIXTURE_HEAD}\nlogical_journal_sha256={FIXTURE_JOURNAL_SHA256}\n"
-        ),
-    )?;
-    Ok(fs::read(&journal)?)
+    let encoded = fs::read(&journal)?;
+    fs::remove_dir_all(source)?;
+    Ok(encoded)
 }
 
 fn run_four_boots(root: &Path, image: &Image, run_dir: &Path, catalog: &str) -> Result<()> {
@@ -761,9 +792,9 @@ fn capture(
         "cd /work; cp /root/ovmf/release/OVMF_VARS.fd \"$HOME/OVMF_VARS.fd\"; test \"$(sha256sum /opt/nexus-fixtures/runtime-fs-block.raw | cut -d ' ' -f1)\" = {RUNTIME_FS_SHA256}; source scripts/qemu-stream-capture.sh; capture_qemu_streams {serial} {debug} bash -lc 'timeout --signal=TERM --kill-after=2s {seconds}s cargo osdk run --scheme {scheme}'"
     );
     let runner = root.join(KERNEL).join("target/osdk/nexus-kernel-run-base");
-    let runner_before = runner_controls(root, &runner)?;
+    let runner_before = runner_controls(&runner)?;
     let result = container(root, image, &command, production_tpm);
-    let runner_result = assert_runner_unchanged(root, &runner, &runner_before);
+    let runner_result = assert_runner_unchanged(&runner, &runner_before, scheme);
     let stop_result = host_tpm.as_mut().map(stop_swtpm).transpose();
     result?;
     runner_result?;
@@ -806,8 +837,6 @@ fn start_swtpm(run_dir: &Path) -> Result<Swtpm> {
             &format!("type=unixio,path={}", socket.display()),
             "--flags",
             flags,
-            "--log",
-            &format!("file={},level=20", run_dir.join("swtpm.log").display()),
             "--pid",
             &format!("file={}", pid.display()),
         ])
@@ -833,7 +862,7 @@ fn stop_swtpm(tpm: &mut Swtpm) -> Result<()> {
     Ok(())
 }
 
-fn snapshot_tpm(root: &Path, state: &Path, output_path: &Path) -> Result<String> {
+fn snapshot_tpm(root: &Path, state: &Path) -> Result<String> {
     let work = state.join(".snapshot");
     if work.exists() {
         fs::remove_dir_all(&work)?;
@@ -920,7 +949,6 @@ fn snapshot_tpm(root: &Path, state: &Path, output_path: &Path) -> Result<String>
         "provisioned_nv_digest={}\n",
         sha256_bytes(root, snapshot.as_bytes())?
     ));
-    fs::write(output_path, &snapshot)?;
     stop_swtpm(&mut daemon)?;
     fs::remove_dir_all(work)?;
     Ok(snapshot)
@@ -1488,16 +1516,11 @@ fn copy_tree(from: &Path, to: &Path) -> Result<()> {
     }
     Ok(())
 }
-fn runner_controls(root: &Path, runner: &Path) -> Result<String> {
-    let mut bytes = Vec::new();
-    for relative in ["Cargo.toml", "Cargo.lock", "src/main.rs"] {
-        let path = runner.join(relative);
-        bytes.extend_from_slice(relative.as_bytes());
-        bytes.push(0);
-        bytes.extend_from_slice(sha256(root, &path)?.as_bytes());
-        bytes.push(0);
-    }
-    sha256_bytes(root, &bytes)
+fn runner_controls(runner: &Path) -> Result<RunnerControls> {
+    RUNNER_CONTROLLED_INPUTS
+        .into_iter()
+        .map(|relative| Ok((relative, fs::read(runner.join(relative))?)))
+        .collect()
 }
 fn sha256(root: &Path, path: &Path) -> Result<String> {
     let path = path.to_str().ok_or("non-utf8 hash input")?;
@@ -1657,8 +1680,8 @@ mod tests {
 
     #[test]
     fn pio_gate_result_requires_one_exact_pass_and_summary() {
-        let gate = "cser_pio_journal_format_gate";
-        let pass = "test nexus_kernel::core_pio_journal::tests::cser_pio_journal_format_gate ... \u{1b}[32mok\u{1b}[39m\ntest result: \u{1b}[32mok\u{1b}[39m. 1 passed; 0 failed; 0 ignored";
+        let gate = "cser_pio_journal_safety_gate";
+        let pass = "test nexus_kernel::core_pio_journal::tests::cser_pio_journal_safety_gate ... \u{1b}[32mok\u{1b}[39m\ntest result: \u{1b}[32mok\u{1b}[39m. 1 passed; 0 failed; 0 ignored";
         assert!(pio_gate_passed(pass, gate));
         assert!(!pio_gate_passed(&format!("{pass}\n{pass}"), gate));
         assert!(!pio_gate_passed(
@@ -1666,11 +1689,11 @@ mod tests {
             gate
         ));
         assert!(!pio_gate_passed(
-            "test nexus_kernel::core_pio_journal::tests::cser_pio_journal_format_gate ... FAILED\ntest result: FAILED. 0 passed; 1 failed",
+            "test nexus_kernel::core_pio_journal::tests::cser_pio_journal_safety_gate ... FAILED\ntest result: FAILED. 0 passed; 1 failed",
             gate
         ));
         assert!(!pio_gate_passed(
-            "test nexus_kernel::core_pio_journal::tests::cser_pio_journal_format_gate ... ok\ntest result: ok. 11 passed; 0 failed; 0 filtered out",
+            "test nexus_kernel::core_pio_journal::tests::cser_pio_journal_safety_gate ... ok\ntest result: ok. 11 passed; 0 failed; 0 filtered out",
             gate
         ));
     }

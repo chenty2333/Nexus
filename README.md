@@ -78,8 +78,9 @@ the kernel image tied to the compiler actually invoking the front door.
 
 Cargo-OSDK generates a runner workspace for which `--locked` is not propagated.
 That is the sole controlled lock exception: the reviewed
-`kernel/nexus-ostd/osdk-runner-base/` snapshot has its own lockfile and is
-checked unchanged before use.
+`kernel/nexus-ostd/osdk-runner-base/` inputs have their own lockfile and are
+compared directly after each run; generated test runners must resolve the
+exact OSDK 0.18.1 packages.
 
 ## Repository map
 

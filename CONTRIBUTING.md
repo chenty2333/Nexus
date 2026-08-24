@@ -36,8 +36,9 @@ kernel profiles; the root `Dockerfile` owns the OSTD/cargo-osdk/QEMU build
 image; the host owns Docker and `swtpm`. The host TPM fixture remains outside
 the container, and the controlled QEMU run connects to it. Cargo-OSDK's
 generated runner does not inherit `--locked`; the reviewed
-`kernel/nexus-ostd/osdk-runner-base/` snapshot and its lockfile are the sole
-controlled exception and must remain unchanged.
+`kernel/nexus-ostd/osdk-runner-base/` inputs and lockfile are the sole
+controlled exception and are compared directly after each run. Generated test
+runners must resolve the exact OSDK 0.18.1 packages.
 
 ## Change discipline
 
