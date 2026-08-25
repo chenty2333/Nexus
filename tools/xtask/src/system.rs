@@ -1404,8 +1404,8 @@ fn assert_dma_arena(one: &str, three: &str, trace_one: &str, trace_three: &str) 
         return Err("DMA arena coordinates are not a bounded aligned PFN range".into());
     }
     for trace in [trace_one, trace_three] {
-        if trace.contains("vtd_dmar_fault") || trace.contains("0xffff") {
-            return Err("DMA arena trace lacks exact safe translation evidence".into());
+        if trace.contains("vtd_dmar_fault") {
+            return Err("DMA arena trace contains a VT-d fault".into());
         }
         for page in 0..PAGES {
             let expected = format!(
@@ -1907,6 +1907,8 @@ mod tests {
         let three = "X resource_generation=2 guest_pfn_base=1 emulated_iova_base=4096 host_backing_offset=4096";
         let trace = "vtd_dmar_translate dev 00:05.00 iova 0x1000 -> gpa 0x1000 mask 0xfff\nvtd_dmar_translate dev 00:05.00 iova 0x2000 -> gpa 0x2000 mask 0xfff\nvtd_dmar_translate dev 00:05.00 iova 0x3000 -> gpa 0x3000 mask 0xfff";
         assert!(assert_dma_arena(one, three, trace, trace).is_ok());
+        let unrelated_wide_value = format!("diagnostic value=0xffff\n{trace}");
+        assert!(assert_dma_arena(one, three, &unrelated_wide_value, trace).is_ok());
         assert!(assert_dma_arena(
             one,
             "X resource_generation=2 guest_pfn_base=9 emulated_iova_base=4096 host_backing_offset=4096",
