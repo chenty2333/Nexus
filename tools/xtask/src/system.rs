@@ -950,7 +950,19 @@ fn snapshot_tpm(root: &Path, state: &Path) -> Result<String> {
         ("0x01800104", "lease-slot-0.bin", None),
         ("0x01800105", "lease-slot-1.bin", None),
     ];
+    let mut written = BTreeMap::new();
+    for (index, _, size) in coordinates {
+        let public = output(root, "tpm2_nvreadpublic", &["-T", &tcti, index])?;
+        let is_written = tpm_nv_attributes_written(&public)?;
+        if size.is_some() && !is_written {
+            return Err(format!("TPM counter {index} is uninitialized").into());
+        }
+        written.insert(index, is_written);
+    }
     for (index, file, size) in coordinates {
+        if !written[index] {
+            continue;
+        }
         let output = work.join(file);
         let mut args = vec![
             "-Q",
@@ -976,19 +988,21 @@ fn snapshot_tpm(root: &Path, state: &Path) -> Result<String> {
         format!("0x0180010{}", lease_slot + 4),
     ];
     let mut snapshot = format!(
-        "nexus.cser.schema8-tpm-nv.v2\ntip_counter_hex={tip}\nlease_counter_hex={lease}\ntip_selected_slot={tip_slot}\nlease_selected_slot={lease_slot}\ntip_selected_slot_index={}\nlease_selected_slot_index={}\n",
+        "nexus.cser.schema8-tpm-nv.v3\ntip_counter_hex={tip}\nlease_counter_hex={lease}\ntip_selected_slot={tip_slot}\nlease_selected_slot={lease_slot}\ntip_selected_slot_index={}\nlease_selected_slot_index={}\n",
         selected[0], selected[1]
     );
-    for (label, file) in [
-        ("tip_slot_0", "tip-slot-0.bin"),
-        ("tip_slot_1", "tip-slot-1.bin"),
-        ("lease_slot_0", "lease-slot-0.bin"),
-        ("lease_slot_1", "lease-slot-1.bin"),
+    for (index, label, file) in [
+        ("0x01800101", "tip_slot_0", "tip-slot-0.bin"),
+        ("0x01800102", "tip_slot_1", "tip-slot-1.bin"),
+        ("0x01800104", "lease_slot_0", "lease-slot-0.bin"),
+        ("0x01800105", "lease_slot_1", "lease-slot-1.bin"),
     ] {
-        snapshot.push_str(&format!(
-            "{label}_sha256={}\n",
-            sha256(root, &work.join(file))?
-        ));
+        let state = if written[index] {
+            format!("written:{}", sha256(root, &work.join(file))?)
+        } else {
+            "uninitialized".to_string()
+        };
+        snapshot.push_str(&format!("{label}={state}\n"));
     }
     snapshot.push_str(&format!(
         "provisioned_nv_digest={}\n",
@@ -997,6 +1011,39 @@ fn snapshot_tpm(root: &Path, state: &Path) -> Result<String> {
     stop_swtpm(&mut daemon)?;
     fs::remove_dir_all(work)?;
     Ok(snapshot)
+}
+
+fn tpm_nv_attributes_written(public: &str) -> Result<bool> {
+    const WRITTEN: u32 = 0x2000_0000;
+    let lines = public.lines().collect::<Vec<_>>();
+    let attributes = lines
+        .iter()
+        .position(|line| line.trim() == "attributes:")
+        .ok_or("TPM NV public output is missing attributes")?;
+    let attributes_indent = lines[attributes].len() - lines[attributes].trim_start().len();
+    let mut value = None;
+    for line in &lines[attributes + 1..] {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let indent = line.len() - line.trim_start().len();
+        if indent <= attributes_indent {
+            break;
+        }
+        if let Some(raw) = trimmed.strip_prefix("value:") {
+            if value.is_some() {
+                return Err("TPM NV attributes contain duplicate values".into());
+            }
+            value = Some(u32::from_str_radix(
+                raw.trim()
+                    .strip_prefix("0x")
+                    .ok_or("TPM NV attributes value is not hexadecimal")?,
+                16,
+            )?);
+        }
+    }
+    Ok(value.ok_or("TPM NV attributes are missing a numeric value")? & WRITTEN != 0)
 }
 
 fn container(root: &Path, image: &Image, command: &str, host_socket: bool) -> Result<()> {
@@ -1162,11 +1209,11 @@ fn assert_boot_semantics(markers: &[String], catalog: &str) -> Result<()> {
     let common = [
         "shared_runtime=true",
         "production_registry=single",
-        "api_profile=6",
+        "api_profile=8",
         "catalog_version=8",
-        "projection_version=10",
-        "snapshot_version=6",
-        "journal_schema=10",
+        "projection_version=12",
+        "snapshot_version=8",
+        "journal_schema=12",
         "production_world=1",
         "reply_provider=1:1:1",
         "dma_provider=1:2:1",
@@ -1687,7 +1734,13 @@ fn tpm_snapshot_unchanged(before: &str, after: &str) -> bool {
                 .collect::<Vec<_>>();
             (values.len() == 1).then_some(values[0])
         };
-        snapshot.lines().next() == Some("nexus.cser.schema8-tpm-nv.v2")
+        let valid_slot = |value: &str| {
+            value == "uninitialized"
+                || value
+                    .strip_prefix("written:")
+                    .is_some_and(|digest| valid_hex(digest, 64))
+        };
+        snapshot.lines().next() == Some("nexus.cser.schema8-tpm-nv.v3")
             && field("tip_counter_hex").is_some_and(|value| valid_hex(value, 16))
             && field("lease_counter_hex").is_some_and(|value| valid_hex(value, 16))
             && field("tip_selected_slot").is_some_and(|value| matches!(value, "0" | "1"))
@@ -1696,10 +1749,10 @@ fn tpm_snapshot_unchanged(before: &str, after: &str) -> bool {
                 .is_some_and(|value| matches!(value, "0x01800101" | "0x01800102"))
             && field("lease_selected_slot_index")
                 .is_some_and(|value| matches!(value, "0x01800104" | "0x01800105"))
-            && field("tip_slot_0_sha256").is_some_and(|value| valid_hex(value, 64))
-            && field("tip_slot_1_sha256").is_some_and(|value| valid_hex(value, 64))
-            && field("lease_slot_0_sha256").is_some_and(|value| valid_hex(value, 64))
-            && field("lease_slot_1_sha256").is_some_and(|value| valid_hex(value, 64))
+            && field("tip_slot_0").is_some_and(valid_slot)
+            && field("tip_slot_1").is_some_and(valid_slot)
+            && field("lease_slot_0").is_some_and(valid_slot)
+            && field("lease_slot_1").is_some_and(valid_slot)
             && field("provisioned_nv_digest").is_some_and(|value| valid_hex(value, 64))
     };
     valid(before) && valid(after) && before == after
@@ -1826,10 +1879,26 @@ mod tests {
 
     #[test]
     fn schema8_rejects_tpm_coordinate_change() {
-        let before = "nexus.cser.schema8-tpm-nv.v2\ntip_counter_hex=0000000000000001\nlease_counter_hex=0000000000000001\ntip_selected_slot=1\nlease_selected_slot=1\ntip_selected_slot_index=0x01800102\nlease_selected_slot_index=0x01800105\ntip_slot_0_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\ntip_slot_1_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nlease_slot_0_sha256=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\nlease_slot_1_sha256=dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\nprovisioned_nv_digest=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\n";
-        let after = before.replacen("aaaaaaaa", "ffffffff", 1);
+        let before = "nexus.cser.schema8-tpm-nv.v3\ntip_counter_hex=0000000000000001\nlease_counter_hex=0000000000000001\ntip_selected_slot=1\nlease_selected_slot=1\ntip_selected_slot_index=0x01800102\nlease_selected_slot_index=0x01800105\ntip_slot_0=uninitialized\ntip_slot_1=written:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nlease_slot_0=uninitialized\nlease_slot_1=written:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\nprovisioned_nv_digest=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\n";
         assert!(tpm_snapshot_unchanged(before, before));
-        assert!(!tpm_snapshot_unchanged(before, &after));
+        let initialized = before.replacen(
+            "tip_slot_0=uninitialized",
+            "tip_slot_0=written:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            1,
+        );
+        assert!(!tpm_snapshot_unchanged(before, &initialized));
+        assert!(!tpm_snapshot_unchanged(&initialized, before));
+        let changed = before.replacen("bbbbbbbb", "ffffffff", 1);
+        assert!(!tpm_snapshot_unchanged(before, &changed));
+    }
+
+    #[test]
+    fn tpm_written_attribute_uses_attributes_numeric_value() {
+        let unwritten = "0x1800101:\n  hash algorithm:\n    friendly: sha256\n    value: 0xB\n  attributes:\n    friendly: ownerwrite|ownerread\n    value: 0x42041404\n  size: 2048\n";
+        let written = unwritten.replace("0x42041404", "0x62041404");
+        assert!(!tpm_nv_attributes_written(unwritten).unwrap());
+        assert!(tpm_nv_attributes_written(&written).unwrap());
+        assert!(tpm_nv_attributes_written("attributes:\n  friendly: written\n").is_err());
     }
 
     #[test]

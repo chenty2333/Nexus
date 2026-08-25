@@ -202,9 +202,9 @@ fi
 
 readonly one=0000000000000001
 readonly zero=0000000000000000
-readonly profile_hex=0006000a000a0003
+readonly profile_hex=0008000c000c0005
 readonly world_hex=0000000000000001
-readonly genesis_projection_hex=a31075614d23365a05fe24ebc82acb6b9f6d85865df5703a150b712fe44e118e
+readonly genesis_projection_hex=bd78d8c1169ff8e607b7b52b9278dd9e946e2e8ac09a0ed0b34ae64bea6c13f1
 readonly prefix_tip=4353455254504d33000301000000000000000001
 readonly prefix_lease=4353455254504d33000302000000000000000001
 readonly binding_hex="${profile_hex}${catalog_hex}${world_hex}${one}"
